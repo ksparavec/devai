@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM docker.io/nvidia/cuda:12.9.1-cudnn-runtime-ubuntu24.04
 
 ARG HTTP_PROXY
 ARG HTTPS_PROXY
@@ -7,14 +7,22 @@ ENV HTTP_PROXY=$HTTP_PROXY
 ENV HTTPS_PROXY=$HTTPS_PROXY
 ENV SHELL=/bin/bash
 ENV OLLAMA_HOST=http://host.containers.internal:11434
+ENV DEBIAN_FRONTEND=noninteractive
 
 # Configure apt proxy if arguments are provided
 RUN if [ -n "$HTTP_PROXY" ]; then echo "Acquire::http::Proxy \"$HTTP_PROXY\";" > /etc/apt/apt.conf.d/99proxy; fi && \
     if [ -n "$HTTPS_PROXY" ]; then echo "Acquire::https::Proxy \"$HTTPS_PROXY\";" >> /etc/apt/apt.conf.d/99proxy; fi
 
-# Install dependencies, uv, gosu, and dev tools
-RUN apt-get update && apt-get install -y curl gnupg libterm-readline-gnu-perl gosu \
+# Install Python 3.11 and dependencies
+RUN apt-get update && apt-get install -y \
+    software-properties-common \
+    && add-apt-repository ppa:deadsnakes/ppa \
+    && apt-get update && apt-get install -y \
+    python3.11 python3.11-venv python3.11-dev \
+    curl gnupg libterm-readline-gnu-perl gosu \
     git build-essential rustc cargo \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 \
+    && update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1 \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
     && curl -LsSf https://astral.sh/uv/install.sh | sh \
@@ -31,12 +39,13 @@ RUN apt-get update && apt-get install -y curl gnupg libterm-readline-gnu-perl go
 RUN npm install -g @google/gemini-cli @anthropic-ai/claude-code \
     && npm cache clean --force
 
-# Install Python packages: JupyterLab, OpenAI CLI, Ollama client, ChromaDB
+# Install Python packages: JupyterLab, OpenAI CLI, Ollama client, ChromaDB with GPU support
 RUN uv pip install --system --no-cache-dir \
     jupyterlab \
     openai \
     ollama \
     chromadb \
+    torch \
     && rm -rf /root/.cache
 
 # Install optional python dependencies

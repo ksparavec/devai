@@ -1,21 +1,20 @@
-# Gemini Lab
+# Dev AI Lab
 
-A containerized environment designed for AI experimentation and development, featuring **JupyterLab** and the **Google Gemini CLI**. This setup provides a consistent, isolated workspace with essential tools pre-installed.
+A containerized environment designed for AI experimentation and development, featuring **JupyterLab** and multiple AI CLIs. This setup provides a consistent, isolated workspace with essential tools pre-installed.
 
 ## Features
 
 *   **Base Environment**: Python 3.11 (slim) on Debian.
 *   **Interactive Computing**: **JupyterLab** pre-installed and configured.
-*   **AI Tools**: Official **Google Gemini CLI** (`@google/gemini-cli`) available globally.
+*   **AI Tools**:
+    *   **Google Gemini CLI** (`@google/gemini-cli`)
+    *   **Claude Code CLI** (`@anthropic-ai/claude-code`)
+    *   **OpenAI CLI** (`openai`)
+    *   **Ollama** for local model inference
+*   **Vector Database**: **ChromaDB** for embeddings and RAG experiments.
+*   **GPU Support**: NVIDIA CUDA support for accelerated inference (optional).
 *   **Package Management**: Includes `uv` (fast Python installer) and `npm`.
 *   **Development Tools**: `git`, `build-essential`, `rustc`, `cargo`.
-*   **Installed Packages**:
-    *   `python` (3.11)
-    *   `jupyterlab`
-    *   `@google/gemini-cli`
-    *   `uv`
-    *   `nodejs` (20.x)
-    *   `rustc` / `cargo`
 *   **Runtime**: Optimized for **Podman** (supports rootless mode) but fully compatible with Docker.
 
 ## Prerequisites
@@ -107,24 +106,111 @@ http://127.0.0.1:8888/lab?token=<long-token-string>
 
 Copy and paste either URL into your browser to access the JupyterLab interface.
 
-## Using the Gemini CLI
+## Using AI Tools
 
-The Google Gemini CLI is installed globally. You can access it from a terminal within JupyterLab:
+All AI CLIs are available from a terminal within JupyterLab (File -> New -> Terminal).
 
-1.  Open a Terminal in JupyterLab (File -> New -> Terminal).
-2.  **First Run & Authentication**:
-    When you run a command for the first time (e.g., `gemini prompt "Hello"`), the CLI will prompt you to authenticate.
-    *   It will likely provide a URL to visit in your browser to authorize the application.
-    *   Follow the on-screen instructions to log in with your Google account.
-    *   Once authenticated, a token will be saved locally (in the mounted home directory), so you won't need to log in again.
-
-For more detailed usage instructions and API capabilities, refer to the [official Google Gemini documentation](https://ai.google.dev/).
-
-### Cleaning Up
-To remove the built image:
+### Google Gemini CLI
 
 ```bash
-make clean
+gemini prompt "Hello"
+```
+
+On first run, follow the browser authentication flow. Credentials are saved in your mounted home directory.
+
+### Claude Code CLI
+
+```bash
+claude
+```
+
+Requires `ANTHROPIC_API_KEY` environment variable or interactive login.
+
+### OpenAI CLI
+
+```python
+# In Python/Jupyter
+from openai import OpenAI
+client = OpenAI()  # Uses OPENAI_API_KEY env var
+response = client.chat.completions.create(
+    model="gpt-4",
+    messages=[{"role": "user", "content": "Hello"}]
+)
+```
+
+### Ollama (Local Models)
+
+The container connects to Ollama running on your host machine:
+
+1.  Install Ollama on host: https://ollama.ai
+2.  Start Ollama: `ollama serve`
+3.  Pull a model: `ollama pull llama3.2`
+4.  Use from container:
+
+```python
+import ollama
+response = ollama.chat(model='llama3.2', messages=[
+    {'role': 'user', 'content': 'Hello'}
+])
+```
+
+### ChromaDB (Vector Database)
+
+```python
+import chromadb
+client = chromadb.Client()
+collection = client.create_collection("my_embeddings")
+collection.add(
+    documents=["doc1", "doc2"],
+    ids=["id1", "id2"]
+)
+results = collection.query(query_texts=["search query"], n_results=2)
+```
+
+## GPU Support
+
+For NVIDIA GPU acceleration:
+
+1.  Install [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)
+2.  Build the GPU image:
+    ```bash
+    make build-gpu
+    ```
+3.  Run with GPU:
+    ```bash
+    make run-gpu
+    ```
+
+The GPU image is based on NVIDIA CUDA with cuDNN and includes PyTorch with CUDA support.
+
+### Selecting a CUDA Base Image
+
+Use the included selector script to choose and update the CUDA base image:
+
+```bash
+# List available cuDNN images
+./scripts/select-cuda-image.sh --list
+
+# Auto-select recommended version and update Dockerfile.gpu
+./scripts/select-cuda-image.sh --auto
+
+# Interactive selection with ncurses UI (if dialog is installed)
+./scripts/select-cuda-image.sh
+
+# Specify Ubuntu version
+./scripts/select-cuda-image.sh --auto 22.04
+```
+
+The script queries Docker Hub for available NVIDIA CUDA images with cuDNN support and recommends the latest stable version from the previous major release for best compatibility with PyTorch and other ML libraries.
+
+## Additional Commands
+
+```bash
+make shell      # Interactive shell without JupyterLab
+make clean      # Remove CPU image
+make clean-gpu  # Remove GPU image
+make prune      # Clean up dangling images (keeps tagged images and volumes)
+make help       # Show all available targets
 ```
 
 ## License
