@@ -1,0 +1,12 @@
+# Port mappings shared across all deployment methods
+
+services:
+  jupyter:
+    container: 8888
+    host: 8888
+    protocol: tcp
+
+  ollama:
+    container: 11434
+    host: 11434
+    protocol: tcp

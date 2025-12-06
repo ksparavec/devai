@@ -1,0 +1,24 @@
+# Development environment profile
+
+environment: dev
+
+resources:
+  cpu: 1
+  memory: 2048
+  storage: 20
+
+replicas: 1
+
+labels:
+  environment: dev
+  tier: development
+
+features:
+  https: false
+  autoscaling: false
+  monitoring: false
+
+network:
+  # Allow all access in dev
+  allowed_cidrs:
+    - "0.0.0.0/0"

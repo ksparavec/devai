@@ -1,0 +1,21 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: devai
+  namespace: devai
+  labels:
+    app: devai-lab
+  annotations:
+    # Cloud-specific annotations added via overlays
+    kubernetes.io/ingress.class: nginx
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: devai
+                port:
+                  number: 8888

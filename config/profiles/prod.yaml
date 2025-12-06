@@ -1,0 +1,24 @@
+# Production environment profile
+
+environment: prod
+
+resources:
+  cpu: 4
+  memory: 8192
+  storage: 100
+
+replicas: 2
+
+labels:
+  environment: prod
+  tier: production
+
+features:
+  https: true
+  autoscaling: true
+  monitoring: true
+
+network:
+  # Restrict access in production
+  allowed_cidrs: []
+  # Define specific IPs/ranges as needed

@@ -1,0 +1,16 @@
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: devai-storage
+  labels:
+    app: devai-lab
+provisioner: file.csi.azure.com
+parameters:
+  skuName: Standard_LRS
+  shareName: devai
+allowVolumeExpansion: true
+mountOptions:
+  - dir_mode=0755
+  - file_mode=0644
+  - uid=1000
+  - gid=1000

@@ -1,0 +1,27 @@
+# GCP Terraform variables
+# Copy to terraform.tfvars and customize
+
+# Required
+project_id = "your-gcp-project-id"
+region     = "us-central1"
+
+# Project settings
+project_name = "devai-lab"
+environment  = "dev"
+
+# Resources
+cpu             = 2
+memory          = 4096
+storage_size_gb = 50
+replicas        = 1
+
+# Features
+enable_gpu   = false  # Note: GPU requires GKE, not Cloud Run
+enable_https = true   # Cloud Run provides HTTPS by default
+
+# Network
+allowed_cidrs = ["0.0.0.0/0"]
+vpc_cidr      = "10.0.0.0/16"
+
+# Container
+image_tag = "latest"

@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: devai
+  namespace: devai
+  labels:
+    app: devai-lab
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: devai-lab
+  template:
+    metadata:
+      labels:
+        app: devai-lab
+    spec:
+      serviceAccountName: devai
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: devai
+          image: devai-lab:latest
+          imagePullPolicy: Always
+          ports:
+            - name: jupyter
+              containerPort: 8888
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: devai-config
+            - secretRef:
+                name: devai-secrets
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+          volumeMounts:
+            - name: work
+              mountPath: /home/devai/work
+          livenessProbe:
+            httpGet:
+              path: /api
+              port: 8888
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /api
+              port: 8888
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: work
+          persistentVolumeClaim:
+            claimName: devai-work

@@ -213,6 +213,134 @@ make prune      # Clean up dangling images (keeps tagged images and volumes)
 make help       # Show all available targets
 ```
 
+## Cloud Deployment
+
+Dev AI Lab supports deployment to major cloud providers via Docker Compose, Terraform, and Kubernetes.
+
+### Deployment Options
+
+| Method | Use Case | Documentation |
+|--------|----------|---------------|
+| **Docker Compose** | Local multi-service orchestration | [docs/docker-compose.md](docs/docker-compose.md) |
+| **Terraform** | Cloud infrastructure provisioning | [docs/terraform.md](docs/terraform.md) |
+| **Kubernetes** | Container orchestration at scale | [docs/kubernetes.md](docs/kubernetes.md) |
+
+### Supported Clouds
+
+| Cloud | Terraform | Kubernetes |
+|-------|-----------|------------|
+| **AWS** | ECS Fargate, ECR, ALB | EKS with ALB Ingress |
+| **Azure** | Container Instances, ACR | AKS with AGIC |
+| **GCP** | Cloud Run, Artifact Registry | GKE with GCE Ingress |
+
+### Quick Start (Docker Compose)
+
+```bash
+# Start devai + ollama locally
+make compose-up
+
+# View logs (includes JupyterLab token)
+make compose-logs
+
+# Stop services
+make compose-down
+```
+
+### Quick Start (Cloud - AWS Example)
+
+```bash
+# 1. Configure
+cp deploy/terraform/aws/terraform.tfvars.example deploy/terraform/aws/terraform.tfvars
+vim deploy/terraform/aws/terraform.tfvars
+
+# 2. Deploy infrastructure
+make tf-init-aws
+make tf-apply-aws
+
+# 3. Push container image
+./scripts/push-image.sh aws
+
+# 4. Get service URL
+cd deploy/terraform/aws && terraform output service_url
+```
+
+### Configuration Management
+
+All deployment methods share configuration from `config/`:
+
+```bash
+# Generate configs for all targets
+make config-generate PROFILE=dev
+
+# Generate for specific profile
+make config-generate PROFILE=prod
+```
+
+See [docs/utilities.md](docs/utilities.md) for details on the configuration system.
+
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| [docs/local-container.md](docs/local-container.md) | Local build/run targets (build, run, shell) |
+| [docs/docker-compose.md](docs/docker-compose.md) | Docker Compose multi-service setup |
+| [docs/terraform.md](docs/terraform.md) | Cloud deployment with Terraform |
+| [docs/kubernetes.md](docs/kubernetes.md) | Kubernetes deployment with Kustomize |
+| [docs/utilities.md](docs/utilities.md) | Config generation and utility scripts |
+
+## All Make Targets
+
+### Local Container
+| Target | Description |
+|--------|-------------|
+| `make build` | Build CPU container image |
+| `make build-gpu` | Build GPU/CUDA container image |
+| `make run` | Run container with JupyterLab |
+| `make run-gpu` | Run GPU container with JupyterLab |
+| `make shell` | Interactive shell without JupyterLab |
+| `make clean` | Remove CPU image |
+| `make clean-gpu` | Remove GPU image |
+| `make prune` | Clean dangling images |
+
+### Docker Compose
+| Target | Description |
+|--------|-------------|
+| `make compose-up` | Start all services |
+| `make compose-up-gpu` | Start with GPU support |
+| `make compose-down` | Stop and remove containers |
+| `make compose-logs` | View container logs |
+| `make compose-build` | Build images |
+| `make compose-ps` | Show running containers |
+
+### Terraform
+| Target | Description |
+|--------|-------------|
+| `make tf-init-aws` | Initialize AWS |
+| `make tf-plan-aws` | Plan AWS deployment |
+| `make tf-apply-aws` | Deploy to AWS |
+| `make tf-destroy-aws` | Destroy AWS resources |
+| `make tf-init-azure` | Initialize Azure |
+| `make tf-plan-azure` | Plan Azure deployment |
+| `make tf-apply-azure` | Deploy to Azure |
+| `make tf-destroy-azure` | Destroy Azure resources |
+| `make tf-init-gcp` | Initialize GCP |
+| `make tf-plan-gcp` | Plan GCP deployment |
+| `make tf-apply-gcp` | Deploy to GCP |
+| `make tf-destroy-gcp` | Destroy GCP resources |
+
+### Kubernetes
+| Target | Description |
+|--------|-------------|
+| `make k8s-build` | Build K8s manifests |
+| `make k8s-apply` | Apply to cluster |
+| `make k8s-delete` | Delete resources |
+
+### Utilities
+| Target | Description |
+|--------|-------------|
+| `make config-generate` | Generate configs from YAML |
+| `make help` | Show all targets |
+
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

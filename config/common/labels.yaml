@@ -1,0 +1,9 @@
+# Labels and tags shared across all deployment methods
+# These are applied to all resources for consistency
+
+standard:
+  app: devai-lab
+  managed-by: devai
+  component: ai-development
+
+# Environment-specific labels are merged from profiles

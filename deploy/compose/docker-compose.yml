@@ -1,0 +1,58 @@
+services:
+  devai:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      args:
+        - HTTP_PROXY=${HTTP_PROXY:-}
+        - HTTPS_PROXY=${HTTPS_PROXY:-}
+    image: ${IMAGE_NAME:-devai-lab}:${IMAGE_TAG:-latest}
+    container_name: devai-lab
+    hostname: devai
+    ports:
+      - "${PORT:-8888}:8888"
+    environment:
+      - OLLAMA_HOST=${OLLAMA_HOST:-http://ollama:11434}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+      - HTTP_PROXY=${HTTP_PROXY:-}
+      - HTTPS_PROXY=${HTTPS_PROXY:-}
+      - USER_ID=${USER_ID:-1000}
+      - GROUP_ID=${GROUP_ID:-1000}
+      - CONTAINER_USER=${CONTAINER_USER:-devai}
+    volumes:
+      - ${HOST_WORK_DIR:-./work}:/home/devai/work
+      - devai-local:/home/devai/.local
+      - devai-cache:/home/devai/.cache
+    depends_on:
+      ollama:
+        condition: service_started
+    restart: unless-stopped
+    networks:
+      - devai-network
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    hostname: ollama
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    restart: unless-stopped
+    networks:
+      - devai-network
+
+volumes:
+  devai-local:
+    name: devai-local
+  devai-cache:
+    name: devai-cache
+  ollama-models:
+    name: ollama-models
+
+networks:
+  devai-network:
+    name: devai-network
+    driver: bridge

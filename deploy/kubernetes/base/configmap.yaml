@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: devai-config
+  namespace: devai
+  labels:
+    app: devai-lab
+data:
+  JUPYTER_PORT: "8888"
+  OLLAMA_HOST: "http://ollama:11434"
+  CONTAINER_USER: "devai"

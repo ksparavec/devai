@@ -1,0 +1,19 @@
+# Local overrides - copy to docker-compose.override.yml
+# This file is automatically loaded by docker compose
+
+services:
+  devai:
+    # Mount additional directories
+    volumes:
+      - ${HOST_HOME_DIR:-~}/.ssh:/home/devai/.ssh:ro
+      - ${HOST_HOME_DIR:-~}/.gitconfig:/home/devai/.gitconfig:ro
+
+    # Add extra environment variables
+    environment:
+      - EXTRA_VAR=value
+
+  # Use external Ollama instead of container
+  # ollama:
+  #   profiles:
+  #     - disabled
+  # Then set OLLAMA_HOST=http://host.docker.internal:11434

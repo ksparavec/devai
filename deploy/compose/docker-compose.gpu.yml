@@ -1,0 +1,24 @@
+# GPU override - use with: docker compose -f docker-compose.yml -f docker-compose.gpu.yml up
+
+services:
+  devai:
+    build:
+      dockerfile: Dockerfile.gpu
+    image: ${IMAGE_NAME:-devai-lab}-gpu:${IMAGE_TAG:-latest}
+    container_name: devai-lab-gpu
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  ollama:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

@@ -1,0 +1,28 @@
+# Resource limits shared across all deployment methods
+
+defaults:
+  cpu: 2          # vCPUs
+  memory: 4096    # MB
+  storage: 50     # GB
+
+profiles:
+  dev:
+    cpu: 1
+    memory: 2048
+    storage: 20
+
+  staging:
+    cpu: 2
+    memory: 4096
+    storage: 50
+
+  prod:
+    cpu: 4
+    memory: 8192
+    storage: 100
+
+gpu:
+  # GPU-specific resource overrides
+  memory: 8192    # GPU workloads need more RAM
+  gpu_count: 1
+  gpu_type: nvidia  # nvidia, amd (nvidia is default)

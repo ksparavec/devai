@@ -1,0 +1,26 @@
+# Staging environment profile
+
+environment: staging
+
+resources:
+  cpu: 2
+  memory: 4096
+  storage: 50
+
+replicas: 1
+
+labels:
+  environment: staging
+  tier: staging
+
+features:
+  https: true
+  autoscaling: false
+  monitoring: true
+
+network:
+  # Restrict to known IPs in staging
+  allowed_cidrs:
+    - "10.0.0.0/8"
+    - "172.16.0.0/12"
+    - "192.168.0.0/16"

@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: devai
+  labels:
+    app: devai-lab
+    managed-by: kustomize
