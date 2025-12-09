@@ -1,0 +1,4 @@
+# GPU-specific packages (appended to .default-python-packages)
+torch
+torchvision
+torchaudio

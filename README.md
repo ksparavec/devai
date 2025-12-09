@@ -4,17 +4,19 @@ A containerized environment designed for AI experimentation and development, fea
 
 ## Features
 
-*   **Base Environment**: Python 3.11 (slim) on Debian.
+*   **Base Environment**: Debian Trixie (slim) with Python 3.13 via uv.
+*   **Tool Management**: **mise** for version-controlled tool installation.
 *   **Interactive Computing**: **JupyterLab** pre-installed and configured.
 *   **AI Tools**:
     *   **Google Gemini CLI** (`@google/gemini-cli`)
     *   **Claude Code CLI** (`@anthropic-ai/claude-code`)
-    *   **OpenAI CLI** (`openai`)
+    *   **OpenAI Codex CLI** (`@openai/codex`)
+    *   **OpenAI Python SDK** (`openai`)
     *   **Ollama** for local model inference
 *   **Vector Database**: **ChromaDB** for embeddings and RAG experiments.
 *   **GPU Support**: NVIDIA CUDA support for accelerated inference (optional).
-*   **Package Management**: Includes `uv` (fast Python installer) and `npm`.
-*   **Development Tools**: `git`, `build-essential`, `rustc`, `cargo`.
+*   **Package Management**: **mise** manages `uv` and `node`; Python packages via `uv pip`.
+*   **Development Tools**: `git`, `build-essential`, `rustc`, `cargo` (via apt).
 *   **Runtime**: Optimized for **Podman** (supports rootless mode) but fully compatible with Docker.
 
 ## Prerequisites
@@ -126,7 +128,15 @@ claude
 
 Requires `ANTHROPIC_API_KEY` environment variable or interactive login.
 
-### OpenAI CLI
+### OpenAI Codex CLI
+
+```bash
+codex
+```
+
+Requires `OPENAI_API_KEY` environment variable or ChatGPT Plus/Pro/Business login.
+
+### OpenAI Python SDK
 
 ```python
 # In Python/Jupyter

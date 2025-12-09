@@ -1,0 +1,37 @@
+# Jupyter
+jupyterlab
+ipywidgets
+
+# AI providers
+openai
+ollama
+chromadb
+
+# Core ML/Data Science
+numpy
+pandas
+scipy
+scikit-learn
+matplotlib
+seaborn
+
+# Deep Learning (CPU-compatible)
+transformers
+datasets
+accelerate
+
+# NLP
+nltk
+spacy
+
+# Computer Vision
+pillow
+opencv-python
+
+# Utilities
+tqdm
+requests
+python-dotenv
+pyyaml
+jsonlines
+pydantic

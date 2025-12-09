@@ -1,0 +1,10 @@
+# mise.toml - Tool version management for devai container
+# All tools except compilers are installed via mise
+
+[tools]
+# Package managers
+uv = "latest"
+node = "25"
+
+# Runtime (installed via uv backend)
+"python:uv" = "3.13"

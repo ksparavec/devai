@@ -10,6 +10,9 @@ HOST_IP ?= $(shell hostname -I | awk '{print $$1}')
 HOST_HOME_DIR ?=
 OLLAMA_HOST ?= http://host.containers.internal:11434
 
+# GPU build settings
+GPU_BASE_IMAGE ?= docker.io/nvidia/cuda:12.9.1-cudnn-runtime-ubuntu24.04
+
 HOME_MOUNT_ARG =
 ifneq ($(HOST_HOME_DIR),)
 	HOME_MOUNT_ARG = -v "$$(readlink -f $(HOST_HOME_DIR))":/home/$(CONTAINER_USER)
@@ -54,7 +57,8 @@ build-gpu: ## Build the container image (GPU/CUDA)
 	$(CONTAINER_RUNTIME) build \
 		--build-arg HTTP_PROXY=$(HTTP_PROXY) \
 		--build-arg HTTPS_PROXY=$(HTTPS_PROXY) \
-		-f Dockerfile.gpu \
+		--build-arg BASE_IMAGE=$(GPU_BASE_IMAGE) \
+		--build-arg GPU_BUILD=true \
 		-t $(IMAGE_NAME)-gpu .
 
 run: ## Run the container (CPU)

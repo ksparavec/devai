@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is **Dev AI Lab** - a containerized development environment for AI experimentation featuring JupyterLab and multiple AI CLIs (Gemini, Claude, OpenAI, Ollama). The container is built on Python 3.11-slim with Node.js 20.x, and is optimized for Podman (rootless mode) but compatible with Docker. GPU/CUDA support is available for local model inference.
+This is **Dev AI Lab** - a containerized development environment for AI experimentation featuring JupyterLab and multiple AI CLIs (Gemini, Claude, OpenAI, Ollama). The container is built on Debian Trixie (slim) with tools managed by **mise** (uv, node). Python 3.13 is installed via uv. Optimized for Podman (rootless mode) but compatible with Docker. GPU/CUDA support is available for local model inference.
 
 ## Build and Run Commands
 
@@ -39,9 +39,19 @@ To add Python packages, create `requirements.txt` from `requirements.txt.example
 
 ## Architecture
 
-- **Dockerfile** - CPU image with Python, Node.js, Rust, AI CLIs (Gemini, Claude, OpenAI), Ollama client, ChromaDB
-- **Dockerfile.gpu** - GPU image based on nvidia/cuda with PyTorch and CUDA support
+- **Dockerfile** - Unified image with build args for CPU/GPU (BASE_IMAGE, GPU_BUILD)
+- **mise.toml** - Tool version configuration (uv, node, python)
+- **.default-npm-packages** - AI CLIs auto-installed with Node
+- **.default-python-packages** - Python packages auto-installed with Python
+- **.default-python-packages.gpu-extra** - GPU-specific packages (torch, torchvision, torchaudio)
 - **entrypoint.sh** - Handles UID/GID mapping for rootless container operation using `gosu`
 - **Makefile** - Build orchestration with Podman/Docker-specific flags and host connectivity for Ollama
+
+Tool installation hierarchy:
+- **apt-get**: Only compilers (build-essential, rustc, cargo) and system utilities (curl, git, gosu)
+- **mise**: All runtime tools and packages
+  - uv, node, python (via uv backend)
+  - .default-npm-packages: @google/gemini-cli, @anthropic-ai/claude-code, @openai/codex
+  - .default-python-packages: jupyterlab, openai, ollama, chromadb (+ torch for GPU)
 
 The container connects to host services via `host.containers.internal` for Ollama integration.
