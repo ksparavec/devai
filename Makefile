@@ -10,6 +10,20 @@ HOST_IP ?= $(shell hostname -I | awk '{print $$1}')
 HOST_HOME_DIR ?=
 OLLAMA_HOST ?= http://host.containers.internal:11434
 
+# Cloud tools configuration (bootstrapped venv)
+DEVAI_PYTHON_VERSION ?= 3.12
+DEVAI_VENV_DIR ?= $(HOME)/.local/devai-venv
+DEVAI_BIN_DIR ?= $(HOME)/.local/bin
+INSTALL_RUNTIME ?= both
+
+# Tool binaries (use bootstrapped venv)
+TERRAFORM ?= $(DEVAI_BIN_DIR)/terraform
+KUBECTL ?= $(DEVAI_BIN_DIR)/kubectl
+KUSTOMIZE ?= $(DEVAI_BIN_DIR)/kustomize
+AWS ?= $(DEVAI_BIN_DIR)/aws
+GCLOUD ?= $(DEVAI_BIN_DIR)/gcloud
+AZ ?= $(DEVAI_BIN_DIR)/az
+
 # GPU build settings
 GPU_BASE_IMAGE ?= docker.io/nvidia/cuda:12.9.1-cudnn-runtime-ubuntu24.04
 
@@ -44,8 +58,11 @@ PROFILE ?= dev
 .PHONY: tf-init-azure tf-plan-azure tf-apply-azure tf-destroy-azure
 .PHONY: tf-init-gcp tf-plan-gcp tf-apply-gcp tf-destroy-gcp
 .PHONY: k8s-build k8s-apply k8s-delete
+.PHONY: setup-build-env setup-cloud-tools setup-cloud-tools-aws setup-cloud-tools-azure setup-cloud-tools-gcp
+.PHONY: setup-cloud-tools-terraform setup-cloud-tools-k8s check-cloud-tools
+.PHONY: setup-runtime setup-runtime-podman setup-runtime-docker
 
-all: build
+all: help
 
 build: ## Build the container image (CPU)
 	$(CONTAINER_RUNTIME) build \
@@ -127,7 +144,52 @@ prune: ## Clean up dangling images only (keeps tagged images and volumes)
 	$(CONTAINER_RUNTIME) image prune -f
 
 help: ## Show this help message
-	@grep -h -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
+	@echo ""
+	@echo "\033[1mDevAI Lab - Containerized AI Development Environment\033[0m"
+	@echo ""
+	@echo "\033[1;33m1. SETUP BUILD ENVIRONMENT\033[0m (install container runtimes and cloud tools)"
+	@echo "   \033[36msetup-build-env\033[0m            Install runtimes + all cloud CLIs (Recommended)"
+	@echo "   \033[36msetup-cloud-tools\033[0m          Install cloud CLIs only (no runtimes)"
+	@echo "   \033[36mcheck-cloud-tools\033[0m          Verify installed tool versions"
+	@echo "   \033[2m(See README.md Appendix A for selective installation options)\033[0m"
+	@echo ""
+	@echo "\033[1;33m2. BUILD CONTAINER IMAGES\033[0m"
+	@echo "   \033[36mbuild\033[0m                      Build container image (CPU)"
+	@echo "   \033[36mbuild-gpu\033[0m                  Build container image (GPU/CUDA)"
+	@echo "   \033[36mcompose-build\033[0m              Build images with Docker Compose"
+	@echo ""
+	@echo "\033[1;33m3. DEPLOY TO TARGET RUNTIME\033[0m"
+	@echo "   \033[1mTerraform (cloud infrastructure):\033[0m"
+	@echo "   \033[36mtf-init-{aws,azure,gcp}\033[0m    Initialize Terraform for target cloud"
+	@echo "   \033[36mtf-plan-{aws,azure,gcp}\033[0m    Plan deployment changes"
+	@echo "   \033[36mtf-apply-{aws,azure,gcp}\033[0m   Apply deployment to cloud"
+	@echo "   \033[36mtf-destroy-{aws,azure,gcp}\033[0m Destroy cloud resources"
+	@echo ""
+	@echo "   \033[1mKubernetes:\033[0m"
+	@echo "   \033[36mk8s-build\033[0m                  Build Kubernetes manifests"
+	@echo "   \033[36mk8s-apply\033[0m                  Apply manifests to cluster"
+	@echo "   \033[36mk8s-delete\033[0m                 Delete Kubernetes resources"
+	@echo ""
+	@echo "\033[1;33m4. RUN LOCALLY\033[0m"
+	@echo "   \033[36mrun\033[0m                        Run container with JupyterLab (CPU)"
+	@echo "   \033[36mrun-gpu\033[0m                    Run container with JupyterLab (GPU)"
+	@echo "   \033[36mshell\033[0m                      Start interactive shell in container"
+	@echo "   \033[36mcompose-up\033[0m                 Start services with Docker Compose"
+	@echo "   \033[36mcompose-up-gpu\033[0m             Start services with GPU support"
+	@echo "   \033[36mcompose-down\033[0m               Stop and remove containers"
+	@echo "   \033[36mcompose-logs\033[0m               View container logs"
+	@echo "   \033[36mcompose-ps\033[0m                 Show running containers"
+	@echo ""
+	@echo "\033[1;33m5. MAINTENANCE\033[0m"
+	@echo "   \033[36mclean\033[0m                      Remove container image (CPU)"
+	@echo "   \033[36mclean-gpu\033[0m                  Remove container image (GPU)"
+	@echo "   \033[36mprune\033[0m                      Clean up dangling images"
+	@echo "   \033[36mconfig-generate\033[0m            Generate config from YAML profiles"
+	@echo ""
+	@echo "\033[1mConfiguration:\033[0m"
+	@echo "   Copy .env.example to .env and adjust settings before running."
+	@echo "   Tool binaries: \033[33m$(DEVAI_BIN_DIR)\033[0m"
+	@echo ""
 
 # =============================================================================
 # Docker Compose targets
@@ -160,47 +222,47 @@ compose-ps: ## Show running containers
 	docker compose -f $(COMPOSE_FILE) ps
 
 # =============================================================================
-# Terraform targets
+# Terraform targets (using bootstrapped venv tools)
 # =============================================================================
 
 tf-init-aws: ## Initialize Terraform for AWS
-	cd deploy/terraform/aws && terraform init
+	cd deploy/terraform/aws && $(TERRAFORM) init
 
 tf-plan-aws: ## Plan AWS deployment
-	cd deploy/terraform/aws && terraform plan
+	cd deploy/terraform/aws && $(TERRAFORM) plan
 
 tf-apply-aws: ## Apply AWS deployment
-	cd deploy/terraform/aws && terraform apply
+	cd deploy/terraform/aws && $(TERRAFORM) apply
 
 tf-destroy-aws: ## Destroy AWS resources
-	cd deploy/terraform/aws && terraform destroy
+	cd deploy/terraform/aws && $(TERRAFORM) destroy
 
 tf-init-azure: ## Initialize Terraform for Azure
-	cd deploy/terraform/azure && terraform init
+	cd deploy/terraform/azure && $(TERRAFORM) init
 
 tf-plan-azure: ## Plan Azure deployment
-	cd deploy/terraform/azure && terraform plan
+	cd deploy/terraform/azure && $(TERRAFORM) plan
 
 tf-apply-azure: ## Apply Azure deployment
-	cd deploy/terraform/azure && terraform apply
+	cd deploy/terraform/azure && $(TERRAFORM) apply
 
 tf-destroy-azure: ## Destroy Azure resources
-	cd deploy/terraform/azure && terraform destroy
+	cd deploy/terraform/azure && $(TERRAFORM) destroy
 
 tf-init-gcp: ## Initialize Terraform for GCP
-	cd deploy/terraform/gcp && terraform init
+	cd deploy/terraform/gcp && $(TERRAFORM) init
 
 tf-plan-gcp: ## Plan GCP deployment
-	cd deploy/terraform/gcp && terraform plan
+	cd deploy/terraform/gcp && $(TERRAFORM) plan
 
 tf-apply-gcp: ## Apply GCP deployment
-	cd deploy/terraform/gcp && terraform apply
+	cd deploy/terraform/gcp && $(TERRAFORM) apply
 
 tf-destroy-gcp: ## Destroy GCP resources
-	cd deploy/terraform/gcp && terraform destroy
+	cd deploy/terraform/gcp && $(TERRAFORM) destroy
 
 # =============================================================================
-# Kubernetes targets
+# Kubernetes targets (using bootstrapped venv tools)
 # =============================================================================
 
 KUSTOMIZE_OVERLAY ?= dev
@@ -208,10 +270,71 @@ CLOUD ?= aws
 
 k8s-build: ## Build Kubernetes manifests (usage: make k8s-build KUSTOMIZE_OVERLAY=prod CLOUD=aws)
 	@echo "Building manifests for overlay: $(KUSTOMIZE_OVERLAY), cloud: $(CLOUD)"
-	kustomize build deploy/kubernetes/overlays/$(KUSTOMIZE_OVERLAY)
+	$(KUSTOMIZE) build deploy/kubernetes/overlays/$(KUSTOMIZE_OVERLAY)
 
 k8s-apply: ## Apply Kubernetes manifests to current context
-	kustomize build deploy/kubernetes/overlays/$(KUSTOMIZE_OVERLAY) | kubectl apply -f -
+	$(KUSTOMIZE) build deploy/kubernetes/overlays/$(KUSTOMIZE_OVERLAY) | $(KUBECTL) apply -f -
 
 k8s-delete: ## Delete Kubernetes resources
-	kustomize build deploy/kubernetes/overlays/$(KUSTOMIZE_OVERLAY) | kubectl delete -f -
+	$(KUSTOMIZE) build deploy/kubernetes/overlays/$(KUSTOMIZE_OVERLAY) | $(KUBECTL) delete -f -
+
+# =============================================================================
+# Setup / Prerequisites targets
+# =============================================================================
+
+ANSIBLE_ARGS ?=
+
+setup-build-env: ## Install container runtimes and cloud management CLIs (recommended)
+	@echo "Installing container runtimes and cloud management tools via bootstrap..."
+	@echo "  Python version:    $(DEVAI_PYTHON_VERSION)"
+	@echo "  Venv directory:    $(DEVAI_VENV_DIR)"
+	@echo "  Bin directory:     $(DEVAI_BIN_DIR)"
+	@echo "  Install runtime:   $(INSTALL_RUNTIME)"
+	DEVAI_PYTHON_VERSION=$(DEVAI_PYTHON_VERSION) \
+	DEVAI_VENV_DIR=$(DEVAI_VENV_DIR) \
+	DEVAI_BIN_DIR=$(DEVAI_BIN_DIR) \
+	./ansible/bootstrap.sh --install-runtime $(INSTALL_RUNTIME) $(ANSIBLE_ARGS)
+
+setup-cloud-tools: ## Install cloud management CLIs only (no runtimes)
+	$(MAKE) setup-build-env INSTALL_RUNTIME=none
+
+setup-cloud-tools-aws: ## Install only AWS CLI (no runtimes)
+	$(MAKE) setup-build-env INSTALL_RUNTIME=none ANSIBLE_ARGS="-- --tags aws"
+
+setup-cloud-tools-azure: ## Install only Azure CLI (no runtimes)
+	$(MAKE) setup-build-env INSTALL_RUNTIME=none ANSIBLE_ARGS="-- --tags azure"
+
+setup-cloud-tools-gcp: ## Install only Google Cloud CLI (no runtimes)
+	$(MAKE) setup-build-env INSTALL_RUNTIME=none ANSIBLE_ARGS="-- --tags gcp"
+
+setup-cloud-tools-terraform: ## Install only Terraform (no runtimes)
+	$(MAKE) setup-build-env INSTALL_RUNTIME=none ANSIBLE_ARGS="-- --tags terraform"
+
+setup-cloud-tools-k8s: ## Install only Kubernetes tools (no runtimes)
+	$(MAKE) setup-build-env INSTALL_RUNTIME=none ANSIBLE_ARGS="-- --tags kubernetes"
+
+setup-runtime: ## Install container runtimes only (podman and docker)
+	$(MAKE) setup-build-env INSTALL_RUNTIME=both ANSIBLE_ARGS="-- --tags never"
+
+setup-runtime-podman: ## Install only Podman
+	$(MAKE) setup-build-env INSTALL_RUNTIME=podman ANSIBLE_ARGS="-- --tags never"
+
+setup-runtime-docker: ## Install only Docker
+	$(MAKE) setup-build-env INSTALL_RUNTIME=docker ANSIBLE_ARGS="-- --tags never"
+
+check-cloud-tools: ## Check installed versions of cloud tools
+	@echo "=== Cloud Tools Status ==="
+	@echo "Checking in: $(DEVAI_BIN_DIR)"
+	@echo ""
+	@echo "AWS CLI:"
+	@$(AWS) --version 2>/dev/null || echo "  Not installed"
+	@echo "Azure CLI:"
+	@$(AZ) version --output tsv 2>/dev/null | head -1 || echo "  Not installed"
+	@echo "Google Cloud CLI:"
+	@$(GCLOUD) version 2>/dev/null | head -1 || echo "  Not installed"
+	@echo "Terraform:"
+	@$(TERRAFORM) version 2>/dev/null | head -1 || echo "  Not installed"
+	@echo "kubectl:"
+	@$(KUBECTL) version --client 2>/dev/null | head -1 || echo "  Not installed"
+	@echo "kustomize:"
+	@$(KUSTOMIZE) version 2>/dev/null || echo "  Not installed"

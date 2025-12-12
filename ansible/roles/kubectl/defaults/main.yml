@@ -1,0 +1,6 @@
+---
+# kubectl role defaults
+# All variables can be overridden in group_vars/all.yml or via extra-vars
+
+kubectl_version: "latest"
+kubectl_download_dir: "{{ tmp_dir }}/kubectl"

@@ -1,0 +1,85 @@
+---
+# AWS CLI installation tasks (user-space, no root required)
+
+- name: Check if AWS CLI is installed
+  ansible.builtin.command: "{{ aws_cli_bin_dir }}/aws --version"
+  register: aws_cli_check
+  changed_when: false
+  failed_when: false
+
+- name: AWS CLI installation block
+  when: aws_cli_check.rc != 0
+  block:
+    - name: Create download directory
+      ansible.builtin.file:
+        path: "{{ aws_cli_download_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Set AWS CLI download URL for Linux x86_64
+      ansible.builtin.set_fact:
+        aws_cli_download_url: "{{ aws_cli_download_url_linux_x86_64 }}"
+      when:
+        - is_linux | bool
+        - arch_amd64 | bool
+
+    - name: Set AWS CLI download URL for Linux aarch64
+      ansible.builtin.set_fact:
+        aws_cli_download_url: "{{ aws_cli_download_url_linux_aarch64 }}"
+      when:
+        - is_linux | bool
+        - arch_arm64 | bool
+
+    - name: Download AWS CLI archive (Linux)
+      ansible.builtin.get_url:
+        url: "{{ aws_cli_download_url }}"
+        dest: "{{ aws_cli_archive_path }}"
+        mode: "0644"
+      when: is_linux | bool
+
+    - name: Extract AWS CLI archive
+      ansible.builtin.unarchive:
+        src: "{{ aws_cli_archive_path }}"
+        dest: "{{ aws_cli_download_dir }}"
+        remote_src: true
+      when: is_linux | bool
+
+    - name: Create installation directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ aws_cli_install_dir }}"
+        - "{{ aws_cli_bin_dir }}"
+
+    - name: Install AWS CLI to user directory (Linux)
+      ansible.builtin.command:
+        cmd: >
+          {{ aws_cli_download_dir }}/aws/install
+          --install-dir {{ aws_cli_install_dir }}
+          --bin-dir {{ aws_cli_bin_dir }}
+          --update
+      register: aws_install_result
+      changed_when: "'Successfully' in aws_install_result.stdout"
+      when: is_linux | bool
+
+    - name: Install AWS CLI via Homebrew (macOS)
+      community.general.homebrew:
+        name: awscli
+        state: present
+      when: is_macos | bool
+
+    - name: Clean up download directory
+      ansible.builtin.file:
+        path: "{{ aws_cli_download_dir }}"
+        state: absent
+
+- name: Verify AWS CLI installation
+  ansible.builtin.command: "{{ aws_cli_bin_dir }}/aws --version"
+  register: aws_version
+  changed_when: false
+
+- name: Display AWS CLI version
+  ansible.builtin.debug:
+    msg: "AWS CLI installed: {{ aws_version.stdout }}"

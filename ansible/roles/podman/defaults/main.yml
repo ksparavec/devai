@@ -1,0 +1,8 @@
+---
+# Podman role defaults
+
+# Package names vary by distribution
+podman_package_name: "podman"
+
+# Whether to update if already installed
+podman_state: "present"  # Use "latest" to always update

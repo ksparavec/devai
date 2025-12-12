@@ -1,0 +1,120 @@
+---
+# Main playbook for installing container runtimes and cloud management CLIs
+#
+# Usage (via bootstrap.sh - recommended):
+#   ./bootstrap.sh
+#   ./bootstrap.sh --install-runtime none -- --tags aws,terraform
+#   ./bootstrap.sh -- -e "install_gcloud=false"
+#
+# Usage (direct, if Ansible is already installed):
+#   ansible-playbook playbooks/install-cloud-tools.yml
+#   ansible-playbook playbooks/install-cloud-tools.yml --tags aws,terraform
+#   ansible-playbook playbooks/install-cloud-tools.yml -e "install_podman=false"
+
+- name: Install container runtimes and cloud management CLIs for devai build environment
+  hosts: localhost
+  connection: local
+  gather_facts: true
+
+  pre_tasks:
+    - name: Display configuration
+      ansible.builtin.debug:
+        msg: |
+          Build Environment Installation Configuration:
+            Base install dir: {{ base_install_dir }}
+            Bin directory:    {{ bin_dir }}
+            Apps directory:   {{ apps_dir }}
+            Venv directory:   {{ venv_dir }}
+            Temp directory:   {{ tmp_dir }}
+            OS:               {{ ansible_system }} ({{ ansible_os_family }})
+            Architecture:     {{ ansible_architecture }}
+
+          Container Runtimes:
+            Install Podman:   {{ install_podman }}
+            Install Docker:   {{ install_docker }}
+
+          Cloud Tools:
+            Install AWS CLI:  {{ install_aws_cli }}
+            Install Azure:    {{ install_azure_cli }}
+            Install gcloud:   {{ install_gcloud }}
+            Install Terraform: {{ install_terraform }}
+            Install kubectl:  {{ install_kubectl }}
+            Install kustomize: {{ install_kustomize }}
+
+    - name: Ensure base directories exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ base_install_dir }}"
+        - "{{ bin_dir }}"
+        - "{{ apps_dir }}"
+        - "{{ tmp_dir }}"
+
+  roles:
+    # Container runtimes (require sudo/become)
+    - role: podman
+      when: install_podman | bool
+      tags: [podman, runtime, runtimes]
+
+    - role: docker
+      when: install_docker | bool
+      tags: [docker, runtime, runtimes]
+
+    # Cloud tools (user-space, no root required)
+    - role: aws_cli
+      when: install_aws_cli | bool
+      tags: [aws, aws-cli, cloud-tools]
+
+    - role: azure_cli
+      when: install_azure_cli | bool
+      tags: [azure, azure-cli, cloud-tools]
+
+    - role: gcloud
+      when: install_gcloud | bool
+      tags: [gcp, gcloud, cloud-tools]
+
+    - role: terraform
+      when: install_terraform | bool
+      tags: [terraform, cloud-tools]
+
+    - role: kubectl
+      when: install_kubectl | bool
+      tags: [kubectl, kubernetes, cloud-tools]
+
+    - role: kustomize
+      when: install_kustomize | bool
+      tags: [kustomize, kubernetes, cloud-tools]
+
+  post_tasks:
+    - name: Clean up temporary directory
+      ansible.builtin.file:
+        path: "{{ tmp_dir }}"
+        state: absent
+
+    - name: Display installation summary
+      ansible.builtin.debug:
+        msg: |
+          Build environment installation complete!
+
+          Container Runtimes:
+          {% if install_podman %}  - Podman{% endif %}
+          {% if install_docker %}  - Docker{% endif %}
+
+          Cloud Tools (in {{ bin_dir }}):
+          {% if install_aws_cli %}  - AWS CLI{% endif %}
+          {% if install_azure_cli %}  - Azure CLI{% endif %}
+          {% if install_gcloud %}  - Google Cloud CLI{% endif %}
+          {% if install_terraform %}  - Terraform{% endif %}
+          {% if install_kubectl %}  - kubectl{% endif %}
+          {% if install_kustomize %}  - kustomize{% endif %}
+
+          Next steps:
+          1. Ensure {{ bin_dir }} is in your PATH:
+             export PATH="{{ bin_dir }}:$PATH"
+
+          2. Configure cloud providers:
+             - AWS: aws configure (or aws sso login)
+             - Azure: az login
+             - GCP: gcloud init (or gcloud auth login)

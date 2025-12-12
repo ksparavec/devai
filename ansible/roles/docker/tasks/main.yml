@@ -1,0 +1,186 @@
+---
+# Docker installation tasks (requires root/become)
+
+- name: Check if Docker is installed
+  ansible.builtin.command: docker --version
+  register: docker_check
+  changed_when: false
+  failed_when: false
+
+- name: Display current Docker version
+  ansible.builtin.debug:
+    msg: "Docker already installed: {{ docker_check.stdout }}"
+  when: docker_check.rc == 0
+
+# Debian/Ubuntu
+- name: Install Docker on Debian/Ubuntu
+  when:
+    - ansible_os_family == "Debian"
+    - docker_check.rc != 0 or docker_state == "latest"
+  block:
+    - name: Install Docker packages (Debian/Ubuntu)
+      ansible.builtin.apt:
+        name: "{{ docker_package_debian }}"
+        state: "{{ docker_state }}"
+        update_cache: true
+      become: true
+
+    - name: Add user to docker group (Debian/Ubuntu)
+      ansible.builtin.user:
+        name: "{{ ansible_user_id }}"
+        groups: docker
+        append: true
+      become: true
+      when: docker_add_user_to_group | bool
+
+# RedHat/Fedora
+- name: Install Docker on RedHat/Fedora
+  when:
+    - ansible_os_family == "RedHat"
+    - docker_check.rc != 0 or docker_state == "latest"
+  block:
+    - name: Install Docker packages (RedHat/Fedora)
+      ansible.builtin.dnf:
+        name:
+          - "{{ docker_package_redhat }}"
+          - "{{ docker_compose_package_redhat }}"
+        state: "{{ docker_state }}"
+      become: true
+
+    - name: Enable and start Docker service (RedHat/Fedora)
+      ansible.builtin.systemd:
+        name: docker
+        enabled: true
+        state: started
+      become: true
+      when: docker_enable_service | bool
+
+    - name: Add user to docker group (RedHat/Fedora)
+      ansible.builtin.user:
+        name: "{{ ansible_user_id }}"
+        groups: docker
+        append: true
+      become: true
+      when: docker_add_user_to_group | bool
+
+# Archlinux
+- name: Install Docker on Archlinux
+  when:
+    - ansible_os_family == "Archlinux"
+    - docker_check.rc != 0 or docker_state == "latest"
+  block:
+    - name: Install Docker packages (Archlinux)
+      community.general.pacman:
+        name:
+          - "{{ docker_package_arch }}"
+          - "{{ docker_compose_package_arch }}"
+        state: "{{ docker_state }}"
+        update_cache: true
+      become: true
+
+    - name: Enable and start Docker service (Archlinux)
+      ansible.builtin.systemd:
+        name: docker
+        enabled: true
+        state: started
+      become: true
+      when: docker_enable_service | bool
+
+    - name: Add user to docker group (Archlinux)
+      ansible.builtin.user:
+        name: "{{ ansible_user_id }}"
+        groups: docker
+        append: true
+      become: true
+      when: docker_add_user_to_group | bool
+
+# Suse
+- name: Install Docker on Suse
+  when:
+    - ansible_os_family == "Suse"
+    - docker_check.rc != 0 or docker_state == "latest"
+  block:
+    - name: Install Docker packages (Suse)
+      community.general.zypper:
+        name:
+          - "{{ docker_package_suse }}"
+          - "{{ docker_compose_package_suse }}"
+        state: "{{ docker_state }}"
+      become: true
+
+    - name: Enable and start Docker service (Suse)
+      ansible.builtin.systemd:
+        name: docker
+        enabled: true
+        state: started
+      become: true
+      when: docker_enable_service | bool
+
+    - name: Add user to docker group (Suse)
+      ansible.builtin.user:
+        name: "{{ ansible_user_id }}"
+        groups: docker
+        append: true
+      become: true
+      when: docker_add_user_to_group | bool
+
+# Alpine
+- name: Install Docker on Alpine
+  when:
+    - ansible_os_family == "Alpine"
+    - docker_check.rc != 0 or docker_state == "latest"
+  block:
+    - name: Install Docker packages (Alpine)
+      community.general.apk:
+        name:
+          - "{{ docker_package_alpine }}"
+          - "{{ docker_compose_package_alpine }}"
+        state: "{{ docker_state }}"
+        update_cache: true
+      become: true
+
+    - name: Enable Docker service on boot (Alpine)
+      ansible.builtin.command: rc-update add docker default
+      become: true
+      when: docker_enable_service | bool
+      changed_when: true
+
+    - name: Start Docker service (Alpine)
+      ansible.builtin.service:
+        name: docker
+        state: started
+      become: true
+      when: docker_enable_service | bool
+
+# macOS
+- name: Install Docker on macOS
+  when:
+    - ansible_os_family == "Darwin"
+    - docker_check.rc != 0 or docker_state == "latest"
+  block:
+    - name: Install Docker Desktop via Homebrew Cask (macOS)
+      community.general.homebrew_cask:
+        name: docker
+        state: "{{ docker_state }}"
+
+    - name: Notify user about Docker Desktop (macOS)
+      ansible.builtin.debug:
+        msg: "Docker Desktop installed. Please start it from Applications to complete setup."
+
+- name: Verify Docker installation
+  ansible.builtin.command: docker --version
+  register: docker_version
+  changed_when: false
+  failed_when: false
+
+- name: Display Docker version
+  ansible.builtin.debug:
+    msg: "Docker installed: {{ docker_version.stdout }}"
+  when: docker_version.rc == 0
+
+- name: Warn about docker group
+  ansible.builtin.debug:
+    msg: "You may need to log out and back in for docker group membership to take effect."
+  when:
+    - docker_add_user_to_group | bool
+    - ansible_os_family != "Darwin"

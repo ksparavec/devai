@@ -1,0 +1,92 @@
+---
+# Google Cloud CLI installation tasks (user-space, no root required)
+
+- name: Check if gcloud is installed
+  ansible.builtin.command: "{{ bin_dir }}/gcloud version"
+  register: gcloud_check
+  changed_when: false
+  failed_when: false
+
+- name: Google Cloud CLI installation block
+  when: gcloud_check.rc != 0
+  block:
+    - name: Create directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ gcloud_download_dir }}"
+        - "{{ apps_dir }}"
+        - "{{ bin_dir }}"
+
+    - name: Set gcloud archive name for Linux x86_64
+      ansible.builtin.set_fact:
+        gcloud_archive_name: "{{ gcloud_archive_name_linux_x86_64 }}"
+      when:
+        - is_linux | bool
+        - arch_amd64 | bool
+
+    - name: Set gcloud archive name for Linux aarch64
+      ansible.builtin.set_fact:
+        gcloud_archive_name: "{{ gcloud_archive_name_linux_aarch64 }}"
+      when:
+        - is_linux | bool
+        - arch_arm64 | bool
+
+    - name: Set gcloud archive name for macOS x86_64
+      ansible.builtin.set_fact:
+        gcloud_archive_name: "{{ gcloud_archive_name_macos_x86_64 }}"
+      when:
+        - is_macos | bool
+        - arch_amd64 | bool
+
+    - name: Set gcloud archive name for macOS aarch64
+      ansible.builtin.set_fact:
+        gcloud_archive_name: "{{ gcloud_archive_name_macos_aarch64 }}"
+      when:
+        - is_macos | bool
+        - arch_arm64 | bool
+
+    - name: Download Google Cloud CLI archive
+      ansible.builtin.get_url:
+        url: "{{ gcloud_download_url_base }}/{{ gcloud_archive_name }}"
+        dest: "{{ gcloud_download_dir }}/{{ gcloud_archive_name }}"
+        mode: "0644"
+
+    - name: Extract Google Cloud CLI archive
+      ansible.builtin.unarchive:
+        src: "{{ gcloud_download_dir }}/{{ gcloud_archive_name }}"
+        dest: "{{ apps_dir }}"
+        remote_src: true
+
+    - name: Run gcloud install script (non-interactive)
+      ansible.builtin.command:
+        cmd: "{{ gcloud_install_dir }}/install.sh --quiet --path-update=false --command-completion=false"
+      register: gcloud_install
+      changed_when: gcloud_install.rc == 0
+
+    - name: Create gcloud symlinks in bin_dir
+      ansible.builtin.file:
+        src: "{{ gcloud_install_dir }}/bin/{{ item }}"
+        dest: "{{ bin_dir }}/{{ item }}"
+        state: link
+        force: true
+      loop:
+        - gcloud
+        - gsutil
+        - bq
+
+    - name: Clean up download directory
+      ansible.builtin.file:
+        path: "{{ gcloud_download_dir }}"
+        state: absent
+
+- name: Verify gcloud installation
+  ansible.builtin.command: "{{ bin_dir }}/gcloud version"
+  register: gcloud_version
+  changed_when: false
+
+- name: Display gcloud version
+  ansible.builtin.debug:
+    msg: "Google Cloud CLI installed successfully"

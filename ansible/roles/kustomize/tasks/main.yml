@@ -1,0 +1,78 @@
+---
+# kustomize installation tasks (user-space, no root required)
+
+- name: Check if kustomize is installed
+  ansible.builtin.command: "{{ bin_dir }}/kustomize version"
+  register: kustomize_check
+  changed_when: false
+  failed_when: false
+
+- name: kustomize installation block
+  when: kustomize_check.rc != 0
+  block:
+    - name: Create directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ kustomize_download_dir }}"
+        - "{{ bin_dir }}"
+
+    - name: Get latest kustomize version
+      when: kustomize_version == 'latest'
+      block:
+        - name: Fetch kustomize releases from GitHub API
+          ansible.builtin.uri:
+            url: "{{ kustomize_releases_api }}"
+            return_content: true
+          register: kustomize_releases
+
+        - name: Find latest kustomize release
+          ansible.builtin.set_fact:
+            kustomize_resolved_version: "{{ kustomize_releases.json | selectattr('tag_name', 'match', '^kustomize/v') | map(attribute='tag_name') | first | regex_replace('^kustomize/', '') }}"
+
+    - name: Set explicit kustomize version
+      ansible.builtin.set_fact:
+        kustomize_resolved_version: "{{ kustomize_version }}"
+      when: kustomize_version != 'latest'
+
+    - name: Set kustomize OS name
+      ansible.builtin.set_fact:
+        kustomize_os: "{{ os_map_kustomize[ansible_system] }}"
+
+    - name: Set kustomize architecture
+      ansible.builtin.set_fact:
+        kustomize_arch: "{{ arch_map_kustomize[ansible_architecture] }}"
+
+    - name: Construct kustomize download URL
+      ansible.builtin.set_fact:
+        kustomize_download_url: "{{ kustomize_download_url_base }}/kustomize/{{ kustomize_resolved_version }}/kustomize_{{ kustomize_resolved_version }}_{{ kustomize_os }}_{{ kustomize_arch }}.tar.gz"
+        kustomize_archive_path: "{{ kustomize_download_dir }}/kustomize.tar.gz"
+
+    - name: Download kustomize archive
+      ansible.builtin.get_url:
+        url: "{{ kustomize_download_url }}"
+        dest: "{{ kustomize_archive_path }}"
+        mode: "0644"
+
+    - name: Extract kustomize binary
+      ansible.builtin.unarchive:
+        src: "{{ kustomize_archive_path }}"
+        dest: "{{ bin_dir }}"
+        remote_src: true
+        mode: "0755"
+
+    - name: Clean up download directory
+      ansible.builtin.file:
+        path: "{{ kustomize_download_dir }}"
+        state: absent
+
+- name: Verify kustomize installation
+  ansible.builtin.command: "{{ bin_dir }}/kustomize version"
+  register: kustomize_version_output
+  changed_when: false
+
+- name: Display kustomize version
+  ansible.builtin.debug:
+    msg: "kustomize installed: {{ kustomize_version_output.stdout }}"

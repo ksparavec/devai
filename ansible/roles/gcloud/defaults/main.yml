@@ -1,0 +1,7 @@
+---
+# Google Cloud CLI role defaults
+# All variables can be overridden in group_vars/all.yml or via extra-vars
+
+gcloud_version: "latest"
+gcloud_install_dir: "{{ apps_dir }}/{{ gcloud_install_subdir }}"
+gcloud_download_dir: "{{ tmp_dir }}/gcloud"

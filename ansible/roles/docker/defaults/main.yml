@@ -1,0 +1,27 @@
+---
+# Docker role defaults
+
+# Package names vary by distribution and available repos
+# Debian/Ubuntu: docker.io (distro) or docker-ce (official repo)
+# Fedora/RHEL: moby-engine (distro) or docker-ce (official repo)
+docker_package_debian: "docker.io"
+docker_package_redhat: "moby-engine"
+docker_package_arch: "docker"
+docker_package_suse: "docker"
+docker_package_alpine: "docker"
+
+# Compose package
+docker_compose_package_debian: ""  # Included in docker.io
+docker_compose_package_redhat: "docker-compose"
+docker_compose_package_arch: "docker-compose"
+docker_compose_package_suse: "docker-compose"
+docker_compose_package_alpine: "docker-cli-compose"
+
+# Whether to update if already installed
+docker_state: "present"  # Use "latest" to always update
+
+# Whether to add current user to docker group
+docker_add_user_to_group: true
+
+# Whether to enable and start docker service
+docker_enable_service: true

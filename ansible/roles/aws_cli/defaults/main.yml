@@ -1,0 +1,9 @@
+---
+# AWS CLI role defaults
+# All variables can be overridden in group_vars/all.yml or via extra-vars
+
+aws_cli_version: "latest"
+aws_cli_install_dir: "{{ apps_dir }}/{{ aws_cli_install_subdir }}"
+aws_cli_bin_dir: "{{ bin_dir }}"
+aws_cli_download_dir: "{{ tmp_dir }}/aws"
+aws_cli_archive_path: "{{ aws_cli_download_dir }}/{{ aws_cli_archive_name }}"

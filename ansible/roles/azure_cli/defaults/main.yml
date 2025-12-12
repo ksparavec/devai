@@ -1,0 +1,6 @@
+---
+# Azure CLI role defaults
+# All variables can be overridden in group_vars/all.yml or via extra-vars
+
+azure_cli_version: "latest"
+azure_cli_pip_package: "azure-cli"

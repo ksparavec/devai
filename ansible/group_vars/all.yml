@@ -1,0 +1,128 @@
+---
+# Global configuration for devai cloud tools installation
+# All paths and versions are configurable - no hardcoded values
+
+# =============================================================================
+# Directory Configuration
+# =============================================================================
+
+# Base directory for all installations (user-space, no root required)
+base_install_dir: "{{ ansible_env.HOME }}/.local"
+
+# Directory for executable binaries
+bin_dir: "{{ base_install_dir }}/bin"
+
+# Directory for application installations
+apps_dir: "{{ base_install_dir }}/share"
+
+# Temporary directory for downloads and extraction
+tmp_dir: "/tmp/devai-cloud-tools"
+
+# Virtual environment directory (passed from bootstrap.sh)
+venv_dir: "{{ ansible_env.HOME }}/.local/devai-venv"
+
+# =============================================================================
+# Container Runtime Installation Toggles
+# =============================================================================
+
+install_podman: true
+install_docker: true
+
+# =============================================================================
+# Cloud Tool Installation Toggles
+# =============================================================================
+
+install_aws_cli: true
+install_azure_cli: true
+install_gcloud: true
+install_terraform: true
+install_kubectl: true
+install_kustomize: true
+
+# =============================================================================
+# Tool Versions
+# Set to 'latest' for latest stable version, or specify exact version
+# =============================================================================
+
+aws_cli_version: "latest"
+azure_cli_version: "latest"
+gcloud_version: "latest"
+terraform_version: "latest"
+kubectl_version: "latest"
+kustomize_version: "latest"
+
+# =============================================================================
+# Download URLs (templates with version/arch placeholders)
+# =============================================================================
+
+# AWS CLI
+aws_cli_download_url_linux_x86_64: "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip"
+aws_cli_download_url_linux_aarch64: "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip"
+aws_cli_download_url_macos: "https://awscli.amazonaws.com/AWSCLIV2.pkg"
+aws_cli_install_subdir: "aws-cli"
+aws_cli_archive_name: "awscliv2.zip"
+
+# Google Cloud CLI
+gcloud_download_url_base: "https://dl.google.com/dl/cloudsdk/channels/rapid/downloads"
+gcloud_archive_name_linux_x86_64: "google-cloud-cli-linux-x86_64.tar.gz"
+gcloud_archive_name_linux_aarch64: "google-cloud-cli-linux-arm.tar.gz"
+gcloud_archive_name_macos_x86_64: "google-cloud-cli-darwin-x86_64.tar.gz"
+gcloud_archive_name_macos_aarch64: "google-cloud-cli-darwin-arm.tar.gz"
+gcloud_install_subdir: "google-cloud-sdk"
+
+# Terraform
+terraform_download_url_base: "https://releases.hashicorp.com/terraform"
+terraform_archive_name_template: "terraform_{{ terraform_resolved_version }}_{{ terraform_os }}_{{ terraform_arch }}.zip"
+
+# kubectl
+kubectl_download_url_base: "https://dl.k8s.io/release"
+kubectl_stable_url: "https://dl.k8s.io/release/stable.txt"
+kubectl_binary_name: "kubectl"
+
+# kustomize
+kustomize_download_url_base: "https://github.com/kubernetes-sigs/kustomize/releases/download"
+kustomize_releases_api: "https://api.github.com/repos/kubernetes-sigs/kustomize/releases"
+kustomize_binary_name: "kustomize"
+
+# =============================================================================
+# Architecture Mappings
+# =============================================================================
+
+# Map ansible_architecture to tool-specific architecture names
+arch_map_terraform:
+  x86_64: "amd64"
+  aarch64: "arm64"
+
+arch_map_kubectl:
+  x86_64: "amd64"
+  aarch64: "arm64"
+
+arch_map_kustomize:
+  x86_64: "amd64"
+  aarch64: "arm64"
+
+# =============================================================================
+# OS Mappings
+# =============================================================================
+
+os_map_terraform:
+  Linux: "linux"
+  Darwin: "darwin"
+
+os_map_kubectl:
+  Linux: "linux"
+  Darwin: "darwin"
+
+os_map_kustomize:
+  Linux: "linux"
+  Darwin: "darwin"
+
+# =============================================================================
+# Computed Variables (set at runtime)
+# =============================================================================
+
+# These are computed based on the host system
+is_linux: "{{ ansible_system == 'Linux' }}"
+is_macos: "{{ ansible_system == 'Darwin' }}"
+arch_amd64: "{{ ansible_architecture in ['x86_64', 'amd64'] }}"
+arch_arm64: "{{ ansible_architecture in ['aarch64', 'arm64'] }}"

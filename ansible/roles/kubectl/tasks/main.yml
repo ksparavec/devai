@@ -1,0 +1,65 @@
+---
+# kubectl installation tasks (user-space, no root required)
+
+- name: Check if kubectl is installed
+  ansible.builtin.command: "{{ bin_dir }}/kubectl version --client"
+  register: kubectl_check
+  changed_when: false
+  failed_when: false
+
+- name: kubectl installation block
+  when: kubectl_check.rc != 0
+  block:
+    - name: Create directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ kubectl_download_dir }}"
+        - "{{ bin_dir }}"
+
+    - name: Get latest kubectl version
+      when: kubectl_version == 'latest'
+      block:
+        - name: Fetch latest kubectl version
+          ansible.builtin.uri:
+            url: "{{ kubectl_stable_url }}"
+            return_content: true
+          register: kubectl_stable
+
+        - name: Set kubectl version from stable endpoint
+          ansible.builtin.set_fact:
+            kubectl_resolved_version: "{{ kubectl_stable.content | trim }}"
+
+    - name: Set explicit kubectl version
+      ansible.builtin.set_fact:
+        kubectl_resolved_version: "{{ kubectl_version }}"
+      when: kubectl_version != 'latest'
+
+    - name: Set kubectl OS name
+      ansible.builtin.set_fact:
+        kubectl_os: "{{ os_map_kubectl[ansible_system] }}"
+
+    - name: Set kubectl architecture
+      ansible.builtin.set_fact:
+        kubectl_arch: "{{ arch_map_kubectl[ansible_architecture] }}"
+
+    - name: Construct kubectl download URL
+      ansible.builtin.set_fact:
+        kubectl_download_url: "{{ kubectl_download_url_base }}/{{ kubectl_resolved_version }}/bin/{{ kubectl_os }}/{{ kubectl_arch }}/{{ kubectl_binary_name }}"
+
+    - name: Download kubectl binary
+      ansible.builtin.get_url:
+        url: "{{ kubectl_download_url }}"
+        dest: "{{ bin_dir }}/{{ kubectl_binary_name }}"
+        mode: "0755"
+
+- name: Verify kubectl installation
+  ansible.builtin.command: "{{ bin_dir }}/kubectl version --client"
+  register: kubectl_version_output
+  changed_when: false
+
+- name: Display kubectl version
+  ansible.builtin.debug:
+    msg: "kubectl installed: {{ kubectl_version_output.stdout_lines[0] }}"

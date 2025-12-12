@@ -1,0 +1,78 @@
+---
+# Podman installation tasks (requires root/become)
+
+- name: Check if Podman is installed
+  ansible.builtin.command: podman --version
+  register: podman_check
+  changed_when: false
+  failed_when: false
+
+- name: Display current Podman version
+  ansible.builtin.debug:
+    msg: "Podman already installed: {{ podman_check.stdout }}"
+  when: podman_check.rc == 0
+
+- name: Install Podman on Debian/Ubuntu
+  ansible.builtin.apt:
+    name: "{{ podman_package_name }}"
+    state: "{{ podman_state }}"
+    update_cache: true
+  become: true
+  when:
+    - ansible_os_family == "Debian"
+    - podman_check.rc != 0 or podman_state == "latest"
+
+- name: Install Podman on RedHat/Fedora
+  ansible.builtin.dnf:
+    name: "{{ podman_package_name }}"
+    state: "{{ podman_state }}"
+  become: true
+  when:
+    - ansible_os_family == "RedHat"
+    - podman_check.rc != 0 or podman_state == "latest"
+
+- name: Install Podman on Archlinux
+  community.general.pacman:
+    name: "{{ podman_package_name }}"
+    state: "{{ podman_state }}"
+    update_cache: true
+  become: true
+  when:
+    - ansible_os_family == "Archlinux"
+    - podman_check.rc != 0 or podman_state == "latest"
+
+- name: Install Podman on Suse
+  community.general.zypper:
+    name: "{{ podman_package_name }}"
+    state: "{{ podman_state }}"
+  become: true
+  when:
+    - ansible_os_family == "Suse"
+    - podman_check.rc != 0 or podman_state == "latest"
+
+- name: Install Podman on Alpine
+  community.general.apk:
+    name: "{{ podman_package_name }}"
+    state: "{{ podman_state }}"
+    update_cache: true
+  become: true
+  when:
+    - ansible_os_family == "Alpine"
+    - podman_check.rc != 0 or podman_state == "latest"
+
+- name: Install Podman on macOS
+  community.general.homebrew:
+    name: podman
+    state: "{{ podman_state }}"
+  when:
+    - ansible_os_family == "Darwin"
+    - podman_check.rc != 0 or podman_state == "latest"
+
+- name: Verify Podman installation
+  ansible.builtin.command: podman --version
+  register: podman_version
+  changed_when: false
+
+- name: Display Podman version
+  ansible.builtin.debug:
+    msg: "Podman installed: {{ podman_version.stdout }}"

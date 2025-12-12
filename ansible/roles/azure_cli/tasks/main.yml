@@ -1,0 +1,43 @@
+---
+# Azure CLI installation tasks (user-space via pip, no root required)
+
+- name: Check if Azure CLI is installed
+  ansible.builtin.command: "{{ venv_dir }}/bin/az version"
+  register: azure_cli_check
+  changed_when: false
+  failed_when: false
+
+- name: Azure CLI installation block
+  when: azure_cli_check.rc != 0
+  block:
+    - name: Install Azure CLI via pip into venv (Linux)
+      ansible.builtin.pip:
+        name: "{{ azure_cli_pip_package }}"
+        virtualenv: "{{ venv_dir }}"
+        state: present
+      when: is_linux | bool
+
+    - name: Install Azure CLI via Homebrew (macOS)
+      community.general.homebrew:
+        name: azure-cli
+        state: present
+      when: is_macos | bool
+
+- name: Create az symlink in bin_dir (Linux)
+  ansible.builtin.file:
+    src: "{{ venv_dir }}/bin/az"
+    dest: "{{ bin_dir }}/az"
+    state: link
+    force: true
+  when: is_linux | bool
+
+- name: Verify Azure CLI installation
+  ansible.builtin.command: "{{ bin_dir }}/az version --output tsv"
+  register: azure_version
+  changed_when: false
+  failed_when: false
+
+- name: Display Azure CLI status
+  ansible.builtin.debug:
+    msg: "Azure CLI installed successfully"
+  when: azure_version.rc == 0

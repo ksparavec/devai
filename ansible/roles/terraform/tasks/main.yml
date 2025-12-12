@@ -1,0 +1,78 @@
+---
+# Terraform installation tasks (user-space, no root required)
+
+- name: Check if Terraform is installed
+  ansible.builtin.command: "{{ bin_dir }}/terraform version"
+  register: terraform_check
+  changed_when: false
+  failed_when: false
+
+- name: Terraform installation block
+  when: terraform_check.rc != 0
+  block:
+    - name: Create directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ terraform_download_dir }}"
+        - "{{ bin_dir }}"
+
+    - name: Get latest Terraform version
+      when: terraform_version == 'latest'
+      block:
+        - name: Fetch latest Terraform version from checkpoint API
+          ansible.builtin.uri:
+            url: "{{ terraform_checkpoint_url }}"
+            return_content: true
+          register: terraform_checkpoint
+
+        - name: Set Terraform version from checkpoint
+          ansible.builtin.set_fact:
+            terraform_resolved_version: "{{ terraform_checkpoint.json.current_version }}"
+
+    - name: Set explicit Terraform version
+      ansible.builtin.set_fact:
+        terraform_resolved_version: "{{ terraform_version }}"
+      when: terraform_version != 'latest'
+
+    - name: Set Terraform OS name
+      ansible.builtin.set_fact:
+        terraform_os: "{{ os_map_terraform[ansible_system] }}"
+
+    - name: Set Terraform architecture
+      ansible.builtin.set_fact:
+        terraform_arch: "{{ arch_map_terraform[ansible_architecture] }}"
+
+    - name: Construct Terraform download URL
+      ansible.builtin.set_fact:
+        terraform_download_url: "{{ terraform_download_url_base }}/{{ terraform_resolved_version }}/terraform_{{ terraform_resolved_version }}_{{ terraform_os }}_{{ terraform_arch }}.zip"
+        terraform_archive_path: "{{ terraform_download_dir }}/terraform.zip"
+
+    - name: Download Terraform archive
+      ansible.builtin.get_url:
+        url: "{{ terraform_download_url }}"
+        dest: "{{ terraform_archive_path }}"
+        mode: "0644"
+
+    - name: Extract Terraform binary
+      ansible.builtin.unarchive:
+        src: "{{ terraform_archive_path }}"
+        dest: "{{ bin_dir }}"
+        remote_src: true
+        mode: "0755"
+
+    - name: Clean up download directory
+      ansible.builtin.file:
+        path: "{{ terraform_download_dir }}"
+        state: absent
+
+- name: Verify Terraform installation
+  ansible.builtin.command: "{{ bin_dir }}/terraform version"
+  register: terraform_version_output
+  changed_when: false
+
+- name: Display Terraform version
+  ansible.builtin.debug:
+    msg: "Terraform installed: {{ terraform_version_output.stdout_lines[0] }}"

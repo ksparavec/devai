@@ -1,0 +1,8 @@
+---
+# Terraform role defaults
+# All variables can be overridden in group_vars/all.yml or via extra-vars
+
+terraform_version: "latest"
+terraform_download_dir: "{{ tmp_dir }}/terraform"
+terraform_releases_url: "https://releases.hashicorp.com/terraform"
+terraform_checkpoint_url: "https://checkpoint-api.hashicorp.com/v1/check/terraform"
