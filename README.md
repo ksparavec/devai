@@ -252,6 +252,7 @@ make compose-down    # Stop services
 
 | Document | Description |
 |----------|-------------|
+| [docs/architecture.md](docs/architecture.md) | Architecture overview, design patterns, technology stack |
 | [ansible/README.md](ansible/README.md) | Cloud tools setup details |
 | [docs/local-container.md](docs/local-container.md) | Local build/run details |
 | [docs/docker-compose.md](docs/docker-compose.md) | Docker Compose setup |
