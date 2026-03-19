@@ -4,23 +4,28 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is **Dev AI Lab** - a containerized development environment for AI experimentation featuring JupyterLab and multiple AI CLIs (Gemini, Claude, OpenAI, Ollama). The container is built on Debian Trixie (slim) with tools managed by **mise** (uv, node). Python 3.13 is installed via uv. Optimized for Podman (rootless mode) but compatible with Docker. GPU/CUDA support is available for local model inference.
+This is **Dev AI Lab** - a containerized development environment for AI experimentation featuring JupyterLab and multiple AI CLIs (Gemini, Claude, OpenAI, Ollama). Built on Debian Trixie with Python 3.13 (apt), Node.js 22 LTS, and uv. Two-layer image build for fast iteration. Compatible with Podman and Docker. GPU/CUDA support available for local model inference.
 
 ## Build and Run Commands
 
 ```bash
-# CPU version
-make build          # Build the container image
+# First time: build both layers
+make build          # Build base + lab image (CPU)
+make build-gpu      # Build base + lab image (GPU/CUDA)
+
+# Fast iteration: rebuild lab layer only (skips base)
+make rebuild        # Rebuild lab image (CPU)
+make rebuild-gpu    # Rebuild lab image (GPU)
+
+# Run
 make run            # Run JupyterLab
+make run-gpu        # Run with GPU acceleration
 make shell          # Interactive shell without JupyterLab
 
-# GPU version (requires NVIDIA Container Toolkit)
-make build-gpu      # Build GPU image with CUDA support
-make run-gpu        # Run with GPU acceleration
-
 # Cleanup
-make clean          # Remove CPU image
-make clean-gpu      # Remove GPU image
+make clean          # Remove lab image
+make clean-base     # Remove base image
+make clean-all      # Remove both
 make help           # Show all targets
 ```
 
@@ -39,19 +44,18 @@ To add Python packages, create `requirements.txt` from `requirements.txt.example
 
 ## Architecture
 
-- **Dockerfile** - Unified image with build args for CPU/GPU (BASE_IMAGE, GPU_BUILD)
-- **mise.toml** - Tool version configuration (uv, node, python)
-- **.default-npm-packages** - AI CLIs auto-installed with Node
-- **.default-python-packages** - Python packages auto-installed with Python
-- **.default-python-packages.gpu-extra** - GPU-specific packages (torch, torchvision, torchaudio)
-- **entrypoint.sh** - Handles UID/GID mapping for rootless container operation using `gosu`
-- **Makefile** - Build orchestration with Podman/Docker-specific flags and host connectivity for Ollama
+Two-layer image build (base rarely changes, lab layer for fast iteration):
 
-Tool installation hierarchy:
-- **apt-get**: Only compilers (build-essential, rustc, cargo) and system utilities (curl, git, gosu)
-- **mise**: All runtime tools and packages
-  - uv, node, python (via uv backend)
-  - .default-npm-packages: @google/gemini-cli, @anthropic-ai/claude-code, @openai/codex
-  - .default-python-packages: jupyterlab, openai, ollama, chromadb (+ torch for GPU)
+### Layer 1: Dockerfile.base (devai-base)
+- **apt-get**: Debian Trixie full, Python 3.13, compilers (build-essential, rustc, cargo), system utilities (curl, git, gosu)
+- **uv**: Python package manager (installed via astral.sh)
+- **Node.js 22 LTS**: Installed from official binary tarball
+
+### Layer 2: Dockerfile (devai-lab)
+- **PyTorch**: CPU-only or CUDA (controlled by GPU_BUILD arg)
+- **.default-python-packages**: jupyterlab, openai, ollama, chromadb, ML/data science stack
+- **.default-npm-packages**: @google/gemini-cli, @anthropic-ai/claude-code, @openai/codex
+- **requirements.txt**: Optional project-specific Python packages
+- **entrypoint.sh**: Handles UID/GID mapping using `gosu`
 
 The container connects to host services via `host.containers.internal` for Ollama integration.

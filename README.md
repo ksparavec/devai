@@ -4,8 +4,7 @@ A containerized environment designed for AI experimentation and development, fea
 
 ## Features
 
-*   **Base Environment**: Debian Trixie (slim) with Python 3.13 via uv.
-*   **Tool Management**: **mise** for version-controlled tool installation.
+*   **Base Environment**: Debian Trixie with Python 3.13, Node.js 22 LTS, uv.
 *   **Interactive Computing**: **JupyterLab** pre-installed and configured.
 *   **AI Tools**:
     *   **Google Gemini CLI** (`@google/gemini-cli`)
@@ -15,7 +14,7 @@ A containerized environment designed for AI experimentation and development, fea
     *   **Ollama** for local model inference
 *   **Vector Database**: **ChromaDB** for embeddings and RAG experiments.
 *   **GPU Support**: NVIDIA CUDA support for accelerated inference (optional).
-*   **Package Management**: **mise** manages `uv` and `node`; Python packages via `uv pip`.
+*   **Package Management**: **uv** for Python packages, **npm** for AI CLIs.
 *   **Development Tools**: `git`, `build-essential`, `rustc`, `cargo` (via apt).
 *   **Runtime**: Optimized for **Podman** (supports rootless mode) but fully compatible with Docker. Both can be auto-installed via bootstrap.
 *   **Multi-Cloud Deployment**: AWS, Azure, and GCP via Terraform and Kubernetes.
@@ -278,8 +277,11 @@ See [Selective Installation Options](#selective-installation-options) in Appendi
 
 | Target | Description |
 |--------|-------------|
-| `make build` | Build CPU container image |
-| `make build-gpu` | Build GPU/CUDA container image |
+| `make build` | Build base + lab image (CPU) |
+| `make build-gpu` | Build base + lab image (GPU/CUDA) |
+| `make rebuild` | Rebuild lab layer only (fast, skips base) |
+| `make rebuild-gpu` | Rebuild lab layer only (GPU) |
+| `make build-base` | Build base image only |
 | `make compose-build` | Build images with Docker Compose |
 
 ### Deploy to Cloud (Terraform)
@@ -324,8 +326,10 @@ See [Selective Installation Options](#selective-installation-options) in Appendi
 
 | Target | Description |
 |--------|-------------|
-| `make clean` | Remove CPU container image |
-| `make clean-gpu` | Remove GPU container image |
+| `make clean` | Remove lab image (CPU) |
+| `make clean-gpu` | Remove lab image (GPU) |
+| `make clean-base` | Remove base image (CPU) |
+| `make clean-all` | Remove all CPU images |
 | `make prune` | Clean up dangling images |
 | `make config-generate` | Generate configs from YAML profiles |
 | `make help` | Show workflow and all targets |

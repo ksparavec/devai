@@ -4,6 +4,7 @@
 # Defaults
 CONTAINER_RUNTIME ?= podman
 IMAGE_NAME ?= devai-lab
+BASE_IMAGE_NAME ?= devai-base
 CONTAINER_USER ?= devai
 PORT ?= 8888
 HOST_IP ?= $(shell hostname -I | awk '{print $$1}')
@@ -27,15 +28,14 @@ AZ ?= $(DEVAI_BIN_DIR)/az
 # GPU build settings
 GPU_BASE_IMAGE ?= docker.io/nvidia/cuda:12.9.1-cudnn-runtime-ubuntu24.04
 
+# Mount host config files (gitconfig, ssh) into container if they exist
 HOME_MOUNT_ARG =
 ifneq ($(HOST_HOME_DIR),)
-	HOME_MOUNT_ARG = -v "$$(readlink -f $(HOST_HOME_DIR))":/home/$(CONTAINER_USER)
+	HOME_MOUNT_ARG += $(if $(wildcard $(HOME)/.gitconfig),-v "$(HOME)/.gitconfig":/home/$(CONTAINER_USER)/.gitconfig:ro)
+	HOME_MOUNT_ARG += $(if $(wildcard $(HOME)/.ssh),-v "$(HOME)/.ssh":/home/$(CONTAINER_USER)/.ssh:ro)
 endif
 
 RUN_FLAGS =
-ifeq ($(findstring podman,$(CONTAINER_RUNTIME)),podman)
-	RUN_FLAGS += --userns=keep-id:uid=1000,gid=1000
-endif
 
 # GPU runtime flags
 GPU_FLAGS =
@@ -51,7 +51,7 @@ COMPOSE_FILE = $(COMPOSE_DIR)/docker-compose.yml
 COMPOSE_GPU_FILE = $(COMPOSE_DIR)/docker-compose.gpu.yml
 PROFILE ?= dev
 
-.PHONY: all build build-gpu run run-gpu clean clean-gpu prune shell help
+.PHONY: all build build-gpu build-base build-base-gpu rebuild rebuild-gpu run run-gpu clean clean-gpu clean-base clean-base-gpu clean-all prune shell help
 .PHONY: compose-up compose-up-gpu compose-down compose-logs compose-build compose-ps
 .PHONY: config-generate
 .PHONY: tf-init-aws tf-plan-aws tf-apply-aws tf-destroy-aws
@@ -64,17 +64,48 @@ PROFILE ?= dev
 
 all: help
 
-build: ## Build the container image (CPU)
+build-base: ## Build base image with system packages and runtimes (CPU)
 	$(CONTAINER_RUNTIME) build \
 		--build-arg HTTP_PROXY=$(HTTP_PROXY) \
 		--build-arg HTTPS_PROXY=$(HTTPS_PROXY) \
-		-t $(IMAGE_NAME) .
+		-f Dockerfile.base \
+		-t $(BASE_IMAGE_NAME) .
 
-build-gpu: ## Build the container image (GPU/CUDA)
+build-base-gpu: ## Build base image with system packages and runtimes (GPU)
 	$(CONTAINER_RUNTIME) build \
 		--build-arg HTTP_PROXY=$(HTTP_PROXY) \
 		--build-arg HTTPS_PROXY=$(HTTPS_PROXY) \
 		--build-arg BASE_IMAGE=$(GPU_BASE_IMAGE) \
+		-f Dockerfile.base \
+		-t $(BASE_IMAGE_NAME)-gpu .
+
+build: build-base ## Build the container image (CPU)
+	$(CONTAINER_RUNTIME) build \
+		--build-arg HTTP_PROXY=$(HTTP_PROXY) \
+		--build-arg HTTPS_PROXY=$(HTTPS_PROXY) \
+		--build-arg BASE_IMAGE=$(BASE_IMAGE_NAME) \
+		-t $(IMAGE_NAME) .
+
+build-gpu: build-base-gpu ## Build the container image (GPU/CUDA)
+	$(CONTAINER_RUNTIME) build \
+		--build-arg HTTP_PROXY=$(HTTP_PROXY) \
+		--build-arg HTTPS_PROXY=$(HTTPS_PROXY) \
+		--build-arg BASE_IMAGE=$(BASE_IMAGE_NAME)-gpu \
+		--build-arg GPU_BUILD=true \
+		-t $(IMAGE_NAME)-gpu .
+
+rebuild: ## Rebuild lab layer only (skip base, faster iteration)
+	$(CONTAINER_RUNTIME) build \
+		--build-arg HTTP_PROXY=$(HTTP_PROXY) \
+		--build-arg HTTPS_PROXY=$(HTTPS_PROXY) \
+		--build-arg BASE_IMAGE=$(BASE_IMAGE_NAME) \
+		-t $(IMAGE_NAME) .
+
+rebuild-gpu: ## Rebuild lab layer only for GPU (skip base)
+	$(CONTAINER_RUNTIME) build \
+		--build-arg HTTP_PROXY=$(HTTP_PROXY) \
+		--build-arg HTTPS_PROXY=$(HTTPS_PROXY) \
+		--build-arg BASE_IMAGE=$(BASE_IMAGE_NAME)-gpu \
 		--build-arg GPU_BUILD=true \
 		-t $(IMAGE_NAME)-gpu .
 
@@ -139,6 +170,14 @@ clean: ## Remove the container image (CPU)
 
 clean-gpu: ## Remove the container image (GPU)
 	$(CONTAINER_RUNTIME) rmi $(IMAGE_NAME)-gpu
+
+clean-base: ## Remove the base image (CPU)
+	$(CONTAINER_RUNTIME) rmi $(BASE_IMAGE_NAME)
+
+clean-base-gpu: ## Remove the base image (GPU)
+	$(CONTAINER_RUNTIME) rmi $(BASE_IMAGE_NAME)-gpu
+
+clean-all: clean clean-base ## Remove all CPU images (lab + base)
 
 prune: ## Clean up dangling images only (keeps tagged images and volumes)
 	$(CONTAINER_RUNTIME) image prune -f

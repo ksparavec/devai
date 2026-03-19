@@ -29,9 +29,9 @@ devai/
 │   ├── generate-config.sh     # Config generation from YAML
 │   ├── push-image.sh          # Push image to cloud registries
 │   └── select-cuda-image.sh   # CUDA image selection utility
-├── Dockerfile                  # Unified CPU/GPU container image
+├── Dockerfile.base             # Layer 1: System packages + runtimes
+├── Dockerfile                  # Layer 2: Packages + configuration
 ├── Makefile                    # Build orchestration (67+ targets)
-├── mise.toml                   # Tool version management
 └── entrypoint.sh              # Container initialization script
 ```
 
@@ -41,21 +41,20 @@ devai/
 
 | Component | Technology | Purpose |
 |-----------|------------|---------|
-| OS | Debian Trixie (slim) | Minimal container base |
-| Python | 3.13 via uv | Primary runtime |
-| Node.js | v25 | npm-based AI CLIs |
-| System Tools | apt (git, build-essential, rustc, cargo, curl, gnupg, gosu) | Build dependencies |
+| OS | Debian Trixie | Container base |
+| Python | 3.13 (apt) | Primary runtime |
+| Node.js | 22 LTS (binary tarball) | npm-based AI CLIs |
+| uv | astral.sh installer | Python package manager |
+| System Tools | apt (git, build-essential, rustc, cargo, curl, gosu) | Build dependencies |
 
-### Tool Management
+### Tool Installation
 
-**mise** serves as the version-controlled tool installer, replacing traditional tools like asdf/nvm/pyenv:
+All tools are installed directly — no version manager needed in a container:
 
-```toml
-[tools]
-uv = "latest"           # Python package manager
-node = "25"             # Node.js runtime
-"python:uv" = "3.13"   # Python via uv backend
-```
+- **apt-get**: Python 3.13, compilers, system utilities
+- **uv**: Installed to `/usr/local/bin` via astral.sh
+- **Node.js**: Binary tarball extracted to `/usr/local`
+- **pip/python**: Symlinked from `python3`/`pip3` to `/usr/local/bin`
 
 ### AI and Compute Tools
 
@@ -76,7 +75,8 @@ node = "25"             # Node.js runtime
 | Utilities | tqdm, requests, python-dotenv, pyyaml, jsonlines, pydantic |
 
 **GPU extras** (installed conditionally with NVIDIA CUDA):
-- torch, torchvision, torchaudio
+- torch, torchvision, torchaudio (full CUDA build)
+- CPU builds get CPU-only torch from `download.pytorch.org/whl/cpu`
 
 ### Container Runtimes
 
@@ -98,6 +98,22 @@ Both can be installed via the Ansible bootstrap system.
 
 ## Build System
 
+### Two-Layer Image Build
+
+The image is split into two layers for fast iteration:
+
+**Layer 1: Dockerfile.base (devai-base)** — build once:
+- Debian Trixie full + apt packages
+- Python 3.13, Node.js 22 LTS, uv
+- Rarely changes (~1.3 GB)
+
+**Layer 2: Dockerfile (devai-lab)** — rebuild on package changes:
+- PyTorch (CPU-only or CUDA)
+- All Python ML/data science packages
+- npm AI CLIs
+- Optional requirements.txt
+- User creation, entrypoint
+
 ### Makefile Organization
 
 The Makefile provides 67+ targets organized into 5 workflows:
@@ -108,8 +124,9 @@ The Makefile provides 67+ targets organized into 5 workflows:
 - `check-cloud-tools` - Verify installations
 
 **2. Build Container Images**
-- `build` - CPU image from Dockerfile
-- `build-gpu` - GPU/CUDA image with nvidia/cuda base
+- `build-base` / `build-base-gpu` - Base image (runtimes only)
+- `build` / `build-gpu` - Full image (base + packages)
+- `rebuild` / `rebuild-gpu` - Lab layer only (fast, skips base)
 - `compose-build` - Build via Docker Compose
 
 **3. Deploy to Cloud**
@@ -122,23 +139,23 @@ The Makefile provides 67+ targets organized into 5 workflows:
 - `compose-up` / `compose-down` - Docker Compose orchestration
 
 **5. Maintenance**
-- `clean` / `clean-gpu` - Remove images
+- `clean` / `clean-base` / `clean-all` - Remove images
 - `prune` - Clean dangling images
 - `config-generate` - Generate deployment configs
 
 ### Dockerfile Design
 
-A single unified Dockerfile supports both CPU and GPU builds via build arguments:
-
 | Argument | Purpose |
 |----------|---------|
-| `BASE_IMAGE` | Container base (Debian or NVIDIA CUDA) |
+| `BASE_IMAGE` | Container base (Debian, NVIDIA CUDA, or devai-base) |
 | `GPU_BUILD` | Boolean flag to include GPU packages |
 | `HTTP_PROXY` / `HTTPS_PROXY` | Proxy support for corporate environments |
 
 Key design decisions:
-- mise installs tools system-wide in `/opt/mise`
-- Python packages installed globally with `uv pip`
+- All tools installed to standard locations (`/usr/local/bin`, `/usr/bin`)
+- No version manager overhead — direct installs for container use
+- `UV_BREAK_SYSTEM_PACKAGES=1` for Debian's externally-managed Python
+- PyTorch CPU/GPU split prevents NVIDIA deps in CPU image
 - User `devai` created with UID 1000 for rootless operation
 - Cache cleanup to minimize image size
 
@@ -265,8 +282,9 @@ The `entrypoint.sh` script handles:
 
 | Decision | Rationale |
 |----------|-----------|
-| Unified Dockerfile | Single image for CPU/GPU via build arguments reduces maintenance |
-| mise over traditional tools | Consistent version management across distros |
+| Two-layer image build | Base (runtimes) rarely changes; lab layer (packages) rebuilds fast |
+| Direct tool installs over version managers | No runtime overhead in containers where versions are fixed |
+| CPU-only torch by default | Prevents ~6 GB NVIDIA deps in CPU image |
 | Rootless containers | Podman configured for security without elevated privileges |
 | Kustomize over Helm | Simpler configuration without templating complexity |
 | Layered configuration | YAML-based profiles enable easy environment switching |

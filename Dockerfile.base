@@ -1,0 +1,54 @@
+# Layer 1: System packages + runtimes (build once)
+# CPU:  podman build -f Dockerfile.base -t devai-base .
+# GPU:  podman build -f Dockerfile.base --build-arg BASE_IMAGE=docker.io/nvidia/cuda:12.9.1-cudnn-runtime-ubuntu24.04 -t devai-base-gpu .
+
+ARG BASE_IMAGE=debian:trixie
+FROM ${BASE_IMAGE}
+
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+
+ENV HTTP_PROXY=$HTTP_PROXY
+ENV HTTPS_PROXY=$HTTPS_PROXY
+ENV SHELL=/bin/bash
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Configure apt proxy if arguments are provided
+RUN if [ -n "$HTTP_PROXY" ]; then echo "Acquire::http::Proxy \"$HTTP_PROXY\";" > /etc/apt/apt.conf.d/99proxy; fi && \
+    if [ -n "$HTTPS_PROXY" ]; then echo "Acquire::https::Proxy \"$HTTPS_PROXY\";" >> /etc/apt/apt.conf.d/99proxy; fi
+
+# Install system packages, compilers, and Python 3.13
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    gnupg \
+    gosu \
+    git \
+    build-essential \
+    rustc \
+    cargo \
+    python3 \
+    python3-pip \
+    python3-venv \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -f /etc/apt/apt.conf.d/99proxy
+
+# Install uv (Python package manager) -> /usr/local/bin/uv
+RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh \
+    && rm -rf /root/.cache
+
+# Install Node.js 22 LTS (binary tarball) -> /usr/local/bin/node, /usr/local/bin/npm
+RUN NODE_VERSION=22.16.0 \
+    && ARCH=$(dpkg --print-architecture) \
+    && case "$ARCH" in amd64) NODE_ARCH=x64;; arm64) NODE_ARCH=arm64;; *) echo "Unsupported arch: $ARCH" && exit 1;; esac \
+    && curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz" \
+       | tar -xJ --strip-components=1 -C /usr/local \
+    && rm -rf /usr/local/CHANGELOG.md /usr/local/README.md /usr/local/LICENSE
+
+# Ensure python/pip are accessible as expected names
+RUN ln -sf /usr/bin/python3 /usr/local/bin/python \
+    && ln -sf /usr/bin/pip3 /usr/local/bin/pip
+
+# Verify all tools are on PATH
+RUN python --version && pip --version && uv --version && node --version && npm --version
