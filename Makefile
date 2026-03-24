@@ -10,6 +10,7 @@ CONTAINER_USER ?= devai
 PORT ?= 8888
 HOST_IP ?= $(shell hostname -I | awk '{print $$1}')
 HOST_HOME_DIR ?=
+HOME_VOLUME ?= $(IMAGE_NAME)-home
 OLLAMA_HOST ?= http://host.containers.internal:11434
 NO_PROXY ?=
 
@@ -56,14 +57,20 @@ AZ ?= $(DEVAI_BIN_DIR)/az
 # GPU build settings
 GPU_BASE_IMAGE ?= docker.io/nvidia/cuda:12.9.1-cudnn-runtime-ubuntu24.04
 
-# Mount host config files (gitconfig, ssh) into container if they exist
+# Mount host config files (gitconfig, ssh) to staging dir for entrypoint to copy
 HOME_MOUNT_ARG =
 ifneq ($(HOST_HOME_DIR),)
-	HOME_MOUNT_ARG += $(if $(wildcard $(HOME)/.gitconfig),-v "$(HOME)/.gitconfig":/home/$(CONTAINER_USER)/.gitconfig:ro)
-	HOME_MOUNT_ARG += $(if $(wildcard $(HOME)/.ssh),-v "$(HOME)/.ssh":/home/$(CONTAINER_USER)/.ssh:ro)
+	HOME_MOUNT_ARG += $(if $(wildcard $(HOME)/.gitconfig),-v "$(HOME)/.gitconfig":/tmp/host-config/.gitconfig:ro)
+	HOME_MOUNT_ARG += $(if $(wildcard $(HOME)/.ssh),-v "$(HOME)/.ssh":/tmp/host-config/.ssh:ro)
 endif
 
 RUN_FLAGS =
+
+# User switching: only needed for docker (rootless podman root = host user)
+USER_ENV =
+ifneq ($(findstring podman,$(CONTAINER_RUNTIME)),podman)
+	USER_ENV += -e USER_ID=$(shell id -u) -e GROUP_ID=$(shell id -g)
+endif
 
 # GPU runtime flags
 GPU_FLAGS =
@@ -79,7 +86,7 @@ COMPOSE_FILE = $(COMPOSE_DIR)/docker-compose.yml
 COMPOSE_GPU_FILE = $(COMPOSE_DIR)/docker-compose.gpu.yml
 PROFILE ?= dev
 
-.PHONY: all build build-gpu build-base build-base-gpu rebuild rebuild-gpu run run-gpu clean clean-gpu clean-base clean-base-gpu clean-all prune shell help
+.PHONY: all build build-gpu build-base build-base-gpu rebuild rebuild-gpu run run-gpu clean clean-gpu clean-base clean-base-gpu clean-home clean-all prune shell help
 .PHONY: compose-up compose-up-gpu compose-down compose-logs compose-build compose-ps
 .PHONY: cache-up cache-down cache-status cache-clean
 .PHONY: config-generate
@@ -146,12 +153,12 @@ run: ## Run the container (CPU)
 		--add-host=host.containers.internal:host-gateway \
 		$(PROXY_RUN_ENV) \
 		-e OLLAMA_HOST=$(OLLAMA_HOST) \
-		-e USER_ID=$(shell id -u) \
-		-e GROUP_ID=$(shell id -g) \
+		$(USER_ENV) \
 		-e CONTAINER_USER=$(CONTAINER_USER) \
 		-e HOST_IP=$(HOST_IP) \
 		-e PORT=$(PORT) \
 		-p 0.0.0.0:$(PORT):8888 \
+		-v $(HOME_VOLUME):/home/$(CONTAINER_USER) \
 		$(HOME_MOUNT_ARG) \
 		-v "$$(readlink -f $(HOST_WORK_DIR))":/home/$(CONTAINER_USER)/work \
 		$(IMAGE_NAME)
@@ -167,12 +174,12 @@ run-gpu: ## Run the container (GPU/CUDA)
 		--add-host=host.containers.internal:host-gateway \
 		$(PROXY_RUN_ENV) \
 		-e OLLAMA_HOST=$(OLLAMA_HOST) \
-		-e USER_ID=$(shell id -u) \
-		-e GROUP_ID=$(shell id -g) \
+		$(USER_ENV) \
 		-e CONTAINER_USER=$(CONTAINER_USER) \
 		-e HOST_IP=$(HOST_IP) \
 		-e PORT=$(PORT) \
 		-p 0.0.0.0:$(PORT):8888 \
+		-v $(HOME_VOLUME):/home/$(CONTAINER_USER) \
 		$(HOME_MOUNT_ARG) \
 		-v "$$(readlink -f $(HOST_WORK_DIR))":/home/$(CONTAINER_USER)/work \
 		$(IMAGE_NAME)-gpu
@@ -184,9 +191,9 @@ shell: ## Start an interactive shell in the container
 		--add-host=host.containers.internal:host-gateway \
 		$(PROXY_RUN_ENV) \
 		-e OLLAMA_HOST=$(OLLAMA_HOST) \
-		-e USER_ID=$(shell id -u) \
-		-e GROUP_ID=$(shell id -g) \
+		$(USER_ENV) \
 		-e CONTAINER_USER=$(CONTAINER_USER) \
+		-v $(HOME_VOLUME):/home/$(CONTAINER_USER) \
 		$(HOME_MOUNT_ARG) \
 		-v "$$(readlink -f $(HOST_WORK_DIR))":/home/$(CONTAINER_USER)/work \
 		$(IMAGE_NAME) /bin/bash
@@ -203,7 +210,10 @@ clean-base: ## Remove the base image (CPU)
 clean-base-gpu: ## Remove the base image (GPU)
 	$(CONTAINER_RUNTIME) rmi $(BASE_IMAGE_NAME)-gpu
 
-clean-all: clean clean-base ## Remove all CPU images (lab + base)
+clean-home: ## Remove the persistent home volume
+	$(CONTAINER_RUNTIME) volume rm $(HOME_VOLUME) 2>/dev/null || true
+
+clean-all: clean clean-base clean-home ## Remove all CPU images and home volume
 
 prune: ## Clean up dangling images only (keeps tagged images and volumes)
 	$(CONTAINER_RUNTIME) image prune -f

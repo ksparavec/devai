@@ -1,3 +1,4 @@
+
 # Dev AI Lab
 
 A containerized environment designed for AI experimentation and development, featuring **JupyterLab** and multiple AI CLIs. This setup provides a consistent, isolated workspace with essential tools pre-installed.
@@ -52,7 +53,7 @@ cp .env.example .env
 ```
 
 Edit `.env` and set:
-*   `HOST_HOME_DIR`: Your home directory (e.g., `/home/username`)
+*   `HOST_HOME_DIR`: Your home directory (e.g., `~`) — enables `.gitconfig` and `.ssh` inside the container
 *   `CONTAINER_RUNTIME`: `podman` (default) or `docker`
 
 ### 2. Build and Run
@@ -329,7 +330,8 @@ See [Selective Installation Options](#selective-installation-options) in Appendi
 | `make clean` | Remove lab image (CPU) |
 | `make clean-gpu` | Remove lab image (GPU) |
 | `make clean-base` | Remove base image (CPU) |
-| `make clean-all` | Remove all CPU images |
+| `make clean-home` | Remove persistent home volume |
+| `make clean-all` | Remove all CPU images and home volume |
 | `make prune` | Clean up dangling images |
 | `make config-generate` | Generate configs from YAML profiles |
 | `make help` | Show workflow and all targets |
@@ -342,8 +344,9 @@ See [Selective Installation Options](#selective-installation-options) in Appendi
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HOST_HOME_DIR` | - | Host home directory to mount |
+| `HOST_HOME_DIR` | - | Host home directory — enables `.gitconfig` and `.ssh` in container |
 | `HOST_WORK_DIR` | `.` | Working directory mounted to /home/devai/work |
+| `HOME_VOLUME` | `devai-lab-home` | Named volume for persistent home directory |
 | `CONTAINER_RUNTIME` | `podman` | Container runtime for running containers and installation preference |
 | `PORT` | `8888` | JupyterLab port |
 | `OLLAMA_HOST` | `http://host.containers.internal:11434` | Ollama server URL |
@@ -399,7 +402,30 @@ cp requirements.txt.example requirements.txt
 make build
 ```
 
-## Appendix B: Podman Configuration
+## Appendix B: Container User and Persistence
+
+### Persistent Home Directory
+
+The container's `/home/devai` is backed by a named volume (`devai-lab-home` by default), so shell history, jupyter config, AI CLI credentials, and user-installed packages survive container restarts. The work directory (`/home/devai/work`) is a separate bind mount from the host.
+
+To reset the home volume:
+
+```bash
+make clean-home
+```
+
+### Host Config Files
+
+When `HOST_HOME_DIR` is set in `.env`, the host's `.gitconfig` and `.ssh` are copied into the container at startup. This makes `git` and SSH work out of the box inside the container.
+
+### User Identity (Podman vs Docker)
+
+The container handles user identity differently depending on the runtime:
+
+*   **Podman (rootless)**: The container runs as root, which in rootless podman maps to the host user. All host-mounted files have correct permissions. No user switching is needed.
+*   **Docker**: The entrypoint remaps the `devai` user to match the host UID/GID and uses `gosu` to drop privileges. This handles UID conflicts in GPU base images (e.g., NVIDIA CUDA images that ship with a UID 1000 user).
+
+## Appendix C: Podman Configuration
 
 ### Storage Driver Setup
 
@@ -421,7 +447,7 @@ For better performance, use the `overlay` storage driver:
     podman system reset
     ```
 
-## Appendix C: GPU Image Selection
+## Appendix D: GPU Image Selection
 
 Use the selector script to choose CUDA base image:
 

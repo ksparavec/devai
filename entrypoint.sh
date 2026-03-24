@@ -13,20 +13,82 @@ if [ -n "${HTTP_PROXY:-}" ]; then
     echo "Proxy configured: ${HTTP_PROXY}"
 fi
 
-echo "Initializing container (UID: $(id -u))..."
+# Remap devai user/group to match host UID/GID (only when running as root)
+if [ "$(id -u)" = "0" ] && [ -n "${USER_ID:-}" ]; then
+    TARGET_UID=${USER_ID}
+    TARGET_GID=${GROUP_ID:-$USER_ID}
 
-# Create directories if missing (works for both root and non-root)
-mkdir -p "$HOME_DIR" "$WORK_DIR" \
-         "$HOME_DIR/.local/share/jupyter/runtime" \
-         "$HOME_DIR/.jupyter"
+    # Ensure group exists with correct GID
+    CURRENT_GID=$(getent group "$USERNAME" 2>/dev/null | cut -d: -f3 || true)
+    if [ -n "$CURRENT_GID" ] && [ "$CURRENT_GID" != "$TARGET_GID" ]; then
+        # Group exists but wrong GID — free target GID if taken, then reassign
+        BLOCKING_GROUP=$(getent group "$TARGET_GID" 2>/dev/null | cut -d: -f1 || true)
+        if [ -n "$BLOCKING_GROUP" ] && [ "$BLOCKING_GROUP" != "$USERNAME" ]; then
+            groupmod -g 99999 "$BLOCKING_GROUP"
+        fi
+        groupmod -g "$TARGET_GID" "$USERNAME"
+    elif [ -z "$CURRENT_GID" ]; then
+        # Group doesn't exist — free target GID if taken, then create
+        BLOCKING_GROUP=$(getent group "$TARGET_GID" 2>/dev/null | cut -d: -f1 || true)
+        if [ -n "$BLOCKING_GROUP" ]; then
+            groupmod -n "$USERNAME" "$BLOCKING_GROUP"
+        else
+            groupadd -g "$TARGET_GID" "$USERNAME"
+        fi
+    fi
 
-export HOME="$HOME_DIR"
+    # Ensure user exists with correct UID
+    CURRENT_UID=$(id -u "$USERNAME" 2>/dev/null || true)
+    if [ -n "$CURRENT_UID" ] && [ "$CURRENT_UID" != "$TARGET_UID" ]; then
+        # User exists but wrong UID — free target UID if taken, then reassign
+        BLOCKING_USER=$(getent passwd "$TARGET_UID" 2>/dev/null | cut -d: -f1 || true)
+        if [ -n "$BLOCKING_USER" ] && [ "$BLOCKING_USER" != "$USERNAME" ]; then
+            usermod -u 99999 "$BLOCKING_USER"
+        fi
+        usermod -u "$TARGET_UID" -g "$TARGET_GID" "$USERNAME"
+    elif [ -z "$CURRENT_UID" ]; then
+        # User doesn't exist — free target UID if taken, then create
+        BLOCKING_USER=$(getent passwd "$TARGET_UID" 2>/dev/null | cut -d: -f1 || true)
+        if [ -n "$BLOCKING_USER" ]; then
+            usermod -l "$USERNAME" -d "$HOME_DIR" "$BLOCKING_USER"
+            usermod -g "$TARGET_GID" "$USERNAME"
+        else
+            useradd -u "$TARGET_UID" -g "$TARGET_GID" -m -s /bin/bash "$USERNAME"
+        fi
+    fi
 
-# Navigate to work dir or home dir
-if [ -d "$WORK_DIR" ]; then
-    cd "$WORK_DIR"
+    # Create directories and fix ownership
+    mkdir -p "$HOME_DIR" "$WORK_DIR" \
+             "$HOME_DIR/.local/share/jupyter/runtime" \
+             "$HOME_DIR/.jupyter"
+    chown -R "$TARGET_UID:$TARGET_GID" "$HOME_DIR/.local" "$HOME_DIR/.jupyter"
+    chown "$TARGET_UID:$TARGET_GID" "$HOME_DIR"
+
+    # Copy host config files from staging mount and fix ownership
+    if [ -d /tmp/host-config ]; then
+        for item in /tmp/host-config/.*; do
+            [ "$(basename "$item")" = "." ] || [ "$(basename "$item")" = ".." ] && continue
+            cp -a "$item" "$HOME_DIR/"
+        done
+        chown -R "$TARGET_UID:$TARGET_GID" "$HOME_DIR/.gitconfig" "$HOME_DIR/.ssh" 2>/dev/null || true
+    fi
+
+    echo "Running as $USERNAME (UID:$TARGET_UID GID:$TARGET_GID)"
 else
-    cd "$HOME_DIR"
+    echo "Running as $(id -un) (UID:$(id -u))"
+
+    # Create directories if missing
+    mkdir -p "$HOME_DIR" "$WORK_DIR" \
+             "$HOME_DIR/.local/share/jupyter/runtime" \
+             "$HOME_DIR/.jupyter"
+
+    # Copy host config files from staging mount (rootless podman: root = host user)
+    if [ -d /tmp/host-config ]; then
+        for item in /tmp/host-config/.*; do
+            [ "$(basename "$item")" = "." ] || [ "$(basename "$item")" = ".." ] && continue
+            cp -a "$item" "$HOME_DIR/"
+        done
+    fi
 fi
 
 # Prepare the command
@@ -38,5 +100,13 @@ if [ -n "$HOST_IP" ] && [ "${CMD[0]}" = "jupyter" ]; then
     CMD+=("--ServerApp.custom_display_url=http://$HOST_IP:$TARGET_PORT")
 fi
 
+# Switch to non-root user via gosu if running as root
+if [ "$(id -u)" = "0" ] && [ -n "${USER_ID:-}" ]; then
+    exec gosu "$USERNAME" bash -c 'export HOME="'"$HOME_DIR"'" && cd "'"$WORK_DIR"'" 2>/dev/null || cd "'"$HOME_DIR"'" && exec "$@"' -- "${CMD[@]}"
+fi
+
+# Fallback: running as non-root already
+export HOME="$HOME_DIR"
+cd "$WORK_DIR" 2>/dev/null || cd "$HOME_DIR"
 echo "Exec command: ${CMD[*]}"
 exec "${CMD[@]}"

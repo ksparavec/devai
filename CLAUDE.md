@@ -25,7 +25,8 @@ make shell          # Interactive shell without JupyterLab
 # Cleanup
 make clean          # Remove lab image
 make clean-base     # Remove base image
-make clean-all      # Remove both
+make clean-home     # Remove persistent home volume
+make clean-all      # Remove all (images + home volume)
 make help           # Show all targets
 ```
 
@@ -33,8 +34,9 @@ make help           # Show all targets
 
 Copy `.env.example` to `.env` before first use. Key settings:
 
-- `HOST_HOME_DIR` - Host home directory to mount (enables access to .gitconfig, .ssh, etc.)
+- `HOST_HOME_DIR` - Host home directory — enables .gitconfig and .ssh in container
 - `HOST_WORK_DIR` - Working directory mounted to /home/devai/work (default: current dir)
+- `HOME_VOLUME` - Named volume for persistent /home/devai (default: devai-lab-home)
 - `CONTAINER_RUNTIME` - `podman` (default) or `docker`
 - `PORT` - JupyterLab port (default: 8888)
 - `OLLAMA_HOST` - Ollama server URL (default: host machine at port 11434)
@@ -56,6 +58,15 @@ Two-layer image build (base rarely changes, lab layer for fast iteration):
 - **.default-python-packages**: jupyterlab, openai, ollama, chromadb, ML/data science stack
 - **.default-npm-packages**: @google/gemini-cli, @anthropic-ai/claude-code, @openai/codex
 - **requirements.txt**: Optional project-specific Python packages
-- **entrypoint.sh**: Handles UID/GID mapping using `gosu`
+- **entrypoint.sh**: Copies host config (.gitconfig, .ssh) from staging mount; for Docker, remaps UID/GID and uses `gosu` to drop privileges
+
+### Runtime volumes
+- **Named volume** (`HOME_VOLUME`): Persistent `/home/devai` — survives container restarts
+- **Bind mount**: `HOST_WORK_DIR` → `/home/devai/work`
+- **Staging mount**: Host `.gitconfig`/`.ssh` → `/tmp/host-config/` (copied into home by entrypoint)
+
+### User identity
+- **Podman (rootless)**: Runs as container root (= host user). No user switching needed.
+- **Docker**: Entrypoint remaps `devai` user to host UID/GID via `gosu`. Handles UID conflicts in GPU base images.
 
 The container connects to host services via `host.containers.internal` for Ollama integration.
