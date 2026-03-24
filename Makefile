@@ -3,6 +3,7 @@
 
 # Defaults
 CONTAINER_RUNTIME ?= podman
+COMPOSE = $(CONTAINER_RUNTIME) compose
 IMAGE_NAME ?= devai-lab
 BASE_IMAGE_NAME ?= devai-base
 CONTAINER_USER ?= devai
@@ -10,6 +11,33 @@ PORT ?= 8888
 HOST_IP ?= $(shell hostname -I | awk '{print $$1}')
 HOST_HOME_DIR ?=
 OLLAMA_HOST ?= http://host.containers.internal:11434
+NO_PROXY ?=
+
+# Cache settings
+CACHE_DIR ?= /var/cache/devai
+CACHE_COMPOSE = deploy/cache/docker-compose.cache.yml
+APT_PROXY ?=
+
+# Proxy build args (passed to all container builds)
+PROXY_BUILD_ARGS = \
+	--build-arg HTTP_PROXY=$(HTTP_PROXY) \
+	--build-arg HTTPS_PROXY=$(HTTPS_PROXY) \
+	--build-arg NO_PROXY=$(NO_PROXY) \
+	--build-arg APT_PROXY=$(APT_PROXY)
+
+# Cache mount args (bind host cache dirs into build for pip/uv and npm)
+CACHE_BUILD_ARGS = \
+	-v $(CACHE_DIR)/pip:/root/.cache/uv \
+	-v $(CACHE_DIR)/npm:/root/.npm
+
+# Proxy runtime env (passed to all container runs)
+PROXY_RUN_ENV = \
+	-e HTTP_PROXY=$(HTTP_PROXY) \
+	-e HTTPS_PROXY=$(HTTPS_PROXY) \
+	-e NO_PROXY=$(NO_PROXY) \
+	-e http_proxy=$(HTTP_PROXY) \
+	-e https_proxy=$(HTTPS_PROXY) \
+	-e no_proxy=$(NO_PROXY)
 
 # Cloud tools configuration (bootstrapped venv)
 DEVAI_PYTHON_VERSION ?= 3.12
@@ -53,6 +81,7 @@ PROFILE ?= dev
 
 .PHONY: all build build-gpu build-base build-base-gpu rebuild rebuild-gpu run run-gpu clean clean-gpu clean-base clean-base-gpu clean-all prune shell help
 .PHONY: compose-up compose-up-gpu compose-down compose-logs compose-build compose-ps
+.PHONY: cache-up cache-down cache-status cache-clean
 .PHONY: config-generate
 .PHONY: tf-init-aws tf-plan-aws tf-apply-aws tf-destroy-aws
 .PHONY: tf-init-azure tf-plan-azure tf-apply-azure tf-destroy-azure
@@ -65,46 +94,44 @@ PROFILE ?= dev
 all: help
 
 build-base: ## Build base image with system packages and runtimes (CPU)
-	$(CONTAINER_RUNTIME) build \
-		--build-arg HTTP_PROXY=$(HTTP_PROXY) \
-		--build-arg HTTPS_PROXY=$(HTTPS_PROXY) \
+	$(CONTAINER_RUNTIME) build --network=host \
+		$(PROXY_BUILD_ARGS) \
 		-f Dockerfile.base \
 		-t $(BASE_IMAGE_NAME) .
 
 build-base-gpu: ## Build base image with system packages and runtimes (GPU)
-	$(CONTAINER_RUNTIME) build \
-		--build-arg HTTP_PROXY=$(HTTP_PROXY) \
-		--build-arg HTTPS_PROXY=$(HTTPS_PROXY) \
+	$(CONTAINER_RUNTIME) build --network=host \
+		$(PROXY_BUILD_ARGS) \
 		--build-arg BASE_IMAGE=$(GPU_BASE_IMAGE) \
 		-f Dockerfile.base \
 		-t $(BASE_IMAGE_NAME)-gpu .
 
 build: build-base ## Build the container image (CPU)
-	$(CONTAINER_RUNTIME) build \
-		--build-arg HTTP_PROXY=$(HTTP_PROXY) \
-		--build-arg HTTPS_PROXY=$(HTTPS_PROXY) \
+	$(CONTAINER_RUNTIME) build --network=host \
+		$(PROXY_BUILD_ARGS) \
+		$(CACHE_BUILD_ARGS) \
 		--build-arg BASE_IMAGE=$(BASE_IMAGE_NAME) \
 		-t $(IMAGE_NAME) .
 
 build-gpu: build-base-gpu ## Build the container image (GPU/CUDA)
-	$(CONTAINER_RUNTIME) build \
-		--build-arg HTTP_PROXY=$(HTTP_PROXY) \
-		--build-arg HTTPS_PROXY=$(HTTPS_PROXY) \
+	$(CONTAINER_RUNTIME) build --network=host \
+		$(PROXY_BUILD_ARGS) \
+		$(CACHE_BUILD_ARGS) \
 		--build-arg BASE_IMAGE=$(BASE_IMAGE_NAME)-gpu \
 		--build-arg GPU_BUILD=true \
 		-t $(IMAGE_NAME)-gpu .
 
 rebuild: ## Rebuild lab layer only (skip base, faster iteration)
-	$(CONTAINER_RUNTIME) build \
-		--build-arg HTTP_PROXY=$(HTTP_PROXY) \
-		--build-arg HTTPS_PROXY=$(HTTPS_PROXY) \
+	$(CONTAINER_RUNTIME) build --network=host \
+		$(PROXY_BUILD_ARGS) \
+		$(CACHE_BUILD_ARGS) \
 		--build-arg BASE_IMAGE=$(BASE_IMAGE_NAME) \
 		-t $(IMAGE_NAME) .
 
 rebuild-gpu: ## Rebuild lab layer only for GPU (skip base)
-	$(CONTAINER_RUNTIME) build \
-		--build-arg HTTP_PROXY=$(HTTP_PROXY) \
-		--build-arg HTTPS_PROXY=$(HTTPS_PROXY) \
+	$(CONTAINER_RUNTIME) build --network=host \
+		$(PROXY_BUILD_ARGS) \
+		$(CACHE_BUILD_ARGS) \
 		--build-arg BASE_IMAGE=$(BASE_IMAGE_NAME)-gpu \
 		--build-arg GPU_BUILD=true \
 		-t $(IMAGE_NAME)-gpu .
@@ -117,8 +144,7 @@ run: ## Run the container (CPU)
 		--name $(IMAGE_NAME) \
 		$(RUN_FLAGS) \
 		--add-host=host.containers.internal:host-gateway \
-		-e HTTP_PROXY=$(HTTP_PROXY) \
-		-e HTTPS_PROXY=$(HTTPS_PROXY) \
+		$(PROXY_RUN_ENV) \
 		-e OLLAMA_HOST=$(OLLAMA_HOST) \
 		-e USER_ID=$(shell id -u) \
 		-e GROUP_ID=$(shell id -g) \
@@ -139,8 +165,7 @@ run-gpu: ## Run the container (GPU/CUDA)
 		$(RUN_FLAGS) \
 		$(GPU_FLAGS) \
 		--add-host=host.containers.internal:host-gateway \
-		-e HTTP_PROXY=$(HTTP_PROXY) \
-		-e HTTPS_PROXY=$(HTTPS_PROXY) \
+		$(PROXY_RUN_ENV) \
 		-e OLLAMA_HOST=$(OLLAMA_HOST) \
 		-e USER_ID=$(shell id -u) \
 		-e GROUP_ID=$(shell id -g) \
@@ -157,6 +182,7 @@ shell: ## Start an interactive shell in the container
 		--name $(IMAGE_NAME)-shell \
 		$(RUN_FLAGS) \
 		--add-host=host.containers.internal:host-gateway \
+		$(PROXY_RUN_ENV) \
 		-e OLLAMA_HOST=$(OLLAMA_HOST) \
 		-e USER_ID=$(shell id -u) \
 		-e GROUP_ID=$(shell id -g) \
@@ -219,7 +245,13 @@ help: ## Show this help message
 	@echo "   \033[36mcompose-logs\033[0m               View container logs"
 	@echo "   \033[36mcompose-ps\033[0m                 Show running containers"
 	@echo ""
-	@echo "\033[1;33m5. MAINTENANCE\033[0m"
+	@echo "\033[1;33m5. BUILD CACHE\033[0m"
+	@echo "   \033[36mcache-up\033[0m                   Start caching proxies (apt + registry)"
+	@echo "   \033[36mcache-down\033[0m                 Stop caching proxies"
+	@echo "   \033[36mcache-status\033[0m               Show cache status and disk usage"
+	@echo "   \033[36mcache-clean\033[0m                Remove all cached data"
+	@echo ""
+	@echo "\033[1;33m6. MAINTENANCE\033[0m"
 	@echo "   \033[36mclean\033[0m                      Remove container image (CPU)"
 	@echo "   \033[36mclean-gpu\033[0m                  Remove container image (GPU)"
 	@echo "   \033[36mprune\033[0m                      Clean up dangling images"
@@ -231,34 +263,65 @@ help: ## Show this help message
 	@echo ""
 
 # =============================================================================
-# Docker Compose targets
+# Cache targets (apt-cacher-ng + registry pull-through)
+# =============================================================================
+
+cache-up: ## Start caching proxies (apt-cacher-ng + registry mirror)
+	$(COMPOSE) -f $(CACHE_COMPOSE) up -d
+	@echo "Cache services started:"
+	@echo "  apt-cacher-ng:     http://localhost:3142"
+	@echo "  Registry mirror:   http://localhost:5000"
+	@echo ""
+	@echo "To use apt cache during builds, set in .env:"
+	@echo "  APT_PROXY=http://host.containers.internal:3142"
+	@echo ""
+	@echo "To use registry mirror, install Podman config:"
+	@echo "  cp deploy/cache/registries.conf ~/.config/containers/registries.conf"
+
+cache-down: ## Stop caching proxies
+	$(COMPOSE) -f $(CACHE_COMPOSE) down
+
+cache-status: ## Show cache service status and disk usage
+	@$(COMPOSE) -f $(CACHE_COMPOSE) ps
+	@echo ""
+	@echo "Cache disk usage:"
+	@du -sh $(CACHE_DIR)/* 2>/dev/null || echo "  (empty)"
+
+cache-clean: ## Remove all cached data (keeps volumes mounted)
+	$(COMPOSE) -f $(CACHE_COMPOSE) down
+	@echo "Cleaning cache directories..."
+	rm -rf $(CACHE_DIR)/registry/* $(CACHE_DIR)/apt/* $(CACHE_DIR)/pip/* $(CACHE_DIR)/npm/*
+	@echo "Cache cleaned."
+
+# =============================================================================
+# Compose targets
 # =============================================================================
 
 config-generate: ## Generate config files from YAML (usage: make config-generate PROFILE=dev)
 	@./scripts/generate-config.sh all $(PROFILE)
 
-compose-build: ## Build images with Docker Compose
-	docker compose -f $(COMPOSE_FILE) build
+compose-build: ## Build images with Compose
+	$(COMPOSE) -f $(COMPOSE_FILE) build
 
-compose-up: ## Start services with Docker Compose
+compose-up: ## Start services with Compose
 	@mkdir -p $(COMPOSE_DIR)/work
-	docker compose -f $(COMPOSE_FILE) up -d
+	$(COMPOSE) -f $(COMPOSE_FILE) up -d
 	@echo "JupyterLab starting at http://localhost:$(PORT)"
 	@echo "Run 'make compose-logs' to see startup logs and token"
 
 compose-up-gpu: ## Start services with GPU support
 	@mkdir -p $(COMPOSE_DIR)/work
-	docker compose -f $(COMPOSE_FILE) -f $(COMPOSE_GPU_FILE) up -d
+	$(COMPOSE) -f $(COMPOSE_FILE) -f $(COMPOSE_GPU_FILE) up -d
 	@echo "JupyterLab (GPU) starting at http://localhost:$(PORT)"
 
 compose-down: ## Stop and remove containers
-	docker compose -f $(COMPOSE_FILE) down
+	$(COMPOSE) -f $(COMPOSE_FILE) down
 
 compose-logs: ## View container logs
-	docker compose -f $(COMPOSE_FILE) logs -f
+	$(COMPOSE) -f $(COMPOSE_FILE) logs -f
 
 compose-ps: ## Show running containers
-	docker compose -f $(COMPOSE_FILE) ps
+	$(COMPOSE) -f $(COMPOSE_FILE) ps
 
 # =============================================================================
 # Terraform targets (using bootstrapped venv tools)

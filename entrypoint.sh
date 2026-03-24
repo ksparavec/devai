@@ -5,6 +5,14 @@ USERNAME=${CONTAINER_USER:-devai}
 HOME_DIR="/home/$USERNAME"
 WORK_DIR="$HOME_DIR/work"
 
+# Export lowercase proxy aliases for tools that require them
+if [ -n "${HTTP_PROXY:-}" ]; then
+    export http_proxy="${HTTP_PROXY}"
+    export https_proxy="${HTTPS_PROXY:-}"
+    export no_proxy="${NO_PROXY:-}"
+    echo "Proxy configured: ${HTTP_PROXY}"
+fi
+
 echo "Initializing container (UID: $(id -u))..."
 
 # Create directories if missing (works for both root and non-root)

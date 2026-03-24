@@ -7,14 +7,15 @@ FROM ${BASE_IMAGE}
 
 ARG HTTP_PROXY
 ARG HTTPS_PROXY
+ARG NO_PROXY
 
-ENV HTTP_PROXY=$HTTP_PROXY
-ENV HTTPS_PROXY=$HTTPS_PROXY
 ENV SHELL=/bin/bash
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Configure apt proxy if arguments are provided
-RUN if [ -n "$HTTP_PROXY" ]; then echo "Acquire::http::Proxy \"$HTTP_PROXY\";" > /etc/apt/apt.conf.d/99proxy; fi && \
+# Configure apt proxy/cache during build (cleaned up after install)
+ARG APT_PROXY
+RUN if [ -n "$APT_PROXY" ]; then echo "Acquire::http::Proxy \"$APT_PROXY\";" > /etc/apt/apt.conf.d/00cache; fi && \
+    if [ -n "$HTTP_PROXY" ]; then echo "Acquire::http::Proxy \"$HTTP_PROXY\";" > /etc/apt/apt.conf.d/99proxy; fi && \
     if [ -n "$HTTPS_PROXY" ]; then echo "Acquire::https::Proxy \"$HTTPS_PROXY\";" >> /etc/apt/apt.conf.d/99proxy; fi
 
 # Install system packages, compilers, and Python 3.13
@@ -32,7 +33,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-venv \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* \
-    && rm -f /etc/apt/apt.conf.d/99proxy
+    && rm -f /etc/apt/apt.conf.d/00cache /etc/apt/apt.conf.d/99proxy
 
 # Install uv (Python package manager) -> /usr/local/bin/uv
 RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh \

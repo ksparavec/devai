@@ -63,6 +63,7 @@ release/
 .Trashes
 ehthumbs.db
 Thumbs.db
+.Trash-0/
 
 # Editors
 .vscode/

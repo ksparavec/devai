@@ -1,0 +1,25 @@
+services:
+  apt-cache:
+    image: sameersbn/apt-cacher-ng:latest
+    container_name: devai-apt-cache
+    hostname: apt-cache
+    ports:
+      - "3142:3142"
+    volumes:
+      - /var/cache/devai/apt:/var/cache/apt-cacher-ng
+    restart: unless-stopped
+
+  registry-cache:
+    image: registry:2
+    container_name: devai-registry-cache
+    hostname: registry-cache
+    ports:
+      - "5000:5000"
+    volumes:
+      - registry-data:/var/lib/registry
+      - ./registry-config.yml:/etc/docker/registry/config.yml:ro
+    restart: unless-stopped
+
+volumes:
+  registry-data:
+    name: devai-registry-data
