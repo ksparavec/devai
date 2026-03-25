@@ -23,8 +23,10 @@ APT_PROXY ?=
 PROXY_BUILD_ARGS = \
 	--build-arg HTTP_PROXY=$(HTTP_PROXY) \
 	--build-arg HTTPS_PROXY=$(HTTPS_PROXY) \
-	--build-arg NO_PROXY=$(NO_PROXY) \
-	--build-arg APT_PROXY=$(APT_PROXY)
+	--build-arg NO_PROXY=$(NO_PROXY)
+
+# APT proxy (base image only — apt is not used in the lab layer)
+APT_PROXY_ARG = --build-arg APT_PROXY=$(APT_PROXY)
 
 # Cache mount args (bind host cache dirs into build for pip/uv and npm)
 CACHE_BUILD_ARGS = \
@@ -103,12 +105,14 @@ all: help
 build-base: ## Build base image with system packages and runtimes (CPU)
 	$(CONTAINER_RUNTIME) build --network=host \
 		$(PROXY_BUILD_ARGS) \
+		$(APT_PROXY_ARG) \
 		-f Dockerfile.base \
 		-t $(BASE_IMAGE_NAME) .
 
 build-base-gpu: ## Build base image with system packages and runtimes (GPU)
 	$(CONTAINER_RUNTIME) build --network=host \
 		$(PROXY_BUILD_ARGS) \
+		$(APT_PROXY_ARG) \
 		--build-arg BASE_IMAGE=$(GPU_BASE_IMAGE) \
 		-f Dockerfile.base \
 		-t $(BASE_IMAGE_NAME)-gpu .
@@ -277,6 +281,10 @@ help: ## Show this help message
 # =============================================================================
 
 cache-up: ## Start caching proxies (apt-cacher-ng + registry mirror)
+	@if [ "$(CONTAINER_RUNTIME)" = "podman" ] && ! systemctl --user is-active --quiet podman.socket; then \
+		echo "Starting Podman API socket..."; \
+		systemctl --user enable --now podman.socket; \
+	fi
 	$(COMPOSE) -f $(CACHE_COMPOSE) up -d
 	@echo "Cache services started:"
 	@echo "  apt-cacher-ng:     http://localhost:3142"
