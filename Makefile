@@ -88,7 +88,7 @@ COMPOSE_FILE = $(COMPOSE_DIR)/docker-compose.yml
 COMPOSE_GPU_FILE = $(COMPOSE_DIR)/docker-compose.gpu.yml
 PROFILE ?= dev
 
-.PHONY: all build build-gpu build-base build-base-gpu rebuild rebuild-gpu run run-gpu clean clean-gpu clean-base clean-base-gpu clean-home clean-all prune shell help
+.PHONY: all build build-gpu build-base build-base-gpu rebuild rebuild-gpu run run-gpu clean clean-gpu clean-base clean-base-gpu clean-home clean-all prune shell help install
 .PHONY: compose-up compose-up-gpu compose-down compose-logs compose-build compose-ps
 .PHONY: cache-up cache-down cache-status cache-clean
 .PHONY: config-generate
@@ -265,7 +265,10 @@ help: ## Show this help message
 	@echo "   \033[36mcache-status\033[0m               Show cache status and disk usage"
 	@echo "   \033[36mcache-clean\033[0m                Remove all cached data"
 	@echo ""
-	@echo "\033[1;33m6. MAINTENANCE\033[0m"
+	@echo "\033[1;33m6. INSTALL\033[0m"
+	@echo "   \033[36minstall\033[0m                    Install devai.sh launcher to ~/.local/bin"
+	@echo ""
+	@echo "\033[1;33m7. MAINTENANCE\033[0m"
 	@echo "   \033[36mclean\033[0m                      Remove container image (CPU)"
 	@echo "   \033[36mclean-gpu\033[0m                  Remove container image (GPU)"
 	@echo "   \033[36mprune\033[0m                      Clean up dangling images"
@@ -275,6 +278,16 @@ help: ## Show this help message
 	@echo "   Copy .env.example to .env and adjust settings before running."
 	@echo "   Tool binaries: \033[33m$(DEVAI_BIN_DIR)\033[0m"
 	@echo ""
+
+# =============================================================================
+# Install
+# =============================================================================
+
+install: ## Install devai.sh launcher to ~/.local/bin
+	@mkdir -p $(HOME)/.local/bin
+	cp scripts/devai.sh $(HOME)/.local/bin/devai.sh
+	chmod +x $(HOME)/.local/bin/devai.sh
+	@echo "Installed devai.sh to $(HOME)/.local/bin/devai.sh"
 
 # =============================================================================
 # Cache targets (apt-cacher-ng + registry pull-through)

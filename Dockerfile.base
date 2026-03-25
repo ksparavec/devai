@@ -25,6 +25,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gnupg \
     gosu \
     git \
+    bubblewrap \
     build-essential \
     rustc \
     cargo \

@@ -22,6 +22,10 @@ make run            # Run JupyterLab
 make run-gpu        # Run with GPU acceleration
 make shell          # Interactive shell without JupyterLab
 
+# Standalone launcher (GPU, auto-detects free port, names container after git repo)
+make install        # Install devai.sh to ~/.local/bin
+devai.sh            # Run from any git repo
+
 # Cleanup
 make clean          # Remove lab image
 make clean-base     # Remove base image
@@ -56,7 +60,10 @@ Two-layer image build (base rarely changes, lab layer for fast iteration):
 ### Layer 2: Dockerfile (devai-lab)
 - **PyTorch**: CPU-only or CUDA (controlled by GPU_BUILD arg)
 - **.default-python-packages**: jupyterlab, openai, ollama, chromadb, ML/data science stack
-- **.default-npm-packages**: @google/gemini-cli, @anthropic-ai/claude-code, @openai/codex
+- **Claude Code**: Binary from official distribution (claude.ai)
+- **OpenAI Codex**: Prebuilt binary from GitHub releases + bubblewrap sandbox
+- **.default-npm-packages**: @google/gemini-cli (npm, no native installer available)
+- **jupyter-ai-launchers**: JupyterLab extension adding Claude, Codex, Gemini to launcher
 - **requirements.txt**: Optional project-specific Python packages
 - **entrypoint.sh**: Copies host config (.gitconfig, .ssh) from staging mount; for Docker, remaps UID/GID and uses `gosu` to drop privileges
 

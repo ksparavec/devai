@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling>=1.5.0", "jupyterlab>=4.0.0,<5", "hatch-jupyter-builder>=0.5"]
+build-backend = "hatchling.build"
+
+[project]
+name = "jupyter-ai-launchers"
+version = "0.1.0"
+description = "JupyterLab launcher entries for AI CLI tools"
+requires-python = ">=3.10"
+dependencies = ["jupyterlab>=4.0.0,<5"]
+
+[tool.hatch.build.targets.wheel.shared-data]
+"jupyter_ai_launchers/labextension" = "share/jupyter/labextensions/jupyter-ai-launchers"
+"install.json" = "share/jupyter/labextensions/jupyter-ai-launchers/install.json"
+
+[tool.hatch.build.hooks.jupyter-builder]
+dependencies = ["hatch-jupyter-builder>=0.5"]
+build-function = "hatch_jupyter_builder.npm_builder"
+ensured-targets = ["jupyter_ai_launchers/labextension/static/style.js"]
+
+[tool.hatch.build.hooks.jupyter-builder.build-kwargs]
+build_cmd = "build:prod"
+npm = ["jlpm"]

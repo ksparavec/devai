@@ -8,14 +8,15 @@ A containerized environment designed for AI experimentation and development, fea
 *   **Base Environment**: Debian Trixie with Python 3.13, Node.js 22 LTS, uv.
 *   **Interactive Computing**: **JupyterLab** pre-installed and configured.
 *   **AI Tools**:
-    *   **Google Gemini CLI** (`@google/gemini-cli`)
-    *   **Claude Code CLI** (`@anthropic-ai/claude-code`)
-    *   **OpenAI Codex CLI** (`@openai/codex`)
+    *   **Claude Code CLI** (native binary from claude.ai)
+    *   **OpenAI Codex CLI** (prebuilt binary from GitHub releases)
+    *   **Google Gemini CLI** (`@google/gemini-cli` via npm)
     *   **OpenAI Python SDK** (`openai`)
     *   **Ollama** for local model inference
+*   **JupyterLab Integration**: Claude, Codex, and Gemini appear as launcher icons — click to open a terminal running the agent.
 *   **Vector Database**: **ChromaDB** for embeddings and RAG experiments.
 *   **GPU Support**: NVIDIA CUDA support for accelerated inference (optional).
-*   **Package Management**: **uv** for Python packages, **npm** for AI CLIs.
+*   **Package Management**: **uv** for Python packages, **npm** for Gemini CLI.
 *   **Development Tools**: `git`, `build-essential`, `rustc`, `cargo` (via apt).
 *   **Runtime**: Optimized for **Podman** (supports rootless mode) but fully compatible with Docker. Both can be auto-installed via bootstrap.
 *   **Multi-Cloud Deployment**: AWS, Azure, and GCP via Terraform and Kubernetes.
@@ -59,11 +60,30 @@ Edit `.env` and set:
 ### 2. Build and Run
 
 ```bash
-make build
-make run
+make build          # CPU
+make build-gpu      # GPU/CUDA
+make run            # CPU
+make run-gpu        # GPU
 ```
 
 Access JupyterLab at the URL shown in the console output.
+
+### 3. Standalone Launcher (optional)
+
+Install `devai.sh` to run the GPU container from any git repo:
+
+```bash
+make install        # Installs to ~/.local/bin/devai.sh
+```
+
+Then from any git repository:
+
+```bash
+cd ~/projects/my-ml-project
+devai.sh            # Starts devai-lab-gpu-my-ml-project, auto-detects free port
+```
+
+The container is named after the git repo, sources `.env` from the current directory if present, and is removed on exit.
 
 ## Quick Start: Cloud Deployment
 
@@ -139,7 +159,7 @@ See [Cloud Deployment](#cloud-deployment) for Azure, GCP, and Kubernetes options
 
 ## Using AI Tools
 
-All AI CLIs are available from a terminal within JupyterLab (File -> New -> Terminal).
+AI agents are available as launcher icons in JupyterLab — click to open a terminal running the agent. They can also be started manually from a terminal (File -> New -> Terminal).
 
 ### Google Gemini CLI
 
@@ -317,6 +337,7 @@ See [Selective Installation Options](#selective-installation-options) in Appendi
 | `make run` | Run container with JupyterLab (CPU) |
 | `make run-gpu` | Run container with JupyterLab (GPU) |
 | `make shell` | Interactive shell without JupyterLab |
+| `make install` | Install `devai.sh` standalone launcher to `~/.local/bin` |
 | `make compose-up` | Start services with Docker Compose |
 | `make compose-up-gpu` | Start with GPU support |
 | `make compose-down` | Stop and remove containers |

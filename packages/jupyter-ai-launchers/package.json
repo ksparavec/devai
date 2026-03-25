@@ -1,0 +1,43 @@
+{
+  "name": "jupyter-ai-launchers",
+  "version": "0.1.0",
+  "description": "JupyterLab launcher entries for AI CLI tools",
+  "license": "MIT",
+  "files": [
+    "lib/**/*.{d.ts,js,js.map,json}",
+    "style/**/*.{css,js}"
+  ],
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "style": "style/index.js",
+  "scripts": {
+    "build": "jlpm build:lib && jlpm build:labextension:dev",
+    "build:prod": "jlpm clean && jlpm build:lib && jlpm build:labextension",
+    "build:labextension": "jupyter labextension build .",
+    "build:labextension:dev": "jupyter labextension build --development True .",
+    "build:lib": "tsc",
+    "clean": "rimraf lib tsconfig.tsbuildinfo",
+    "clean:labextension": "rimraf jupyter_ai_launchers/labextension",
+    "clean:all": "jlpm clean && jlpm clean:labextension",
+    "install:extension": "jlpm build"
+  },
+  "dependencies": {
+    "@jupyterlab/application": "^4.0.0",
+    "@jupyterlab/launcher": "^4.0.0",
+    "@jupyterlab/ui-components": "^4.0.0"
+  },
+  "devDependencies": {
+    "@jupyterlab/builder": "^4.0.0",
+    "rimraf": "~6.0.0",
+    "typescript": "~5.8.0"
+  },
+  "sideEffects": [
+    "style/**/*.css",
+    "style/index.js"
+  ],
+  "styleModule": "style/index.js",
+  "jupyterlab": {
+    "extension": true,
+    "outputDir": "jupyter_ai_launchers/labextension"
+  }
+}
