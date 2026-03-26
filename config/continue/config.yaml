@@ -1,0 +1,9 @@
+name: DevAI Local
+version: 0.0.1
+schema: v1
+
+models:
+  - name: Qwen 3.5 9B
+    provider: ollama
+    model: qwen3.5:9b
+    apiBase: http://192.168.189.205:11434

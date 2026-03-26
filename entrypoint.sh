@@ -94,10 +94,27 @@ fi
 # Prepare the command
 CMD=("$@")
 
-# Inject custom display URL if HOST_IP is set and we are running jupyter
-if [ -n "$HOST_IP" ] && [ "${CMD[0]}" = "jupyter" ]; then
+# Inject Jupyter settings if running jupyter
+if [ "${CMD[0]}" = "jupyter" ]; then
     TARGET_PORT=${PORT:-8888}
-    CMD+=("--ServerApp.custom_display_url=http://$HOST_IP:$TARGET_PORT")
+    CERT_DIR="$HOME_DIR/.jupyter/ssl"
+    if [ -f "$CERT_DIR/cert.pem" ] || [ -f "$CERT_DIR/${HOST_IP}.pem" ]; then
+        # Use mkcert certs if available (named by IP or as cert.pem)
+        CERTFILE="${CERT_DIR}/${HOST_IP}.pem"
+        KEYFILE="${CERT_DIR}/${HOST_IP}-key.pem"
+        [ -f "$CERTFILE" ] || CERTFILE="$CERT_DIR/cert.pem"
+        [ -f "$KEYFILE" ] || KEYFILE="$CERT_DIR/key.pem"
+        CMD+=("--ServerApp.certfile=$CERTFILE" "--ServerApp.keyfile=$KEYFILE")
+        PROTO=https
+    else
+        PROTO=http
+    fi
+    if [ -n "$HOST_IP" ]; then
+        CMD+=("--ServerApp.custom_display_url=$PROTO://$HOST_IP:$TARGET_PORT")
+    fi
+    if [ -n "${JUPYTER_TOKEN:-}" ]; then
+        CMD+=("--IdentityProvider.token=$JUPYTER_TOKEN")
+    fi
 fi
 
 # Switch to non-root user via gosu if running as root

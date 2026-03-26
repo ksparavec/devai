@@ -6,6 +6,9 @@ ipywidgets
 openai
 ollama
 chromadb
+llm
+jupyter-server-proxy
+jupyter-vscode-proxy
 
 # Core ML/Data Science
 numpy

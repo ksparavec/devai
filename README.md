@@ -7,17 +7,22 @@ A containerized environment designed for AI experimentation and development, fea
 
 *   **Base Environment**: Debian Trixie with Python 3.13, Node.js 22 LTS, uv.
 *   **Interactive Computing**: **JupyterLab** pre-installed and configured.
-*   **AI Tools**:
+*   **AI Agents (cloud)**:
     *   **Claude Code CLI** (native binary from claude.ai)
     *   **OpenAI Codex CLI** (prebuilt binary from GitHub releases)
-    *   **Google Gemini CLI** (`@google/gemini-cli` via npm)
-    *   **OpenAI Python SDK** (`openai`)
-    *   **Ollama** for local model inference
-*   **JupyterLab Integration**: Claude, Codex, and Gemini appear as launcher icons — click to open a terminal running the agent.
+    *   **Google Gemini CLI** (pre-installed npm package)
+*   **AI Agents (local — Ollama)**:
+    *   **Ollama server** in its own GPU-accelerated container
+    *   **Open WebUI** — web chat interface (port 3000)
+    *   **Ollama CLI** — interactive terminal chat
+    *   **code-server** — VS Code in the browser with Continue/Cline AI extensions
+    *   **llm** — lightweight CLI for LLM research
+    *   **ollama-bench.py** — model benchmarking with timing stats
+*   **JupyterLab Integration**: Claude, Codex, Gemini, and Ollama appear as launcher icons — click to open a terminal running the agent.
 *   **Vector Database**: **ChromaDB** for embeddings and RAG experiments.
-*   **GPU Support**: NVIDIA CUDA support for accelerated inference (optional).
-*   **Package Management**: **uv** for Python packages, **npm** for Gemini CLI.
-*   **Development Tools**: `git`, `build-essential`, `rustc`, `cargo` (via apt).
+*   **GPU Support**: NVIDIA CUDA for accelerated inference. GPU monitoring via `nvtop`.
+*   **Package Management**: **uv** for Python packages. All external binaries pre-cached via `make fetch`.
+*   **Development Tools**: `git`, `build-essential`, `rustc`, `cargo`, `vim` (via apt).
 *   **Runtime**: Optimized for **Podman** (supports rootless mode) but fully compatible with Docker. Both can be auto-installed via bootstrap.
 *   **Multi-Cloud Deployment**: AWS, Azure, and GCP via Terraform and Kubernetes.
 
@@ -187,19 +192,85 @@ Requires `OPENAI_API_KEY` environment variable.
 
 ### Ollama (Local Models)
 
-The container connects to Ollama running on your host machine:
+Ollama runs in its own GPU-accelerated container, shared by all agent containers. No host install needed.
 
-1.  Install Ollama on host: https://ollama.ai
-2.  Start Ollama: `ollama serve`
-3.  Pull a model: `ollama pull llama3.2`
-4.  Use from container:
+```bash
+make cache-up                    # Start infrastructure (includes Ollama + Open WebUI)
+make ollama-pull MODEL=qwen3.5:9b  # Pull a model
+```
+
+**Interfaces:**
+
+| Interface | URL / Command | Description |
+|-----------|---------------|-------------|
+| Open WebUI | http://localhost:3000 | Web chat UI with model management |
+| Ollama API | http://localhost:11434 | REST API (OpenAI-compatible at /v1/) |
+| Terminal chat | `ollama run qwen3.5:9b` | Interactive CLI inside container |
+| code-server | VS Code icon in JupyterLab | IDE with Continue/Cline AI extensions |
+
+**Model management** (from host):
+
+```bash
+ollama.sh pull qwen3.5:27b      # Pull a model
+ollama.sh list                   # List downloaded models
+ollama.sh loaded                 # Show models in GPU VRAM
+ollama.sh load qwen3.5:9b       # Load model into GPU
+ollama.sh unload                 # Unload all models from GPU
+ollama.sh gpu                    # GPU status (nvidia-smi)
+ollama.sh top                    # Live GPU monitor (nvtop)
+```
+
+**Or via Make targets:**
+
+```bash
+make ollama-pull MODEL=qwen3.5:9b
+make ollama-list
+make ollama-unload
+make ollama-status
+```
+
+**Python SDK:**
 
 ```python
 import ollama
-response = ollama.chat(model='llama3.2', messages=[
+response = ollama.chat(model='qwen3.5:9b', messages=[
     {'role': 'user', 'content': 'Hello'}
 ])
 ```
+
+**OpenAI-compatible API:**
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://devai-ollama:11434/v1", api_key="ollama")
+response = client.chat.completions.create(
+    model="qwen3.5:9b", messages=[{"role": "user", "content": "Hello"}]
+)
+```
+
+**Benchmarking:**
+
+```bash
+python3 scripts/ollama-bench.py -m qwen3.5:9b "explain quicksort"
+python3 scripts/ollama-bench.py -m qwen3.5:27b  # auto-unloads previous model
+```
+
+**Auto-start at boot:** `make install-systemd`
+
+### code-server (VS Code in Browser)
+
+VS Code runs inside the container via code-server, accessible from JupyterLab's launcher (VS Code icon). Install AI coding extensions:
+
+*   **Continue** — AI chat and autocomplete with Ollama models
+*   **Cline** — autonomous coding agent with file/terminal access
+
+Configure Continue in `~/.continue/config.yaml` (template at `config/continue/config.yaml`).
+
+For full extension functionality (webviews), use mkcert for trusted HTTPS:
+1.  Install `mkcert` on the browser workstation
+2.  `mkcert -install && mkcert <server-IP>`
+3.  Copy certs to `~/devai-home/.jupyter/ssl/`
+4.  Container auto-detects and enables HTTPS
 
 ### ChromaDB (Vector Database)
 
@@ -337,7 +408,8 @@ See [Selective Installation Options](#selective-installation-options) in Appendi
 | `make run` | Run container with JupyterLab (CPU) |
 | `make run-gpu` | Run container with JupyterLab (GPU) |
 | `make shell` | Interactive shell without JupyterLab |
-| `make install` | Install `devai.sh` standalone launcher to `~/.local/bin` |
+| `make install` | Install `devai.sh` + `ollama.sh` to `~/.local/bin` |
+| `make install-systemd` | Enable infrastructure auto-start at boot |
 | `make compose-up` | Start services with Docker Compose |
 | `make compose-up-gpu` | Start with GPU support |
 | `make compose-down` | Stop and remove containers |
@@ -352,6 +424,11 @@ See [Selective Installation Options](#selective-installation-options) in Appendi
 | `make clean-gpu` | Remove lab image (GPU) |
 | `make clean-base` | Remove base image (CPU) |
 | `make clean-home` | Remove persistent home volume |
+| `make fetch` | Download external dependencies to local cache |
+| `make ollama-pull` | Pull Ollama model (`MODEL=llama3.2`) |
+| `make ollama-list` | List downloaded Ollama models |
+| `make ollama-unload` | Unload all models from GPU VRAM |
+| `make ollama-status` | Show Ollama container status + loaded models |
 | `make clean-all` | Remove all CPU images and home volume |
 | `make prune` | Clean up dangling images |
 | `make config-generate` | Generate configs from YAML profiles |
@@ -370,7 +447,8 @@ See [Selective Installation Options](#selective-installation-options) in Appendi
 | `HOME_VOLUME` | `devai-lab-home` | Named volume for persistent home directory |
 | `CONTAINER_RUNTIME` | `podman` | Container runtime for running containers and installation preference |
 | `PORT` | `8888` | JupyterLab port |
-| `OLLAMA_HOST` | `http://host.containers.internal:11434` | Ollama server URL |
+| `OLLAMA_HOST` | `http://devai-ollama:11434` | Ollama server URL |
+| `OLLAMA_DEFAULT_MODEL` | `llama3.2` | Default model for interactive chat |
 | `HTTP_PROXY` / `HTTPS_PROXY` | - | Proxy settings |
 
 ### Cloud Tools Configuration

@@ -1,0 +1,15 @@
+[Unit]
+Description=DevAI Infrastructure (caches + Ollama + Open WebUI)
+Requires=podman.socket
+After=podman.socket
+
+[Service]
+Type=oneshot
+RemainAfterExit=true
+WorkingDirectory=%h/.config/devai
+ExecStart=/usr/bin/podman compose up -d
+ExecStop=/usr/bin/podman compose down
+TimeoutStartSec=600
+
+[Install]
+WantedBy=default.target

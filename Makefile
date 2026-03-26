@@ -11,8 +11,12 @@ PORT ?= 8888
 HOST_IP ?= $(shell hostname -I | awk '{print $$1}')
 HOST_HOME_DIR ?=
 HOME_VOLUME ?= $(IMAGE_NAME)-home
-OLLAMA_HOST ?= http://host.containers.internal:11434
 NO_PROXY ?=
+
+# Ollama settings
+OLLAMA_CONTAINER ?= devai-ollama
+DEVAI_NETWORK ?= devai-net
+OLLAMA_HOST ?= http://$(OLLAMA_CONTAINER):11434
 
 # Cache settings
 CACHE_DIR ?= /var/cache/devai
@@ -28,10 +32,11 @@ PROXY_BUILD_ARGS = \
 # APT proxy (base image only — apt is not used in the lab layer)
 APT_PROXY_ARG = --build-arg APT_PROXY=$(APT_PROXY)
 
-# Cache mount args (bind host cache dirs into build for pip/uv and npm)
+# Cache mount args (bind host cache dirs into build for pip/uv, npm, and binaries)
 CACHE_BUILD_ARGS = \
 	-v $(CACHE_DIR)/pip:/root/.cache/uv \
-	-v $(CACHE_DIR)/npm:/root/.npm
+	-v $(CACHE_DIR)/npm:/root/.npm \
+	-v $(CACHE_DIR)/pip/bin:/var/cache/bin:ro
 
 # Proxy runtime env (passed to all container runs)
 PROXY_RUN_ENV = \
@@ -89,6 +94,7 @@ COMPOSE_GPU_FILE = $(COMPOSE_DIR)/docker-compose.gpu.yml
 PROFILE ?= dev
 
 .PHONY: all build build-gpu build-base build-base-gpu rebuild rebuild-gpu run run-gpu clean clean-gpu clean-base clean-base-gpu clean-home clean-all prune shell help install
+.PHONY: ollama-pull ollama-list ollama-status install-systemd fetch
 .PHONY: compose-up compose-up-gpu compose-down compose-logs compose-build compose-ps
 .PHONY: cache-up cache-down cache-status cache-clean
 .PHONY: config-generate
@@ -101,6 +107,57 @@ PROFILE ?= dev
 .PHONY: setup-runtime setup-runtime-podman setup-runtime-docker
 
 all: help
+
+# =============================================================================
+# Fetch external dependencies to local cache (run once)
+# =============================================================================
+
+fetch-clean: ## Remove cached binaries (forces re-download on next fetch)
+	rm -rf $(CACHE_DIR)/pip/bin/*
+	@echo "Cache cleared. Run 'make fetch' to re-download."
+
+fetch: ## Download all external binaries and packages to local cache
+	@mkdir -p $(CACHE_DIR)/pip/bin/gemini
+	@if [ -f $(CACHE_DIR)/pip/bin/claude ]; then echo "Claude Code: cached"; else \
+		echo "Fetching Claude Code..." \
+		&& ARCH=$$(dpkg --print-architecture) \
+		&& case "$$ARCH" in amd64) CC_PLATFORM=linux-x64;; arm64) CC_PLATFORM=linux-arm64;; esac \
+		&& CC_BUCKET="https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases" \
+		&& CC_VERSION=$$(curl -fsSL "$$CC_BUCKET/latest") \
+		&& curl -fsSL -o $(CACHE_DIR)/pip/bin/claude "$$CC_BUCKET/$$CC_VERSION/$$CC_PLATFORM/claude" \
+		&& chmod +x $(CACHE_DIR)/pip/bin/claude; fi
+	@if [ -f $(CACHE_DIR)/pip/bin/codex ]; then echo "OpenAI Codex: cached"; else \
+		echo "Fetching OpenAI Codex..." \
+		&& ARCH=$$(dpkg --print-architecture) \
+		&& case "$$ARCH" in amd64) CODEX_ARCH=x86_64;; arm64) CODEX_ARCH=aarch64;; esac \
+		&& curl -fsSL "https://github.com/openai/codex/releases/latest/download/codex-$${CODEX_ARCH}-unknown-linux-musl.tar.gz" \
+		   | tar -xz -C $(CACHE_DIR)/pip/bin \
+		&& mv $(CACHE_DIR)/pip/bin/codex-$${CODEX_ARCH}-unknown-linux-musl $(CACHE_DIR)/pip/bin/codex; fi
+	@if [ -f $(CACHE_DIR)/pip/bin/ollama ]; then echo "Ollama CLI: cached"; else \
+		echo "Fetching Ollama CLI..." \
+		&& ARCH=$$(dpkg --print-architecture) \
+		&& case "$$ARCH" in amd64) OL_ARCH=amd64;; arm64) OL_ARCH=arm64;; esac \
+		&& curl -fsSL "https://github.com/ollama/ollama/releases/latest/download/ollama-linux-$${OL_ARCH}.tar.zst" \
+		   | tar --zstd -xf - -C $(CACHE_DIR)/pip/bin --strip-components=1 bin/ollama; fi
+	@if [ -f $(CACHE_DIR)/pip/bin/code-server/bin/code-server ]; then echo "code-server: cached"; else \
+		echo "Fetching code-server..." \
+		&& ARCH=$$(dpkg --print-architecture) \
+		&& case "$$ARCH" in amd64) CS_ARCH=amd64;; arm64) CS_ARCH=arm64;; esac \
+		&& CS_VERSION=$$(curl -fsSL https://api.github.com/repos/coder/code-server/releases/latest | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'].lstrip('v'))") \
+		&& mkdir -p $(CACHE_DIR)/pip/bin/code-server \
+		&& curl -fsSL "https://github.com/coder/code-server/releases/latest/download/code-server-$${CS_VERSION}-linux-$${CS_ARCH}.tar.gz" \
+		   | tar -xz -C $(CACHE_DIR)/pip/bin/code-server --strip-components=1; fi
+	@if [ -f $(CACHE_DIR)/pip/bin/uv ]; then echo "uv: cached"; else \
+		echo "Fetching uv..." \
+		&& curl -fsSL "https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-unknown-linux-gnu.tar.gz" \
+		   | tar -xz -C $(CACHE_DIR)/pip/bin --strip-components=1 uv-x86_64-unknown-linux-gnu/uv uv-x86_64-unknown-linux-gnu/uvx; fi
+	@if [ -d $(CACHE_DIR)/pip/bin/gemini/lib ]; then echo "Gemini CLI: cached"; else \
+		echo "Fetching Gemini CLI..." \
+		&& $(CONTAINER_RUNTIME) run --rm \
+			-v $(CACHE_DIR)/npm:/root/.npm \
+			-v $(CACHE_DIR)/pip/bin/gemini:/install \
+			docker.io/library/node:22-slim \
+			npm install -g --prefix /install @google/gemini-cli; fi
 
 build-base: ## Build base image with system packages and runtimes (CPU)
 	$(CONTAINER_RUNTIME) build --network=host \
@@ -117,14 +174,14 @@ build-base-gpu: ## Build base image with system packages and runtimes (GPU)
 		-f Dockerfile.base \
 		-t $(BASE_IMAGE_NAME)-gpu .
 
-build: build-base ## Build the container image (CPU)
+build: build-base fetch ## Build the container image (CPU)
 	$(CONTAINER_RUNTIME) build --network=host \
 		$(PROXY_BUILD_ARGS) \
 		$(CACHE_BUILD_ARGS) \
 		--build-arg BASE_IMAGE=$(BASE_IMAGE_NAME) \
 		-t $(IMAGE_NAME) .
 
-build-gpu: build-base-gpu ## Build the container image (GPU/CUDA)
+build-gpu: build-base-gpu fetch ## Build the container image (GPU/CUDA)
 	$(CONTAINER_RUNTIME) build --network=host \
 		$(PROXY_BUILD_ARGS) \
 		$(CACHE_BUILD_ARGS) \
@@ -132,14 +189,14 @@ build-gpu: build-base-gpu ## Build the container image (GPU/CUDA)
 		--build-arg GPU_BUILD=true \
 		-t $(IMAGE_NAME)-gpu .
 
-rebuild: ## Rebuild lab layer only (skip base, faster iteration)
+rebuild: fetch ## Rebuild lab layer only (skip base, faster iteration)
 	$(CONTAINER_RUNTIME) build --network=host \
 		$(PROXY_BUILD_ARGS) \
 		$(CACHE_BUILD_ARGS) \
 		--build-arg BASE_IMAGE=$(BASE_IMAGE_NAME) \
 		-t $(IMAGE_NAME) .
 
-rebuild-gpu: ## Rebuild lab layer only for GPU (skip base)
+rebuild-gpu: fetch ## Rebuild lab layer only for GPU (skip base)
 	$(CONTAINER_RUNTIME) build --network=host \
 		$(PROXY_BUILD_ARGS) \
 		$(CACHE_BUILD_ARGS) \
@@ -154,6 +211,7 @@ run: ## Run the container (CPU)
 	$(CONTAINER_RUNTIME) run -it --rm \
 		--name $(IMAGE_NAME) \
 		$(RUN_FLAGS) \
+		--network $(DEVAI_NETWORK) \
 		--add-host=host.containers.internal:host-gateway \
 		$(PROXY_RUN_ENV) \
 		-e OLLAMA_HOST=$(OLLAMA_HOST) \
@@ -175,6 +233,7 @@ run-gpu: ## Run the container (GPU/CUDA)
 		--name $(IMAGE_NAME)-gpu \
 		$(RUN_FLAGS) \
 		$(GPU_FLAGS) \
+		--network $(DEVAI_NETWORK) \
 		--add-host=host.containers.internal:host-gateway \
 		$(PROXY_RUN_ENV) \
 		-e OLLAMA_HOST=$(OLLAMA_HOST) \
@@ -192,6 +251,7 @@ shell: ## Start an interactive shell in the container
 	$(CONTAINER_RUNTIME) run -it --rm \
 		--name $(IMAGE_NAME)-shell \
 		$(RUN_FLAGS) \
+		--network $(DEVAI_NETWORK) \
 		--add-host=host.containers.internal:host-gateway \
 		$(PROXY_RUN_ENV) \
 		-e OLLAMA_HOST=$(OLLAMA_HOST) \
@@ -233,6 +293,7 @@ help: ## Show this help message
 	@echo "   \033[2m(See README.md Appendix A for selective installation options)\033[0m"
 	@echo ""
 	@echo "\033[1;33m2. BUILD CONTAINER IMAGES\033[0m"
+	@echo "   \033[36mfetch\033[0m                      Download external dependencies to cache (run once)"
 	@echo "   \033[36mbuild\033[0m                      Build container image (CPU)"
 	@echo "   \033[36mbuild-gpu\033[0m                  Build container image (GPU/CUDA)"
 	@echo "   \033[36mcompose-build\033[0m              Build images with Docker Compose"
@@ -259,14 +320,18 @@ help: ## Show this help message
 	@echo "   \033[36mcompose-logs\033[0m               View container logs"
 	@echo "   \033[36mcompose-ps\033[0m                 Show running containers"
 	@echo ""
-	@echo "\033[1;33m5. BUILD CACHE\033[0m"
-	@echo "   \033[36mcache-up\033[0m                   Start caching proxies (apt + registry)"
-	@echo "   \033[36mcache-down\033[0m                 Stop caching proxies"
-	@echo "   \033[36mcache-status\033[0m               Show cache status and disk usage"
+	@echo "\033[1;33m5. INFRASTRUCTURE (caches + Ollama + Open WebUI)\033[0m"
+	@echo "   \033[36mcache-up\033[0m                   Start all infrastructure services"
+	@echo "   \033[36mcache-down\033[0m                 Stop all infrastructure services"
+	@echo "   \033[36mcache-status\033[0m               Show status and disk usage"
 	@echo "   \033[36mcache-clean\033[0m                Remove all cached data"
+	@echo "   \033[36mollama-pull\033[0m                 Pull Ollama model (MODEL=llama3.2)"
+	@echo "   \033[36mollama-list\033[0m                 List downloaded Ollama models"
+	@echo "   \033[36mollama-status\033[0m               Show Ollama container status"
 	@echo ""
 	@echo "\033[1;33m6. INSTALL\033[0m"
-	@echo "   \033[36minstall\033[0m                    Install devai.sh launcher to ~/.local/bin"
+	@echo "   \033[36minstall\033[0m                    Install devai.sh + ollama.sh to ~/.local/bin"
+	@echo "   \033[36minstall-systemd\033[0m            Enable auto-start at boot via systemd"
 	@echo ""
 	@echo "\033[1;33m7. MAINTENANCE\033[0m"
 	@echo "   \033[36mclean\033[0m                      Remove container image (CPU)"
@@ -283,46 +348,73 @@ help: ## Show this help message
 # Install
 # =============================================================================
 
-install: ## Install devai.sh launcher to ~/.local/bin
+install: ## Install devai.sh + ollama.sh to ~/.local/bin
 	@mkdir -p $(HOME)/.local/bin
 	cp scripts/devai.sh $(HOME)/.local/bin/devai.sh
-	chmod +x $(HOME)/.local/bin/devai.sh
-	@echo "Installed devai.sh to $(HOME)/.local/bin/devai.sh"
+	cp scripts/ollama.sh $(HOME)/.local/bin/ollama.sh
+	chmod +x $(HOME)/.local/bin/devai.sh $(HOME)/.local/bin/ollama.sh
+	@echo "Installed to $(HOME)/.local/bin: devai.sh, ollama.sh"
 
 # =============================================================================
-# Cache targets (apt-cacher-ng + registry pull-through)
+# Infrastructure services (caches + Ollama + Open WebUI)
 # =============================================================================
 
-cache-up: ## Start caching proxies (apt-cacher-ng + registry mirror)
+cache-up: ## Start infrastructure services (caches + Ollama + Open WebUI)
 	@if [ "$(CONTAINER_RUNTIME)" = "podman" ] && ! systemctl --user is-active --quiet podman.socket; then \
 		echo "Starting Podman API socket..."; \
 		systemctl --user enable --now podman.socket; \
 	fi
 	$(COMPOSE) -f $(CACHE_COMPOSE) up -d
-	@echo "Cache services started:"
+	@echo "Infrastructure services started:"
 	@echo "  apt-cacher-ng:     http://localhost:3142"
 	@echo "  Registry mirror:   http://localhost:5000"
+	@echo "  Ollama API:        http://localhost:11434"
+	@echo "  Open WebUI:        http://localhost:3000"
 	@echo ""
-	@echo "To use apt cache during builds, set in .env:"
-	@echo "  APT_PROXY=http://host.containers.internal:3142"
-	@echo ""
-	@echo "To use registry mirror, install Podman config:"
-	@echo "  cp deploy/cache/registries.conf ~/.config/containers/registries.conf"
+	@echo "To pull a model:  make ollama-pull MODEL=llama3.2"
 
-cache-down: ## Stop caching proxies
+cache-down: ## Stop infrastructure services
 	$(COMPOSE) -f $(CACHE_COMPOSE) down
 
-cache-status: ## Show cache service status and disk usage
+cache-status: ## Show infrastructure service status and disk usage
 	@$(COMPOSE) -f $(CACHE_COMPOSE) ps
 	@echo ""
 	@echo "Cache disk usage:"
 	@du -sh $(CACHE_DIR)/* 2>/dev/null || echo "  (empty)"
+	@echo ""
+	@echo "Ollama models:"
+	@$(CONTAINER_RUNTIME) exec $(OLLAMA_CONTAINER) ollama list 2>/dev/null || echo "  (ollama not running)"
 
 cache-clean: ## Remove all cached data (keeps volumes mounted)
 	$(COMPOSE) -f $(CACHE_COMPOSE) down
 	@echo "Cleaning cache directories..."
 	rm -rf $(CACHE_DIR)/registry/* $(CACHE_DIR)/apt/* $(CACHE_DIR)/pip/* $(CACHE_DIR)/npm/*
 	@echo "Cache cleaned."
+
+ollama-pull: ## Pull an Ollama model (usage: make ollama-pull MODEL=llama3.2)
+	$(CONTAINER_RUNTIME) exec $(OLLAMA_CONTAINER) ollama pull $(or $(MODEL),llama3.2)
+
+ollama-list: ## List downloaded Ollama models
+	@$(CONTAINER_RUNTIME) exec $(OLLAMA_CONTAINER) ollama list
+
+ollama-unload: ## Unload all models from GPU VRAM
+	@$(CONTAINER_RUNTIME) exec $(OLLAMA_CONTAINER) sh -c 'ollama ps | tail -n +2 | awk "{print \$$1}" | while read m; do [ -n "$$m" ] && ollama stop "$$m"; done'
+	@echo "All models unloaded from GPU"
+
+ollama-status: ## Show Ollama container status
+	@$(CONTAINER_RUNTIME) inspect -f '{{.State.Status}}' $(OLLAMA_CONTAINER) 2>/dev/null || echo "not running"
+	@$(CONTAINER_RUNTIME) exec $(OLLAMA_CONTAINER) ollama ps 2>/dev/null || true
+
+install-systemd: ## Install and enable systemd service for infrastructure
+	@mkdir -p $(HOME)/.config/devai $(HOME)/.config/systemd/user
+	cp deploy/cache/docker-compose.cache.yml $(HOME)/.config/devai/docker-compose.yml
+	cp deploy/cache/registry-config.yml $(HOME)/.config/devai/registry-config.yml
+	cp deploy/systemd/devai-infra.service $(HOME)/.config/systemd/user/
+	systemctl --user daemon-reload
+	systemctl --user enable --now podman.socket
+	systemctl --user enable --now devai-infra.service
+	loginctl enable-linger $(USER)
+	@echo "Installed to $(HOME)/.config/devai/ and enabled devai-infra.service"
 
 # =============================================================================
 # Compose targets

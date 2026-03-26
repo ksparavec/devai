@@ -27,6 +27,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     bubblewrap \
     build-essential \
+    nvtop \
+    vim \
+    zstd \
     rustc \
     cargo \
     python3 \
@@ -36,9 +39,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && rm -f /etc/apt/apt.conf.d/00cache /etc/apt/apt.conf.d/99proxy
 
-# Install uv (Python package manager) -> /usr/local/bin/uv
-RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh \
-    && rm -rf /root/.cache
 
 # Install Node.js 22 LTS (binary tarball) -> /usr/local/bin/node, /usr/local/bin/npm
 RUN NODE_VERSION=22.16.0 \
@@ -53,4 +53,4 @@ RUN ln -sf /usr/bin/python3 /usr/local/bin/python \
     && ln -sf /usr/bin/pip3 /usr/local/bin/pip
 
 # Verify all tools are on PATH
-RUN python --version && pip --version && uv --version && node --version && npm --version
+RUN python --version && pip --version && node --version && npm --version

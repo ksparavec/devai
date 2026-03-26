@@ -10,9 +10,27 @@ ARG HTTPS_PROXY
 ARG NO_PROXY
 ARG GPU_BUILD=false
 
-ENV OLLAMA_HOST=http://host.containers.internal:11434
+ENV OLLAMA_HOST=http://devai-ollama:11434
+ENV OLLAMA_URL=http://devai-ollama:11434
+ENV OLLAMA_DEFAULT_MODEL=llama3.2
 ENV UV_BREAK_SYSTEM_PACKAGES=1
 ENV PATH="/home/devai/.local/bin:${PATH}"
+
+# --- Binary installs (from local cache, populated by: make fetch) ---
+
+# Install CLI binaries (pre-downloaded to /var/cache/bin/ via cache mount)
+RUN cp /var/cache/bin/uv /var/cache/bin/uvx /var/cache/bin/claude /var/cache/bin/codex /var/cache/bin/ollama /usr/local/bin/ \
+    && chmod +x /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/claude /usr/local/bin/codex /usr/local/bin/ollama
+
+# Install code-server (pre-downloaded)
+RUN cp -a /var/cache/bin/code-server /usr/local/lib/code-server \
+    && ln -s /usr/local/lib/code-server/bin/code-server /usr/local/bin/code-server
+
+# Install Gemini CLI (pre-installed by: make fetch)
+RUN cp -a /var/cache/bin/gemini/lib/node_modules/@google /usr/local/lib/node_modules/ \
+    && ln -sf ../lib/node_modules/@google/gemini-cli/bin/gemini.js /usr/local/bin/gemini
+
+# --- Package installs (change more often, cached after binaries) ---
 
 # Install PyTorch (CPU-only for CPU builds, full CUDA for GPU builds)
 # Host cache dirs are bind-mounted via -v at build time (see Makefile)
@@ -27,38 +45,22 @@ RUN if [ "$GPU_BUILD" = "true" ]; then \
 COPY .default-python-packages /tmp/.default-python-packages
 RUN uv pip install --system -r /tmp/.default-python-packages
 
-# Install Claude Code (binary from official distribution)
-RUN ARCH=$(dpkg --print-architecture) \
-    && case "$ARCH" in amd64) CC_PLATFORM=linux-x64;; arm64) CC_PLATFORM=linux-arm64;; *) echo "Unsupported arch: $ARCH" && exit 1;; esac \
-    && CC_BUCKET="https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases" \
-    && CC_VERSION=$(curl -fsSL "$CC_BUCKET/latest") \
-    && curl -fsSL -o /usr/local/bin/claude "$CC_BUCKET/$CC_VERSION/$CC_PLATFORM/claude" \
-    && chmod +x /usr/local/bin/claude
-
-# Install OpenAI Codex (prebuilt binary from GitHub releases)
-RUN ARCH=$(dpkg --print-architecture) \
-    && case "$ARCH" in amd64) CODEX_ARCH=x86_64;; arm64) CODEX_ARCH=aarch64;; *) echo "Unsupported arch: $ARCH" && exit 1;; esac \
-    && curl -fsSL "https://github.com/openai/codex/releases/latest/download/codex-${CODEX_ARCH}-unknown-linux-musl.tar.gz" \
-       | tar -xz -C /usr/local/bin \
-    && mv /usr/local/bin/codex-${CODEX_ARCH}-unknown-linux-musl /usr/local/bin/codex
-
-# Install npm packages (Gemini CLI)
-COPY .default-npm-packages /tmp/.default-npm-packages
-RUN xargs npm install -g < /tmp/.default-npm-packages
-
-# Install JupyterLab AI launcher extension (build JS directly, skip pip isolation)
-COPY packages/jupyter-ai-launchers /tmp/jupyter-ai-launchers
-RUN cd /tmp/jupyter-ai-launchers \
-    && jlpm install \
-    && jlpm run build:prod \
-    && cp -r jupyter_ai_launchers/labextension /usr/local/share/jupyter/labextensions/jupyter-ai-launchers \
-    && rm -rf /tmp/jupyter-ai-launchers
-
 # Install optional project-specific dependencies
 COPY requirements.txt* /tmp/
 RUN if [ -f /tmp/requirements.txt ]; then \
         uv pip install --system -r /tmp/requirements.txt; \
     fi && rm -f /tmp/requirements.txt
+
+# --- JupyterLab extension (depends on jupyterlab being installed above) ---
+
+# Install JupyterLab AI launcher extension (pre-built)
+COPY packages/jupyter-ai-launchers/jupyter_ai_launchers/labextension /usr/local/share/jupyter/labextensions/jupyter-ai-launchers
+
+# --- Runtime setup ---
+
+# Install ollama-chat wrapper for JupyterLab launcher
+COPY scripts/ollama-chat.sh /usr/local/bin/ollama-chat
+RUN chmod +x /usr/local/bin/ollama-chat
 
 # Create user and directories (handle GID/UID conflicts in GPU base images)
 RUN getent group 1000 >/dev/null || groupadd -g 1000 devai \
@@ -67,6 +69,8 @@ RUN getent group 1000 >/dev/null || groupadd -g 1000 devai \
     && ln -s /usr/local/bin/claude /home/devai/.local/bin/claude \
     && ln -s /usr/local/bin/codex /home/devai/.local/bin/codex \
     && ln -s /usr/local/bin/gemini /home/devai/.local/bin/gemini \
+    && ln -s /usr/local/bin/ollama /home/devai/.local/bin/ollama \
+    && ln -s /usr/local/bin/code-server /home/devai/.local/bin/code-server \
     && chown -R 1000:1000 /home/devai
 
 # Copy entrypoint script
