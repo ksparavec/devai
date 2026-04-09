@@ -1,0 +1,14 @@
+# gpu-arbiter router — routes LLM requests between Ollama and vLLM
+# with GPU exclusion management.
+#
+# Build: podman build -f deploy/Dockerfile.router -t devai-router .
+
+FROM docker.io/library/golang:1.23-bookworm AS build
+WORKDIR /src
+COPY gpu-arbiter/ .
+RUN go mod tidy && CGO_ENABLED=0 go build -ldflags="-s -w" -o /gpu-arbiter .
+
+FROM gcr.io/distroless/static-debian12
+COPY --from=build /gpu-arbiter /gpu-arbiter
+EXPOSE 11434
+ENTRYPOINT ["/gpu-arbiter"]

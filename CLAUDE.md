@@ -4,113 +4,100 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is **Dev AI Lab** - a containerized development environment for AI experimentation featuring JupyterLab and multiple AI CLIs (Gemini, Claude, OpenAI, Ollama). Built on Debian Trixie with Python 3.13 (apt), Node.js 22 LTS, and uv. Two-layer image build for fast iteration. Compatible with Podman and Docker. GPU/CUDA support available for local model inference.
+This is **Dev AI Lab** — a containerized development environment for AI experimentation featuring JupyterLab and multiple AI CLIs (Gemini, Claude, OpenAI, Ollama). Built on Debian Trixie with Python 3.13 (uv-managed), Node.js 22 LTS. Two-layer image build for fast iteration. Compatible with Podman and Docker. GPU/CUDA support with automatic GPU arbitration between Ollama (GGUF) and vLLM (NVFP4) backends.
 
 ## Build and Run Commands
 
 ```bash
-# First time: build both layers
-make build          # Build base + lab image (CPU)
-make build-gpu      # Build base + lab image (GPU/CUDA)
-
-# Fast iteration: rebuild lab layer only (skips base)
-make rebuild        # Rebuild lab image (CPU)
-make rebuild-gpu    # Rebuild lab image (GPU)
+# Build
+make build-cpu       # Build base + lab image (CPU)
+make build-gpu       # Build base + lab image (GPU/CUDA)
+make build-router    # Build gpu-arbiter router image
+make build           # Build all (CPU + GPU + router)
 
 # Run
-make run            # Run JupyterLab
-make run-gpu        # Run with GPU acceleration
-make shell          # Interactive shell without JupyterLab
+make lab-gpu         # Run JupyterLab with GPU
+make lab-cpu         # Run JupyterLab CPU-only
+make shell-gpu       # Interactive shell (GPU)
+make shell-cpu       # Interactive shell (CPU)
 
-# Standalone launcher (GPU, auto-detects free port, names container after git repo)
-make install        # Install devai.sh + ollama.sh to ~/.local/bin
-devai.sh            # Run from any git repo
+# Infrastructure
+make cache-up        # Start all services (Ollama, vLLM, router, Open WebUI)
+make cache-down      # Stop all services
+make cache-status    # Show status, models, disk usage
 
-# Infrastructure (Ollama + Open WebUI + caches)
-make cache-up       # Start all infrastructure services
-make cache-down     # Stop all infrastructure services
-make ollama-pull MODEL=llama3.2  # Pull a model
-make ollama-list    # List downloaded models
-make ollama-unload  # Unload all models from GPU VRAM
-make install-systemd  # Enable auto-start at boot
+# Models
+make ollama-list     # List Ollama (GGUF) models with status
+make ollama-pull     # Pull all Ollama models from models.yaml
+make vllm-list       # List vLLM (NVFP4) models with status
+make vllm-pull       # Download all vLLM models from HuggingFace
 
-# Cleanup
-make clean          # Remove lab image
-make clean-base     # Remove base image
-make clean-home     # Remove persistent home volume
-make clean-all      # Remove all (images + home volume)
-make help           # Show all targets
+# Maintenance
+make clean           # Remove all images (CPU + GPU + router)
+make prune           # Prune dangling images
+make help            # Show all targets
 ```
 
 ## Configuration
 
 Copy `.env.example` to `.env` before first use. Key settings:
 
-- `HOST_HOME_DIR` - Host home directory — enables .gitconfig and .ssh in container
-- `HOST_WORK_DIR` - Working directory mounted to /home/devai/work (default: current dir)
-- `HOME_VOLUME` - Named volume for persistent /home/devai (default: devai-lab-home)
-- `CONTAINER_RUNTIME` - `podman` (default) or `docker`
-- `PORT` - JupyterLab port (default: 8888)
-- `OLLAMA_HOST` - Ollama server URL (default: containerized at devai-ollama:11434)
-- `OLLAMA_DEFAULT_MODEL` - Default model for interactive chat (default: llama3.2)
-- `JUPYTER_TOKEN` - Fixed JupyterLab access token (default: devai)
-- `HTTP_PROXY`/`HTTPS_PROXY` - Proxy settings for corporate environments
+- `LAB_PORT` — JupyterLab port (default: 8888)
+- `WEBUI_PORT` — Open WebUI HTTPS port (default: 8443)
+- `CONTAINER_RUNTIME` — `podman` (default) or `docker`
+- `HOST_HOME_DIR` — Host home directory for .gitconfig/.ssh mounting
+- `HOME_VOLUME` — Persistent home directory path
+- `JUPYTER_TOKEN` — Fixed JupyterLab access token
+- `HTTP_PROXY`/`HTTPS_PROXY` — Proxy settings for corporate environments
 
-To add Python packages, create `requirements.txt` from `requirements.txt.example` and rebuild.
+Model catalog is in `deploy/models.yaml` (single source of truth for all models).
 
 ## Architecture
 
+### Lab container (devai-lab-cpu / devai-lab-gpu)
+
 Two-layer image build (base rarely changes, lab layer for fast iteration):
 
-### Layer 1: Dockerfile.base (devai-base)
-- **apt-get**: Debian Trixie full, Python 3.13, compilers (build-essential, rustc, cargo), system utilities (curl, git, gosu, vim, nvtop, zstd)
-- **uv**: Python package manager (installed via astral.sh)
-- **Node.js 22 LTS**: Installed from official binary tarball
+**Layer 1: Dockerfile.base** — System packages, Python 3.13 (via uv), Node.js 22 LTS
+**Layer 2: Dockerfile.lab** — CLI binaries (Claude, Codex, Ollama, Gemini, code-server), PyTorch, Python packages, JupyterLab
 
-### Layer 2: Dockerfile (devai-lab)
-- **Binary installs** (from local cache, populated by `make fetch`):
-  - **Claude Code**: Binary from official distribution (claude.ai)
-  - **OpenAI Codex**: Prebuilt binary from GitHub releases
-  - **Ollama CLI**: Client binary (connects to containerized Ollama server)
-  - **code-server**: VS Code in the browser (with jupyter-vscode-proxy integration)
-  - **Google Gemini CLI**: Pre-installed npm package
-- **PyTorch**: CPU-only or CUDA (controlled by GPU_BUILD arg)
-- **.default-python-packages**: jupyterlab, openai, ollama, chromadb, llm, jupyter-server-proxy, jupyter-vscode-proxy, ML/data science stack
-- **jupyter-ai-launchers**: JupyterLab extension adding Claude, Codex, Gemini, Ollama to launcher (pre-built)
-- **requirements.txt**: Optional project-specific Python packages
-- **entrypoint.sh**: Copies host config (.gitconfig, .ssh) from staging mount; auto-detects SSL certs (mkcert); for Docker, remaps UID/GID and uses `gosu` to drop privileges
+Build cache: CLI binaries pre-downloaded to `/var/cache/devai/pip/bin/` via `make fetch-cli` (ETag-based updates). Mounted into build — no network downloads during rebuild.
 
-### Build cache (`make fetch`)
-All external binaries are pre-downloaded to `/var/cache/devai/pip/bin/` and mounted into the build. No network downloads during `make rebuild`. The `fetch` target is a dependency of all build targets.
+### Inference stack (deploy/docker-compose.yaml)
 
-### Runtime volumes
-- **Named volume** (`HOME_VOLUME`): Persistent `/home/devai` — survives container restarts
-- **Bind mount**: `HOST_WORK_DIR` → `/home/devai/work`
-- **Staging mount**: Host `.gitconfig`/`.ssh` → `/tmp/host-config/` (copied into home by entrypoint)
+```
+Client → devai-router:11434 [gpu-arbiter, 9 MB Go binary]
+              ├─ GGUF model → devai-ollama:11434 (always running, auto load/unload)
+              └─ NVFP4 model → devai-vllm:11434 (container auto-created per model)
+```
 
-### User identity
-- **Podman (rootless)**: Runs as container root (= host user). No user switching needed.
-- **Docker**: Entrypoint remaps `devai` user to host UID/GID via `gosu`. Handles UID conflicts in GPU base images.
+- **devai-router** — Routes by model name (NVFP4 → vLLM, everything else → Ollama). Manages GPU exclusion: unloads Ollama before starting vLLM, stops vLLM on GGUF request or idle timeout. Translates Ollama API ↔ OpenAI API for vLLM. Recreates vLLM container with correct model on switch.
+- **devai-ollama** — Unmodified `ollama/ollama:latest`. GGUF models, GPU auto-detected. `OLLAMA_MAX_LOADED_MODELS=1` ensures clean model switching.
+- **devai-vllm** — `vllm/vllm-openai` image. NVFP4 models for Blackwell GPUs. Container lifecycle managed by router via Podman API.
+- **devai-webui-proxy** — nginx TLS proxy for Open WebUI (mkcert certs or self-signed fallback).
+- **devai-open-webui** — Web chat interface, sees all models (Ollama + vLLM) via router.
 
-### Infrastructure services (docker-compose.cache.yml)
-- **apt-cacher-ng**: APT package cache (port 3142)
-- **Registry mirror**: Docker Hub pull-through cache (port 5000)
-- **Ollama**: Local LLM server with GPU support (port 11434, `/var/cache/devai/ollama` bind mount)
-- **Open WebUI**: Web chat interface for Ollama (port 3000, `/var/cache/devai/open-webui` bind mount)
-- All services share `devai-net` network; agent containers join the same network
-- All data stored on LVM thin-provisioned volumes under `/var/cache/devai/`
+### Supporting services
 
-Managed via `make cache-up`/`cache-down` or systemd (`make install-systemd`).
-Installed to `~/.config/devai/` (independent of repo location).
+- **apt-cacher-ng** — APT package cache (port 3142)
+- **Registry mirror** — Docker Hub pull-through cache (port 5000)
+
+All services share `devai-net` network. Model data stored under `/var/cache/devai/`.
 
 ### SSL / HTTPS
-- Entrypoint auto-detects mkcert certificates in `~/.jupyter/ssl/`
-- Looks for `<HOST_IP>.pem` or `cert.pem`
-- HTTPS enables secure context for code-server webviews (Continue, Cline extensions)
-- Generate with `mkcert <IP>` on the browser workstation, copy to container host
 
-### Scripts
-- **devai.sh**: Standalone GPU launcher — auto-detects free port, names container after git repo, joins devai-net, passes OLLAMA_HOST/JUPYTER_TOKEN
-- **ollama.sh**: Model and GPU management — pull/list/rm/load/unload/gpu/top
-- **ollama-chat.sh**: Wrapper for JupyterLab launcher — runs `interpreter` with default model
-- **ollama-bench.py**: Quick model benchmarking with timing stats
+- JupyterLab: auto-detects mkcert certs in `~/.jupyter/ssl/`
+- Open WebUI: nginx proxy with mkcert certs or self-signed fallback
+- Generate with `mkcert <IP>` on browser workstation, copy to container host
+
+### Key files
+
+```
+deploy/models.yaml            — Model catalog (ollama + vllm models)
+deploy/docker-compose.yaml    — Infrastructure services
+deploy/Dockerfile.base        — Base image
+deploy/Dockerfile.lab         — Lab image
+deploy/Dockerfile.router      — Router image (distroless, 9 MB)
+gpu-arbiter/main.go           — Router source (~400 lines Go)
+tests/test-router.sh          — Integration tests
+```

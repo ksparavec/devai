@@ -1,0 +1,42 @@
+# Jupyter
+jupyterlab
+ipywidgets
+
+# AI providers
+openai
+ollama
+open-interpreter
+chromadb
+llm
+jupyter-server-proxy
+jupyter-vscode-proxy
+
+# Core ML/Data Science
+numpy
+pandas
+scipy
+scikit-learn
+matplotlib
+seaborn
+
+# Deep Learning (CPU-compatible)
+transformers
+datasets
+accelerate
+
+# NLP
+nltk
+spacy
+
+# Computer Vision
+pillow
+opencv-python
+
+# Utilities
+httpx<0.28
+tqdm
+requests
+python-dotenv
+pyyaml
+jsonlines
+pydantic

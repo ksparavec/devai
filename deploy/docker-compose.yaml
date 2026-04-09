@@ -1,0 +1,115 @@
+services:
+  apt-cache:
+    image: sameersbn/apt-cacher-ng:latest
+    container_name: devai-apt-cache
+    hostname: apt-cache
+    ports:
+      - "3142:3142"
+    volumes:
+      - /var/cache/devai/apt:/var/cache/apt-cacher-ng
+    restart: unless-stopped
+
+  registry-cache:
+    image: registry:2
+    container_name: devai-registry-cache
+    hostname: registry-cache
+    ports:
+      - "5000:5000"
+    volumes:
+      - /var/cache/devai/registry:/var/lib/registry
+      - ./registry-config.yaml:/etc/docker/registry/config.yml:ro
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: devai-ollama
+    hostname: ollama
+    environment:
+      - OLLAMA_KEEP_ALIVE=${OLLAMA_KEEP_ALIVE:-300s}
+      - OLLAMA_MAX_LOADED_MODELS=1
+    volumes:
+      - /var/cache/devai/ollama:/root/.ollama
+    devices:
+      - nvidia.com/gpu=all
+    security_opt:
+      - label=disable
+    restart: unless-stopped
+
+  vllm:
+    image: vllm/vllm-openai:latest-cu130-ubuntu2404
+    container_name: devai-vllm
+    hostname: vllm
+    volumes:
+      - /var/cache/devai/ollama/models/vllm:/models:ro
+    entrypoint: ["python3", "-m", "vllm.entrypoints.openai.api_server",
+      "--model", "${VLLM_MODEL_PATH:-/models/NVIDIA-Nemotron-Nano-9B-v2-NVFP4}",
+      "--host", "0.0.0.0",
+      "--port", "11434",
+      "--tensor-parallel-size", "1",
+      "--max-model-len", "${VLLM_CTX_LEN:-16384}",
+      "--gpu-memory-utilization", "${VLLM_GPU_UTIL:-0.95}",
+      "--trust-remote-code",
+      "--served-model-name", "${VLLM_MODEL_NAME:-NVIDIA-Nemotron-Nano-9B-v2-NVFP4}"]
+    devices:
+      - nvidia.com/gpu=all
+    security_opt:
+      - label=disable
+    restart: "no"
+
+  router:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.router
+    image: devai-router:latest
+    container_name: devai-router
+    hostname: router
+    environment:
+      - OLLAMA_URL=http://ollama:11434
+      - VLLM_URL=http://vllm:11434
+      - VLLM_CONTAINER=devai-vllm
+      - VLLM_PATTERNS=NVFP4,nvfp4
+      - VLLM_IMAGE=docker.io/vllm/vllm-openai:latest-cu130-ubuntu2404
+      - VLLM_MODELS_DIR=/var/cache/devai/ollama/models/vllm
+      - VLLM_NETWORK=devai-net
+      - IDLE_TIMEOUT=${VLLM_IDLE_TIMEOUT:-300}
+      - PODMAN_SOCKET=/run/podman/podman.sock
+    volumes:
+      - ${XDG_RUNTIME_DIR:-/run/user/1000}/podman/podman.sock:/run/podman/podman.sock
+      - ./models.yaml:/etc/devai/models.yaml:ro
+    depends_on:
+      - ollama
+    restart: unless-stopped
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: devai-open-webui
+    hostname: open-webui
+    environment:
+      - OLLAMA_BASE_URL=http://router:11434
+    volumes:
+      - /var/cache/devai/open-webui:/app/backend/data
+    depends_on:
+      - router
+    restart: unless-stopped
+
+  webui-proxy:
+    image: docker.io/library/nginx:alpine
+    container_name: devai-webui-proxy
+    hostname: webui-proxy
+    ports:
+      - "${WEBUI_PORT:-8443}:443"
+    environment:
+      - HOST_IP=${HOST_IP:-localhost}
+    volumes:
+      - ./webui-proxy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./webui-proxy/entrypoint.sh:/entrypoint.sh:ro
+      - ${HOME}/devai-home/.jupyter/ssl:/ssl:ro
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
+    depends_on:
+      - open-webui
+    restart: unless-stopped
+
+networks:
+  default:
+    name: devai-net
+    external: true

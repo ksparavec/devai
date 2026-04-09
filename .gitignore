@@ -95,3 +95,4 @@ config/secrets.yaml
 !deploy/compose/.env.example
 !deploy/terraform/**/terraform.tfvars.example
 !config/secrets.example.yaml
+.claude/

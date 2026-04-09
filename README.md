@@ -1,568 +1,321 @@
-
 # Dev AI Lab
 
-A containerized environment designed for AI experimentation and development, featuring **JupyterLab** and multiple AI CLIs. This setup provides a consistent, isolated workspace with essential tools pre-installed.
+**Run AI models entirely on your own hardware.** No cloud APIs, no data leaving your network, no per-token costs.
+
+Dev AI Lab is a containerized development environment that brings together JupyterLab, multiple AI coding assistants, and local model inference into a single, reproducible setup. It runs open-weight LLMs on your GPU — from 4B parameter models for quick tasks to 70B models for complex reasoning — all served through a unified API with automatic GPU management.
+
+### Why local inference?
+
+Cloud AI services (ChatGPT, Claude API, Gemini API) are convenient but come with trade-offs that matter in professional settings:
+
+- **Data sovereignty** — your code, documents, and conversations never leave your machine. No third-party data processing agreements needed. No risk of training data leakage.
+- **Regulatory compliance** — meet data residency requirements (GDPR, HIPAA, financial regulations) without complex cloud configurations. The data stays where you control it.
+- **Cost predictability** — no per-token billing, no surprise invoices. One-time hardware investment, unlimited inference. A single GPU pays for itself after a few months of heavy API usage.
+- **No internet dependency** — works offline, on air-gapped networks, behind restrictive firewalls. Essential for secure environments and field work.
+- **Full control** — choose your models, quantization, context length, and serving parameters. No vendor lock-in, no deprecated APIs, no terms-of-service changes.
+- **Privacy by design** — conversations with AI about proprietary code, internal architecture, or sensitive business logic stay completely private.
+
+Dev AI Lab makes local inference practical by handling the operational complexity: container builds, model management, GPU arbitration between multiple backends, and a web chat UI — all through a single `make` command.
+
+For tasks where cloud AI is appropriate, the JupyterLab environment also includes **Claude Code**, **OpenAI Codex**, and **Google Gemini CLI** — giving you the flexibility to use local models for sensitive work and cloud models when you need their capabilities, all from the same workspace.
 
 ## Features
 
-*   **Base Environment**: Debian Trixie with Python 3.13, Node.js 22 LTS, uv.
-*   **Interactive Computing**: **JupyterLab** pre-installed and configured.
-*   **AI Agents (cloud)**:
-    *   **Claude Code CLI** (native binary from claude.ai)
-    *   **OpenAI Codex CLI** (prebuilt binary from GitHub releases)
-    *   **Google Gemini CLI** (pre-installed npm package)
-*   **AI Agents (local — Ollama)**:
-    *   **Ollama server** in its own GPU-accelerated container
-    *   **Open WebUI** — web chat interface (port 3000)
-    *   **Ollama CLI** — interactive terminal chat
-    *   **code-server** — VS Code in the browser with Continue/Cline AI extensions
-    *   **llm** — lightweight CLI for LLM research
-    *   **ollama-bench.py** — model benchmarking with timing stats
-*   **JupyterLab Integration**: Claude, Codex, Gemini, and Ollama appear as launcher icons — click to open a terminal running the agent.
-*   **Vector Database**: **ChromaDB** for embeddings and RAG experiments.
-*   **GPU Support**: NVIDIA CUDA for accelerated inference. GPU monitoring via `nvtop`.
-*   **Package Management**: **uv** for Python packages. All external binaries pre-cached via `make fetch`.
-*   **Development Tools**: `git`, `build-essential`, `rustc`, `cargo`, `vim` (via apt).
-*   **Runtime**: Optimized for **Podman** (supports rootless mode) but fully compatible with Docker. Both can be auto-installed via bootstrap.
-*   **Multi-Cloud Deployment**: AWS, Azure, and GCP via Terraform and Kubernetes.
+- **JupyterLab workspace** — full data science environment with launcher icons for Claude, Codex, Gemini, and Ollama. One click to start a conversation with any AI from within your notebook workflow.
+- **Multiple AI CLIs pre-installed** — Claude Code, OpenAI Codex, Google Gemini CLI, and Ollama are all ready to use from the terminal. No manual installation, no version conflicts.
+- **VS Code in the browser** — code-server provides a full Visual Studio Code experience accessible from any browser, with Jupyter integration via extensions.
+- **Automatic GPU-arbitrated model serving** — run both GGUF models (via Ollama) and NVFP4 models (via vLLM) on a single GPU. The gpu-arbiter router transparently switches between backends based on the model you request — no manual intervention, no OOM errors.
+- **Open WebUI chat interface** — web-based chat UI over HTTPS that sees all available models (both Ollama and vLLM). Select any model from the dropdown and start chatting.
+- **Fast iteration** — two-layer container build separates rarely-changing system packages (base) from frequently-updated tools and Python packages (lab). Rebuilds take minutes, not hours.
+- **Aggressive caching** — CLI binaries are updated via ETags (only downloads when upstream changes). APT proxy and Docker Hub mirror eliminate redundant network traffic across rebuilds.
+- **Works with Podman and Docker** — rootless Podman is the default for security and simplicity. Docker is fully supported as an alternative.
 
-## Workflow Overview
+## Quick Start
 
-Run `make` to see the recommended workflow:
-
-```
-1. SETUP BUILD ENVIRONMENT  - Install container runtimes and cloud CLIs
-2. BUILD CONTAINER IMAGES   - Build CPU or GPU container images
-3. DEPLOY TO TARGET RUNTIME - Deploy via Terraform or Kubernetes
-4. RUN LOCALLY              - Run container with JupyterLab
-5. MAINTENANCE              - Clean up images and resources
-```
-
-## Quick Start: Local Development
-
-### Prerequisites
-
-Ensure you have Podman or Docker installed. If not, run:
+### Prerequisites (Debian 13 Trixie)
 
 ```bash
-make setup-build-env         # Install runtimes + cloud tools (recommended)
-# Or install just runtimes:
-make setup-runtime           # Both podman and docker
-make setup-runtime-podman    # Podman only
-make setup-runtime-docker    # Docker only
+# Podman + Compose
+sudo apt install podman python3-podman-compose
+
+# Python tools (for model management scripts)
+sudo apt install python3-yaml
+
+# HuggingFace CLI (for vLLM model downloads)
+pip install --user huggingface-hub
+
+# NVIDIA GPU drivers (if not already installed)
+sudo apt install nvidia-driver nvidia-container-toolkit
+sudo nvidia-ctk runtime configure --runtime=podman --config=$HOME/.config/containers/containers.conf
 ```
 
-### 1. Configure Environment
+### 1. Configure
 
 ```bash
 cp .env.example .env
+# Edit .env: set JUPYTER_TOKEN, adjust ports if needed
 ```
 
-Edit `.env` and set:
-*   `HOST_HOME_DIR`: Your home directory (e.g., `~`) — enables `.gitconfig` and `.ssh` inside the container
-*   `CONTAINER_RUNTIME`: `podman` (default) or `docker`
-
-### 2. Build and Run
+### 2. Build
 
 ```bash
-make build          # CPU
-make build-gpu      # GPU/CUDA
-make run            # CPU
-make run-gpu        # GPU
+make build           # Build all images (CPU + GPU + router)
 ```
 
-Access JupyterLab at the URL shown in the console output.
-
-### 3. Standalone Launcher (optional)
-
-Install `devai.sh` to run the GPU container from any git repo:
+### 3. Start Infrastructure
 
 ```bash
-make install        # Installs to ~/.local/bin/devai.sh
+make cache-up        # Start Ollama, vLLM, router, Open WebUI, caches
 ```
 
-Then from any git repository:
+### 4. Pull Models
 
 ```bash
-cd ~/projects/my-ml-project
-devai.sh            # Starts devai-lab-gpu-my-ml-project, auto-detects free port
+make ollama-pull     # Pull all GGUF models from deploy/models.yaml
+make vllm-pull       # Download all NVFP4 models from HuggingFace
 ```
 
-The container is named after the git repo, sources `.env` from the current directory if present, and is removed on exit.
-
-## Quick Start: Cloud Deployment
-
-### 1. Setup Build Environment
-
-Install container runtimes and cloud management tools:
+### 5. Run
 
 ```bash
-make setup-build-env
+make lab-gpu         # Start JupyterLab with GPU (or make lab-cpu)
 ```
 
-This installs:
-*   **Container Runtimes**: Podman and Docker (both by default)
-*   **Cloud CLIs**: AWS CLI, Azure CLI, gcloud, Terraform, kubectl, kustomize
+Access:
+- **JupyterLab**: `https://<HOST_IP>:8888`
+- **Open WebUI**: `https://<HOST_IP>:8443`
 
-To install only cloud tools (if you already have a container runtime):
+## Architecture
 
-```bash
-make setup-cloud-tools
+```
+  Browser / API clients
+  ─────────────────────────────────────────────────────────
+  https://<HOST_IP>:8888        https://<HOST_IP>:8443
+         │                              │
+  ───────┼──────────────────────────────┼──────────────────
+         │         devai-net            │
+         │       (internal)             │
+         ▼                              ▼
+  devai-lab-gpu              devai-webui-proxy
+  (JupyterLab + AI CLIs)    (nginx TLS termination)
+         │                              │
+         │                              ▼
+         │                      devai-open-webui
+         │                       (chat UI)
+         │                              │
+         └──────────┬───────────────────┘
+                    │
+                    ▼
+             devai-router :11434
+             (gpu-arbiter, 9 MB)
+                    │
+         ┌──────────┴──────────┐
+         │                     │
+         ▼                     ▼
+  devai-ollama          devai-vllm
+  (GGUF models)         (NVFP4 models)
+  always running         on-demand
+
+  devai-apt-cache    devai-registry-cache
+  (APT cache)        (Docker Hub mirror)
 ```
 
-All tools are installed to `~/.local/bin`. Add to your PATH:
+**External access** (host ports): JupyterLab `:8888`, Open WebUI `:8443`
+**Internal only** (devai-net): router, Ollama, vLLM, caches — no host ports exposed
 
-```bash
-export PATH="$HOME/.local/bin:$PATH"
-```
+### GPU Arbitration
 
-Verify installation:
+The gpu-arbiter router (`devai-router`) automatically manages GPU exclusion:
 
-```bash
-make check-cloud-tools
-```
+- **GGUF model requested** → routes to Ollama (auto-loads model)
+- **NVFP4 model requested** → unloads Ollama, starts vLLM container, proxies request
+- **Model switch** → recreates vLLM container with the new model
+- **Idle timeout** → stops vLLM after 5 minutes of inactivity
+- **API translation** → Ollama API ↔ OpenAI API for transparent Open WebUI support
 
-### 2. Configure Cloud Provider
+Only one backend uses the GPU at a time. No manual switching required.
 
-```bash
-# AWS
-aws configure
+## Configuration
 
-# Azure
-az login
+### `.env` — Host/runtime settings
 
-# GCP
-gcloud init
-```
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `LAB_PORT` | 8888 | JupyterLab port |
+| `WEBUI_PORT` | 8443 | Open WebUI HTTPS port |
+| `CONTAINER_RUNTIME` | podman | `podman` or `docker` |
+| `HOST_HOME_DIR` | `$HOME` | Enables .gitconfig/.ssh in container |
+| `HOME_VOLUME` | `$HOME/devai-home` | Persistent home directory |
+| `JUPYTER_TOKEN` | — | Fixed access token (set in .env) |
+| `APT_PROXY` | — | APT cache URL (e.g. `http://localhost:3142`) |
 
-### 3. Build Container Image
+### `deploy/models.yaml` — Model catalog
 
-```bash
-make build
-```
-
-### 4. Deploy Infrastructure
-
-Example for AWS:
-
-```bash
-# Configure
-cp deploy/terraform/aws/terraform.tfvars.example deploy/terraform/aws/terraform.tfvars
-vim deploy/terraform/aws/terraform.tfvars
-
-# Deploy
-make tf-init-aws
-make tf-apply-aws
-
-# Push image
-./scripts/push-image.sh aws
-```
-
-See [Cloud Deployment](#cloud-deployment) for Azure, GCP, and Kubernetes options.
-
----
-
-## Using AI Tools
-
-AI agents are available as launcher icons in JupyterLab — click to open a terminal running the agent. They can also be started manually from a terminal (File -> New -> Terminal).
-
-### Google Gemini CLI
-
-```bash
-gemini prompt "Hello"
-```
-
-On first run, follow the browser authentication flow.
-
-### Claude Code CLI
-
-```bash
-claude
-```
-
-Requires `ANTHROPIC_API_KEY` environment variable or interactive login.
-
-### OpenAI Codex CLI
-
-```bash
-codex
-```
-
-Requires `OPENAI_API_KEY` environment variable.
-
-### Ollama (Local Models)
-
-Ollama runs in its own GPU-accelerated container, shared by all agent containers. No host install needed.
-
-```bash
-make cache-up                    # Start infrastructure (includes Ollama + Open WebUI)
-make ollama-pull MODEL=qwen3.5:9b  # Pull a model
-```
-
-**Interfaces:**
-
-| Interface | URL / Command | Description |
-|-----------|---------------|-------------|
-| Open WebUI | http://localhost:3000 | Web chat UI with model management |
-| Ollama API | http://localhost:11434 | REST API (OpenAI-compatible at /v1/) |
-| Terminal chat | `ollama run qwen3.5:9b` | Interactive CLI inside container |
-| code-server | VS Code icon in JupyterLab | IDE with Continue/Cline AI extensions |
-
-**Model management** (from host):
-
-```bash
-ollama.sh pull qwen3.5:27b      # Pull a model
-ollama.sh list                   # List downloaded models
-ollama.sh loaded                 # Show models in GPU VRAM
-ollama.sh load qwen3.5:9b       # Load model into GPU
-ollama.sh unload                 # Unload all models from GPU
-ollama.sh gpu                    # GPU status (nvidia-smi)
-ollama.sh top                    # Live GPU monitor (nvtop)
-```
-
-**Or via Make targets:**
-
-```bash
-make ollama-pull MODEL=qwen3.5:9b
-make ollama-list
-make ollama-unload
-make ollama-status
-```
-
-**Python SDK:**
-
-```python
-import ollama
-response = ollama.chat(model='qwen3.5:9b', messages=[
-    {'role': 'user', 'content': 'Hello'}
-])
-```
-
-**OpenAI-compatible API:**
-
-```python
-from openai import OpenAI
-client = OpenAI(base_url="http://devai-ollama:11434/v1", api_key="ollama")
-response = client.chat.completions.create(
-    model="qwen3.5:9b", messages=[{"role": "user", "content": "Hello"}]
-)
-```
-
-**Benchmarking:**
-
-```bash
-python3 scripts/ollama-bench.py -m qwen3.5:9b "explain quicksort"
-python3 scripts/ollama-bench.py -m qwen3.5:27b  # auto-unloads previous model
-```
-
-**Auto-start at boot:** `make install-systemd`
-
-### code-server (VS Code in Browser)
-
-VS Code runs inside the container via code-server, accessible from JupyterLab's launcher (VS Code icon). Install AI coding extensions:
-
-*   **Continue** — AI chat and autocomplete with Ollama models
-*   **Cline** — autonomous coding agent with file/terminal access
-
-Configure Continue in `~/.continue/config.yaml` (template at `config/continue/config.yaml`).
-
-For full extension functionality (webviews), use mkcert for trusted HTTPS:
-1.  Install `mkcert` on the browser workstation
-2.  `mkcert -install && mkcert <server-IP>`
-3.  Copy certs to `~/devai-home/.jupyter/ssl/`
-4.  Container auto-detects and enables HTTPS
-
-### ChromaDB (Vector Database)
-
-```python
-import chromadb
-client = chromadb.Client()
-collection = client.create_collection("my_embeddings")
-collection.add(documents=["doc1", "doc2"], ids=["id1", "id2"])
-results = collection.query(query_texts=["search query"], n_results=2)
-```
-
----
-
-## GPU Support
-
-For NVIDIA GPU acceleration:
-
-1.  Install [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)
-2.  Build and run:
-    ```bash
-    make build-gpu
-    make run-gpu
-    ```
-
----
-
-## Cloud Deployment
-
-Dev AI Lab supports deployment to major cloud providers via Terraform and Kubernetes.
-
-### Supported Clouds
-
-| Cloud | Terraform | Kubernetes |
-|-------|-----------|------------|
-| **AWS** | ECS Fargate, ECR, ALB | EKS with ALB Ingress |
-| **Azure** | Container Instances, ACR | AKS with AGIC |
-| **GCP** | Cloud Run, Artifact Registry | GKE with GCE Ingress |
-
-### Terraform Deployment
-
-```bash
-# AWS
-make tf-init-aws && make tf-plan-aws && make tf-apply-aws
-
-# Azure
-make tf-init-azure && make tf-plan-azure && make tf-apply-azure
-
-# GCP
-make tf-init-gcp && make tf-plan-gcp && make tf-apply-gcp
-```
-
-### Kubernetes Deployment
-
-```bash
-make k8s-build KUSTOMIZE_OVERLAY=dev
-make k8s-apply KUSTOMIZE_OVERLAY=dev
-```
-
-### Docker Compose (Local Multi-Service)
-
-```bash
-make compose-up      # Start devai + ollama
-make compose-logs    # View logs (includes JupyterLab token)
-make compose-down    # Stop services
-```
-
----
-
-## Documentation
-
-| Document | Description |
-|----------|-------------|
-| [docs/architecture.md](docs/architecture.md) | Architecture overview, design patterns, technology stack |
-| [ansible/README.md](ansible/README.md) | Cloud tools setup details |
-| [docs/local-container.md](docs/local-container.md) | Local build/run details |
-| [docs/docker-compose.md](docs/docker-compose.md) | Docker Compose setup |
-| [docs/terraform.md](docs/terraform.md) | Terraform deployment |
-| [docs/kubernetes.md](docs/kubernetes.md) | Kubernetes deployment |
-| [docs/utilities.md](docs/utilities.md) | Config generation scripts |
-
----
-
-## All Make Targets
-
-### Setup Build Environment
-
-| Target | Description |
-|--------|-------------|
-| `make setup-build-env` | Install container runtimes + all cloud CLIs (recommended) |
-| `make setup-cloud-tools` | Install cloud CLIs only (no runtimes) |
-| `make check-cloud-tools` | Verify installed tool versions |
-
-See [Selective Installation Options](#selective-installation-options) in Appendix A for partial installation.
-
-### Build Container Images
-
-| Target | Description |
-|--------|-------------|
-| `make build` | Build base + lab image (CPU) |
-| `make build-gpu` | Build base + lab image (GPU/CUDA) |
-| `make rebuild` | Rebuild lab layer only (fast, skips base) |
-| `make rebuild-gpu` | Rebuild lab layer only (GPU) |
-| `make build-base` | Build base image only |
-| `make compose-build` | Build images with Docker Compose |
-
-### Deploy to Cloud (Terraform)
-
-| Target | Description |
-|--------|-------------|
-| `make tf-init-aws` | Initialize Terraform for AWS |
-| `make tf-plan-aws` | Plan AWS deployment |
-| `make tf-apply-aws` | Deploy to AWS |
-| `make tf-destroy-aws` | Destroy AWS resources |
-| `make tf-init-azure` | Initialize Terraform for Azure |
-| `make tf-plan-azure` | Plan Azure deployment |
-| `make tf-apply-azure` | Deploy to Azure |
-| `make tf-destroy-azure` | Destroy Azure resources |
-| `make tf-init-gcp` | Initialize Terraform for GCP |
-| `make tf-plan-gcp` | Plan GCP deployment |
-| `make tf-apply-gcp` | Deploy to GCP |
-| `make tf-destroy-gcp` | Destroy GCP resources |
-
-### Deploy to Kubernetes
-
-| Target | Description |
-|--------|-------------|
-| `make k8s-build` | Build Kubernetes manifests |
-| `make k8s-apply` | Apply manifests to cluster |
-| `make k8s-delete` | Delete Kubernetes resources |
-
-### Run Locally
-
-| Target | Description |
-|--------|-------------|
-| `make run` | Run container with JupyterLab (CPU) |
-| `make run-gpu` | Run container with JupyterLab (GPU) |
-| `make shell` | Interactive shell without JupyterLab |
-| `make install` | Install `devai.sh` + `ollama.sh` to `~/.local/bin` |
-| `make install-systemd` | Enable infrastructure auto-start at boot |
-| `make compose-up` | Start services with Docker Compose |
-| `make compose-up-gpu` | Start with GPU support |
-| `make compose-down` | Stop and remove containers |
-| `make compose-logs` | View container logs |
-| `make compose-ps` | Show running containers |
-
-### Maintenance
-
-| Target | Description |
-|--------|-------------|
-| `make clean` | Remove lab image (CPU) |
-| `make clean-gpu` | Remove lab image (GPU) |
-| `make clean-base` | Remove base image (CPU) |
-| `make clean-home` | Remove persistent home volume |
-| `make fetch` | Download external dependencies to local cache |
-| `make ollama-pull` | Pull Ollama model (`MODEL=llama3.2`) |
-| `make ollama-list` | List downloaded Ollama models |
-| `make ollama-unload` | Unload all models from GPU VRAM |
-| `make ollama-status` | Show Ollama container status + loaded models |
-| `make clean-all` | Remove all CPU images and home volume |
-| `make prune` | Clean up dangling images |
-| `make config-generate` | Generate configs from YAML profiles |
-| `make help` | Show workflow and all targets |
-
----
-
-## Appendix A: Detailed Configuration
-
-### Environment Variables (.env)
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `HOST_HOME_DIR` | - | Host home directory — enables `.gitconfig` and `.ssh` in container |
-| `HOST_WORK_DIR` | `.` | Working directory mounted to /home/devai/work |
-| `HOME_VOLUME` | `devai-lab-home` | Named volume for persistent home directory |
-| `CONTAINER_RUNTIME` | `podman` | Container runtime for running containers and installation preference |
-| `PORT` | `8888` | JupyterLab port |
-| `OLLAMA_HOST` | `http://devai-ollama:11434` | Ollama server URL |
-| `OLLAMA_DEFAULT_MODEL` | `llama3.2` | Default model for interactive chat |
-| `HTTP_PROXY` / `HTTPS_PROXY` | - | Proxy settings |
-
-### Cloud Tools Configuration
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `DEVAI_PYTHON_VERSION` | `3.12` | Python version for tools venv |
-| `DEVAI_VENV_DIR` | `~/.local/devai-venv` | Virtual environment path |
-| `DEVAI_BIN_DIR` | `~/.local/bin` | Tool binary directory |
-
-### Selective Installation Options
-
-By default, `make setup-build-env` installs everything. Use these options for selective installation:
-
-```bash
-# Via Makefile - runtime selection
-make setup-build-env INSTALL_RUNTIME=podman     # Runtimes: Podman only + all cloud tools
-make setup-build-env INSTALL_RUNTIME=docker     # Runtimes: Docker only + all cloud tools
-make setup-build-env INSTALL_RUNTIME=both       # Runtimes: Both (default) + all cloud tools
-make setup-build-env INSTALL_RUNTIME=none       # Cloud tools only (same as setup-cloud-tools)
-
-# Via Makefile - runtime only (no cloud tools)
-make setup-runtime                              # Both runtimes
-make setup-runtime-podman                       # Podman only
-make setup-runtime-docker                       # Docker only
-
-# Via Makefile - specific cloud tools only (no runtimes)
-make setup-cloud-tools-aws                      # AWS CLI only
-make setup-cloud-tools-azure                    # Azure CLI only
-make setup-cloud-tools-gcp                      # Google Cloud CLI only
-make setup-cloud-tools-terraform                # Terraform only
-make setup-cloud-tools-k8s                      # kubectl + kustomize only
-
-# Via bootstrap script directly
-./ansible/bootstrap.sh --install-runtime podman
-./ansible/bootstrap.sh --install-runtime docker
-./ansible/bootstrap.sh --install-runtime both
-./ansible/bootstrap.sh --install-runtime none
-./ansible/bootstrap.sh -- --tags aws            # AWS CLI only
-./ansible/bootstrap.sh -- --tags terraform      # Terraform only
-```
-
-If `.env` exists with `CONTAINER_RUNTIME` set, that value determines which runtime(s) to install. Existing installations are updated if newer versions are available.
+Single source of truth for all models. Defines Ollama (GGUF) and vLLM (NVFP4) models with names, sizes, and purposes. Used by `make ollama-list`, `make vllm-list`, and the gpu-arbiter router. The included models have been selected for systems with consumer-grade GPUs (up to 24 GB VRAM) and up to 64 GB main RAM.
 
 ### Adding Python Packages
 
-```bash
-cp requirements.txt.example requirements.txt
-# Edit requirements.txt
-make build
-```
-
-## Appendix B: Container User and Persistence
-
-### Persistent Home Directory
-
-The container's `/home/devai` is backed by a named volume (`devai-lab-home` by default), so shell history, jupyter config, AI CLI credentials, and user-installed packages survive container restarts. The work directory (`/home/devai/work`) is a separate bind mount from the host.
-
-To reset the home volume:
+Create `requirements.txt` in the repo root and rebuild:
 
 ```bash
-make clean-home
+echo "langchain" > requirements.txt
+make build-gpu
 ```
 
-### Host Config Files
+## Make Targets
 
-When `HOST_HOME_DIR` is set in `.env`, the host's `.gitconfig` and `.ssh` are copied into the container at startup. This makes `git` and SSH work out of the box inside the container.
+Run `make help` for the full list:
 
-### User Identity (Podman vs Docker)
+```
+BUILD                                       INFRASTRUCTURE                              RUN
+fetch-cli        Update CLI binaries        cache-up         Start services             lab-cpu          JupyterLab (CPU)
+pull-images      Pull base images           cache-down       Stop services              lab-gpu          JupyterLab (GPU)
+build-cpu        Build image (CPU)          cache-status     Show status                shell-cpu        Shell (CPU)
+build-gpu        Build image (GPU)          cache-clean      Remove cached data         shell-gpu        Shell (GPU)
+build-router     Build router image
+build            Build all (CPU+GPU+router)
 
-The container handles user identity differently depending on the runtime:
+OLLAMA (GGUF)                               vLLM (NVFP4)                                MAINTENANCE
+ollama-list      List models                vllm-list        List models                 clean-cpu        Remove image (CPU)
+ollama-pull      Pull model(s)              vllm-pull        Pull model(s)               clean-gpu        Remove image (GPU)
+ollama-rm        Remove model               vllm-rm          Remove model                clean-router     Remove router image
+ollama-status    Show status                vllm-status      Show status                 clean            Remove all images
+ollama-df        Disk usage                 vllm-df          Disk usage                  prune            Prune dangling images
+ollama-clean     Clean partials                                                          test             Run integration tests
+```
 
-*   **Podman (rootless)**: The container runs as root, which in rootless podman maps to the host user. All host-mounted files have correct permissions. No user switching is needed.
-*   **Docker**: The entrypoint remaps the `devai` user to match the host UID/GID and uses `gosu` to drop privileges. This handles UID conflicts in GPU base images (e.g., NVIDIA CUDA images that ship with a UID 1000 user).
+## GPU Support
 
-## Appendix C: Podman Configuration
+### Requirements
 
-### Storage Driver Setup
+- NVIDIA GPU with CUDA support
+- NVIDIA Container Toolkit installed
+- For NVFP4 models: Blackwell architecture
 
-For better performance, use the `overlay` storage driver:
+### GPU images
 
-1.  Check current driver:
-    ```bash
-    podman info --format '{{.Store.GraphDriverName}}'
-    ```
+The GPU lab image (`devai-lab-gpu`) includes PyTorch with CUDA. The base image uses `nvidia/cuda:12.9.1-cudnn-runtime-ubuntu24.04`. Python is installed via uv (not system apt) to ensure a single Python version across CPU and GPU images.
 
-2.  Update configuration (`~/.config/containers/storage.conf`):
-    ```ini
-    [storage]
-    driver = "overlay"
-    ```
+## SSL / HTTPS
 
-3.  Reset storage (warning: deletes all images/containers):
-    ```bash
-    podman system reset
-    ```
+Both JupyterLab and Open WebUI support HTTPS:
 
-## Appendix D: GPU Image Selection
+- **JupyterLab**: Auto-detects mkcert certificates in `~/.jupyter/ssl/`
+- **Open WebUI**: nginx proxy with mkcert certs or self-signed fallback
 
-Use the selector script to choose CUDA base image:
+Generate certificates on the browser workstation:
+```bash
+mkcert <HOST_IP>
+# Copy <HOST_IP>.pem and <HOST_IP>-key.pem to the container host
+```
+
+## Podman Registry Mirror
+
+To route Docker Hub pulls through the local cache (saves bandwidth on rebuilds):
 
 ```bash
-# List available cuDNN images
-./scripts/select-cuda-image.sh --list
-
-# Auto-select recommended version
-./scripts/select-cuda-image.sh --auto
-
-# Interactive selection
-./scripts/select-cuda-image.sh
+cp deploy/registries.conf ~/.config/containers/registries.conf
 ```
 
----
+This tells Podman to try `localhost:5000` (the registry mirror started by `make cache-up`) before going to Docker Hub directly.
+
+## Auto-Start at Boot
+
+```bash
+make install-systemd
+```
+
+Installs a systemd user service that starts all infrastructure containers (Ollama, router, Open WebUI, caches) on login. Uses `loginctl enable-linger` to keep services running after logout.
+
+## Updating
+
+```bash
+make fetch-cli       # Update CLI binaries (Claude, Codex, Ollama, Gemini) via ETags
+make pull-images     # Pull latest base and infrastructure images
+make ollama-pull     # Sync Ollama models (skips unchanged)
+make vllm-pull       # Sync vLLM models from HuggingFace
+make build           # Rebuild all images with updated binaries/packages
+```
+
+## Storage Layout (LVM2)
+
+All persistent data is stored on dedicated LVM2 thin-provisioned logical volumes under `/var/cache/devai/`. This provides:
+- **Independent sizing** — each volume can be extended without affecting others
+- **Thin provisioning** — space is allocated on demand from a shared pool
+- **Clean separation** — models, container images, and caches don't compete for space
+
+Reference implementation (volume group `vgais`):
+
+| Volume | Mount | Size | Purpose |
+|--------|-------|------|---------|
+| `cache_ollama` | `/var/cache/devai/ollama` | 200G | Ollama GGUF models + vLLM NVFP4 models |
+| `cache_registry` | `/var/cache/devai/registry` | 200G | Podman container image storage + Docker Hub mirror |
+| `cache_pip` | `/var/cache/devai/pip` | 30G | Python package cache (uv) + CLI binaries |
+| `cache_apt` | `/var/cache/devai/apt` | 10G | APT package cache (apt-cacher-ng) |
+| `cache_npm` | `/var/cache/devai/npm` | 10G | npm package cache |
+| `cache_open_webui` | `/var/cache/devai/open-webui` | 5G | Open WebUI application data |
+
+Create the volumes:
+
+```bash
+# Create thin pool (adjust size for your disk)
+sudo lvcreate -L 500G -T vgais/cachepool
+
+# Create thin volumes
+sudo lvcreate -V 200G -T vgais/cachepool -n cache_ollama
+sudo lvcreate -V 200G -T vgais/cachepool -n cache_registry
+sudo lvcreate -V 30G  -T vgais/cachepool -n cache_pip
+sudo lvcreate -V 10G  -T vgais/cachepool -n cache_apt
+sudo lvcreate -V 10G  -T vgais/cachepool -n cache_npm
+sudo lvcreate -V 5G   -T vgais/cachepool -n cache_open_webui
+
+# Format and mount
+for vol in cache_ollama cache_registry cache_pip cache_apt cache_npm cache_open_webui; do
+    sudo mkfs.xfs /dev/vgais/$vol
+done
+
+# Add to /etc/fstab
+cat <<'EOF' | sudo tee -a /etc/fstab
+/dev/vgais/cache_ollama     /var/cache/devai/ollama     xfs defaults 0 0
+/dev/vgais/cache_registry   /var/cache/devai/registry   xfs defaults 0 0
+/dev/vgais/cache_pip        /var/cache/devai/pip         xfs defaults 0 0
+/dev/vgais/cache_apt        /var/cache/devai/apt         xfs defaults 0 0
+/dev/vgais/cache_npm        /var/cache/devai/npm         xfs defaults 0 0
+/dev/vgais/cache_open_webui /var/cache/devai/open-webui  xfs defaults 0 0
+EOF
+
+sudo mkdir -p /var/cache/devai/{ollama,registry,pip,apt,npm,open-webui}
+sudo mount -a
+sudo chown -R $USER:$USER /var/cache/devai
+```
+
+To extend a volume (e.g. when models fill up):
+```bash
+sudo lvextend -L 300G /dev/vgais/cache_ollama
+sudo xfs_growfs /var/cache/devai/ollama
+```
+
+## Key Files
+
+```
+.env                          — Host/runtime configuration
+.env.example                  — Configuration template
+deploy/
+  models.yaml                 — Model catalog (ollama + vllm)
+  docker-compose.yaml         — Infrastructure services
+  Dockerfile.base             — Base image (system packages, Python, Node)
+  Dockerfile.lab              — Lab image (CLI tools, packages, JupyterLab)
+  Dockerfile.router           — Router image (distroless, 9 MB)
+  webui-proxy/                — nginx TLS proxy for Open WebUI
+  systemd/                    — Auto-start service
+gpu-arbiter/                  — Router Go source
+scripts/                      — Python helpers for model management
+tests/                        — Integration tests
+requirements-base.txt         — Base Python packages (always installed)
+requirements.txt              — Optional project-specific packages
+packages/jupyter-ai-launchers — JupyterLab launcher extension
+```
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+MIT

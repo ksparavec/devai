@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+"""GPU detection and matrix multiply benchmark."""
 import time
 import torch
 
