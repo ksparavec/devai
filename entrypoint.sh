@@ -97,10 +97,6 @@ if [ ! -f "$HOME_DIR/.codex/config.toml" ] && [ -f /etc/devai/codex-config.toml 
     mkdir -p "$HOME_DIR/.codex"
     cp /etc/devai/codex-config.toml "$HOME_DIR/.codex/config.toml"
 fi
-if [ ! -f "$HOME_DIR/.local/state/opencode/model.json" ] && [ -f /etc/devai/opencode-model.json ]; then
-    mkdir -p "$HOME_DIR/.local/state/opencode"
-    cp /etc/devai/opencode-model.json "$HOME_DIR/.local/state/opencode/model.json"
-fi
 
 # Prepare the command
 CMD=("$@")

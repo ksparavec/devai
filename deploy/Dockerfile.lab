@@ -18,12 +18,11 @@ ENV OLLAMA_DEFAULT_MODEL=${OLLAMA_DEFAULT_MODEL}
 ENV ANTHROPIC_BASE_URL=${OLLAMA_HOST}
 ENV ANTHROPIC_AUTH_TOKEN=ollama
 ENV ANTHROPIC_API_KEY=""
-ENV LOCAL_ENDPOINT=${OLLAMA_HOST}/v1
 ENV UV_BREAK_SYSTEM_PACKAGES=1
 ENV PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1
 ENV PATH="/home/devai/.local/bin:${PATH}"
 
-# --- Dependencies for coding agents (ripgrep for OpenCode, fzf for fuzzy search) ---
+# --- Dependencies for coding agents ---
 RUN apt-get update && apt-get install -y --no-install-recommends ripgrep fzf \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
@@ -32,8 +31,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends ripgrep fzf \
 # Cache-bust when binaries change (hash computed by Makefile)
 ARG BIN_HASH=unknown
 # Install CLI binaries (pre-downloaded to /var/cache/bin/ via cache mount)
-RUN cp /var/cache/bin/uv /var/cache/bin/uvx /var/cache/bin/claude /var/cache/bin/codex /var/cache/bin/ollama /var/cache/bin/opencode /usr/local/bin/ \
-    && chmod +x /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/claude /usr/local/bin/codex /usr/local/bin/ollama /usr/local/bin/opencode
+RUN cp /var/cache/bin/uv /var/cache/bin/uvx /var/cache/bin/claude /var/cache/bin/codex /var/cache/bin/ollama /usr/local/bin/ \
+    && chmod +x /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/claude /usr/local/bin/codex /usr/local/bin/ollama
 
 # Install code-server (pre-downloaded)
 RUN cp -a /var/cache/bin/code-server /usr/local/lib/code-server \
@@ -88,13 +87,11 @@ RUN getent group 1000 >/dev/null || groupadd -g 1000 devai \
     && ln -s /usr/local/bin/codex /home/devai/.local/bin/codex \
     && ln -s /usr/local/bin/gemini /home/devai/.local/bin/gemini \
     && ln -s /usr/local/bin/ollama /home/devai/.local/bin/ollama \
-    && ln -s /usr/local/bin/opencode /home/devai/.local/bin/opencode \
     && ln -s /usr/local/bin/code-server /home/devai/.local/bin/code-server \
     && chown -R 1000:1000 /home/devai
 
 # Seed config files for coding agents (copied to $HOME by entrypoint if absent)
 COPY config/codex/config.toml /etc/devai/codex-config.toml
-COPY config/opencode/model.json /etc/devai/opencode-model.json
 
 # Copy entrypoint script
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh

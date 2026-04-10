@@ -1,11 +1,11 @@
 # TODO
 
 ## Local AI Agent Integration
-- [x] Install Aider and OpenCode as local AI coding agents in JupyterLab
-- [x] Configure Claude Code, Codex, and OpenCode CLIs to use local models via router
-- [x] Add JupyterLab launcher icons for Aider and OpenCode
+- [x] Install Aider as local AI coding agent in JupyterLab
+- [x] Configure Claude Code and Codex CLIs to use local models via router
+- [x] Add JupyterLab launcher icons for Aider
 - [x] Add interactive agent picker for shell-cpu/shell-gpu targets
-- [x] Seed Codex and OpenCode config files via entrypoint
+- [x] Seed Codex config files via entrypoint
 
 ## Router Testing
 - [x] Go unit tests for isVLLMModel, model routing, API translation (gpu-arbiter/main_test.go)

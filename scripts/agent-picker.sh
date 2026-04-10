@@ -7,7 +7,6 @@ DEFAULT_MODEL="${OLLAMA_DEFAULT_MODEL:-qwen3.5:9b}"
 AGENTS=(
   "claude|Claude Code|ollama launch claude --model $DEFAULT_MODEL --yes"
   "codex|Codex|ollama launch codex --model $DEFAULT_MODEL --yes"
-  "opencode|OpenCode|ollama launch opencode --model $DEFAULT_MODEL --yes"
   "aider|Aider|aider-launcher"
   "bash|Bash Shell|bash"
 )

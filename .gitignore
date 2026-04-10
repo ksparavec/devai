@@ -99,8 +99,5 @@ config/secrets.yaml
 node_modules/
 .yarn/install-state.gz
 
-# OpenCode
-.opencode/
-
 # Claude Code
 .claude/

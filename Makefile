@@ -161,16 +161,6 @@ fetch-cli: ## Download all external binaries and packages to local cache (uses E
 		else \
 			tar -xzf $(CACHE_DIR)/pip/bin/uv.tar.gz -C $(CACHE_DIR)/pip/bin --strip-components=1 uv-x86_64-unknown-linux-gnu/uv uv-x86_64-unknown-linux-gnu/uvx \
 			&& rm -f $(CACHE_DIR)/pip/bin/uv.tar.gz && echo "uv: updated"; fi
-	@ARCH=$$(dpkg --print-architecture) \
-		&& case "$$ARCH" in amd64) OC_ARCH=x86_64;; arm64) OC_ARCH=arm64;; esac \
-		&& HTTP_CODE=$$(curl -fsSL -w '%{http_code}' -o $(CACHE_DIR)/pip/bin/opencode.tar.gz \
-			--etag-compare $(ETAG_DIR)/opencode.etag --etag-save $(ETAG_DIR)/opencode.etag \
-			"https://github.com/opencode-ai/opencode/releases/latest/download/opencode-linux-$${OC_ARCH}.tar.gz") \
-		&& if [ "$$HTTP_CODE" = "304" ] || [ ! -s $(CACHE_DIR)/pip/bin/opencode.tar.gz ]; then \
-			rm -f $(CACHE_DIR)/pip/bin/opencode.tar.gz; echo "OpenCode: up to date"; \
-		else \
-			tar -xzf $(CACHE_DIR)/pip/bin/opencode.tar.gz -C $(CACHE_DIR)/pip/bin opencode \
-			&& rm -f $(CACHE_DIR)/pip/bin/opencode.tar.gz && echo "OpenCode: updated"; fi
 	@META=$$(curl -fsSL "https://registry.npmjs.org/@google/gemini-cli/latest") \
 		&& LATEST=$$(echo "$$META" | python3 -c "import sys,json; print(json.load(sys.stdin)['version'])") \
 		&& CACHED=$$(cat $(ETAG_DIR)/gemini.version 2>/dev/null || echo "none") \
