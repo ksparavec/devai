@@ -1,0 +1,7 @@
+[model_providers.local]
+name = "Ollama"
+base_url = "http://devai-router:11434/v1"
+
+[profiles.local]
+model = "qwen3.5:9b"
+model_provider = "local"

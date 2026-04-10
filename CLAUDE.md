@@ -98,6 +98,6 @@ deploy/docker-compose.yaml    — Infrastructure services
 deploy/Dockerfile.base        — Base image
 deploy/Dockerfile.lab         — Lab image
 deploy/Dockerfile.router      — Router image (distroless, 9 MB)
-gpu-arbiter/main.go           — Router source (~400 lines Go)
+gpu-arbiter/main.go           — Router source (~650 lines Go)
 tests/test-router.sh          — Integration tests
 ```

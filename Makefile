@@ -95,7 +95,7 @@ endif
 .PHONY: ollama-pull ollama-rm ollama-list ollama-status ollama-clean ollama-df
 .PHONY: vllm-pull vllm-list vllm-rm vllm-status vllm-df
 .PHONY: clean clean-cpu clean-gpu clean-router prune
-.PHONY: fetch-cli pull-images install-systemd test help
+.PHONY: fetch-cli pull-images install-systemd test test-router test-ollama test-vllm test-idle help
 
 all: help
 
@@ -161,6 +161,16 @@ fetch-cli: ## Download all external binaries and packages to local cache (uses E
 		else \
 			tar -xzf $(CACHE_DIR)/pip/bin/uv.tar.gz -C $(CACHE_DIR)/pip/bin --strip-components=1 uv-x86_64-unknown-linux-gnu/uv uv-x86_64-unknown-linux-gnu/uvx \
 			&& rm -f $(CACHE_DIR)/pip/bin/uv.tar.gz && echo "uv: updated"; fi
+	@ARCH=$$(dpkg --print-architecture) \
+		&& case "$$ARCH" in amd64) OC_ARCH=x86_64;; arm64) OC_ARCH=arm64;; esac \
+		&& HTTP_CODE=$$(curl -fsSL -w '%{http_code}' -o $(CACHE_DIR)/pip/bin/opencode.tar.gz \
+			--etag-compare $(ETAG_DIR)/opencode.etag --etag-save $(ETAG_DIR)/opencode.etag \
+			"https://github.com/opencode-ai/opencode/releases/latest/download/opencode-linux-$${OC_ARCH}.tar.gz") \
+		&& if [ "$$HTTP_CODE" = "304" ] || [ ! -s $(CACHE_DIR)/pip/bin/opencode.tar.gz ]; then \
+			rm -f $(CACHE_DIR)/pip/bin/opencode.tar.gz; echo "OpenCode: up to date"; \
+		else \
+			tar -xzf $(CACHE_DIR)/pip/bin/opencode.tar.gz -C $(CACHE_DIR)/pip/bin opencode \
+			&& rm -f $(CACHE_DIR)/pip/bin/opencode.tar.gz && echo "OpenCode: updated"; fi
 	@META=$$(curl -fsSL "https://registry.npmjs.org/@google/gemini-cli/latest") \
 		&& LATEST=$$(echo "$$META" | python3 -c "import sys,json; print(json.load(sys.stdin)['version'])") \
 		&& CACHED=$$(cat $(ETAG_DIR)/gemini.version 2>/dev/null || echo "none") \
@@ -285,7 +295,7 @@ shell-cpu: ## Start an interactive shell (CPU)
 		-v $(HOME_VOLUME):/home/$(CONTAINER_USER) \
 		$(HOME_MOUNT_ARG) \
 		-v "$$(readlink -f $(HOST_WORK_DIR))":/home/$(CONTAINER_USER)/work \
-		$(IMAGE_NAME) /bin/bash
+		$(IMAGE_NAME) agent-picker
 
 shell-gpu: ## Start an interactive shell (GPU)
 	$(CONTAINER_RUNTIME) run -it --rm \
@@ -302,7 +312,7 @@ shell-gpu: ## Start an interactive shell (GPU)
 		-v $(HOME_VOLUME):/home/$(CONTAINER_USER) \
 		$(HOME_MOUNT_ARG) \
 		-v "$$(readlink -f $(HOST_WORK_DIR))":/home/$(CONTAINER_USER)/work \
-		$(IMAGE_NAME_GPU) /bin/bash
+		$(IMAGE_NAME_GPU) agent-picker
 
 clean: clean-cpu clean-gpu clean-router ## Remove all images (CPU + GPU + router)
 
@@ -320,8 +330,24 @@ clean-router: ## Remove the router image
 prune: ## Clean up dangling images only (keeps tagged images and volumes)
 	$(CONTAINER_RUNTIME) image prune -f
 
-test: ## Run integration tests (requires: make cache-up)
+test-router: ## Run Go unit tests for gpu-arbiter router
+	$(CONTAINER_RUNTIME) run --rm \
+		--entrypoint bash \
+		-v "$$(pwd)/gpu-arbiter:/src:z" \
+		-w /src \
+		docker.io/library/golang:1.23-bookworm \
+		-c "go test -race -v -count=1 ./..."
+
+test-ollama: cache-up ## Run Ollama-only integration tests
 	./tests/test-router.sh
+
+test-vllm: cache-up ## Run vLLM/GPU integration tests (~10min)
+	./tests/test-router-vllm.sh
+
+test-idle: cache-up ## Run vLLM idle timeout test (restarts router temporarily)
+	./tests/test-router-idle.sh
+
+test: test-router test-ollama test-vllm test-idle ## Run all tests in sequence
 
 help: ## Show this help message
 	@printf "\nDevAI Lab — Containerized AI Development Environment\n\n"

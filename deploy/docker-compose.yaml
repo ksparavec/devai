@@ -27,6 +27,7 @@ services:
     environment:
       - OLLAMA_KEEP_ALIVE=${OLLAMA_KEEP_ALIVE:-300s}
       - OLLAMA_MAX_LOADED_MODELS=1
+      - OLLAMA_CONTEXT_LENGTH=${OLLAMA_CONTEXT_LENGTH:-65536}
     volumes:
       - /var/cache/devai/ollama:/root/.ollama
     devices:

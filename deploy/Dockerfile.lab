@@ -14,17 +14,26 @@ ENV OLLAMA_HOST=${OLLAMA_HOST}
 ENV OLLAMA_URL=${OLLAMA_HOST}
 ENV OLLAMA_API_BASE=${OLLAMA_HOST}
 ENV OLLAMA_DEFAULT_MODEL=${OLLAMA_DEFAULT_MODEL}
+# CLI local model defaults via Ollama router (override at runtime with real API keys for cloud use)
+ENV ANTHROPIC_BASE_URL=${OLLAMA_HOST}
+ENV ANTHROPIC_AUTH_TOKEN=ollama
+ENV ANTHROPIC_API_KEY=""
+ENV LOCAL_ENDPOINT=${OLLAMA_HOST}/v1
 ENV UV_BREAK_SYSTEM_PACKAGES=1
 ENV PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1
 ENV PATH="/home/devai/.local/bin:${PATH}"
+
+# --- Dependencies for coding agents (ripgrep for OpenCode, fzf for fuzzy search) ---
+RUN apt-get update && apt-get install -y --no-install-recommends ripgrep fzf \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # --- Binary installs (from local cache, populated by: make fetch) ---
 
 # Cache-bust when binaries change (hash computed by Makefile)
 ARG BIN_HASH=unknown
 # Install CLI binaries (pre-downloaded to /var/cache/bin/ via cache mount)
-RUN cp /var/cache/bin/uv /var/cache/bin/uvx /var/cache/bin/claude /var/cache/bin/codex /var/cache/bin/ollama /usr/local/bin/ \
-    && chmod +x /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/claude /usr/local/bin/codex /usr/local/bin/ollama
+RUN cp /var/cache/bin/uv /var/cache/bin/uvx /var/cache/bin/claude /var/cache/bin/codex /var/cache/bin/ollama /var/cache/bin/opencode /usr/local/bin/ \
+    && chmod +x /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/claude /usr/local/bin/codex /usr/local/bin/ollama /usr/local/bin/opencode
 
 # Install code-server (pre-downloaded)
 RUN cp -a /var/cache/bin/code-server /usr/local/lib/code-server \
@@ -55,6 +64,9 @@ RUN --mount=type=bind,source=.,target=/src \
     fi
 
 
+# Install Aider in isolated venv (requires Python <3.13, uv tool handles this)
+RUN UV_TOOL_BIN_DIR=/usr/local/bin uv tool install aider-chat
+
 # --- JupyterLab extension (depends on jupyterlab being installed above) ---
 
 # Install JupyterLab AI launcher extension (pre-built)
@@ -62,9 +74,11 @@ COPY packages/jupyter-ai-launchers/jupyter_ai_launchers/labextension /usr/local/
 
 # --- Runtime setup ---
 
-# Install ollama-chat wrapper for JupyterLab launcher
+# Install wrapper scripts for JupyterLab launchers and shell picker
 COPY scripts/ollama-chat.sh /usr/local/bin/ollama-chat
-RUN chmod +x /usr/local/bin/ollama-chat
+COPY scripts/aider-launcher.sh /usr/local/bin/aider-launcher
+COPY scripts/agent-picker.sh /usr/local/bin/agent-picker
+RUN chmod +x /usr/local/bin/ollama-chat /usr/local/bin/aider-launcher /usr/local/bin/agent-picker
 
 # Create user and directories (handle GID/UID conflicts in GPU base images)
 RUN getent group 1000 >/dev/null || groupadd -g 1000 devai \
@@ -74,8 +88,13 @@ RUN getent group 1000 >/dev/null || groupadd -g 1000 devai \
     && ln -s /usr/local/bin/codex /home/devai/.local/bin/codex \
     && ln -s /usr/local/bin/gemini /home/devai/.local/bin/gemini \
     && ln -s /usr/local/bin/ollama /home/devai/.local/bin/ollama \
+    && ln -s /usr/local/bin/opencode /home/devai/.local/bin/opencode \
     && ln -s /usr/local/bin/code-server /home/devai/.local/bin/code-server \
     && chown -R 1000:1000 /home/devai
+
+# Seed config files for coding agents (copied to $HOME by entrypoint if absent)
+COPY config/codex/config.toml /etc/devai/codex-config.toml
+COPY config/opencode/model.json /etc/devai/opencode-model.json
 
 # Copy entrypoint script
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh

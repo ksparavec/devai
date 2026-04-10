@@ -1,0 +1,10 @@
+{
+  "favorite": [],
+  "recent": [
+    {
+      "modelID": "qwen3.5:9b",
+      "providerID": "ollama"
+    }
+  ],
+  "variant": {}
+}

@@ -110,7 +110,7 @@ func main() {
 		ollamaURL:      ollamaURL,
 		vllmURL:        vllmURL,
 		ollamaProxy:    newProxy(ollamaURL),
-		vllmProxy:      newProxy(vllmURL),
+		vllmProxy:      newVLLMProxy(vllmURL),
 		patterns:       patterns,
 		idleTimeout:    time.Duration(idleSec) * time.Second,
 		vllmContainer:  env("VLLM_CONTAINER", "devai-vllm"),
@@ -150,6 +150,27 @@ func newProxy(target *url.URL) *httputil.ReverseProxy {
 	return p
 }
 
+// newVLLMProxy creates a reverse proxy that rewrites vLLM's 500 context-overflow
+// errors to 400 so clients (like Claude Code) handle them gracefully instead of
+// blindly retrying.
+func newVLLMProxy(target *url.URL) *httputil.ReverseProxy {
+	p := httputil.NewSingleHostReverseProxy(target)
+	p.FlushInterval = -1
+	p.ModifyResponse = func(resp *http.Response) error {
+		if resp.StatusCode == http.StatusInternalServerError {
+			body, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err == nil && strings.Contains(string(body), "maximum context length") {
+				resp.StatusCode = http.StatusBadRequest
+				resp.Status = "400 Bad Request"
+			}
+			resp.Body = io.NopCloser(bytes.NewReader(body))
+		}
+		return nil
+	}
+	return p
+}
+
 func (r *router) isVLLMModel(model string) bool {
 	lower := strings.ToLower(model)
 	for _, p := range r.patterns {
@@ -182,8 +203,11 @@ func (r *router) containerRecreate(modelName string) error {
 			"--host", "0.0.0.0",
 			"--port", "11434",
 			"--tensor-parallel-size", "1",
-			"--max-model-len", "16384",
+			"--max-model-len", "131072",
 			"--gpu-memory-utilization", "0.95",
+			"--enable-prefix-caching",
+			"--enable-auto-tool-choice",
+			"--tool-call-parser", "qwen3_coder",
 			"--trust-remote-code",
 			"--served-model-name", modelName,
 		},
@@ -194,7 +218,8 @@ func (r *router) containerRecreate(modelName string) error {
 			"type":        "bind",
 			"options":     []string{"ro"},
 		}},
-		"hostadd":      []string{"host.containers.internal:host-gateway"},
+		"env": map[string]string{"VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1"},
+			"hostadd": []string{"host.containers.internal:host-gateway"},
 		"netns":        map[string]any{"nsmode": "bridge"},
 		"Networks":     map[string]any{r.vllmNetwork: map[string]any{}},
 		"devices":      []map[string]any{{"path": "nvidia.com/gpu=all"}},
@@ -349,11 +374,9 @@ func (r *router) handleModels(w http.ResponseWriter, req *http.Request) {
 		all = append(all, list.Data...)
 	}
 
-	if resp, err := http.Get(r.vllmURL.String() + "/v1/models"); err == nil {
-		var list modelList
-		json.NewDecoder(resp.Body).Decode(&list)
-		resp.Body.Close()
-		all = append(all, list.Data...)
+	// Add vLLM models from config (always visible regardless of vLLM state)
+	for _, name := range r.vllmModelNames {
+		all = append(all, model{ID: name, Object: "model", OwnedBy: "vllm"})
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -366,7 +389,7 @@ func (r *router) handleRequest(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(io.LimitReader(req.Body, 64*1024))
+	body, err := io.ReadAll(req.Body)
 	if err != nil {
 		http.Error(w, `{"error":"failed to read body"}`, http.StatusBadRequest)
 		return
@@ -378,16 +401,34 @@ func (r *router) handleRequest(w http.ResponseWriter, req *http.Request) {
 	}
 	json.Unmarshal(body, &parsed)
 
+	// Anthropic API paths (/v1/messages) always go to the active backend
+	// without triggering a switch — Claude Code sends a different model name
+	// than the one configured for routing.
+	if req.URL.Path == "/v1/messages" {
+		r.mu.Lock()
+		active := r.activeBackend
+		r.mu.Unlock()
+		if active == "vllm" {
+			r.routeToVLLM(w, req, body)
+		} else {
+			r.routeToOllama(w, req, body, false)
+		}
+		return
+	}
+
 	if r.isVLLMModel(parsed.Model) {
 		r.routeToVLLM(w, req, body)
 	} else {
-		r.routeToOllama(w, req, body)
+		if parsed.Model != "" {
+			log.Printf("routing to ollama: model=%q path=%s", parsed.Model, req.URL.Path)
+		}
+		r.routeToOllama(w, req, body, parsed.Model != "")
 	}
 }
 
-func (r *router) routeToOllama(w http.ResponseWriter, req *http.Request, body []byte) {
+func (r *router) routeToOllama(w http.ResponseWriter, req *http.Request, body []byte, hasModel bool) {
 	r.mu.Lock()
-	if r.activeBackend == "vllm" {
+	if r.activeBackend == "vllm" && hasModel {
 		log.Println("switching to ollama — stopping vLLM container")
 		if err := r.containerStop(); err != nil {
 			log.Printf("warning: failed to stop vLLM: %v", err)
@@ -457,10 +498,16 @@ func (r *router) routeToVLLM(w http.ResponseWriter, req *http.Request, body []by
 func (r *router) translateOllamaToOpenAI(w http.ResponseWriter, req *http.Request, body []byte) {
 	// Parse Ollama request format
 	var ollamaReq struct {
-		Model    string           `json:"model"`
-		Messages []map[string]any `json:"messages"`
-		Prompt   string           `json:"prompt"`
-		Stream   *bool            `json:"stream"`
+		Model       string           `json:"model"`
+		Messages    []map[string]any `json:"messages"`
+		Prompt      string           `json:"prompt"`
+		Stream      *bool            `json:"stream"`
+		Temperature *float64         `json:"temperature"`
+		TopP        *float64         `json:"top_p"`
+		TopK        *int             `json:"top_k"`
+		MaxTokens   *int             `json:"max_tokens"`
+		Seed        *int             `json:"seed"`
+		Stop        []string         `json:"stop"`
 	}
 	json.Unmarshal(body, &ollamaReq)
 
@@ -479,6 +526,24 @@ func (r *router) translateOllamaToOpenAI(w http.ResponseWriter, req *http.Reques
 		"model":    ollamaReq.Model,
 		"messages": messages,
 		"stream":   stream,
+	}
+	if ollamaReq.Temperature != nil {
+		openaiReq["temperature"] = *ollamaReq.Temperature
+	}
+	if ollamaReq.TopP != nil {
+		openaiReq["top_p"] = *ollamaReq.TopP
+	}
+	if ollamaReq.TopK != nil {
+		openaiReq["top_k"] = *ollamaReq.TopK
+	}
+	if ollamaReq.MaxTokens != nil {
+		openaiReq["max_tokens"] = *ollamaReq.MaxTokens
+	}
+	if ollamaReq.Seed != nil {
+		openaiReq["seed"] = *ollamaReq.Seed
+	}
+	if len(ollamaReq.Stop) > 0 {
+		openaiReq["stop"] = ollamaReq.Stop
 	}
 	openaiBody, _ := json.Marshal(openaiReq)
 

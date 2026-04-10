@@ -95,4 +95,12 @@ config/secrets.yaml
 !deploy/compose/.env.example
 !deploy/terraform/**/terraform.tfvars.example
 !config/secrets.example.yaml
+# Node.js
+node_modules/
+.yarn/install-state.gz
+
+# OpenCode
+.opencode/
+
+# Claude Code
 .claude/
