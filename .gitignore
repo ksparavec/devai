@@ -97,7 +97,8 @@ config/secrets.yaml
 !config/secrets.example.yaml
 # Node.js
 node_modules/
-.yarn/install-state.gz
+**/.yarn/install-state.gz
+*.tsbuildinfo
 
 # Claude Code
 .claude/
