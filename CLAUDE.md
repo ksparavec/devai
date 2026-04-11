@@ -66,16 +66,17 @@ Build cache: CLI binaries pre-downloaded to `/var/cache/devai/pip/bin/` via `mak
 ### Inference stack (deploy/docker-compose.yaml)
 
 ```
-Client → devai-router:11434 [gpu-arbiter, 9 MB Go binary]
-              ├─ GGUF model → devai-ollama:11434 (always running, auto load/unload)
-              └─ NVFP4 model → devai-vllm:11434 (container auto-created per model)
+Agent → devai-router:11434 → devai-ollama:11434 (GGUF models)
+Agent → devai-router:11435 → devai-vllm:11434   (NVFP4 models via vLLM)
+Agent → devai-router:11436 → devai-sglang:11434  (NVFP4 models via SGLang)
 ```
 
-- **devai-router** — Routes by model name (NVFP4 → vLLM, everything else → Ollama). Manages GPU exclusion: unloads Ollama before starting vLLM, stops vLLM on GGUF request or idle timeout. Translates Ollama API ↔ OpenAI API for vLLM. Recreates vLLM container with correct model on switch.
+- **devai-router** — Multi-port GPU-aware reverse proxy (~720 lines Go, 9 MB distroless binary). One port per backend. No message inspection — port determines backend. Manages GPU exclusion: only one backend uses GPU at a time. Graceful drain waits for in-flight requests before stopping a backend. Idle timeout auto-stops backends.
 - **devai-ollama** — Unmodified `ollama/ollama:latest`. GGUF models, GPU auto-detected. `OLLAMA_MAX_LOADED_MODELS=1` ensures clean model switching.
 - **devai-vllm** — `vllm/vllm-openai` image. NVFP4 models for Blackwell GPUs. Container lifecycle managed by router via Podman API.
+- **devai-sglang** — `lmsysorg/sglang` image. NVFP4 + HuggingFace models. RadixAttention for multi-turn speedup. Container lifecycle managed by router via Podman API.
 - **devai-webui-proxy** — nginx TLS proxy for Open WebUI (mkcert certs or self-signed fallback).
-- **devai-open-webui** — Web chat interface, sees all models (Ollama + vLLM) via router.
+- **devai-open-webui** — Web chat interface, connects to Ollama port (:11434).
 
 ### Supporting services
 
@@ -93,11 +94,11 @@ All services share `devai-net` network. Model data stored under `/var/cache/deva
 ### Key files
 
 ```
-deploy/models.yaml            — Model catalog (ollama + vllm models)
+deploy/models.yaml            — Model catalog (flat list, each model declares backend: [ollama/vllm/sglang])
 deploy/docker-compose.yaml    — Infrastructure services
 deploy/Dockerfile.base        — Base image
 deploy/Dockerfile.lab         — Lab image
 deploy/Dockerfile.router      — Router image (distroless, 9 MB)
-gpu-arbiter/main.go           — Router source (~650 lines Go)
+gpu-arbiter/main.go           — GPU arbiter source (multi-port proxy, ~720 lines Go)
 tests/test-router.sh          — Integration tests
 ```

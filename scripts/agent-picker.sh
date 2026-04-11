@@ -5,9 +5,10 @@
 DEFAULT_MODEL="${OLLAMA_DEFAULT_MODEL:-qwen3.5:9b}"
 
 AGENTS=(
-  "claude|Claude Code|ollama launch claude --model $DEFAULT_MODEL --yes"
-  "codex|Codex|ollama launch codex --model $DEFAULT_MODEL --yes"
-  "aider|Aider|aider-launcher"
+  "claude-ollama|Claude Code (Ollama)|ollama launch claude --model $DEFAULT_MODEL --yes"
+  "claude-vllm|Claude Code (vLLM)|ANTHROPIC_BASE_URL=http://devai-router:11435 claude --model Qwen3.5-9B-NVFP4"
+  "claude-sglang|Claude Code (SGLang)|ANTHROPIC_BASE_URL=http://devai-router:11436 claude --model Qwen3.5-9B-NVFP4"
+  "aider|Aider (Ollama)|aider-launcher"
   "bash|Bash Shell|bash"
 )
 

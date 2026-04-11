@@ -57,6 +57,18 @@ services:
       - label=disable
     restart: "no"
 
+  sglang:
+    image: ${SGLANG_IMAGE:-docker.io/lmsysorg/sglang:latest}
+    container_name: devai-sglang
+    hostname: sglang
+    volumes:
+      - /var/cache/devai/ollama/models/vllm:/models:ro
+    devices:
+      - nvidia.com/gpu=all
+    security_opt:
+      - label=disable
+    restart: "no"
+
   router:
     build:
       context: ..
@@ -66,13 +78,20 @@ services:
     hostname: router
     environment:
       - OLLAMA_URL=http://ollama:11434
+      - OLLAMA_PORT=11434
       - VLLM_URL=http://vllm:11434
+      - VLLM_PORT=11435
       - VLLM_CONTAINER=devai-vllm
-      - VLLM_PATTERNS=NVFP4,nvfp4
-      - VLLM_IMAGE=docker.io/vllm/vllm-openai:latest-cu130-ubuntu2404
+      - VLLM_IMAGE=${VLLM_IMAGE:-docker.io/vllm/vllm-openai:latest-cu130-ubuntu2404}
       - VLLM_MODELS_DIR=/var/cache/devai/ollama/models/vllm
-      - VLLM_NETWORK=devai-net
-      - IDLE_TIMEOUT=${VLLM_IDLE_TIMEOUT:-300}
+      - SGLANG_URL=http://sglang:11434
+      - SGLANG_PORT=11436
+      - SGLANG_CONTAINER=devai-sglang
+      - SGLANG_IMAGE=${SGLANG_IMAGE:-docker.io/lmsysorg/sglang:latest}
+      - SGLANG_MODELS_DIR=/var/cache/devai/ollama/models/vllm
+      - NETWORK=devai-net
+      - IDLE_TIMEOUT=${IDLE_TIMEOUT:-300}
+      - DRAIN_TIMEOUT=${DRAIN_TIMEOUT:-30}
       - PODMAN_SOCKET=/run/podman/podman.sock
     volumes:
       - ${XDG_RUNTIME_DIR:-/run/user/1000}/podman/podman.sock:/run/podman/podman.sock

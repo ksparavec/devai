@@ -10,5 +10,5 @@ RUN go mod tidy && CGO_ENABLED=0 go build -ldflags="-s -w" -o /gpu-arbiter .
 
 FROM gcr.io/distroless/static-debian12
 COPY --from=build /gpu-arbiter /gpu-arbiter
-EXPOSE 11434
+EXPOSE 11434 11435 11436
 ENTRYPOINT ["/gpu-arbiter"]
