@@ -50,7 +50,10 @@ Copy `.env.example` to `.env` before first use. Key settings:
 - `JUPYTER_TOKEN` — Fixed JupyterLab access token
 - `HTTP_PROXY`/`HTTPS_PROXY` — Proxy settings for corporate environments
 
-Model catalog is in `deploy/models.yaml` (single source of truth for all models).
+Model catalog is in `deploy/models.yaml` (single source of truth for all models). GPU inference settings:
+
+- `GPU_MEMORY_GB` — Total GPU VRAM in GB (default: 24). Used by router to calculate memory fractions and context limits.
+- `MAX_CONTEXT_LEN` — Default max context length in tokens (default: 131072 = 128K). Auto-reduced when KV cache can't fit it. Per-model override via `context` field in models.yaml.
 
 ## Architecture
 
@@ -71,7 +74,7 @@ Agent → devai-router:11435 → devai-vllm:11434   (NVFP4 models via vLLM)
 Agent → devai-router:11436 → devai-sglang:11434  (NVFP4 models via SGLang)
 ```
 
-- **devai-router** — Multi-port GPU-aware reverse proxy (~720 lines Go, 9 MB distroless binary). One port per backend. No message inspection — port determines backend. Manages GPU exclusion: only one backend uses GPU at a time. Graceful drain waits for in-flight requests before stopping a backend. Idle timeout auto-stops backends.
+- **devai-router** — Multi-port GPU-aware reverse proxy (~800 lines Go, 9 MB distroless binary). One port per backend. No message inspection — port determines backend. Manages GPU exclusion: only one backend uses GPU at a time. Graceful drain waits for in-flight requests before stopping a backend. Idle timeout auto-stops backends. Dynamic GPU memory allocation: calculates `--gpu-memory-utilization` (vLLM) and `--mem-fraction-static` (SGLang) from model weight size vs total VRAM, with backend-specific reservations for CUDA graphs and RadixAttention. Context length auto-sized to fit available KV cache (128K default, reduced for tight fits).
 - **devai-ollama** — Unmodified `ollama/ollama:latest`. GGUF models, GPU auto-detected. `OLLAMA_MAX_LOADED_MODELS=1` ensures clean model switching.
 - **devai-vllm** — `vllm/vllm-openai` image. NVFP4 models for Blackwell GPUs. Container lifecycle managed by router via Podman API.
 - **devai-sglang** — `lmsysorg/sglang` image. NVFP4 + HuggingFace models. RadixAttention for multi-turn speedup. Container lifecycle managed by router via Podman API.
@@ -91,6 +94,27 @@ All services share `devai-net` network. Model data stored under `/var/cache/deva
 - Open WebUI: nginx proxy with mkcert certs or self-signed fallback
 - Generate with `mkcert <IP>` on browser workstation, copy to container host
 
+### Model picker (shell + Jupyter)
+
+Interactive model → backend → agent selection via fzf. Used by both `make shell-*` (via `agent-picker`) and JupyterLab launcher cards.
+
+- `scripts/model-picker.py` — Python TUI: reads `deploy/models.yaml`, three-step fzf picker
+- `scripts/agent-picker.sh` — Shell wrapper, calls model-picker.py
+- `packages/jupyter-ai-launchers/src/index.ts` — JupyterLab extension, each card runs `model-picker --agent <name>`
+
+### Building the JupyterLab extension
+
+Never build on the host. Build inside a container:
+
+```bash
+podman run --rm -it \
+  -v "$(pwd)/packages/jupyter-ai-launchers:/src:z" \
+  -w /src \
+  devai-lab-cpu bash -c "jlpm install && jlpm build:prod"
+```
+
+Pre-built output lives in `packages/jupyter-ai-launchers/jupyter_ai_launchers/labextension/` and is copied into the image by Dockerfile.lab. Rebuild after changing `src/index.ts`.
+
 ### Key files
 
 ```
@@ -100,5 +124,6 @@ deploy/Dockerfile.base        — Base image
 deploy/Dockerfile.lab         — Lab image
 deploy/Dockerfile.router      — Router image (distroless, 9 MB)
 gpu-arbiter/main.go           — GPU arbiter source (multi-port proxy, ~720 lines Go)
+scripts/model-picker.py       — Interactive model/backend/agent picker (fzf-based)
 tests/test-router.sh          — Integration tests
 ```

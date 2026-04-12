@@ -12,6 +12,10 @@
 - [x] SGLang backend support added
 - [x] models.yaml flat list with backend: [list] per model
 - [x] Go unit tests (19) + integration tests (19) — all passing
+- [x] Interactive model picker (fzf-based shell + Jupyter launcher cards)
+- [x] Dynamic GPU memory fraction (model size vs VRAM, backend-aware)
+- [x] Dynamic context length (128K default, auto-reduced for tight fits)
+- [x] Go unit tests expanded to 31 (parseSizeGB, memFraction, computeLaunchConfig)
 
 ## Open Items
 - [ ] README.md — full rewrite of remaining legacy sections (appendices, detailed GPU docs)

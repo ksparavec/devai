@@ -21,10 +21,11 @@ For tasks where cloud AI is appropriate, the JupyterLab environment also include
 
 ## Features
 
-- **JupyterLab workspace** — full data science environment with launcher icons for Claude, Codex, Gemini, and Ollama. One click to start a conversation with any AI from within your notebook workflow.
+- **Interactive model picker** — select model first, then backend, then agent. Arrow-key navigation via fzf in the shell (`make shell-gpu`); same flow from JupyterLab launcher cards. Shows model size, purpose, and backend rationale (GGUF compatibility vs NVFP4 throughput vs RadixAttention).
+- **JupyterLab workspace** — full data science environment with launcher icons for Claude, Codex, Gemini, and Ollama. Each card launches the model picker for interactive model and backend selection.
 - **Multiple AI CLIs pre-installed** — Claude Code, OpenAI Codex, Google Gemini CLI, and Ollama are all ready to use from the terminal. No manual installation, no version conflicts.
 - **VS Code in the browser** — code-server provides a full Visual Studio Code experience accessible from any browser, with Jupyter integration via extensions.
-- **Automatic GPU-arbitrated model serving** — run both GGUF models (via Ollama) and NVFP4 models (via vLLM) on a single GPU. The gpu-arbiter router transparently switches between backends based on the model you request — no manual intervention, no OOM errors.
+- **Automatic GPU-arbitrated model serving** — run GGUF models (via Ollama), NVFP4 models (via vLLM or SGLang) on a single GPU. The gpu-arbiter router transparently switches between backends, dynamically calculates GPU memory fractions and context lengths from model size vs available VRAM — no manual intervention, no OOM errors.
 - **Open WebUI chat interface** — web-based chat UI over HTTPS that sees all available models (both Ollama and vLLM). Select any model from the dropdown and start chatting.
 - **Fast iteration** — two-layer container build separates rarely-changing system packages (base) from frequently-updated tools and Python packages (lab). Rebuilds take minutes, not hours.
 - **Aggressive caching** — CLI binaries are updated via ETags (only downloads when upstream changes). APT proxy and Docker Hub mirror eliminate redundant network traffic across rebuilds.
@@ -127,10 +128,13 @@ Access:
 
 The gpu-arbiter router (`devai-router`) automatically manages GPU exclusion:
 
-- **GGUF model requested** → routes to Ollama (auto-loads model)
-- **NVFP4 model requested** → unloads Ollama, starts vLLM container, proxies request
-- **Model switch** → recreates vLLM container with the new model
-- **Idle timeout** → stops vLLM after 5 minutes of inactivity
+- **GGUF model requested** (port 11434) → routes to Ollama (auto-loads model)
+- **NVFP4 model requested** (port 11435) → unloads Ollama, starts vLLM container, proxies request
+- **NVFP4 model via SGLang** (port 11436) → unloads Ollama, starts SGLang container (RadixAttention for multi-turn)
+- **Model switch** → recreates backend container with the new model
+- **Dynamic GPU memory** → calculates `--gpu-memory-utilization` (vLLM) / `--mem-fraction-static` (SGLang) from model weight size vs total VRAM. Reserves 2 GB for vLLM runtime (CUDA graphs, activations) and 3 GB for SGLang (RadixAttention tree + CUDA graphs)
+- **Dynamic context length** → defaults to 128K, auto-reduced when KV cache can't support it. Estimates per-token KV footprint from model size class
+- **Idle timeout** → stops vLLM/SGLang after 5 minutes of inactivity
 - **API translation** → Ollama API ↔ OpenAI API for transparent Open WebUI support
 
 Only one backend uses the GPU at a time. No manual switching required.
@@ -148,10 +152,12 @@ Only one backend uses the GPU at a time. No manual switching required.
 | `HOME_VOLUME` | `$HOME/devai-home` | Persistent home directory |
 | `JUPYTER_TOKEN` | — | Fixed access token (set in .env) |
 | `APT_PROXY` | — | APT cache URL (e.g. `http://localhost:3142`) |
+| `GPU_MEMORY_GB` | 24 | Total GPU VRAM in GB (for memory fraction and context calculation) |
+| `MAX_CONTEXT_LEN` | 131072 | Default max context length in tokens (128K). Auto-reduced for tight fits |
 
 ### `deploy/models.yaml` — Model catalog
 
-Single source of truth for all models. Defines Ollama (GGUF) and vLLM (NVFP4) models with names, sizes, and purposes. Used by `make ollama-list`, `make vllm-list`, and the gpu-arbiter router. The included models have been selected for systems with consumer-grade GPUs (up to 24 GB VRAM) and up to 64 GB main RAM.
+Single source of truth for all models. Defines Ollama (GGUF), vLLM and SGLang (NVFP4) models with names, sizes, backends, and purposes. Used by `make ollama-list`, `make vllm-list`, the gpu-arbiter router, and the interactive model picker. Optional `context` field caps the max context length per model (overrides `MAX_CONTEXT_LEN`). The included models have been selected for systems with consumer-grade GPUs (up to 24 GB VRAM) and up to 64 GB main RAM.
 
 ### Adding Python Packages
 

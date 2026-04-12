@@ -45,11 +45,11 @@ interface Tool {
 }
 
 const TOOLS: Tool[] = [
-  { id: 'claude', name: 'Claude', svg: claudeSvg, command: 'ollama launch claude --model ${OLLAMA_DEFAULT_MODEL:-qwen3.5:9b} --yes' },
-  { id: 'codex', name: 'Codex', svg: codexSvg, command: 'ollama launch codex --model ${OLLAMA_DEFAULT_MODEL:-qwen3.5:9b} --yes' },
-  { id: 'aider', name: 'Aider', svg: aiderSvg, command: 'aider-launcher' },
+  { id: 'claude', name: 'Claude', svg: claudeSvg, command: 'model-picker --agent claude' },
+  { id: 'codex', name: 'Codex', svg: codexSvg, command: 'model-picker --agent codex' },
+  { id: 'aider', name: 'Aider', svg: aiderSvg, command: 'model-picker --agent aider' },
   { id: 'gemini', name: 'Gemini', svg: geminiSvg, command: 'gemini' },
-  { id: 'ollama', name: 'Ollama', svg: ollamaSvg, command: 'ollama-chat' }
+  { id: 'ollama', name: 'Ollama', svg: ollamaSvg, command: 'model-picker --agent interpreter' }
 ];
 
 const plugin: JupyterFrontEndPlugin<void> = {

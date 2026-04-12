@@ -26,9 +26,13 @@ func testBackend(name string, server *httptest.Server) *backendState {
 
 func testArbiter(backends ...*backendState) *arbiter {
 	a := &arbiter{
-		backends:     make(map[string]*backendState),
-		idleTimeout:  5 * time.Minute,
-		drainTimeout: 5 * time.Second,
+		backends:      make(map[string]*backendState),
+		idleTimeout:   5 * time.Minute,
+		drainTimeout:  5 * time.Second,
+		modelSizes:    map[string]float64{"test-model": 7.4},
+		modelContexts: map[string]int{},
+		totalVRAMGB:   24.0,
+		maxContextLen: 131072,
 	}
 	for _, bs := range backends {
 		a.backends[bs.config.Name] = bs
@@ -281,7 +285,7 @@ func TestEnsureBackendRunning_RequiresModelForNonOllama(t *testing.T) {
 	bs := testBackend("vllm", server)
 	bs.config.Image = "test-image"
 	bs.config.ModelsDir = "/tmp"
-	bs.config.Entrypoint = func(m string) []string { return []string{"echo", m} }
+	bs.config.Entrypoint = func(m string, lc launchConfig) []string { return []string{"echo", m} }
 	a := testArbiter(bs)
 
 	a.mu.Lock()
@@ -407,6 +411,132 @@ func TestEnvInt(t *testing.T) {
 	}
 }
 
+// --- TestParseSizeGB ---
+
+func TestParseSizeGB(t *testing.T) {
+	tests := []struct {
+		input string
+		want  float64
+	}{
+		{"7.4 GB", 7.4},
+		{"17 GB", 17.0},
+		{"2.0 GB", 2.0},
+		{"58 GB", 58.0},
+		{"", 0},
+		{"invalid", 0},
+		{" 10 GB ", 10.0},
+	}
+	for _, tt := range tests {
+		got := parseSizeGB(tt.input)
+		if got != tt.want {
+			t.Errorf("parseSizeGB(%q) = %v, want %v", tt.input, got, tt.want)
+		}
+	}
+}
+
+// --- TestMemFraction ---
+
+func TestMemFraction(t *testing.T) {
+	tests := []struct {
+		name        string
+		modelSizeGB float64
+		totalVRAMGB float64
+		backend     string
+		wantMin     float64
+		wantMax     float64
+	}{
+		// Small model on 24 GB — plenty of room
+		{"small_vllm_24", 7.4, 24, "vllm", 0.90, 0.95},
+		{"small_sglang_24", 7.4, 24, "sglang", 0.85, 0.90},
+		// Medium model on 24 GB
+		{"medium_vllm_24", 17, 24, "vllm", 0.90, 0.95},
+		{"medium_sglang_24", 17, 24, "sglang", 0.85, 0.90},
+		// Tight fit on 24 GB — fraction approaches max
+		{"tight_vllm_24", 22, 24, "vllm", 0.80, 0.95},
+		{"tight_sglang_24", 22, 24, "sglang", 0.80, 0.95},
+		// Large GPU — clamped at 0.95
+		{"small_vllm_80", 7.4, 80, "vllm", 0.95, 0.95},
+		// Unknown model size — conservative defaults
+		{"unknown_vllm", 0, 24, "vllm", 0.85, 0.92},
+		{"unknown_sglang", 0, 24, "sglang", 0.78, 0.85},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := memFraction(tt.modelSizeGB, tt.totalVRAMGB, tt.backend)
+			if got < tt.wantMin || got > tt.wantMax {
+				t.Errorf("memFraction(%.1f, %.0f, %s) = %.2f, want [%.2f, %.2f]",
+					tt.modelSizeGB, tt.totalVRAMGB, tt.backend, got, tt.wantMin, tt.wantMax)
+			}
+		})
+	}
+}
+
+func TestMemFraction_SGLangLowerThanVLLM(t *testing.T) {
+	// SGLang reserves more for RadixAttention, so its fraction should be lower
+	vllm := memFraction(10, 24, "vllm")
+	sglang := memFraction(10, 24, "sglang")
+	if sglang >= vllm {
+		t.Errorf("sglang fraction (%.2f) should be lower than vllm (%.2f)", sglang, vllm)
+	}
+}
+
+// --- TestComputeLaunchConfig ---
+
+func TestComputeLaunchConfig_ContextFitsInKVCache(t *testing.T) {
+	// 7.4 GB model on 24 GB GPU — plenty of room for 128K context
+	lc := computeLaunchConfig(7.4, 24, "vllm", 131072)
+	if lc.MaxContext < 32768 {
+		t.Errorf("expected at least 32K context for small model, got %d", lc.MaxContext)
+	}
+	if lc.MaxContext > 131072 {
+		t.Errorf("context should not exceed declared max, got %d", lc.MaxContext)
+	}
+}
+
+func TestComputeLaunchConfig_TightFitReducesContext(t *testing.T) {
+	// 22 GB model on 24 GB GPU — very little KV cache room
+	lc := computeLaunchConfig(22, 24, "vllm", 131072)
+	if lc.MaxContext >= 131072 {
+		t.Errorf("tight model should reduce context below 128K, got %d", lc.MaxContext)
+	}
+	if lc.MaxContext < 4096 {
+		t.Errorf("context should be at least 4K, got %d", lc.MaxContext)
+	}
+}
+
+func TestComputeLaunchConfig_ModelDeclaredContextRespected(t *testing.T) {
+	// Model declares 32K max even though GPU has room for more
+	lc := computeLaunchConfig(7.4, 24, "vllm", 32768)
+	if lc.MaxContext > 32768 {
+		t.Errorf("should respect declared max of 32K, got %d", lc.MaxContext)
+	}
+}
+
+func TestComputeLaunchConfig_SGLangReservesMoreMemory(t *testing.T) {
+	vllm := computeLaunchConfig(10, 24, "vllm", 131072)
+	sglang := computeLaunchConfig(10, 24, "sglang", 131072)
+	if sglang.MaxContext >= vllm.MaxContext {
+		t.Errorf("sglang should have lower max context due to RadixAttention overhead: vllm=%d sglang=%d",
+			vllm.MaxContext, sglang.MaxContext)
+	}
+}
+
+// --- TestEnvFloat ---
+
+func TestEnvFloat(t *testing.T) {
+	t.Setenv("TEST_FLOAT", "48.5")
+	if got := envFloat("TEST_FLOAT", 24.0); got != 48.5 {
+		t.Errorf("expected 48.5, got %f", got)
+	}
+	if got := envFloat("NONEXISTENT_FLOAT", 24.0); got != 24.0 {
+		t.Errorf("expected 24.0, got %f", got)
+	}
+	t.Setenv("TEST_FLOAT_BAD", "notanumber")
+	if got := envFloat("TEST_FLOAT_BAD", 24.0); got != 24.0 {
+		t.Errorf("expected fallback 24.0 for bad value, got %f", got)
+	}
+}
+
 // --- TestMakeTagsHandler ---
 
 func TestMakeTagsHandler_ReturnsConfiguredModels(t *testing.T) {
@@ -443,7 +573,7 @@ func TestMakeRequestHandler_Returns503WhenBackendFails(t *testing.T) {
 	defer server.Close()
 
 	bs := testBackend("vllm", server)
-	bs.config.Entrypoint = func(m string) []string { return []string{"echo", m} }
+	bs.config.Entrypoint = func(m string, lc launchConfig) []string { return []string{"echo", m} }
 	bs.config.ContainerName = "test-vllm"
 
 	a := testArbiter(bs)

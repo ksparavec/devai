@@ -29,6 +29,8 @@
 //	PODMAN_SOCKET     path to Podman API socket (default /run/podman/podman.sock)
 //	CONFIG_FILE       path to models.yaml (default /etc/devai/models.yaml)
 //	NETWORK           Podman network name (default devai-net)
+//	GPU_MEMORY_GB     total GPU VRAM in GB for memory fraction calc (default 24)
+//	MAX_CONTEXT_LEN   default max context length in tokens (default 131072 = 128K)
 package main
 
 import (
@@ -44,6 +46,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -71,6 +74,15 @@ func envInt(key string, fallback int) int {
 	return fallback
 }
 
+func envFloat(key string, fallback float64) float64 {
+	if s := os.Getenv(key); s != "" {
+		if v, err := strconv.ParseFloat(s, 64); err == nil && v > 0 {
+			return v
+		}
+	}
+	return fallback
+}
+
 // --- Configuration ---
 
 type backendConfig struct {
@@ -82,7 +94,7 @@ type backendConfig struct {
 	ModelsDir     string
 	Network       string
 	HealthPath    string
-	Entrypoint    func(modelName string) []string
+	Entrypoint    func(modelName string, lc launchConfig) []string
 	EnvVars       map[string]string
 }
 
@@ -91,7 +103,14 @@ type configModel struct {
 	Backend []string `yaml:"backend"`
 	Repo    string   `yaml:"repo"`
 	Size    string   `yaml:"size"`
+	Context int      `yaml:"context"`
 	Purpose string   `yaml:"purpose"`
+}
+
+// launchConfig holds computed GPU parameters passed to backend entrypoints.
+type launchConfig struct {
+	MemFraction float64
+	MaxContext  int
 }
 
 type configFile struct {
@@ -125,12 +144,16 @@ type backendState struct {
 }
 
 type arbiter struct {
-	backends     map[string]*backendState
-	mu           sync.Mutex
-	ollamaURL    *url.URL
-	podmanClient *http.Client
-	idleTimeout  time.Duration
-	drainTimeout time.Duration
+	backends      map[string]*backendState
+	mu            sync.Mutex
+	ollamaURL     *url.URL
+	podmanClient  *http.Client
+	idleTimeout   time.Duration
+	drainTimeout  time.Duration
+	modelSizes    map[string]float64 // model name → weight size in GB
+	modelContexts map[string]int     // model name → declared max context (from models.yaml)
+	totalVRAMGB   float64
+	maxContextLen int // global default from MAX_CONTEXT_LEN env (default 131072)
 }
 
 // --- Proxy factories ---
@@ -167,17 +190,148 @@ func newSmartProxy(target *url.URL) *httputil.ReverseProxy {
 	return p
 }
 
+// --- GPU memory calculation ---
+
+// parseSizeGB extracts a float from strings like "7.4 GB", "17 GB", "2.0 GB".
+func parseSizeGB(s string) float64 {
+	s = strings.TrimSpace(s)
+	s = strings.TrimSuffix(s, "GB")
+	s = strings.TrimSpace(s)
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0
+	}
+	return v
+}
+
+// memFraction calculates the optimal GPU memory fraction for a backend.
+//
+// The fraction controls what share of total VRAM is allocated to the static
+// memory pool (model weights + KV cache).  The remainder stays free for CUDA
+// graph capture, activation tensors, and temporary buffers.
+//
+// Backend-specific reservations (kept outside the static pool):
+//   - vLLM:   ~2 GB — CUDA graphs + activations
+//   - SGLang: ~3 GB — RadixAttention tree + CUDA graphs + activations
+func memFraction(modelSizeGB, totalVRAMGB float64, backend string) float64 {
+	if modelSizeGB <= 0 {
+		// Unknown model size — conservative defaults
+		switch backend {
+		case "sglang":
+			return 0.82
+		default:
+			return 0.88
+		}
+	}
+
+	// Base reservation for runtime memory outside the static pool
+	var reserveGB float64
+	switch backend {
+	case "sglang":
+		reserveGB = 3.0
+	default: // vllm
+		reserveGB = 2.0
+	}
+
+	// Tight fit: model barely leaves room for KV cache + runtime
+	headroom := totalVRAMGB - modelSizeGB
+	if headroom < reserveGB+2.0 {
+		reserveGB = max(0.5, headroom*0.3)
+	}
+
+	frac := (totalVRAMGB - reserveGB) / totalVRAMGB
+
+	// Clamp to [0.40, 0.95]
+	return max(0.40, min(0.95, frac))
+}
+
+// maxContextLen estimates the maximum context length that fits in the
+// available KV cache memory.  Both vLLM and SGLang store KV cache in BF16
+// regardless of weight quantization.
+//
+// Rough per-token KV footprint (BF16, GQA):
+//
+//	2 (K+V) × layers × kv_heads × head_dim × 2 bytes
+//
+// We approximate this from the weight file size since we don't have the
+// architecture config:
+//
+//	≤ 6 GB  →  ~100 KB/token  (small models, fewer layers)
+//	≤ 12 GB →  ~160 KB/token  (9B class)
+//	≤ 20 GB →  ~256 KB/token  (14-27B class)
+//	> 20 GB →  ~400 KB/token  (35B+ class)
+// fittableContext estimates the maximum context length that fits in the
+// available KV cache memory.  Both vLLM and SGLang store KV cache in BF16
+// regardless of weight quantization.
+//
+// Approximate per-token KV footprint (BF16, GQA):
+//
+//	2 (K+V) × layers × kv_heads × head_dim × 2 bytes
+//
+// Estimated from weight file size (architecture config unavailable):
+//
+//	≤ 6 GB  →  ~100 KB/token  (small models, fewer layers)
+//	≤ 12 GB →  ~160 KB/token  (9B class)
+//	≤ 20 GB →  ~256 KB/token  (14-27B class)
+//	> 20 GB →  ~400 KB/token  (35B+ class)
+func fittableContext(availableKVGB, modelSizeGB float64) int {
+	var kvPerTokenKB float64
+	switch {
+	case modelSizeGB <= 6:
+		kvPerTokenKB = 100
+	case modelSizeGB <= 12:
+		kvPerTokenKB = 160
+	case modelSizeGB <= 20:
+		kvPerTokenKB = 256
+	default:
+		kvPerTokenKB = 400
+	}
+
+	tokens := int(availableKVGB * 1024 * 1024 / kvPerTokenKB)
+	tokens = (tokens / 4096) * 4096 // round down to 4K boundary
+
+	if tokens < 4096 {
+		return 4096
+	}
+	return tokens
+}
+
+// computeLaunchConfig builds a launchConfig for the given model and backend.
+// desiredContext is the target context length (from models.yaml or
+// MAX_CONTEXT_LEN env); the actual value is reduced when KV cache memory
+// cannot support it.
+func computeLaunchConfig(modelSizeGB, totalVRAMGB float64, backend string, desiredContext int) launchConfig {
+	frac := memFraction(modelSizeGB, totalVRAMGB, backend)
+
+	// KV cache budget = static pool minus weights
+	availKV := frac*totalVRAMGB - modelSizeGB
+	if availKV < 0 {
+		availKV = 0
+	}
+
+	fits := fittableContext(availKV, modelSizeGB)
+	ctx := desiredContext
+	if ctx <= 0 {
+		ctx = 131072
+	}
+	if fits < ctx {
+		ctx = fits
+	}
+
+	return launchConfig{MemFraction: frac, MaxContext: ctx}
+}
+
 // --- Entrypoint builders ---
 
-func vllmEntrypoint(modelName string) []string {
+func vllmEntrypoint(modelName string, lc launchConfig) []string {
 	return []string{
 		"python3", "-m", "vllm.entrypoints.openai.api_server",
 		"--model", "/models/" + modelName,
 		"--host", "0.0.0.0",
 		"--port", "11434",
 		"--tensor-parallel-size", "1",
-		"--max-model-len", "65536",
-		"--gpu-memory-utilization", "0.95",
+		"--max-model-len", fmt.Sprintf("%d", lc.MaxContext),
+		"--gpu-memory-utilization", fmt.Sprintf("%.2f", lc.MemFraction),
 		"--enable-prefix-caching",
 		"--enable-auto-tool-choice",
 		"--tool-call-parser", "qwen3_coder",
@@ -186,14 +340,15 @@ func vllmEntrypoint(modelName string) []string {
 	}
 }
 
-func sglangEntrypoint(modelName string) []string {
+func sglangEntrypoint(modelName string, lc launchConfig) []string {
 	return []string{
 		"python3", "-m", "sglang.launch_server",
 		"--model-path", "/models/" + modelName,
 		"--host", "0.0.0.0",
 		"--port", "11434",
 		"--tp", "1",
-		"--mem-fraction-static", "0.95",
+		"--mem-fraction-static", fmt.Sprintf("%.2f", lc.MemFraction),
+		"--context-length", fmt.Sprintf("%d", lc.MaxContext),
 		"--trust-remote-code",
 	}
 }
@@ -256,12 +411,30 @@ func main() {
 		},
 	}
 
+	// Build model size and context lookups from catalog
+	modelSizes := make(map[string]float64, len(cfg.Models))
+	modelContexts := make(map[string]int, len(cfg.Models))
+	for _, m := range cfg.Models {
+		if sz := parseSizeGB(m.Size); sz > 0 {
+			modelSizes[m.Name] = sz
+		}
+		if m.Context > 0 {
+			modelContexts[m.Name] = m.Context
+		}
+	}
+	totalVRAMGB := envFloat("GPU_MEMORY_GB", 24.0)
+	maxCtx := envInt("MAX_CONTEXT_LEN", 131072)
+
 	a := &arbiter{
-		backends:     make(map[string]*backendState),
-		ollamaURL:    ollamaURL,
-		podmanClient: podmanClient,
-		idleTimeout:  time.Duration(envInt("IDLE_TIMEOUT", 300)) * time.Second,
-		drainTimeout: time.Duration(envInt("DRAIN_TIMEOUT", 30)) * time.Second,
+		backends:      make(map[string]*backendState),
+		ollamaURL:     ollamaURL,
+		podmanClient:  podmanClient,
+		idleTimeout:   time.Duration(envInt("IDLE_TIMEOUT", 300)) * time.Second,
+		drainTimeout:  time.Duration(envInt("DRAIN_TIMEOUT", 30)) * time.Second,
+		modelSizes:    modelSizes,
+		modelContexts: modelContexts,
+		totalVRAMGB:   totalVRAMGB,
+		maxContextLen: maxCtx,
 	}
 
 	for _, bc := range backends {
@@ -340,6 +513,9 @@ func (a *arbiter) containerRemove(name string) {
 }
 
 func (a *arbiter) containerIsRunning(name string) bool {
+	if a.podmanClient == nil {
+		return false
+	}
 	url := fmt.Sprintf("http://d/v4.0.0/libpod/containers/%s/json", name)
 	resp, err := a.podmanClient.Get(url)
 	if err != nil {
@@ -360,10 +536,19 @@ func (a *arbiter) containerRecreate(bs *backendState, modelName string) error {
 	a.containerStop(cfg.ContainerName)
 	a.containerRemove(cfg.ContainerName)
 
+	modelSizeGB := a.modelSizes[modelName]
+	declaredCtx := a.modelContexts[modelName]
+	if declaredCtx == 0 {
+		declaredCtx = a.maxContextLen
+	}
+	lc := computeLaunchConfig(modelSizeGB, a.totalVRAMGB, cfg.Name, declaredCtx)
+	log.Printf("  %s launch: model=%.1f GB, gpu=%.1f GB → fraction=%.2f, context=%dk",
+		cfg.Name, modelSizeGB, a.totalVRAMGB, lc.MemFraction, lc.MaxContext/1024)
+
 	spec := map[string]any{
 		"image":      cfg.Image,
 		"name":       cfg.ContainerName,
-		"entrypoint": cfg.Entrypoint(modelName),
+		"entrypoint": cfg.Entrypoint(modelName, lc),
 		"command":    []string{},
 		"mounts": []map[string]any{{
 			"destination": "/models",
@@ -502,7 +687,7 @@ func (a *arbiter) ensureBackendRunning(bs *backendState, modelName string) error
 	}
 
 	// Verify container is actually running (may have been stopped externally)
-	if bs.running && !a.containerIsRunning(bs.config.ContainerName) {
+	if bs.running && a.podmanClient != nil && !a.containerIsRunning(bs.config.ContainerName) {
 		log.Printf("%s container not running (externally stopped), resetting state", bs.config.Name)
 		bs.running = false
 		bs.currentModel = ""
