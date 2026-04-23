@@ -10,7 +10,7 @@ runtime = os.environ.get('CONTAINER_RUNTIME', 'podman')
 container = os.environ.get('OLLAMA_CONTAINER', 'devai-ollama')
 
 cfg = yaml.safe_load(open(config_path))
-models = cfg.get('models', {}).get('ollama', [])
+models = [m for m in cfg.get('models', []) if 'ollama' in m.get('backend', [])]
 
 try:
     out = subprocess.check_output(
@@ -27,13 +27,13 @@ except Exception:
     loaded = []
 
 print()
-print(f"{'MODEL':<35s} {'SIZE':<10s} {'FIT':<6s} {'STATE':<6s} PURPOSE")
-print('-' * 103)
+print(f"{'MODEL':<35s} {'SIZE':<10s} {'STATE':<6s} PURPOSE")
+print('-' * 97)
 for m in models:
     state = '-'
     if any(m['name'] in i for i in installed):
         state = 'ready'
     if any(m['name'] in l for l in loaded):
         state = '\033[32mloaded\033[0m'
-    print(f"{m['name']:<35s} {m['size']:<10s} {m['fit']:<6s} {state:<6s} {m['purpose']}")
+    print(f"{m['name']:<35s} {m['size']:<10s} {state:<6s} {m['purpose']}")
 print()

@@ -97,7 +97,7 @@ services:
       - PODMAN_SOCKET=/run/podman/podman.sock
     volumes:
       - ${XDG_RUNTIME_DIR:-/run/user/1000}/podman/podman.sock:/run/podman/podman.sock
-      - ./models.yaml:/etc/devai/models.yaml:ro
+      - ./active-models.yaml:/etc/devai/models.yaml:ro
     depends_on:
       - ollama
     restart: unless-stopped

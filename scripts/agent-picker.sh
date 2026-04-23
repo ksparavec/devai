@@ -1,5 +1,6 @@
 #!/bin/bash
 # Interactive model/agent picker for devai shell sessions.
-# Delegates to model-picker for fzf-based model → backend → agent selection.
-# Falls back to bash on error.
-exec python3 /usr/local/bin/model-picker "$@" || exec bash
+# Delegates to model-picker; its stdout/stderr and exit code are the user's
+# truth. No fallback, no wrapping, no filtering.
+
+exec python3 /usr/local/bin/model-picker "$@"

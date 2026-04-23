@@ -24,6 +24,8 @@ OLLAMA_CONTAINER = devai-ollama
 OLLAMA_EXEC = $(CONTAINER_RUNTIME) exec $(OLLAMA_CONTAINER) ollama
 DEVAI_NETWORK = devai-net
 CACHE_DIR = /var/cache/devai
+GPU_MEMORY_GB ?= 24
+MAX_CONTEXT_LEN ?= 131072
 CACHE_COMPOSE = deploy/docker-compose.yaml
 INFERENCE_CONFIG = deploy/models.yaml
 HF_CLI = hf
@@ -116,31 +118,37 @@ fetch-cli: ## Download all external binaries and packages to local cache (uses E
 			--etag-compare $(ETAG_DIR)/claude.etag --etag-save $(ETAG_DIR)/claude.etag \
 			"$$CC_BUCKET/$$CC_VERSION/$$CC_PLATFORM/claude") \
 		&& if [ "$$HTTP_CODE" = "304" ] || [ ! -s $(CACHE_DIR)/pip/bin/claude.tmp ]; then \
-			rm -f $(CACHE_DIR)/pip/bin/claude.tmp; echo "Claude Code: up to date"; \
+			rm -f $(CACHE_DIR)/pip/bin/claude.tmp; STATE="up to date"; \
 		else \
 			mv $(CACHE_DIR)/pip/bin/claude.tmp $(CACHE_DIR)/pip/bin/claude \
-			&& chmod +x $(CACHE_DIR)/pip/bin/claude && echo "Claude Code: updated"; fi
+			&& chmod +x $(CACHE_DIR)/pip/bin/claude && STATE="updated"; fi \
+		&& VERSION=$$($(CACHE_DIR)/pip/bin/claude --version 2>&1 | awk '{print $$1; exit}') \
+		&& echo "Claude Code: $$STATE ($$VERSION)"
 	@ARCH=$$(dpkg --print-architecture) \
 		&& case "$$ARCH" in amd64) CODEX_ARCH=x86_64;; arm64) CODEX_ARCH=aarch64;; esac \
 		&& HTTP_CODE=$$(curl -fsSL -w '%{http_code}' -o $(CACHE_DIR)/pip/bin/codex.tar.gz \
 			--etag-compare $(ETAG_DIR)/codex.etag --etag-save $(ETAG_DIR)/codex.etag \
 			"https://github.com/openai/codex/releases/latest/download/codex-$${CODEX_ARCH}-unknown-linux-musl.tar.gz") \
 		&& if [ "$$HTTP_CODE" = "304" ] || [ ! -s $(CACHE_DIR)/pip/bin/codex.tar.gz ]; then \
-			rm -f $(CACHE_DIR)/pip/bin/codex.tar.gz; echo "OpenAI Codex: up to date"; \
+			rm -f $(CACHE_DIR)/pip/bin/codex.tar.gz; STATE="up to date"; \
 		else \
 			tar -xzf $(CACHE_DIR)/pip/bin/codex.tar.gz -C $(CACHE_DIR)/pip/bin \
 			&& mv $(CACHE_DIR)/pip/bin/codex-$${CODEX_ARCH}-unknown-linux-musl $(CACHE_DIR)/pip/bin/codex \
-			&& rm -f $(CACHE_DIR)/pip/bin/codex.tar.gz && echo "OpenAI Codex: updated"; fi
+			&& rm -f $(CACHE_DIR)/pip/bin/codex.tar.gz && STATE="updated"; fi \
+		&& VERSION=$$($(CACHE_DIR)/pip/bin/codex --version 2>&1 | awk '{print $$2; exit}') \
+		&& echo "OpenAI Codex: $$STATE ($$VERSION)"
 	@ARCH=$$(dpkg --print-architecture) \
 		&& case "$$ARCH" in amd64) OL_ARCH=amd64;; arm64) OL_ARCH=arm64;; esac \
 		&& HTTP_CODE=$$(curl -fsSL -w '%{http_code}' -o $(CACHE_DIR)/pip/bin/ollama.tar.zst \
 			--etag-compare $(ETAG_DIR)/ollama.etag --etag-save $(ETAG_DIR)/ollama.etag \
 			"https://github.com/ollama/ollama/releases/latest/download/ollama-linux-$${OL_ARCH}.tar.zst") \
 		&& if [ "$$HTTP_CODE" = "304" ] || [ ! -s $(CACHE_DIR)/pip/bin/ollama.tar.zst ]; then \
-			rm -f $(CACHE_DIR)/pip/bin/ollama.tar.zst; echo "Ollama CLI: up to date"; \
+			rm -f $(CACHE_DIR)/pip/bin/ollama.tar.zst; STATE="up to date"; \
 		else \
 			tar --zstd -xf $(CACHE_DIR)/pip/bin/ollama.tar.zst -C $(CACHE_DIR)/pip/bin --strip-components=1 bin/ollama \
-			&& rm -f $(CACHE_DIR)/pip/bin/ollama.tar.zst && echo "Ollama CLI: updated"; fi
+			&& rm -f $(CACHE_DIR)/pip/bin/ollama.tar.zst && STATE="updated"; fi \
+		&& VERSION=$$(OLLAMA_HOST= $(CACHE_DIR)/pip/bin/ollama --version 2>&1 | awk '/client version/{print $$NF; exit}') \
+		&& echo "Ollama CLI: $$STATE ($$VERSION)"
 	@ARCH=$$(dpkg --print-architecture) \
 		&& case "$$ARCH" in amd64) CS_ARCH=amd64;; arm64) CS_ARCH=arm64;; esac \
 		&& CS_VERSION=$$(curl -fsSL https://api.github.com/repos/coder/code-server/releases/latest | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'].lstrip('v'))") \
@@ -148,19 +156,23 @@ fetch-cli: ## Download all external binaries and packages to local cache (uses E
 			--etag-compare $(ETAG_DIR)/code-server.etag --etag-save $(ETAG_DIR)/code-server.etag \
 			"https://github.com/coder/code-server/releases/latest/download/code-server-$${CS_VERSION}-linux-$${CS_ARCH}.tar.gz") \
 		&& if [ "$$HTTP_CODE" = "304" ] || [ ! -s $(CACHE_DIR)/pip/bin/code-server.tar.gz ]; then \
-			rm -f $(CACHE_DIR)/pip/bin/code-server.tar.gz; echo "code-server: up to date"; \
+			rm -f $(CACHE_DIR)/pip/bin/code-server.tar.gz; STATE="up to date"; \
 		else \
 			mkdir -p $(CACHE_DIR)/pip/bin/code-server \
 			&& tar -xzf $(CACHE_DIR)/pip/bin/code-server.tar.gz -C $(CACHE_DIR)/pip/bin/code-server --strip-components=1 \
-			&& rm -f $(CACHE_DIR)/pip/bin/code-server.tar.gz && echo "code-server: updated"; fi
+			&& rm -f $(CACHE_DIR)/pip/bin/code-server.tar.gz && STATE="updated"; fi \
+		&& VERSION=$$($(CACHE_DIR)/pip/bin/code-server/bin/code-server --version 2>&1 | awk '/^[0-9]+\.[0-9]+\.[0-9]+ /{print $$1; exit}') \
+		&& echo "code-server: $$STATE ($$VERSION)"
 	@HTTP_CODE=$$(curl -fsSL -w '%{http_code}' -o $(CACHE_DIR)/pip/bin/uv.tar.gz \
 			--etag-compare $(ETAG_DIR)/uv.etag --etag-save $(ETAG_DIR)/uv.etag \
 			"https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-unknown-linux-gnu.tar.gz") \
 		&& if [ "$$HTTP_CODE" = "304" ] || [ ! -s $(CACHE_DIR)/pip/bin/uv.tar.gz ]; then \
-			rm -f $(CACHE_DIR)/pip/bin/uv.tar.gz; echo "uv: up to date"; \
+			rm -f $(CACHE_DIR)/pip/bin/uv.tar.gz; STATE="up to date"; \
 		else \
 			tar -xzf $(CACHE_DIR)/pip/bin/uv.tar.gz -C $(CACHE_DIR)/pip/bin --strip-components=1 uv-x86_64-unknown-linux-gnu/uv uv-x86_64-unknown-linux-gnu/uvx \
-			&& rm -f $(CACHE_DIR)/pip/bin/uv.tar.gz && echo "uv: updated"; fi
+			&& rm -f $(CACHE_DIR)/pip/bin/uv.tar.gz && STATE="updated"; fi \
+		&& VERSION=$$($(CACHE_DIR)/pip/bin/uv --version 2>&1 | awk '{print $$2; exit}') \
+		&& echo "uv: $$STATE ($$VERSION)"
 	@META=$$(curl -fsSL "https://registry.npmjs.org/@google/gemini-cli/latest") \
 		&& LATEST=$$(echo "$$META" | python3 -c "import sys,json; print(json.load(sys.stdin)['version'])") \
 		&& CACHED=$$(cat $(ETAG_DIR)/gemini.version 2>/dev/null || echo "none") \
@@ -174,6 +186,18 @@ fetch-cli: ## Download all external binaries and packages to local cache (uses E
 			&& ln -sf ../lib/node_modules/@google/gemini-cli/bundle/gemini.js $(CACHE_DIR)/pip/bin/gemini/bin/gemini \
 			&& echo "$$LATEST" > $(ETAG_DIR)/gemini.version \
 			&& echo "Gemini CLI: updated to $$LATEST"; fi
+	@ARCH=$$(dpkg --print-architecture) \
+		&& case "$$ARCH" in amd64) LATE_ARCH=amd64;; arm64) LATE_ARCH=arm64;; esac \
+		&& HTTP_CODE=$$(curl -fsSL -w '%{http_code}' -o $(CACHE_DIR)/pip/bin/late.tmp \
+			--etag-compare $(ETAG_DIR)/late.etag --etag-save $(ETAG_DIR)/late.etag \
+			"https://github.com/mlhher/late/releases/latest/download/late-linux-$${LATE_ARCH}") \
+		&& if [ "$$HTTP_CODE" = "304" ] || [ ! -s $(CACHE_DIR)/pip/bin/late.tmp ]; then \
+			rm -f $(CACHE_DIR)/pip/bin/late.tmp; STATE="up to date"; \
+		else \
+			mv $(CACHE_DIR)/pip/bin/late.tmp $(CACHE_DIR)/pip/bin/late \
+			&& chmod +x $(CACHE_DIR)/pip/bin/late && STATE="updated"; fi \
+		&& VERSION=$$($(CACHE_DIR)/pip/bin/late --version 2>&1 | awk '{print $$2; exit}' | sed 's/^v//') \
+		&& echo "LATE: $$STATE ($$VERSION)"
 
 # Base images used by build and infrastructure
 BASE_IMAGES = debian:trixie $(GPU_BASE_IMAGE)
@@ -391,8 +415,17 @@ cache-up: ## Start infrastructure services (caches + Ollama + vLLM + Open WebUI)
 	@echo ""
 	@echo "To pull a model:  make ollama-pull MODEL=llama3.2"
 
-cache-down: ## Stop infrastructure services
-	$(COMPOSE) -f $(CACHE_COMPOSE) down
+cache-down: ## Stop and remove ALL infrastructure services (running, stopped, orphaned)
+	@# -t 0 kills immediately; --remove-orphans catches containers no longer in compose.
+	-$(COMPOSE) -f $(CACHE_COMPOSE) down --remove-orphans -t 0
+	@# Force-remove any leftovers from the compose project (e.g. a previous cache-up
+	@# that errored mid-create and left containers behind). Target the compose
+	@# project label so we never touch lab/shell containers the user is running.
+	@ids=$$($(CONTAINER_RUNTIME) ps -aq --filter "label=com.docker.compose.project=deploy" 2>/dev/null); \
+	if [ -n "$$ids" ]; then \
+		echo "Removing stragglers: $$ids"; \
+		$(CONTAINER_RUNTIME) rm -f $$ids; \
+	fi
 
 cache-status: ## Show infrastructure service status and disk usage
 	@$(COMPOSE) -f $(CACHE_COMPOSE) ps
@@ -425,15 +458,40 @@ cache-status: ## Show infrastructure service status and disk usage
 	done; \
 	$$found || echo "  (none — run 'make vllm-pull' to download)"
 
-cache-clean: ## Remove all cached data (keeps volumes mounted)
+cache-clean: ## Remove all cached data (keeps volumes mounted, preserves podman graphroot)
 	$(COMPOSE) -f $(CACHE_COMPOSE) down
 	@echo "Cleaning cache directories..."
-	rm -rf $(CACHE_DIR)/registry/* $(CACHE_DIR)/apt/* $(CACHE_DIR)/pip/* $(CACHE_DIR)/npm/*
-	@echo "Cache cleaned."
-
-ollama-pull: ## Pull model(s) (usage: make ollama-pull MODEL=name, or make ollama-pull to pull all)
-	@INFERENCE_CONFIG=$(INFERENCE_CONFIG) CONTAINER_RUNTIME=$(CONTAINER_RUNTIME) OLLAMA_CONTAINER=$(OLLAMA_CONTAINER) MODEL="$(MODEL)" \
-		python3 scripts/ollama-pull.py
+	@# $(CACHE_DIR)/registry co-hosts podman's graphroot AND the registry:2 pull-through cache
+	@# (see README "Storage Layout"). Wiping registry/* would destroy podman image storage,
+	@# so we target only the registry:2 subtree (registry/docker) and guard every path
+	@# against overlap with the container runtime's graphroot.
+	@# Container-managed caches (apt-cacher-ng, registry:2) contain files owned by
+	@# subuids, so the cleanup runs under `podman unshare` to access them.
+	@graphroot=$$($(CONTAINER_RUNTIME) info --format '{{.Store.GraphRoot}}' 2>/dev/null \
+	              || $(CONTAINER_RUNTIME) info --format '{{.DockerRootDir}}' 2>/dev/null \
+	              || true); \
+	targets="$(CACHE_DIR)/registry/docker $(CACHE_DIR)/apt $(CACHE_DIR)/pip $(CACHE_DIR)/npm"; \
+	for target in $$targets; do \
+		if [ -n "$$graphroot" ]; then \
+			case "$$graphroot/" in \
+				"$$target"/*) \
+					echo "ERROR: refusing to clean $$target — $(CONTAINER_RUNTIME) graphroot ($$graphroot) is inside it."; \
+					echo "       Relocate graphroot or clean selectively by hand."; \
+					exit 1;; \
+			esac; \
+		fi; \
+	done; \
+	if [ "$(CONTAINER_RUNTIME)" = "podman" ]; then \
+		wrap="$(CONTAINER_RUNTIME) unshare"; \
+	else \
+		wrap=""; \
+	fi; \
+	for target in $$targets; do \
+		[ -d "$$target" ] || continue; \
+		$$wrap find "$$target" -mindepth 1 -maxdepth 1 -exec rm -rf {} +; \
+		echo "  cleaned $$target/"; \
+	done
+	@echo "Cache cleaned. Podman graphroot preserved."
 
 ollama-rm: ## Remove an Ollama model and clean up (usage: make ollama-rm MODEL=llama3.2)
 	$(OLLAMA_EXEC) rm $(MODEL)
@@ -500,13 +558,37 @@ ollama-df: ## Show Ollama cache disk usage breakdown
 # vLLM targets (NVFP4 on Blackwell)
 # =============================================================================
 
-vllm-pull: ## Download vLLM model (usage: make vllm-pull MODEL=name or make vllm-pull to download all)
-	@INFERENCE_CONFIG=$(INFERENCE_CONFIG) VLLM_MODELS_DIR=$(VLLM_MODELS_DIR) HF_CLI=$(HF_CLI) MODEL="$(MODEL)" \
-		python3 scripts/vllm-pull.py
-
 vllm-list: ## List vLLM models with status
 	@INFERENCE_CONFIG=$(INFERENCE_CONFIG) VLLM_MODELS_DIR=$(VLLM_MODELS_DIR) \
 		python3 scripts/vllm-list.py
+
+vram-fit: ## Show which models from the full catalog fit in VRAM (planning aid; use model-select to act)
+	@GPU_MEMORY_GB=$${VRAM:-$(GPU_MEMORY_GB)} MAX_CONTEXT_LEN=$${CONTEXT:-$(MAX_CONTEXT_LEN)} \
+		python3 scripts/vram-fit.py \
+			$(if $(VRAM),--vram $(VRAM),) \
+			$(if $(CONTEXT),--context $(CONTEXT),) \
+			$(if $(KV),--kv-dtype $(KV),) \
+			$(if $(FAMILY),--family $(FAMILY),) \
+			$(if $(FITS_ONLY),--fits-only,) \
+			--models-yaml $(INFERENCE_CONFIG) \
+			--vllm-dir $(VLLM_MODELS_DIR)
+
+model-select: ## Select fitting+on-disk models into deploy/active-models.yaml (DOWNLOAD=1 pulls missing, PRUNE=1 deletes too-large)
+	@OLLAMA_CONTAINER=$(OLLAMA_CONTAINER) CONTAINER_RUNTIME=$(CONTAINER_RUNTIME) \
+	 VLLM_MODELS_DIR=$(VLLM_MODELS_DIR) HF_CLI=$(HF_CLI) \
+	 GPU_MEMORY_GB=$${VRAM:-$(GPU_MEMORY_GB)} MAX_CONTEXT_LEN=$${CONTEXT:-$(MAX_CONTEXT_LEN)} \
+		python3 scripts/select-models.py \
+			$(if $(FAMILY),--family $(FAMILY),) \
+			$(if $(VRAM),--vram $(VRAM),) \
+			$(if $(CONTEXT),--context $(CONTEXT),) \
+			$(if $(KV),--kv-dtype $(KV),) \
+			$(if $(DOWNLOAD),--download,) \
+			$(if $(PRUNE),--prune,) \
+			$(if $(PRUNE_SHADOWS),--prune-shadows,) \
+			$(if $(DRY_RUN),--dry-run,)
+
+catalog-regen: ## Regenerate deploy/models.yaml from scripts/model-families.yaml using live upstream data
+	python3 scripts/generate-catalog.py
 
 vllm-status: ## Show vLLM container status
 	@$(CONTAINER_RUNTIME) inspect -f '{{.State.Status}}' devai-vllm 2>/dev/null || echo "not running"

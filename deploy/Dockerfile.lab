@@ -30,9 +30,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends ripgrep fzf \
 
 # Cache-bust when binaries change (hash computed by Makefile)
 ARG BIN_HASH=unknown
-# Install CLI binaries (pre-downloaded to /var/cache/bin/ via cache mount)
+# Install CLI binaries (pre-downloaded to /var/cache/bin/ via cache mount).
+# LATE is installed as late-bin; a shell wrapper is installed as `late` to
+# apply sensible OPENAI_* defaults pointing at the in-cluster router.
 RUN cp /var/cache/bin/uv /var/cache/bin/uvx /var/cache/bin/claude /var/cache/bin/codex /var/cache/bin/ollama /usr/local/bin/ \
-    && chmod +x /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/claude /usr/local/bin/codex /usr/local/bin/ollama
+    && cp /var/cache/bin/late /usr/local/bin/late-bin \
+    && chmod +x /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/claude /usr/local/bin/codex /usr/local/bin/late-bin /usr/local/bin/ollama
 
 # Install code-server (pre-downloaded)
 RUN cp -a /var/cache/bin/code-server /usr/local/lib/code-server \
@@ -76,10 +79,11 @@ COPY packages/jupyter-ai-launchers/jupyter_ai_launchers/labextension /usr/local/
 # Install wrapper scripts for JupyterLab launchers and shell picker
 COPY scripts/ollama-chat.sh /usr/local/bin/ollama-chat
 COPY scripts/aider-launcher.sh /usr/local/bin/aider-launcher
+COPY scripts/late-launcher.sh /usr/local/bin/late
 COPY scripts/agent-picker.sh /usr/local/bin/agent-picker
 COPY scripts/model-picker.py /usr/local/bin/model-picker
 COPY deploy/models.yaml /etc/devai/models.yaml
-RUN chmod +x /usr/local/bin/ollama-chat /usr/local/bin/aider-launcher /usr/local/bin/agent-picker /usr/local/bin/model-picker
+RUN chmod +x /usr/local/bin/ollama-chat /usr/local/bin/aider-launcher /usr/local/bin/late /usr/local/bin/agent-picker /usr/local/bin/model-picker
 
 # Create user and directories (handle GID/UID conflicts in GPU base images)
 RUN getent group 1000 >/dev/null || groupadd -g 1000 devai \
@@ -88,6 +92,7 @@ RUN getent group 1000 >/dev/null || groupadd -g 1000 devai \
     && ln -s /usr/local/bin/claude /home/devai/.local/bin/claude \
     && ln -s /usr/local/bin/codex /home/devai/.local/bin/codex \
     && ln -s /usr/local/bin/gemini /home/devai/.local/bin/gemini \
+    && ln -s /usr/local/bin/late /home/devai/.local/bin/late \
     && ln -s /usr/local/bin/ollama /home/devai/.local/bin/ollama \
     && ln -s /usr/local/bin/code-server /home/devai/.local/bin/code-server \
     && chown -R 1000:1000 /home/devai
