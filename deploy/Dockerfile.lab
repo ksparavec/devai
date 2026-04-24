@@ -82,6 +82,7 @@ COPY scripts/aider-launcher.sh /usr/local/bin/aider-launcher
 COPY scripts/late-launcher.sh /usr/local/bin/late
 COPY scripts/agent-picker.sh /usr/local/bin/agent-picker
 COPY scripts/model-picker.py /usr/local/bin/model-picker
+COPY scripts/vram-fit.py /usr/local/bin/vram-fit.py
 COPY deploy/models.yaml /etc/devai/models.yaml
 RUN chmod +x /usr/local/bin/ollama-chat /usr/local/bin/aider-launcher /usr/local/bin/late /usr/local/bin/agent-picker /usr/local/bin/model-picker
 

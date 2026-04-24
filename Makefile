@@ -75,6 +75,14 @@ endif
 
 RUN_FLAGS =
 
+# Read-only mount of the model cache so the in-container picker can do
+# disk-based "is downloaded?" detection (ollama manifests + vllm/sglang dirs).
+MODEL_CACHE_MOUNT = $(if $(wildcard $(CACHE_DIR)/ollama),-v $(CACHE_DIR)/ollama:/var/cache/devai/ollama:ro)
+
+# Read-only mount of the active-models catalog so the picker can show the
+# precomputed VRAM breakdown (weights / KV / overhead / total) per model.
+ACTIVE_CATALOG_MOUNT = $(if $(wildcard deploy/active-models.yaml),-v $(CURDIR)/deploy/active-models.yaml:/etc/devai/active-models.yaml:ro)
+
 # User switching: only needed for docker (rootless podman root = host user)
 USER_ENV =
 ifneq ($(findstring podman,$(CONTAINER_RUNTIME)),podman)
@@ -269,6 +277,8 @@ lab-cpu: ## Run the container (CPU)
 		-p 0.0.0.0:$(LAB_PORT):8888 \
 		-v $(HOME_VOLUME):/home/$(CONTAINER_USER) \
 		$(HOME_MOUNT_ARG) \
+		$(MODEL_CACHE_MOUNT) \
+		$(ACTIVE_CATALOG_MOUNT) \
 		-v "$$(readlink -f $(HOST_WORK_DIR))":/home/$(CONTAINER_USER)/work \
 		$(IMAGE_NAME)
 
@@ -292,6 +302,8 @@ lab-gpu: ## Run the container (GPU/CUDA)
 		-p 0.0.0.0:$(LAB_PORT):8888 \
 		-v $(HOME_VOLUME):/home/$(CONTAINER_USER) \
 		$(HOME_MOUNT_ARG) \
+		$(MODEL_CACHE_MOUNT) \
+		$(ACTIVE_CATALOG_MOUNT) \
 		-v "$$(readlink -f $(HOST_WORK_DIR))":/home/$(CONTAINER_USER)/work \
 		$(IMAGE_NAME_GPU)
 
@@ -308,6 +320,8 @@ shell-cpu: ## Start an interactive shell (CPU)
 		-e CONTAINER_USER=$(CONTAINER_USER) \
 		-v $(HOME_VOLUME):/home/$(CONTAINER_USER) \
 		$(HOME_MOUNT_ARG) \
+		$(MODEL_CACHE_MOUNT) \
+		$(ACTIVE_CATALOG_MOUNT) \
 		-v "$$(readlink -f $(HOST_WORK_DIR))":/home/$(CONTAINER_USER)/work \
 		$(IMAGE_NAME) agent-picker
 
@@ -325,6 +339,8 @@ shell-gpu: ## Start an interactive shell (GPU)
 		-e CONTAINER_USER=$(CONTAINER_USER) \
 		-v $(HOME_VOLUME):/home/$(CONTAINER_USER) \
 		$(HOME_MOUNT_ARG) \
+		$(MODEL_CACHE_MOUNT) \
+		$(ACTIVE_CATALOG_MOUNT) \
 		-v "$$(readlink -f $(HOST_WORK_DIR))":/home/$(CONTAINER_USER)/work \
 		$(IMAGE_NAME_GPU) agent-picker
 
@@ -360,6 +376,32 @@ test-vllm: cache-up ## Run vLLM/GPU integration tests (~10min)
 
 test-idle: cache-up ## Run vLLM idle timeout test (restarts router temporarily)
 	./tests/test-router-idle.sh
+
+test-agents: ## Smoke-test every (agent × backend) cell against the live router
+	@# Router lifecycle-manages vllm/sglang via podman API — they linger after
+	@# the router stops them and confuse `compose up`. Clear them first.
+	@$(CONTAINER_RUNTIME) rm -f devai-vllm devai-sglang 2>/dev/null || true
+	@$(MAKE) cache-up
+	@mkdir -p $(CURDIR)/tests/.matrix-logs
+	$(CONTAINER_RUNTIME) run --rm \
+		--name devai-test-agents \
+		$(GPU_FLAGS) \
+		--network $(DEVAI_NETWORK) \
+		$(MODEL_CACHE_MOUNT) \
+		$(ACTIVE_CATALOG_MOUNT) \
+		-v "$(CURDIR)/tests/agent-matrix.sh":/usr/local/bin/agent-matrix:ro \
+		-v "$(CURDIR)/tests/.matrix-logs":/var/log/agent-matrix \
+		-v "$(CURDIR)/config/codex/config.toml":/root/.codex/config.toml:ro \
+		-e TIMEOUT_OLLAMA=$${TIMEOUT_OLLAMA:-30} \
+		-e TIMEOUT_VLLM=$${TIMEOUT_VLLM:-180} \
+		-e TIMEOUT_SGLANG=$${TIMEOUT_SGLANG:-180} \
+		-e PROMPT="$${PROMPT:-say hi in five words}" \
+		-e ROUTER=devai-router \
+		-e OPENAI_API_KEY=local \
+		-e LOG_DIR=/var/log/agent-matrix \
+		--entrypoint /usr/local/bin/agent-matrix \
+		$(IMAGE_NAME_GPU)
+	@echo "  logs preserved at $(CURDIR)/tests/.matrix-logs/"
 
 test: test-router test-ollama test-vllm test-idle ## Run all tests in sequence
 

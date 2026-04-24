@@ -1,7 +1,32 @@
-[model_providers.local]
-name = "Ollama"
+# DevAI Codex configuration.
+#
+# Codex 0.124+ removed `wire_api = "chat"` and only supports its built-in OSS
+# code path (`--oss --local-provider <name>`) for non-OpenAI endpoints. The
+# built-in `ollama` provider name is reserved and hard-codes localhost, so we
+# define custom providers (`router-ollama`, `router-vllm`, `router-sglang`)
+# pointing at the DevAI router on the appropriate port. The picker invokes
+# codex with `--oss --local-provider router-<backend>`.
+#
+# This file ships in the image at /etc/devai/codex-config.toml. The container
+# entrypoint installs it to ~/.codex/config.toml on first launch and tracks
+# its sha in ~/.codex/.devai-managed-sum. On image rebuilds the entrypoint
+# refreshes the file if and only if the user hasn't edited their copy. If
+# you edit ~/.codex/config.toml the entrypoint will leave it alone (but
+# logs a "not refreshing" note so future provider changes are visible).
+
+[model_providers.router-ollama]
+name = "Ollama via DevAI router"
 base_url = "http://devai-router:11434/v1"
 
-[profiles.local]
-model = "qwen3.5:9b"
-model_provider = "local"
+[model_providers.router-vllm]
+name = "vLLM via DevAI router"
+base_url = "http://devai-router:11435/v1"
+
+[model_providers.router-sglang]
+name = "SGLang via DevAI router"
+base_url = "http://devai-router:11436/v1"
+
+# Pre-trust the default workdir so codex doesn't prompt on first launch
+# inside a fresh shell. Codex will still prompt for any other directory.
+[projects."/home/devai/work"]
+trust_level = "trusted"

@@ -102,3 +102,4 @@ node_modules/
 
 # Claude Code
 .claude/
+tests/.matrix-logs

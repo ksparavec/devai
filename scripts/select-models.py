@@ -76,8 +76,8 @@ def kv_per_token_bytes(arch: dict, kv_dtype: str) -> int:
             * KV_BYTES[kv_dtype])
 
 
-def estimate_total_gb(model: dict, context: int, kv_dtype: str) -> float:
-    """Return the estimated VRAM requirement for this model's backend.
+def vram_breakdown(model: dict, context: int, kv_dtype: str) -> dict:
+    """Return the per-component VRAM breakdown for this model's backend.
 
     vLLM/SGLang: strict — weights + full KV + CUDA graphs + activations.
     Ollama: lean — weights + small runtime buffer (llama.cpp handles KV
@@ -86,7 +86,14 @@ def estimate_total_gb(model: dict, context: int, kv_dtype: str) -> float:
     weight_gb = parse_size_gb(model["size"])
     backends = model.get("backend", [])
     if "ollama" in backends and "vllm" not in backends and "sglang" not in backends:
-        return weight_gb + OLLAMA_OVERHEAD_GB
+        return {
+            "weights_gb": round(weight_gb, 2),
+            "kv_gb": 0.0,
+            "overhead_gb": OLLAMA_OVERHEAD_GB,
+            "total_gb": round(weight_gb + OLLAMA_OVERHEAD_GB, 2),
+            "context": context,
+            "kv_dtype": kv_dtype,
+        }
     arch = model.get("arch")
     if not arch:
         # No arch means we can't compute KV. Be conservative: assume
@@ -94,7 +101,19 @@ def estimate_total_gb(model: dict, context: int, kv_dtype: str) -> float:
         kv_gb = (256 * 1024 * context) / (1024 ** 3)
     else:
         kv_gb = (kv_per_token_bytes(arch, kv_dtype) * context) / (1024 ** 3)
-    return weight_gb + kv_gb + VLLM_OVERHEAD_GB
+    return {
+        "weights_gb": round(weight_gb, 2),
+        "kv_gb": round(kv_gb, 2),
+        "overhead_gb": VLLM_OVERHEAD_GB,
+        "total_gb": round(weight_gb + kv_gb + VLLM_OVERHEAD_GB, 2),
+        "context": context,
+        "kv_dtype": kv_dtype,
+    }
+
+
+def estimate_total_gb(model: dict, context: int, kv_dtype: str) -> float:
+    """Back-compat wrapper around vram_breakdown."""
+    return vram_breakdown(model, context, kv_dtype)["total_gb"]
 
 
 # ── Disk detection ───────────────────────────────────────────────────────────
@@ -305,6 +324,17 @@ def write_active(models: list[dict], vram: float, context: int, kv_dtype: str) -
             )
         if m.get("purpose"):
             lines.append(f'    purpose: "{m["purpose"]}"')
+        v = m.get("vram") or {}
+        if v:
+            lines.append(
+                f"    vram: {{ "
+                f"weights_gb: {v['weights_gb']}, "
+                f"kv_gb: {v['kv_gb']}, "
+                f"overhead_gb: {v['overhead_gb']}, "
+                f"total_gb: {v['total_gb']}, "
+                f"context: {v['context']}, "
+                f"kv_dtype: {v['kv_dtype']} }}"
+            )
         lines.append("")
     ACTIVE.write_text("\n".join(lines))
 
@@ -349,11 +379,12 @@ def main() -> None:
 
     rows: list[Row] = []
     for m in models:
-        total = estimate_total_gb(m, args.context, args.kv_dtype)
+        breakdown = vram_breakdown(m, args.context, args.kv_dtype)
+        m["vram"] = breakdown            # persist into catalog row for write_active
         rows.append(Row(
             model=m,
-            total_gb=total,
-            fits=total <= args.vram,
+            total_gb=breakdown["total_gb"],
+            fits=breakdown["total_gb"] <= args.vram,
             downloaded=is_downloaded(m),
         ))
     rows.sort(key=lambda r: (not r.fits, r.total_gb))
