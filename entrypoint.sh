@@ -92,39 +92,10 @@ else
 fi
 
 
-# Seed agent config files. We track the sha of the bundled config we last
-# installed in a marker file so we can distinguish "image updated" from
-# "user edited their copy":
-#
-#   no marker          → first launch, install
-#   marker == user sha → user hasn't edited, safe to refresh on image bump
-#   marker != user sha → user took ownership of the file, leave it alone
-if [ -f /etc/devai/codex-config.toml ]; then
-    USER_CFG="$HOME_DIR/.codex/config.toml"
-    MARKER="$HOME_DIR/.codex/.devai-managed-sum"
-    BUNDLED_SUM=$(sha256sum /etc/devai/codex-config.toml | awk '{print $1}')
-    NEEDS_INSTALL=0
-    if [ ! -f "$USER_CFG" ]; then
-        NEEDS_INSTALL=1
-    elif [ ! -f "$MARKER" ]; then
-        # Predates marker — back up and refresh once to adopt new layout.
-        cp "$USER_CFG" "${USER_CFG}.devai-pre$(date +%s).bak"
-        NEEDS_INSTALL=1
-    else
-        USER_SUM=$(sha256sum "$USER_CFG" | awk '{print $1}')
-        TRACKED_SUM=$(cat "$MARKER")
-        if [ "$BUNDLED_SUM" != "$TRACKED_SUM" ] && [ "$USER_SUM" = "$TRACKED_SUM" ]; then
-            # Image bumped, user hasn't edited → refresh.
-            NEEDS_INSTALL=1
-        elif [ "$BUNDLED_SUM" != "$TRACKED_SUM" ]; then
-            echo "note: bundled codex config has changed but ~/.codex/config.toml has user edits — not refreshing" >&2
-        fi
-    fi
-    if [ "$NEEDS_INSTALL" = "1" ]; then
-        mkdir -p "$HOME_DIR/.codex"
-        cp /etc/devai/codex-config.toml "$USER_CFG"
-        echo "$BUNDLED_SUM" > "$MARKER"
-    fi
+# Seed codex config if absent — never overwrite an existing one.
+if [ -f /etc/devai/codex-config.toml ] && [ ! -f "$HOME_DIR/.codex/config.toml" ]; then
+    mkdir -p "$HOME_DIR/.codex"
+    cp /etc/devai/codex-config.toml "$HOME_DIR/.codex/config.toml"
 fi
 
 # Prepare the command

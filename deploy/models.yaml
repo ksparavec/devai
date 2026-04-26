@@ -17,6 +17,7 @@ models:
     arch: { layers: 35, kv_heads: 1, head_dim: 256, k_eq_v: false }
     arch_source: "google/gemma-4-e2b-it/config.json"
     purpose: "gemma4 · 9.5 GB · 35L/1kv/256h"
+    thinking: true
 
   - name: "gemma-4-e4b-it"
     family: gemma4
@@ -27,6 +28,7 @@ models:
     arch: { layers: 42, kv_heads: 2, head_dim: 256, k_eq_v: false }
     arch_source: "google/gemma-4-e4b-it/config.json"
     purpose: "gemma4 · 14.9 GB · 42L/2kv/256h"
+    thinking: true
 
   - name: "gemma-4-26b-a4b-it"
     family: gemma4
@@ -37,6 +39,7 @@ models:
     arch: { layers: 30, kv_heads: 8, head_dim: 256, k_eq_v: true }
     arch_source: "google/gemma-4-26b-a4b-it/config.json"
     purpose: "gemma4 · 48.1 GB · 30L/8kv/256h · k=v"
+    thinking: true
 
   - name: "gemma-4-31b-it"
     family: gemma4
@@ -47,6 +50,7 @@ models:
     arch: { layers: 60, kv_heads: 16, head_dim: 256, k_eq_v: true }
     arch_source: "google/gemma-4-31b-it/config.json"
     purpose: "gemma4 · 58.3 GB · 60L/16kv/256h · k=v"
+    thinking: true
 
   - name: "Gemma-4-31B-IT-NVFP4"
     family: gemma4
@@ -57,6 +61,7 @@ models:
     arch: { layers: 60, kv_heads: 16, head_dim: 256, k_eq_v: true }
     arch_source: "nvidia/Gemma-4-31B-IT-NVFP4/config.json"
     purpose: "gemma4 · 30.4 GB · 60L/16kv/256h · k=v"
+    thinking: true
 
   - name: "Gemma-4-26B-A4B-it-NVFP4"
     family: gemma4
@@ -67,6 +72,7 @@ models:
     arch: { layers: 30, kv_heads: 8, head_dim: 256, k_eq_v: true }
     arch_source: "bg-digitalservices/Gemma-4-26B-A4B-it-NVFP4/config.json"
     purpose: "gemma4 · 15.3 GB · 30L/8kv/256h · k=v"
+    thinking: true
 
   - name: "gemma4:latest"
     family: gemma4
@@ -76,6 +82,7 @@ models:
     arch: { layers: 30, kv_heads: 8, head_dim: 256, k_eq_v: true }
     arch_source: "google/gemma-4-26b-a4b-it/config.json"
     purpose: "gemma4 · 8.9 GB · 30L/8kv/256h · k=v"
+    thinking: true
 
   - name: "gemma4:e2b"
     family: gemma4
@@ -85,6 +92,7 @@ models:
     arch: { layers: 30, kv_heads: 8, head_dim: 256, k_eq_v: true }
     arch_source: "google/gemma-4-26b-a4b-it/config.json"
     purpose: "gemma4 · 6.7 GB · 30L/8kv/256h · k=v"
+    thinking: true
 
   - name: "gemma4:e4b"
     family: gemma4
@@ -94,6 +102,7 @@ models:
     arch: { layers: 30, kv_heads: 8, head_dim: 256, k_eq_v: true }
     arch_source: "google/gemma-4-26b-a4b-it/config.json"
     purpose: "gemma4 · 8.9 GB · 30L/8kv/256h · k=v"
+    thinking: true
 
   - name: "gemma4:26b"
     family: gemma4
@@ -103,6 +112,7 @@ models:
     arch: { layers: 30, kv_heads: 8, head_dim: 256, k_eq_v: true }
     arch_source: "google/gemma-4-26b-a4b-it/config.json"
     purpose: "gemma4 · 16.8 GB · 30L/8kv/256h · k=v"
+    thinking: true
 
   - name: "gemma4:31b"
     family: gemma4
@@ -112,6 +122,7 @@ models:
     arch: { layers: 30, kv_heads: 8, head_dim: 256, k_eq_v: true }
     arch_source: "google/gemma-4-26b-a4b-it/config.json"
     purpose: "gemma4 · 18.5 GB · 30L/8kv/256h · k=v"
+    thinking: true
 
   - name: "gemma4:e2b-it-q4_K_M"
     family: gemma4
@@ -121,6 +132,7 @@ models:
     arch: { layers: 30, kv_heads: 8, head_dim: 256, k_eq_v: true }
     arch_source: "google/gemma-4-26b-a4b-it/config.json"
     purpose: "gemma4 · 6.7 GB · 30L/8kv/256h · k=v"
+    thinking: true
 
   - name: "gemma4:e2b-it-q8_0"
     family: gemma4
@@ -130,6 +142,7 @@ models:
     arch: { layers: 30, kv_heads: 8, head_dim: 256, k_eq_v: true }
     arch_source: "google/gemma-4-26b-a4b-it/config.json"
     purpose: "gemma4 · 7.6 GB · 30L/8kv/256h · k=v"
+    thinking: true
 
   - name: "gemma4:e2b-it-bf16"
     family: gemma4
@@ -139,6 +152,7 @@ models:
     arch: { layers: 30, kv_heads: 8, head_dim: 256, k_eq_v: true }
     arch_source: "google/gemma-4-26b-a4b-it/config.json"
     purpose: "gemma4 · 9.6 GB · 30L/8kv/256h · k=v"
+    thinking: true
 
   - name: "gemma4:e4b-it-q4_K_M"
     family: gemma4
@@ -148,6 +162,7 @@ models:
     arch: { layers: 30, kv_heads: 8, head_dim: 256, k_eq_v: true }
     arch_source: "google/gemma-4-26b-a4b-it/config.json"
     purpose: "gemma4 · 8.9 GB · 30L/8kv/256h · k=v"
+    thinking: true
 
   - name: "gemma4:e4b-it-q8_0"
     family: gemma4
@@ -157,6 +172,7 @@ models:
     arch: { layers: 30, kv_heads: 8, head_dim: 256, k_eq_v: true }
     arch_source: "google/gemma-4-26b-a4b-it/config.json"
     purpose: "gemma4 · 10.8 GB · 30L/8kv/256h · k=v"
+    thinking: true
 
   - name: "gemma4:e4b-it-bf16"
     family: gemma4
@@ -166,6 +182,7 @@ models:
     arch: { layers: 30, kv_heads: 8, head_dim: 256, k_eq_v: true }
     arch_source: "google/gemma-4-26b-a4b-it/config.json"
     purpose: "gemma4 · 14.9 GB · 30L/8kv/256h · k=v"
+    thinking: true
 
   - name: "gemma4:26b-a4b-it-q4_K_M"
     family: gemma4
@@ -175,6 +192,7 @@ models:
     arch: { layers: 30, kv_heads: 8, head_dim: 256, k_eq_v: true }
     arch_source: "google/gemma-4-26b-a4b-it/config.json"
     purpose: "gemma4 · 16.8 GB · 30L/8kv/256h · k=v"
+    thinking: true
 
   - name: "gemma4:26b-a4b-it-q8_0"
     family: gemma4
@@ -184,6 +202,7 @@ models:
     arch: { layers: 30, kv_heads: 8, head_dim: 256, k_eq_v: true }
     arch_source: "google/gemma-4-26b-a4b-it/config.json"
     purpose: "gemma4 · 26.1 GB · 30L/8kv/256h · k=v"
+    thinking: true
 
   - name: "gemma4:31b-it-q4_K_M"
     family: gemma4
@@ -193,6 +212,7 @@ models:
     arch: { layers: 30, kv_heads: 8, head_dim: 256, k_eq_v: true }
     arch_source: "google/gemma-4-26b-a4b-it/config.json"
     purpose: "gemma4 · 18.5 GB · 30L/8kv/256h · k=v"
+    thinking: true
 
   - name: "gemma4:31b-it-q8_0"
     family: gemma4
@@ -202,6 +222,7 @@ models:
     arch: { layers: 30, kv_heads: 8, head_dim: 256, k_eq_v: true }
     arch_source: "google/gemma-4-26b-a4b-it/config.json"
     purpose: "gemma4 · 31.5 GB · 30L/8kv/256h · k=v"
+    thinking: true
 
   - name: "gemma4:31b-it-bf16"
     family: gemma4
@@ -211,6 +232,7 @@ models:
     arch: { layers: 30, kv_heads: 8, head_dim: 256, k_eq_v: true }
     arch_source: "google/gemma-4-26b-a4b-it/config.json"
     purpose: "gemma4 · 58.3 GB · 30L/8kv/256h · k=v"
+    thinking: true
 
   - name: "Qwen3.5-9B-NVFP4"
     family: qwen3.5
@@ -221,6 +243,7 @@ models:
     arch: { layers: 32, kv_heads: 4, head_dim: 256, k_eq_v: false }
     arch_source: "ykarout/Qwen3.5-9B-NVFP4/config.json"
     purpose: "qwen3.5 · 11.5 GB · 32L/4kv/256h"
+    thinking: true
 
   - name: "Qwen3.5-27B-NVFP4"
     family: qwen3.5
@@ -231,6 +254,7 @@ models:
     arch: { layers: 64, kv_heads: 4, head_dim: 256, k_eq_v: false }
     arch_source: "apolo13x/Qwen3.5-27B-NVFP4/config.json"
     purpose: "qwen3.5 · 18.4 GB · 64L/4kv/256h"
+    thinking: true
 
   - name: "Qwen3.5-35B-A3B-NVFP4"
     family: qwen3.5
@@ -241,6 +265,7 @@ models:
     arch: { layers: 40, kv_heads: 2, head_dim: 256, k_eq_v: false }
     arch_source: "apolo13x/Qwen3.5-35B-A3B-NVFP4/config.json"
     purpose: "qwen3.5 · 21.8 GB · 40L/2kv/256h"
+    thinking: true
 
   - name: "qwen3.5:latest"
     family: qwen3.5
@@ -250,6 +275,7 @@ models:
     arch: { layers: 32, kv_heads: 4, head_dim: 256, k_eq_v: false }
     arch_source: "ykarout/Qwen3.5-9B-NVFP4/config.json"
     purpose: "qwen3.5 · 6.1 GB · 32L/4kv/256h"
+    thinking: true
 
   - name: "qwen3.5:0.8b"
     family: qwen3.5
@@ -259,6 +285,7 @@ models:
     arch: { layers: 32, kv_heads: 4, head_dim: 256, k_eq_v: false }
     arch_source: "ykarout/Qwen3.5-9B-NVFP4/config.json"
     purpose: "qwen3.5 · 1.0 GB · 32L/4kv/256h"
+    thinking: true
 
   - name: "qwen3.5:2b"
     family: qwen3.5
@@ -268,6 +295,7 @@ models:
     arch: { layers: 32, kv_heads: 4, head_dim: 256, k_eq_v: false }
     arch_source: "ykarout/Qwen3.5-9B-NVFP4/config.json"
     purpose: "qwen3.5 · 2.6 GB · 32L/4kv/256h"
+    thinking: true
 
   - name: "qwen3.5:4b"
     family: qwen3.5
@@ -277,6 +305,7 @@ models:
     arch: { layers: 32, kv_heads: 4, head_dim: 256, k_eq_v: false }
     arch_source: "ykarout/Qwen3.5-9B-NVFP4/config.json"
     purpose: "qwen3.5 · 3.2 GB · 32L/4kv/256h"
+    thinking: true
 
   - name: "qwen3.5:9b"
     family: qwen3.5
@@ -286,6 +315,7 @@ models:
     arch: { layers: 32, kv_heads: 4, head_dim: 256, k_eq_v: false }
     arch_source: "ykarout/Qwen3.5-9B-NVFP4/config.json"
     purpose: "qwen3.5 · 6.1 GB · 32L/4kv/256h"
+    thinking: true
 
   - name: "qwen3.5:27b"
     family: qwen3.5
@@ -295,6 +325,7 @@ models:
     arch: { layers: 32, kv_heads: 4, head_dim: 256, k_eq_v: false }
     arch_source: "ykarout/Qwen3.5-9B-NVFP4/config.json"
     purpose: "qwen3.5 · 16.2 GB · 32L/4kv/256h"
+    thinking: true
 
   - name: "qwen3.5:35b"
     family: qwen3.5
@@ -304,6 +335,7 @@ models:
     arch: { layers: 32, kv_heads: 4, head_dim: 256, k_eq_v: false }
     arch_source: "ykarout/Qwen3.5-9B-NVFP4/config.json"
     purpose: "qwen3.5 · 22.2 GB · 32L/4kv/256h"
+    thinking: true
 
   - name: "qwen3.5:122b"
     family: qwen3.5
@@ -313,6 +345,7 @@ models:
     arch: { layers: 32, kv_heads: 4, head_dim: 256, k_eq_v: false }
     arch_source: "ykarout/Qwen3.5-9B-NVFP4/config.json"
     purpose: "qwen3.5 · 75.8 GB · 32L/4kv/256h"
+    thinking: true
 
   - name: "qwen3.5:0.8b-q8_0"
     family: qwen3.5
@@ -322,6 +355,7 @@ models:
     arch: { layers: 32, kv_heads: 4, head_dim: 256, k_eq_v: false }
     arch_source: "ykarout/Qwen3.5-9B-NVFP4/config.json"
     purpose: "qwen3.5 · 1.0 GB · 32L/4kv/256h"
+    thinking: true
 
   - name: "qwen3.5:0.8b-bf16"
     family: qwen3.5
@@ -331,6 +365,7 @@ models:
     arch: { layers: 32, kv_heads: 4, head_dim: 256, k_eq_v: false }
     arch_source: "ykarout/Qwen3.5-9B-NVFP4/config.json"
     purpose: "qwen3.5 · 1.6 GB · 32L/4kv/256h"
+    thinking: true
 
   - name: "qwen3.5:2b-q4_K_M"
     family: qwen3.5
@@ -340,6 +375,7 @@ models:
     arch: { layers: 32, kv_heads: 4, head_dim: 256, k_eq_v: false }
     arch_source: "ykarout/Qwen3.5-9B-NVFP4/config.json"
     purpose: "qwen3.5 · 1.8 GB · 32L/4kv/256h"
+    thinking: true
 
   - name: "qwen3.5:2b-q8_0"
     family: qwen3.5
@@ -349,6 +385,7 @@ models:
     arch: { layers: 32, kv_heads: 4, head_dim: 256, k_eq_v: false }
     arch_source: "ykarout/Qwen3.5-9B-NVFP4/config.json"
     purpose: "qwen3.5 · 2.6 GB · 32L/4kv/256h"
+    thinking: true
 
   - name: "qwen3.5:2b-bf16"
     family: qwen3.5
@@ -358,6 +395,7 @@ models:
     arch: { layers: 32, kv_heads: 4, head_dim: 256, k_eq_v: false }
     arch_source: "ykarout/Qwen3.5-9B-NVFP4/config.json"
     purpose: "qwen3.5 · 4.2 GB · 32L/4kv/256h"
+    thinking: true
 
   - name: "qwen3.5:4b-q4_K_M"
     family: qwen3.5
@@ -367,6 +405,7 @@ models:
     arch: { layers: 32, kv_heads: 4, head_dim: 256, k_eq_v: false }
     arch_source: "ykarout/Qwen3.5-9B-NVFP4/config.json"
     purpose: "qwen3.5 · 3.2 GB · 32L/4kv/256h"
+    thinking: true
 
   - name: "qwen3.5:4b-q8_0"
     family: qwen3.5
@@ -376,6 +415,7 @@ models:
     arch: { layers: 32, kv_heads: 4, head_dim: 256, k_eq_v: false }
     arch_source: "ykarout/Qwen3.5-9B-NVFP4/config.json"
     purpose: "qwen3.5 · 4.9 GB · 32L/4kv/256h"
+    thinking: true
 
   - name: "qwen3.5:4b-bf16"
     family: qwen3.5
@@ -385,6 +425,7 @@ models:
     arch: { layers: 32, kv_heads: 4, head_dim: 256, k_eq_v: false }
     arch_source: "ykarout/Qwen3.5-9B-NVFP4/config.json"
     purpose: "qwen3.5 · 8.7 GB · 32L/4kv/256h"
+    thinking: true
 
   - name: "qwen3.5:9b-q4_K_M"
     family: qwen3.5
@@ -394,6 +435,7 @@ models:
     arch: { layers: 32, kv_heads: 4, head_dim: 256, k_eq_v: false }
     arch_source: "ykarout/Qwen3.5-9B-NVFP4/config.json"
     purpose: "qwen3.5 · 6.1 GB · 32L/4kv/256h"
+    thinking: true
 
   - name: "qwen3.5:9b-q8_0"
     family: qwen3.5
@@ -403,6 +445,7 @@ models:
     arch: { layers: 32, kv_heads: 4, head_dim: 256, k_eq_v: false }
     arch_source: "ykarout/Qwen3.5-9B-NVFP4/config.json"
     purpose: "qwen3.5 · 10.0 GB · 32L/4kv/256h"
+    thinking: true
 
   - name: "qwen3.5:9b-bf16"
     family: qwen3.5
@@ -412,6 +455,7 @@ models:
     arch: { layers: 32, kv_heads: 4, head_dim: 256, k_eq_v: false }
     arch_source: "ykarout/Qwen3.5-9B-NVFP4/config.json"
     purpose: "qwen3.5 · 18.0 GB · 32L/4kv/256h"
+    thinking: true
 
   - name: "qwen3.5:27b-q4_K_M"
     family: qwen3.5
@@ -421,6 +465,7 @@ models:
     arch: { layers: 32, kv_heads: 4, head_dim: 256, k_eq_v: false }
     arch_source: "ykarout/Qwen3.5-9B-NVFP4/config.json"
     purpose: "qwen3.5 · 16.2 GB · 32L/4kv/256h"
+    thinking: true
 
   - name: "qwen3.5:27b-q8_0"
     family: qwen3.5
@@ -430,6 +475,7 @@ models:
     arch: { layers: 32, kv_heads: 4, head_dim: 256, k_eq_v: false }
     arch_source: "ykarout/Qwen3.5-9B-NVFP4/config.json"
     purpose: "qwen3.5 · 27.9 GB · 32L/4kv/256h"
+    thinking: true
 
   - name: "qwen3.5:27b-bf16"
     family: qwen3.5
@@ -439,6 +485,7 @@ models:
     arch: { layers: 32, kv_heads: 4, head_dim: 256, k_eq_v: false }
     arch_source: "ykarout/Qwen3.5-9B-NVFP4/config.json"
     purpose: "qwen3.5 · 51.8 GB · 32L/4kv/256h"
+    thinking: true
 
   - name: "qwen3.5:35b-a3b"
     family: qwen3.5
@@ -448,6 +495,7 @@ models:
     arch: { layers: 32, kv_heads: 4, head_dim: 256, k_eq_v: false }
     arch_source: "ykarout/Qwen3.5-9B-NVFP4/config.json"
     purpose: "qwen3.5 · 22.2 GB · 32L/4kv/256h"
+    thinking: true
 
   - name: "qwen3.5:35b-a3b-q4_K_M"
     family: qwen3.5
@@ -457,6 +505,7 @@ models:
     arch: { layers: 32, kv_heads: 4, head_dim: 256, k_eq_v: false }
     arch_source: "ykarout/Qwen3.5-9B-NVFP4/config.json"
     purpose: "qwen3.5 · 22.2 GB · 32L/4kv/256h"
+    thinking: true
 
   - name: "qwen3.5:35b-a3b-q8_0"
     family: qwen3.5
@@ -466,6 +515,7 @@ models:
     arch: { layers: 32, kv_heads: 4, head_dim: 256, k_eq_v: false }
     arch_source: "ykarout/Qwen3.5-9B-NVFP4/config.json"
     purpose: "qwen3.5 · 36.0 GB · 32L/4kv/256h"
+    thinking: true
 
   - name: "qwen3.5:35b-a3b-bf16"
     family: qwen3.5
@@ -475,6 +525,7 @@ models:
     arch: { layers: 32, kv_heads: 4, head_dim: 256, k_eq_v: false }
     arch_source: "ykarout/Qwen3.5-9B-NVFP4/config.json"
     purpose: "qwen3.5 · 67.0 GB · 32L/4kv/256h"
+    thinking: true
 
   - name: "qwen3.5:122b-a10b"
     family: qwen3.5
@@ -484,6 +535,7 @@ models:
     arch: { layers: 32, kv_heads: 4, head_dim: 256, k_eq_v: false }
     arch_source: "ykarout/Qwen3.5-9B-NVFP4/config.json"
     purpose: "qwen3.5 · 75.8 GB · 32L/4kv/256h"
+    thinking: true
 
   - name: "qwen3.5:122b-a10b-q4_K_M"
     family: qwen3.5
@@ -493,6 +545,7 @@ models:
     arch: { layers: 32, kv_heads: 4, head_dim: 256, k_eq_v: false }
     arch_source: "ykarout/Qwen3.5-9B-NVFP4/config.json"
     purpose: "qwen3.5 · 75.8 GB · 32L/4kv/256h"
+    thinking: true
 
   - name: "Qwen3-14B-NVFP4"
     family: qwen3
@@ -503,6 +556,7 @@ models:
     arch: { layers: 40, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Qwen3-14B-NVFP4/config.json"
     purpose: "qwen3 · 9.8 GB · 40L/8kv/128h"
+    thinking: true
 
   - name: "llama3.2:latest"
     family: llama3.2
@@ -512,6 +566,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 1.9 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:1b"
     family: llama3.2
@@ -521,6 +576,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 1.2 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:3b"
     family: llama3.2
@@ -530,6 +586,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 1.9 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:1b-instruct-q2_K"
     family: llama3.2
@@ -539,6 +596,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 0.5 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:1b-instruct-q3_K_S"
     family: llama3.2
@@ -548,6 +606,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 0.6 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:1b-instruct-q3_K_M"
     family: llama3.2
@@ -557,6 +616,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 0.6 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:1b-instruct-q3_K_L"
     family: llama3.2
@@ -566,6 +626,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 0.7 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:1b-instruct-q4_0"
     family: llama3.2
@@ -575,6 +636,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 0.7 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:1b-instruct-q4_1"
     family: llama3.2
@@ -584,6 +646,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 0.8 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:1b-instruct-q4_K_S"
     family: llama3.2
@@ -593,6 +656,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 0.7 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:1b-instruct-q4_K_M"
     family: llama3.2
@@ -602,6 +666,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 0.8 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:1b-instruct-q5_0"
     family: llama3.2
@@ -611,6 +676,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 0.8 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:1b-instruct-q5_1"
     family: llama3.2
@@ -620,6 +686,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 0.9 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:1b-instruct-q5_K_S"
     family: llama3.2
@@ -629,6 +696,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 0.8 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:1b-instruct-q5_K_M"
     family: llama3.2
@@ -638,6 +706,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 0.8 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:1b-instruct-q6_K"
     family: llama3.2
@@ -647,6 +716,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 1.0 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:1b-instruct-q8_0"
     family: llama3.2
@@ -656,6 +726,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 1.2 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:1b-instruct-fp16"
     family: llama3.2
@@ -665,6 +736,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 2.3 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:1b-text-q2_K"
     family: llama3.2
@@ -674,6 +746,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 0.5 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:1b-text-q3_K_S"
     family: llama3.2
@@ -683,6 +756,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 0.6 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:1b-text-q3_K_M"
     family: llama3.2
@@ -692,6 +766,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 0.6 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:1b-text-q3_K_L"
     family: llama3.2
@@ -701,6 +776,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 0.7 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:1b-text-q4_0"
     family: llama3.2
@@ -710,6 +786,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 0.7 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:1b-text-q4_1"
     family: llama3.2
@@ -719,6 +796,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 0.8 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:1b-text-q4_K_S"
     family: llama3.2
@@ -728,6 +806,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 0.7 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:1b-text-q4_K_M"
     family: llama3.2
@@ -737,6 +816,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 0.8 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:1b-text-q5_0"
     family: llama3.2
@@ -746,6 +826,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 0.8 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:1b-text-q5_1"
     family: llama3.2
@@ -755,6 +836,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 0.9 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:1b-text-q5_K_S"
     family: llama3.2
@@ -764,6 +846,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 0.8 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:1b-text-q5_K_M"
     family: llama3.2
@@ -773,6 +856,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 0.8 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:1b-text-q6_K"
     family: llama3.2
@@ -782,6 +866,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 1.0 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:1b-text-q8_0"
     family: llama3.2
@@ -791,6 +876,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 1.2 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:1b-text-fp16"
     family: llama3.2
@@ -800,6 +886,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 2.3 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:3b-instruct-q2_K"
     family: llama3.2
@@ -809,6 +896,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 1.3 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:3b-instruct-q3_K_S"
     family: llama3.2
@@ -818,6 +906,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 1.4 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:3b-instruct-q3_K_M"
     family: llama3.2
@@ -827,6 +916,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 1.6 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:3b-instruct-q3_K_L"
     family: llama3.2
@@ -836,6 +926,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 1.7 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:3b-instruct-q4_0"
     family: llama3.2
@@ -845,6 +936,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 1.8 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:3b-instruct-q4_1"
     family: llama3.2
@@ -854,6 +946,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 1.9 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:3b-instruct-q4_K_S"
     family: llama3.2
@@ -863,6 +956,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 1.8 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:3b-instruct-q4_K_M"
     family: llama3.2
@@ -872,6 +966,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 1.9 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:3b-instruct-q5_0"
     family: llama3.2
@@ -881,6 +976,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 2.1 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:3b-instruct-q5_1"
     family: llama3.2
@@ -890,6 +986,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 2.3 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:3b-instruct-q5_K_S"
     family: llama3.2
@@ -899,6 +996,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 2.1 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:3b-instruct-q5_K_M"
     family: llama3.2
@@ -908,6 +1006,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 2.2 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:3b-instruct-q6_K"
     family: llama3.2
@@ -917,6 +1016,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 2.5 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:3b-instruct-q8_0"
     family: llama3.2
@@ -926,6 +1026,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 3.2 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:3b-instruct-fp16"
     family: llama3.2
@@ -935,6 +1036,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 6.0 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:3b-text-q2_K"
     family: llama3.2
@@ -944,6 +1046,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 1.3 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:3b-text-q3_K_S"
     family: llama3.2
@@ -953,6 +1056,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 1.4 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:3b-text-q3_K_M"
     family: llama3.2
@@ -962,6 +1066,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 1.6 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:3b-text-q3_K_L"
     family: llama3.2
@@ -971,6 +1076,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 1.7 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:3b-text-q4_0"
     family: llama3.2
@@ -980,6 +1086,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 1.8 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:3b-text-q4_1"
     family: llama3.2
@@ -989,6 +1096,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 1.9 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:3b-text-q4_K_S"
     family: llama3.2
@@ -998,6 +1106,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 1.8 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:3b-text-q4_K_M"
     family: llama3.2
@@ -1007,6 +1116,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 1.9 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:3b-text-q5_0"
     family: llama3.2
@@ -1016,6 +1126,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 2.1 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:3b-text-q5_1"
     family: llama3.2
@@ -1025,6 +1136,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 2.3 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:3b-text-q5_K_S"
     family: llama3.2
@@ -1034,6 +1146,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 2.1 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:3b-text-q5_K_M"
     family: llama3.2
@@ -1043,6 +1156,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 2.2 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:3b-text-q6_K"
     family: llama3.2
@@ -1052,6 +1166,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 2.5 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:3b-text-q8_0"
     family: llama3.2
@@ -1061,6 +1176,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 3.2 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "llama3.2:3b-text-fp16"
     family: llama3.2
@@ -1070,6 +1186,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.2 · 6.0 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "Llama-3.1-8B-Instruct-NVFP4"
     family: llama3.1
@@ -1080,6 +1197,7 @@ models:
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
     purpose: "llama3.1 · 5.6 GB · 32L/8kv/128h"
+    thinking: false
 
   - name: "NVIDIA-Nemotron-Nano-9B-v2-NVFP4"
     family: nemotron-nano-v2
@@ -1090,6 +1208,7 @@ models:
     arch: { layers: 56, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4/config.json"
     purpose: "nemotron-nano-v2 · 7.3 GB · 56L/8kv/128h"
+    thinking: false
 
   - name: "nemotron-3-nano:latest"
     family: nemotron-3-nano
@@ -1099,6 +1218,7 @@ models:
     arch: { layers: 56, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4/config.json"
     purpose: "nemotron-3-nano · 22.6 GB · 56L/8kv/128h"
+    thinking: false
 
   - name: "nemotron-3-nano:4b"
     family: nemotron-3-nano
@@ -1108,6 +1228,7 @@ models:
     arch: { layers: 56, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4/config.json"
     purpose: "nemotron-3-nano · 2.6 GB · 56L/8kv/128h"
+    thinking: false
 
   - name: "nemotron-3-nano:30b"
     family: nemotron-3-nano
@@ -1117,6 +1238,7 @@ models:
     arch: { layers: 56, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4/config.json"
     purpose: "nemotron-3-nano · 22.6 GB · 56L/8kv/128h"
+    thinking: false
 
   - name: "nemotron-3-nano:4b-q8_0"
     family: nemotron-3-nano
@@ -1126,6 +1248,7 @@ models:
     arch: { layers: 56, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4/config.json"
     purpose: "nemotron-3-nano · 3.9 GB · 56L/8kv/128h"
+    thinking: false
 
   - name: "nemotron-3-nano:4b-bf16"
     family: nemotron-3-nano
@@ -1135,6 +1258,7 @@ models:
     arch: { layers: 56, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4/config.json"
     purpose: "nemotron-3-nano · 7.4 GB · 56L/8kv/128h"
+    thinking: false
 
   - name: "nemotron-3-nano:30b-a3b-q4_K_M"
     family: nemotron-3-nano
@@ -1144,6 +1268,7 @@ models:
     arch: { layers: 56, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4/config.json"
     purpose: "nemotron-3-nano · 22.6 GB · 56L/8kv/128h"
+    thinking: false
 
   - name: "nemotron-3-nano:30b-a3b-q8_0"
     family: nemotron-3-nano
@@ -1153,6 +1278,7 @@ models:
     arch: { layers: 56, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4/config.json"
     purpose: "nemotron-3-nano · 31.3 GB · 56L/8kv/128h"
+    thinking: false
 
   - name: "nemotron-3-nano:30b-a3b-fp16"
     family: nemotron-3-nano
@@ -1162,6 +1288,7 @@ models:
     arch: { layers: 56, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4/config.json"
     purpose: "nemotron-3-nano · 58.8 GB · 56L/8kv/128h"
+    thinking: false
 
   - name: "nemotron-cascade-2:latest"
     family: nemotron-cascade-2
@@ -1171,6 +1298,7 @@ models:
     arch: { layers: 56, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4/config.json"
     purpose: "nemotron-cascade-2 · 22.6 GB · 56L/8kv/128h"
+    thinking: false
 
   - name: "nemotron-cascade-2:30b"
     family: nemotron-cascade-2
@@ -1180,6 +1308,7 @@ models:
     arch: { layers: 56, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4/config.json"
     purpose: "nemotron-cascade-2 · 22.6 GB · 56L/8kv/128h"
+    thinking: false
 
   - name: "nemotron-cascade-2:30b-a3b-q4_K_M"
     family: nemotron-cascade-2
@@ -1189,6 +1318,7 @@ models:
     arch: { layers: 56, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4/config.json"
     purpose: "nemotron-cascade-2 · 22.6 GB · 56L/8kv/128h"
+    thinking: false
 
   - name: "nemotron:latest"
     family: nemotron
@@ -1198,6 +1328,7 @@ models:
     arch: { layers: 56, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4/config.json"
     purpose: "nemotron · 39.6 GB · 56L/8kv/128h"
+    thinking: false
 
   - name: "nemotron:70b"
     family: nemotron
@@ -1207,6 +1338,7 @@ models:
     arch: { layers: 56, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4/config.json"
     purpose: "nemotron · 39.6 GB · 56L/8kv/128h"
+    thinking: false
 
   - name: "nemotron:70b-instruct-q2_K"
     family: nemotron
@@ -1216,6 +1348,7 @@ models:
     arch: { layers: 56, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4/config.json"
     purpose: "nemotron · 24.6 GB · 56L/8kv/128h"
+    thinking: false
 
   - name: "nemotron:70b-instruct-q3_K_S"
     family: nemotron
@@ -1225,6 +1358,7 @@ models:
     arch: { layers: 56, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4/config.json"
     purpose: "nemotron · 28.8 GB · 56L/8kv/128h"
+    thinking: false
 
   - name: "nemotron:70b-instruct-q3_K_M"
     family: nemotron
@@ -1234,6 +1368,7 @@ models:
     arch: { layers: 56, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4/config.json"
     purpose: "nemotron · 31.9 GB · 56L/8kv/128h"
+    thinking: false
 
   - name: "nemotron:70b-instruct-q3_K_L"
     family: nemotron
@@ -1243,6 +1378,7 @@ models:
     arch: { layers: 56, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4/config.json"
     purpose: "nemotron · 34.6 GB · 56L/8kv/128h"
+    thinking: false
 
   - name: "nemotron:70b-instruct-q4_0"
     family: nemotron
@@ -1252,6 +1388,7 @@ models:
     arch: { layers: 56, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4/config.json"
     purpose: "nemotron · 37.2 GB · 56L/8kv/128h"
+    thinking: false
 
   - name: "nemotron:70b-instruct-q4_1"
     family: nemotron
@@ -1261,6 +1398,7 @@ models:
     arch: { layers: 56, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4/config.json"
     purpose: "nemotron · 41.3 GB · 56L/8kv/128h"
+    thinking: false
 
   - name: "nemotron:70b-instruct-q4_K_S"
     family: nemotron
@@ -1270,6 +1408,7 @@ models:
     arch: { layers: 56, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4/config.json"
     purpose: "nemotron · 37.6 GB · 56L/8kv/128h"
+    thinking: false
 
   - name: "nemotron:70b-instruct-q4_K_M"
     family: nemotron
@@ -1279,6 +1418,7 @@ models:
     arch: { layers: 56, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4/config.json"
     purpose: "nemotron · 39.6 GB · 56L/8kv/128h"
+    thinking: false
 
   - name: "nemotron:70b-instruct-q5_0"
     family: nemotron
@@ -1288,6 +1428,7 @@ models:
     arch: { layers: 56, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4/config.json"
     purpose: "nemotron · 45.3 GB · 56L/8kv/128h"
+    thinking: false
 
   - name: "nemotron:70b-instruct-q5_1"
     family: nemotron
@@ -1297,6 +1438,7 @@ models:
     arch: { layers: 56, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4/config.json"
     purpose: "nemotron · 49.4 GB · 56L/8kv/128h"
+    thinking: false
 
   - name: "nemotron:70b-instruct-q5_K_S"
     family: nemotron
@@ -1306,6 +1448,7 @@ models:
     arch: { layers: 56, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4/config.json"
     purpose: "nemotron · 45.3 GB · 56L/8kv/128h"
+    thinking: false
 
   - name: "nemotron:70b-instruct-q5_K_M"
     family: nemotron
@@ -1315,6 +1458,7 @@ models:
     arch: { layers: 56, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4/config.json"
     purpose: "nemotron · 46.5 GB · 56L/8kv/128h"
+    thinking: false
 
   - name: "nemotron:70b-instruct-q6_K"
     family: nemotron
@@ -1324,6 +1468,7 @@ models:
     arch: { layers: 56, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4/config.json"
     purpose: "nemotron · 53.9 GB · 56L/8kv/128h"
+    thinking: false
 
   - name: "nemotron:70b-instruct-q8_0"
     family: nemotron
@@ -1333,6 +1478,7 @@ models:
     arch: { layers: 56, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4/config.json"
     purpose: "nemotron · 69.8 GB · 56L/8kv/128h"
+    thinking: false
 
   - name: "nemotron:70b-instruct-fp16"
     family: nemotron
@@ -1342,3 +1488,4 @@ models:
     arch: { layers: 56, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4/config.json"
     purpose: "nemotron · 131.4 GB · 56L/8kv/128h"
+    thinking: false

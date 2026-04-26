@@ -99,12 +99,28 @@ type backendConfig struct {
 }
 
 type configModel struct {
-	Name    string   `yaml:"name"`
-	Backend []string `yaml:"backend"`
-	Repo    string   `yaml:"repo"`
-	Size    string   `yaml:"size"`
-	Context int      `yaml:"context"`
-	Purpose string   `yaml:"purpose"`
+	Name      string           `yaml:"name"`
+	Backend   []string         `yaml:"backend"`
+	Repo      string           `yaml:"repo"`
+	Size      string           `yaml:"size"`
+	Context   int              `yaml:"context"`
+	Purpose   string           `yaml:"purpose"`
+	Reasoning *configReasoning `yaml:"reasoning,omitempty"`
+}
+
+// configReasoning records what the runtime probe observed for this model.
+// Capability values (per docs/ollama_models.md):
+//   structured  – native API exposes a separate reasoning trace field
+//   inline      – reasoning appears inline (e.g. <think> blocks) only
+//   unsupported – no reasoning behavior observed
+//   unknown     – not yet probed (e.g. vLLM/SGLang models pre-probe)
+//   error       – probe failed (model load error, HTTP 4xx, etc.)
+//
+// DisableVerified is set only for `structured` capability and reports
+// whether sending the protocol's "off" field actually suppresses reasoning.
+type configReasoning struct {
+	Capability      string `yaml:"capability"`
+	DisableVerified *bool  `yaml:"disable_verified,omitempty"`
 }
 
 // launchConfig holds computed GPU parameters passed to backend entrypoints.
@@ -144,16 +160,19 @@ type backendState struct {
 }
 
 type arbiter struct {
-	backends      map[string]*backendState
-	mu            sync.Mutex
-	ollamaURL     *url.URL
-	podmanClient  *http.Client
-	idleTimeout   time.Duration
-	drainTimeout  time.Duration
-	modelSizes    map[string]float64 // model name → weight size in GB
-	modelContexts map[string]int     // model name → declared max context (from models.yaml)
-	totalVRAMGB   float64
-	maxContextLen int // global default from MAX_CONTEXT_LEN env (default 131072)
+	backends         map[string]*backendState
+	mu               sync.Mutex
+	ollamaURL        *url.URL
+	podmanClient     *http.Client
+	idleTimeout      time.Duration
+	drainTimeout     time.Duration
+	modelSizes       map[string]float64 // model name → weight size in GB
+	modelContexts    map[string]int     // model name → declared max context (from models.yaml)
+	modelCapability  map[string]string  // model name → reasoning.capability
+	modelDisableOK   map[string]bool    // model name → disable_verified (only when present)
+	defaultPolicy    string             // DEVAI_REASONING env value: auto|off|low|medium|high
+	totalVRAMGB      float64
+	maxContextLen    int // global default from MAX_CONTEXT_LEN env (default 131072)
 }
 
 // --- Proxy factories ---
@@ -411,9 +430,17 @@ func main() {
 		},
 	}
 
-	// Build model size and context lookups from catalog
+	// Build model size, context, and reasoning capability lookups from catalog.
+	// Reasoning capability comes from the runtime probe written by
+	// scripts/probe-ollama-reasoning.py. The arbiter applies the policy
+	// (DEVAI_REASONING env) per request to set the protocol's reasoning
+	// field — currently only the Ollama native `think:` field is wired;
+	// vLLM/SGLang are stubs.
 	modelSizes := make(map[string]float64, len(cfg.Models))
 	modelContexts := make(map[string]int, len(cfg.Models))
+	modelCapability := make(map[string]string, len(cfg.Models))
+	modelDisableOK := make(map[string]bool)
+	capCounts := make(map[string]int)
 	for _, m := range cfg.Models {
 		if sz := parseSizeGB(m.Size); sz > 0 {
 			modelSizes[m.Name] = sz
@@ -421,20 +448,38 @@ func main() {
 		if m.Context > 0 {
 			modelContexts[m.Name] = m.Context
 		}
+		cap := "unknown"
+		if m.Reasoning != nil && m.Reasoning.Capability != "" {
+			cap = m.Reasoning.Capability
+		}
+		modelCapability[m.Name] = cap
+		capCounts[cap]++
+		if m.Reasoning != nil && m.Reasoning.DisableVerified != nil && *m.Reasoning.DisableVerified {
+			modelDisableOK[m.Name] = true
+		}
 	}
+	policy := strings.ToLower(env("DEVAI_REASONING", "auto"))
+	if !validPolicy(policy) {
+		log.Printf("warning: invalid DEVAI_REASONING=%q; falling back to auto", policy)
+		policy = "auto"
+	}
+	log.Printf("reasoning policy: %s; capability counts: %v", policy, capCounts)
 	totalVRAMGB := envFloat("GPU_MEMORY_GB", 24.0)
 	maxCtx := envInt("MAX_CONTEXT_LEN", 131072)
 
 	a := &arbiter{
-		backends:      make(map[string]*backendState),
-		ollamaURL:     ollamaURL,
-		podmanClient:  podmanClient,
-		idleTimeout:   time.Duration(envInt("IDLE_TIMEOUT", 300)) * time.Second,
-		drainTimeout:  time.Duration(envInt("DRAIN_TIMEOUT", 30)) * time.Second,
-		modelSizes:    modelSizes,
-		modelContexts: modelContexts,
-		totalVRAMGB:   totalVRAMGB,
-		maxContextLen: maxCtx,
+		backends:        make(map[string]*backendState),
+		ollamaURL:       ollamaURL,
+		podmanClient:    podmanClient,
+		idleTimeout:     time.Duration(envInt("IDLE_TIMEOUT", 300)) * time.Second,
+		drainTimeout:    time.Duration(envInt("DRAIN_TIMEOUT", 30)) * time.Second,
+		modelSizes:      modelSizes,
+		modelContexts:   modelContexts,
+		modelCapability: modelCapability,
+		modelDisableOK:  modelDisableOK,
+		defaultPolicy:   policy,
+		totalVRAMGB:     totalVRAMGB,
+		maxContextLen:   maxCtx,
 	}
 
 	for _, bc := range backends {
@@ -734,21 +779,28 @@ func (a *arbiter) makeRequestHandler(backendName string) http.HandlerFunc {
 		atomic.AddInt64(&bs.activeReqs, 1)
 		defer atomic.AddInt64(&bs.activeReqs, -1)
 
-		// For non-Ollama backends, extract model from request body
+		// Read body for any POST so we can (a) extract the model name
+		// for backend lifecycle decisions and (b) apply the reasoning
+		// policy via the backend's native protocol field.
 		var modelName string
-		if backendName != "ollama" && req.Method == http.MethodPost && req.Body != nil {
+		if req.Method == http.MethodPost && req.Body != nil {
 			body, err := io.ReadAll(req.Body)
 			if err != nil {
 				http.Error(w, `{"error":"failed to read body"}`, http.StatusBadRequest)
 				return
 			}
-			req.Body = io.NopCloser(bytes.NewReader(body))
 
 			var parsed struct {
 				Model string `json:"model"`
 			}
 			json.Unmarshal(body, &parsed)
 			modelName = parsed.Model
+
+			policy := a.requestPolicy(req)
+			body = a.applyReasoningPolicy(backendName, modelName, policy, body)
+			req.Body = io.NopCloser(bytes.NewReader(body))
+			req.ContentLength = int64(len(body))
+			req.Header.Set("Content-Length", strconv.Itoa(len(body)))
 		}
 
 		a.mu.Lock()
@@ -763,6 +815,115 @@ func (a *arbiter) makeRequestHandler(backendName string) http.HandlerFunc {
 
 		bs.proxy.ServeHTTP(w, req)
 	}
+}
+
+// validPolicy returns true for accepted DEVAI_REASONING values.
+func validPolicy(p string) bool {
+	switch p {
+	case "auto", "off", "low", "medium", "high":
+		return true
+	}
+	return false
+}
+
+// requestPolicy resolves the effective policy for a request: the
+// X-DevAI-Reasoning header overrides the env-default if it parses to a
+// valid value; otherwise the arbiter's defaultPolicy wins.
+func (a *arbiter) requestPolicy(req *http.Request) string {
+	if h := strings.ToLower(strings.TrimSpace(req.Header.Get("X-DevAI-Reasoning"))); h != "" {
+		if validPolicy(h) {
+			return h
+		}
+	}
+	return a.defaultPolicy
+}
+
+// applyReasoningPolicy rewrites the request body to carry the reasoning
+// directive expected by the target backend's native protocol. Per
+// docs/ollama_models.md: prefer protocol fields over prompt-text tricks.
+//
+// Currently wired:
+//   ollama → sets/clears `think: true|false` on /api/chat (and Ollama's
+//            OpenAI- and Anthropic-compat endpoints, which honour the
+//            same field).
+//
+// Stubbed (returns body unchanged) for vLLM/SGLang — those backends will
+// get their own protocol-specific implementations later (vLLM has
+// --reasoning-parser, Anthropic has thinking={type:enabled,budget_tokens}).
+func (a *arbiter) applyReasoningPolicy(backendName, modelName, policy string, body []byte) []byte {
+	switch backendName {
+	case "ollama":
+		return a.applyOllamaPolicy(modelName, policy, body)
+	default:
+		// vLLM/SGLang: TODO. Body forwarded unchanged.
+		return body
+	}
+}
+
+// applyOllamaPolicy injects the native `think` field according to the
+// (capability, policy) matrix. Ollama's `think` is boolean; effort levels
+// (low/medium/high) all collapse to true.
+//
+//   capability  | policy   | think field
+//   structured  | auto/L/M/H | true
+//   structured  | off (disable_verified) | false
+//   structured  | off (not verified) | (not set — avoid surprising client)
+//   inline/unsupported/error | any | (not set — no reliable way to control)
+//   unknown     | any      | (not set — let backend decide)
+//
+// Client-supplied `think` always wins; we never override it.
+func (a *arbiter) applyOllamaPolicy(modelName, policy string, body []byte) []byte {
+	cap := a.modelCapability[modelName]
+	if cap != "structured" {
+		return body
+	}
+
+	var setThink *bool
+	switch policy {
+	case "auto", "low", "medium", "high":
+		t := true
+		setThink = &t
+	case "off":
+		if a.modelDisableOK[modelName] {
+			f := false
+			setThink = &f
+		}
+	}
+	if setThink == nil {
+		return body
+	}
+
+	var raw map[string]json.RawMessage
+	if json.Unmarshal(body, &raw) != nil {
+		return body
+	}
+	if _, exists := raw["think"]; exists {
+		// Client-supplied — respect it.
+		return body
+	}
+	v, err := encodeJSON(*setThink)
+	if err != nil {
+		return body
+	}
+	raw["think"] = v
+	out, err := encodeJSON(raw)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// encodeJSON marshals v without HTML-escaping (`<`, `>`, `&` stay literal)
+// and strips json.Encoder's trailing newline. Used wherever we hand bytes
+// back to the proxy or stash them as json.RawMessage.
+func encodeJSON(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return bytes.TrimRight(buf.Bytes(), "\n"), nil
 }
 
 func (a *arbiter) makeModelsHandler(backendName string) http.HandlerFunc {

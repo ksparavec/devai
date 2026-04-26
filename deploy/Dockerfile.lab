@@ -18,12 +18,23 @@ ENV OLLAMA_DEFAULT_MODEL=${OLLAMA_DEFAULT_MODEL}
 ENV ANTHROPIC_BASE_URL=${OLLAMA_HOST}
 ENV ANTHROPIC_AUTH_TOKEN=ollama
 ENV ANTHROPIC_API_KEY=""
+# Codex reads config from $CODEX_HOME (default ~/.codex). Pin it to the
+# devai user's home so codex finds the entrypoint-seeded config.toml
+# regardless of the runtime user (root or devai) and without per-shell
+# tweaks. OPENAI_API_KEY is required for codex's OSS path; local backends
+# don't validate it.
+ENV CODEX_HOME=/home/devai/.codex
+ENV OPENAI_API_KEY=local
 ENV UV_BREAK_SYSTEM_PACKAGES=1
 ENV PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1
 ENV PATH="/home/devai/.local/bin:${PATH}"
 
 # --- Dependencies for coding agents ---
-RUN apt-get update && apt-get install -y --no-install-recommends ripgrep fzf \
+# libxcb1 is needed by Open Interpreter — it imports cv2 at startup which
+# loads X11 client libs even in headless mode. Without it, OI crashes on
+# the first prompt with `libxcb.so.1: cannot open shared object file`.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ripgrep fzf libxcb1 \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # --- Binary installs (from local cache, populated by: make fetch) ---
@@ -66,8 +77,11 @@ RUN --mount=type=bind,source=.,target=/src \
     fi
 
 
-# Install Aider in isolated venv (requires Python <3.13, uv tool handles this)
-RUN UV_TOOL_BIN_DIR=/usr/local/bin uv tool install aider-chat
+# Install Aider in isolated venv. Python 3.13 dropped stdlib `audioop`,
+# which pydub (transitively imported by aider.voice) needs — pull
+# `audioop-lts` into the same venv so `import aider` doesn't crash.
+RUN UV_TOOL_BIN_DIR=/usr/local/bin uv tool install aider-chat \
+    --with audioop-lts
 
 # --- JupyterLab extension (depends on jupyterlab being installed above) ---
 

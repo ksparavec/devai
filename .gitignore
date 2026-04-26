@@ -100,6 +100,13 @@ node_modules/
 **/.yarn/install-state.gz
 *.tsbuildinfo
 
-# Claude Code
+# Agents
 .claude/
 tests/.matrix-logs
+.aider*
+.codex
+deploy/.ollama-reasoning-cache.json
+
+# Go build artifacts (router binary built by `make build-router` lands here
+# on hosts that compile outside the container; the repo only tracks source).
+gpu-arbiter/gpu-arbiter
