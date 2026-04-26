@@ -2,34 +2,36 @@
 
 **Run AI models entirely on your own hardware.** No cloud APIs, no data leaving your network, no per-token costs.
 
-Dev AI Lab is a containerized development environment that brings together JupyterLab, multiple AI coding assistants, and local model inference into a single, reproducible setup. It runs open-weight LLMs on your GPU — from 4B parameter models for quick tasks to 70B models for complex reasoning — all served through a unified API with automatic GPU management.
+Dev AI Lab is a containerized development environment that brings together JupyterLab, multiple AI coding assistants, and local model inference into a single, reproducible setup. It runs open-weight LLMs on your GPU — from 4B parameter models for quick tasks to 70B-class MoE models with active-parameter inference speed — all served through a unified API with automatic GPU management and runtime-verified capability detection.
 
 ### Why local inference?
 
 Cloud AI services (ChatGPT, Claude API, Gemini API) are convenient but come with trade-offs that matter in professional settings:
 
-- **Data sovereignty** — your code, documents, and conversations never leave your machine. No third-party data processing agreements needed. No risk of training data leakage.
-- **Regulatory compliance** — meet data residency requirements (GDPR, HIPAA, financial regulations) without complex cloud configurations. The data stays where you control it.
-- **Cost predictability** — no per-token billing, no surprise invoices. One-time hardware investment, unlimited inference. A single GPU pays for itself after a few months of heavy API usage.
-- **No internet dependency** — works offline, on air-gapped networks, behind restrictive firewalls. Essential for secure environments and field work.
-- **Full control** — choose your models, quantization, context length, and serving parameters. No vendor lock-in, no deprecated APIs, no terms-of-service changes.
-- **Privacy by design** — conversations with AI about proprietary code, internal architecture, or sensitive business logic stay completely private.
+- **Data sovereignty** — your code, documents, and conversations never leave your machine.
+- **Regulatory compliance** — meet data residency requirements (GDPR, HIPAA, financial regulations).
+- **Cost predictability** — no per-token billing, no surprise invoices.
+- **No internet dependency** — works offline, on air-gapped networks, behind restrictive firewalls.
+- **Full control** — choose your models, quantization, context length, and serving parameters.
+- **Privacy by design** — conversations about proprietary code stay completely private.
 
-Dev AI Lab makes local inference practical by handling the operational complexity: container builds, model management, GPU arbitration between multiple backends, and a web chat UI — all through a single `make` command.
+Dev AI Lab makes local inference practical by handling the operational complexity: container builds, model management, GPU arbitration between multiple backends, runtime probing for actual VRAM use and reasoning capability, and a web chat UI — all through a single `make` command.
 
-For tasks where cloud AI is appropriate, the JupyterLab environment also includes **Claude Code**, **OpenAI Codex**, and **Google Gemini CLI** — giving you the flexibility to use local models for sensitive work and cloud models when you need their capabilities, all from the same workspace.
+For tasks where cloud AI is appropriate, the JupyterLab environment also includes **Claude Code**, **OpenAI Codex**, and **Google Gemini CLI** — giving you the flexibility to use local models for sensitive work and cloud models when you need their capabilities.
 
 ## Features
 
-- **Interactive model picker** — select model first, then backend, then agent. Arrow-key navigation via fzf in the shell (`make shell-gpu`); same flow from JupyterLab launcher cards. Shows model size, purpose, and backend rationale (GGUF compatibility vs NVFP4 throughput vs RadixAttention).
-- **JupyterLab workspace** — full data science environment with launcher icons for Claude, Codex, Gemini, and Ollama. Each card launches the model picker for interactive model and backend selection.
-- **Multiple AI CLIs pre-installed** — Claude Code, OpenAI Codex, Google Gemini CLI, and Ollama are all ready to use from the terminal. No manual installation, no version conflicts.
-- **VS Code in the browser** — code-server provides a full Visual Studio Code experience accessible from any browser, with Jupyter integration via extensions.
-- **Automatic GPU-arbitrated model serving** — run GGUF models (via Ollama), NVFP4 models (via vLLM or SGLang) on a single GPU. The gpu-arbiter router transparently switches between backends, dynamically calculates GPU memory fractions and context lengths from model size vs available VRAM — no manual intervention, no OOM errors.
-- **Open WebUI chat interface** — web-based chat UI over HTTPS that sees all available models (both Ollama and vLLM). Select any model from the dropdown and start chatting.
-- **Fast iteration** — two-layer container build separates rarely-changing system packages (base) from frequently-updated tools and Python packages (lab). Rebuilds take minutes, not hours.
-- **Aggressive caching** — CLI binaries are updated via ETags (only downloads when upstream changes). APT proxy and Docker Hub mirror eliminate redundant network traffic across rebuilds.
-- **Works with Podman and Docker** — rootless Podman is the default for security and simplicity. Docker is fully supported as an alternative.
+- **Two-step interactive picker** — pick a model, then an agent. Arrow-key navigation via fzf in the shell (`make shell-gpu`); same flow from JupyterLab launcher cards.
+- **Probe-verified model facts** — every downloaded model is probed against the live ollama runtime. Reasoning capability (`structured` / `inline` / `unsupported` / `error`), MoE expert counts, and *actual* VRAM use at the configured context length are measured, not guessed. Cached by model digest so re-runs are fast.
+- **MoE / dense awareness** — the picker labels each model with `MoE 8/128` (8 of 128 experts active per token) or `dense`. Same fit rules apply (full weights must be GPU-resident), but you can see at a glance which models give big-model-quality at small-model speed.
+- **Multiple AI CLIs pre-installed** — Claude Code, OpenAI Codex, Google Gemini CLI, Aider, LATE, Open Interpreter, Ollama. All wired through the local router by default.
+- **VS Code in the browser** — code-server provides a full Visual Studio Code experience accessible from any browser.
+- **Automatic GPU-arbitrated model serving** — Ollama for GGUF models, vLLM/SGLang for NVFP4 models. The gpu-arbiter router transparently switches backends and exposes a single endpoint per protocol (`/api/chat`, `/v1/chat/completions`, `/v1/messages`).
+- **Reasoning policy at the router** — set `DEVAI_REASONING=auto|off|low|medium|high` to control thinking mode globally; override per-request via `X-DevAI-Reasoning` header. The router maps your policy to the right native protocol field (Ollama's `think:`) based on each model's verified capability.
+- **Open WebUI chat interface** — web-based chat UI over HTTPS that sees all available models.
+- **Fast iteration** — two-layer container build separates rarely-changing system packages from frequently-updated tools.
+- **Aggressive caching** — CLI binaries via ETags, APT proxy, Docker Hub mirror.
+- **Works with Podman and Docker** — rootless Podman is the default.
 
 ## Quick Start
 
@@ -54,7 +56,7 @@ sudo nvidia-ctk runtime configure --runtime=podman --config=$HOME/.config/contai
 
 ```bash
 cp .env.example .env
-# Edit .env: set JUPYTER_TOKEN, adjust ports if needed
+# Edit .env: set JUPYTER_TOKEN, GPU_MEMORY_GB, adjust ports if needed
 ```
 
 ### 2. Build
@@ -66,20 +68,28 @@ make build           # Build all images (CPU + GPU + router)
 ### 3. Start Infrastructure
 
 ```bash
-make cache-up        # Start Ollama, vLLM, router, Open WebUI, caches
+make cache-up        # Start Ollama, router, Open WebUI, caches
+                     # (vLLM/SGLang are dormant — see docs/sidelined-backends.md)
 ```
 
-### 4. Pull Models
+### 4. Pull, Probe & Select
+
+A single entry point. `make model-select` chains the reasoning probe and writes
+`deploy/active-models.yaml` (what the router serves and the picker shows).
+Add `DOWNLOAD=1` to also pull missing variants in the same run.
 
 ```bash
-make ollama-pull     # Pull all GGUF models from deploy/models.yaml
-make vllm-pull       # Download all NVFP4 models from HuggingFace
+make model-select DOWNLOAD=1                 # pull + probe + select all fitting
+make model-select DOWNLOAD=1 FAMILY=qwen3.5  # scope to one family
+make model-select                            # re-probe + re-select after a manual pull
 ```
 
 ### 5. Run
 
 ```bash
 make lab-gpu         # Start JupyterLab with GPU (or make lab-cpu)
+# OR
+make shell-gpu       # Drop straight into the model picker
 ```
 
 Access:
@@ -106,38 +116,91 @@ Access:
          │                              │
          └──────────┬───────────────────┘
                     │
-                    ▼
-             devai-router :11434
-             (gpu-arbiter, 9 MB)
-                    │
          ┌──────────┴──────────┐
-         │                     │
-         ▼                     ▼
-  devai-ollama          devai-vllm
-  (GGUF models)         (NVFP4 models)
-  always running         on-demand
+         │  devai-router       │  ports per backend:
+         │  (gpu-arbiter)      │    :11434 → ollama
+         │                     │    :11435 → vllm
+         │  reasoning policy   │    :11436 → sglang
+         └──────────┬──────────┘
+                    │
+         ┌──────────┼──────────┐
+         ▼          ▼          ▼
+   devai-ollama  devai-vllm  devai-sglang
+   (GGUF, RAM-   (NVFP4,     (NVFP4 +
+    resident)    on-demand)  RadixAttn,
+                              on-demand)
 
   devai-apt-cache    devai-registry-cache
   (APT cache)        (Docker Hub mirror)
 ```
 
 **External access** (host ports): JupyterLab `:8888`, Open WebUI `:8443`
-**Internal only** (devai-net): router, Ollama, vLLM, caches — no host ports exposed
+**Internal only** (devai-net): router, Ollama, vLLM, SGLang, caches.
 
 ### GPU Arbitration
 
-The gpu-arbiter router (`devai-router`) automatically manages GPU exclusion:
+The router (`devai-router`) is a small Go reverse proxy (~9 MB distroless) that:
 
-- **GGUF model requested** (port 11434) → routes to Ollama (auto-loads model)
-- **NVFP4 model requested** (port 11435) → unloads Ollama, starts vLLM container, proxies request
-- **NVFP4 model via SGLang** (port 11436) → unloads Ollama, starts SGLang container (RadixAttention for multi-turn)
-- **Model switch** → recreates backend container with the new model
-- **Dynamic GPU memory** → calculates `--gpu-memory-utilization` (vLLM) / `--mem-fraction-static` (SGLang) from model weight size vs total VRAM. Reserves 2 GB for vLLM runtime (CUDA graphs, activations) and 3 GB for SGLang (RadixAttention tree + CUDA graphs)
-- **Dynamic context length** → defaults to 128K, auto-reduced when KV cache can't support it. Estimates per-token KV footprint from model size class
-- **Idle timeout** → stops vLLM/SGLang after 5 minutes of inactivity
-- **API translation** → Ollama API ↔ OpenAI API for transparent Open WebUI support
+- Routes by **port → backend** (no message inspection): `:11434` → ollama, `:11435` → vllm, `:11436` → sglang.
+- Manages **GPU exclusion**: only one backend uses the GPU at a time. Switches by stopping the current backend (with graceful drain for in-flight requests) and starting the next via the Podman API.
+- Sizes vLLM/SGLang launches dynamically (`--gpu-memory-utilization`, `--mem-fraction-static`, `--max-model-len`) from per-model VRAM budgets.
+- Auto-stops idle backends after `IDLE_TIMEOUT` seconds.
+- Applies the **reasoning policy** to each request (see below).
 
-Only one backend uses the GPU at a time. No manual switching required.
+> **Status:** the vLLM and SGLang code paths in the router are still compiled in and exercised by `make test-router`, but the auxiliary containers are dormant — `deploy/docker-compose.yaml` keeps them in a `backends-disabled` profile so `make cache-up` only starts Ollama. The picker filter therefore admits Ollama models only. See [`docs/sidelined-backends.md`](docs/sidelined-backends.md) for what's frozen and how to reactivate.
+
+### Reasoning & MoE
+
+The router doesn't *guess* whether a model can reason. `make model-select` runs `scripts/probe-ollama-reasoning.py` against the live Ollama. The probe is **two-point** by default: each model is loaded twice with `think: true` — once at `PROBE_LOW=32768` tokens (32K), once at `PROBE_HIGH=262144` tokens (256K) — and `/api/ps` is read after each load. From the two points the script derives a linear fit (verified across full-attention, sliding-window, and Mamba-hybrid architectures with sub-1% deviation):
+
+```
+total_vram(c) = weights_overhead_gb + c × kv_per_token_bytes / 1024^3
+```
+
+These coefficients let `select-models.py` and the model picker compute fit at any user-chosen context (32K, 64K, 128K, 256K) **without re-probing**, with every choice landing inside the probed range. The model's true `max_context` ceiling (128K, 256K, 1M, …) is read independently from `/api/show`'s `<arch>.context_length`, so it's accurate regardless of probe range. Reasoning capability and real VRAM use are recorded, keyed by model digest in `deploy/.ollama-reasoning-cache.json`.
+
+Probe time scales with the HIGH-side KV allocation (e.g. ~10 GB extra for qwen3.5 9B at 256K), so two-point probing of the full catalog takes ~12 min cold. Cache is digest-keyed, so subsequent runs only re-probe models whose weights changed.
+
+**Reasoning capabilities** (`reasoning.capability` in `active-models.yaml`):
+- `structured` — model returns reasoning in a separate `message.thinking` field. Clean, agent-friendly. Native `think: true|false` controls it.
+- `inline` — reasoning appears as `<think>…</think>` blocks inside `message.content`. Visible but contaminates the answer.
+- `unsupported` — no reasoning behavior observed (e.g. small Gemma 4 e2b/e4b variants per probe data).
+- `error` — Ollama rejected the probe (e.g. Llama 3.2 — its template doesn't accept `think:`).
+
+**Reasoning policy** is set globally via `DEVAI_REASONING=auto|off|low|medium|high` and overridable per-request via the `X-DevAI-Reasoning` header. The arbiter rewrites the request body to set Ollama's native `think:` field (no system-prompt mangling). For Ollama, effort levels (`low|medium|high`) all collapse to `think: true` because the field is boolean.
+
+**Dense vs MoE** is read from `/api/show`'s `model_info` and surfaced in the picker. The numbers in `MoE 8/128` mean **8 experts used per token, out of 128 total** — at every applicable transformer layer, the gating network picks the top-8 experts by score. Concretely:
+
+| field | meaning |
+|---|---|
+| `expert_count: 128` | the model has a pool of 128 experts (small FFN sub-networks) |
+| `expert_used_count: 8` | every token routes through 8 of them at each MoE layer |
+| `expert_feed_forward_length: 704` | per-expert hidden dim |
+| `block_count: 30` | 30 transformer layers (most/all are MoE) |
+
+So one token through `gemma4:26b` (MoE 8/128) does ~30 × 8 = 240 expert activations, drawing on 6.25% of expert weights *that token*. Over many tokens with varied routing, you sample most of the pool — so all 128 experts must be in VRAM. **The MoE benefit is compute (small active fraction per token), not memory (full pool always loaded)**. Same `fully_on_gpu` rule applies as for dense models: if any weights spill to CPU, performance collapses regardless of MoE/dense.
+
+Three MoE families currently detected from `/api/show` data: `qwen35moe` (256 experts, 8 used), `nemotron_h_moe` (128/6), `gemma4` MoE variants (128/8). Their dense cousins (e.g. `gemma4:31b`, `gemma4:e4b-it-bf16`, `qwen3.5:9b`) carry no `expert_*` fields.
+
+### Selection pipeline
+
+```
+scripts/model-families.yaml           hand-edited (add/remove families)
+        │
+        ▼  python3 scripts/generate-catalog.py        ── make catalog-regen
+deploy/models.yaml                    catalog: name, size, arch, purpose
+        │
+        ▼  python3 scripts/probe-ollama-reasoning.py  ── make probe-reasoning
+deploy/.ollama-reasoning-cache.json   per-digest: capability, vram, MoE info
+        │
+        ▼  python3 scripts/select-models.py           ── make model-select
+deploy/active-models.yaml             catalog ∩ disk ∩ fits, with probe data
+        │
+        ▼  router loads at startup
+gpu-arbiter modelCapability map       drives reasoning policy + lifecycle
+```
+
+`make model-select` chains `probe-reasoning` automatically. Day-to-day after pulling a new model: `make model-select && podman rm -f devai-router && make cache-up`.
 
 ## Configuration
 
@@ -152,12 +215,30 @@ Only one backend uses the GPU at a time. No manual switching required.
 | `HOME_VOLUME` | `$HOME/devai-home` | Persistent home directory |
 | `JUPYTER_TOKEN` | — | Fixed access token (set in .env) |
 | `APT_PROXY` | — | APT cache URL (e.g. `http://localhost:3142`) |
-| `GPU_MEMORY_GB` | 24 | Total GPU VRAM in GB (for memory fraction and context calculation) |
-| `MAX_CONTEXT_LEN` | 131072 | Default max context length in tokens (128K). Auto-reduced for tight fits |
+| `GPU_MEMORY_GB` | 24 | Total GPU VRAM in GB. Picker filter ceiling. Override per-call: `VRAM=48 make shell-gpu` |
+| `MAX_CONTEXT_LEN` | 131072 | Default context for VRAM fit (128K). Override per-call: `CONTEXT=32768 make shell-gpu` (32K) or `CONTEXT=262144` (256K). The picker uses the probe's coefficients to interpolate VRAM at this context — no re-probe needed. |
+| `PROBE_LOW` | 32768 | Two-point probe LOW context (32K). Bookends the picker's smallest CONTEXT option so no extrapolation needed. |
+| `PROBE_HIGH` | 262144 | Two-point probe HIGH context (256K). Bookends the picker's largest CONTEXT option. `max_context` comes from `/api/show` independently, so it stays accurate regardless of probe range. |
+| `OLLAMA_CONTEXT_LENGTH` | 262144 | Runtime ollama cap (compose env). May cap the probe's `num_ctx` |
+| `MIN_VRAM_FRACTION` | 0.5 | Drop models whose total VRAM < this × `GPU_MEMORY_GB` |
+| `DEVAI_REASONING` | auto | Default reasoning policy: `auto|off|low|medium|high` |
+| `IDLE_TIMEOUT` | 300 | Seconds before auto-stopping vLLM/SGLang (router env) |
 
-### `deploy/models.yaml` — Model catalog
+### Per-request override
 
-Single source of truth for all models. Defines Ollama (GGUF), vLLM and SGLang (NVFP4) models with names, sizes, backends, and purposes. Used by `make ollama-list`, `make vllm-list`, the gpu-arbiter router, and the interactive model picker. Optional `context` field caps the max context length per model (overrides `MAX_CONTEXT_LEN`). The included models have been selected for systems with consumer-grade GPUs (up to 24 GB VRAM) and up to 64 GB main RAM.
+Any agent that talks to the router can set `X-DevAI-Reasoning: off|auto|...` on its HTTP request to override the env-level policy for that one call. Useful for testing without restart.
+
+### `scripts/model-families.yaml` — Family definitions
+
+Hand-maintained source of model lineages. Each family declares its `ollama_library` and/or `hf_repos`, plus an `arch_ref` HF repo for architecture metadata. The `thinking: true|false` flag in this file is a hint for humans curating the families file — it is no longer propagated into `deploy/models.yaml`. Final reasoning capability is determined per-variant at probe time and recorded in `deploy/active-models.yaml`.
+
+### `deploy/models.yaml` — Generated catalog
+
+Auto-generated by `make catalog-regen` from upstream HF and Ollama APIs. Has size, architecture, and purpose for every variant. Don't hand-edit.
+
+### `deploy/active-models.yaml` — Active subset
+
+Auto-generated by `make model-select`. Contains only models that are downloaded AND fit (`MIN_VRAM_FRACTION × GPU` ≤ probed VRAM ≤ `GPU_MEMORY_GB`) at the chosen `CONTEXT`. Carries the probe results: `reasoning.capability`, `vram.{source, total_gb, vram_gb, weights_overhead_gb, kv_per_token_bytes, max_context, ...}`, optional `moe.{experts_total, experts_used}`. The two coefficients (`weights_overhead_gb`, `kv_per_token_bytes`) let the picker recompute total VRAM at any `CONTEXT` env override at runtime without re-running `model-select`. This is what the router and picker actually consume.
 
 ### Adding Python Packages
 
@@ -170,24 +251,28 @@ make build-gpu
 
 ## Make Targets
 
-Run `make help` for the full list:
+Run `make help` for the full list. Highlights:
 
 ```
-BUILD                                       INFRASTRUCTURE                              RUN
-fetch-cli        Update CLI binaries        cache-up         Start services             lab-cpu          JupyterLab (CPU)
-pull-images      Pull base images           cache-down       Stop services              lab-gpu          JupyterLab (GPU)
-build-cpu        Build image (CPU)          cache-status     Show status                shell-cpu        Shell (CPU)
-build-gpu        Build image (GPU)          cache-clean      Remove cached data         shell-gpu        Shell (GPU)
-build-router     Build router image
-build            Build all (CPU+GPU+router)
+BUILD                                     INFRASTRUCTURE                            RUN
+build-cpu        Build image (CPU)        cache-up        Start services            lab-cpu        JupyterLab (CPU)
+build-gpu        Build image (GPU)        cache-down      Stop services             lab-gpu        JupyterLab (GPU)
+build-router     Build router image       cache-status    Show status               shell-cpu      Shell + picker (CPU)
+build            Build all                cache-clean     Remove cached data        shell-gpu      Shell + picker (GPU)
+fetch-cli        Update CLI binaries
+pull-images      Pull base images
 
-OLLAMA (GGUF)                               vLLM (NVFP4)                                MAINTENANCE
-ollama-list      List models                vllm-list        List models                 clean-cpu        Remove image (CPU)
-ollama-pull      Pull model(s)              vllm-pull        Pull model(s)               clean-gpu        Remove image (GPU)
-ollama-rm        Remove model               vllm-rm          Remove model                clean-router     Remove router image
-ollama-status    Show status                vllm-status      Show status                 clean            Remove all images
-ollama-df        Disk usage                 vllm-df          Disk usage                  prune            Prune dangling images
-ollama-clean     Clean partials                                                          test             Run integration tests
+OLLAMA (GGUF — active)                    vLLM (NVFP4 — dormant)                    CATALOG
+ollama-list      List downloaded models   vllm-list       List on-disk weights      catalog-regen     Refresh deploy/models.yaml from upstream
+ollama-rm        Remove model             vllm-rm         Remove weights            probe-reasoning   Probe ollama for reasoning + VRAM
+ollama-status    Show status              vllm-status     Show status               model-select      Probe + write active-models.yaml
+ollama-df        Disk usage               vllm-df         Disk usage                                  (DOWNLOAD=1 also pulls missing variants)
+ollama-clean     Clean partials                                                     vram-fit          Show what fits without acting
+
+MAINTENANCE                                                                         TESTING
+clean            Remove all images        prune           Prune dangling images     test              Run integration tests (Ollama only)
+                                                                                    test-router       Go unit tests for arbiter
+                                                                                    test-agents       Smoke-test all agents against ollama
 ```
 
 ## GPU Support
@@ -195,7 +280,7 @@ ollama-clean     Clean partials                                                 
 ### Requirements
 
 - NVIDIA GPU with CUDA support
-- NVIDIA Container Toolkit installed
+- NVIDIA Container Toolkit
 - For NVFP4 models: Blackwell architecture
 
 ### GPU images
@@ -217,7 +302,7 @@ mkcert <HOST_IP>
 
 ## Podman Registry Mirror
 
-To route Docker Hub pulls through the local cache (saves bandwidth on rebuilds):
+To route Docker Hub pulls through the local cache:
 
 ```bash
 cp deploy/registries.conf ~/.config/containers/registries.conf
@@ -231,16 +316,16 @@ This tells Podman to try `localhost:5000` (the registry mirror started by `make 
 make install-systemd
 ```
 
-Installs a systemd user service that starts all infrastructure containers (Ollama, router, Open WebUI, caches) on login. Uses `loginctl enable-linger` to keep services running after logout.
+Installs a systemd user service that starts all infrastructure containers on login. Uses `loginctl enable-linger` to keep services running after logout.
 
 ## Updating
 
 ```bash
-make fetch-cli       # Update CLI binaries (Claude, Codex, Ollama, Gemini) via ETags
-make pull-images     # Pull latest base and infrastructure images
-make ollama-pull     # Sync Ollama models (skips unchanged)
-make vllm-pull       # Sync vLLM models from HuggingFace
-make build           # Rebuild all images with updated binaries/packages
+make fetch-cli                 # Update CLI binaries (Claude, Codex, Ollama, Gemini) via ETags
+make pull-images               # Pull latest base and infrastructure images
+make catalog-regen             # Refresh deploy/models.yaml from HF + Ollama upstream
+make model-select DOWNLOAD=1   # Pull any new fitting variants and refresh active set
+make build                     # Rebuild all images with updated binaries/packages
 ```
 
 ## Storage Layout (LVM2)
@@ -304,22 +389,35 @@ sudo xfs_growfs /var/cache/devai/ollama
 ## Key Files
 
 ```
-.env                          — Host/runtime configuration
-.env.example                  — Configuration template
+.env                              — Host/runtime configuration
+.env.example                      — Configuration template
 deploy/
-  models.yaml                 — Model catalog (ollama + vllm)
-  docker-compose.yaml         — Infrastructure services
-  Dockerfile.base             — Base image (system packages, Python, Node)
-  Dockerfile.lab              — Lab image (CLI tools, packages, JupyterLab)
-  Dockerfile.router           — Router image (distroless, 9 MB)
-  webui-proxy/                — nginx TLS proxy for Open WebUI
-  systemd/                    — Auto-start service
-gpu-arbiter/                  — Router Go source
-scripts/                      — Python helpers for model management
-tests/                        — Integration tests
-requirements-base.txt         — Base Python packages (always installed)
-requirements.txt              — Optional project-specific packages
-packages/jupyter-ai-launchers — JupyterLab launcher extension
+  models.yaml                     — Generated catalog (ollama + vllm/sglang)
+  active-models.yaml              — Generated active subset (probed + fits)
+  .ollama-reasoning-cache.json    — Probe cache, keyed by model digest
+  docker-compose.yaml             — Infrastructure services
+  Dockerfile.base                 — Base image (system packages, Python, Node)
+  Dockerfile.lab                  — Lab image (CLI tools, packages, JupyterLab)
+  Dockerfile.router               — Router image (distroless, 9 MB)
+  webui-proxy/                    — nginx TLS proxy for Open WebUI
+  systemd/                        — Auto-start service
+gpu-arbiter/
+  main.go                         — Router source (multi-port proxy + reasoning policy)
+  policy_test.go                  — Unit tests for the reasoning policy
+scripts/
+  model-families.yaml             — Hand-edited family definitions
+  generate-catalog.py             — Refresh deploy/models.yaml from upstream APIs
+  probe-ollama-reasoning.py       — Two-point probe per model: capability + VRAM coefficients
+  select-models.py                — Combine catalog + probe + disk into active-models.yaml
+  model-picker.py                 — Two-step interactive picker (model → agent)
+docs/
+  ollama_models.md                — Reasoning detection design doc
+tests/
+  agent-matrix.sh                 — Smoke-test all agents against ollama
+  test-router*.sh                 — Router integration tests
+requirements-base.txt             — Base Python packages (always installed)
+requirements.txt                  — Optional project-specific packages
+packages/jupyter-ai-launchers     — JupyterLab launcher extension
 ```
 
 ## License

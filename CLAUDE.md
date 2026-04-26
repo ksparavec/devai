@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is **Dev AI Lab** — a containerized development environment for AI experimentation featuring JupyterLab and multiple AI CLIs (Gemini, Claude, OpenAI, Ollama). Built on Debian Trixie with Python 3.13 (uv-managed), Node.js 22 LTS. Two-layer image build for fast iteration. Compatible with Podman and Docker. GPU/CUDA support with automatic GPU arbitration between Ollama (GGUF) and vLLM (NVFP4) backends.
+This is **Dev AI Lab** — a containerized development environment for AI experimentation featuring JupyterLab and multiple AI CLIs (Gemini, Claude, OpenAI, Ollama). Built on Debian Trixie with Python 3.13 (uv-managed), Node.js 22 LTS. Two-layer image build for fast iteration. Compatible with Podman and Docker. GPU/CUDA support.
+
+**Active backend:** Ollama (GGUF) only. vLLM and SGLang lifecycle code remains compiled into `gpu-arbiter` and is still covered by `make test-router`, but the compose services are behind a `backends-disabled` profile while Ollama-side behaviour is stabilized — see `docs/sidelined-backends.md` for what's dormant and how to reactivate.
 
 ## Build and Run Commands
 
@@ -22,15 +24,16 @@ make shell-gpu       # Interactive shell (GPU)
 make shell-cpu       # Interactive shell (CPU)
 
 # Infrastructure
-make cache-up        # Start all services (Ollama, vLLM, router, Open WebUI)
+make cache-up        # Start active services (Ollama, router, Open WebUI). vLLM/SGLang dormant
 make cache-down      # Stop all services
 make cache-status    # Show status, models, disk usage
 
-# Models
-make ollama-list     # List Ollama (GGUF) models with status
-make ollama-pull     # Pull all Ollama models from models.yaml
-make vllm-list       # List vLLM (NVFP4) models with status
-make vllm-pull       # Download all vLLM models from HuggingFace
+# Models — single download path through model-select
+make model-select               # Probe + write active-models.yaml
+make model-select DOWNLOAD=1    # …also pull missing fitting variants
+make model-select FAMILY=qwen3.5 DOWNLOAD=1   # scope to one family
+make ollama-list                # List downloaded Ollama models
+make vllm-list                  # List on-disk vLLM weights (backend currently dormant)
 
 # Maintenance
 make clean           # Remove all images (CPU + GPU + router)
@@ -53,7 +56,7 @@ Copy `.env.example` to `.env` before first use. Key settings:
 Model catalog is in `deploy/models.yaml` (single source of truth for all models). GPU inference settings:
 
 - `GPU_MEMORY_GB` — Total GPU VRAM in GB (default: 24). Used by router to calculate memory fractions and context limits.
-- `MAX_CONTEXT_LEN` — Default max context length in tokens (default: 131072 = 128K). Auto-reduced when KV cache can't fit it. Per-model override via `context` field in models.yaml.
+- `MAX_CONTEXT_LEN` — Default max context length in tokens (default: 131072 = 128K). Auto-reduced when KV cache can't fit it. Per-model `context:` overrides are written into `deploy/active-models.yaml` by `select-models.py` from probe data — not hand-edited.
 
 ## Architecture
 
@@ -69,17 +72,17 @@ Build cache: CLI binaries pre-downloaded to `/var/cache/devai/pip/bin/` via `mak
 ### Inference stack (deploy/docker-compose.yaml)
 
 ```
-Agent → devai-router:11434 → devai-ollama:11434 (GGUF models)
-Agent → devai-router:11435 → devai-vllm:11434   (NVFP4 models via vLLM)
-Agent → devai-router:11436 → devai-sglang:11434  (NVFP4 models via SGLang)
+Agent → devai-router:11434 → devai-ollama:11434 (GGUF models)               ← active
+Agent → devai-router:11435 → devai-vllm:11434   (NVFP4 models via vLLM)     ← dormant
+Agent → devai-router:11436 → devai-sglang:11434 (NVFP4 + HF via SGLang)     ← dormant
 ```
 
-- **devai-router** — Multi-port GPU-aware reverse proxy (~800 lines Go, 9 MB distroless binary). One port per backend. No message inspection — port determines backend. Manages GPU exclusion: only one backend uses GPU at a time. Graceful drain waits for in-flight requests before stopping a backend. Idle timeout auto-stops backends. Dynamic GPU memory allocation: calculates `--gpu-memory-utilization` (vLLM) and `--mem-fraction-static` (SGLang) from model weight size vs total VRAM, with backend-specific reservations for CUDA graphs and RadixAttention. Context length auto-sized to fit available KV cache (128K default, reduced for tight fits).
-- **devai-ollama** — Unmodified `ollama/ollama:latest`. GGUF models, GPU auto-detected. `OLLAMA_MAX_LOADED_MODELS=1` ensures clean model switching.
-- **devai-vllm** — `vllm/vllm-openai` image. NVFP4 models for Blackwell GPUs. Container lifecycle managed by router via Podman API.
-- **devai-sglang** — `lmsysorg/sglang` image. NVFP4 + HuggingFace models. RadixAttention for multi-turn speedup. Container lifecycle managed by router via Podman API.
+- **devai-router** — Multi-port GPU-aware reverse proxy. One port per backend. No message inspection — port determines backend. Manages GPU exclusion (only one backend uses GPU at a time), graceful drain on switch, idle timeout, dynamic GPU memory allocation (`--gpu-memory-utilization` for vLLM, `--mem-fraction-static` for SGLang). Context length per request comes from the per-model `context:` in `active-models.yaml`, falling back to `MAX_CONTEXT_LEN`. All vLLM/SGLang lifecycle code stays compiled in (~1070 lines total in `gpu-arbiter/main.go`); only the auxiliary containers are dormant.
+- **devai-ollama** — Unmodified `ollama/ollama:latest`. GGUF models, GPU auto-detected. `OLLAMA_MAX_LOADED_MODELS=1` ensures clean model switching. `OLLAMA_CONTEXT_LENGTH` defaults to 262144 (compose env).
+- **devai-vllm** *(dormant)* — `vllm/vllm-openai` image. NVFP4 models for Blackwell GPUs. Container lifecycle managed by router via Podman API. Behind `profiles: ["backends-disabled"]` in compose.
+- **devai-sglang** *(dormant)* — `lmsysorg/sglang` image. NVFP4 + HuggingFace models, RadixAttention for multi-turn speedup. Same profile, same lifecycle hookup.
 - **devai-webui-proxy** — nginx TLS proxy for Open WebUI (mkcert certs or self-signed fallback).
-- **devai-open-webui** — Web chat interface, connects to Ollama port (:11434).
+- **devai-open-webui** — Web chat interface, connects to router's ollama port (:11434).
 
 ### Supporting services
 
@@ -96,11 +99,13 @@ All services share `devai-net` network. Model data stored under `/var/cache/deva
 
 ### Model picker (shell + Jupyter)
 
-Interactive model → backend → agent selection via fzf. Used by both `make shell-*` (via `agent-picker`) and JupyterLab launcher cards.
+Interactive model → agent selection via fzf. Used by both `make shell-*` (via `agent-picker`) and JupyterLab launcher cards.
 
-- `scripts/model-picker.py` — Python TUI: reads `deploy/models.yaml`, three-step fzf picker
-- `scripts/agent-picker.sh` — Shell wrapper, calls model-picker.py
-- `packages/jupyter-ai-launchers/src/index.ts` — JupyterLab extension, each card runs `model-picker --agent <name>`
+- `scripts/model-picker.py` — Python TUI, two-step fzf picker. Reads `deploy/active-models.yaml` (probe data, capability, VRAM coefficients) and falls back to `deploy/models.yaml` for catalog metadata only. Backend is derived from the chosen model's entry — there's no explicit backend step.
+- `scripts/agent-picker.sh` — Shell wrapper, execs model-picker.py.
+- `packages/jupyter-ai-launchers/src/index.ts` — JupyterLab extension, each card runs `model-picker --agent <name>`.
+
+**Filter:** the picker only shows models with `reasoning.capability == "structured"` AND probe-derived VRAM coefficients (`weights_overhead_gb`, `kv_per_token_bytes`). Today that filter resolves to Ollama-only because no probe runner exists for vLLM/SGLang yet. The picker prints a footer line listing how many catalog entries were hidden and points at `docs/sidelined-backends.md`. To loosen the filter for vLLM/SGLang, see that doc.
 
 ### Building the JupyterLab extension
 
@@ -118,14 +123,19 @@ Pre-built output lives in `packages/jupyter-ai-launchers/jupyter_ai_launchers/la
 ### Key files
 
 ```
-deploy/models.yaml            — Model catalog (flat list, each model declares backend: [ollama/vllm/sglang])
-deploy/docker-compose.yaml    — Infrastructure services
+deploy/models.yaml            — Auto-generated catalog (every variant the upstream catalog declares)
+deploy/active-models.yaml     — Auto-generated active subset (downloaded ∩ fits ∩ probed) — what router and picker read
+deploy/docker-compose.yaml    — Infrastructure services (vllm/sglang in `backends-disabled` profile)
 deploy/Dockerfile.base        — Base image
 deploy/Dockerfile.lab         — Lab image
-deploy/Dockerfile.router      — Router image (distroless, 9 MB)
-gpu-arbiter/main.go           — GPU arbiter source (multi-port proxy, ~720 lines Go)
-scripts/model-picker.py       — Interactive model/backend/agent picker (fzf-based)
-tests/test-router.sh          — Integration tests
+deploy/Dockerfile.router      — Router image (distroless)
+gpu-arbiter/main.go           — GPU arbiter source (multi-port proxy, ~1070 lines Go)
+scripts/generate-catalog.py   — Refresh deploy/models.yaml from upstream (HF + Ollama registry)
+scripts/probe-ollama-reasoning.py — Two-point probe: capability + VRAM coefficients
+scripts/select-models.py      — Combine catalog + probe + disk → active-models.yaml
+scripts/model-picker.py       — Two-step interactive picker (model → agent)
+tests/test-router.sh          — Ollama-side integration tests
+docs/sidelined-backends.md    — Why vLLM/SGLang are dormant + how to reactivate
 ```
 # AK's CLAUDE.md
 
@@ -189,6 +199,35 @@ For multi-step tasks, state a brief plan:
 
 Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
 
+## 5. Don't Assume — If You Don't Know, Say So
+
+**Never claim something works, exists, or behaves a certain way unless you've verified it. If you haven't, say "I don't know" or "I haven't tested that".**
+
+Banned phrases when not verified:
+- "this works"
+- "verified"
+- "should work"
+- "this is wired up"
+- "X is fine"
+
+Required phrases when uncertain:
+- "I don't know"
+- "I haven't tested this"
+- "I'm assuming X but haven't confirmed"
+- "This is unverified"
+
+Before reporting status, audit each claim:
+- Did I run it end-to-end? → can claim "works"
+- Did I only check it parses / imports / starts? → say "starts cleanly, full round-trip not tested"
+- Did I infer from documentation, help text, or another agent's behavior? → say "I'm assuming based on X, not verified"
+
+A "PASS" in a test harness means PASS only for what the harness actually checked. If the harness checks "non-empty output", report that, not "works".
+
+When the user asks "does X work?", the only honest answers are:
+- "Yes — verified by [specific test/command/output]"
+- "No — fails at [specific point], log/error attached"
+- "I don't know — haven't tested"
+
 ---
 
-**These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
+**These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, fewer false-confidence claims that have to be retracted later, and clarifying questions come before implementation rather than after mistakes.

@@ -143,13 +143,17 @@ class Entry:
     size_gb: float
     arch: Arch
     source_kind: str  # "hf" | "ollama"
+    thinking: bool = False  # family-level pre-probe hint; final capability
+                            # is determined at runtime by
+                            # scripts/probe-ollama-reasoning.py
 
 
 def _gb(bytes_: int) -> float:
     return bytes_ / (1024 ** 3)
 
 
-def _entry_hf(repo: str, family: str, fallback_arch: Arch) -> Entry | None:
+def _entry_hf(repo: str, family: str, fallback_arch: Arch,
+              thinking: bool) -> Entry | None:
     try:
         size_bytes = hf_weight_bytes(repo)
     except Exception as e:
@@ -172,10 +176,12 @@ def _entry_hf(repo: str, family: str, fallback_arch: Arch) -> Entry | None:
         size_gb=_gb(size_bytes),
         arch=arch,
         source_kind="hf",
+        thinking=thinking,
     )
 
 
-def _entry_ollama(library: str, tag: str, family: str, arch: Arch) -> Entry | None:
+def _entry_ollama(library: str, tag: str, family: str, arch: Arch,
+                  thinking: bool) -> Entry | None:
     try:
         size_bytes = ollama_manifest_size(library, tag)
     except urllib.error.HTTPError as e:
@@ -196,6 +202,7 @@ def _entry_ollama(library: str, tag: str, family: str, arch: Arch) -> Entry | No
         size_gb=_gb(size_bytes),
         arch=arch,
         source_kind="ollama",
+        thinking=thinking,
     )
 
 
@@ -210,7 +217,8 @@ def main() -> None:
 
     for fam in fams:
         name = fam["name"]
-        print(f"\n── family: {name}")
+        thinking = bool(fam.get("thinking", False))
+        print(f"\n── family: {name}  (thinking-hint={thinking})")
         arch_ref = fam.get("arch_ref")
         if not arch_ref:
             print(f"  [error] family {name} has no arch_ref — skipping",
@@ -222,7 +230,7 @@ def main() -> None:
 
         for repo in fam.get("hf_repos") or []:
             print(f"  HF: {repo} ... ", end="", flush=True)
-            e = _entry_hf(repo, name, fam_arch)
+            e = _entry_hf(repo, name, fam_arch, thinking)
             if e:
                 print(f"{e.size_gb:.1f} GB  arch={e.arch.layers}L/"
                       f"{e.arch.kv_heads}kv/{e.arch.head_dim}h")
@@ -237,7 +245,7 @@ def main() -> None:
                 tags = []
             skipped = 0
             for tag in tags:
-                e = _entry_ollama(lib, tag, name, fam_arch)
+                e = _entry_ollama(lib, tag, name, fam_arch, thinking)
                 if e is None:
                     skipped += 1
                     continue
@@ -276,6 +284,11 @@ def main() -> None:
         lines.append(f"    arch: {e.arch.to_yaml()}")
         lines.append(f'    arch_source: "{e.arch.source}"')
         lines.append(f'    purpose: "{purpose}"')
+        # Note: a `thinking:` field used to be written here as a family-level
+        # pre-probe hint, but no consumer reads it — capability is determined
+        # at runtime by scripts/probe-ollama-reasoning.py and recorded in
+        # active-models.yaml under `reasoning.capability`. Field removed to
+        # avoid the impression that catalog metadata can override the probe.
         lines.append("")
 
     OUTPUT_YAML.write_text("\n".join(lines))

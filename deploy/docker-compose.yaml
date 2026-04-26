@@ -27,7 +27,7 @@ services:
     environment:
       - OLLAMA_KEEP_ALIVE=${OLLAMA_KEEP_ALIVE:-300s}
       - OLLAMA_MAX_LOADED_MODELS=1
-      - OLLAMA_CONTEXT_LENGTH=${OLLAMA_CONTEXT_LENGTH:-65536}
+      - OLLAMA_CONTEXT_LENGTH=${OLLAMA_CONTEXT_LENGTH:-262144}
     volumes:
       - /var/cache/devai/ollama:/root/.ollama
     devices:
@@ -36,7 +36,15 @@ services:
       - label=disable
     restart: unless-stopped
 
+  # vLLM and SGLang are dormant — see docs/sidelined-backends.md.
+  # The `backends-disabled` profile keeps them out of the default
+  # `compose up -d` (used by `make cache-up`) so they don't start with
+  # broken/placeholder configs and litter `podman ps` with failed
+  # containers. Their lifecycle is still managed at runtime by the
+  # router (gpu-arbiter) when re-enabled. To re-enable temporarily:
+  #   compose --profile backends-disabled up -d vllm sglang
   vllm:
+    profiles: ["backends-disabled"]
     image: vllm/vllm-openai:latest-cu130-ubuntu2404
     container_name: devai-vllm
     hostname: vllm
@@ -58,6 +66,7 @@ services:
     restart: "no"
 
   sglang:
+    profiles: ["backends-disabled"]
     image: ${SGLANG_IMAGE:-docker.io/lmsysorg/sglang:latest}
     container_name: devai-sglang
     hostname: sglang

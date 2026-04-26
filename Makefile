@@ -31,7 +31,10 @@ INFERENCE_CONFIG = deploy/models.yaml
 HF_CLI = hf
 VLLM_MODELS_DIR = $(CACHE_DIR)/ollama/models/vllm
 OLLAMA_HOST = http://devai-router:11434
-OLLAMA_DEFAULT_MODEL = $(shell python3 -c "import yaml; print(yaml.safe_load(open('$(INFERENCE_CONFIG)'))['defaults']['ollama'])" 2>/dev/null || echo "qwen3.5:9b")
+# Pinned to a real catalog tag. The previous shell-out read defaults['ollama']
+# from models.yaml, which generate-catalog.py never writes — so this always
+# fell through to a tag (qwen3.5:9b) that doesn't exist in the catalog.
+OLLAMA_DEFAULT_MODEL = qwen3.5:9b-q8_0
 
 # Proxy build args (passed to all container builds)
 PROXY_BUILD_ARGS = \
@@ -102,10 +105,11 @@ endif
 .PHONY: all build build-cpu build-gpu build-base-cpu build-base-gpu build-router
 .PHONY: lab-cpu lab-gpu shell-cpu shell-gpu
 .PHONY: cache-up cache-down cache-status cache-clean
-.PHONY: ollama-pull ollama-rm ollama-list ollama-status ollama-clean ollama-df
-.PHONY: vllm-pull vllm-list vllm-rm vllm-status vllm-df
+.PHONY: ollama-rm ollama-list ollama-status ollama-clean ollama-df
+.PHONY: vllm-list vllm-rm vllm-status vllm-df
 .PHONY: clean clean-cpu clean-gpu clean-router prune
-.PHONY: fetch-cli pull-images install-systemd test test-router test-ollama test-vllm test-idle help
+.PHONY: fetch-cli pull-images install-systemd test test-router test-ollama test-agents help
+.PHONY: catalog-regen probe-reasoning model-select vram-fit
 
 all: help
 
@@ -270,6 +274,8 @@ lab-cpu: ## Run the container (CPU)
 		$(PROXY_RUN_ENV) \
 		-e OLLAMA_HOST=$(OLLAMA_HOST) \
 		-e OLLAMA_DEFAULT_MODEL=$(OLLAMA_DEFAULT_MODEL) \
+		-e CONTEXT=$${CONTEXT:-$(MAX_CONTEXT_LEN)} \
+		-e VRAM=$${VRAM:-$(GPU_MEMORY_GB)} \
 		$(USER_ENV) \
 		-e CONTAINER_USER=$(CONTAINER_USER) \
 		-e HOST_IP=$(HOST_IP) \
@@ -295,6 +301,8 @@ lab-gpu: ## Run the container (GPU/CUDA)
 		$(PROXY_RUN_ENV) \
 		-e OLLAMA_HOST=$(OLLAMA_HOST) \
 		-e OLLAMA_DEFAULT_MODEL=$(OLLAMA_DEFAULT_MODEL) \
+		-e CONTEXT=$${CONTEXT:-$(MAX_CONTEXT_LEN)} \
+		-e VRAM=$${VRAM:-$(GPU_MEMORY_GB)} \
 		$(USER_ENV) \
 		-e CONTAINER_USER=$(CONTAINER_USER) \
 		-e HOST_IP=$(HOST_IP) \
@@ -316,6 +324,8 @@ shell-cpu: ## Start an interactive shell (CPU)
 		$(PROXY_RUN_ENV) \
 		-e OLLAMA_HOST=$(OLLAMA_HOST) \
 		-e OLLAMA_DEFAULT_MODEL=$(OLLAMA_DEFAULT_MODEL) \
+		-e CONTEXT=$${CONTEXT:-$(MAX_CONTEXT_LEN)} \
+		-e VRAM=$${VRAM:-$(GPU_MEMORY_GB)} \
 		$(USER_ENV) \
 		-e CONTAINER_USER=$(CONTAINER_USER) \
 		-v $(HOME_VOLUME):/home/$(CONTAINER_USER) \
@@ -335,6 +345,8 @@ shell-gpu: ## Start an interactive shell (GPU)
 		$(PROXY_RUN_ENV) \
 		-e OLLAMA_HOST=$(OLLAMA_HOST) \
 		-e OLLAMA_DEFAULT_MODEL=$(OLLAMA_DEFAULT_MODEL) \
+		-e CONTEXT=$${CONTEXT:-$(MAX_CONTEXT_LEN)} \
+		-e VRAM=$${VRAM:-$(GPU_MEMORY_GB)} \
 		$(USER_ENV) \
 		-e CONTAINER_USER=$(CONTAINER_USER) \
 		-v $(HOME_VOLUME):/home/$(CONTAINER_USER) \
@@ -371,39 +383,39 @@ test-router: ## Run Go unit tests for gpu-arbiter router
 test-ollama: cache-up ## Run Ollama-only integration tests
 	./tests/test-router.sh
 
-test-vllm: cache-up ## Run vLLM/GPU integration tests (~10min)
-	./tests/test-router-vllm.sh
-
-test-idle: cache-up ## Run vLLM idle timeout test (restarts router temporarily)
-	./tests/test-router-idle.sh
+# test-vllm and test-idle are dormant alongside the vLLM/SGLang sideline
+# (see docs/sidelined-backends.md). The recipes for ./tests/test-router-vllm.sh
+# and ./tests/test-router-idle.sh stay in the tree so reactivation is
+# trivial; rerun once vLLM is moved out of the backends-disabled profile.
 
 test-agents: ## Smoke-test every (agent × backend) cell against the live router
-	@# Router lifecycle-manages vllm/sglang via podman API — they linger after
-	@# the router stops them and confuse `compose up`. Clear them first.
+	@# Defensive cleanup: a previous run with the dormant backends profile
+	@# disabled may have left vllm/sglang containers behind. Harmless when
+	@# they don't exist.
 	@$(CONTAINER_RUNTIME) rm -f devai-vllm devai-sglang 2>/dev/null || true
 	@$(MAKE) cache-up
 	@mkdir -p $(CURDIR)/tests/.matrix-logs
+	@# Run via the default entrypoint so codex config gets seeded into
+	@# /home/devai/.codex (CODEX_HOME). Image ENV provides ANTHROPIC_*
+	@# and OPENAI_API_KEY so no overrides are needed here.
 	$(CONTAINER_RUNTIME) run --rm \
 		--name devai-test-agents \
 		$(GPU_FLAGS) \
 		--network $(DEVAI_NETWORK) \
+		-e CONTAINER_USER=devai \
 		$(MODEL_CACHE_MOUNT) \
 		$(ACTIVE_CATALOG_MOUNT) \
 		-v "$(CURDIR)/tests/agent-matrix.sh":/usr/local/bin/agent-matrix:ro \
 		-v "$(CURDIR)/tests/.matrix-logs":/var/log/agent-matrix \
-		-v "$(CURDIR)/config/codex/config.toml":/root/.codex/config.toml:ro \
-		-e TIMEOUT_OLLAMA=$${TIMEOUT_OLLAMA:-30} \
-		-e TIMEOUT_VLLM=$${TIMEOUT_VLLM:-180} \
-		-e TIMEOUT_SGLANG=$${TIMEOUT_SGLANG:-180} \
-		-e PROMPT="$${PROMPT:-say hi in five words}" \
+		-v $(HOME_VOLUME):/home/devai \
+		-e CELL_TIMEOUT=$${CELL_TIMEOUT:-60} \
+		-e PROMPT="$${PROMPT:-reply with the single word PONG}" \
 		-e ROUTER=devai-router \
-		-e OPENAI_API_KEY=local \
 		-e LOG_DIR=/var/log/agent-matrix \
-		--entrypoint /usr/local/bin/agent-matrix \
-		$(IMAGE_NAME_GPU)
+		$(IMAGE_NAME_GPU) /usr/local/bin/agent-matrix
 	@echo "  logs preserved at $(CURDIR)/tests/.matrix-logs/"
 
-test: test-router test-ollama test-vllm test-idle ## Run all tests in sequence
+test: test-router test-ollama ## Run all tests in sequence (vLLM/idle tests dormant — see docs/sidelined-backends.md)
 
 help: ## Show this help message
 	@printf "\nDevAI Lab — Containerized AI Development Environment\n\n"
@@ -423,12 +435,14 @@ help: ## Show this help message
 	@printf "  %-44s%s\n" "" "prune            Prune dangling images"
 	@printf "  %-44s%s\n" "" "test             Run integration tests"
 	@printf "\n"
-	@printf "  %-44s%s\n" "OLLAMA (GGUF)" "vLLM (NVFP4)"
-	@printf "  %-44s%s\n" "ollama-list      List models" "vllm-list        List models"
-	@printf "  %-44s%s\n" "ollama-pull      Pull model(s)" "vllm-pull        Pull model(s)"
-	@printf "  %-44s%s\n" "ollama-rm        Remove model" "vllm-rm          Remove model"
-	@printf "  %-44s%s\n" "ollama-status    Show status" "vllm-status      Show status"
-	@printf "  %-44s%s\n" "ollama-df        Disk usage" "vllm-df          Disk usage"
+	@printf "  %-44s%s\n" "MODELS" "vLLM (dormant — see docs/sidelined-backends.md)"
+	@printf "  %-44s%s\n" "model-select     Probe + select active set" "vllm-list        List on-disk vLLM weights"
+	@printf "  %-44s%s\n" "  DOWNLOAD=1     also pull missing variants" "vllm-rm          Remove model"
+	@printf "  %-44s%s\n" "  FAMILY=qwen3.5 scope to one family" "vllm-status      Show status"
+	@printf "  %-44s%s\n" "ollama-list      List downloaded models" "vllm-df          Disk usage"
+	@printf "  %-44s%s\n" "ollama-rm        Remove model" ""
+	@printf "  %-44s%s\n" "ollama-status    Show status" ""
+	@printf "  %-44s%s\n" "ollama-df        Disk usage" ""
 	@printf "  %s\n" "ollama-clean     Clean partials"
 	@printf "\n"
 	@printf "  %s\n" "DEPLOY"
@@ -439,23 +453,22 @@ help: ## Show this help message
 # Infrastructure services (caches + Ollama + vLLM + Open WebUI)
 # =============================================================================
 
-cache-up: ## Start infrastructure services (caches + Ollama + vLLM + Open WebUI)
+cache-up: ## Start infrastructure services (caches + Ollama + Open WebUI; vLLM/SGLang dormant)
 	@if [ "$(CONTAINER_RUNTIME)" = "podman" ] && ! systemctl --user is-active --quiet podman.socket; then \
 		echo "Starting Podman API socket..."; \
 		systemctl --user enable --now podman.socket; \
 	fi
 	@$(CONTAINER_RUNTIME) network exists $(DEVAI_NETWORK) 2>/dev/null || $(CONTAINER_RUNTIME) network create $(DEVAI_NETWORK)
 	$(COMPOSE) -f $(CACHE_COMPOSE) up -d
-	@$(COMPOSE) -f $(CACHE_COMPOSE) stop vllm 2>/dev/null || true
 	@echo "Infrastructure services started:"
 	@echo "  apt-cacher-ng:     http://localhost:3142"
 	@echo "  Registry mirror:   http://localhost:5000"
 	@echo "  Router:            devai-router:11434 (unified endpoint)"
 	@echo "  Ollama:            devai-ollama:11434 (GGUF models)"
-	@echo "  vLLM:              devai-vllm (auto-managed by router)"
+	@echo "  vLLM/SGLang:       dormant (see docs/sidelined-backends.md)"
 	@echo "  Open WebUI:        https://localhost:$(WEBUI_PORT)"
 	@echo ""
-	@echo "To pull a model:  make ollama-pull MODEL=llama3.2"
+	@echo "To pull and select models: make model-select DOWNLOAD=1 [FAMILY=qwen3.5]"
 
 cache-down: ## Stop and remove ALL infrastructure services (running, stopped, orphaned)
 	@# -t 0 kills immediately; --remove-orphans catches containers no longer in compose.
@@ -498,7 +511,7 @@ cache-status: ## Show infrastructure service status and disk usage
 		else modified="$$((diff_sec / 604800)) weeks ago"; fi; \
 		printf "%-46s%-16s%-10s%-20s\n" "$$name" "$$id" "$$size" "$$modified"; \
 	done; \
-	$$found || echo "  (none — run 'make vllm-pull' to download)"
+	$$found || echo "  (none — run 'make model-select DOWNLOAD=1' to populate)"
 
 cache-clean: ## Remove all cached data (keeps volumes mounted, preserves podman graphroot)
 	$(COMPOSE) -f $(CACHE_COMPOSE) down
@@ -615,10 +628,29 @@ vram-fit: ## Show which models from the full catalog fit in VRAM (planning aid; 
 			--models-yaml $(INFERENCE_CONFIG) \
 			--vllm-dir $(VLLM_MODELS_DIR)
 
-model-select: ## Select fitting+on-disk models into deploy/active-models.yaml (DOWNLOAD=1 pulls missing, PRUNE=1 deletes too-large)
-	@OLLAMA_CONTAINER=$(OLLAMA_CONTAINER) CONTAINER_RUNTIME=$(CONTAINER_RUNTIME) \
+probe-reasoning: ## Probe each downloaded ollama model for native reasoning support (two-point: PROBE_LOW, PROBE_HIGH)
+	@# Runs inside the lab container so it can reach devai-ollama on devai-net.
+	@# Two-point probe (low + high contexts) derives weights_overhead_gb +
+	@# kv_per_token_bytes per model so downstream tools can interpolate
+	@# total VRAM at any user-chosen context. Cache invalidates when
+	@# either probe context changes.
+	$(CONTAINER_RUNTIME) run --rm \
+		--network $(DEVAI_NETWORK) \
+		-v $(CURDIR)/scripts:/scripts:ro \
+		-v $(CURDIR)/deploy:/deploy \
+		-e OLLAMA_HOST=http://devai-ollama:11434 \
+		-e PROBE_LOW=$${PROBE_LOW:-32768} \
+		-e PROBE_HIGH=$${PROBE_HIGH:-262144} \
+		--entrypoint python3 \
+		$(IMAGE_NAME) \
+		/scripts/probe-ollama-reasoning.py --cache /deploy/.ollama-reasoning-cache.json
+
+model-select: probe-reasoning ## Select fitting+on-disk models (probe first, then write active-models.yaml; restarts router if active set changed)
+	@before_sha=$$(grep -v '^#' deploy/active-models.yaml 2>/dev/null | sha256sum | awk '{print $$1}' || echo "none"); \
+	 OLLAMA_CONTAINER=$(OLLAMA_CONTAINER) CONTAINER_RUNTIME=$(CONTAINER_RUNTIME) \
 	 VLLM_MODELS_DIR=$(VLLM_MODELS_DIR) HF_CLI=$(HF_CLI) \
 	 GPU_MEMORY_GB=$${VRAM:-$(GPU_MEMORY_GB)} MAX_CONTEXT_LEN=$${CONTEXT:-$(MAX_CONTEXT_LEN)} \
+	 VERBOSE=$${VERBOSE:-0} \
 		python3 scripts/select-models.py \
 			$(if $(FAMILY),--family $(FAMILY),) \
 			$(if $(VRAM),--vram $(VRAM),) \
@@ -627,7 +659,15 @@ model-select: ## Select fitting+on-disk models into deploy/active-models.yaml (D
 			$(if $(DOWNLOAD),--download,) \
 			$(if $(PRUNE),--prune,) \
 			$(if $(PRUNE_SHADOWS),--prune-shadows,) \
-			$(if $(DRY_RUN),--dry-run,)
+			$(if $(DRY_RUN),--dry-run,); \
+	 after_sha=$$(grep -v '^#' deploy/active-models.yaml 2>/dev/null | sha256sum | awk '{print $$1}' || echo "none"); \
+	 if [ "$$before_sha" != "$$after_sha" ] && \
+	    $(CONTAINER_RUNTIME) ps --format '{{.Names}}' 2>/dev/null | grep -q '^devai-router$$'; then \
+		echo; \
+		echo "  active-models.yaml changed — restarting devai-router so it picks up the new map"; \
+		$(CONTAINER_RUNTIME) rm -f devai-router >/dev/null && \
+		$(COMPOSE) -f $(CACHE_COMPOSE) up -d router; \
+	 fi
 
 catalog-regen: ## Regenerate deploy/models.yaml from scripts/model-families.yaml using live upstream data
 	python3 scripts/generate-catalog.py
