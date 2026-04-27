@@ -103,6 +103,7 @@ services:
       - DRAIN_TIMEOUT=${DRAIN_TIMEOUT:-30}
       - GPU_MEMORY_GB=${GPU_MEMORY_GB:-24}
       - MAX_CONTEXT_LEN=${MAX_CONTEXT_LEN:-131072}
+      - DEVAI_REASONING=${DEVAI_REASONING:-auto}
       - PODMAN_SOCKET=/run/podman/podman.sock
     volumes:
       - ${XDG_RUNTIME_DIR:-/run/user/1000}/podman/podman.sock:/run/podman/podman.sock

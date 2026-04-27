@@ -98,7 +98,7 @@ _RESET = "\033[0m"
 def _load_catalog() -> dict[str, dict]:
     """Optional metadata lookup. Returns {} if no yaml found — discovery
     still works, rows just lose declared size / purpose / arch / family /
-    thinking-flag."""
+    reasoning capability."""
     for path in _CATALOG_PATHS:
         if os.path.isfile(path):
             with open(path) as fh:
@@ -308,10 +308,22 @@ def _vram_at(v: dict, context: int) -> tuple[float | None, int]:
     picker shows that honestly. This is NOT a runtime clamp like
     OLLAMA_CONTEXT_LENGTH; it's a fact about the model's architecture.
 
-    Returns (None, 0) when no coefficients are present (unprobed model).
+    Formula-only entries store a KV total at the generation context; KV
+    memory is linear in context, so recompute it when CONTEXT changes.
+    Returns (None, 0) when no usable VRAM data is present.
     """
     if not v:
         return None, 0
+    if v.get("source") == "formula" and v.get("total_gb") is not None:
+        base_ctx = int(v.get("context") or context)
+        if base_ctx <= 0:
+            return round(float(v["total_gb"]), 2), context
+        max_ctx = v.get("max_context") or 0
+        eff_ctx = min(context, max_ctx) if max_ctx else context
+        kv_gb = float(v.get("kv_gb") or 0)
+        static_gb = float(v["total_gb"]) - kv_gb
+        total = static_gb + (kv_gb * eff_ctx / base_ctx)
+        return round(total, 2), eff_ctx
     weights = v.get("weights_overhead_gb")
     kv_pt = v.get("kv_per_token_bytes")
     if weights is None or kv_pt is None:
@@ -412,68 +424,49 @@ def _quality(m: dict) -> float:
         return 0.0
 
 
-# Was capped at 3; the strict-structured filter already cuts the list
-# enough that an artificial cap loses real choices. Dedup-by-VRAM-bucket
-# below still collapses literal aliases (same digest, different tag).
+# Was capped at 3; dedup-by-VRAM-bucket below still collapses literal
+# aliases (same digest, different tag) without losing distinct model sizes.
 _TOP_PER_FAMILY = None  # None = no cap
 
 
 def _build_menu(models: list[dict]) -> tuple[list[str], list[bool], list[dict | None]]:
     """Build (display_lines, selectable_flags, model_per_line) for fzf.
 
-    Shows ALL fitting models, grouped by backend then family. Per row a
+    Shows all fitting Ollama models, grouped by family. Per row a
     capability glyph (●/◐/·/?/✗) reflects the runtime probe — no filter
     by capability (per docs/ollama_models.md). Within each family, top N
     by quality (weights_gb desc), deduped on weight bucket so the user
     sees distinct sizes rather than 3 quants of the same model.
     """
-    # backend → family → [models]. Three strict filters:
-    #   1. must have probe-derived coefficients — absence means
-    #      the model wasn't probed.
-    #   2. capability must be `structured` — runtime probe must have
-    #      verified the model exposes its reasoning in a separate
-    #      message field. Hides:
-    #         · unsupported (no reasoning observed)
-    #         ◐ inline      (reasoning leaks into content as <think>…</think>)
-    #         ? unknown     (not yet probed — incl. all vLLM/SGLang)
-    #         ✗ error       (probe failed; e.g. ollama HTTP 400 on think:)
-    #   3. interpolated total at effective_ctx (= min(CONTEXT, max_ctx))
-    #      must fit in VRAM_BUDGET. Models with max_ctx < CONTEXT are
-    #      shown with their effective context, not hidden.
+    # backend → family → [models]. Filters:
+    #   1. Only Ollama models are selectable while vLLM/SGLang are dormant.
+    #   2. The model needs usable VRAM data for display/filtering.
+    #   3. Total at effective_ctx (= min(CONTEXT, max_ctx), with
+    #      formula-only KV scaled to CONTEXT) must fit in VRAM_BUDGET.
+    # Reasoning capability is display metadata, not a selection filter.
     grouped: dict[str, dict[str, list[dict]]] = {}
     # Track why models were hidden so the footer can explain. The big
     # categories worth distinguishing today:
-    #   - non_ollama_unprobed: every vLLM/SGLang entry (capability=unknown)
-    #     because there is no probe runner for those backends yet — they
-    #     are also dormant per docs/sidelined-backends.md
-    #   - non_structured: ollama models the probe classified as
-    #     unsupported / inline / error
-    #   - over_budget: structured but interpolated VRAM > VRAM_BUDGET
-    #   - missing_coeffs: probe never ran or didn't yield coefficients
+    #   - non_ollama_dormant: vLLM/SGLang entries are not part of the
+    #     current Ollama reasoning flow.
+    #   - over_budget: interpolated/recorded VRAM > VRAM_BUDGET
+    #   - missing_vram: no usable coefficients or formula totals
     hidden = {
-        "non_ollama_unprobed": 0,
-        "non_structured": 0,
+        "non_ollama_dormant": 0,
         "over_budget": 0,
-        "missing_coeffs": 0,
+        "missing_vram": 0,
     }
     for m in models:
         v = m.get("vram") or {}
-        cap = m.get("capability", "unknown")
         backend = m.get("backend", "ollama")
-        if not v or v.get("weights_overhead_gb") is None:
-            if backend != "ollama":
-                hidden["non_ollama_unprobed"] += 1
-            else:
-                hidden["missing_coeffs"] += 1
-            continue
-        if cap != "structured":
-            if backend != "ollama":
-                hidden["non_ollama_unprobed"] += 1
-            else:
-                hidden["non_structured"] += 1
+        if backend != "ollama":
+            hidden["non_ollama_dormant"] += 1
             continue
         total, _ = _vram_at(v, _CONTEXT)
-        if total is None or total > _VRAM_BUDGET:
+        if total is None:
+            hidden["missing_vram"] += 1
+            continue
+        if total > _VRAM_BUDGET:
             hidden["over_budget"] += 1
             continue
         family = m.get("family") or "(uncategorized)"
@@ -545,16 +538,14 @@ def _build_menu(models: list[dict]) -> tuple[list[str], list[bool], list[dict | 
     if total_hidden:
         emit("", selectable_=False, model=None)
         bits: list[str] = []
-        if hidden["non_ollama_unprobed"]:
-            bits.append(f"{hidden['non_ollama_unprobed']} vLLM/SGLang (dormant)")
-        if hidden["non_structured"]:
-            bits.append(f"{hidden['non_structured']} non-structured")
-        if hidden["missing_coeffs"]:
-            bits.append(f"{hidden['missing_coeffs']} unprobed")
+        if hidden["non_ollama_dormant"]:
+            bits.append(f"{hidden['non_ollama_dormant']} vLLM/SGLang (dormant)")
+        if hidden["missing_vram"]:
+            bits.append(f"{hidden['missing_vram']} missing VRAM data")
         if hidden["over_budget"]:
             bits.append(f"{hidden['over_budget']} over VRAM budget")
         emit(f"  {_DIM}hidden: {', '.join(bits)}  ·  "
-             f"see docs/sidelined-backends.md{_RESET}",
+             f"see docs/ollama_models.md{_RESET}",
              selectable_=False, model=None)
 
     return lines, selectable, item_models
@@ -609,27 +600,15 @@ def _build(agent_id: str, model_name: str, backend: str) -> list[str]:
         os.environ["OPENAI_BASE_URL"] = base
         os.environ["OPENAI_API_KEY"] = "local"
         os.environ["OPENAI_MODEL"] = model_name
-        cmd = ["late"]
-        if model_name.startswith("Gemma-4-"):
-            cmd.append("--gemma-thinking")
-        return cmd
+        return ["late"]
 
     if agent_id == "interpreter":
-        # `/no_think` is a Qwen3 hint to skip <think>…</think> reasoning
-        # blocks (which OI doesn't render — content goes to reasoning_content).
-        # Harmless for non-Qwen models. We pass it as a system-prompt suffix
-        # so OI doesn't treat the prompt itself as a slash-command.
-        custom = "/no_think"
         if backend == "ollama":
-            return [
-                "interpreter", "--model", f"ollama/{model_name}",
-                "--custom_instructions", custom,
-            ]
+            return ["interpreter", "--model", f"ollama/{model_name}"]
         return [
             "interpreter", "--model", f"openai/{model_name}",
             "--api_base", f"{base}/v1",
             "--api_key", "local",
-            "--custom_instructions", custom,
         ]
 
     sys.exit(f"error: unknown agent '{agent_id}'")
@@ -673,7 +652,7 @@ def main() -> None:
         )
     header = (
         f"DevAI  ▸  Step 1/2: pick a model  "
-        f"(structured-reasoning · {_CONTEXT // 1024}K ctx · "
+        f"(Ollama · {_CONTEXT // 1024}K ctx · "
         f"≤ {_VRAM_BUDGET:g} GB)"
     )
     idx = _fzf(lines, header, selectable=selectable)

@@ -31,6 +31,7 @@
 //	NETWORK           Podman network name (default devai-net)
 //	GPU_MEMORY_GB     total GPU VRAM in GB for memory fraction calc (default 24)
 //	MAX_CONTEXT_LEN   default max context length in tokens (default 131072 = 128K)
+//	DEVAI_REASONING   reasoning policy: auto|off|low|medium|high (default auto)
 package main
 
 import (
@@ -110,11 +111,12 @@ type configModel struct {
 
 // configReasoning records what the runtime probe observed for this model.
 // Capability values (per docs/ollama_models.md):
-//   structured  – native API exposes a separate reasoning trace field
-//   inline      – reasoning appears inline (e.g. <think> blocks) only
-//   unsupported – no reasoning behavior observed
-//   unknown     – not yet probed (e.g. vLLM/SGLang models pre-probe)
-//   error       – probe failed (model load error, HTTP 4xx, etc.)
+//
+//	structured  – native API exposes a separate reasoning trace field
+//	inline      – reasoning appears inline (e.g. <think> blocks) only
+//	unsupported – no reasoning behavior observed
+//	unknown     – not yet probed (e.g. vLLM/SGLang models pre-probe)
+//	error       – probe failed (model load error, HTTP 4xx, etc.)
 //
 // DisableVerified is set only for `structured` capability and reports
 // whether sending the protocol's "off" field actually suppresses reasoning.
@@ -160,19 +162,19 @@ type backendState struct {
 }
 
 type arbiter struct {
-	backends         map[string]*backendState
-	mu               sync.Mutex
-	ollamaURL        *url.URL
-	podmanClient     *http.Client
-	idleTimeout      time.Duration
-	drainTimeout     time.Duration
-	modelSizes       map[string]float64 // model name → weight size in GB
-	modelContexts    map[string]int     // model name → declared max context (from models.yaml)
-	modelCapability  map[string]string  // model name → reasoning.capability
-	modelDisableOK   map[string]bool    // model name → disable_verified (only when present)
-	defaultPolicy    string             // DEVAI_REASONING env value: auto|off|low|medium|high
-	totalVRAMGB      float64
-	maxContextLen    int // global default from MAX_CONTEXT_LEN env (default 131072)
+	backends        map[string]*backendState
+	mu              sync.Mutex
+	ollamaURL       *url.URL
+	podmanClient    *http.Client
+	idleTimeout     time.Duration
+	drainTimeout    time.Duration
+	modelSizes      map[string]float64 // model name → weight size in GB
+	modelContexts   map[string]int     // model name → declared max context (from models.yaml)
+	modelCapability map[string]string  // model name → reasoning.capability
+	modelDisableOK  map[string]bool    // model name → disable_verified (only when present)
+	defaultPolicy   string             // DEVAI_REASONING env value: auto|off|low|medium|high
+	totalVRAMGB     float64
+	maxContextLen   int // global default from MAX_CONTEXT_LEN env (default 131072)
 }
 
 // --- Proxy factories ---
@@ -279,6 +281,7 @@ func memFraction(modelSizeGB, totalVRAMGB float64, backend string) float64 {
 //	≤ 12 GB →  ~160 KB/token  (9B class)
 //	≤ 20 GB →  ~256 KB/token  (14-27B class)
 //	> 20 GB →  ~400 KB/token  (35B+ class)
+//
 // fittableContext estimates the maximum context length that fits in the
 // available KV cache memory.  Both vLLM and SGLang store KV cache in BF16
 // regardless of weight quantization.
@@ -433,9 +436,8 @@ func main() {
 	// Build model size, context, and reasoning capability lookups from catalog.
 	// Reasoning capability comes from the runtime probe written by
 	// scripts/probe-ollama-reasoning.py. The arbiter applies the policy
-	// (DEVAI_REASONING env) per request to set the protocol's reasoning
-	// field — currently only the Ollama native `think:` field is wired;
-	// vLLM/SGLang are stubs.
+	// (DEVAI_REASONING env) per request using the protocol field for the
+	// incoming Ollama API path.
 	modelSizes := make(map[string]float64, len(cfg.Models))
 	modelContexts := make(map[string]int, len(cfg.Models))
 	modelCapability := make(map[string]string, len(cfg.Models))
@@ -797,7 +799,7 @@ func (a *arbiter) makeRequestHandler(backendName string) http.HandlerFunc {
 			modelName = parsed.Model
 
 			policy := a.requestPolicy(req)
-			body = a.applyReasoningPolicy(backendName, modelName, policy, body)
+			body = a.applyReasoningPolicy(backendName, req.URL.Path, modelName, policy, body)
 			req.Body = io.NopCloser(bytes.NewReader(body))
 			req.ContentLength = int64(len(body))
 			req.Header.Set("Content-Length", strconv.Itoa(len(body)))
@@ -838,74 +840,147 @@ func (a *arbiter) requestPolicy(req *http.Request) string {
 	return a.defaultPolicy
 }
 
+type reasoningAction int
+
+const (
+	reasoningNoop reasoningAction = iota
+	reasoningEnable
+	reasoningDisable
+)
+
 // applyReasoningPolicy rewrites the request body to carry the reasoning
-// directive expected by the target backend's native protocol. Per
-// docs/ollama_models.md: prefer protocol fields over prompt-text tricks.
-//
-// Currently wired:
-//   ollama → sets/clears `think: true|false` on /api/chat (and Ollama's
-//            OpenAI- and Anthropic-compat endpoints, which honour the
-//            same field).
-//
-// Stubbed (returns body unchanged) for vLLM/SGLang — those backends will
-// get their own protocol-specific implementations later (vLLM has
-// --reasoning-parser, Anthropic has thinking={type:enabled,budget_tokens}).
-func (a *arbiter) applyReasoningPolicy(backendName, modelName, policy string, body []byte) []byte {
-	switch backendName {
-	case "ollama":
-		return a.applyOllamaPolicy(modelName, policy, body)
+// directive expected by the incoming protocol path. Per docs/ollama_models.md:
+// prefer protocol fields over prompt-text tricks.
+func (a *arbiter) applyReasoningPolicy(backendName, path, modelName, policy string, body []byte) []byte {
+	if backendName != "ollama" {
+		// vLLM/SGLang are dormant and need separate probe/policy recipes.
+		return body
+	}
+
+	switch strings.TrimRight(path, "/") {
+	case "/api/chat", "/api/generate":
+		return a.applyOllamaNativePolicy(modelName, policy, body)
+	case "/v1/chat/completions":
+		return a.applyOllamaOpenAIChatPolicy(modelName, policy, body)
+	case "/v1/messages":
+		return a.applyOllamaAnthropicMessagesPolicy(modelName, policy, body)
 	default:
-		// vLLM/SGLang: TODO. Body forwarded unchanged.
 		return body
 	}
 }
 
-// applyOllamaPolicy injects the native `think` field according to the
+func (a *arbiter) reasoningAction(modelName, policy string) reasoningAction {
+	if a.modelCapability[modelName] != "structured" {
+		return reasoningNoop
+	}
+	switch policy {
+	case "auto", "low", "medium", "high":
+		return reasoningEnable
+	case "off":
+		if a.modelDisableOK[modelName] {
+			return reasoningDisable
+		}
+	}
+	return reasoningNoop
+}
+
+// applyOllamaNativePolicy injects the native `think` field according to the
 // (capability, policy) matrix. Ollama's `think` is boolean; effort levels
 // (low/medium/high) all collapse to true.
 //
-//   capability  | policy   | think field
-//   structured  | auto/L/M/H | true
-//   structured  | off (disable_verified) | false
-//   structured  | off (not verified) | (not set — avoid surprising client)
-//   inline/unsupported/error | any | (not set — no reliable way to control)
-//   unknown     | any      | (not set — let backend decide)
+//	capability  | policy   | think field
+//	structured  | auto/L/M/H | true
+//	structured  | off (disable_verified) | false
+//	structured  | off (not verified) | (not set — avoid surprising client)
+//	inline/unsupported/error | any | (not set — no reliable way to control)
+//	unknown     | any      | (not set — let backend decide)
 //
 // Client-supplied `think` always wins; we never override it.
-func (a *arbiter) applyOllamaPolicy(modelName, policy string, body []byte) []byte {
-	cap := a.modelCapability[modelName]
-	if cap != "structured" {
+func (a *arbiter) applyOllamaNativePolicy(modelName, policy string, body []byte) []byte {
+	switch a.reasoningAction(modelName, policy) {
+	case reasoningEnable:
+		return setJSONFieldIfAbsent(body, []string{"think"}, "think", true)
+	case reasoningDisable:
+		return setJSONFieldIfAbsent(body, []string{"think"}, "think", false)
+	default:
 		return body
 	}
+}
 
-	var setThink *bool
+func (a *arbiter) applyOllamaOpenAIChatPolicy(modelName, policy string, body []byte) []byte {
+	switch a.reasoningAction(modelName, policy) {
+	case reasoningEnable:
+		return setJSONFieldIfAbsent(
+			body,
+			[]string{"reasoning_effort", "reasoning"},
+			"reasoning_effort",
+			openAIReasoningEffort(policy),
+		)
+	case reasoningDisable:
+		return setJSONFieldIfAbsent(
+			body,
+			[]string{"reasoning_effort", "reasoning"},
+			"reasoning_effort",
+			"none",
+		)
+	default:
+		return body
+	}
+}
+
+func (a *arbiter) applyOllamaAnthropicMessagesPolicy(modelName, policy string, body []byte) []byte {
+	switch a.reasoningAction(modelName, policy) {
+	case reasoningEnable:
+		return setJSONFieldIfAbsent(
+			body,
+			[]string{"thinking"},
+			"thinking",
+			map[string]any{
+				"type":          "enabled",
+				"budget_tokens": anthropicThinkingBudget(policy),
+			},
+		)
+	default:
+		// docs/ollama_models.md defines off_request as {}; nothing to inject.
+		return body
+	}
+}
+
+func openAIReasoningEffort(policy string) string {
 	switch policy {
-	case "auto", "low", "medium", "high":
-		t := true
-		setThink = &t
-	case "off":
-		if a.modelDisableOK[modelName] {
-			f := false
-			setThink = &f
-		}
+	case "low", "high":
+		return policy
+	default:
+		return "medium"
 	}
-	if setThink == nil {
-		return body
-	}
+}
 
+func anthropicThinkingBudget(policy string) int {
+	switch policy {
+	case "low":
+		return 1024
+	case "high":
+		return 4096
+	default:
+		return 2048
+	}
+}
+
+func setJSONFieldIfAbsent(body []byte, existingKeys []string, setKey string, value any) []byte {
 	var raw map[string]json.RawMessage
 	if json.Unmarshal(body, &raw) != nil {
 		return body
 	}
-	if _, exists := raw["think"]; exists {
-		// Client-supplied — respect it.
-		return body
+	for _, key := range existingKeys {
+		if _, exists := raw[key]; exists {
+			return body
+		}
 	}
-	v, err := encodeJSON(*setThink)
+	v, err := encodeJSON(value)
 	if err != nil {
 		return body
 	}
-	raw["think"] = v
+	raw[setKey] = v
 	out, err := encodeJSON(raw)
 	if err != nil {
 		return body
@@ -931,8 +1006,8 @@ func (a *arbiter) makeModelsHandler(backendName string) http.HandlerFunc {
 		bs := a.backends[backendName]
 
 		type model struct {
-			ID       string `json:"id"`
-			Object   string `json:"object"`
+			ID      string `json:"id"`
+			Object  string `json:"object"`
 			OwnedBy string `json:"owned_by"`
 		}
 		type modelList struct {
