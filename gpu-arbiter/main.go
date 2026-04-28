@@ -925,7 +925,27 @@ func (a *arbiter) makeRequestHandler(backendName string) http.HandlerFunc {
 				Model string `json:"model"`
 			}
 			json.Unmarshal(body, &parsed)
-			modelName = parsed.Model
+
+			// Resolve the per-request num_ctx and strip any "@<int>"
+			// suffix from the model name. Override priority:
+			//   1. Picker-supplied @<int>  → force-injected (user choice).
+			//   2. Registered modelContexts cap (= min(model_max,
+			//      MAX_CONTEXT_LEN) from the probe cache) → soft cap,
+			//      only set when the client didn't supply num_ctx.
+			//   3. None → request passes through unchanged.
+			cleanName, override := parseCtxOverride(parsed.Model)
+			numCtx := override
+			force := override > 0
+			if numCtx == 0 {
+				if cap, ok := a.modelContexts[cleanName]; ok && cap > 0 {
+					numCtx = cap
+				}
+			}
+			if cleanName != parsed.Model {
+				body = setTopJSONField(body, "model", cleanName)
+			}
+			body = setNumCtx(body, numCtx, force)
+			modelName = cleanName
 
 			policy := a.requestPolicy(req)
 			body = a.applyReasoningPolicy(backendName, req.URL.Path, modelName, policy, body)
@@ -1093,6 +1113,90 @@ func anthropicThinkingBudget(policy string) int {
 	default:
 		return 2048
 	}
+}
+
+// parseCtxOverride extracts a "<name>@<int>" suffix carrying an explicit
+// num_ctx override. The picker appends this for every agent so the
+// chosen tier is enforced regardless of which client (Claude Code,
+// Aider, Codex, Open Interpreter, LATE, …) sends the request — no
+// custom HTTP headers required, just the model name string. Returns
+// the clean name and the override (0 when no suffix is present).
+func parseCtxOverride(name string) (clean string, override int) {
+	at := strings.LastIndex(name, "@")
+	if at < 0 {
+		return name, 0
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(name[at+1:]))
+	if err != nil || n <= 0 {
+		return name, 0
+	}
+	return name[:at], n
+}
+
+// setTopJSONField overwrites a top-level field unconditionally (no
+// "if absent" gate). Used to rewrite the request's `model` field to
+// the clean name before forwarding to the backend.
+func setTopJSONField(body []byte, key string, value any) []byte {
+	var raw map[string]json.RawMessage
+	if json.Unmarshal(body, &raw) != nil {
+		return body
+	}
+	v, err := encodeJSON(value)
+	if err != nil {
+		return body
+	}
+	raw[key] = v
+	out, err := encodeJSON(raw)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// setNumCtx injects/overrides options.num_ctx in any of the wire
+// protocols Ollama accepts. `force=true` (picker @suffix override)
+// replaces any existing value; `force=false` (registered modelContexts
+// cap as a soft fallback) only sets when the client didn't.
+//
+// Ollama's /api/chat, /api/generate, /v1/chat/completions, and
+// /v1/messages all honour `options.num_ctx` in the request body —
+// the OpenAI- and Anthropic-compat layers pass extra fields through.
+func setNumCtx(body []byte, numCtx int, force bool) []byte {
+	if numCtx <= 0 {
+		return body
+	}
+	var doc map[string]json.RawMessage
+	if json.Unmarshal(body, &doc) != nil {
+		return body
+	}
+	var opts map[string]json.RawMessage
+	if rawOpts, ok := doc["options"]; ok {
+		if json.Unmarshal(rawOpts, &opts) != nil {
+			opts = map[string]json.RawMessage{}
+		}
+	} else {
+		opts = map[string]json.RawMessage{}
+	}
+	if !force {
+		if _, exists := opts["num_ctx"]; exists {
+			return body
+		}
+	}
+	v, err := encodeJSON(numCtx)
+	if err != nil {
+		return body
+	}
+	opts["num_ctx"] = v
+	encOpts, err := encodeJSON(opts)
+	if err != nil {
+		return body
+	}
+	doc["options"] = encOpts
+	out, err := encodeJSON(doc)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 func setJSONFieldIfAbsent(body []byte, existingKeys []string, setKey string, value any) []byte {

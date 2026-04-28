@@ -257,7 +257,12 @@ def _discover_models() -> list[dict]:
     probes = _load_probe_records()
     out: list[dict] = []
 
-    # Ollama: <library>/<tag> manifest files
+    # Ollama: <library>/<tag> manifest files. Skip ctx-variant derived
+    # tags — they're a per-session artefact created by the picker via
+    # Modelfile to bake `num_ctx` in. The user picks the parent; the
+    # picker materialises the variant on launch.
+    import re as _re
+    _ctx_tag = _re.compile(r"-ctx\d+$")
     base = Path(_OLLAMA_MANIFESTS)
     if base.is_dir():
         for lib_dir in sorted(base.iterdir()):
@@ -265,6 +270,8 @@ def _discover_models() -> list[dict]:
                 continue
             for tag_file in sorted(lib_dir.iterdir()):
                 if not tag_file.is_file():
+                    continue
+                if _ctx_tag.search(tag_file.name):
                     continue
                 name = f"{lib_dir.name}:{tag_file.name}"
                 meta = catalog.get(name, {})
@@ -777,9 +784,87 @@ def _format_agent_row(agent: tuple[str, str, str]) -> str:
 
 # ── Command builder ──────────────────────────────────────────────────────────
 
+def _ensure_ctx_variant(parent: str, ctx: int) -> str:
+    """Materialise a Modelfile-derived Ollama tag with `PARAMETER num_ctx <ctx>`
+    baked in, return its name.
+
+    Background: Ollama 0.21+ honours `options.num_ctx` only on its native
+    /api/chat path. The OpenAI-compat (/v1/chat/completions) and Anthropic-
+    compat (/v1/messages) layers silently ignore the field — they read
+    only the model's baked-in defaults. Claude Code, Open Interpreter,
+    LATE, and OpenAI-compatible Aider modes all hit those paths.
+
+    The fix is to encode the chosen num_ctx into a derived model whose
+    Modelfile carries `PARAMETER num_ctx <ctx>`. Layers (weights) are
+    shared with the parent — only the manifest differs (~1 KB).
+
+    Naming: `<parent>-ctx<N>` (e.g. `qwen3.5:9b-q8_0-ctx32768`). The
+    suffix is recognised by probe-ollama-reasoning.py and the picker so
+    these derived tags don't pollute the menu.
+
+    Idempotent: if the derived tag already exists in /api/tags, reuse it.
+    """
+    import urllib.error
+    import urllib.request
+
+    if ":" in parent:
+        lib, tag = parent.split(":", 1)
+        derived = f"{lib}:{tag}-ctx{ctx}"
+    else:
+        derived = f"{parent}-ctx{ctx}"
+
+    ollama_url = os.environ.get("OLLAMA_HOST", "http://devai-ollama:11434")
+
+    # Existence check via /api/show (POST {"name": "..."}).
+    show_body = json.dumps({"name": derived}).encode("utf-8")
+    show_req = urllib.request.Request(
+        f"{ollama_url}/api/show",
+        data=show_body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(show_req, timeout=5) as resp:
+            if resp.status == 200:
+                return derived
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            raise
+    except urllib.error.URLError as e:
+        sys.exit(f"error: cannot reach ollama at {ollama_url}: {e}")
+
+    # Create the derived tag. /api/create accepts a JSON body with the
+    # Modelfile content. The call blocks until creation completes; status
+    # comes back as a stream of progress events — we drain to EOF and
+    # check the final HTTP code.
+    # Ollama 0.21+ deprecated the `modelfile` string field on /api/create;
+    # the structured form is {model, from, parameters}.
+    create_body = json.dumps({
+        "model": derived,
+        "from": parent,
+        "parameters": {"num_ctx": ctx},
+    }).encode("utf-8")
+    create_req = urllib.request.Request(
+        f"{ollama_url}/api/create",
+        data=create_body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(create_req, timeout=120) as resp:
+            for _line in resp:  # drain progress stream
+                pass
+    except urllib.error.HTTPError as e:
+        sys.exit(f"error: ollama /api/create {derived} failed: HTTP {e.code} {e.reason}")
+    except urllib.error.URLError as e:
+        sys.exit(f"error: ollama /api/create {derived} failed: {e}")
+    return derived
+
+
 def _build(agent_id: str, model_name: str, backend: str) -> list[str]:
     _, _, port = _BACKENDS[backend]
     base = f"http://{_ROUTER}:{port}"
+    name = model_name
 
     if agent_id == "claude":
         # Claude Code only knows the Anthropic API. Both Ollama (0.21+) and
@@ -788,13 +873,13 @@ def _build(agent_id: str, model_name: str, backend: str) -> list[str]:
         # backend ignores auth: claude refuses to dispatch otherwise.
         os.environ["ANTHROPIC_BASE_URL"] = base
         os.environ.setdefault("ANTHROPIC_AUTH_TOKEN", "local")
-        return ["claude", "--model", model_name]
+        return ["claude", "--model", name]
 
     if agent_id == "aider":
         if backend == "ollama":
-            return ["aider", "--model", f"ollama_chat/{model_name}"]
+            return ["aider", "--model", f"ollama_chat/{name}"]
         return [
-            "aider", "--model", f"openai/{model_name}",
+            "aider", "--model", f"openai/{name}",
             "--openai-api-base", f"{base}/v1",
             "--openai-api-key", "local",
         ]
@@ -810,7 +895,7 @@ def _build(agent_id: str, model_name: str, backend: str) -> list[str]:
             "codex",
             "--oss",
             "--local-provider", f"router-{backend}",
-            "-c", f'model="{model_name}"',
+            "-c", f'model="{name}"',
         ]
 
     if agent_id == "late":
@@ -818,14 +903,14 @@ def _build(agent_id: str, model_name: str, backend: str) -> list[str]:
         # NOT end in `/v1` or requests go to /v1/v1/... → HTTP 404.
         os.environ["OPENAI_BASE_URL"] = base
         os.environ["OPENAI_API_KEY"] = "local"
-        os.environ["OPENAI_MODEL"] = model_name
+        os.environ["OPENAI_MODEL"] = name
         return ["late"]
 
     if agent_id == "interpreter":
         if backend == "ollama":
-            return ["interpreter", "--model", f"ollama/{model_name}"]
+            return ["interpreter", "--model", f"ollama/{name}"]
         return [
-            "interpreter", "--model", f"openai/{model_name}",
+            "interpreter", "--model", f"openai/{name}",
             "--api_base", f"{base}/v1",
             "--api_key", "local",
         ]
@@ -906,7 +991,16 @@ def main() -> None:
             os.execvp("bash", ["bash"])
         agent = _AGENTS[idx]
 
-    cmd = _build(agent[0], model["name"], model["backend"])
+    # For Ollama-backed models, materialise a Modelfile-derived tag with
+    # the chosen num_ctx baked in. Hands the derived name to the agent;
+    # all wire protocols (Anthropic /v1/messages, OpenAI /v1/chat/completions,
+    # Ollama /api/chat) then pick up the right context automatically.
+    if model["backend"] == "ollama":
+        serving_name = _ensure_ctx_variant(model["name"], selected_context)
+    else:
+        serving_name = model["name"]
+
+    cmd = _build(agent[0], serving_name, model["backend"])
     print(
         f"\n  {_BOLD}{agent[0]}{_RESET}"
         f" → {model['name']} @ {_context_label(selected_context)}"

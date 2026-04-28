@@ -79,6 +79,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -120,18 +121,29 @@ def _http_get(url: str, timeout: float) -> dict:
 
 # ── Live model lookups (/api/tags, /api/show, /api/ps) ───────────────────────
 
+_CTX_VARIANT_RE = re.compile(r"-ctx\d+$")
+
+
 def list_models(ollama_url: str, timeout: float) -> list[dict]:
-    """Return [{name, digest, modified_at, size}, ...] from /api/tags."""
+    """Return [{name, digest, modified_at, size}, ...] from /api/tags.
+
+    Skips picker-materialised "<parent>-ctx<N>" derived tags — they exist
+    only to bake a per-session num_ctx into Ollama's load defaults and
+    share their digest with the parent (so probing them adds nothing).
+    """
     data = _http_get(f"{ollama_url}/api/tags", timeout)
-    return [
-        {
-            "name": m.get("name", ""),
+    out = []
+    for m in data.get("models", []) or []:
+        name = m.get("name", "")
+        if not name or _CTX_VARIANT_RE.search(name):
+            continue
+        out.append({
+            "name": name,
             "digest": (m.get("digest") or "")[:32],
             "modified_at": m.get("modified_at", ""),
             "size": m.get("size", 0),
-        }
-        for m in data.get("models", []) or []
-    ]
+        })
+    return out
 
 
 def measure_arch(ollama_url: str, model_name: str, timeout: float) -> dict:
