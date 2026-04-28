@@ -495,6 +495,7 @@ setup-logs: ## One-time: create dedicated 100G LV at /var/cache/devai/logs (requ
 	@$(MAKE) cache-down
 	@echo
 	sudo SIZE=$${SIZE:-100G} VG=$${VG:-vgais} LV=$${LV:-cache_logs} \
+	     POOL=$${POOL:-cachepool} RECREATE=$${RECREATE:-0} \
 	  deploy/setup-logs-volume.sh
 	@echo
 	@echo "Next: run 'make cache-up' to start services on the new logs volume."

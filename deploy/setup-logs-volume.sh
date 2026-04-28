@@ -23,9 +23,11 @@ set -euo pipefail
 
 VG="${VG:-vgais}"
 LV="${LV:-cache_logs}"
-SIZE="${SIZE:-100G}"
+SIZE="${SIZE:-100G}"           # virtual size for the thin LV
+POOL="${POOL:-cachepool}"      # thin pool name in $VG
 MOUNTPOINT="${MOUNTPOINT:-/var/cache/devai/logs}"
 DEVICE="/dev/${VG}/${LV}"
+RECREATE="${RECREATE:-0}"      # 1 → unmount + lvremove existing, then recreate fresh
 
 if [[ "$EUID" -ne 0 ]]; then
     echo "error: must run as root (use sudo)" >&2
@@ -49,19 +51,60 @@ echo "    logical volume: $LV"
 echo "    size:           $SIZE"
 echo "    mountpoint:     $MOUNTPOINT"
 echo "    owner:          ${OWNER_UID}:${OWNER_GID}"
+echo "    recreate:       $RECREATE"
+
+# ── Optional clean slate ────────────────────────────────────────────────────
+# RECREATE=1 wipes any pre-existing logs LV (e.g. a thick LV from an
+# earlier setup attempt) before creating the thin one. Safe to run on a
+# fresh host — every step is guarded by an existence check.
+if [[ "$RECREATE" == "1" ]]; then
+    echo "==> RECREATE=1: removing any existing $MOUNTPOINT mount, fstab"
+    echo "    entry, and ${VG}/${LV} logical volume."
+    # Use exact-path mount check, not findmnt --target (which walks up
+    # to the root filesystem and always matches on a non-mountpoint).
+    if mountpoint -q "$MOUNTPOINT" 2>/dev/null; then
+        umount "$MOUNTPOINT" || true
+    fi
+    # Strip any old fstab entries for this mountpoint or device.
+    if grep -qE "(\\s${MOUNTPOINT}\\s|^${DEVICE}\\s|UUID=[^[:space:]]+\\s+${MOUNTPOINT}\\s)" /etc/fstab 2>/dev/null; then
+        cp -f /etc/fstab "/etc/fstab.bak.$(date -u +%Y%m%dT%H%M%SZ)"
+        sed -i.tmp -e "\#\\s${MOUNTPOINT}\\s#d" \
+                   -e "\#${DEVICE}\\s#d" \
+                   /etc/fstab
+        rm -f /etc/fstab.tmp
+    fi
+    if lvs "${VG}/${LV}" >/dev/null 2>&1; then
+        lvremove -f "${VG}/${LV}"
+    fi
+    if [[ -d "$MOUNTPOINT" ]]; then
+        rm -rf "$MOUNTPOINT"
+    fi
+fi
 
 # ── Sanity: is anything still using $MOUNTPOINT? ────────────────────────────
-if findmnt --target "$MOUNTPOINT" --types xfs >/dev/null 2>&1 \
-   && [[ "$(findmnt -no SOURCE --target "$MOUNTPOINT")" == "$DEVICE" ]]; then
+# Use `mountpoint -q` for an EXACT path match. `findmnt --target` walks
+# up the path looking for any enclosing mount (e.g. "/"), which gave
+# false positives when /var/cache/devai/logs wasn't a mountpoint yet.
+if mountpoint -q "$MOUNTPOINT" \
+   && [[ "$(findmnt -no SOURCE --mountpoint "$MOUNTPOINT")" == "$DEVICE" ]]; then
     echo "==> $MOUNTPOINT already mounted from $DEVICE — skipping create/format/mount"
     SKIP_CREATE=1
 else
     SKIP_CREATE=0
-    if [[ -d "$MOUNTPOINT" ]] \
-       && fuser -mv "$MOUNTPOINT" 2>/dev/null | grep -q .; then
-        echo "error: $MOUNTPOINT is in use by another process" >&2
-        echo "       run 'make cache-down' first, then re-run this script." >&2
-        exit 1
+    # Defend against running while a process holds files OPEN inside
+    # $MOUNTPOINT — those would silently keep writing to the pre-mount
+    # inode after we mount over them. We probe with `lsof +D` (recurses
+    # into the directory). `fuser -mv` was wrong here: -m treats the
+    # argument as a mount point and flags every process using the
+    # ENCLOSING filesystem (root /), which always trips.
+    if [[ -d "$MOUNTPOINT" ]] && command -v lsof >/dev/null 2>&1; then
+        in_use="$(lsof +D "$MOUNTPOINT" 2>/dev/null | tail -n +2 || true)"
+        if [[ -n "$in_use" ]]; then
+            echo "error: $MOUNTPOINT has files open by:" >&2
+            echo "$in_use" | head -5 >&2
+            echo "       run 'make cache-down' first, then re-run this script." >&2
+            exit 1
+        fi
     fi
 fi
 
@@ -72,22 +115,58 @@ if ! vgs --noheadings -o vg_name 2>/dev/null | grep -q "^[[:space:]]*${VG}\$"; t
     exit 1
 fi
 
-# ── Create LV (idempotent) ──────────────────────────────────────────────────
+# ── Locate or validate the thin pool ────────────────────────────────────────
+# The new LV must be a thin volume inside a thin pool. Detect the pool by
+# segtype=thin-pool; require POOL= if the VG has more than one.
+POOLS_RAW="$(lvs --noheadings -o lv_name,segtype "$VG" 2>/dev/null \
+             | awk '$2 == "thin-pool" { print $1 }')"
+mapfile -t POOLS < <(echo "$POOLS_RAW")
+# Strip empty entries that mapfile leaves behind on empty input.
+POOLS_NONEMPTY=()
+for p in "${POOLS[@]}"; do
+    [[ -n "$p" ]] && POOLS_NONEMPTY+=("$p")
+done
+
+if [[ -n "$POOL" ]]; then
+    found=0
+    for p in "${POOLS_NONEMPTY[@]}"; do
+        [[ "$p" == "$POOL" ]] && found=1 && break
+    done
+    if [[ "$found" -ne 1 ]]; then
+        echo "error: thin pool '$POOL' not found in VG '$VG'" >&2
+        echo "       available pools: ${POOLS_NONEMPTY[*]:-<none>}" >&2
+        exit 1
+    fi
+elif [[ "${#POOLS_NONEMPTY[@]}" -eq 0 ]]; then
+    echo "error: VG '$VG' has no thin pool" >&2
+    echo "       create one first, e.g.:" >&2
+    echo "         sudo lvcreate -L <size> --thinpool <name> $VG" >&2
+    exit 1
+elif [[ "${#POOLS_NONEMPTY[@]}" -gt 1 ]]; then
+    echo "error: VG '$VG' has multiple thin pools: ${POOLS_NONEMPTY[*]}" >&2
+    echo "       set POOL=<name> to choose one" >&2
+    exit 1
+else
+    POOL="${POOLS_NONEMPTY[0]}"
+fi
+echo "==> thin pool: ${VG}/${POOL}"
+
+# ── Create thin LV (idempotent) ─────────────────────────────────────────────
 if [[ "$SKIP_CREATE" -eq 0 ]]; then
     if lvs "${VG}/${LV}" >/dev/null 2>&1; then
-        echo "==> ${VG}/${LV} already exists — reusing"
-    else
-        # Check free space.
-        FREE_BYTES="$(vgs --noheadings -o vg_free --units b "$VG" \
-                      | tr -d ' B')"
-        REQ_BYTES="$(numfmt --from=iec "$SIZE")"
-        if [[ "$FREE_BYTES" -lt "$REQ_BYTES" ]]; then
-            FREE_HUMAN="$(numfmt --to=iec --suffix=B "$FREE_BYTES")"
-            echo "error: VG '$VG' has only $FREE_HUMAN free, need $SIZE" >&2
+        # Verify it's a thin LV in our chosen pool.
+        existing_pool="$(lvs --noheadings -o pool_lv "${VG}/${LV}" \
+                         | tr -d ' ')"
+        if [[ "$existing_pool" != "$POOL" ]]; then
+            echo "error: ${VG}/${LV} exists but is not in pool '$POOL'" >&2
+            echo "       segtype/pool: $(lvs --noheadings -o segtype,pool_lv "${VG}/${LV}")" >&2
+            echo "       remove it first or set POOL=$existing_pool to reuse." >&2
             exit 1
         fi
-        echo "==> creating ${VG}/${LV} (${SIZE})"
-        lvcreate -L "$SIZE" -n "$LV" "$VG"
+        echo "==> ${VG}/${LV} already exists in thin pool '$POOL' — reusing"
+    else
+        echo "==> creating thin LV ${VG}/${LV} (virtual size ${SIZE}) in pool '$POOL'"
+        lvcreate --thin --virtualsize "$SIZE" --name "$LV" "${VG}/${POOL}"
     fi
 
     # Format if no existing filesystem.
@@ -122,8 +201,16 @@ echo "==> /etc/fstab updated"
 # ── Mount it now ────────────────────────────────────────────────────────────
 mkdir -p "$MOUNTPOINT"
 
-if findmnt --target "$MOUNTPOINT" --types xfs >/dev/null 2>&1; then
-    echo "==> $MOUNTPOINT already mounted"
+# Exact-path mount check — see above note on findmnt --target gotcha.
+if mountpoint -q "$MOUNTPOINT"; then
+    src="$(findmnt -no SOURCE --mountpoint "$MOUNTPOINT")"
+    if [[ "$src" == "$DEVICE" ]]; then
+        echo "==> $MOUNTPOINT already mounted from $DEVICE"
+    else
+        echo "error: $MOUNTPOINT is mounted from $src, not $DEVICE" >&2
+        echo "       unmount it first or set RECREATE=1." >&2
+        exit 1
+    fi
 else
     # Wipe whatever was previously sitting at $MOUNTPOINT before the new
     # filesystem hides it. We're explicitly asked to remove old logs.
