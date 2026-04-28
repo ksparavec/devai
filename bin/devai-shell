@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+# devai-shell — start a devai lab container with the *current directory*
+# mounted as the working dir, dropping straight into the agent picker.
+#
+# Standalone: no Make required. Reads only environment variables, finds
+# the repo's probe cache via this script's own location, and works from
+# any directory on the host so you can use it as a per-project shell agent.
+#
+# Usage:
+#     devai-shell                     # GPU lab (default)
+#     devai-shell --gpu               # explicit GPU
+#     devai-shell --cpu               # CPU lab
+#
+# Environment overrides (defaults shown):
+#     CONTAINER_RUNTIME=podman        podman or docker
+#     GPU_MEMORY_GB=24                advertised VRAM ceiling in the picker
+#     MAX_CONTEXT_LEN=131072          default context cap if CONTEXT unset
+#     CONTEXT=<int>                   per-call context override (tokens)
+#     VRAM=<int>                      per-call VRAM override (GB)
+#     HOME_VOLUME=$HOME/devai-home    persistent in-container home
+#     HTTP_PROXY / HTTPS_PROXY / NO_PROXY    forwarded to the container
+#
+# Prerequisites (run once from the repo):
+#     make build-gpu          # or build-cpu
+#     make cache-up           # creates devai-net + Ollama backend
+
+set -euo pipefail
+
+# ── Argument parsing ────────────────────────────────────────────────────────
+mode=gpu
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --gpu)        mode=gpu;  shift ;;
+        --cpu)        mode=cpu;  shift ;;
+        -h|--help)
+            sed -n '2,/^$/p' "$0" | sed -E 's/^# ?//'
+            exit 0
+            ;;
+        --)           shift; break ;;
+        -*)
+            echo "devai-shell: unknown option '$1'" >&2
+            echo "             try 'devai-shell --help'" >&2
+            exit 2
+            ;;
+        *)
+            echo "devai-shell: unexpected argument '$1'" >&2
+            exit 2
+            ;;
+    esac
+done
+
+# ── Resolve repo root (script lives at <repo>/bin/devai-shell) ─────────────
+script_path=$(readlink -f "${BASH_SOURCE[0]}")
+repo_root=$(cd "$(dirname "$script_path")/.." && pwd)
+
+# Working directory follows the user's pwd, NOT repo_root.
+work_dir=$(pwd)
+
+# ── Settings (env or default) ───────────────────────────────────────────────
+container_runtime=${CONTAINER_RUNTIME:-podman}
+gpu_mem=${GPU_MEMORY_GB:-24}
+max_ctx=${MAX_CONTEXT_LEN:-131072}
+home_volume=${HOME_VOLUME:-$HOME/devai-home}
+
+container_user=devai
+network=devai-net
+cache_dir=/var/cache/devai
+ollama_host=http://devai-router:11434
+ollama_default_model=qwen3.5:9b-q8_0
+
+if [[ $mode == gpu ]]; then
+    image=devai-lab-gpu
+    if [[ $container_runtime == *podman* ]]; then
+        gpu_flags=(--device nvidia.com/gpu=all --security-opt=label=disable)
+    else
+        gpu_flags=(--gpus all)
+    fi
+else
+    image=devai-lab-cpu
+    gpu_flags=()
+fi
+
+# ── Pre-flight checks ───────────────────────────────────────────────────────
+if ! command -v "$container_runtime" >/dev/null 2>&1; then
+    echo "devai-shell: '$container_runtime' not on PATH" >&2
+    exit 1
+fi
+
+if ! "$container_runtime" image inspect "$image" >/dev/null 2>&1; then
+    echo "devai-shell: image '$image' not found" >&2
+    echo "             cd $repo_root && make build-$mode" >&2
+    exit 1
+fi
+
+if ! "$container_runtime" network inspect "$network" >/dev/null 2>&1; then
+    echo "devai-shell: network '$network' not found" >&2
+    echo "             cd $repo_root && make cache-up" >&2
+    exit 1
+fi
+
+mkdir -p "$home_volume"
+
+# ── Optional read-only mounts (skip silently if absent) ─────────────────────
+optional_mounts=()
+
+# Host gitconfig and ssh, copied by entrypoint.sh from /tmp/host-config/
+[[ -f $HOME/.gitconfig ]] && \
+    optional_mounts+=(-v "$HOME/.gitconfig:/tmp/host-config/.gitconfig:ro")
+[[ -d $HOME/.ssh ]] && \
+    optional_mounts+=(-v "$HOME/.ssh:/tmp/host-config/.ssh:ro")
+
+# Read-only model cache so the picker can do disk-based "is downloaded?" checks
+[[ -d $cache_dir/ollama ]] && \
+    optional_mounts+=(-v "$cache_dir/ollama:/var/cache/devai/ollama:ro")
+
+# Probe cache (router and picker source of truth for fit data)
+probe_cache="$repo_root/deploy/.ollama-reasoning-cache.json"
+[[ -f $probe_cache ]] && \
+    optional_mounts+=(-v "$probe_cache:/etc/devai/.ollama-reasoning-cache.json:ro")
+
+# ── Proxy env (only forward when set in the host shell) ─────────────────────
+proxy_env=()
+for var in HTTP_PROXY HTTPS_PROXY NO_PROXY; do
+    val=${!var:-}
+    if [[ -n $val ]]; then
+        proxy_env+=(-e "$var=$val" -e "${var,,}=$val")
+    fi
+done
+
+# ── User/group remap (docker only — rootless podman maps root → host user) ──
+user_env=()
+if [[ $container_runtime != *podman* ]]; then
+    user_env+=(-e "USER_ID=$(id -u)" -e "GROUP_ID=$(id -g)")
+fi
+
+# ── Run ─────────────────────────────────────────────────────────────────────
+# No --name: ephemeral (--rm) container, runtime can autogenerate so multiple
+# concurrent terminals don't collide.
+exec "$container_runtime" run -it --rm \
+    "${gpu_flags[@]}" \
+    --network "$network" \
+    --add-host=host.containers.internal:host-gateway \
+    "${proxy_env[@]}" \
+    -e "OLLAMA_HOST=$ollama_host" \
+    -e "OLLAMA_DEFAULT_MODEL=$ollama_default_model" \
+    -e "CONTEXT=${CONTEXT:-$max_ctx}" \
+    -e "VRAM=${VRAM:-$gpu_mem}" \
+    "${user_env[@]}" \
+    -e "CONTAINER_USER=$container_user" \
+    -v "$home_volume:/home/$container_user" \
+    "${optional_mounts[@]}" \
+    -v "$work_dir:/home/$container_user/work" \
+    "$image" agent-picker

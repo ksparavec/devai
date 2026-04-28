@@ -92,12 +92,35 @@ make model-fit VRAM=16 CONTEXT=32768          # query a different (VRAM, ctx)
 ```bash
 make lab-gpu         # Start JupyterLab with GPU (or make lab-cpu)
 # OR
-make shell-gpu       # Drop straight into the model picker
+make shell-gpu       # Drop straight into the model picker (cwd = repo)
+# OR (per-project shell agent — works from anywhere on the host)
+bin/devai-shell      # GPU lab with $(pwd) mounted as /home/devai/work
 ```
 
 Access:
 - **JupyterLab**: `https://<HOST_IP>:8888`
 - **Open WebUI**: `https://<HOST_IP>:8443`
+
+### `devai-shell` — standalone shell agent
+
+`bin/devai-shell` is the same lab container as `make shell-gpu` but
+without Make. It mounts the **current** working directory (not the
+repo root) as `/home/devai/work`, so you can drop it on your `PATH`
+and use it as a per-project shell agent:
+
+```bash
+ln -s "$(pwd)/bin/devai-shell" ~/.local/bin/devai-shell    # one-time
+
+cd ~/projects/my-app && devai-shell           # picker, then shell with my-app/ at $PWD
+cd ~/projects/other-repo && devai-shell --cpu # CPU lab from another project
+CONTEXT=32768 VRAM=16 devai-shell             # per-call overrides
+```
+
+It still finds the repo's probe cache via its own location, so the
+picker sees the latest fit data regardless of where it was invoked.
+Prerequisites: `make build-{cpu,gpu}` and `make cache-up` once from
+the repo (`devai-shell` prints an actionable message if either is
+missing).
 
 ## Architecture
 
@@ -417,6 +440,7 @@ sudo xfs_growfs /var/cache/devai/ollama
 ```
 .env                              — Host/runtime configuration
 .env.example                      — Configuration template
+bin/devai-shell                   — Standalone shell-agent launcher (no Make required)
 deploy/
   models.yaml                     — Generated catalog (ollama + hf + gguf rows)
   .ollama-reasoning-cache.json    — Probe cache (schema v3, digest-keyed,

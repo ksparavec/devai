@@ -20,8 +20,10 @@ make build           # Build all (CPU + GPU + router)
 # Run
 make lab-gpu         # Run JupyterLab with GPU
 make lab-cpu         # Run JupyterLab CPU-only
-make shell-gpu       # Interactive shell (GPU)
-make shell-cpu       # Interactive shell (CPU)
+make shell-gpu       # Interactive shell (GPU) — cwd = repo root
+make shell-cpu       # Interactive shell (CPU) — cwd = repo root
+bin/devai-shell      # Standalone shell-agent — cwd = $(pwd), no Make required
+bin/devai-shell --cpu
 
 # Infrastructure
 make cache-up        # Start active services (Ollama, router, Open WebUI). vLLM/SGLang dormant
