@@ -53,8 +53,6 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
-
-	"gopkg.in/yaml.v3"
 )
 
 func env(key, fallback string) string {
@@ -136,6 +134,101 @@ type launchConfig struct {
 type configFile struct {
 	Defaults map[string]string `yaml:"defaults"`
 	Models   []configModel     `yaml:"models"`
+}
+
+// cacheProbe is one (vram, ctx) cell from the probe driver's v3 cache.
+type cacheProbe struct {
+	Ctx           int     `json:"ctx"`
+	VramGB        int     `json:"vram_gb"`
+	ActualTotalGB float64 `json:"actual_total_gb"`
+	FullyOnGPU    bool    `json:"fully_on_gpu"`
+	Capability    string  `json:"capability"`
+}
+
+// cacheEntry mirrors the per-digest record in
+// deploy/.ollama-reasoning-cache.json (schema v3).
+type cacheEntry struct {
+	SchemaVersion   int                              `json:"schema_version"`
+	Digest          string                           `json:"digest"`
+	Aliases         []string                         `json:"aliases"`
+	MaxContext      int                              `json:"max_context"`
+	Capability      string                           `json:"capability"`
+	DisableVerified *bool                            `json:"disable_verified,omitempty"`
+	Probes          map[string]map[string]cacheProbe `json:"probes"`
+}
+
+// synthesizeFromCache returns one configModel per cache entry that has a
+// fully-on-GPU probe at the host VRAM band and at or below the operator's
+// MAX_CONTEXT_LEN. Entries without a clean probe at the host band are
+// dropped — they would not be servable on this GPU at this context cap.
+//
+// The synthesized rows feed the same downstream maps (modelSizes /
+// modelContexts / modelCapability / modelDisableOK) that active-models.yaml
+// used to feed.
+func synthesizeFromCache(
+	cache map[string]*cacheEntry, hostVRAMGB, operatorMaxCtx int,
+) []configModel {
+	hostKey := strconv.Itoa(hostVRAMGB)
+	out := make([]configModel, 0, len(cache))
+	for _, entry := range cache {
+		if entry == nil || entry.SchemaVersion != 3 || len(entry.Aliases) == 0 {
+			continue
+		}
+		band, ok := entry.Probes[hostKey]
+		if !ok || len(band) == 0 {
+			continue
+		}
+		bestCtx := 0
+		var bestProbe cacheProbe
+		for ctxStr, probe := range band {
+			c, err := strconv.Atoi(ctxStr)
+			if err != nil {
+				continue
+			}
+			if operatorMaxCtx > 0 && c > operatorMaxCtx {
+				continue
+			}
+			if !probe.FullyOnGPU {
+				continue
+			}
+			if c >= bestCtx {
+				bestCtx = c
+				bestProbe = probe
+			}
+		}
+		if bestCtx == 0 {
+			continue
+		}
+		// Effective context cap: min(model_max, operator_max).
+		effCtx := entry.MaxContext
+		if operatorMaxCtx > 0 && (effCtx == 0 || effCtx > operatorMaxCtx) {
+			effCtx = operatorMaxCtx
+		}
+		cap := entry.Capability
+		if cap == "" {
+			cap = "unknown"
+		}
+		// First alias is the placeholder Name; the rest are Aliases. The
+		// router registers every name into the lookup maps regardless.
+		canonical := entry.Aliases[0]
+		var aliases []string
+		if len(entry.Aliases) > 1 {
+			aliases = append([]string(nil), entry.Aliases[1:]...)
+		}
+		out = append(out, configModel{
+			Name:    canonical,
+			Aliases: aliases,
+			Digest:  entry.Digest,
+			Backend: []string{"ollama"},
+			Size:    fmt.Sprintf("%.2f GB", bestProbe.ActualTotalGB),
+			Context: effCtx,
+			Reasoning: &configReasoning{
+				Capability:      cap,
+				DisableVerified: entry.DisableVerified,
+			},
+		})
+	}
+	return out
 }
 
 func modelsForBackend(models []configModel, backend string) []string {
@@ -395,11 +488,29 @@ func main() {
 		Timeout: 30 * time.Second,
 	}
 
-	// Load model catalog
+	// Load probe cache (schema v3). The cache is the single source of truth
+	// for fit data after the resilient-splashing-peach refactor; the old
+	// active-models.yaml is gone. We synthesize one configModel per cache
+	// entry whose host-VRAM band has a fully-on-GPU probe at or below
+	// MAX_CONTEXT_LEN, then feed downstream consumers (modelsForBackend,
+	// the lookup maps) the same way they were fed by the YAML file.
 	var cfg configFile
-	configPath := env("CONFIG_FILE", "/etc/devai/models.yaml")
-	if data, err := os.ReadFile(configPath); err == nil {
-		yaml.Unmarshal(data, &cfg)
+	cachePath := env("PROBE_CACHE", "/etc/devai/.ollama-reasoning-cache.json")
+	hostVRAMGB := envInt("GPU_MEMORY_GB", 24)
+	operatorMaxCtx := envInt("MAX_CONTEXT_LEN", 131072)
+	if data, err := os.ReadFile(cachePath); err == nil {
+		var cache map[string]*cacheEntry
+		if jerr := json.Unmarshal(data, &cache); jerr == nil {
+			cfg.Models = synthesizeFromCache(cache, hostVRAMGB, operatorMaxCtx)
+			log.Printf("probe cache: %s loaded (%d v3 entries → %d serving rows)",
+				cachePath, len(cache), len(cfg.Models))
+		} else {
+			log.Printf("warning: probe cache parse failed: %v", jerr)
+		}
+	} else if !os.IsNotExist(err) {
+		log.Printf("warning: probe cache read failed: %v", err)
+	} else {
+		log.Printf("probe cache: %s not present — no models registered (run `make probe`)", cachePath)
 	}
 
 	backends := []backendConfig{

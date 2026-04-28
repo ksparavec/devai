@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Probe downloaded Ollama models for reasoning support and per-tier VRAM use.
+"""Probe downloaded Ollama models per (VRAM band, context tier).
 
-Capability is determined by runtime behavior, not catalog metadata. The
-probe sends /api/chat with `think: true` and `options.num_ctx` set to
-each requested tier and reads /api/ps for `size`/`size_vram`. Results
-are stored per (digest, context) — there is no interpolation. If a
-(model, context) pair isn't in the cache, downstream tools will treat
-it as ineligible at that context.
+Each probe sends /api/chat with `think: true` and `options.num_ctx` set
+to a specific context tier, then reads /api/ps for size/size_vram.
+Results are stored per (digest, vram, context) — there is no
+interpolation. The driver itself probes ONE VRAM band per invocation;
+the orchestrating Make target loops over bands, recreating the
+devai-ollama container with OLLAMA_GPU_OVERHEAD set so the daemon
+believes it has only the target VRAM. This lets a 24G card produce
+cache entries that are valid for 16G targets.
 
 Per-probe capability values:
     structured  – response has non-empty `message.thinking` field
@@ -14,11 +16,11 @@ Per-probe capability values:
     unsupported – neither thinking field nor inline markers
     error       – probe request failed OR the load spilled to CPU/RAM
 
-Cache schema (v2, JSON, digest-keyed):
+Cache schema (v3, JSON, digest-keyed):
 
     {
       "<digest>": {
-        "schema_version": 2,
+        "schema_version": 3,
         "digest": "<short>",
         "aliases": ["name1", "name2", ...],
         "max_context": <int>,                      # /api/show ceiling
@@ -32,18 +34,18 @@ Cache schema (v2, JSON, digest-keyed):
         "disable_verified": true|false|"error",    # only for `structured`
         "evidence_disable": {...},
         "probes": {
-          "<ctx>": {
-            "ctx": <int>,
-            "size_bytes": <int>,
-            "size_vram_bytes": <int>,
-            "actual_total_gb": <float>,
-            "actual_vram_gb": <float>,
-            "fully_on_gpu": <bool>,
-            "actual_context": <int>,
-            "capability": "...",
-            "evidence": {...},
-            "probed_at": "<iso>",
-            "probe_seconds": <float>
+          "<vram_gb>": {
+            "<ctx>": {
+              "ctx": <int>, "vram_gb": <int>,
+              "size_bytes": <int>, "size_vram_bytes": <int>,
+              "actual_total_gb": <float>, "actual_vram_gb": <float>,
+              "fully_on_gpu": <bool>, "actual_context": <int>,
+              "capability": "...",
+              "evidence": {...},
+              "probed_at": "<iso>", "probe_seconds": <float>,
+              "think_param_rejected": <bool>?
+            },
+            ...
           },
           ...
         },
@@ -53,14 +55,15 @@ Cache schema (v2, JSON, digest-keyed):
       ...
     }
 
-Probing is incremental: a probe entry is NEVER overwritten unless --force
-or --force-ctx asks for it. Adding a new tier next run only fills gaps.
-Aliases sharing a digest share their probes — we probe each digest once
-per tier. Migration of v1 cache (name@digest keys, two-point
-interpolation coefficients) is automatic on first run.
+Probing is incremental: a (vram, ctx) cell is NEVER overwritten unless
+--force or --force-ctx asks for it. Adding a new tier next run only
+fills gaps. Aliases sharing a digest share their cells. Migration of
+v1 (name@digest keys, two-point coefficients) and v2 (single-dimension
+probes) caches is automatic — v2 probes are dropped because they carry
+no VRAM stamp; the next run re-probes at the configured bands.
 
 Usage:
-    probe-ollama-reasoning.py [--cache PATH] [--prompt TEXT]
+    probe-ollama-reasoning.py --vram 24G [--cache PATH] [--prompt TEXT]
                               [--num-predict N] [--timeout SEC]
                               [--ollama-url URL]
                               [--probe-contexts 32K,64K,128K,256K]
@@ -89,11 +92,13 @@ from _contexts import (  # noqa: E402  — local import after sys.path fix
     context_label,
     effective_targets,
     parse_context_list,
+    parse_vram_token,
+    vram_label,
 )
 
 DEFAULT_CACHE = REPO_ROOT / "deploy" / ".ollama-reasoning-cache.json"
 DEFAULT_PROMPT = "Answer with only the final number: What is 17 + 25?"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 # ── HTTP helpers ─────────────────────────────────────────────────────────────
@@ -353,17 +358,38 @@ def probe_one_context(
 
 
 def smallest_clean_probe(entry: dict) -> dict | None:
-    """Smallest-ctx probe whose capability is a non-error reasoning value."""
+    """Smallest-ctx probe whose capability is a non-error reasoning value.
+
+    Handles both schema layouts:
+      v3 (nested):  probes[<vram>][<ctx>]  → walk both levels.
+      v2 (flat):    probes[<ctx>]          → walk one level. Encountered
+                    transiently while migrating v1 → v2 → v3.
+
+    Distinguishes the two at each value by checking for the `capability`
+    key — present on a probe record, absent on a vram bucket (which
+    contains probe records as its values). Ties broken by smallest vram
+    so the "tightest" GPU that still classified cleanly wins.
+    """
     probes = entry.get("probes") or {}
-    candidates = sorted(
-        (
-            p for p in probes.values()
-            if isinstance(p, dict)
-            and p.get("capability") not in (None, "error")
-        ),
-        key=lambda p: int(p.get("ctx") or 0),
+    candidates: list[dict] = []
+    for value in probes.values():
+        if not isinstance(value, dict):
+            continue
+        if "capability" in value:
+            # v2 probe record (flat layout).
+            if value.get("capability") not in (None, "error"):
+                candidates.append(value)
+        else:
+            # v3 vram bucket (nested layout).
+            for p in value.values():
+                if isinstance(p, dict) and p.get("capability") not in (None, "error"):
+                    candidates.append(p)
+    if not candidates:
+        return None
+    candidates.sort(
+        key=lambda p: (int(p.get("ctx") or 0), int(p.get("vram_gb") or 0)),
     )
-    return candidates[0] if candidates else None
+    return candidates[0]
 
 
 def update_canonical_capability(entry: dict) -> None:
@@ -443,8 +469,12 @@ def save_cache(path: Path, cache: dict) -> None:
     path.write_text(json.dumps(cache, indent=2, sort_keys=True) + "\n")
 
 
+def is_v3_entry(entry: dict) -> bool:
+    return isinstance(entry, dict) and entry.get("schema_version") == 3
+
+
 def is_v2_entry(entry: dict) -> bool:
-    return isinstance(entry, dict) and entry.get("schema_version") == SCHEMA_VERSION
+    return isinstance(entry, dict) and entry.get("schema_version") == 2
 
 
 def _migrate_one(entry: dict, old: dict) -> None:
@@ -527,19 +557,19 @@ def migrate_v1_to_v2(old_cache: dict) -> dict:
     """
     new_cache: dict = {}
     for key, old in old_cache.items():
-        if is_v2_entry(old):
+        if is_v2_entry(old) or is_v3_entry(old):
             digest = old.get("digest") or key
             new_cache[digest] = old
 
     for key, old in old_cache.items():
-        if not isinstance(old, dict) or is_v2_entry(old):
+        if not isinstance(old, dict) or is_v2_entry(old) or is_v3_entry(old):
             continue
         digest = old.get("digest") or (key.split("@", 1)[1] if "@" in key else "")
         if not digest:
             continue
         name = old.get("name") or (key.split("@", 1)[0] if "@" in key else key)
         entry = new_cache.setdefault(digest, {
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": 2,  # v1 lifts to v2 here; v2→v3 happens later
             "digest": digest,
             "aliases": [],
             "probes": {},
@@ -556,13 +586,54 @@ def migrate_v1_to_v2(old_cache: dict) -> dict:
 
 
 def ensure_v2(cache: dict) -> tuple[dict, int]:
-    """Return (v2_cache, migrated_count). Idempotent on already-v2 caches."""
+    """Lift any v1 entries to v2 in-place (helper for ensure_v3)."""
     if not cache:
         return {}, 0
-    if all(is_v2_entry(v) for v in cache.values()):
+    if all(is_v2_entry(v) or is_v3_entry(v) for v in cache.values()):
         return cache, 0
-    migrated_legacy = sum(1 for v in cache.values() if not is_v2_entry(v))
+    migrated_legacy = sum(
+        1 for v in cache.values() if not (is_v2_entry(v) or is_v3_entry(v))
+    )
     return migrate_v1_to_v2(cache), migrated_legacy
+
+
+def migrate_v2_to_v3(cache: dict) -> int:
+    """In-place upgrade of v2 entries (flat probes) to v3 (vram-nested).
+
+    v2 probes carry no VRAM stamp, so we cannot safely re-bucket them.
+    The cells get wiped and the next probe run repopulates per-band.
+    Architectural fields (max_context, aliases, MoE/params/quant) are
+    kept verbatim — they don't depend on VRAM.
+
+    Returns the number of entries upgraded.
+    """
+    n = 0
+    for entry in cache.values():
+        if not isinstance(entry, dict) or is_v3_entry(entry):
+            continue
+        entry["schema_version"] = 3
+        # Probes are unbanded — drop them.
+        entry["probes"] = {}
+        # Capability and disable_verified come from probes; reset.
+        entry["capability"] = "unknown"
+        entry.pop("disable_verified", None)
+        entry.pop("evidence_disable", None)
+        entry.pop("first_probed_at", None)
+        entry.pop("last_probed_at", None)
+        n += 1
+    return n
+
+
+def ensure_v3(cache: dict) -> tuple[dict, int, int]:
+    """Return (v3_cache, n_v1_lifted, n_v2_to_v3).
+
+    Chains the two migration steps. Idempotent on already-v3 caches.
+    """
+    if not cache:
+        return {}, 0, 0
+    cache, n_v1 = ensure_v2(cache)
+    n_v2 = migrate_v2_to_v3(cache)
+    return cache, n_v1, n_v2
 
 
 # ── Main loop ────────────────────────────────────────────────────────────────
@@ -601,6 +672,16 @@ def main() -> None:
         help="ollama base URL",
     )
     ap.add_argument(
+        "--vram", required=True,
+        help=(
+            "VRAM band this probe pass targets, e.g. '16G' or '24G'. "
+            "Cells are stored under entry['probes'][<vram_gb>][<ctx>] in "
+            "the cache. The orchestrator (Makefile) sets "
+            "OLLAMA_GPU_OVERHEAD before calling this script so the "
+            "daemon behaves as if it had only this much VRAM."
+        ),
+    )
+    ap.add_argument(
         "--probe-contexts",
         default=os.environ.get(
             "PROBE_CONTEXTS", ",".join(str(c) for c in STANDARD_CONTEXTS)
@@ -612,7 +693,7 @@ def main() -> None:
     )
     ap.add_argument(
         "--force", action="store_true",
-        help="re-probe every requested tier (ignores cached probes)",
+        help="re-probe every requested tier in this VRAM band",
     )
     ap.add_argument(
         "--force-ctx", default="",
@@ -624,6 +705,12 @@ def main() -> None:
     )
     args = ap.parse_args()
 
+    try:
+        vram_gb = parse_vram_token(args.vram)
+    except ValueError as e:
+        sys.exit(f"error: --vram: {e}")
+    vram_key = str(vram_gb)
+
     tiers = parse_context_list(args.probe_contexts)
     if not tiers:
         sys.exit("error: --probe-contexts produced an empty list")
@@ -634,6 +721,7 @@ def main() -> None:
         force_raw = parse_context_list(args.force_ctx)
 
     print(f"  probe target:   {args.ollama_url}", file=sys.stderr)
+    print(f"  vram band:      {vram_label(vram_gb)}", file=sys.stderr)
     print(
         f"  probe tiers:    {','.join(context_label(t) for t in tiers)}",
         file=sys.stderr,
@@ -645,15 +733,20 @@ def main() -> None:
         )
 
     raw_cache = load_cache(args.cache)
-    cache, migrated = ensure_v2(raw_cache)
-    note = f"migrated {migrated} from v1" if migrated else ""
+    cache, n_v1, n_v2 = ensure_v3(raw_cache)
+    notes = []
+    if n_v1:
+        notes.append(f"lifted {n_v1} from v1")
+    if n_v2:
+        notes.append(f"upgraded {n_v2} v2→v3 (probes wiped, re-probe needed)")
+    note = "; ".join(notes)
     print(
         f"  cache:          {args.cache} ({len(cache)} digest entries"
-        + (f", {note}" if note else "")
+        + (f"; {note}" if note else "")
         + ")",
         file=sys.stderr,
     )
-    if migrated:
+    if n_v1 or n_v2:
         save_cache(args.cache, cache)
 
     try:
@@ -709,6 +802,7 @@ def main() -> None:
         nonlocal header_printed
         if header_printed:
             return
+        # The "vram band:" line above the table identifies this pass.
         print(
             f"  {'CANONICAL':<40s} {'CAP':<11s} "
             f"{'TIERS':<28s} ACTION",
@@ -773,19 +867,19 @@ def main() -> None:
             continue
 
         force_set = set(effective_targets(force_raw, max_ctx))
-        existing_probes = entry.get("probes") or {}
+        vram_band = entry.setdefault("probes", {}).setdefault(vram_key, {})
         # Auto-retry cached HTTP 400 errors — they're the legacy result of
         # probing non-thinking models with `think:true` before the fallback
         # path existed. Other errors (timeouts, 5xx) stay cached so transient
         # backend issues don't burn probe budget on every run.
         missing = [
             t for t in targets
-            if str(t) not in existing_probes
+            if str(t) not in vram_band
             or t in force_set
             or _is_think_param_rejection(
-                (existing_probes.get(str(t)) or {}).get("evidence") or {}
+                (vram_band.get(str(t)) or {}).get("evidence") or {}
             )
-            and (existing_probes.get(str(t)) or {}).get("capability") == "error"
+            and (vram_band.get(str(t)) or {}).get("capability") == "error"
         ]
         if not missing:
             fully_cached += 1
@@ -797,7 +891,8 @@ def main() -> None:
                 args.ollama_url, canonical, digest, args.prompt,
                 args.num_predict, args.timeout, ctx,
             )
-            entry.setdefault("probes", {})[str(ctx)] = rec
+            rec["vram_gb"] = vram_gb
+            vram_band[str(ctx)] = rec
             entry.setdefault("first_probed_at", rec["probed_at"])
             entry["last_probed_at"] = rec["probed_at"]
             ctxs_done.append(ctx)

@@ -1,22 +1,19 @@
 #!/usr/bin/env python3
-"""Select and optionally download models from deploy/models.yaml.
+"""Diagnostic + downloader for deploy/models.yaml entries.
 
-Reads the catalog produced by scripts/generate-catalog.py and filters
-entries by VRAM / CONTEXT / KV dtype requirements. Missing Ollama
-models are only trial-download candidates when they are the best
-estimated family fit: explicit tag, no larger fitting same-family
-variant, and closest to the VRAM budget from below. Always writes
-deploy/active-models.yaml with the set of models that are both fitting
-AND downloaded; Ollama entries must also have probe-backed VRAM data
-before becoming active.
+Reads the catalog from scripts/generate-catalog.py and the probe cache
+from scripts/probe-ollama-reasoning.py, then prints which models fit
+at the chosen (VRAM, CONTEXT) and (with --download) pulls missing
+best-fit candidates. Does NOT write any output file — the probe cache
+is the single source of truth for the router and picker. The old
+deploy/active-models.yaml is gone; this script just queries.
 
 Usage:
-    scripts/select-models.py                         # all families, 24 GB default
+    scripts/select-models.py                         # all families, host VRAM
     scripts/select-models.py --family gemma4
-    scripts/select-models.py --vram 48 --context 65536 --kv-dtype fp8
-    scripts/select-models.py --dry-run               # plan only, no downloads
-
-Re-runnable: new fitters added, stale entries removed from active set.
+    scripts/select-models.py --vram 16 --context 32768
+    scripts/select-models.py --download              # pull missing best-fit
+    scripts/select-models.py --prune                 # delete on-disk strays
 
 Errors (network, disk, subprocess) propagate verbatim.
 """
@@ -39,7 +36,6 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))
 from _contexts import effective_targets as _ctx_effective_targets  # noqa: E402
 
 CATALOG = REPO_ROOT / "deploy" / "models.yaml"
-ACTIVE = REPO_ROOT / "deploy" / "active-models.yaml"
 PROBE_CACHE = REPO_ROOT / "deploy" / ".ollama-reasoning-cache.json"
 
 # vLLM/SGLang serve models fully in VRAM — weights + full KV cache +
@@ -218,13 +214,65 @@ def pull_hf(display_name: str, repo: str) -> None:
         sys.exit(f"error: hf download {repo} failed with rc={rc}")
 
 
+# Staging for GGUF blobs imported into Ollama via Modelfile. Lives next to
+# VLLM_MODELS so we don't pollute Ollama's blob store with files that are
+# already absorbed there. Path is informational — Ollama hardlinks/copies
+# the file into its blob store on `ollama create`.
+GGUF_STAGING = VLLM_MODELS.parent / "_gguf"
+
+
+def pull_gguf(display_name: str, repo: str, filename: str) -> None:
+    """Download one GGUF file from HF, register it in Ollama via Modelfile.
+
+    Three steps:
+      1. hf download <repo> <filename> --local-dir <staging>/<repo-slug>
+      2. write a one-line Modelfile: `FROM <filename>`
+      3. ollama create <display_name> -f Modelfile (run inside devai-ollama)
+
+    `display_name` is the catalog tag (e.g. `qwen3.5:27b-ud-q3_k_xl`).
+    Once `ollama create` completes, the GGUF bytes are absorbed into
+    Ollama's blob store and the staging file becomes redundant — we
+    keep it as a readable artifact for re-import after a blob-store wipe.
+    """
+    repo_slug = repo.replace("/", "_")
+    target_dir = GGUF_STAGING / repo_slug
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_file = target_dir / filename
+    print(f"  hf download {repo} {filename} → {target_file} ...", flush=True)
+    rc = subprocess.call(
+        [HF_CLI, "download", repo, filename, "--local-dir", str(target_dir)]
+    )
+    if rc != 0:
+        sys.exit(f"error: hf download {repo} {filename} failed with rc={rc}")
+    if not target_file.is_file():
+        sys.exit(
+            f"error: hf download claimed success but {target_file} is missing"
+        )
+    modelfile = target_dir / f"Modelfile.{filename}"
+    modelfile.write_text(f"FROM {filename}\n")
+    print(f"  ollama create {display_name} -f {modelfile.name} "
+          f"(in {target_dir}) ...", flush=True)
+    rc = subprocess.call([
+        CONTAINER_RUNTIME, "exec", "-w", str(target_dir), OLLAMA_CONTAINER,
+        "ollama", "create", display_name, "-f", modelfile.name,
+    ])
+    if rc != 0:
+        sys.exit(f"error: ollama create {display_name} failed with rc={rc}")
+
+
 def pull(model: dict) -> None:
-    if model["source"] == "ollama":
+    src = model.get("source")
+    if src == "ollama":
         pull_ollama(model["name"])
-    elif model["source"] == "hf":
+    elif src == "hf":
         pull_hf(model["name"], model["repo"])
+    elif src == "gguf":
+        if not model.get("repo") or not model.get("gguf_filename"):
+            sys.exit(f"error: gguf source row {model['name']} is missing "
+                     f"repo or gguf_filename")
+        pull_gguf(model["name"], model["repo"], model["gguf_filename"])
     else:
-        sys.exit(f"error: unknown source '{model.get('source')}' for {model['name']}")
+        sys.exit(f"error: unknown source '{src}' for {model['name']}")
 
 
 # ── Deletion ─────────────────────────────────────────────────────────────────
@@ -375,12 +423,13 @@ class ProbeCache:
 
 
 def load_probe_cache() -> ProbeCache:
-    """Read deploy/.ollama-reasoning-cache.json and build the v2 view.
+    """Read deploy/.ollama-reasoning-cache.json and build the v3 view.
 
-    Probe schema v2 is digest-keyed (see scripts/probe-ollama-reasoning.py).
-    Legacy v1 entries are migrated in-memory using the same routine the
-    prober uses on disk; the file is not rewritten from here. If the file
-    is absent every model resolves to capability=unknown.
+    Cache schema v3 is digest-keyed with probes nested by VRAM band
+    (see scripts/probe-ollama-reasoning.py). v1 and v2 entries are
+    migrated in-memory using the prober's helper; the on-disk file is
+    not rewritten from here (`make probe` does that). Missing file →
+    every model resolves to capability=unknown.
     """
     if not PROBE_CACHE.is_file():
         return ProbeCache(by_digest={}, by_name={})
@@ -391,7 +440,7 @@ def load_probe_cache() -> ProbeCache:
         return ProbeCache(by_digest={}, by_name={})
     by_digest: dict
     if all(
-        isinstance(v, dict) and v.get("schema_version") == 2
+        isinstance(v, dict) and v.get("schema_version") == 3
         for v in raw.values()
     ):
         by_digest = {
@@ -400,15 +449,16 @@ def load_probe_cache() -> ProbeCache:
             if isinstance(entry, dict)
         }
     else:
-        # In-memory migration; on-disk file is left as-is for the prober.
+        # In-memory migration to v3; on-disk file is unchanged.
         import importlib.util
         spec = importlib.util.spec_from_file_location(
             "_probe_module",
             REPO_ROOT / "scripts" / "probe-ollama-reasoning.py",
         )
         mod = importlib.util.module_from_spec(spec)
+        sys.modules["_probe_module"] = mod  # frozen-dataclass workaround
         spec.loader.exec_module(mod)
-        by_digest, _ = mod.ensure_v2(raw)
+        by_digest, _, _ = mod.ensure_v3(raw)
     by_name: dict = {}
     for digest, entry in by_digest.items():
         for alias in entry.get("aliases") or []:
@@ -436,187 +486,56 @@ def lookup_capability(model_name: str, cache: ProbeCache) -> tuple[str, str | No
     return cap, None
 
 
-def probe_at_context(entry: dict, context: int) -> dict | None:
-    """Return the per-context probe record from a v2 digest entry.
+def probe_at_context(entry: dict, vram_gb: int, context: int) -> dict | None:
+    """Return the per-(vram, ctx) probe cell from a v3 digest entry.
 
     The effective context is min(context, max_context). The model's
     design ceiling is a hard physical limit — asking a 128K-only model
-    to run at 256K just runs at 128K. Returns None when no probe was
-    recorded at the effective context (i.e. probe-reasoning hasn't been
-    run for that tier yet, or the tier was forced off the model).
+    to run at 256K just runs at 128K. Returns None when the cache has
+    no cell at that (vram, eff_ctx) — i.e. `make probe` hasn't been
+    run for that band/tier yet, or the tier was capped above the
+    model's max.
     """
     if not entry:
         return None
     max_ctx = int(entry.get("max_context") or 0)
     eff_ctx = min(context, max_ctx) if max_ctx else context
-    rec = (entry.get("probes") or {}).get(str(eff_ctx))
+    band = (entry.get("probes") or {}).get(str(int(vram_gb)))
+    if not isinstance(band, dict):
+        return None
+    rec = band.get(str(eff_ctx))
     if isinstance(rec, dict):
         return rec
     return None
 
 
-def canonical_sort_key(name: str) -> tuple:
-    """Lower wins. Non-:latest tags before :latest; longer (more specific) first."""
-    return (name.endswith(":latest"), -len(name), name)
+def print_active_set(rows: list["Row"], vram: float, context: int) -> None:
+    """Render the eligible (fits + fully_on_gpu) set as a summary table.
 
-
-def select_canonical_per_bucket(
-    rows: list[Row], probe_cache: ProbeCache,
-) -> list[dict]:
-    """Collapse active rows to one row per (family, effective_context, capability).
-
-    For each bucket we pick the best model by (param scale, name preference)
-    and fold the alias names sharing its digest into `aliases: [...]`. The
-    per-context capability comes from the probe at that context — a model
-    that's `structured` at 32K but spills at 256K is canonical at the 32K
-    bucket and absent from the 256K bucket.
+    Replaces the old `write_active` YAML emit with a print-only diagnostic.
+    The probe cache is the source of truth; downstream consumers (router,
+    picker) read it directly. This view is informational.
     """
     eligible = [r for r in rows if r.active_eligible]
-    by_bucket: dict[tuple, list[Row]] = {}
+    print()
+    print(f"  ── Eligible at VRAM={vram:g} GB / CONTEXT={context} "
+          f"({len(eligible)} model(s)) ──")
+    if not eligible:
+        print("    (no models fit at this (VRAM, CONTEXT) — run `make probe` "
+              "to populate the cache)")
+        return
+    print(f"    {'NAME':<42s}  {'FAMILY':<14s}  {'TOTAL GB':>9s}  {'CTX':>6s}  CAP")
+    print(f"    {'-' * 96}")
     for r in eligible:
-        family = r.model.get("family", "")
-        v = r.model.get("vram") or {}
+        m = r.model
+        v = m.get("vram") or {}
         eff_ctx = int(v.get("context") or 0)
         cap = v.get("context_capability") or "unknown"
-        by_bucket.setdefault((family, eff_ctx, cap), []).append(r)
-
-    def bucket_score(r: Row) -> tuple:
-        # Higher param count wins; ties broken by higher total_gb at this
-        # context (≈ more bytes per parameter ≈ higher precision quant);
-        # finally name preference (explicit > :latest, longer > shorter).
-        return (
-            -row_quality(r),
-            -float((r.model.get("vram") or {}).get("total_gb") or 0.0),
-            name_priority(r.model),
-        )
-
-    selected: list[dict] = []
-    for bucket in sorted(by_bucket):
-        candidates = by_bucket[bucket]
-        candidates.sort(key=bucket_score)
-        winner = candidates[0]
-        m = dict(winner.model)
-
-        # Aliases come from the winner's digest only — losing candidates in
-        # this bucket are different digests and aren't part of the active
-        # row. They're suppressed entirely (one model per bucket).
-        winner_name = winner.model["name"]
-        if is_ollama_only(winner.model):
-            digest = probe_cache.digest_of(winner_name)
-            alias_names = set(probe_cache.aliases_for(winner_name))
-        else:
-            digest = ""
-            alias_names = set()
-        alias_names.add(winner_name)  # defensive — always include the winner
-
-        canonical = sorted(alias_names, key=canonical_sort_key)[0]
-        m["name"] = canonical
-        m["aliases"] = sorted(n for n in alias_names if n != canonical)
-        if digest:
-            m["digest"] = digest
-        selected.append(m)
-    return selected
-
-
-def write_active(
-    models: list[dict],
-    vram: float,
-    context: int,
-    kv_dtype: str,
-    probe_cache: ProbeCache,
-) -> None:
-    now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
-    lines: list[str] = []
-    lines.append("# Active model catalog — AUTO-GENERATED by scripts/select-models.py.")
-    lines.append("#")
-    lines.append(f"# Selection criteria: VRAM={vram:g} GB  CONTEXT={context}"
-                 f"  KV={kv_dtype}")
-    lines.append(f"# Generated at:       {now}")
-    lines.append("#")
-    lines.append("# Each row is the best model in its (family, effective_context,")
-    lines.append("# capability) bucket. Alias names sharing the same weights live")
-    lines.append("# in `aliases:` so the router can resolve any of them. Effective")
-    lines.append("# context = min(--context, model max_context); per-context probe")
-    lines.append("# data lives in deploy/.ollama-reasoning-cache.json.")
-    lines.append("# Regenerate: make model-select [FAMILY=...] [VRAM=...] [CONTEXT=...] [KV=...]")
-    lines.append("")
-    lines.append("models:")
-    if not models:
-        lines.append("  []")
-    for m in models:
-        backend_inline = "[" + ", ".join(m["backend"]) + "]"
-        lines.append(f'  - name: "{m["name"]}"')
-        if m.get("digest"):
-            lines.append(f'    digest: "{m["digest"]}"')
-        aliases = m.get("aliases") or []
-        if aliases:
-            alias_inline = ", ".join(f'"{a}"' for a in aliases)
-            lines.append(f"    aliases: [{alias_inline}]")
-        lines.append(f"    family: {m.get('family', '')}")
-        lines.append(f"    backend: {backend_inline}")
-        if m.get("repo"):
-            lines.append(f'    repo: "{m["repo"]}"')
-        lines.append(f'    source: {m["source"]}')
-        lines.append(f'    size: "{m["size"]}"')
-        v = m.get("vram") or {}
-        eff_ctx = v.get("context")
-        if eff_ctx:
-            lines.append(f"    context: {eff_ctx}")
-        arch = m.get("arch") or {}
-        if arch:
-            keq = "true" if arch.get("k_eq_v") else "false"
-            lines.append(
-                f"    arch: {{ layers: {arch['layers']}, "
-                f"kv_heads: {arch['kv_heads']}, "
-                f"head_dim: {arch['head_dim']}, k_eq_v: {keq} }}"
-            )
-        if m.get("purpose"):
-            lines.append(f'    purpose: "{m["purpose"]}"')
-        if "ollama" in m.get("backend", []):
-            cap, disable = lookup_capability(m["name"], probe_cache)
-            probe_entry = lookup_probe(m["name"], probe_cache)
-        else:
-            cap, disable = "unknown", None
-            probe_entry = {}
-        parts = [f"capability: {cap}"]
-        if disable is not None:
-            parts.append(f"disable_verified: {disable}")
-        lines.append(f"    reasoning: {{ {', '.join(parts)} }}")
-        ec = probe_entry.get("experts_total")
-        eu = probe_entry.get("experts_used")
-        if ec is not None and eu is not None:
-            lines.append(f"    moe: {{ experts_total: {ec}, experts_used: {eu} }}")
-        det_parts = []
-        if probe_entry.get("param_size_label"):
-            det_parts.append(f'param_size: "{probe_entry["param_size_label"]}"')
-        if probe_entry.get("quantization"):
-            det_parts.append(f'quantization: "{probe_entry["quantization"]}"')
-        if det_parts:
-            lines.append(f"    details: {{ {', '.join(det_parts)} }}")
-        if v.get("source") == "probe":
-            spill = "false" if v.get("fully_on_gpu", True) else "true"
-            vparts = [
-                "source: probe",
-                f"total_gb: {v['total_gb']}",
-                f"vram_gb: {v.get('vram_gb', v['total_gb'])}",
-                f"context: {v['context']}",
-                f"spilled_to_cpu: {spill}",
-            ]
-            if v.get("max_context"):
-                vparts.append(f"max_context: {v['max_context']}")
-            lines.append(f"    vram: {{ {', '.join(vparts)} }}")
-        elif v.get("source") == "formula":
-            lines.append(
-                f"    vram: {{ source: formula, "
-                f"weights_gb: {v['weights_gb']}, "
-                f"kv_gb: {v['kv_gb']}, "
-                f"overhead_gb: {v['overhead_gb']}, "
-                f"total_gb: {v['total_gb']}, "
-                f"context: {v['context']}, "
-                f"kv_dtype: {v['kv_dtype']} }}"
-            )
-        lines.append("")
-    ACTIVE.write_text("\n".join(lines))
+        total = v.get("total_gb") or 0.0
+        family = m.get("family", "?")
+        ctx_label = f"{eff_ctx // 1024}K" if eff_ctx >= 1024 else str(eff_ctx)
+        print(f"    {m['name']:<42s}  {family:<14s}  {total:>8.2f}G  "
+              f"{ctx_label:>6s}  {cap}")
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -847,7 +766,11 @@ def build_rows(
         model_is_ollama_only = is_ollama_only(m)
 
         probe_entry = lookup_probe(m["name"], probe_cache) if model_is_ollama_only else {}
-        probe_record = probe_at_context(probe_entry, context) if probe_entry else None
+        vram_gb = int(round(vram_budget))
+        probe_record = (
+            probe_at_context(probe_entry, vram_gb, context)
+            if probe_entry else None
+        )
 
         if probe_record:
             total = float(probe_record.get("actual_total_gb") or 0.0)
@@ -973,7 +896,7 @@ def main() -> None:
                     help="Also delete Ollama tags on disk that aren't in the "
                          "full catalog (hand-made aliases that hold blobs alive).")
     ap.add_argument("--dry-run", action="store_true",
-                    help="Plan only — no downloads, no deletions, no active-models.yaml write")
+                    help="Plan only — no downloads, no deletions")
     ap.add_argument("--verbose", action="store_true",
                     default=os.environ.get("VERBOSE", "").lower() in ("1", "true", "yes"),
                     help="Print every catalog entry, including too-small and "
@@ -1013,7 +936,6 @@ def main() -> None:
     prunable = [r for r in rows
                 if r.downloaded and (r.total_gb > args.vram
                                      or r.total_gb < min_total)]
-    active = select_canonical_per_bucket(rows, probe_cache)
 
     # ── Print plan ───────────────────────────────────────────────────────
     print()
@@ -1187,7 +1109,6 @@ def main() -> None:
             args.download_report.write_text("\n".join(downloaded_names) + "\n")
         for r in rows:
             r.active_eligible = active_eligible(r)
-        active = select_canonical_per_bucket(rows, probe_cache)
         print()
 
     # ── Prune only if requested ──────────────────────────────────────────
@@ -1200,7 +1121,6 @@ def main() -> None:
             r.downloaded = False
         for r in rows:
             r.active_eligible = active_eligible(r)
-        active = select_canonical_per_bucket(rows, probe_cache)
         print()
 
     # ── Prune shadow Ollama tags if requested ────────────────────────────
@@ -1212,12 +1132,10 @@ def main() -> None:
             delete_ollama(name)
         print()
 
-    # ── Write active catalog ─────────────────────────────────────────────
-    if args.dry_run:
-        print(f"  (dry-run: {ACTIVE.name} NOT written)")
-    else:
-        write_active(active, args.vram, args.context, args.kv_dtype, probe_cache)
-        print(f"  wrote {ACTIVE}  ({len(active)} active entries)")
+    # ── Eligible set summary ────────────────────────────────────────────
+    # The probe cache is the source of truth; this is informational only.
+    # Router and picker read deploy/.ollama-reasoning-cache.json directly.
+    print_active_set(rows, args.vram, args.context)
     print()
 
 

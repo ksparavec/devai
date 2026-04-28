@@ -82,12 +82,10 @@ RUN_FLAGS =
 # disk-based "is downloaded?" detection (ollama manifests + vllm/sglang dirs).
 MODEL_CACHE_MOUNT = $(if $(wildcard $(CACHE_DIR)/ollama),-v $(CACHE_DIR)/ollama:/var/cache/devai/ollama:ro)
 
-# Read-only mount of the active-models catalog so the picker can show the
-# precomputed VRAM breakdown (weights / KV / overhead / total) per model.
-ACTIVE_CATALOG_MOUNT = $(if $(wildcard deploy/active-models.yaml),-v $(CURDIR)/deploy/active-models.yaml:/etc/devai/active-models.yaml:ro)
-
-# Read-only mount of the probe cache so the picker can show probed-but-not-active
-# rows, including models skipped because the target context spilled to CPU/RAM.
+# Read-only mount of the probe cache so the picker can render the per-tier
+# menu and the router can build its name → context-cap map. The cache is the
+# single source of truth for fit data after the resilient-splashing-peach
+# refactor; deploy/active-models.yaml no longer exists.
 PROBE_CACHE_MOUNT = $(if $(wildcard deploy/.ollama-reasoning-cache.json),-v $(CURDIR)/deploy/.ollama-reasoning-cache.json:/etc/devai/.ollama-reasoning-cache.json:ro)
 
 # User switching: only needed for docker (rootless podman root = host user)
@@ -113,7 +111,7 @@ endif
 .PHONY: vllm-list vllm-rm vllm-status vllm-df
 .PHONY: clean clean-cpu clean-gpu clean-router prune
 .PHONY: fetch-cli pull-images install-systemd test test-router test-ollama test-agents help
-.PHONY: catalog-regen probe-reasoning model-select vram-fit
+.PHONY: catalog-regen probe model-fit model-pull vram-fit
 
 all: help
 
@@ -288,7 +286,6 @@ lab-cpu: ## Run the container (CPU)
 		-v $(HOME_VOLUME):/home/$(CONTAINER_USER) \
 		$(HOME_MOUNT_ARG) \
 		$(MODEL_CACHE_MOUNT) \
-		$(ACTIVE_CATALOG_MOUNT) \
 		$(PROBE_CACHE_MOUNT) \
 		-v "$$(readlink -f $(HOST_WORK_DIR))":/home/$(CONTAINER_USER)/work \
 		$(IMAGE_NAME)
@@ -316,7 +313,6 @@ lab-gpu: ## Run the container (GPU/CUDA)
 		-v $(HOME_VOLUME):/home/$(CONTAINER_USER) \
 		$(HOME_MOUNT_ARG) \
 		$(MODEL_CACHE_MOUNT) \
-		$(ACTIVE_CATALOG_MOUNT) \
 		$(PROBE_CACHE_MOUNT) \
 		-v "$$(readlink -f $(HOST_WORK_DIR))":/home/$(CONTAINER_USER)/work \
 		$(IMAGE_NAME_GPU)
@@ -337,7 +333,6 @@ shell-cpu: ## Start an interactive shell (CPU)
 		-v $(HOME_VOLUME):/home/$(CONTAINER_USER) \
 		$(HOME_MOUNT_ARG) \
 		$(MODEL_CACHE_MOUNT) \
-		$(ACTIVE_CATALOG_MOUNT) \
 		$(PROBE_CACHE_MOUNT) \
 		-v "$$(readlink -f $(HOST_WORK_DIR))":/home/$(CONTAINER_USER)/work \
 		$(IMAGE_NAME) agent-picker
@@ -359,7 +354,6 @@ shell-gpu: ## Start an interactive shell (GPU)
 		-v $(HOME_VOLUME):/home/$(CONTAINER_USER) \
 		$(HOME_MOUNT_ARG) \
 		$(MODEL_CACHE_MOUNT) \
-		$(ACTIVE_CATALOG_MOUNT) \
 		$(PROBE_CACHE_MOUNT) \
 		-v "$$(readlink -f $(HOST_WORK_DIR))":/home/$(CONTAINER_USER)/work \
 		$(IMAGE_NAME_GPU) agent-picker
@@ -412,7 +406,6 @@ test-agents: ## Smoke-test every (agent × backend) cell against the live router
 		--network $(DEVAI_NETWORK) \
 		-e CONTAINER_USER=devai \
 		$(MODEL_CACHE_MOUNT) \
-		$(ACTIVE_CATALOG_MOUNT) \
 		$(PROBE_CACHE_MOUNT) \
 		-v "$(CURDIR)/tests/agent-matrix.sh":/usr/local/bin/agent-matrix:ro \
 		-v "$(CURDIR)/tests/.matrix-logs":/var/log/agent-matrix \
@@ -445,9 +438,10 @@ help: ## Show this help message
 	@printf "  %-44s%s\n" "" "test             Run integration tests"
 	@printf "\n"
 	@printf "  %-44s%s\n" "MODELS" "vLLM (dormant — see docs/sidelined-backends.md)"
-	@printf "  %-44s%s\n" "model-select     Probe + select active set" "vllm-list        List on-disk vLLM weights"
-	@printf "  %-44s%s\n" "  DOWNLOAD=1     also pull missing variants" "vllm-rm          Remove model"
-	@printf "  %-44s%s\n" "  FAMILY=qwen3.5 scope to one family" "vllm-status      Show status"
+	@printf "  %-44s%s\n" "probe            Populate cache for every (VRAM, ctx) tier" "vllm-list        List on-disk vLLM weights"
+	@printf "  %-44s%s\n" "model-fit        Print fitting models at VRAM/CONTEXT" "vllm-rm          Remove model"
+	@printf "  %-44s%s\n" "model-pull       Download best-fit candidates" "vllm-status      Show status"
+	@printf "  %-44s%s\n" "  FAMILY=qwen3.5 scope to one family" ""
 	@printf "  %-44s%s\n" "ollama-list      List downloaded models" "vllm-df          Disk usage"
 	@printf "  %-44s%s\n" "ollama-rm        Remove model" ""
 	@printf "  %-44s%s\n" "ollama-status    Show status" ""
@@ -477,7 +471,7 @@ cache-up: ## Start infrastructure services (caches + Ollama + Open WebUI; vLLM/S
 	@echo "  vLLM/SGLang:       dormant (see docs/sidelined-backends.md)"
 	@echo "  Open WebUI:        https://localhost:$(WEBUI_PORT)"
 	@echo ""
-	@echo "To pull and select models: make model-select DOWNLOAD=1 [FAMILY=qwen3.5]"
+	@echo "To pull and probe models:  make model-pull [FAMILY=qwen3.5] && make probe"
 
 cache-down: ## Stop and remove ALL infrastructure services (running, stopped, orphaned)
 	@# -t 0 kills immediately; --remove-orphans catches containers no longer in compose.
@@ -520,7 +514,7 @@ cache-status: ## Show infrastructure service status and disk usage
 		else modified="$$((diff_sec / 604800)) weeks ago"; fi; \
 		printf "%-46s%-16s%-10s%-20s\n" "$$name" "$$id" "$$size" "$$modified"; \
 	done; \
-	$$found || echo "  (none — run 'make model-select DOWNLOAD=1' to populate)"
+	$$found || echo "  (none — run 'make model-pull' to populate)"
 
 cache-clean: ## Remove all cached data (keeps volumes mounted, preserves podman graphroot)
 	$(COMPOSE) -f $(CACHE_COMPOSE) down
@@ -626,7 +620,7 @@ vllm-list: ## List vLLM models with status
 	@INFERENCE_CONFIG=$(INFERENCE_CONFIG) VLLM_MODELS_DIR=$(VLLM_MODELS_DIR) \
 		python3 scripts/vllm-list.py
 
-vram-fit: ## Show which models from the full catalog fit in VRAM (planning aid; use model-select to act)
+vram-fit: ## Show which models from the full catalog fit in VRAM (planning aid; use model-pull to act)
 	@GPU_MEMORY_GB=$${VRAM:-$(GPU_MEMORY_GB)} MAX_CONTEXT_LEN=$${CONTEXT:-$(MAX_CONTEXT_LEN)} \
 		python3 scripts/vram-fit.py \
 			$(if $(VRAM),--vram $(VRAM),) \
@@ -637,30 +631,55 @@ vram-fit: ## Show which models from the full catalog fit in VRAM (planning aid; 
 			--models-yaml $(INFERENCE_CONFIG) \
 			--vllm-dir $(VLLM_MODELS_DIR)
 
-probe-reasoning: ## Probe downloaded ollama models at every standard context tier
-	@# Runs inside the lab container so it can reach devai-ollama on devai-net.
-	@# Probes each tier in PROBE_CONTEXTS (default 32K,64K,128K,256K) once
-	@# per digest. Existing per-tier results are never overwritten — a new
-	@# tier in the list only fills gaps. Pass --force-ctx to re-probe a
-	@# specific tier; PROBE_FORCE=1 to re-probe everything.
-	$(CONTAINER_RUNTIME) run --rm \
-		--network $(DEVAI_NETWORK) \
-		-v $(CURDIR)/scripts:/scripts:ro \
-		-v $(CURDIR)/deploy:/deploy \
-		-e OLLAMA_HOST=http://devai-ollama:11434 \
-		-e PROBE_CONTEXTS=$${PROBE_CONTEXTS:-32768,65536,131072,262144} \
-		--entrypoint python3 \
-		$(IMAGE_NAME) \
-		/scripts/probe-ollama-reasoning.py --cache /deploy/.ollama-reasoning-cache.json \
-			$(if $(PROBE_FORCE),--force,) \
-			$(if $(PROBE_FORCE_CTX),--force-ctx $(PROBE_FORCE_CTX),) \
-			$(PROBE_MODELS)
+PROBE_VRAMS    ?= 16G,24G
+PROBE_CONTEXTS ?= 32K,64K,128K,256K
 
-model-select: probe-reasoning ## Select fitting+on-disk models (probe first, then write active-models.yaml; restarts router if active set changed)
+probe: ## Probe every downloaded ollama digest at every (VRAM, CONTEXT) tier.
+	@# Loops over PROBE_VRAMS, recreating devai-ollama with
+	@# OLLAMA_GPU_OVERHEAD set so the daemon behaves as a smaller card.
+	@# A 24G host can therefore produce cache entries valid for 16G targets.
+	@# Each probe pass is incremental: existing (vram, ctx) cells are
+	@# never overwritten unless PROBE_FORCE=1 or PROBE_FORCE_CTX=<list>.
 	@set -e; \
-	 download_report=$$(mktemp /tmp/devai-model-downloads.XXXXXX); \
-	 trap 'rm -f "$$download_report"' EXIT; \
-	 before_sha=$$(grep -v '^#' deploy/active-models.yaml 2>/dev/null | sha256sum | awk '{print $$1}' || echo "none"); \
+	 for vram in $$(echo $(PROBE_VRAMS) | tr ',' ' '); do \
+	    overhead_bytes=$$(python3 -c "import sys; sys.path.insert(0, 'scripts'); from _contexts import parse_vram_token, vram_overhead_bytes; print(vram_overhead_bytes($(GPU_MEMORY_GB), parse_vram_token('$$vram')))"); \
+	    echo; \
+	    echo ">>> probing at VRAM=$$vram (host=$(GPU_MEMORY_GB)G, OLLAMA_GPU_OVERHEAD=$$overhead_bytes bytes)"; \
+	    OLLAMA_GPU_OVERHEAD=$$overhead_bytes \
+	      $(COMPOSE) -f $(CACHE_COMPOSE) up -d --force-recreate ollama; \
+	    until $(CONTAINER_RUNTIME) exec $(OLLAMA_CONTAINER) ollama list >/dev/null 2>&1; do sleep 1; done; \
+	    $(CONTAINER_RUNTIME) run --rm \
+	        --network $(DEVAI_NETWORK) \
+	        -v $(CURDIR)/scripts:/scripts:ro \
+	        -v $(CURDIR)/deploy:/deploy \
+	        -e OLLAMA_HOST=http://devai-ollama:11434 \
+	        -e PROBE_CONTEXTS=$(PROBE_CONTEXTS) \
+	        --entrypoint python3 \
+	        $(IMAGE_NAME) \
+	        /scripts/probe-ollama-reasoning.py \
+	            --cache /deploy/.ollama-reasoning-cache.json \
+	            --vram $$vram \
+	            $(if $(PROBE_FORCE),--force,) \
+	            $(if $(PROBE_FORCE_CTX),--force-ctx $(PROBE_FORCE_CTX),) \
+	            $(PROBE_MODELS); \
+	 done; \
+	 echo; \
+	 echo ">>> restoring devai-ollama to host VRAM (no overhead)"; \
+	 OLLAMA_GPU_OVERHEAD=0 $(COMPOSE) -f $(CACHE_COMPOSE) up -d --force-recreate ollama
+
+model-fit: ## Print which models fit at the chosen (VRAM, CONTEXT) — diagnostic, no writes.
+	@OLLAMA_CONTAINER=$(OLLAMA_CONTAINER) CONTAINER_RUNTIME=$(CONTAINER_RUNTIME) \
+	 VLLM_MODELS_DIR=$(VLLM_MODELS_DIR) HF_CLI=$(HF_CLI) \
+	 GPU_MEMORY_GB=$${VRAM:-$(GPU_MEMORY_GB)} MAX_CONTEXT_LEN=$${CONTEXT:-$(MAX_CONTEXT_LEN)} \
+	 VERBOSE=$${VERBOSE:-0} \
+		python3 scripts/select-models.py \
+			$(if $(FAMILY),--family $(FAMILY),) \
+			$(if $(VRAM),--vram $(VRAM),) \
+			$(if $(CONTEXT),--context $(CONTEXT),) \
+			$(if $(KV),--kv-dtype $(KV),)
+
+model-pull: ## Pull missing best-fit candidates from the catalog (catalog-driven downloads).
+	@set -e; \
 	 OLLAMA_CONTAINER=$(OLLAMA_CONTAINER) CONTAINER_RUNTIME=$(CONTAINER_RUNTIME) \
 	 VLLM_MODELS_DIR=$(VLLM_MODELS_DIR) HF_CLI=$(HF_CLI) \
 	 GPU_MEMORY_GB=$${VRAM:-$(GPU_MEMORY_GB)} MAX_CONTEXT_LEN=$${CONTEXT:-$(MAX_CONTEXT_LEN)} \
@@ -670,37 +689,13 @@ model-select: probe-reasoning ## Select fitting+on-disk models (probe first, the
 			$(if $(VRAM),--vram $(VRAM),) \
 			$(if $(CONTEXT),--context $(CONTEXT),) \
 			$(if $(KV),--kv-dtype $(KV),) \
-			$(if $(DOWNLOAD),--download --download-report "$$download_report",) \
+			--download \
 			$(if $(DOWNLOAD_LIMIT),--max-downloads $(DOWNLOAD_LIMIT),) \
 			$(if $(PRUNE),--prune,) \
 			$(if $(PRUNE_SHADOWS),--prune-shadows,) \
 			$(if $(DRY_RUN),--dry-run,); \
-	 if [ -n "$(DOWNLOAD)" ] && [ -z "$(DRY_RUN)" ] && [ -s "$$download_report" ]; then \
-		echo; \
-		echo "  probing newly downloaded Ollama model(s) before final active write"; \
-		$(MAKE) --no-print-directory probe-reasoning PROBE_MODELS="$$(tr '\n' ' ' < "$$download_report")"; \
-		OLLAMA_CONTAINER=$(OLLAMA_CONTAINER) CONTAINER_RUNTIME=$(CONTAINER_RUNTIME) \
-		VLLM_MODELS_DIR=$(VLLM_MODELS_DIR) HF_CLI=$(HF_CLI) \
-		GPU_MEMORY_GB=$${VRAM:-$(GPU_MEMORY_GB)} MAX_CONTEXT_LEN=$${CONTEXT:-$(MAX_CONTEXT_LEN)} \
-		VERBOSE=$${VERBOSE:-0} \
-			python3 scripts/select-models.py \
-				$(if $(FAMILY),--family $(FAMILY),) \
-				$(if $(VRAM),--vram $(VRAM),) \
-				$(if $(CONTEXT),--context $(CONTEXT),) \
-				$(if $(KV),--kv-dtype $(KV),) \
-				$(if $(DOWNLOAD_LIMIT),--max-downloads $(DOWNLOAD_LIMIT),) \
-				$(if $(PRUNE),--prune,) \
-				$(if $(PRUNE_SHADOWS),--prune-shadows,) \
-				$(if $(DRY_RUN),--dry-run,); \
-	 fi; \
-	 after_sha=$$(grep -v '^#' deploy/active-models.yaml 2>/dev/null | sha256sum | awk '{print $$1}' || echo "none"); \
-	 if [ "$$before_sha" != "$$after_sha" ] && \
-	    $(CONTAINER_RUNTIME) ps --format '{{.Names}}' 2>/dev/null | grep -q '^devai-router$$'; then \
-		echo; \
-		echo "  active-models.yaml changed — restarting devai-router so it picks up the new map"; \
-		$(CONTAINER_RUNTIME) rm -f devai-router >/dev/null && \
-		$(COMPOSE) -f $(CACHE_COMPOSE) up -d router; \
-	 fi
+	 echo; \
+	 echo "  next: 'make probe' to populate cache cells for any newly pulled tags"
 
 catalog-regen: ## Regenerate deploy/models.yaml from scripts/model-families.yaml using live upstream data
 	python3 scripts/generate-catalog.py

@@ -28,10 +28,11 @@ make cache-up        # Start active services (Ollama, router, Open WebUI). vLLM/
 make cache-down      # Stop all services
 make cache-status    # Show status, models, disk usage
 
-# Models — single download path through model-select
-make model-select               # Probe + write active-models.yaml
-make model-select DOWNLOAD=1    # …also pull missing fitting variants
-make model-select FAMILY=qwen3.5 DOWNLOAD=1   # scope to one family
+# Models — three orthogonal commands after the resilient-splashing-peach refactor
+make probe                      # Probe each downloaded digest at every (VRAM, ctx) tier
+make model-fit                  # Print which models fit at chosen VRAM/CONTEXT (no writes)
+make model-pull                 # Download best-fit candidates from catalog (catalog-driven)
+make model-pull FAMILY=qwen3.5  # Scope to one family
 make ollama-list                # List downloaded Ollama models
 make vllm-list                  # List on-disk vLLM weights (backend currently dormant)
 
@@ -56,7 +57,7 @@ Copy `.env.example` to `.env` before first use. Key settings:
 Model catalog is in `deploy/models.yaml` (single source of truth for all models). GPU inference settings:
 
 - `GPU_MEMORY_GB` — Total GPU VRAM in GB (default: 24). Used by router to calculate memory fractions and context limits.
-- `MAX_CONTEXT_LEN` — Default max context length in tokens (default: 131072 = 128K). Auto-reduced when KV cache can't fit it. Per-model `context:` overrides are written into `deploy/active-models.yaml` by `select-models.py` from probe data — not hand-edited.
+- `MAX_CONTEXT_LEN` — Default max context length in tokens (default: 131072 = 128K). The router caps each model's per-name context at `min(model.max_context, MAX_CONTEXT_LEN)`. The probe cache (`deploy/.ollama-reasoning-cache.json`) is the source of truth — `deploy/active-models.yaml` no longer exists.
 
 ## Architecture
 
@@ -77,7 +78,7 @@ Agent → devai-router:11435 → devai-vllm:11434   (NVFP4 models via vLLM)     
 Agent → devai-router:11436 → devai-sglang:11434 (NVFP4 + HF via SGLang)     ← dormant
 ```
 
-- **devai-router** — Multi-port GPU-aware reverse proxy. One port per backend. No message inspection — port determines backend. Manages GPU exclusion (only one backend uses GPU at a time), graceful drain on switch, idle timeout, dynamic GPU memory allocation (`--gpu-memory-utilization` for vLLM, `--mem-fraction-static` for SGLang). Context length per request comes from the per-model `context:` in `active-models.yaml`, falling back to `MAX_CONTEXT_LEN`. All vLLM/SGLang lifecycle code stays compiled in (~1070 lines total in `gpu-arbiter/main.go`); only the auxiliary containers are dormant.
+- **devai-router** — Multi-port GPU-aware reverse proxy. One port per backend. No message inspection — port determines backend. Manages GPU exclusion (only one backend uses GPU at a time), graceful drain on switch, idle timeout, dynamic GPU memory allocation (`--gpu-memory-utilization` for vLLM, `--mem-fraction-static` for SGLang). Context length per request comes from `min(model.max_context, MAX_CONTEXT_LEN)`, computed from the probe cache at startup. All vLLM/SGLang lifecycle code stays compiled in; only the auxiliary containers are dormant.
 - **devai-ollama** — Unmodified `ollama/ollama:latest`. GGUF models, GPU auto-detected. `OLLAMA_MAX_LOADED_MODELS=1` ensures clean model switching. `OLLAMA_CONTEXT_LENGTH` defaults to 262144 (compose env).
 - **devai-vllm** *(dormant)* — `vllm/vllm-openai` image. NVFP4 models for Blackwell GPUs. Container lifecycle managed by router via Podman API. Behind `profiles: ["backends-disabled"]` in compose.
 - **devai-sglang** *(dormant)* — `lmsysorg/sglang` image. NVFP4 + HuggingFace models, RadixAttention for multi-turn speedup. Same profile, same lifecycle hookup.
@@ -101,11 +102,11 @@ All services share `devai-net` network. Model data stored under `/var/cache/deva
 
 Interactive model → agent selection via fzf. Used by both `make shell-*` (via `agent-picker`) and JupyterLab launcher cards.
 
-- `scripts/model-picker.py` — Python TUI, two-step fzf picker. Reads `deploy/active-models.yaml` for the run-time active set and `deploy/.ollama-reasoning-cache.json` (digest-keyed, schema v2) for per-tier probe data. Falls back to `deploy/models.yaml` for catalog metadata only. Backend is derived from the chosen model's entry — there's no explicit backend step.
+- `scripts/model-picker.py` — Python TUI, two-step fzf picker. Reads `deploy/.ollama-reasoning-cache.json` (digest-keyed, schema v3, probes nested by VRAM × CONTEXT) for fit data. Falls back to `deploy/models.yaml` for catalog metadata only. Backend is derived from the chosen model's entry — there's no explicit backend step.
 - `scripts/agent-picker.sh` — Shell wrapper, execs model-picker.py.
 - `packages/jupyter-ai-launchers/src/index.ts` — JupyterLab extension, each card runs `model-picker --agent <name>`.
 
-**Filter:** the picker shows one row per (family, context tier, reasoning status) bucket. A model is eligible at a tier only when the probe cache contains a measurement at exactly that tier with `fully_on_gpu: true`. There is no interpolation — gaps mean "re-run `make probe-reasoning`". HF entries stay `capability: unknown` because no probe runner exists for vLLM/SGLang yet (see `docs/sidelined-backends.md`); the picker hides them.
+**Filter:** the picker shows one row per (family, context tier, reasoning status) bucket at the picker's VRAM band (env `VRAM` or `GPU_MEMORY_GB`). A model is eligible at a (vram, ctx) cell only when the probe cache contains a measurement there with `fully_on_gpu: true`. There is no interpolation — gaps mean "re-run `make probe`". HF entries stay `capability: unknown` because no probe runner exists for vLLM/SGLang yet (see `docs/sidelined-backends.md`); the picker hides them.
 
 ### Building the JupyterLab extension
 
@@ -124,15 +125,15 @@ Pre-built output lives in `packages/jupyter-ai-launchers/jupyter_ai_launchers/la
 
 ```
 deploy/models.yaml            — Auto-generated catalog (every variant the upstream catalog declares)
-deploy/active-models.yaml     — Auto-generated active subset (downloaded ∩ fits ∩ probed) — what router and picker read
+deploy/.ollama-reasoning-cache.json — Auto-generated probe cache (schema v3, digest-keyed, probes nested by VRAM × CONTEXT) — what router and picker read
 deploy/docker-compose.yaml    — Infrastructure services (vllm/sglang in `backends-disabled` profile)
 deploy/Dockerfile.base        — Base image
 deploy/Dockerfile.lab         — Lab image
 deploy/Dockerfile.router      — Router image (distroless)
 gpu-arbiter/main.go           — GPU arbiter source (multi-port proxy, ~1070 lines Go)
 scripts/generate-catalog.py   — Refresh deploy/models.yaml from upstream (HF + Ollama registry)
-scripts/probe-ollama-reasoning.py — Per-tier probe: capability + measured VRAM at each context tier (schema v2, digest-keyed)
-scripts/select-models.py      — Combine catalog + probe + disk → active-models.yaml
+scripts/probe-ollama-reasoning.py — Per-(VRAM, ctx) probe: capability + measured VRAM at each (band, tier) cell (schema v3, digest-keyed)
+scripts/select-models.py      — Print fitting models / pull missing best-fit candidates (no file writes)
 scripts/model-picker.py       — Two-step interactive picker (model → agent)
 tests/test-router.sh          — Ollama-side integration tests
 docs/sidelined-backends.md    — Why vLLM/SGLang are dormant + how to reactivate

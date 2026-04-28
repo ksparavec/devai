@@ -38,13 +38,6 @@ _CATALOG_PATHS = [
     str(Path(__file__).resolve().parent.parent / "deploy" / "models.yaml"),
 ]
 
-# Active catalog with precomputed VRAM breakdown (written by select-models.py).
-# We read this for display only — never to decide what's downloaded.
-_ACTIVE_CATALOG_PATHS = [
-    "/etc/devai/active-models.yaml",
-    str(Path(__file__).resolve().parent.parent / "deploy" / "active-models.yaml"),
-]
-
 _PROBE_CACHE_PATHS = [
     "/etc/devai/.ollama-reasoning-cache.json",
     str(Path(__file__).resolve().parent.parent / "deploy" / ".ollama-reasoning-cache.json"),
@@ -134,28 +127,14 @@ def _load_catalog() -> dict[str, dict]:
     return {}
 
 
-def _load_active_entries() -> dict[str, dict]:
-    """Lookup of name → full active-models.yaml entry (vram, reasoning, …).
-
-    Written by scripts/select-models.py. Returns {} if not mounted.
-    """
-    for path in _ACTIVE_CATALOG_PATHS:
-        if os.path.isfile(path):
-            with open(path) as fh:
-                data = yaml.safe_load(fh) or {}
-            return {m["name"]: m for m in data.get("models", []) or []
-                    if isinstance(m, dict)}
-    return {}
-
-
 def _load_probe_records() -> dict[str, dict]:
-    """Lookup of model name → v2 digest entry from the probe cache.
+    """Lookup of model name → v3 digest entry from the probe cache.
 
-    Schema v2 keys are digests; each entry carries an `aliases` list and
-    a `probes` map keyed by stringified context. Every alias resolves to
-    the same digest entry here so a `name`-based lookup downstream stays
-    one-call. Legacy v1 caches (name@digest keys) are migrated in-memory
-    on the fly using the prober's helper — the on-disk file is left as-is.
+    Schema v3 keys are digests; each entry carries an `aliases` list and
+    a `probes` map nested by VRAM band then context. Every alias resolves
+    to the same digest entry here so a `name`-based lookup downstream
+    stays one-call. Legacy v1 / v2 caches are migrated in-memory using
+    the prober's helper — the on-disk file is unchanged.
     """
     for path in _PROBE_CACHE_PATHS:
         if not os.path.isfile(path):
@@ -165,7 +144,7 @@ def _load_probe_records() -> dict[str, dict]:
         if not data:
             return {}
         if not all(
-            isinstance(v, dict) and v.get("schema_version") == 2
+            isinstance(v, dict) and v.get("schema_version") == 3
             for v in data.values()
         ):
             data = _migrate_in_memory(data)
@@ -180,7 +159,7 @@ def _load_probe_records() -> dict[str, dict]:
 
 
 def _migrate_in_memory(raw: dict) -> dict:
-    """Run probe-ollama-reasoning's v1→v2 conversion without touching disk."""
+    """Run probe-ollama-reasoning's v1/v2 → v3 conversion without touching disk."""
     import importlib.util
     import sys
     here = Path(__file__).resolve().parent
@@ -189,8 +168,9 @@ def _migrate_in_memory(raw: dict) -> dict:
         "_probe_module", here / "probe-ollama-reasoning.py",
     )
     mod = importlib.util.module_from_spec(spec)
+    sys.modules["_probe_module"] = mod  # frozen-dataclass workaround
     spec.loader.exec_module(mod)
-    migrated, _ = mod.ensure_v2(raw)
+    migrated, _, _ = mod.ensure_v3(raw)
     return migrated
 
 
@@ -274,7 +254,6 @@ def _discover_models() -> list[dict]:
     recomputed here.
     """
     catalog = _load_catalog()
-    active = _load_active_entries()
     probes = _load_probe_records()
     out: list[dict] = []
 
@@ -290,11 +269,8 @@ def _discover_models() -> list[dict]:
                 name = f"{lib_dir.name}:{tag_file.name}"
                 meta = catalog.get(name, {})
                 disk_gb = _ollama_disk_size_gb(lib_dir.name, tag_file.name)
-                act = active.get(name) or {}
                 probe = probes.get(name) or {}
-                active_cap = (act.get("reasoning") or {}).get("capability", "unknown")
-                cap = _capability_from_probe(probe, active_cap)
-                active_details = act.get("details") or {}
+                cap = _capability_from_probe(probe, "unknown")
                 probe_details = _details_from_probe(probe)
                 out.append({
                     "name": name,
@@ -302,15 +278,17 @@ def _discover_models() -> list[dict]:
                     "backend": "ollama",
                     "size": meta.get("size") or f"{disk_gb:.2f} GB",
                     "purpose": meta.get("purpose", ""),
-                    "vram": _vram_from_probe(probe) or act.get("vram"),
+                    "vram": _vram_from_probe(probe),
                     "family": meta.get("family", ""),
                     "capability": cap,
                     "probe": probe,
-                    "moe": _moe_from_probe(probe) or act.get("moe"),
-                    "details": probe_details or active_details,
+                    "moe": _moe_from_probe(probe),
+                    "details": probe_details,
                 })
 
-    # HF/vLLM/SGLang: <name>/config.json
+    # HF/vLLM/SGLang: <name>/config.json (no probe runner yet — capability
+    # stays "unknown" and rows are hidden by the picker filter until those
+    # backends get their own probe driver).
     vbase = Path(_VLLM_DIR)
     if vbase.is_dir():
         for d in sorted(vbase.iterdir()):
@@ -319,20 +297,17 @@ def _discover_models() -> list[dict]:
             name = d.name
             meta = catalog.get(name, {})
             disk_gb = _hf_disk_size_gb(d)
-            # HF models can run on vllm or sglang; default per env.
             backend = _HF_BACKEND if _HF_BACKEND in ("vllm", "sglang") else "vllm"
-            act = active.get(name) or {}
-            cap = (act.get("reasoning") or {}).get("capability", "unknown")
             out.append({
                 "name": name,
                 "source": "hf",
                 "backend": backend,
                 "size": meta.get("size") or f"{disk_gb:.2f} GB",
                 "purpose": meta.get("purpose", ""),
-                "vram": act.get("vram"),
+                "vram": None,
                 "family": meta.get("family", ""),
-                "capability": cap,
-                "moe": act.get("moe"),
+                "capability": "unknown",
+                "moe": None,
             })
 
     return out
@@ -473,33 +448,26 @@ def _vram_at(v: dict, context: int) -> tuple[float | None, int]:
 
 
 def _measured_point_at(v: dict, context: int) -> dict:
-    """Return the v2 probe record at min(context, max_context), or {}.
+    """Return the v3 probe cell at the picker's VRAM band and effective ctx.
 
-    Two shapes are accepted:
-      - Cache shape: v["probes"] is a dict keyed by str(ctx). We pick the
-        record at the effective context.
-      - Active-models.yaml shape: v carries a single measurement
-        (total_gb, vram_gb, context, spilled_to_cpu) as a flat dict. This
-        is the picker's fallback when the probe cache isn't mounted; we
-        treat it as a measured point at v["context"].
+    `v` is the full v3 entry as exposed by `_vram_from_probe(probe)`.
+    The probes map is nested: `probes[<vram_gb>][<ctx>]`. We use the
+    picker's `_VRAM_BUDGET` env (an int GB) as the band key. If no cell
+    is recorded for the (band, ctx) pair we return {} — there is no
+    interpolation any more.
     """
     max_ctx = int(v.get("max_context") or 0)
     eff_ctx = min(context, max_ctx) if max_ctx else context
     probes = v.get("probes")
-    if isinstance(probes, dict) and probes:
-        rec = probes.get(str(eff_ctx))
-        if isinstance(rec, dict):
-            return rec
-    if v.get("source") == "probe" and v.get("total_gb") is not None:
-        flat_ctx = int(v.get("context") or 0)
-        if flat_ctx == eff_ctx:
-            return {
-                "ctx": flat_ctx,
-                "actual_total_gb": float(v["total_gb"]),
-                "actual_vram_gb": float(v.get("vram_gb") or v["total_gb"]),
-                "fully_on_gpu": not bool(v.get("spilled_to_cpu", False)),
-                "actual_context": flat_ctx,
-            }
+    if not isinstance(probes, dict) or not probes:
+        return {}
+    band_key = str(int(_VRAM_BUDGET))
+    band = probes.get(band_key)
+    if not isinstance(band, dict):
+        return {}
+    rec = band.get(str(eff_ctx))
+    if isinstance(rec, dict):
+        return rec
     return {}
 
 

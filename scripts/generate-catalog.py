@@ -75,6 +75,21 @@ def hf_config(repo: str) -> dict:
     return json.loads(_http_text(f"{HF_RAW}/{repo}/raw/main/config.json"))
 
 
+def hf_gguf_files(repo: str) -> list[dict]:
+    """List every .gguf file in an HF repo with its size in bytes.
+
+    Returns [{"filename": "...gguf", "size_bytes": <int>}, ...]. Used by
+    the gguf_repos source kind to enumerate one catalog row per quant.
+    """
+    data = _http_json(f"{HF_API}/{repo}?blobs=true")
+    out: list[dict] = []
+    for f in data.get("siblings", []):
+        name = f.get("rfilename", "")
+        if name.endswith(".gguf"):
+            out.append({"filename": name, "size_bytes": int(f.get("size") or 0)})
+    return out
+
+
 # ── Ollama ───────────────────────────────────────────────────────────────────
 
 def ollama_tags(library: str) -> list[str]:
@@ -142,10 +157,11 @@ class Entry:
     repo: str | None
     size_gb: float
     arch: Arch
-    source_kind: str  # "hf" | "ollama"
+    source_kind: str  # "hf" | "ollama" | "gguf"
     thinking: bool = False  # family-level pre-probe hint; final capability
                             # is determined at runtime by
                             # scripts/probe-ollama-reasoning.py
+    gguf_filename: str | None = None  # set on source_kind == "gguf"
 
 
 def _gb(bytes_: int) -> float:
@@ -177,6 +193,56 @@ def _entry_hf(repo: str, family: str, fallback_arch: Arch,
         arch=arch,
         source_kind="hf",
         thinking=thinking,
+    )
+
+
+def _gguf_tag_token(filename: str) -> str:
+    """Derive a stable Ollama tag suffix from a .gguf filename.
+
+    `Qwen3.5-27B-UD-Q3_K_XL.gguf` → `ud-q3_k_xl`. We strip the model-name
+    prefix (everything up to and including the size-in-B token) and the
+    `.gguf` suffix, then lowercase. `_` and `-` are kept as-is. Falls
+    back to a sanitised lowercase of the full stem when no size token
+    is present.
+    """
+    import re
+    stem = filename
+    if stem.endswith(".gguf"):
+        stem = stem[: -len(".gguf")]
+    # Find the rightmost size-in-B token (e.g. "27B", "9B", "1.5B"). Quant
+    # tokens always come AFTER it in canonical filenames.
+    matches = list(re.finditer(r"(?<![A-Za-z0-9])(\d+(?:\.\d+)?B)(?=[-_]|$)", stem))
+    if matches:
+        stem = stem[matches[-1].end():].lstrip("-_")
+    return stem.lower() or "unspec"
+
+
+def _entry_gguf(repo: str, file_meta: dict, family: str, arch: Arch,
+                tag_prefix: str, thinking: bool) -> Entry | None:
+    """One catalog row per .gguf file inside an HF repo.
+
+    `tag_prefix` anchors the local Ollama tag (e.g. "27b") so the
+    final name is `<family>:<tag_prefix>-<quant_token>`. Architecture
+    comes from the family `arch_ref` — quantization doesn't change
+    the architecture, so the same arch applies to every quant.
+    """
+    size_bytes = int(file_meta.get("size_bytes") or 0)
+    if size_bytes == 0:
+        print(f"  [warn] gguf {repo}/{file_meta.get('filename')}: zero size — "
+              f"skipping", file=sys.stderr)
+        return None
+    quant_token = _gguf_tag_token(file_meta["filename"])
+    tag = f"{tag_prefix}-{quant_token}" if tag_prefix else quant_token
+    return Entry(
+        name=f"{family}:{tag}",
+        family=family,
+        backend=["ollama"],          # GGUF runs on the ollama backend
+        repo=repo,
+        size_gb=_gb(size_bytes),
+        arch=arch,
+        source_kind="gguf",
+        thinking=thinking,
+        gguf_filename=file_meta["filename"],
     )
 
 
@@ -254,12 +320,52 @@ def main() -> None:
                 print(f"  (skipped {skipped} tag(s): platform-gated or "
                       f"unavailable)")
 
-        # gguf_repos: parsed-and-ignored in commit 1 (anchor commit).
-        # Commit 2 of the simplification refactor wires HF file enumeration
-        # and emits one catalog row per .gguf file with source: gguf.
-        if fam.get("gguf_repos"):
-            print(f"  (gguf_repos present but loader not wired yet — "
-                  f"see commit 2 of resilient-splashing-peach)")
+        for spec in fam.get("gguf_repos") or []:
+            repo = spec.get("repo")
+            if not repo:
+                print(f"  [warn] gguf_repos entry missing 'repo' — skipping",
+                      file=sys.stderr)
+                continue
+            tag_prefix = (spec.get("tag_prefix") or "").strip("-_")
+            # include semantics:
+            #   key absent             → include every .gguf in the repo
+            #   key present, list []   → include nothing (safe placeholder)
+            #   key present, list[..] → only files whose lowered filename
+            #                            contains any of these tokens
+            include_raw = spec.get("include")
+            include_filter: list[str] | None
+            if "include" in spec:
+                include_filter = [s.strip().lower() for s in (include_raw or []) if s]
+            else:
+                include_filter = None
+            filter_label = (
+                "all" if include_filter is None
+                else (f"{include_filter}" if include_filter else "<empty — none emitted>")
+            )
+            print(f"  GGUF: {repo} (tag_prefix={tag_prefix or '<none>'}, "
+                  f"include={filter_label}) ...")
+            if include_filter == []:
+                continue
+            try:
+                files = hf_gguf_files(repo)
+            except Exception as e:
+                print(f"  [warn] HF GGUF list {repo}: {e}", file=sys.stderr)
+                continue
+            kept = 0
+            for fmeta in files:
+                fname = fmeta["filename"]
+                if include_filter is not None:
+                    fname_lc = fname.lower()
+                    if not any(token in fname_lc for token in include_filter):
+                        continue
+                e = _entry_gguf(repo, fmeta, name, fam_arch, tag_prefix, thinking)
+                if e is None:
+                    continue
+                all_entries.append(e)
+                print(f"    gguf: {e.name} → {e.size_gb:.1f} GB ({fname})")
+                kept += 1
+            if not kept:
+                print(f"  [info] {repo}: filter matched 0 files (no entries)")
 
     # ── Write deploy/models.yaml ─────────────────────────────────────────
     lines: list[str] = []
@@ -286,6 +392,8 @@ def main() -> None:
         if e.repo:
             lines.append(f'    repo: "{e.repo}"')
         lines.append(f'    source: {e.source_kind}')
+        if e.gguf_filename:
+            lines.append(f'    gguf_filename: "{e.gguf_filename}"')
         lines.append(f'    size: "{e.size_gb:.2f} GB"')
         lines.append(f"    arch: {e.arch.to_yaml()}")
         lines.append(f'    arch_source: "{e.arch.source}"')

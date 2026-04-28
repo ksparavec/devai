@@ -46,18 +46,18 @@ In rough order, smallest task first:
 2. **Add a probe runner for vLLM/SGLang.** `scripts/probe-ollama-reasoning.py`
    speaks `/api/chat` + `/api/ps` (Ollama-specific). The vLLM/SGLang
    equivalent uses `/v1/chat/completions` plus `nvidia-smi` (or vLLM's
-   prometheus metrics) for VRAM. Output must conform to schema v2: one
-   digest-keyed entry per set of weights, with a `probes` map keyed by
-   context tier and per-tier `{actual_total_gb, actual_vram_gb,
-   fully_on_gpu, capability}`. No interpolation — each tier is measured
-   directly. Until such a runner exists, every HF entry stays
-   `capability: unknown` and the picker hides them.
+   prometheus metrics) for VRAM. Output must conform to schema v3: one
+   digest-keyed entry per set of weights, with a `probes` map nested by
+   VRAM band then context, each cell carrying `{actual_total_gb,
+   actual_vram_gb, fully_on_gpu, capability}`. No interpolation — each
+   (vram, ctx) cell is measured directly. Until such a runner exists,
+   every HF entry stays `capability: unknown` and the picker hides them.
 
-3. **Rerun selection.** Once probes succeed, `make model-select` reads
-   the v2 cache and writes one row per (family, effective_context,
-   capability) bucket into `deploy/active-models.yaml`, alias names
-   collapsed under `aliases:`. The picker filter starts admitting the
-   new backend's rows and the existing router path serves them.
+3. **Re-probe.** `make probe PROBE_VRAMS=...` populates the cache for
+   each VRAM band by recreating devai-ollama with `OLLAMA_GPU_OVERHEAD`
+   set so the daemon behaves like a smaller card. The router and picker
+   read the cache directly (no `active-models.yaml` any more) and the
+   new backend's rows show up automatically once their cells exist.
 
 4. **Optional: relax the picker filter** if you want to expose
    not-yet-probed vLLM/SGLang models in the UI before step 2 lands.

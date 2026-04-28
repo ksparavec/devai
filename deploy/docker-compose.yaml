@@ -28,6 +28,10 @@ services:
       - OLLAMA_KEEP_ALIVE=${OLLAMA_KEEP_ALIVE:-300s}
       - OLLAMA_MAX_LOADED_MODELS=1
       - OLLAMA_CONTEXT_LENGTH=${OLLAMA_CONTEXT_LENGTH:-262144}
+      # Reserved bytes off the visible VRAM. Set non-zero by `make probe`
+      # to simulate a smaller GPU during probing (so a 24G host can produce
+      # cache cells valid for a 16G target). 0 = no constraint.
+      - OLLAMA_GPU_OVERHEAD=${OLLAMA_GPU_OVERHEAD:-0}
     volumes:
       - /var/cache/devai/ollama:/root/.ollama
     devices:

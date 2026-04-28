@@ -74,14 +74,17 @@ make cache-up        # Start Ollama, router, Open WebUI, caches
 
 ### 4. Pull, Probe & Select
 
-A single entry point. `make model-select` chains the reasoning probe and writes
-`deploy/active-models.yaml` (what the router serves and the picker shows).
+Three orthogonal commands. `make probe` populates the probe cache (single source
+of truth); `make model-fit` queries it; `make model-pull` downloads.
 Add `DOWNLOAD=1` to also pull missing variants in the same run.
 
 ```bash
-make model-select DOWNLOAD=1                 # pull + probe + select all fitting
-make model-select DOWNLOAD=1 FAMILY=qwen3.5  # scope to one family
-make model-select                            # re-probe + re-select after a manual pull
+make probe                                    # probe every (VRAM, ctx) cell
+make probe PROBE_VRAMS=24G PROBE_CONTEXTS=128K # one band, one tier
+make model-pull                               # download missing best-fit candidates
+make model-pull FAMILY=qwen3.5                # scope to one family
+make model-fit                                # print fitting models at host VRAM × MAX_CONTEXT_LEN
+make model-fit VRAM=16 CONTEXT=32768          # query a different (VRAM, ctx)
 ```
 
 ### 5. Run
@@ -151,13 +154,13 @@ The router (`devai-router`) is a small Go reverse proxy (~9 MB distroless) that:
 
 ### Reasoning & MoE
 
-The router doesn't *guess* whether a model can reason. `make probe-reasoning` runs `scripts/probe-ollama-reasoning.py` against the live Ollama and exercises each model at every tier in `PROBE_CONTEXTS` (default `32768,65536,131072,262144`). For each tier the probe loads the model with `options.num_ctx` set to that exact value, then reads `/api/ps` to record actual total memory, on-GPU memory, and CPU/RAM spill. Each tier is measured directly — there is no interpolation, no two-point linear fit.
+The router doesn't *guess* whether a model can reason. `make probe` runs `scripts/probe-ollama-reasoning.py` against the live Ollama. It probes a 2-D matrix per digest: every VRAM band in `PROBE_VRAMS` (default `16G,24G`) crossed with every context tier in `PROBE_CONTEXTS` (default `32K,64K,128K,256K`). Between bands the orchestrator recreates devai-ollama with `OLLAMA_GPU_OVERHEAD` set to `(host_vram - target_vram) * 1024^3`, so the daemon behaves as if it had only the target VRAM — which lets a 24G host produce cache cells valid for 16G targets. Each cell loads the model with `options.num_ctx` set to that tier and reads `/api/ps` for actual total memory, on-GPU memory, and CPU/RAM spill. No interpolation.
 
-The probe cache (`deploy/.ollama-reasoning-cache.json`, schema v2) is digest-keyed: one record per set of weights, with a `probes` map keyed by stringified context tier. Aliases pointing to the same digest (e.g. `qwen3.5:latest` and `qwen3.5:9b-q8_0`) live under the entry's `aliases` list and share its measurements — they're probed at most once per tier. The model's true `max_context` ceiling (128K, 256K, 1M, …) is read independently from `/api/show`'s `<arch>.context_length`; tiers above `max_context` are silently capped, so a 128K-only model never wastes a probe on 256K.
+The probe cache (`deploy/.ollama-reasoning-cache.json`, schema v3) is digest-keyed: one record per set of weights, with a `probes` map nested as `probes[<vram_gb>][<ctx>]`. Aliases pointing to the same digest (e.g. `qwen3.5:latest` and `qwen3.5:9b-q8_0`) live under the entry's `aliases` list and share its measurements. The model's true `max_context` ceiling (128K, 256K, 1M, …) is read independently from `/api/show`'s `<arch>.context_length`; tiers above `max_context` are silently capped, so a 128K-only model never wastes a probe on 256K.
 
-Probe runs are incremental: existing per-tier results are immutable. A new tier in `PROBE_CONTEXTS` only fills gaps; existing tiers are left alone. To re-probe one tier specifically, pass `PROBE_FORCE_CTX=64K`. To force a full re-probe of every tier, pass `PROBE_FORCE=1`. When a digest disappears from `/api/tags` its entry is dropped automatically.
+Probe runs are incremental: existing cells are immutable. A new (band, tier) only fills a gap; existing cells are left alone. To re-probe one tier specifically, pass `PROBE_FORCE_CTX=64K`. To force a full re-probe of every cell at the current VRAM band, pass `PROBE_FORCE=1`. When a digest disappears from `/api/tags`, its entry is dropped automatically.
 
-**Reasoning capabilities** (`reasoning.capability` in `active-models.yaml`):
+**Reasoning capabilities** (top-level `capability` in the probe cache entry):
 - `structured` — UI label: Native reasoning. Model returns reasoning in a separate `message.thinking` field. Clean, agent-friendly. Native `think: true|false` controls it.
 - `inline` — UI label: Inline reasoning. Reasoning appears as `<think>…</think>` blocks inside `message.content`. Visible but contaminates the answer.
 - `unsupported` — UI label: No reasoning. No reasoning behavior observed.
@@ -186,19 +189,21 @@ scripts/model-families.yaml           hand-edited (add/remove families)
         ▼  python3 scripts/generate-catalog.py        ── make catalog-regen
 deploy/models.yaml                    catalog: name, size, arch, purpose
         │
-        ▼  python3 scripts/probe-ollama-reasoning.py  ── make probe-reasoning
-deploy/.ollama-reasoning-cache.json   per-digest: capability, vram, MoE info
-        │
-        ▼  python3 scripts/select-models.py           ── make model-select
-deploy/active-models.yaml             catalog ∩ disk ∩ fits, with probe data
-        │
-        ▼  router loads at startup
-gpu-arbiter modelCapability map       drives reasoning policy + lifecycle
+        │   ┌─ for each VRAM band, recreate devai-ollama with
+        │   │  OLLAMA_GPU_OVERHEAD set, then probe each context tier
+        ▼  python3 scripts/probe-ollama-reasoning.py  ── make probe
+deploy/.ollama-reasoning-cache.json   per-digest, per-(VRAM, ctx) cells
+        │                             (single source of truth for fit data)
+        ├──► router (gpu-arbiter)     reads cache directly, builds
+        │                             modelContexts/modelCapability maps
+        ├──► picker (model-picker.py) reads cache directly, renders tiers
+        └──► diagnostic (model-fit)   prints fitting models at chosen
+                                       (VRAM, CONTEXT)
 ```
 
-`make model-select` chains `probe-reasoning` automatically. Day-to-day after pulling a new model: `make model-select && podman rm -f devai-router && make cache-up`.
+Day-to-day after pulling a new model: `make probe && podman rm -f devai-router && make cache-up`.
 
-The interactive model picker reads both `active-models.yaml` and the probe cache. It shows the best Ollama row per family, per context tier (32K, 64K, 128K, 256K), and per user-facing status: Native reasoning, Inline reasoning, No reasoning, CPU offload.
+The interactive model picker reads the probe cache directly. It shows the best Ollama row per family, per context tier (32K, 64K, 128K, 256K), and per user-facing status: Native reasoning, Inline reasoning, No reasoning, CPU offload — all filtered to the picker's VRAM band (env `VRAM` or `GPU_MEMORY_GB`).
 
 ## Configuration
 
@@ -214,7 +219,7 @@ The interactive model picker reads both `active-models.yaml` and the probe cache
 | `JUPYTER_TOKEN` | — | Fixed access token (set in .env) |
 | `APT_PROXY` | — | APT cache URL (e.g. `http://localhost:3142`) |
 | `GPU_MEMORY_GB` | 24 | Total GPU VRAM in GB. Picker filter ceiling. Override per-call: `VRAM=48 make shell-gpu` |
-| `MAX_CONTEXT_LEN` | 131072 | Default context for VRAM fit (128K). Override per-call: `CONTEXT=32768 make shell-gpu` (32K) or `CONTEXT=262144` (256K). `make model-select` probes at this target unless `PROBE_HIGH` is set. |
+| `MAX_CONTEXT_LEN` | 131072 | Operator-side cap on per-model context, in tokens (128K). The router reads `min(model.max_context, MAX_CONTEXT_LEN)` from the probe cache at startup. `make probe` is independent and probes the full `PROBE_CONTEXTS` tier set. |
 | `PROBE_LOW` | 32768 | LOW context used when the target context is above 32K. |
 | `PROBE_HIGH` | `CONTEXT` / `MAX_CONTEXT_LEN` | Target probe context. Override only when you intentionally want to probe a context different from selection. |
 | `OLLAMA_CONTEXT_LENGTH` | 262144 | Runtime ollama cap (compose env). May cap the probe's `num_ctx` |
@@ -228,15 +233,15 @@ Any agent that talks to the router can set `X-DevAI-Reasoning: off|auto|...` on 
 
 ### `scripts/model-families.yaml` — Family definitions
 
-Hand-maintained source of model lineages. Each family declares its `ollama_library` and/or `hf_repos`, plus an `arch_ref` HF repo for architecture metadata. The `thinking: true|false` flag in this file is a hint for humans curating the families file — it is no longer propagated into `deploy/models.yaml`. Final reasoning capability is determined per-variant at probe time and recorded in `deploy/active-models.yaml`.
+Hand-maintained source of model lineages. Each family declares its `ollama_repos`, `hf_repos`, and/or `gguf_repos`, plus an `arch_ref` HF repo for architecture metadata. The `thinking: true|false` flag is a hint for humans — final reasoning capability is determined per-variant at probe time and recorded in the probe cache.
 
 ### `deploy/models.yaml` — Generated catalog
 
 Auto-generated by `make catalog-regen` from upstream HF and Ollama APIs. Has size, architecture, and purpose for every variant. Don't hand-edit.
 
-### `deploy/active-models.yaml` — Active subset
+### `deploy/.ollama-reasoning-cache.json` — Probe cache (single source of truth)
 
-Auto-generated by `make model-select`. Contains the best model in each `(family, effective_context, capability)` bucket — one row, alias names sharing the digest collapsed under `aliases:`. The router resolves any alias to the canonical row's per-model context cap. Each row carries `digest`, `reasoning.{capability, disable_verified}`, `vram.{source, total_gb, vram_gb, context, spilled_to_cpu, max_context}`, optional `moe.{experts_total, experts_used}`, and probe-derived `details.{param_size, quantization}`. The picker reads `deploy/.ollama-reasoning-cache.json` directly to enumerate other tiers and rows the active set intentionally dropped (e.g. higher-precision quants that lost a bucket).
+Auto-generated by `make probe`. Schema v3, digest-keyed. Each entry carries `aliases`, `max_context`, top-level `capability`, optional `disable_verified`, and a 2-D `probes` map nested as `probes[<vram_gb>][<ctx>]`. Each probe cell records `actual_total_gb`, `actual_vram_gb`, `fully_on_gpu`, per-cell capability, and timestamp. Both the router (`gpu-arbiter`) and the picker read this file directly. There is no separate active-models.yaml any more — the cache IS the active set.
 
 ### Adding Python Packages
 
@@ -260,11 +265,11 @@ build            Build all                cache-clean     Remove cached data    
 fetch-cli        Update CLI binaries
 pull-images      Pull base images
 
-OLLAMA (GGUF — active)                    vLLM (NVFP4 — dormant)                    CATALOG
+OLLAMA (GGUF — active)                    vLLM (NVFP4 — dormant)                    CATALOG / FIT
 ollama-list      List downloaded models   vllm-list       List on-disk weights      catalog-regen     Refresh deploy/models.yaml from upstream
-ollama-rm        Remove model             vllm-rm         Remove weights            probe-reasoning   Probe ollama for reasoning + VRAM
-ollama-status    Show status              vllm-status     Show status               model-select      Probe + write active-models.yaml
-ollama-df        Disk usage               vllm-df         Disk usage                                  (DOWNLOAD=1 also pulls missing variants)
+ollama-rm        Remove model             vllm-rm         Remove weights            probe             Probe every (VRAM, ctx) cell
+ollama-status    Show status              vllm-status     Show status               model-fit         Print fitting models at VRAM/CONTEXT
+ollama-df        Disk usage               vllm-df         Disk usage                model-pull        Download best-fit candidates
 ollama-clean     Clean partials                                                     vram-fit          Show what fits without acting
 
 MAINTENANCE                                                                         TESTING
@@ -322,7 +327,7 @@ Installs a systemd user service that starts all infrastructure containers on log
 make fetch-cli                 # Update CLI binaries (Claude, Codex, Ollama, Gemini) via ETags
 make pull-images               # Pull latest base and infrastructure images
 make catalog-regen             # Refresh deploy/models.yaml from HF + Ollama upstream
-make model-select DOWNLOAD=1   # Pull any new fitting variants and refresh active set
+make model-pull && make probe  # Pull any new fitting variants, then probe them
 make build                     # Rebuild all images with updated binaries/packages
 ```
 
@@ -390,9 +395,10 @@ sudo xfs_growfs /var/cache/devai/ollama
 .env                              — Host/runtime configuration
 .env.example                      — Configuration template
 deploy/
-  models.yaml                     — Generated catalog (ollama + vllm/sglang)
-  active-models.yaml              — Generated active subset (probed + fits)
-  .ollama-reasoning-cache.json    — Probe cache, keyed by model digest
+  models.yaml                     — Generated catalog (ollama + hf + gguf rows)
+  .ollama-reasoning-cache.json    — Probe cache (schema v3, digest-keyed,
+                                    probes nested by VRAM × CONTEXT) — single
+                                    source of truth for fit data
   docker-compose.yaml             — Infrastructure services
   Dockerfile.base                 — Base image (system packages, Python, Node)
   Dockerfile.lab                  — Lab image (CLI tools, packages, JupyterLab)
@@ -404,9 +410,10 @@ gpu-arbiter/
   policy_test.go                  — Unit tests for the reasoning policy
 scripts/
   model-families.yaml             — Hand-edited family definitions
+  _contexts.py                    — Shared (VRAM, CONTEXT) tier arrays + parsers
   generate-catalog.py             — Refresh deploy/models.yaml from upstream APIs
-  probe-ollama-reasoning.py       — Per-tier probe per digest: capability + measured VRAM at each context (schema v2, digest-keyed)
-  select-models.py                — Combine catalog + probe + disk into active-models.yaml
+  probe-ollama-reasoning.py       — Per-(VRAM, ctx) probe per digest (schema v3)
+  select-models.py                — Print fitting models / pull catalog candidates
   model-picker.py                 — Two-step interactive picker (model/context/status → agent)
 docs/
   ollama_models.md                — Reasoning detection design doc
