@@ -43,10 +43,20 @@ import yaml
 
 CONFIG_DIR = Path.home() / ".devai"
 PREFS_FILE = CONFIG_DIR / "preferences.yaml"
-PROBE_CACHE = CONFIG_DIR / ".ollama-reasoning-cache.json"
 PICKER_SRC = CONFIG_DIR / "model-picker.py"
 SESSIONS_DIR = CONFIG_DIR / "sessions"
 PICK_BACK_CHANNEL = CONFIG_DIR / ".last-pick.json"
+
+# One probe cache per backend. The picker reads them independently —
+# missing ones are tolerated (the picker just shows no rows for that
+# backend). The Ollama cache is the only one required for a useful
+# picker session today; vLLM and SGLang come online as their probers
+# populate their caches.
+PROBE_CACHES = {
+    "ollama": CONFIG_DIR / ".ollama-reasoning-cache.json",
+    "vllm":   CONFIG_DIR / ".vllm-reasoning-cache.json",
+    "sglang": CONFIG_DIR / ".sglang-reasoning-cache.json",
+}
 
 DEFAULTS: dict = {
     "vram": 24,
@@ -123,8 +133,11 @@ def preflight(runtime: str, image: str) -> None:
     if not runtime_check(runtime, "network", DEVAI_NETWORK):
         sys.exit(f"error: network {DEVAI_NETWORK!r} not found.\n"
                  f"       Start the cache services: `make cache-up`.")
-    if not PROBE_CACHE.exists():
-        sys.exit(f"error: probe cache missing at {PROBE_CACHE}.\n"
+    # Require at least the Ollama cache — without it the picker's first
+    # screen is empty. vLLM and SGLang caches are optional.
+    ollama_cache = PROBE_CACHES["ollama"]
+    if not ollama_cache.exists():
+        sys.exit(f"error: probe cache missing at {ollama_cache}.\n"
                  f"       Run `make install` (and `make probe` first if "
                  f"the repo's cache is empty).")
 
@@ -213,9 +226,12 @@ def build_run_cmd(
     # exit so we can update preferences after the container ends.
     cmd += ["-v", f"{CONFIG_DIR}:/devai-host"]
 
-    # Probe cache — picker and router both expect /etc/devai/ for it.
-    cmd += ["-v",
-            f"{PROBE_CACHE}:/etc/devai/.ollama-reasoning-cache.json:ro"]
+    # Probe caches — the picker and router expect /etc/devai/<name>.json.
+    # Mount whatever exists; absent backend caches are tolerated downstream.
+    for backend, host_path in PROBE_CACHES.items():
+        if host_path.exists():
+            cmd += ["-v",
+                    f"{host_path}:/etc/devai/.{backend}-reasoning-cache.json:ro"]
 
     # Override the baked-in /usr/local/bin/model-picker with the host copy
     # so improvements made in the repo (and copied to ~/.devai/ by
