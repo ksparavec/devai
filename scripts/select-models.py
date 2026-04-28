@@ -61,6 +61,35 @@ OLLAMA_CONTAINER = os.environ.get("OLLAMA_CONTAINER", "devai-ollama")
 CONTAINER_RUNTIME = os.environ.get("CONTAINER_RUNTIME", "podman")
 HF_CLI = os.environ.get("HF_CLI", "hf")
 
+# Host → container path mapping for the devai-ollama service.
+# deploy/docker-compose.yaml mounts `/var/cache/devai/ollama:/root/.ollama`,
+# so any host path under that root has a deterministic in-container twin.
+# Used by `ollama create -w <dir>` so the daemon can resolve the GGUF file
+# referenced by FROM in the Modelfile.
+OLLAMA_HOST_ROOT = Path(
+    os.environ.get("OLLAMA_HOST_ROOT", "/var/cache/devai/ollama")
+)
+OLLAMA_CONTAINER_ROOT = Path(
+    os.environ.get("OLLAMA_CONTAINER_ROOT", "/root/.ollama")
+)
+
+
+def to_container_path(host_path: Path) -> str:
+    """Map a host path under OLLAMA_HOST_ROOT to its devai-ollama path.
+
+    Raises ValueError when host_path is outside the mounted root, since
+    `ollama create` would not be able to read the file in that case.
+    """
+    resolved = host_path.resolve()
+    try:
+        rel = resolved.relative_to(OLLAMA_HOST_ROOT.resolve())
+    except ValueError as exc:
+        raise ValueError(
+            f"path {resolved} is not under {OLLAMA_HOST_ROOT} — devai-ollama "
+            f"cannot see it. Set OLLAMA_HOST_ROOT or move the file."
+        ) from exc
+    return str(OLLAMA_CONTAINER_ROOT / rel)
+
 
 # ── Parsing ──────────────────────────────────────────────────────────────────
 
