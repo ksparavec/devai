@@ -86,7 +86,11 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile.router
-    image: devai-router:latest
+    # Fully-qualified to bypass unqualified-search-registries (docker.io)
+    # in registries.conf — otherwise the local mirror at localhost:5000
+    # can shadow the locally-built image with a stale `docker.io/library/...`
+    # copy. `make build-router` tags as `localhost/devai-router:latest`.
+    image: localhost/devai-router:latest
     container_name: devai-router
     hostname: router
     environment:

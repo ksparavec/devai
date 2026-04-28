@@ -645,8 +645,9 @@ probe: ## Probe every downloaded ollama digest at every (VRAM, CONTEXT) tier.
 	    overhead_bytes=$$(python3 -c "import sys; sys.path.insert(0, 'scripts'); from _contexts import parse_vram_token, vram_overhead_bytes; print(vram_overhead_bytes($(GPU_MEMORY_GB), parse_vram_token('$$vram')))"); \
 	    echo; \
 	    echo ">>> probing at VRAM=$$vram (host=$(GPU_MEMORY_GB)G, OLLAMA_GPU_OVERHEAD=$$overhead_bytes bytes)"; \
+	    $(CONTAINER_RUNTIME) rm -f $(OLLAMA_CONTAINER) >/dev/null 2>&1 || true; \
 	    OLLAMA_GPU_OVERHEAD=$$overhead_bytes \
-	      $(COMPOSE) -f $(CACHE_COMPOSE) up -d --force-recreate ollama; \
+	      $(COMPOSE) -f $(CACHE_COMPOSE) up -d ollama; \
 	    until $(CONTAINER_RUNTIME) exec $(OLLAMA_CONTAINER) ollama list >/dev/null 2>&1; do sleep 1; done; \
 	    $(CONTAINER_RUNTIME) run --rm \
 	        --network $(DEVAI_NETWORK) \
@@ -665,7 +666,8 @@ probe: ## Probe every downloaded ollama digest at every (VRAM, CONTEXT) tier.
 	 done; \
 	 echo; \
 	 echo ">>> restoring devai-ollama to host VRAM (no overhead)"; \
-	 OLLAMA_GPU_OVERHEAD=0 $(COMPOSE) -f $(CACHE_COMPOSE) up -d --force-recreate ollama
+	 $(CONTAINER_RUNTIME) rm -f $(OLLAMA_CONTAINER) >/dev/null 2>&1 || true; \
+	 OLLAMA_GPU_OVERHEAD=0 $(COMPOSE) -f $(CACHE_COMPOSE) up -d ollama
 
 model-fit: ## Print which models fit at the chosen (VRAM, CONTEXT) — diagnostic, no writes.
 	@OLLAMA_CONTAINER=$(OLLAMA_CONTAINER) CONTAINER_RUNTIME=$(CONTAINER_RUNTIME) \
