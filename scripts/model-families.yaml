@@ -6,8 +6,21 @@
 # scripts/generate-catalog.py, which writes deploy/models.yaml.
 #
 # Each family may specify:
-#   ollama_library  – library name under ollama.com/library/<name>
-#   hf_repos        – explicit list of HuggingFace repositories to include
+#   ollama_repos    – list of library names under ollama.com/library/<name>;
+#                     every published tag for each library becomes a catalog
+#                     row served by the ollama backend
+#   hf_repos        – list of HuggingFace repositories (transformers
+#                     safetensors / FP8 / NVFP4 / AWQ / GPTQ); each becomes
+#                     one catalog row served by vllm/sglang backends
+#   gguf_repos      – list of HuggingFace GGUF-only repositories. Each
+#                     entry can carry an optional `include:` allowlist of
+#                     quantization tokens (substring-matched against the
+#                     filename, case-insensitive) and an optional
+#                     `tag_prefix:` that anchors the local Ollama tag.
+#                     Example: filename Qwen3.5-27B-UD-Q3_K_XL.gguf with
+#                     tag_prefix=27b becomes ollama tag
+#                     qwen3.5:27b-ud-q3_k_xl. Wired by the gguf source
+#                     kind (commit 2 of the simplification refactor).
 #   arch_ref        – HF repo whose config.json holds the architecture
 #                     for variants that don't publish a full config
 #                     (primarily Ollama GGUF tags; quantization does not
@@ -16,16 +29,20 @@
 #   thinking        – PRE-PROBE HINT only. Final reasoning capability is
 #                     determined per model variant at runtime by
 #                     scripts/probe-ollama-reasoning.py and stored in
-#                     deploy/active-models.yaml as `reasoning.capability`.
+#                     the probe cache as `reasoning.capability`.
 #                     This flag is informational; the picker and router
 #                     ignore it and use the probe result instead.
 #   defaults        – advisory default tags per backend (optional)
+#
+# YAML formatting rule: every list element on its own line. Do NOT use
+# inline brackets `[a, b]` or inline maps `{key: val}`.
 #
 # To add a family: add a block below, then run `make catalog-regen`.
 
 families:
   - name: gemma4
-    ollama_library: gemma4
+    ollama_repos:
+      - gemma4
     hf_repos:
       - google/gemma-4-e2b-it
       - google/gemma-4-e4b-it
@@ -37,11 +54,17 @@ families:
     thinking: true        # hint; runtime probe shows e2b/e4b are unsupported
 
   - name: qwen3.5
-    ollama_library: qwen3.5
+    ollama_repos:
+      - qwen3.5
     hf_repos:
       - ykarout/Qwen3.5-9B-NVFP4
       - apolo13x/Qwen3.5-27B-NVFP4
       - apolo13x/Qwen3.5-35B-A3B-NVFP4
+    gguf_repos:
+      - repo: unsloth/Qwen3.5-27B-GGUF
+        tag_prefix: 27b
+        include: []        # commit 2 of refactor will wire the loader; until
+                           # then this block is parsed-and-ignored
     arch_ref: ykarout/Qwen3.5-9B-NVFP4
     thinking: true
 
@@ -52,7 +75,8 @@ families:
     thinking: true
 
   - name: llama3.2
-    ollama_library: llama3.2
+    ollama_repos:
+      - llama3.2
     arch_ref: nvidia/Llama-3.1-8B-Instruct-NVFP4
     thinking: false
 
@@ -69,16 +93,19 @@ families:
     thinking: true        # hint; vLLM/SGLang variants probed separately later
 
   - name: nemotron-3-nano
-    ollama_library: nemotron-3-nano
+    ollama_repos:
+      - nemotron-3-nano
     arch_ref: nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4
     thinking: true        # hint upgraded after probe verified structured
 
   - name: nemotron-cascade-2
-    ollama_library: nemotron-cascade-2
+    ollama_repos:
+      - nemotron-cascade-2
     arch_ref: nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4
     thinking: true        # hint upgraded after probe verified structured
 
   - name: nemotron
-    ollama_library: nemotron
+    ollama_repos:
+      - nemotron
     arch_ref: nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4
     thinking: false       # generic Nemotron, no reasoning per model card

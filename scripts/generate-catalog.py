@@ -236,8 +236,7 @@ def main() -> None:
                       f"{e.arch.kv_heads}kv/{e.arch.head_dim}h")
                 all_entries.append(e)
 
-        lib = fam.get("ollama_library")
-        if lib:
+        for lib in fam.get("ollama_repos") or []:
             try:
                 tags = ollama_tags(lib)
             except Exception as e:
@@ -254,6 +253,13 @@ def main() -> None:
             if skipped:
                 print(f"  (skipped {skipped} tag(s): platform-gated or "
                       f"unavailable)")
+
+        # gguf_repos: parsed-and-ignored in commit 1 (anchor commit).
+        # Commit 2 of the simplification refactor wires HF file enumeration
+        # and emits one catalog row per .gguf file with source: gguf.
+        if fam.get("gguf_repos"):
+            print(f"  (gguf_repos present but loader not wired yet — "
+                  f"see commit 2 of resilient-splashing-peach)")
 
     # ── Write deploy/models.yaml ─────────────────────────────────────────
     lines: list[str] = []

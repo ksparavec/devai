@@ -2,7 +2,7 @@
 #
 # Regenerate with: make catalog-regen
 # Source of truth:  scripts/model-families.yaml
-# Generated at:     2026-04-23T00:02:21+00:00
+# Generated at:     2026-04-28T10:02:58+00:00
 #
 # Every 'size' and 'arch' below was fetched live from the
 # upstream provider at generation time. Do not hand-edit.
