@@ -221,13 +221,21 @@ def pull_hf(display_name: str, repo: str) -> None:
 GGUF_STAGING = VLLM_MODELS.parent / "_gguf"
 
 
-def pull_gguf(display_name: str, repo: str, filename: str) -> None:
+def pull_gguf(display_name: str, repo: str, filename: str, family: str) -> None:
     """Download one GGUF file from HF, register it in Ollama via Modelfile.
 
     Three steps:
       1. hf download <repo> <filename> --local-dir <staging>/<repo-slug>
-      2. write a one-line Modelfile: `FROM <filename>`
-      3. ollama create <display_name> -f Modelfile (run inside devai-ollama)
+      2. write Modelfile: FROM <filename> + RENDERER <family> + PARSER <family>
+      3. ollama create <display_name> -f Modelfile (inside devai-ollama)
+
+    The RENDERER and PARSER directives are critical for capability
+    detection. Without them the imported model is treated as a raw
+    completion engine and Ollama refuses tool / thinking calls
+    ("does not support tools" on /v1/messages, /v1/chat/completions).
+    The renderer/parser names are 1:1 with the family name in our
+    catalog (qwen3.5, gemma4, nemotron-3-nano, …) — confirmed by
+    inspecting registry-served models of those families.
 
     `display_name` is the catalog tag (e.g. `qwen3.5:27b-ud-q3_k_xl`).
     Once `ollama create` completes, the GGUF bytes are absorbed into
@@ -249,11 +257,16 @@ def pull_gguf(display_name: str, repo: str, filename: str) -> None:
             f"error: hf download claimed success but {target_file} is missing"
         )
     modelfile = target_dir / f"Modelfile.{filename}"
-    modelfile.write_text(f"FROM {filename}\n")
+    modelfile.write_text(
+        f"FROM {filename}\n"
+        f"RENDERER {family}\n"
+        f"PARSER {family}\n"
+    )
+    container_dir = to_container_path(target_dir)
     print(f"  ollama create {display_name} -f {modelfile.name} "
-          f"(in {target_dir}) ...", flush=True)
+          f"(in {container_dir}) ...", flush=True)
     rc = subprocess.call([
-        CONTAINER_RUNTIME, "exec", "-w", str(target_dir), OLLAMA_CONTAINER,
+        CONTAINER_RUNTIME, "exec", "-w", container_dir, OLLAMA_CONTAINER,
         "ollama", "create", display_name, "-f", modelfile.name,
     ])
     if rc != 0:
@@ -270,7 +283,10 @@ def pull(model: dict) -> None:
         if not model.get("repo") or not model.get("gguf_filename"):
             sys.exit(f"error: gguf source row {model['name']} is missing "
                      f"repo or gguf_filename")
-        pull_gguf(model["name"], model["repo"], model["gguf_filename"])
+        family = model.get("family") or ""
+        if not family:
+            sys.exit(f"error: gguf source row {model['name']} is missing family")
+        pull_gguf(model["name"], model["repo"], model["gguf_filename"], family)
     else:
         sys.exit(f"error: unknown source '{src}' for {model['name']}")
 
