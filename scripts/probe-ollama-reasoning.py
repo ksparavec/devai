@@ -885,7 +885,14 @@ def main() -> None:
             fully_cached += 1
             continue
 
+        # `missing` is ascending (effective_targets returns sorted). Iterate
+        # smallest first; if any tier spills, all LARGER tiers at this VRAM
+        # band will also spill (KV grows with ctx, weights are constant).
+        # Mark them implied-spill without actually probing — saves time and
+        # avoids stressing the daemon with enormous CPU/RAM offload loads
+        # (the original cause of the qwen3.5:9b @ 16G crash sequence).
         ctxs_done: list[int] = []
+        ctxs_implied: list[int] = []
         for ctx in missing:
             rec = probe_one_context(
                 args.ollama_url, canonical, digest, args.prompt,
@@ -898,6 +905,44 @@ def main() -> None:
             ctxs_done.append(ctx)
             fresh_probes += 1
             save_cache(args.cache, cache)
+
+            if not rec.get("fully_on_gpu", True):
+                # Fill every larger tier with a deterministic "implied
+                # spill" cell — a cached non-measurement so re-runs skip
+                # them too. We carry the smaller-tier total as a lower
+                # bound so the picker can still tell roughly how big.
+                spill_total = rec.get("actual_total_gb")
+                spill_vram = rec.get("actual_vram_gb")
+                spill_at = rec["probed_at"]
+                for larger in (t for t in targets if t > ctx):
+                    larger_key = str(larger)
+                    # Respect cached cells that aren't being forced.
+                    if larger_key in vram_band and larger not in force_set:
+                        continue
+                    vram_band[larger_key] = {
+                        "ctx": larger,
+                        "vram_gb": vram_gb,
+                        "actual_total_gb": spill_total,
+                        "actual_vram_gb": spill_vram,
+                        "actual_context": larger,
+                        "fully_on_gpu": False,
+                        "capability": "error",
+                        "evidence": {
+                            "error": (
+                                f"implied spill: "
+                                f"{context_label(ctx)} at "
+                                f"{vram_label(vram_gb)} already spilled"
+                            ),
+                            "implied_from_ctx": ctx,
+                        },
+                        "probed_at": spill_at,
+                        "probe_seconds": 0.0,
+                        "implied": True,
+                    }
+                    entry["last_probed_at"] = spill_at
+                    ctxs_implied.append(larger)
+                save_cache(args.cache, cache)
+                break
 
         update_canonical_capability(entry)
         # disable_verified: clear stale value on force, then re-probe.
@@ -923,6 +968,10 @@ def main() -> None:
             marker += f" (capped at {context_label(max_ctx)})"
         if ran_disable:
             marker += " +disable"
+        if ctxs_implied:
+            marker += (
+                f" +impl({','.join(context_label(c) for c in ctxs_implied)})"
+            )
         ctx_summary = ",".join(context_label(c) for c in ctxs_done) or "-"
         maybe_header()
         print(

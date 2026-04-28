@@ -152,6 +152,31 @@ services:
       - open-webui
     restart: unless-stopped
 
+  # Aggregates stdout from every devai-* service into per-container
+  # log files on the host (/var/cache/devai/logs/<name>.log). Survives
+  # source-container recreation — the follower reconnects to the new
+  # container of the same name within 5 seconds. Uses podman + sh only;
+  # no third-party log daemon. The image is the upstream podman client
+  # so we can call `podman logs --follow` against the host's socket.
+  logger:
+    image: quay.io/podman/stable
+    container_name: devai-logger
+    hostname: logger
+    user: "0"
+    entrypoint: ["/bin/sh"]
+    command: ["/scripts/logging.sh"]
+    environment:
+      # Empty → discover devai-* containers at startup. Override to a
+      # space-separated list to follow a specific subset.
+      - LOG_TARGETS=
+      - LOG_DIR=/logs
+    volumes:
+      - ./logging.sh:/scripts/logging.sh:ro
+      - /var/cache/devai/logs:/logs
+      - ${XDG_RUNTIME_DIR:-/run/user/1000}/podman/podman.sock:/run/podman/podman.sock:ro
+    network_mode: none
+    restart: unless-stopped
+
 networks:
   default:
     name: devai-net
