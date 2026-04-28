@@ -106,7 +106,7 @@ endif
 
 .PHONY: all build build-cpu build-gpu build-base-cpu build-base-gpu build-router
 .PHONY: lab-cpu lab-gpu shell-cpu shell-gpu
-.PHONY: cache-up cache-down cache-status cache-clean logs
+.PHONY: cache-up cache-down cache-status cache-clean logs setup-logs
 .PHONY: ollama-rm ollama-list ollama-status ollama-clean ollama-df
 .PHONY: vllm-list vllm-rm vllm-status vllm-df
 .PHONY: clean clean-cpu clean-gpu clean-router prune
@@ -486,6 +486,18 @@ cache-down: ## Stop and remove ALL infrastructure services (running, stopped, or
 		echo "Removing stragglers: $$ids"; \
 		$(CONTAINER_RUNTIME) rm -f $$ids; \
 	fi
+
+setup-logs: ## One-time: create dedicated 100G LV at /var/cache/devai/logs (requires sudo).
+	@# Stops cache so nothing holds the old logs path open, then runs the
+	@# setup script under sudo (LVM + mkfs.xfs + /etc/fstab + mount). The
+	@# script is idempotent — re-running on an already-set-up host does
+	@# nothing destructive. Override SIZE/VG/LV via env if desired.
+	@$(MAKE) cache-down
+	@echo
+	sudo SIZE=$${SIZE:-100G} VG=$${VG:-vgais} LV=$${LV:-cache_logs} \
+	  deploy/setup-logs-volume.sh
+	@echo
+	@echo "Next: run 'make cache-up' to start services on the new logs volume."
 
 logs: ## Tail container stdout via the logger sidecar (SERVICE=devai-X, default devai-ollama; LINES=N to seed).
 	@svc="$${SERVICE:-devai-ollama}"; \
