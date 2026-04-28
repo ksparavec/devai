@@ -15,7 +15,7 @@ intended end state.
 | `gpu-arbiter/main.go` (router source) | Full vLLM + SGLang lifecycle (`containerRecreate`, `vllmEntrypoint`, `sglangEntrypoint`, port 11435/11436 listeners) is compiled in and passes `make test-router` |
 | `deploy/docker-compose.yaml` | `vllm` and `sglang` services are tagged `profiles: ["backends-disabled"]` — `compose up -d` (used by `make cache-up`) skips them |
 | `make cache-up` | Starts ollama, router, open-webui, webui-proxy, apt-cache, registry-cache only |
-| `scripts/model-picker.py` | Filter requires `reasoning.capability == "structured"` AND probe-derived VRAM coefficients. There is no probe runner for vLLM/SGLang yet, so HF entries always have `capability: unknown` and no coefficients → they're hidden. The picker prints a footer line saying how many were hidden and points back here |
+| `scripts/model-picker.py` | Shows Ollama rows only while vLLM/SGLang are dormant. Rows are grouped by family, context tier, and user-facing reasoning/offload label. There is no probe runner for vLLM/SGLang yet, so HF entries stay `capability: unknown` and are hidden. The picker prints a footer line saying how many were hidden and points back here |
 | `make test-vllm`, `make test-idle` | Recipes removed from `.PHONY` and from the aggregate `make test`. The shell scripts under `tests/` still exist and can be invoked manually once vLLM is running again |
 
 ## Why it was sidelined
@@ -44,22 +44,26 @@ In rough order, smallest task first:
    directly without going through the router.
 
 2. **Add a probe runner for vLLM/SGLang.** `scripts/probe-ollama-reasoning.py`
-   speaks `/api/chat` + `/api/ps` (Ollama-specific). For vLLM/SGLang the
-   equivalent is the OpenAI-style `/v1/chat/completions` plus parsing
-   `nvidia-smi` (or vLLM's prometheus metrics) for VRAM. Until this
-   exists, every HF entry stays `capability: unknown` and `model-picker`
-   keeps hiding them.
+   speaks `/api/chat` + `/api/ps` (Ollama-specific). The vLLM/SGLang
+   equivalent uses `/v1/chat/completions` plus `nvidia-smi` (or vLLM's
+   prometheus metrics) for VRAM. Output must conform to schema v2: one
+   digest-keyed entry per set of weights, with a `probes` map keyed by
+   context tier and per-tier `{actual_total_gb, actual_vram_gb,
+   fully_on_gpu, capability}`. No interpolation — each tier is measured
+   directly. Until such a runner exists, every HF entry stays
+   `capability: unknown` and the picker hides them.
 
-3. **Rerun selection.** Once probes succeed, `make model-select` will
-   write coefficients into `deploy/active-models.yaml` for the new
-   backend, the picker filter starts admitting them, and the existing
-   router path serves them.
+3. **Rerun selection.** Once probes succeed, `make model-select` reads
+   the v2 cache and writes one row per (family, effective_context,
+   capability) bucket into `deploy/active-models.yaml`, alias names
+   collapsed under `aliases:`. The picker filter starts admitting the
+   new backend's rows and the existing router path serves them.
 
 4. **Optional: relax the picker filter** if you want to expose
    not-yet-probed vLLM/SGLang models in the UI before step 2 lands.
    The check in `scripts/model-picker.py:_build_menu` is one
    conditional; relaxing it loses the "only show models we've actually
-   measured" guarantee, so the structured-only default is intentional.
+   measured" guarantee.
 
 ## Quick reactivation for one-off testing
 

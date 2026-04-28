@@ -86,6 +86,10 @@ MODEL_CACHE_MOUNT = $(if $(wildcard $(CACHE_DIR)/ollama),-v $(CACHE_DIR)/ollama:
 # precomputed VRAM breakdown (weights / KV / overhead / total) per model.
 ACTIVE_CATALOG_MOUNT = $(if $(wildcard deploy/active-models.yaml),-v $(CURDIR)/deploy/active-models.yaml:/etc/devai/active-models.yaml:ro)
 
+# Read-only mount of the probe cache so the picker can show probed-but-not-active
+# rows, including models skipped because the target context spilled to CPU/RAM.
+PROBE_CACHE_MOUNT = $(if $(wildcard deploy/.ollama-reasoning-cache.json),-v $(CURDIR)/deploy/.ollama-reasoning-cache.json:/etc/devai/.ollama-reasoning-cache.json:ro)
+
 # User switching: only needed for docker (rootless podman root = host user)
 USER_ENV =
 ifneq ($(findstring podman,$(CONTAINER_RUNTIME)),podman)
@@ -285,6 +289,7 @@ lab-cpu: ## Run the container (CPU)
 		$(HOME_MOUNT_ARG) \
 		$(MODEL_CACHE_MOUNT) \
 		$(ACTIVE_CATALOG_MOUNT) \
+		$(PROBE_CACHE_MOUNT) \
 		-v "$$(readlink -f $(HOST_WORK_DIR))":/home/$(CONTAINER_USER)/work \
 		$(IMAGE_NAME)
 
@@ -312,6 +317,7 @@ lab-gpu: ## Run the container (GPU/CUDA)
 		$(HOME_MOUNT_ARG) \
 		$(MODEL_CACHE_MOUNT) \
 		$(ACTIVE_CATALOG_MOUNT) \
+		$(PROBE_CACHE_MOUNT) \
 		-v "$$(readlink -f $(HOST_WORK_DIR))":/home/$(CONTAINER_USER)/work \
 		$(IMAGE_NAME_GPU)
 
@@ -332,6 +338,7 @@ shell-cpu: ## Start an interactive shell (CPU)
 		$(HOME_MOUNT_ARG) \
 		$(MODEL_CACHE_MOUNT) \
 		$(ACTIVE_CATALOG_MOUNT) \
+		$(PROBE_CACHE_MOUNT) \
 		-v "$$(readlink -f $(HOST_WORK_DIR))":/home/$(CONTAINER_USER)/work \
 		$(IMAGE_NAME) agent-picker
 
@@ -353,6 +360,7 @@ shell-gpu: ## Start an interactive shell (GPU)
 		$(HOME_MOUNT_ARG) \
 		$(MODEL_CACHE_MOUNT) \
 		$(ACTIVE_CATALOG_MOUNT) \
+		$(PROBE_CACHE_MOUNT) \
 		-v "$$(readlink -f $(HOST_WORK_DIR))":/home/$(CONTAINER_USER)/work \
 		$(IMAGE_NAME_GPU) agent-picker
 
@@ -405,6 +413,7 @@ test-agents: ## Smoke-test every (agent × backend) cell against the live router
 		-e CONTAINER_USER=devai \
 		$(MODEL_CACHE_MOUNT) \
 		$(ACTIVE_CATALOG_MOUNT) \
+		$(PROBE_CACHE_MOUNT) \
 		-v "$(CURDIR)/tests/agent-matrix.sh":/usr/local/bin/agent-matrix:ro \
 		-v "$(CURDIR)/tests/.matrix-logs":/var/log/agent-matrix \
 		-v $(HOME_VOLUME):/home/devai \
@@ -628,25 +637,30 @@ vram-fit: ## Show which models from the full catalog fit in VRAM (planning aid; 
 			--models-yaml $(INFERENCE_CONFIG) \
 			--vllm-dir $(VLLM_MODELS_DIR)
 
-probe-reasoning: ## Probe each downloaded ollama model for native reasoning support (two-point: PROBE_LOW, PROBE_HIGH)
+probe-reasoning: ## Probe downloaded ollama models at every standard context tier
 	@# Runs inside the lab container so it can reach devai-ollama on devai-net.
-	@# Two-point probe (low + high contexts) derives weights_overhead_gb +
-	@# kv_per_token_bytes per model so downstream tools can interpolate
-	@# total VRAM at any user-chosen context. Cache invalidates when
-	@# either probe context changes.
+	@# Probes each tier in PROBE_CONTEXTS (default 32K,64K,128K,256K) once
+	@# per digest. Existing per-tier results are never overwritten — a new
+	@# tier in the list only fills gaps. Pass --force-ctx to re-probe a
+	@# specific tier; PROBE_FORCE=1 to re-probe everything.
 	$(CONTAINER_RUNTIME) run --rm \
 		--network $(DEVAI_NETWORK) \
 		-v $(CURDIR)/scripts:/scripts:ro \
 		-v $(CURDIR)/deploy:/deploy \
 		-e OLLAMA_HOST=http://devai-ollama:11434 \
-		-e PROBE_LOW=$${PROBE_LOW:-32768} \
-		-e PROBE_HIGH=$${PROBE_HIGH:-262144} \
+		-e PROBE_CONTEXTS=$${PROBE_CONTEXTS:-32768,65536,131072,262144} \
 		--entrypoint python3 \
 		$(IMAGE_NAME) \
-		/scripts/probe-ollama-reasoning.py --cache /deploy/.ollama-reasoning-cache.json
+		/scripts/probe-ollama-reasoning.py --cache /deploy/.ollama-reasoning-cache.json \
+			$(if $(PROBE_FORCE),--force,) \
+			$(if $(PROBE_FORCE_CTX),--force-ctx $(PROBE_FORCE_CTX),) \
+			$(PROBE_MODELS)
 
 model-select: probe-reasoning ## Select fitting+on-disk models (probe first, then write active-models.yaml; restarts router if active set changed)
-	@before_sha=$$(grep -v '^#' deploy/active-models.yaml 2>/dev/null | sha256sum | awk '{print $$1}' || echo "none"); \
+	@set -e; \
+	 download_report=$$(mktemp /tmp/devai-model-downloads.XXXXXX); \
+	 trap 'rm -f "$$download_report"' EXIT; \
+	 before_sha=$$(grep -v '^#' deploy/active-models.yaml 2>/dev/null | sha256sum | awk '{print $$1}' || echo "none"); \
 	 OLLAMA_CONTAINER=$(OLLAMA_CONTAINER) CONTAINER_RUNTIME=$(CONTAINER_RUNTIME) \
 	 VLLM_MODELS_DIR=$(VLLM_MODELS_DIR) HF_CLI=$(HF_CLI) \
 	 GPU_MEMORY_GB=$${VRAM:-$(GPU_MEMORY_GB)} MAX_CONTEXT_LEN=$${CONTEXT:-$(MAX_CONTEXT_LEN)} \
@@ -656,10 +670,29 @@ model-select: probe-reasoning ## Select fitting+on-disk models (probe first, the
 			$(if $(VRAM),--vram $(VRAM),) \
 			$(if $(CONTEXT),--context $(CONTEXT),) \
 			$(if $(KV),--kv-dtype $(KV),) \
-			$(if $(DOWNLOAD),--download,) \
+			$(if $(DOWNLOAD),--download --download-report "$$download_report",) \
+			$(if $(DOWNLOAD_LIMIT),--max-downloads $(DOWNLOAD_LIMIT),) \
 			$(if $(PRUNE),--prune,) \
 			$(if $(PRUNE_SHADOWS),--prune-shadows,) \
 			$(if $(DRY_RUN),--dry-run,); \
+	 if [ -n "$(DOWNLOAD)" ] && [ -z "$(DRY_RUN)" ] && [ -s "$$download_report" ]; then \
+		echo; \
+		echo "  probing newly downloaded Ollama model(s) before final active write"; \
+		$(MAKE) --no-print-directory probe-reasoning PROBE_MODELS="$$(tr '\n' ' ' < "$$download_report")"; \
+		OLLAMA_CONTAINER=$(OLLAMA_CONTAINER) CONTAINER_RUNTIME=$(CONTAINER_RUNTIME) \
+		VLLM_MODELS_DIR=$(VLLM_MODELS_DIR) HF_CLI=$(HF_CLI) \
+		GPU_MEMORY_GB=$${VRAM:-$(GPU_MEMORY_GB)} MAX_CONTEXT_LEN=$${CONTEXT:-$(MAX_CONTEXT_LEN)} \
+		VERBOSE=$${VERBOSE:-0} \
+			python3 scripts/select-models.py \
+				$(if $(FAMILY),--family $(FAMILY),) \
+				$(if $(VRAM),--vram $(VRAM),) \
+				$(if $(CONTEXT),--context $(CONTEXT),) \
+				$(if $(KV),--kv-dtype $(KV),) \
+				$(if $(DOWNLOAD_LIMIT),--max-downloads $(DOWNLOAD_LIMIT),) \
+				$(if $(PRUNE),--prune,) \
+				$(if $(PRUNE_SHADOWS),--prune-shadows,) \
+				$(if $(DRY_RUN),--dry-run,); \
+	 fi; \
 	 after_sha=$$(grep -v '^#' deploy/active-models.yaml 2>/dev/null | sha256sum | awk '{print $$1}' || echo "none"); \
 	 if [ "$$before_sha" != "$$after_sha" ] && \
 	    $(CONTAINER_RUNTIME) ps --format '{{.Names}}' 2>/dev/null | grep -q '^devai-router$$'; then \
@@ -709,4 +742,3 @@ install-systemd: ## Install and enable systemd service for infrastructure
 	systemctl --user enable --now devai-infra.service
 	loginctl enable-linger $(USER)
 	@echo "Installed to $(HOME)/.config/devai/ and enabled devai-infra.service"
-

@@ -3,10 +3,9 @@
 
 Discovery is disk-only — the picker walks the host model cache that is
 mounted into the container and lists exactly what is on disk. The yaml
-catalog (deploy/models.yaml) is consulted only to enrich display metadata
-(purpose). It is never used to decide whether a model is "downloaded",
-and the picker performs no VRAM-fit math: that gate happens upstream in
-`select-models.py` before a model ever reaches disk.
+catalog (deploy/models.yaml), active catalog, and Ollama probe cache are
+used only to enrich display metadata and rank the best rows per family,
+context, and reasoning/offload label.
 
 Layout scanned:
     OLLAMA_MANIFESTS_DIR/<library>/<tag>          → ollama tag <library>:<tag>
@@ -46,6 +45,11 @@ _ACTIVE_CATALOG_PATHS = [
     str(Path(__file__).resolve().parent.parent / "deploy" / "active-models.yaml"),
 ]
 
+_PROBE_CACHE_PATHS = [
+    "/etc/devai/.ollama-reasoning-cache.json",
+    str(Path(__file__).resolve().parent.parent / "deploy" / ".ollama-reasoning-cache.json"),
+]
+
 _ROUTER = os.environ.get("DEVAI_ROUTER_HOST", "devai-router")
 _VLLM_DIR = os.environ.get("VLLM_MODELS_DIR", "/var/cache/devai/ollama/models/vllm")
 _OLLAMA_MANIFESTS = os.environ.get(
@@ -57,13 +61,36 @@ _OLLAMA_MANIFESTS = os.environ.get(
 # Override via env DEVAI_HF_BACKEND=sglang.
 _HF_BACKEND = os.environ.get("DEVAI_HF_BACKEND", "vllm")
 
-# User-chosen context for VRAM display + filtering. Picker re-computes
-# total VRAM at this context using probe-derived coefficients
-# (weights_overhead_gb + ctx × kv_per_token_bytes / 1024^3). Defaults to
-# the same value select-models.py uses so behavior matches what was
-# written into active-models.yaml. Override via `CONTEXT=32768 make
-# shell-gpu` to widen the choice set, or `CONTEXT=262144` to narrow it.
-_CONTEXT = int(os.environ.get("CONTEXT", os.environ.get("MAX_CONTEXT_LEN", "131072")))
+def _parse_context_value(raw: str) -> int:
+    value = raw.strip().lower()
+    if value.endswith("k"):
+        return int(value[:-1]) * 1024
+    return int(value)
+
+
+def _parse_context_list(raw: str) -> list[int]:
+    out: list[int] = []
+    for part in raw.split(","):
+        value = part.strip()
+        if not value:
+            continue
+        ctx = _parse_context_value(value)
+        if ctx > 0 and ctx not in out:
+            out.append(ctx)
+    return out
+
+
+# The model step always shows the standard context tiers. The selected row
+# stores its tier in CONTEXT before launching the agent, so wrappers that
+# honor CONTEXT can use the same budget the picker displayed.
+_CONTEXT_CHOICES = _parse_context_list(
+    os.environ.get("PICKER_CONTEXTS", "32768,65536,131072,262144")
+)
+_DEFAULT_CONTEXT = _parse_context_value(
+    os.environ.get("CONTEXT", os.environ.get("MAX_CONTEXT_LEN", "131072"))
+)
+if not _CONTEXT_CHOICES:
+    _CONTEXT_CHOICES = [_DEFAULT_CONTEXT]
 
 # VRAM budget for in-budget filtering. Models whose interpolated total
 # exceeds this are dropped (they only landed in active-models.yaml under
@@ -121,6 +148,52 @@ def _load_active_entries() -> dict[str, dict]:
     return {}
 
 
+def _load_probe_records() -> dict[str, dict]:
+    """Lookup of model name → v2 digest entry from the probe cache.
+
+    Schema v2 keys are digests; each entry carries an `aliases` list and
+    a `probes` map keyed by stringified context. Every alias resolves to
+    the same digest entry here so a `name`-based lookup downstream stays
+    one-call. Legacy v1 caches (name@digest keys) are migrated in-memory
+    on the fly using the prober's helper — the on-disk file is left as-is.
+    """
+    for path in _PROBE_CACHE_PATHS:
+        if not os.path.isfile(path):
+            continue
+        with open(path) as fh:
+            data = json.load(fh) or {}
+        if not data:
+            return {}
+        if not all(
+            isinstance(v, dict) and v.get("schema_version") == 2
+            for v in data.values()
+        ):
+            data = _migrate_in_memory(data)
+        records: dict[str, dict] = {}
+        for digest, entry in data.items():
+            if not isinstance(entry, dict):
+                continue
+            for alias in entry.get("aliases") or []:
+                records[alias] = entry
+        return records
+    return {}
+
+
+def _migrate_in_memory(raw: dict) -> dict:
+    """Run probe-ollama-reasoning's v1→v2 conversion without touching disk."""
+    import importlib.util
+    import sys
+    here = Path(__file__).resolve().parent
+    sys.path.insert(0, str(here))
+    spec = importlib.util.spec_from_file_location(
+        "_probe_module", here / "probe-ollama-reasoning.py",
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    migrated, _ = mod.ensure_v2(raw)
+    return migrated
+
+
 # ── Disk discovery ───────────────────────────────────────────────────────────
 
 def _ollama_disk_size_gb(library: str, tag: str) -> float:
@@ -145,6 +218,53 @@ def _hf_disk_size_gb(model_dir: Path) -> float:
     return total / (1024 ** 3)
 
 
+def _details_from_probe(probe: dict) -> dict:
+    details: dict = {}
+    if probe.get("param_size_label"):
+        details["param_size"] = probe["param_size_label"]
+    if probe.get("quantization"):
+        details["quantization"] = probe["quantization"]
+    return details
+
+
+def _moe_from_probe(probe: dict) -> dict:
+    if probe.get("experts_total") is None or probe.get("experts_used") is None:
+        return {}
+    return {
+        "experts_total": probe["experts_total"],
+        "experts_used": probe["experts_used"],
+    }
+
+
+def _vram_from_probe(probe: dict) -> dict:
+    """Pass through the v2 entry's per-context probes for the picker.
+
+    `_vram_at` reads `probes[str(min(ctx, max_context))]` from this dict.
+    """
+    if not probe:
+        return {}
+    out: dict = {"source": "probe"}
+    if probe.get("max_context") is not None:
+        out["max_context"] = probe["max_context"]
+    if probe.get("probes"):
+        out["probes"] = probe["probes"]
+    return out
+
+
+def _capability_from_probe(probe: dict, fallback: str = "unknown") -> str:
+    """Read the canonical capability from a v2 entry.
+
+    Probe driver records the capability of the smallest fitting tier as
+    the canonical (top-level) value, so a model that's structured at 32K
+    but spills at 256K stays labelled `structured` here. Per-tier
+    capability is read directly from `probes[ctx].capability` when the
+    picker needs to filter by tier-specific behaviour.
+    """
+    if not probe:
+        return fallback
+    return str(probe.get("capability") or fallback)
+
+
 def _discover_models() -> list[dict]:
     """Walk the cache dirs and return one entry per model on disk.
 
@@ -155,6 +275,7 @@ def _discover_models() -> list[dict]:
     """
     catalog = _load_catalog()
     active = _load_active_entries()
+    probes = _load_probe_records()
     out: list[dict] = []
 
     # Ollama: <library>/<tag> manifest files
@@ -170,18 +291,23 @@ def _discover_models() -> list[dict]:
                 meta = catalog.get(name, {})
                 disk_gb = _ollama_disk_size_gb(lib_dir.name, tag_file.name)
                 act = active.get(name) or {}
-                cap = (act.get("reasoning") or {}).get("capability", "unknown")
+                probe = probes.get(name) or {}
+                active_cap = (act.get("reasoning") or {}).get("capability", "unknown")
+                cap = _capability_from_probe(probe, active_cap)
+                active_details = act.get("details") or {}
+                probe_details = _details_from_probe(probe)
                 out.append({
                     "name": name,
                     "source": "ollama",
                     "backend": "ollama",
                     "size": meta.get("size") or f"{disk_gb:.2f} GB",
                     "purpose": meta.get("purpose", ""),
-                    "vram": act.get("vram"),
+                    "vram": _vram_from_probe(probe) or act.get("vram"),
                     "family": meta.get("family", ""),
                     "capability": cap,
-                    "moe": act.get("moe"),
-                    "details": act.get("details") or {},
+                    "probe": probe,
+                    "moe": _moe_from_probe(probe) or act.get("moe"),
+                    "details": probe_details or active_details,
                 })
 
     # HF/vLLM/SGLang: <name>/config.json
@@ -298,22 +424,41 @@ _CAP_GLYPH = {
     "error":       "✗",  # probe failed
 }
 
+_REASONING_LABEL = {
+    "structured": "Native reasoning",
+    "inline": "Inline reasoning",
+    "unsupported": "No reasoning",
+}
+
+_STATUS_ORDER = {
+    "native": 0,
+    "inline": 1,
+    "none": 2,
+    "cpu_offload": 3,
+}
+
+
+def _context_label(context: int) -> str:
+    return f"{context // 1024}K" if context >= 1024 else str(context)
+
 
 def _vram_at(v: dict, context: int) -> tuple[float | None, int]:
     """Compute (total_gb, effective_context) for the model at CONTEXT.
 
-    effective_context = min(context, max_context) — the model's design
-    ceiling is a hard physical limit, not a runtime knob. A 128K-only
-    model asked to run at 256K simply runs at 128K (its max), and the
-    picker shows that honestly. This is NOT a runtime clamp like
-    OLLAMA_CONTEXT_LENGTH; it's a fact about the model's architecture.
-
-    Formula-only entries store a KV total at the generation context; KV
-    memory is linear in context, so recompute it when CONTEXT changes.
-    Returns (None, 0) when no usable VRAM data is present.
+    effective_context = min(context, max_context). Probe-backed entries
+    return the measurement at that exact tier; when no probe was recorded
+    there (e.g., the user picked a non-standard context), the picker
+    treats the row as ineligible — there is no interpolation any more.
+    Formula entries (vLLM/SGLang dormant path) recompute KV linearly.
+    Returns (None, 0) when no usable data is present.
     """
     if not v:
         return None, 0
+    exact = _measured_point_at(v, context)
+    if exact:
+        return round(float(exact.get("actual_total_gb") or 0), 2), int(
+            exact.get("ctx") or exact.get("actual_context") or context
+        )
     if v.get("source") == "formula" and v.get("total_gb") is not None:
         base_ctx = int(v.get("context") or context)
         if base_ctx <= 0:
@@ -324,14 +469,81 @@ def _vram_at(v: dict, context: int) -> tuple[float | None, int]:
         static_gb = float(v["total_gb"]) - kv_gb
         total = static_gb + (kv_gb * eff_ctx / base_ctx)
         return round(total, 2), eff_ctx
-    weights = v.get("weights_overhead_gb")
-    kv_pt = v.get("kv_per_token_bytes")
-    if weights is None or kv_pt is None:
-        return None, 0
-    max_ctx = v.get("max_context") or 0
+    return None, 0
+
+
+def _measured_point_at(v: dict, context: int) -> dict:
+    """Return the v2 probe record at min(context, max_context), or {}.
+
+    Two shapes are accepted:
+      - Cache shape: v["probes"] is a dict keyed by str(ctx). We pick the
+        record at the effective context.
+      - Active-models.yaml shape: v carries a single measurement
+        (total_gb, vram_gb, context, spilled_to_cpu) as a flat dict. This
+        is the picker's fallback when the probe cache isn't mounted; we
+        treat it as a measured point at v["context"].
+    """
+    max_ctx = int(v.get("max_context") or 0)
     eff_ctx = min(context, max_ctx) if max_ctx else context
-    total = weights + (kv_pt * eff_ctx) / (1024**3)
-    return round(total, 2), eff_ctx
+    probes = v.get("probes")
+    if isinstance(probes, dict) and probes:
+        rec = probes.get(str(eff_ctx))
+        if isinstance(rec, dict):
+            return rec
+    if v.get("source") == "probe" and v.get("total_gb") is not None:
+        flat_ctx = int(v.get("context") or 0)
+        if flat_ctx == eff_ctx:
+            return {
+                "ctx": flat_ctx,
+                "actual_total_gb": float(v["total_gb"]),
+                "actual_vram_gb": float(v.get("vram_gb") or v["total_gb"]),
+                "fully_on_gpu": not bool(v.get("spilled_to_cpu", False)),
+                "actual_context": flat_ctx,
+            }
+    return {}
+
+
+def _vram_info_at(v: dict, context: int) -> dict | None:
+    exact = _measured_point_at(v, context)
+    if exact:
+        total = round(float(exact["actual_total_gb"]), 2)
+        vram_gb = round(float(exact.get("actual_vram_gb") or total), 2)
+        return {
+            "total_gb": total,
+            "vram_gb": vram_gb,
+            "context": int(exact.get("actual_context") or context),
+            "fully_on_gpu": bool(exact.get("fully_on_gpu", True))
+            and total <= _VRAM_BUDGET,
+            "over_budget": total > _VRAM_BUDGET,
+            "measured": True,
+        }
+    total, eff_ctx = _vram_at(v, context)
+    if total is None:
+        return None
+    return {
+        "total_gb": total,
+        "vram_gb": min(total, _VRAM_BUDGET),
+        "context": eff_ctx,
+        "fully_on_gpu": (
+            not bool(v.get("spilled_to_cpu", False))
+            and total <= _VRAM_BUDGET
+        ),
+        "over_budget": total > _VRAM_BUDGET,
+        "measured": False,
+    }
+
+
+def _reasoning_status(m: dict, info: dict) -> tuple[str, str, str] | None:
+    if not info.get("fully_on_gpu", True):
+        return "cpu_offload", "!", "CPU offload"
+    cap = m.get("capability", "unknown")
+    if cap == "structured":
+        return "native", _CAP_GLYPH[cap], _REASONING_LABEL[cap]
+    if cap == "inline":
+        return "inline", _CAP_GLYPH[cap], _REASONING_LABEL[cap]
+    if cap == "unsupported":
+        return "none", _CAP_GLYPH[cap], _REASONING_LABEL[cap]
+    return None
 
 
 def _infer_tuning(name: str) -> str:
@@ -350,20 +562,17 @@ def _infer_tuning(name: str) -> str:
 
 
 def _format_model_row(m: dict) -> str:
-    v = m.get("vram") or {}
-    src = v.get("source")
-    total, eff_ctx = _vram_at(v, _CONTEXT)
-    if total is None:
-        vram_num = "?"
-        ctx_str = "?"
-    else:
-        suffix = "*" if src == "formula" else ""
-        vram_num = f"{total:.2f}{suffix}"
-        ctx_k = eff_ctx // 1024
-        ctx_str = f"{ctx_k}K"
+    info = m.get("_picker_vram") or {}
+    vram_num = "?"
+    gpu_num = "?"
+    if info:
+        suffix = "" if info.get("measured") else "*"
+        vram_num = f"{info['total_gb']:.2f}{suffix}"
+        gpu_num = f"{info['vram_gb']:.2f}"
 
-    cap = m.get("capability", "unknown")
-    glyph = _CAP_GLYPH.get(cap, _CAP_GLYPH["unknown"])
+    ctx_str = _context_label(int(m.get("_picker_context") or 0))
+    glyph = m.get("_picker_glyph", "?")
+    status_label = m.get("_picker_status_label", "Unknown")
 
     # Params column: dense → "9B", MoE → "26B/A4B" (total/active).
     moe = m.get("moe") or {}
@@ -385,13 +594,15 @@ def _format_model_row(m: dict) -> str:
     tuning = _infer_tuning(m["name"])
 
     return (
-        f"      {glyph} {m['name']:<32s}  "
+        f"      {ctx_str:>4s}  "
+        f"{glyph} {status_label:<16s}  "
+        f"{m['name']:<32s}  "
         f"{params_col:>10s}  "
         f"{quant:>8s}  "
         f"{tuning:>5s}  "
         f"{type_col:>5s}  "
         f"{vram_num:>10s}  "
-        f"{ctx_str:>8s}"
+        f"{gpu_num:>8s}"
     )
 
 
@@ -406,71 +617,91 @@ def _name_priority(m: dict) -> tuple:
     return (not name.endswith(":latest"), len(name))
 
 
-def _quality(m: dict) -> float:
-    """Quality proxy used to rank within a family. Larger weights → better.
+def _parse_param_b(label: str) -> float:
+    import re
+    match = re.search(r"(\d+(?:\.\d+)?)\s*b", label.lower())
+    return float(match.group(1)) if match else 0.0
 
-    Coefficient-derived `weights_overhead_gb` is the cleanest signal
-    (intercept = weights + small runtime overhead, KV-free). Older
-    formula-only entries fall back to `weights_gb`, then raw disk size.
+
+def _quality(m: dict) -> tuple[float, float, float]:
+    """Quality proxy used to rank within a family. Higher tuple wins.
+
+    Tuple components in priority order:
+      1. parameter count from /api/show details (probe-backed) — most
+         meaningful "scale" signal (a 27B Q4 beats a 9B BF16).
+      2. actual VRAM at the picker's context — at fixed param count the
+         higher-precision quant uses more memory and is preferred.
+      3. raw disk size — last-resort tiebreaker for missing metadata.
     """
-    v = m.get("vram") or {}
-    if v.get("weights_overhead_gb") is not None:
-        return float(v["weights_overhead_gb"])
-    if v.get("weights_gb"):
-        return float(v["weights_gb"])
+    details = m.get("details") or {}
+    params_b = _parse_param_b(str(details.get("param_size") or ""))
+    info = m.get("_picker_vram") or {}
+    vram_total = float(info.get("total_gb") or 0.0)
     try:
-        return float((m.get("size") or "0").split()[0])
+        size_gb = float((m.get("size") or "0").split()[0])
     except (ValueError, IndexError):
-        return 0.0
-
-
-# Was capped at 3; dedup-by-VRAM-bucket below still collapses literal
-# aliases (same digest, different tag) without losing distinct model sizes.
-_TOP_PER_FAMILY = None  # None = no cap
+        size_gb = 0.0
+    return (params_b, vram_total, size_gb)
 
 
 def _build_menu(models: list[dict]) -> tuple[list[str], list[bool], list[dict | None]]:
     """Build (display_lines, selectable_flags, model_per_line) for fzf.
 
-    Shows all fitting Ollama models, grouped by family. Per row a
-    capability glyph (●/◐/·/?/✗) reflects the runtime probe — no filter
-    by capability (per docs/ollama_models.md). Within each family, top N
-    by quality (weights_gb desc), deduped on weight bucket so the user
-    sees distinct sizes rather than 3 quants of the same model.
+    For each family and standard context tier, show the best model for
+    each user-facing status: Native reasoning, Inline reasoning, No
+    reasoning, and CPU offload. "Best" means highest model quality proxy,
+    with explicit tags preferred over moving :latest aliases.
     """
-    # backend → family → [models]. Filters:
-    #   1. Only Ollama models are selectable while vLLM/SGLang are dormant.
-    #   2. The model needs usable VRAM data for display/filtering.
-    #   3. Total at effective_ctx (= min(CONTEXT, max_ctx), with
-    #      formula-only KV scaled to CONTEXT) must fit in VRAM_BUDGET.
-    # Reasoning capability is display metadata, not a selection filter.
-    grouped: dict[str, dict[str, list[dict]]] = {}
+    # backend → family → (context, status) → model
+    grouped: dict[str, dict[str, dict[tuple[int, str], dict]]] = {}
     # Track why models were hidden so the footer can explain. The big
     # categories worth distinguishing today:
     #   - non_ollama_dormant: vLLM/SGLang entries are not part of the
     #     current Ollama reasoning flow.
-    #   - over_budget: interpolated/recorded VRAM > VRAM_BUDGET
     #   - missing_vram: no usable coefficients or formula totals
+    #   - missing_capability: probed state is unknown/error and not CPU offload
     hidden = {
         "non_ollama_dormant": 0,
-        "over_budget": 0,
+        "context_capped": 0,
         "missing_vram": 0,
+        "missing_capability": 0,
     }
     for m in models:
-        v = m.get("vram") or {}
         backend = m.get("backend", "ollama")
         if backend != "ollama":
             hidden["non_ollama_dormant"] += 1
             continue
-        total, _ = _vram_at(v, _CONTEXT)
-        if total is None:
-            hidden["missing_vram"] += 1
-            continue
-        if total > _VRAM_BUDGET:
-            hidden["over_budget"] += 1
-            continue
-        family = m.get("family") or "(uncategorized)"
-        grouped.setdefault(backend, {}).setdefault(family, []).append(m)
+        for ctx in _CONTEXT_CHOICES:
+            v = m.get("vram") or {}
+            info = _vram_info_at(v, ctx)
+            if info is None:
+                hidden["missing_vram"] += 1
+                continue
+            if int(info.get("context") or 0) < ctx:
+                hidden["context_capped"] += 1
+                continue
+            status = _reasoning_status(m, info)
+            if status is None:
+                hidden["missing_capability"] += 1
+                continue
+            status_key, glyph, status_label = status
+            family = m.get("family") or "(uncategorized)"
+            candidate = dict(m)
+            candidate["_picker_context"] = ctx
+            candidate["_picker_vram"] = info
+            candidate["_picker_status"] = status_key
+            candidate["_picker_glyph"] = glyph
+            candidate["_picker_status_label"] = status_label
+
+            bucket = (ctx, status_key)
+            family_rows = grouped.setdefault(backend, {}).setdefault(family, {})
+            previous = family_rows.get(bucket)
+            if (
+                previous is None
+                or (_quality(candidate), _name_priority(candidate))
+                > (_quality(previous), _name_priority(previous))
+            ):
+                family_rows[bucket] = candidate
 
     lines: list[str] = []
     selectable: list[bool] = []
@@ -482,17 +713,18 @@ def _build_menu(models: list[dict]) -> tuple[list[str], list[bool], list[dict | 
         item_models.append(model)
 
     first_section = True
-    # Column header is emitted with a 2-char prefix from emit(); the leading
-    # 6 spaces here align it with data rows whose prefix is "      ● " (6
-    # spaces + 1 glyph + 1 space = 8 chars before the TAG field begins).
+    # Column header is emitted with a 2-char prefix from emit(); leading
+    # spaces align it with data rows.
     column_header = (
-        f"      {'TAG':<32s}  "
+        f"      {'CTX':>4s}  "
+        f"{'REASONING':<18s}  "
+        f"{'TAG':<32s}  "
         f"{'PARAMS':>10s}  "
         f"{'QUANT':>8s}  "
         f"{'TUNE':>5s}  "
         f"{'TYPE':>5s}  "
         f"{'VRAM (GB)':>10s}  "
-        f"{'CONTEXT':>8s}"
+        f"{'GPU GB':>8s}"
     )
     for backend in ("ollama", "vllm", "sglang"):
         if backend not in grouped:
@@ -505,30 +737,27 @@ def _build_menu(models: list[dict]) -> tuple[list[str], list[bool], list[dict | 
              selectable_=False, model=None)
         emit(f"  {_BOLD}{column_header}{_RESET}",
              selectable_=False, model=None)
+        emit(f"  {_DIM}* = formula estimate (vLLM/SGLang have no probe runner yet){_RESET}",
+             selectable_=False, model=None)
 
-        # Order families within this backend by their best variant.
-        families = sorted(
-            grouped[backend].items(),
-            key=lambda kv: -max(_quality(m) for m in kv[1]),
-        )
-        for fam, fmodels in families:
-            # Dedupe on VRAM bucket (1-decimal). When several tags share
-            # the same bucket (almost always literal aliases of one blob —
-            # e.g. qwen3.5:9b, qwen3.5:9b-q4_K_M and qwen3.5:latest all
-            # map to the same digest) we keep the most INFORMATIVE name:
-            #   - never :latest (it's a moving alias, says nothing about
-            #     parameters / quantization)
-            #   - otherwise prefer the longest name (longer = more
-            #     explicit suffixes like -q4_K_M, -a3b, -it-bf16)
-            seen: dict[float, dict] = {}
-            for m in sorted(fmodels, key=_quality, reverse=True):
-                bucket = round(_quality(m), 1)
-                if bucket not in seen or _name_priority(m) > _name_priority(seen[bucket]):
-                    seen[bucket] = m
-            ranked = sorted(seen.values(), key=_quality, reverse=True)
-            top = ranked if _TOP_PER_FAMILY is None else ranked[:_TOP_PER_FAMILY]
+        # Order families within this backend by their best selected variant.
+        # _quality returns a tuple (params_b, vram_total, size_gb); negate
+        # via tuple-component sign to keep "higher quality first".
+        def _family_sort_key(kv):
+            best = max(_quality(m) for m in kv[1].values())
+            return tuple(-x for x in best)
+
+        families = sorted(grouped[backend].items(), key=_family_sort_key)
+        for fam, selected in families:
             emit(f"    {_BOLD}{fam}:{_RESET}",
                  selectable_=False, model=None)
+            top = sorted(
+                selected.values(),
+                key=lambda m: (
+                    int(m.get("_picker_context") or 0),
+                    _STATUS_ORDER.get(str(m.get("_picker_status")), 99),
+                ),
+            )
             for m in top:
                 emit(_format_model_row(m), selectable_=True, model=m)
 
@@ -542,8 +771,10 @@ def _build_menu(models: list[dict]) -> tuple[list[str], list[bool], list[dict | 
             bits.append(f"{hidden['non_ollama_dormant']} vLLM/SGLang (dormant)")
         if hidden["missing_vram"]:
             bits.append(f"{hidden['missing_vram']} missing VRAM data")
-        if hidden["over_budget"]:
-            bits.append(f"{hidden['over_budget']} over VRAM budget")
+        if hidden["context_capped"]:
+            bits.append(f"{hidden['context_capped']} below requested context")
+        if hidden["missing_capability"]:
+            bits.append(f"{hidden['missing_capability']} not probed/probe failed")
         emit(f"  {_DIM}hidden: {', '.join(bits)}  ·  "
              f"see docs/ollama_models.md{_RESET}",
              selectable_=False, model=None)
@@ -638,21 +869,23 @@ def main() -> None:
             "  Pull models first (e.g. `make ollama-pull`, `make vllm-pull`)."
         )
 
-    # Step 1 — pick a model. Top N per family ranked by weight, with the
-    # runtime-probed reasoning capability shown as a glyph next to each
-    # row. ●=structured ◐=inline ·=unsupported ?=unknown ✗=error.
+    # Step 1 — pick a model/context/status row. For each family and
+    # standard context tier, the picker shows the best model per
+    # user-facing status: Native reasoning, Inline reasoning, No reasoning,
+    # and CPU offload.
     lines, selectable, item_models = _build_menu(models)
     if not any(selectable):
         sys.exit(
-            f"error: no fitting models on disk at {_CONTEXT // 1024}K ctx, "
+            f"error: no usable model/context rows on disk for "
             f"≤ {_VRAM_BUDGET:g} GB.\n"
-            f"  Try a smaller context: CONTEXT=32768 …\n"
-            f"  Or raise the VRAM budget: VRAM=48 …\n"
+            f"  Run `make model-select` so probe data exists.\n"
+            f"  Or raise the VRAM budget: VRAM=48 ...\n"
             f"  Or pull smaller models: make ollama-pull MODEL=…"
         )
     header = (
         f"DevAI  ▸  Step 1/2: pick a model  "
-        f"(Ollama · {_CONTEXT // 1024}K ctx · "
+        f"(Ollama · {_context_label(_CONTEXT_CHOICES[0])}-"
+        f"{_context_label(_CONTEXT_CHOICES[-1])} ctx · "
         f"≤ {_VRAM_BUDGET:g} GB)"
     )
     idx = _fzf(lines, header, selectable=selectable)
@@ -661,6 +894,8 @@ def main() -> None:
     model = item_models[idx]
     if model is None:  # defensive — _fzf already filters headers
         os.execvp("bash", ["bash"])
+    selected_context = int(model.get("_picker_context") or _DEFAULT_CONTEXT)
+    os.environ["CONTEXT"] = str(selected_context)
 
     # Step 2 — pick an agent (skipped when --agent was passed)
     if agent_filter:
@@ -675,6 +910,7 @@ def main() -> None:
         header = (
             f"Step 2/2: pick an agent for "
             f"{_BOLD}{model['name']}{_RESET}"
+            f" @ {_context_label(selected_context)}"
             f" via {_BACKENDS[model['backend']][0]}"
         )
         idx = _fzf(alines, header)
@@ -685,7 +921,8 @@ def main() -> None:
     cmd = _build(agent[0], model["name"], model["backend"])
     print(
         f"\n  {_BOLD}{agent[0]}{_RESET}"
-        f" → {model['name']} via {_BACKENDS[model['backend']][0]}\n"
+        f" → {model['name']} @ {_context_label(selected_context)}"
+        f" via {_BACKENDS[model['backend']][0]}\n"
     )
     os.execvp(cmd[0], cmd)
 

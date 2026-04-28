@@ -101,11 +101,11 @@ All services share `devai-net` network. Model data stored under `/var/cache/deva
 
 Interactive model → agent selection via fzf. Used by both `make shell-*` (via `agent-picker`) and JupyterLab launcher cards.
 
-- `scripts/model-picker.py` — Python TUI, two-step fzf picker. Reads `deploy/active-models.yaml` (probe data, capability, VRAM coefficients) and falls back to `deploy/models.yaml` for catalog metadata only. Backend is derived from the chosen model's entry — there's no explicit backend step.
+- `scripts/model-picker.py` — Python TUI, two-step fzf picker. Reads `deploy/active-models.yaml` for the run-time active set and `deploy/.ollama-reasoning-cache.json` (digest-keyed, schema v2) for per-tier probe data. Falls back to `deploy/models.yaml` for catalog metadata only. Backend is derived from the chosen model's entry — there's no explicit backend step.
 - `scripts/agent-picker.sh` — Shell wrapper, execs model-picker.py.
 - `packages/jupyter-ai-launchers/src/index.ts` — JupyterLab extension, each card runs `model-picker --agent <name>`.
 
-**Filter:** the picker only shows models with `reasoning.capability == "structured"` AND probe-derived VRAM coefficients (`weights_overhead_gb`, `kv_per_token_bytes`). Today that filter resolves to Ollama-only because no probe runner exists for vLLM/SGLang yet. The picker prints a footer line listing how many catalog entries were hidden and points at `docs/sidelined-backends.md`. To loosen the filter for vLLM/SGLang, see that doc.
+**Filter:** the picker shows one row per (family, context tier, reasoning status) bucket. A model is eligible at a tier only when the probe cache contains a measurement at exactly that tier with `fully_on_gpu: true`. There is no interpolation — gaps mean "re-run `make probe-reasoning`". HF entries stay `capability: unknown` because no probe runner exists for vLLM/SGLang yet (see `docs/sidelined-backends.md`); the picker hides them.
 
 ### Building the JupyterLab extension
 
@@ -131,7 +131,7 @@ deploy/Dockerfile.lab         — Lab image
 deploy/Dockerfile.router      — Router image (distroless)
 gpu-arbiter/main.go           — GPU arbiter source (multi-port proxy, ~1070 lines Go)
 scripts/generate-catalog.py   — Refresh deploy/models.yaml from upstream (HF + Ollama registry)
-scripts/probe-ollama-reasoning.py — Two-point probe: capability + VRAM coefficients
+scripts/probe-ollama-reasoning.py — Per-tier probe: capability + measured VRAM at each context tier (schema v2, digest-keyed)
 scripts/select-models.py      — Combine catalog + probe + disk → active-models.yaml
 scripts/model-picker.py       — Two-step interactive picker (model → agent)
 tests/test-router.sh          — Ollama-side integration tests

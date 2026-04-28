@@ -101,6 +101,8 @@ type backendConfig struct {
 
 type configModel struct {
 	Name      string           `yaml:"name"`
+	Aliases   []string         `yaml:"aliases,omitempty"`
+	Digest    string           `yaml:"digest,omitempty"`
 	Backend   []string         `yaml:"backend"`
 	Repo      string           `yaml:"repo"`
 	Size      string           `yaml:"size"`
@@ -438,27 +440,43 @@ func main() {
 	// scripts/probe-ollama-reasoning.py. The arbiter applies the policy
 	// (DEVAI_REASONING env) per request using the protocol field for the
 	// incoming Ollama API path.
-	modelSizes := make(map[string]float64, len(cfg.Models))
-	modelContexts := make(map[string]int, len(cfg.Models))
-	modelCapability := make(map[string]string, len(cfg.Models))
+	// Resolve canonical name + aliases (one digest = one set of weights, but
+	// users may issue requests with any registered alias). Each lookup map
+	// receives an entry per alias so a request for "qwen3.5:latest" finds
+	// the same context cap and capability as the canonical "qwen3.5:9b-q8_0".
+	modelSizes := make(map[string]float64)
+	modelContexts := make(map[string]int)
+	modelCapability := make(map[string]string)
 	modelDisableOK := make(map[string]bool)
 	capCounts := make(map[string]int)
 	for _, m := range cfg.Models {
-		if sz := parseSizeGB(m.Size); sz > 0 {
-			modelSizes[m.Name] = sz
-		}
-		if m.Context > 0 {
-			modelContexts[m.Name] = m.Context
-		}
+		names := append([]string{m.Name}, m.Aliases...)
+		sz := parseSizeGB(m.Size)
 		cap := "unknown"
 		if m.Reasoning != nil && m.Reasoning.Capability != "" {
 			cap = m.Reasoning.Capability
 		}
-		modelCapability[m.Name] = cap
-		capCounts[cap]++
-		if m.Reasoning != nil && m.Reasoning.DisableVerified != nil && *m.Reasoning.DisableVerified {
-			modelDisableOK[m.Name] = true
+		disableOK := m.Reasoning != nil &&
+			m.Reasoning.DisableVerified != nil &&
+			*m.Reasoning.DisableVerified
+		for _, name := range names {
+			if name == "" {
+				continue
+			}
+			if sz > 0 {
+				modelSizes[name] = sz
+			}
+			if m.Context > 0 {
+				modelContexts[name] = m.Context
+			}
+			modelCapability[name] = cap
+			if disableOK {
+				modelDisableOK[name] = true
+			}
 		}
+		// Count capability once per canonical row, not once per alias —
+		// otherwise a model with N aliases would dominate the histogram.
+		capCounts[cap]++
 	}
 	policy := strings.ToLower(env("DEVAI_REASONING", "auto"))
 	if !validPolicy(policy) {

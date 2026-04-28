@@ -209,19 +209,31 @@ Classify disable support:
 This matters because some models default reasoning on. Omitting the control
 field is not equivalent to disabling reasoning.
 
-### Step 4: Cache by Model Identity
+### Step 4: Cache by Digest, Not Name
 
-Cache probe results by model identity, not just model name.
+The probe cache (`deploy/.ollama-reasoning-cache.json`, schema v2) is
+keyed by `digest` — one record per set of weights. Each record carries:
 
-Recommended identity fields:
+- `aliases`: every name pointing at this digest (`ollama:latest`,
+  `ollama:9b`, `ollama:9b-q4_K_M` …)
+- `max_context`: the architecture's design ceiling from `/api/show`
+- `capability` and `disable_verified`: canonical, taken at the smallest
+  fitting tier (most reliable signal)
+- `probes`: a map keyed by stringified context tier, each value a
+  measurement record with `actual_total_gb`, `actual_vram_gb`,
+  `fully_on_gpu`, per-tier capability, and timestamp
 
-- model name
-- digest from `/api/tags` when available
-- modified timestamp
-- Ollama version
+Probing is incremental and never destructive. A new tier only fills a
+gap; existing tier measurements are immutable unless `--force-ctx` or
+`--force` is passed. Two aliases of the same digest probe at most once
+per tier — the probe driver dedups before issuing chat calls. If a tier
+is above `max_context`, it's silently capped: a 128K-only model with
+tiers `[32K, 64K, 128K, 256K]` records probes at `[32768, 65536, 131072]`
+and is shown at the higher tiers as "limited to 128K".
 
-If any identity field changes, the probe result is stale and should be
-regenerated.
+When the digest disappears from `/api/tags` (model deleted), the entry
+is dropped on the next probe run. When an alias disappears (retag), it's
+removed from `aliases` but the digest entry stays.
 
 ## Runtime Policy
 
@@ -296,17 +308,17 @@ The picker should not hide all non-reasoning models by default.
 Recommended display:
 
 ```text
-qwen3.5:9b        reasoning: structured   policy: auto
-deepseek-r1:8b    reasoning: structured   policy: auto
-llama3.2:3b       reasoning: none         standard chat
-unknown:model     reasoning: unknown      probe needed
+qwen3.5:9b        Native reasoning   policy: auto
+deepseek-r1:8b    Native reasoning   policy: auto
+gemma4:e4b        No reasoning       standard chat
+qwen3.5:27b       CPU offload        slow / not preferred
 ```
 
 Filtering should be explicit:
 
-- show all models by default
+- show all measured labels by default
 - optional filter: reasoning-capable only
-- optional filter: structured reasoning only
+- optional filter: Native reasoning only
 - optional filter: probe errors
 
 ## Avoid These Patterns
