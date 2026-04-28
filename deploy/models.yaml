@@ -2,7 +2,7 @@
 #
 # Regenerate with: make catalog-regen
 # Source of truth:  scripts/model-families.yaml
-# Generated at:     2026-04-28T10:21:26+00:00
+# Generated at:     2026-04-28T13:23:23+00:00
 #
 # Every 'size' and 'arch' below was fetched live from the
 # upstream provider at generation time. Do not hand-edit.
@@ -493,6 +493,17 @@ models:
     arch: { layers: 32, kv_heads: 4, head_dim: 256, k_eq_v: false }
     arch_source: "ykarout/Qwen3.5-9B-NVFP4/config.json"
     purpose: "qwen3.5 · 75.8 GB · 32L/4kv/256h"
+
+  - name: "qwen3.5:27b-ud-q3_k_xl"
+    family: qwen3.5
+    backend: [ollama]
+    repo: "unsloth/Qwen3.5-27B-GGUF"
+    source: gguf
+    gguf_filename: "Qwen3.5-27B-UD-Q3_K_XL.gguf"
+    size: "13.45 GB"
+    arch: { layers: 32, kv_heads: 4, head_dim: 256, k_eq_v: false }
+    arch_source: "ykarout/Qwen3.5-9B-NVFP4/config.json"
+    purpose: "qwen3.5 · 13.4 GB · 32L/4kv/256h"
 
   - name: "Qwen3-14B-NVFP4"
     family: qwen3

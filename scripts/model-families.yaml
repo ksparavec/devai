@@ -63,8 +63,11 @@ families:
     gguf_repos:
       - repo: unsloth/Qwen3.5-27B-GGUF
         tag_prefix: 27b
-        include: []        # commit 2 of refactor will wire the loader; until
-                           # then this block is parsed-and-ignored
+        include:
+          - UD-Q3_K_XL     # ~14.4 GB — Unsloth Dynamic 2.0; sweet spot
+                           # for 27B on a 24G card (q3_k_m quality with
+                           # importance-matrix calibration). Add more
+                           # tokens here to enumerate other quants.
     arch_ref: ykarout/Qwen3.5-9B-NVFP4
     thinking: true
 
