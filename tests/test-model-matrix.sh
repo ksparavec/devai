@@ -114,21 +114,22 @@ else
         echo "error: $PROBE_CACHE not found — run 'make probe' first" >&2
         exit 2
     fi
+    # Exhaustive: every probed digest where at least one (vram, ctx) cell
+    # at the host VRAM band fits fully on GPU. We test ONE alias per
+    # digest (the first sorted name); aliases share weights and behave
+    # identically, so testing all aliases would just multiply runtime
+    # without finding new bugs. Eligible digests with capability=error
+    # at the canonical level are excluded — they have no fitting cell.
     mapfile -t MODELS < <(jq -r --argjson vram "$HOST_VRAM" '
         [ to_entries[]
           | .value
           | select(.schema_version == 3 and .capability != "error")
-          | { family: .arch_family,
-              capability,
-              disable_verified,
-              alias: .aliases[0],
+          | { alias: .aliases[0],
               has_fit: ((.probes[$vram | tostring] // {}) |
                         to_entries | any(.value.fully_on_gpu == true)) }
           | select(.has_fit)
-        ] | group_by([.family, .capability])
-          | map(.[0])
-          | .[] | .alias
-    ' "$PROBE_CACHE" | head -5)
+        ] | sort_by(.alias) | .[] | .alias
+    ' "$PROBE_CACHE")
 fi
 
 if [ "${#MODELS[@]}" -eq 0 ]; then
@@ -136,10 +137,16 @@ if [ "${#MODELS[@]}" -eq 0 ]; then
     exit 2
 fi
 
+# Each model load takes ~5-30s cold; the matrix runs ~5 scenarios × 3
+# protocols per model. A full sweep across every eligible digest is
+# typically 30-60 min on a 24G card. Print a heads-up so the operator
+# isn't surprised by the wall time.
 hdr "matrix: ${#MODELS[@]} model(s) × 3 protocol(s) × up to 5 scenarios"
-echo "  models:  ${MODELS[*]}"
+echo "  models ($HOST_VRAM GB band, exhaustive over fitting digests):"
+for m in "${MODELS[@]}"; do echo "    - $m"; done
 echo "  router:  $ROUTER"
 echo "  ctx:     $TEST_CTX (per-session via Modelfile-derived tag)"
+echo "  expect:  ~30-60 min for a full sweep; pin TEST_MODELS=... to subset"
 
 # Capability lookup helpers (read from cache).
 cap_of() {
