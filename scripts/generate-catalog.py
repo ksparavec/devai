@@ -199,19 +199,29 @@ def _entry_hf(repo: str, family: str, fallback_arch: Arch,
 def _gguf_tag_token(filename: str) -> str:
     """Derive a stable Ollama tag suffix from a .gguf filename.
 
-    `Qwen3.5-27B-UD-Q3_K_XL.gguf` → `ud-q3_k_xl`. We strip the model-name
-    prefix (everything up to and including the size-in-B token) and the
-    `.gguf` suffix, then lowercase. `_` and `-` are kept as-is. Falls
-    back to a sanitised lowercase of the full stem when no size token
-    is present.
+    Strips everything up to and including the rightmost SIZE-in-B token,
+    then lowercases. Recognises both plain `<digits>B` and
+    `<letter><digits>B` shapes — the latter covers MoE notation like
+    `A4B` / `A3B` (active-experts size). Without that, filenames like
+    `gemma-4-26B-A4B-it-UD-Q3_K_XL.gguf` would only strip up to `26B`,
+    leaving `A4B` in the token and producing duplicated tag prefixes
+    (`26b-a4b-a4b-it-...`).
+
+    Examples:
+      `Qwen3.5-27B-UD-Q3_K_XL.gguf`            → `ud-q3_k_xl`
+      `Qwen3.5-35B-A3B-UD-Q3_K_XL.gguf`        → `ud-q3_k_xl`
+      `gemma-4-26B-A4B-it-UD-Q3_K_XL.gguf`     → `it-ud-q3_k_xl`
+      `NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-UD-Q3_K_XL.gguf`
+                                               → `reasoning-ud-q3_k_xl`
     """
     import re
     stem = filename
     if stem.endswith(".gguf"):
         stem = stem[: -len(".gguf")]
-    # Find the rightmost size-in-B token (e.g. "27B", "9B", "1.5B"). Quant
-    # tokens always come AFTER it in canonical filenames.
-    matches = list(re.finditer(r"(?<![A-Za-z0-9])(\d+(?:\.\d+)?B)(?=[-_]|$)", stem))
+    # `[A-Z]?` makes the optional letter prefix recognise A4B / A3B / etc.
+    matches = list(re.finditer(
+        r"(?<![A-Za-z0-9])([A-Z]?\d+(?:\.\d+)?B)(?=[-_]|$)", stem,
+    ))
     if matches:
         stem = stem[matches[-1].end():].lstrip("-_")
     return stem.lower() or "unspec"
