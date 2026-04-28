@@ -47,6 +47,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -947,8 +948,16 @@ func (a *arbiter) makeRequestHandler(backendName string) http.HandlerFunc {
 			body = setNumCtx(body, numCtx, force)
 			modelName = cleanName
 
+			// Capability lookup must resolve picker-materialised
+			// "<parent>-ctx<N>" derived tags back to the parent's entry.
+			// The cache only registers the parent (the derived tag is
+			// per-session and absent from /api/show metadata at probe
+			// time). Without this strip, modelCapability[derived] = ""
+			// and applyReasoningPolicy short-circuits to noop on every
+			// derived-tag request.
+			policyModel := stripCtxVariantSuffix(modelName)
 			policy := a.requestPolicy(req)
-			body = a.applyReasoningPolicy(backendName, req.URL.Path, modelName, policy, body)
+			body = a.applyReasoningPolicy(backendName, req.URL.Path, policyModel, policy, body)
 			req.Body = io.NopCloser(bytes.NewReader(body))
 			req.ContentLength = int64(len(body))
 			req.Header.Set("Content-Length", strconv.Itoa(len(body)))
@@ -1131,6 +1140,22 @@ func parseCtxOverride(name string) (clean string, override int) {
 		return name, 0
 	}
 	return name[:at], n
+}
+
+// stripCtxVariantSuffix peels the "-ctx<int>" suffix the picker adds when
+// it materialises a Modelfile-derived tag (PARAMETER num_ctx baked in).
+// The suffix doesn't appear in the cache (only the parent does), so
+// per-model lookups (capability, disable_verified, registered context
+// cap) need to resolve to the parent. Returns the input unchanged when
+// no suffix is present.
+var ctxVariantSuffix = regexp.MustCompile(`-ctx\d+$`)
+
+func stripCtxVariantSuffix(name string) string {
+	loc := ctxVariantSuffix.FindStringIndex(name)
+	if loc == nil {
+		return name
+	}
+	return name[:loc[0]]
 }
 
 // setTopJSONField overwrites a top-level field unconditionally (no

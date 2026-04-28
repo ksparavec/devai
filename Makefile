@@ -110,7 +110,7 @@ endif
 .PHONY: ollama-rm ollama-list ollama-status ollama-clean ollama-df
 .PHONY: vllm-list vllm-rm vllm-status vllm-df
 .PHONY: clean clean-cpu clean-gpu clean-router prune
-.PHONY: fetch-cli pull-images install-systemd test test-router test-ollama test-agents help
+.PHONY: fetch-cli pull-images install-systemd test test-router test-ollama test-agents test-models help
 .PHONY: catalog-regen probe model-fit model-pull vram-fit
 
 all: help
@@ -390,6 +390,17 @@ test-ollama: cache-up ## Run Ollama-only integration tests
 # and ./tests/test-router-idle.sh stay in the tree so reactivation is
 # trivial; rerun once vLLM is moved out of the backends-disabled profile.
 
+test-models: cache-up ## Matrix test: every probed model × wire protocol × scenario.
+	@# Drives /api/chat, /v1/chat/completions, /v1/messages directly via curl
+	@# (faster + more deterministic than spinning up real agent CLIs). For
+	@# each candidate model materialises a Modelfile-derived ctx variant
+	@# (matching what the picker does) and runs basic / tools / think_auto /
+	@# think_off / ctx scenarios. Pin a specific subset via TEST_MODELS=...
+	HOST_VRAM=$${VRAM:-$(GPU_MEMORY_GB)} \
+	TEST_CTX=$${CONTEXT:-32768} \
+	CONTAINER_RUNTIME=$(CONTAINER_RUNTIME) \
+	  ./tests/test-model-matrix.sh
+
 test-agents: ## Smoke-test every (agent × backend) cell against the live router
 	@# Defensive cleanup: a previous run with the dormant backends profile
 	@# disabled may have left vllm/sglang containers behind. Harmless when
@@ -417,7 +428,7 @@ test-agents: ## Smoke-test every (agent × backend) cell against the live router
 		$(IMAGE_NAME_GPU) /usr/local/bin/agent-matrix
 	@echo "  logs preserved at $(CURDIR)/tests/.matrix-logs/"
 
-test: test-router test-ollama ## Run all tests in sequence (vLLM/idle tests dormant — see docs/sidelined-backends.md)
+test: test-router test-ollama test-models ## Run all tests in sequence (vLLM/idle tests dormant — see docs/sidelined-backends.md)
 
 help: ## Show this help message
 	@printf "\nDevAI Lab — Containerized AI Development Environment\n\n"
