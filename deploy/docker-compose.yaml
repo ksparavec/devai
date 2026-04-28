@@ -115,7 +115,10 @@ services:
       - PODMAN_SOCKET=/run/podman/podman.sock
     volumes:
       - ${XDG_RUNTIME_DIR:-/run/user/1000}/podman/podman.sock:/run/podman/podman.sock
-      - ./active-models.yaml:/etc/devai/models.yaml:ro
+      # Probe cache (schema v3) is the single source of truth for model
+      # fit data. The router reads it via the PROBE_CACHE env (default
+      # path matches this mount point).
+      - ./.ollama-reasoning-cache.json:/etc/devai/.ollama-reasoning-cache.json:ro
     depends_on:
       - ollama
     restart: unless-stopped
