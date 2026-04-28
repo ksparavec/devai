@@ -205,6 +205,8 @@ Day-to-day after pulling a new model: `make probe && podman rm -f devai-router &
 
 The interactive model picker reads the probe cache directly. It shows the best Ollama row per family, per context tier (32K, 64K, 128K, 256K), and per user-facing status: Native reasoning, Inline reasoning, No reasoning, CPU offload — all filtered to the picker's VRAM band (env `VRAM` or `GPU_MEMORY_GB`).
 
+**Per-session context binding.** When you select a (model, context) pair in the picker, it derives a session-scoped Ollama tag `<parent>-ctx<N>` (e.g. `qwen3.5:9b-q8_0-ctx32768`) using `/api/create` so `PARAMETER num_ctx N` is baked into the Modelfile. Derived tags share weight blobs with the parent (sub-second creation, no extra disk). This makes the chosen context binding for every wire protocol — Ollama 0.21.x silently ignores `options.num_ctx` on `/v1/chat/completions` and `/v1/messages`, so per-session Modelfile overrides are the only universal mechanism. The router peels the `-ctx<N>` suffix when resolving capability/policy so the parent's reasoning entry still applies. The probe driver also filters `-ctx<N>` derived tags out of `/api/tags` so they're never re-probed.
+
 ## Configuration
 
 ### `.env` — Host/runtime settings
@@ -220,8 +222,10 @@ The interactive model picker reads the probe cache directly. It shows the best O
 | `APT_PROXY` | — | APT cache URL (e.g. `http://localhost:3142`) |
 | `GPU_MEMORY_GB` | 24 | Total GPU VRAM in GB. Picker filter ceiling. Override per-call: `VRAM=48 make shell-gpu` |
 | `MAX_CONTEXT_LEN` | 131072 | Operator-side cap on per-model context, in tokens (128K). The router reads `min(model.max_context, MAX_CONTEXT_LEN)` from the probe cache at startup. `make probe` is independent and probes the full `PROBE_CONTEXTS` tier set. |
-| `PROBE_LOW` | 32768 | LOW context used when the target context is above 32K. |
-| `PROBE_HIGH` | `CONTEXT` / `MAX_CONTEXT_LEN` | Target probe context. Override only when you intentionally want to probe a context different from selection. |
+| `PROBE_VRAMS` | `16G,24G` | Comma-separated VRAM bands `make probe` cycles through. Each band recreates `devai-ollama` with `OLLAMA_GPU_OVERHEAD` set so the daemon behaves like a card of that size. |
+| `PROBE_CONTEXTS` | `32K,64K,128K,256K` | Comma-separated context tiers probed inside each VRAM band. Tiers above a model's `max_context` are silently capped. |
+| `PROBE_FORCE` | — | When set, `make probe` re-probes every cell in the current VRAM band, ignoring existing cache rows. |
+| `PROBE_FORCE_CTX` | — | Single tier (e.g. `64K`) to re-probe; existing cells at other tiers are left alone. |
 | `OLLAMA_CONTEXT_LENGTH` | 262144 | Runtime ollama cap (compose env). May cap the probe's `num_ctx` |
 | `MIN_VRAM_FRACTION` | 0.5 | Drop models whose total VRAM < this × `GPU_MEMORY_GB` |
 | `DEVAI_REASONING` | auto | Default reasoning policy: `auto|off|low|medium|high` |
@@ -234,6 +238,12 @@ Any agent that talks to the router can set `X-DevAI-Reasoning: off|auto|...` on 
 ### `scripts/model-families.yaml` — Family definitions
 
 Hand-maintained source of model lineages. Each family declares its `ollama_repos`, `hf_repos`, and/or `gguf_repos`, plus an `arch_ref` HF repo for architecture metadata. The `thinking: true|false` flag is a hint for humans — final reasoning capability is determined per-variant at probe time and recorded in the probe cache.
+
+Source kinds:
+
+- **`ollama_repos:`** — list of library names under `ollama.com/library/<name>`. Every published tag for each library becomes a catalog row served by the Ollama backend (`ollama pull` on download).
+- **`hf_repos:`** — list of HuggingFace repositories (transformers safetensors / FP8 / NVFP4 / AWQ / GPTQ). Each becomes one catalog row served by vLLM/SGLang (currently dormant).
+- **`gguf_repos:`** — list of HuggingFace GGUF-only repositories with one entry per file inside the repo. Each entry takes a `repo:`, optional `tag_prefix:` (anchors the local Ollama tag), and optional `include:` allowlist of quantization tokens substring-matched against the filename (e.g. `UD-Q3_K_XL`, `Q3_K_M`). `make model-pull` downloads the `.gguf` blob, writes a Modelfile that emits `FROM <file>` plus `RENDERER <family>` and `PARSER <family>` directives, and runs `ollama create` to register the imported tag. The renderer/parser pair is what makes imported GGUFs accept tool calls — without them Ollama returns "does not support tools".
 
 ### `deploy/models.yaml` — Generated catalog
 
@@ -262,8 +272,8 @@ build-cpu        Build image (CPU)        cache-up        Start services        
 build-gpu        Build image (GPU)        cache-down      Stop services             lab-gpu        JupyterLab (GPU)
 build-router     Build router image       cache-status    Show status               shell-cpu      Shell + picker (CPU)
 build            Build all                cache-clean     Remove cached data        shell-gpu      Shell + picker (GPU)
-fetch-cli        Update CLI binaries
-pull-images      Pull base images
+fetch-cli        Update CLI binaries      logs            Tail SERVICE=devai-X
+pull-images      Pull base images         setup-logs      One-time: 100G LV at /var/cache/devai/logs
 
 OLLAMA (GGUF — active)                    vLLM (NVFP4 — dormant)                    CATALOG / FIT
 ollama-list      List downloaded models   vllm-list       List on-disk weights      catalog-regen     Refresh deploy/models.yaml from upstream
@@ -273,8 +283,10 @@ ollama-df        Disk usage               vllm-df         Disk usage            
 ollama-clean     Clean partials                                                     vram-fit          Show what fits without acting
 
 MAINTENANCE                                                                         TESTING
-clean            Remove all images        prune           Prune dangling images     test              Run integration tests (Ollama only)
+clean            Remove all images        prune           Prune dangling images     test              Run all tests (router + ollama + matrix)
                                                                                     test-router       Go unit tests for arbiter
+                                                                                    test-ollama       Ollama integration tests
+                                                                                    test-models       Matrix: every probed digest × wire × scenario
                                                                                     test-agents       Smoke-test all agents against ollama
 ```
 
@@ -344,10 +356,17 @@ Reference implementation (volume group `vgais`):
 |--------|-------|------|---------|
 | `cache_ollama` | `/var/cache/devai/ollama` | 200G | Ollama GGUF models + vLLM NVFP4 models |
 | `cache_registry` | `/var/cache/devai/registry` | 200G | Podman container image storage + Docker Hub mirror |
+| `cache_logs` | `/var/cache/devai/logs` | 100G | Persisted container stdout (one `<service>.log` per devai-* container, written by the `logger` sidecar) |
 | `cache_pip` | `/var/cache/devai/pip` | 30G | Python package cache (uv) + CLI binaries |
 | `cache_apt` | `/var/cache/devai/apt` | 10G | APT package cache (apt-cacher-ng) |
 | `cache_npm` | `/var/cache/devai/npm` | 10G | npm package cache |
 | `cache_open_webui` | `/var/cache/devai/open-webui` | 5G | Open WebUI application data |
+
+`cache_logs` is the only volume that can be created entirely from the
+repo: `make setup-logs` carves the LV in the existing `vgais/cachepool`,
+mkfs.xfs, adds an `/etc/fstab` line, and mounts it. Re-running is a
+no-op; `RECREATE=1 make setup-logs` rebuilds the volume from scratch.
+The remaining volumes are still set up with the manual procedure below.
 
 Create the volumes:
 
@@ -381,6 +400,10 @@ EOF
 sudo mkdir -p /var/cache/devai/{ollama,registry,pip,apt,npm,open-webui}
 sudo mount -a
 sudo chown -R $USER:$USER /var/cache/devai
+
+# Logs volume (handled by Make):
+make setup-logs                    # creates cache_logs LV (100G default)
+make setup-logs SIZE=200G          # override
 ```
 
 To extend a volume (e.g. when models fill up):

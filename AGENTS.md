@@ -64,14 +64,31 @@ Use `make help` to list supported targets. Common commands:
 - `make lab-cpu`: run JupyterLab without GPU support.
 - `make shell-gpu`: start the GPU shell and open the model picker.
 - `make shell-cpu`: start the CPU shell.
-- `make model-select`: probe downloaded Ollama models and write
-  `deploy/active-models.yaml`.
-- `make model-select DOWNLOAD=1`: also pull fitting missing model variants.
-- `make model-select FAMILY=qwen3.5 DOWNLOAD=1`: scope selection to one family.
+- `make catalog-regen`: refresh `deploy/models.yaml` from the upstream HF
+  and Ollama registries (input is `scripts/model-families.yaml`).
+- `make probe`: probe every downloaded Ollama digest at every
+  `(VRAM, CONTEXT)` cell and write the result to
+  `deploy/.ollama-reasoning-cache.json`.
+- `make model-pull`: download missing best-fit catalog candidates. Add
+  `FAMILY=qwen3.5` to scope to one family, `CONTEXT=32768` to bias the
+  selection toward smaller-context fits, `DRY_RUN=1` to preview.
+- `make model-fit`: print which models fit at the chosen `(VRAM,
+  CONTEXT)`. Read-only diagnostic — never writes a file.
 - `make ollama-list`: list downloaded Ollama models.
 - `make vllm-list`: list on-disk vLLM weights; backend is currently dormant.
+- `make logs SERVICE=devai-ollama`: tail a service's persisted stdout
+  from the logger sidecar; `LINES=N` seeds the buffer.
+- `make setup-logs`: one-time, sudo. Carve out a dedicated 100 GB
+  thin LV in `vgais/cachepool` for `/var/cache/devai/logs` so log
+  growth never crowds the model cache. `RECREATE=1` re-creates an
+  existing volume.
 - `make test-router`: run Go router tests in a Go container.
-- `make test`: run router tests plus Ollama integration tests.
+- `make test-models`: matrix test over every probed digest × wire
+  protocol (`/api/chat`, `/v1/chat/completions`, `/v1/messages`) ×
+  scenario (basic, tools, reasoning auto/off, ctx). Reads the probe
+  cache to enumerate cells.
+- `make test`: run router tests plus Ollama integration tests plus
+  the model matrix test.
 
 JupyterLab extension changes must be built inside a container, not directly on
 the host. Use the documented container build flow from `CLAUDE.md` or
@@ -79,27 +96,65 @@ the host. Use the documented container build flow from `CLAUDE.md` or
 
 ## Model Catalog and Selection Workflow
 
-`deploy/models.yaml` is the generated full model catalog. It should normally be
-updated through `make catalog-regen`, not hand-edited.
+`scripts/model-families.yaml` is the only hand-edited input. Each family
+declares `ollama_repos`, `hf_repos`, and/or `gguf_repos`, plus an
+`arch_ref` HF repo for architecture metadata. Backend is implicit:
+`ollama_repos` and `gguf_repos` rows run on Ollama; `hf_repos` rows run
+on vLLM/SGLang (currently dormant).
 
-`deploy/active-models.yaml` is also generated. It is the active subset consumed
-by the router and picker: downloaded models that fit current VRAM/context
-constraints and include probe metadata where available. Regenerate it with
-`make model-select`.
+`deploy/models.yaml` is the generated full model catalog. It is
+refreshed by `make catalog-regen`, not hand-edited.
 
-The Ollama reasoning probe is in `scripts/probe-ollama-reasoning.py`. It records
-model capability, disable support, and VRAM coefficients used by
-`scripts/select-models.py` and `scripts/model-picker.py`. The picker should
-show fitting Ollama models and display reasoning capability as metadata. It
-should not own model-specific reasoning activation logic.
+`deploy/.ollama-reasoning-cache.json` (schema v3) is the single source
+of truth for what fits. It is digest-keyed; each entry carries
+`aliases`, `max_context`, top-level `capability`, optional
+`disable_verified`, and a 2-D `probes` map nested as
+`probes[<vram_gb>][<ctx>]`. Each probe cell records `vram_gb`, `ctx`,
+`actual_total_gb`, `actual_vram_gb`, `fully_on_gpu`, per-cell
+capability, and timestamp. There is no `deploy/active-models.yaml`
+any more — the router and picker read this cache directly.
+
+The Ollama reasoning probe is in `scripts/probe-ollama-reasoning.py`.
+It loops the `(VRAM, CONTEXT)` matrix from
+`PROBE_VRAMS=16G,24G` × `PROBE_CONTEXTS=32K,64K,128K,256K`. Between
+VRAM bands the orchestrator recreates `devai-ollama` with
+`OLLAMA_GPU_OVERHEAD=(host_vram - target_vram) * 1024^3` so the daemon
+behaves as if it had only the target card — a 24 GB host can produce
+cache cells valid for 16 GB targets without hardware swaps. Probing is
+incremental and never destructive: existing cells are immutable unless
+`PROBE_FORCE=1` (whole VRAM band) or `PROBE_FORCE_CTX=64K` (one tier).
+
+`scripts/select-models.py` is the diagnostic + downloader. It reads
+the catalog and the probe cache, prints the fitting set at the chosen
+`(VRAM, CONTEXT)`, and (with `--download`) pulls missing best-fit
+candidates. `pull_gguf` downloads a `.gguf` blob from HF, writes a
+Modelfile that emits `FROM <file>` plus `RENDERER <family>` and
+`PARSER <family>` directives, and runs `ollama create` to register
+the imported tag. The renderer/parser pair is what makes imported
+GGUFs accept tool calls; without them Ollama returns "does not
+support tools".
+
+`scripts/model-picker.py` reads the probe cache directly. For each
+session it derives a per-session tag `<parent>-ctx<N>` (e.g.
+`qwen3.5:9b-q8_0-ctx32768`) using Ollama's `/api/create` so
+`PARAMETER num_ctx N` is baked into the Modelfile. This makes the
+chosen context binding for every wire protocol — `/v1/chat/completions`
+(Ollama 0.21.x) silently ignores `options.num_ctx`, so per-session
+Modelfile overrides are the only universal mechanism. The router
+peels the `-ctx<N>` suffix when resolving capability/policy so the
+parent's reasoning entry still applies.
 
 Important runtime knobs:
 
 - `GPU_MEMORY_GB`: total GPU VRAM, default `24`.
-- `MAX_CONTEXT_LEN`: default context, default `131072`.
+- `MAX_CONTEXT_LEN`: default per-request context cap in tokens, default `131072`.
 - `CONTEXT`: per-run picker/model selection override, for example
   `CONTEXT=32768 make shell-gpu`.
-- `VRAM`: per-run VRAM override, for example `VRAM=48 make model-select`.
+- `VRAM`: per-run VRAM override, for example `VRAM=16 make model-fit`.
+- `PROBE_VRAMS`, `PROBE_CONTEXTS`: comma-separated lists driving
+  `make probe`. Defaults `16G,24G` and `32K,64K,128K,256K`.
+- `PROBE_FORCE`, `PROBE_FORCE_CTX`: re-probe the current VRAM band /
+  the named tier, ignoring existing cache cells.
 - `DEVAI_REASONING`: `auto|off|low|medium|high`.
 
 ## Coding Style & Naming Conventions
@@ -165,8 +220,8 @@ Verification:
 
 Pull requests should include a short summary, linked issues when relevant, test
 commands run, and notes about generated files. Call out changes to
-`deploy/models.yaml`, `deploy/active-models.yaml`, compose profiles, exposed
-ports, or persistent cache behavior.
+`deploy/models.yaml`, `deploy/.ollama-reasoning-cache.json`, compose profiles,
+exposed ports, or persistent cache behavior.
 
 ## Security & Configuration Tips
 

@@ -36,6 +36,17 @@ make model-pull FAMILY=qwen3.5  # Scope to one family
 make ollama-list                # List downloaded Ollama models
 make vllm-list                  # List on-disk vLLM weights (backend currently dormant)
 
+# Logging (logger sidecar persists each container's stdout)
+make logs SERVICE=devai-ollama  # Tail one container's persisted log
+make logs SERVICE=devai-router LINES=200
+make setup-logs                 # One-time: 100G LV at /var/cache/devai/logs (sudo)
+
+# Tests
+make test-router                # Go unit tests for arbiter
+make test-ollama                # Ollama integration tests
+make test-models                # Matrix: every probed digest × wire × scenario
+make test                       # All three in sequence
+
 # Maintenance
 make clean           # Remove all images (CPU + GPU + router)
 make prune           # Prune dangling images
@@ -84,6 +95,7 @@ Agent → devai-router:11436 → devai-sglang:11434 (NVFP4 + HF via SGLang)     
 - **devai-sglang** *(dormant)* — `lmsysorg/sglang` image. NVFP4 + HuggingFace models, RadixAttention for multi-turn speedup. Same profile, same lifecycle hookup.
 - **devai-webui-proxy** — nginx TLS proxy for Open WebUI (mkcert certs or self-signed fallback).
 - **devai-open-webui** — Web chat interface, connects to router's ollama port (:11434).
+- **devai-logger** — Sidecar that streams `podman --remote logs --follow` for every devai-* container into `/var/cache/devai/logs/<service>.log`. Survives container restarts. Tail via `make logs SERVICE=<name> [LINES=N]`. Requires the `cache_logs` LV (one-time setup via `make setup-logs`).
 
 ### Supporting services
 
@@ -107,6 +119,8 @@ Interactive model → agent selection via fzf. Used by both `make shell-*` (via 
 - `packages/jupyter-ai-launchers/src/index.ts` — JupyterLab extension, each card runs `model-picker --agent <name>`.
 
 **Filter:** the picker shows one row per (family, context tier, reasoning status) bucket at the picker's VRAM band (env `VRAM` or `GPU_MEMORY_GB`). A model is eligible at a (vram, ctx) cell only when the probe cache contains a measurement there with `fully_on_gpu: true`. There is no interpolation — gaps mean "re-run `make probe`". HF entries stay `capability: unknown` because no probe runner exists for vLLM/SGLang yet (see `docs/sidelined-backends.md`); the picker hides them.
+
+**Per-session context binding.** When the user picks a (model, context) pair, the picker derives a session-scoped Ollama tag `<parent>-ctx<N>` (e.g. `qwen3.5:9b-q8_0-ctx32768`) by calling `/api/create` with the structured `{model, from, parameters: {num_ctx: N}}` body. Derived tags share weight blobs with the parent (sub-second creation, no extra disk). They're necessary because Ollama 0.21.x silently ignores `options.num_ctx` on `/v1/chat/completions` and `/v1/messages` — Modelfile-baked `PARAMETER num_ctx` is the only universal mechanism. The router's policy lookup peels the `-ctx<N>` suffix (`stripCtxVariantSuffix` in `gpu-arbiter/main.go`) so the parent's reasoning entry still applies. The probe driver also filters `-ctx<N>` derived tags out of `/api/tags` so they're never re-probed.
 
 ### Building the JupyterLab extension
 
@@ -133,9 +147,12 @@ deploy/Dockerfile.router      — Router image (distroless)
 gpu-arbiter/main.go           — GPU arbiter source (multi-port proxy, ~1070 lines Go)
 scripts/generate-catalog.py   — Refresh deploy/models.yaml from upstream (HF + Ollama registry)
 scripts/probe-ollama-reasoning.py — Per-(VRAM, ctx) probe: capability + measured VRAM at each (band, tier) cell (schema v3, digest-keyed)
-scripts/select-models.py      — Print fitting models / pull missing best-fit candidates (no file writes)
-scripts/model-picker.py       — Two-step interactive picker (model → agent)
-tests/test-router.sh          — Ollama-side integration tests
+scripts/select-models.py      — Print fitting models / pull missing best-fit candidates (gguf path emits FROM + RENDERER + PARSER Modelfile, runs ollama create)
+scripts/model-picker.py       — Two-step interactive picker (model → agent); creates per-session `<parent>-ctx<N>` tag with PARAMETER num_ctx baked in
+deploy/setup-logs-volume.sh   — Idempotent LVM/XFS/fstab setup for /var/cache/devai/logs (called by `make setup-logs`)
+deploy/logging.sh             — Logger sidecar entrypoint (runs `podman --remote logs --follow` per devai-* container)
+tests/test-router.sh          — Ollama-side router integration tests
+tests/test-model-matrix.sh    — Exhaustive matrix: every probed digest × wire × scenario
 docs/sidelined-backends.md    — Why vLLM/SGLang are dormant + how to reactivate
 ```
 # AK's CLAUDE.md
