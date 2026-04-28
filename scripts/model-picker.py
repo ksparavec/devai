@@ -113,6 +113,29 @@ _DIM = "\033[2m"
 _RESET = "\033[0m"
 
 
+# Pick-back-channel: when the host launcher (`bin/devai-shell`) bind-mounts
+# `~/.devai/` to `/devai-host`, the picker drops a one-shot JSON file the
+# launcher reads after exit so it can persist (model, agent, context) into
+# `preferences.yaml`. Silent no-op when the path is absent — this is what
+# happens for `make shell-gpu` and any other invocation that doesn't go
+# through the launcher.
+_PICK_BACK_CHANNEL = Path("/devai-host/.last-pick.json")
+
+
+def _record_pick(model_name: str, agent_id: str, context: int) -> None:
+    if not _PICK_BACK_CHANNEL.parent.is_dir():
+        return
+    try:
+        _PICK_BACK_CHANNEL.write_text(json.dumps({
+            "model": model_name,
+            "agent": agent_id,
+            "context": context,
+        }))
+    except OSError:
+        # Permission or I/O issue is not fatal — the pick still launches.
+        pass
+
+
 # ── Catalog (display metadata only) ──────────────────────────────────────────
 
 def _load_catalog() -> dict[str, dict]:
@@ -1001,6 +1024,7 @@ def main() -> None:
         serving_name = model["name"]
 
     cmd = _build(agent[0], serving_name, model["backend"])
+    _record_pick(model["name"], agent[0], selected_context)
     print(
         f"\n  {_BOLD}{agent[0]}{_RESET}"
         f" → {model['name']} @ {_context_label(selected_context)}"

@@ -1,153 +1,337 @@
-#!/usr/bin/env bash
-# devai-shell — start a devai lab container with the *current directory*
-# mounted as the working dir, dropping straight into the agent picker.
-#
-# Standalone: no Make required. Reads only environment variables, finds
-# the repo's probe cache via this script's own location, and works from
-# any directory on the host so you can use it as a per-project shell agent.
-#
-# Usage:
-#     devai-shell                     # GPU lab (default)
-#     devai-shell --gpu               # explicit GPU
-#     devai-shell --cpu               # CPU lab
-#
-# Environment overrides (defaults shown):
-#     CONTAINER_RUNTIME=podman        podman or docker
-#     GPU_MEMORY_GB=24                advertised VRAM ceiling in the picker
-#     MAX_CONTEXT_LEN=131072          default context cap if CONTEXT unset
-#     CONTEXT=<int>                   per-call context override (tokens)
-#     VRAM=<int>                      per-call VRAM override (GB)
-#     HOME_VOLUME=$HOME/devai-home    persistent in-container home
-#     HTTP_PROXY / HTTPS_PROXY / NO_PROXY    forwarded to the container
-#
-# Prerequisites (run once from the repo):
-#     make build-gpu          # or build-cpu
-#     make cache-up           # creates devai-net + Ollama backend
+#!/usr/bin/env python3
+"""devai-shell — host-side launcher for the devai lab container.
 
-set -euo pipefail
+Reads user preferences from ~/.devai/preferences.yaml, runs the lab
+container with the picker as entry point, and writes preferences back
+on exit so the next invocation reuses the same model/agent/work-dir.
 
-# ── Argument parsing ────────────────────────────────────────────────────────
-mode=gpu
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --gpu)        mode=gpu;  shift ;;
-        --cpu)        mode=cpu;  shift ;;
-        -h|--help)
-            sed -n '2,/^$/p' "$0" | sed -E 's/^# ?//'
-            exit 0
-            ;;
-        --)           shift; break ;;
-        -*)
-            echo "devai-shell: unknown option '$1'" >&2
-            echo "             try 'devai-shell --help'" >&2
-            exit 2
-            ;;
-        *)
-            echo "devai-shell: unexpected argument '$1'" >&2
-            exit 2
-            ;;
-    esac
-done
+Install once via `make install` from the devai repo, then run from
+anywhere on the host:
 
-# ── Resolve repo root (script lives at <repo>/bin/devai-shell) ─────────────
-script_path=$(readlink -f "${BASH_SOURCE[0]}")
-repo_root=$(cd "$(dirname "$script_path")/.." && pwd)
+    devai-shell             # launch lab + picker (auto-init prefs if missing)
+    devai-shell --init      # reset preferences to defaults
+    devai-shell --cpu       # use the CPU lab image
+    devai-shell -C ~/myapp  # override last_work_dir for this run
+    devai-shell --model qwen3.5:9b-q8_0 --agent claude  # pre-set picks
 
-# Working directory follows the user's pwd, NOT repo_root.
-work_dir=$(pwd)
+Preferences (in ~/.devai/preferences.yaml):
+    vram                int       advertised VRAM ceiling, GB
+    context             int       default context cap, tokens
+    last_model          str|null  most recent picker selection
+    last_agent          str|null  most recent agent pick
+    last_work_dir       str       directory mounted as /home/devai/work
+    agent_session_file  str|null  per-(agent,model) session, if supported
 
-# ── Settings (env or default) ───────────────────────────────────────────────
-container_runtime=${CONTAINER_RUNTIME:-podman}
-gpu_mem=${GPU_MEMORY_GB:-24}
-max_ctx=${MAX_CONTEXT_LEN:-131072}
-home_volume=${HOME_VOLUME:-$HOME/devai-home}
+The script does NOT read the repo's .env, NOT modify the parent shell,
+NOT write to the repo. Everything it touches at runtime lives under
+~/.devai/. The repo is only consulted at `make install` time.
+"""
+from __future__ import annotations
 
-container_user=devai
-network=devai-net
-cache_dir=/var/cache/devai
-ollama_host=http://devai-router:11434
-ollama_default_model=qwen3.5:9b-q8_0
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
 
-if [[ $mode == gpu ]]; then
-    image=devai-lab-gpu
-    if [[ $container_runtime == *podman* ]]; then
-        gpu_flags=(--device nvidia.com/gpu=all --security-opt=label=disable)
-    else
-        gpu_flags=(--gpus all)
-    fi
-else
-    image=devai-lab-cpu
-    gpu_flags=()
-fi
+import yaml
 
-# ── Pre-flight checks ───────────────────────────────────────────────────────
-if ! command -v "$container_runtime" >/dev/null 2>&1; then
-    echo "devai-shell: '$container_runtime' not on PATH" >&2
-    exit 1
-fi
 
-if ! "$container_runtime" image inspect "$image" >/dev/null 2>&1; then
-    echo "devai-shell: image '$image' not found" >&2
-    echo "             cd $repo_root && make build-$mode" >&2
-    exit 1
-fi
+# ── Paths and constants ─────────────────────────────────────────────────────
 
-if ! "$container_runtime" network inspect "$network" >/dev/null 2>&1; then
-    echo "devai-shell: network '$network' not found" >&2
-    echo "             cd $repo_root && make cache-up" >&2
-    exit 1
-fi
+CONFIG_DIR = Path.home() / ".devai"
+PREFS_FILE = CONFIG_DIR / "preferences.yaml"
+PROBE_CACHE = CONFIG_DIR / ".ollama-reasoning-cache.json"
+PICKER_SRC = CONFIG_DIR / "model-picker.py"
+SESSIONS_DIR = CONFIG_DIR / "sessions"
+PICK_BACK_CHANNEL = CONFIG_DIR / ".last-pick.json"
 
-mkdir -p "$home_volume"
+DEFAULTS: dict = {
+    "vram": 24,
+    "context": 131072,
+    "last_model": None,
+    "last_agent": None,
+    "last_work_dir": str(Path.home()),
+    "agent_session_file": None,
+}
 
-# ── Optional read-only mounts (skip silently if absent) ─────────────────────
-optional_mounts=()
+DEVAI_NETWORK = "devai-net"
+OLLAMA_HOST = "http://devai-router:11434"
+FALLBACK_MODEL = "qwen3.5:9b-q8_0"
+CONTAINER_USER = "devai"
 
-# Host gitconfig and ssh, copied by entrypoint.sh from /tmp/host-config/
-[[ -f $HOME/.gitconfig ]] && \
-    optional_mounts+=(-v "$HOME/.gitconfig:/tmp/host-config/.gitconfig:ro")
-[[ -d $HOME/.ssh ]] && \
-    optional_mounts+=(-v "$HOME/.ssh:/tmp/host-config/.ssh:ro")
+# Agents whose CLI accepts a session file we can persist across runs.
+# Suffix is informational; current agents all use plain text/JSONL.
+# When this list grows, the in-container launchers (`scripts/*-launcher.sh`)
+# need matching wiring to actually pass DEVAI_SESSION_FILE through.
+AGENT_SESSION_SUFFIX = {
+    "claude": ".jsonl",
+    "codex":  ".jsonl",
+    "aider":  ".chat",
+}
 
-# Read-only model cache so the picker can do disk-based "is downloaded?" checks
-[[ -d $cache_dir/ollama ]] && \
-    optional_mounts+=(-v "$cache_dir/ollama:/var/cache/devai/ollama:ro")
 
-# Probe cache (router and picker source of truth for fit data)
-probe_cache="$repo_root/deploy/.ollama-reasoning-cache.json"
-[[ -f $probe_cache ]] && \
-    optional_mounts+=(-v "$probe_cache:/etc/devai/.ollama-reasoning-cache.json:ro")
+# ── Preferences I/O ─────────────────────────────────────────────────────────
 
-# ── Proxy env (only forward when set in the host shell) ─────────────────────
-proxy_env=()
-for var in HTTP_PROXY HTTPS_PROXY NO_PROXY; do
-    val=${!var:-}
-    if [[ -n $val ]]; then
-        proxy_env+=(-e "$var=$val" -e "${var,,}=$val")
-    fi
-done
+def write_prefs(prefs: dict) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    PREFS_FILE.write_text(yaml.safe_dump(prefs, sort_keys=False))
 
-# ── User/group remap (docker only — rootless podman maps root → host user) ──
-user_env=()
-if [[ $container_runtime != *podman* ]]; then
-    user_env+=(-e "USER_ID=$(id -u)" -e "GROUP_ID=$(id -g)")
-fi
 
-# ── Run ─────────────────────────────────────────────────────────────────────
-# No --name: ephemeral (--rm) container, runtime can autogenerate so multiple
-# concurrent terminals don't collide.
-exec "$container_runtime" run -it --rm \
-    "${gpu_flags[@]}" \
-    --network "$network" \
-    --add-host=host.containers.internal:host-gateway \
-    "${proxy_env[@]}" \
-    -e "OLLAMA_HOST=$ollama_host" \
-    -e "OLLAMA_DEFAULT_MODEL=$ollama_default_model" \
-    -e "CONTEXT=${CONTEXT:-$max_ctx}" \
-    -e "VRAM=${VRAM:-$gpu_mem}" \
-    "${user_env[@]}" \
-    -e "CONTAINER_USER=$container_user" \
-    -v "$home_volume:/home/$container_user" \
-    "${optional_mounts[@]}" \
-    -v "$work_dir:/home/$container_user/work" \
-    "$image" agent-picker
+def read_prefs() -> dict:
+    """Load preferences, creating defaults on first use."""
+    if not PREFS_FILE.exists():
+        write_prefs(DEFAULTS)
+        return dict(DEFAULTS)
+    raw = yaml.safe_load(PREFS_FILE.read_text()) or {}
+    if not isinstance(raw, dict):
+        sys.exit(f"error: {PREFS_FILE} is not a YAML mapping. "
+                 f"Run `devai-shell --init` to reset.")
+    merged = dict(DEFAULTS)
+    merged.update(raw)
+    return merged
+
+
+def session_path_for(agent: str | None, model: str | None) -> str | None:
+    if not agent or not model or agent not in AGENT_SESSION_SUFFIX:
+        return None
+    safe_model = model.replace("/", "_").replace(":", "_")
+    return str(SESSIONS_DIR / f"{agent}-{safe_model}{AGENT_SESSION_SUFFIX[agent]}")
+
+
+# ── Pre-flight ──────────────────────────────────────────────────────────────
+
+def runtime_check(runtime: str, kind: str, name: str) -> bool:
+    cp = subprocess.run(
+        [runtime, kind, "inspect", name],
+        capture_output=True, check=False,
+    )
+    return cp.returncode == 0
+
+
+def preflight(runtime: str, image: str) -> None:
+    if not shutil.which(runtime):
+        sys.exit(f"error: container runtime {runtime!r} not on PATH "
+                 f"(set CONTAINER_RUNTIME=docker if you don't use podman)")
+    if not runtime_check(runtime, "image", image):
+        which = "cpu" if image.endswith("-cpu") else "gpu"
+        sys.exit(f"error: image {image!r} not found.\n"
+                 f"       Build it from the devai repo: `make build-{which}`.")
+    if not runtime_check(runtime, "network", DEVAI_NETWORK):
+        sys.exit(f"error: network {DEVAI_NETWORK!r} not found.\n"
+                 f"       Start the cache services: `make cache-up`.")
+    if not PROBE_CACHE.exists():
+        sys.exit(f"error: probe cache missing at {PROBE_CACHE}.\n"
+                 f"       Run `make install` (and `make probe` first if "
+                 f"the repo's cache is empty).")
+
+
+# ── Container command construction ──────────────────────────────────────────
+
+def gpu_flags(runtime: str, cpu_only: bool) -> list[str]:
+    if cpu_only:
+        return []
+    if "podman" in runtime:
+        return ["--device", "nvidia.com/gpu=all", "--security-opt=label=disable"]
+    return ["--gpus", "all"]
+
+
+def proxy_env() -> list[str]:
+    out: list[str] = []
+    for var in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"):
+        val = os.environ.get(var)
+        if val:
+            out += ["-e", f"{var}={val}", "-e", f"{var.lower()}={val}"]
+    return out
+
+
+def user_env(runtime: str) -> list[str]:
+    # Rootless podman maps container root → host UID; only docker needs the
+    # entrypoint's gosu-based UID/GID remap.
+    if "podman" in runtime:
+        return []
+    return ["-e", f"USER_ID={os.getuid()}", "-e", f"GROUP_ID={os.getgid()}"]
+
+
+def optional_mounts() -> list[str]:
+    out: list[str] = []
+    home = Path.home()
+    if (home / ".gitconfig").is_file():
+        out += ["-v", f"{home / '.gitconfig'}:/tmp/host-config/.gitconfig:ro"]
+    if (home / ".ssh").is_dir():
+        out += ["-v", f"{home / '.ssh'}:/tmp/host-config/.ssh:ro"]
+    # Read-only model cache so the picker can do disk-based "is downloaded?"
+    # checks. Skip silently if absent — the user may not have that volume.
+    if Path("/var/cache/devai/ollama").is_dir():
+        out += ["-v", "/var/cache/devai/ollama:/var/cache/devai/ollama:ro"]
+    return out
+
+
+def build_run_cmd(
+    *, runtime: str, image: str, cpu_only: bool,
+    work_dir: Path, prefs: dict,
+    pref_model: str | None, pref_agent: str | None,
+) -> list[str]:
+    home_volume = Path(os.environ.get("HOME_VOLUME", str(Path.home() / "devai-home")))
+    home_volume.mkdir(parents=True, exist_ok=True)
+
+    pref_session = session_path_for(pref_agent, pref_model)
+
+    cmd: list[str] = [
+        runtime, "run", "-it", "--rm",
+        *gpu_flags(runtime, cpu_only),
+        "--network", DEVAI_NETWORK,
+        "--add-host=host.containers.internal:host-gateway",
+        *proxy_env(),
+        "-e", f"OLLAMA_HOST={OLLAMA_HOST}",
+        "-e", f"OLLAMA_DEFAULT_MODEL={pref_model or FALLBACK_MODEL}",
+        "-e", f"CONTEXT={prefs['context']}",
+        "-e", f"VRAM={prefs['vram']}",
+        "-e", f"CONTAINER_USER={CONTAINER_USER}",
+    ]
+
+    # Surface preferences to the picker so future versions can pre-select.
+    # Today's picker doesn't read these but the env contract is forward-stable.
+    if pref_model:
+        cmd += ["-e", f"DEVAI_PREF_MODEL={pref_model}"]
+    if pref_agent:
+        cmd += ["-e", f"DEVAI_PREF_AGENT={pref_agent}"]
+    if pref_session:
+        # In-container path; the launcher mounts ~/.devai → /devai-host.
+        cmd += ["-e", f"DEVAI_SESSION_FILE=/devai-host/sessions/"
+                f"{Path(pref_session).name}"]
+
+    cmd += [*user_env(runtime)]
+
+    # Persistent home for the devai user inside the container.
+    cmd += ["-v", f"{home_volume}:/home/{CONTAINER_USER}"]
+
+    # ~/.devai/ → /devai-host (rw). The picker drops .last-pick.json here on
+    # exit so we can update preferences after the container ends.
+    cmd += ["-v", f"{CONFIG_DIR}:/devai-host"]
+
+    # Probe cache — picker and router both expect /etc/devai/ for it.
+    cmd += ["-v",
+            f"{PROBE_CACHE}:/etc/devai/.ollama-reasoning-cache.json:ro"]
+
+    # Override the baked-in /usr/local/bin/model-picker with the host copy
+    # so improvements made in the repo (and copied to ~/.devai/ by
+    # `make install`) take effect without an image rebuild.
+    if PICKER_SRC.is_file():
+        cmd += ["-v", f"{PICKER_SRC}:/usr/local/bin/model-picker:ro"]
+
+    cmd += [*optional_mounts()]
+
+    # The user-chosen working directory.
+    cmd += ["-v", f"{work_dir}:/home/{CONTAINER_USER}/work"]
+
+    cmd += [image, "agent-picker"]
+    return cmd
+
+
+# ── Main ────────────────────────────────────────────────────────────────────
+
+def make_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(
+        prog="devai-shell",
+        description="Standalone launcher for the devai lab container.",
+    )
+    ap.add_argument("--init", action="store_true",
+                    help="reset ~/.devai/preferences.yaml to defaults and exit")
+    ap.add_argument("--cpu", action="store_true",
+                    help="use the CPU lab image instead of GPU")
+    ap.add_argument("-C", "--workdir",
+                    help="override last_work_dir for this run "
+                         "(persisted to preferences on exit)")
+    ap.add_argument("--model",
+                    help="override last_model for this run "
+                         "(persisted to preferences on exit)")
+    ap.add_argument("--agent",
+                    help="override last_agent for this run "
+                         "(persisted to preferences on exit)")
+    ap.add_argument("--show", action="store_true",
+                    help="print the resolved preferences and the "
+                         "container command, do not run")
+    return ap
+
+
+def main() -> int:
+    args = make_parser().parse_args()
+
+    if args.init:
+        write_prefs(DEFAULTS)
+        print(f"reset {PREFS_FILE} to defaults.")
+        return 0
+
+    prefs = read_prefs()
+
+    runtime = os.environ.get("CONTAINER_RUNTIME", "podman")
+    image = "devai-lab-cpu" if args.cpu else "devai-lab-gpu"
+
+    work_dir = Path(args.workdir or prefs["last_work_dir"]).expanduser().resolve()
+    if not work_dir.is_dir():
+        sys.exit(f"error: work_dir {work_dir} is not an existing directory.\n"
+                 f"       Pass --workdir <path> or fix preferences.yaml.")
+
+    pref_model = args.model or prefs.get("last_model")
+    pref_agent = args.agent or prefs.get("last_agent")
+
+    preflight(runtime, image)
+
+    cmd = build_run_cmd(
+        runtime=runtime, image=image, cpu_only=args.cpu,
+        work_dir=work_dir, prefs=prefs,
+        pref_model=pref_model, pref_agent=pref_agent,
+    )
+
+    if args.show:
+        print(yaml.safe_dump(prefs, sort_keys=False))
+        print("# container command:")
+        print(" \\\n  ".join(cmd))
+        return 0
+
+    # Clear stale pick file before running so we only see this run's choice.
+    try:
+        PICK_BACK_CHANNEL.unlink()
+    except FileNotFoundError:
+        pass
+
+    rc = subprocess.call(cmd)
+
+    # Update preferences from this run.
+    new_prefs = dict(prefs)
+    new_prefs["last_work_dir"] = str(work_dir)
+
+    pick: dict = {}
+    if PICK_BACK_CHANNEL.exists():
+        try:
+            pick = json.loads(PICK_BACK_CHANNEL.read_text()) or {}
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"warning: ignoring corrupt {PICK_BACK_CHANNEL.name} ({exc})",
+                  file=sys.stderr)
+        finally:
+            try:
+                PICK_BACK_CHANNEL.unlink()
+            except FileNotFoundError:
+                pass
+
+    chosen_model = args.model or pick.get("model") or prefs.get("last_model")
+    chosen_agent = args.agent or pick.get("agent") or prefs.get("last_agent")
+    new_prefs["last_model"] = chosen_model
+    new_prefs["last_agent"] = chosen_agent
+    new_prefs["agent_session_file"] = session_path_for(chosen_agent, chosen_model)
+    if pick.get("context"):
+        new_prefs["context"] = int(pick["context"])
+
+    write_prefs(new_prefs)
+    return rc
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

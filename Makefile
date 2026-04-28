@@ -110,7 +110,7 @@ endif
 .PHONY: ollama-rm ollama-list ollama-status ollama-clean ollama-df
 .PHONY: vllm-list vllm-rm vllm-status vllm-df
 .PHONY: clean clean-cpu clean-gpu clean-router prune
-.PHONY: fetch-cli pull-images install-systemd test test-router test-ollama test-agents test-models help
+.PHONY: fetch-cli pull-images install install-systemd uninstall test test-router test-ollama test-agents test-models help
 .PHONY: catalog-regen probe model-fit model-pull vram-fit
 
 all: help
@@ -767,6 +767,41 @@ build-router: ## Build the gpu-arbiter router image
 	$(CONTAINER_RUNTIME) build --network=host \
 		-f deploy/Dockerfile.router \
 		-t devai-router .
+
+INSTALL_PREFIX ?= $(HOME)/.local
+DEVAI_HOME ?= $(HOME)/.devai
+
+install: ## Install bin/devai-shell to $(INSTALL_PREFIX)/bin and stage config in $(DEVAI_HOME)
+	@install -d $(INSTALL_PREFIX)/bin $(DEVAI_HOME) $(DEVAI_HOME)/sessions
+	@install -m 755 bin/devai-shell $(INSTALL_PREFIX)/bin/devai-shell
+	@# Symlink the picker so devai-shell can override the in-image copy via
+	@# bind-mount; re-running `make install` after picker edits picks up the
+	@# new code without a full image rebuild.
+	@ln -sf "$(CURDIR)/scripts/model-picker.py" $(DEVAI_HOME)/model-picker.py
+	@# Symlink the probe cache so it stays fresh as `make probe` regenerates
+	@# it. If users want a frozen snapshot they can replace the link with a
+	@# copy after install.
+	@if [ -f deploy/.ollama-reasoning-cache.json ]; then \
+		ln -sf "$(CURDIR)/deploy/.ollama-reasoning-cache.json" \
+		       $(DEVAI_HOME)/.ollama-reasoning-cache.json; \
+		echo "  linked: $(DEVAI_HOME)/.ollama-reasoning-cache.json"; \
+	else \
+		echo "  WARNING: deploy/.ollama-reasoning-cache.json missing — run 'make probe' first"; \
+	fi
+	@echo "  linked: $(DEVAI_HOME)/model-picker.py"
+	@echo "  installed: $(INSTALL_PREFIX)/bin/devai-shell"
+	@echo
+	@echo "Next steps:"
+	@echo "  1. Add $(INSTALL_PREFIX)/bin to PATH if not already."
+	@echo "  2. devai-shell --init     # create $(DEVAI_HOME)/preferences.yaml"
+	@echo "  3. devai-shell            # launch the lab + picker"
+
+uninstall: ## Remove devai-shell launcher and the staged config dir
+	@rm -f $(INSTALL_PREFIX)/bin/devai-shell
+	@rm -f $(DEVAI_HOME)/.ollama-reasoning-cache.json
+	@rm -f $(DEVAI_HOME)/model-picker.py
+	@echo "Removed $(INSTALL_PREFIX)/bin/devai-shell and the symlinks under $(DEVAI_HOME)/."
+	@echo "preferences.yaml and sessions/ are kept; remove $(DEVAI_HOME)/ manually if you want a clean slate."
 
 install-systemd: ## Install and enable systemd service for infrastructure
 	@mkdir -p $(HOME)/.config/devai $(HOME)/.config/systemd/user

@@ -22,8 +22,17 @@ make lab-gpu         # Run JupyterLab with GPU
 make lab-cpu         # Run JupyterLab CPU-only
 make shell-gpu       # Interactive shell (GPU) — cwd = repo root
 make shell-cpu       # Interactive shell (CPU) — cwd = repo root
-bin/devai-shell      # Standalone shell-agent — cwd = $(pwd), no Make required
-bin/devai-shell --cpu
+
+# Install standalone launcher (one-time; stages launcher + config under ~/.devai/)
+make install         # writes ~/.local/bin/devai-shell + ~/.devai/{model-picker.py,probe-cache symlink}
+make uninstall       # removes the launcher + symlinks
+
+# Standalone launcher (state in ~/.devai/, independent of repo cwd)
+devai-shell --init           # reset ~/.devai/preferences.yaml to defaults
+devai-shell                  # GPU lab; reads/writes preferences.yaml
+devai-shell --cpu
+devai-shell -C ~/projects/foo --model qwen3.5:9b-q8_0 --agent claude
+devai-shell --show           # print resolved prefs + podman command, no run
 
 # Infrastructure
 make cache-up        # Start active services (Ollama, router, Open WebUI). vLLM/SGLang dormant
@@ -114,10 +123,11 @@ All services share `devai-net` network. Model data stored under `/var/cache/deva
 
 ### Model picker (shell + Jupyter)
 
-Interactive model → agent selection via fzf. Used by both `make shell-*` (via `agent-picker`) and JupyterLab launcher cards.
+Interactive model → agent selection via fzf. Used by `make shell-*` (via `agent-picker`), the standalone `devai-shell` launcher, and JupyterLab launcher cards.
 
 - `scripts/model-picker.py` — Python TUI, two-step fzf picker. Reads `deploy/.ollama-reasoning-cache.json` (digest-keyed, schema v3, probes nested by VRAM × CONTEXT) for fit data. Falls back to `deploy/models.yaml` for catalog metadata only. Backend is derived from the chosen model's entry — there's no explicit backend step.
 - `scripts/agent-picker.sh` — Shell wrapper, execs model-picker.py.
+- `bin/devai-shell` — Host-side Python launcher. Reads/writes `~/.devai/preferences.yaml` (vram, context, last_model, last_agent, last_work_dir, agent_session_file). Bind-mounts `~/.devai/` to `/devai-host` (rw) so the picker can drop `.last-pick.json` for the launcher to consume on exit. Bind-mounts `~/.devai/model-picker.py` over `/usr/local/bin/model-picker` so picker edits don't require an image rebuild. Pre-flight checks for image + `devai-net`.
 - `packages/jupyter-ai-launchers/src/index.ts` — JupyterLab extension, each card runs `model-picker --agent <name>`.
 
 **Filter:** the picker shows one row per (family, context tier, reasoning status) bucket at the picker's VRAM band (env `VRAM` or `GPU_MEMORY_GB`). A model is eligible at a (vram, ctx) cell only when the probe cache contains a measurement there with `fully_on_gpu: true`. There is no interpolation — gaps mean "re-run `make probe`". HF entries stay `capability: unknown` because no probe runner exists for vLLM/SGLang yet (see `docs/sidelined-backends.md`); the picker hides them.

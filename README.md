@@ -93,34 +93,72 @@ make model-fit VRAM=16 CONTEXT=32768          # query a different (VRAM, ctx)
 make lab-gpu         # Start JupyterLab with GPU (or make lab-cpu)
 # OR
 make shell-gpu       # Drop straight into the model picker (cwd = repo)
-# OR (per-project shell agent — works from anywhere on the host)
-bin/devai-shell      # GPU lab with $(pwd) mounted as /home/devai/work
+# OR (standalone host launcher — see "devai-shell" below)
+make install         # one-time: stage launcher + config in ~/.local/bin and ~/.devai/
+devai-shell --init   # one-time: write default ~/.devai/preferences.yaml
+devai-shell          # launch with last-used model/agent/work-dir
 ```
 
 Access:
 - **JupyterLab**: `https://<HOST_IP>:8888`
 - **Open WebUI**: `https://<HOST_IP>:8443`
 
-### `devai-shell` — standalone shell agent
+### `devai-shell` — standalone host launcher
 
-`bin/devai-shell` is the same lab container as `make shell-gpu` but
-without Make. It mounts the **current** working directory (not the
-repo root) as `/home/devai/work`, so you can drop it on your `PATH`
-and use it as a per-project shell agent:
+`bin/devai-shell` is the same lab container as `make shell-gpu`,
+runnable from anywhere on the host without invoking Make. State lives
+under `~/.devai/`; the repo is only consulted at `make install` time.
+
+**Install once:**
 
 ```bash
-ln -s "$(pwd)/bin/devai-shell" ~/.local/bin/devai-shell    # one-time
-
-cd ~/projects/my-app && devai-shell           # picker, then shell with my-app/ at $PWD
-cd ~/projects/other-repo && devai-shell --cpu # CPU lab from another project
-CONTEXT=32768 VRAM=16 devai-shell             # per-call overrides
+make install                       # default INSTALL_PREFIX=~/.local
+make install INSTALL_PREFIX=/opt   # alternative location
 ```
 
-It still finds the repo's probe cache via its own location, so the
-picker sees the latest fit data regardless of where it was invoked.
+This writes:
+
+| Target | Purpose |
+|---|---|
+| `~/.local/bin/devai-shell` | The launcher script. |
+| `~/.devai/.ollama-reasoning-cache.json` | Symlink to the repo's probe cache so it stays fresh as `make probe` regenerates it. |
+| `~/.devai/model-picker.py` | Symlink so the launcher can override the in-image picker via bind-mount (no rebuild needed). |
+| `~/.devai/sessions/` | Per-`(agent, model)` session-history dir. |
+
+Then add `~/.local/bin` to `PATH` and run `devai-shell --init` to seed
+`~/.devai/preferences.yaml` with defaults.
+
+**Run:**
+
+```bash
+devai-shell                         # GPU; reads ~/.devai/preferences.yaml
+devai-shell --cpu                   # CPU lab
+devai-shell -C ~/projects/my-app    # override last_work_dir for this run
+devai-shell --model qwen3.5:9b-q8_0 --agent claude
+devai-shell --show                  # print resolved prefs + container cmd, no run
+devai-shell --init                  # reset preferences.yaml to defaults
+uninstall via:  make uninstall      # removes the launcher + symlinks
+```
+
+**Preferences (`~/.devai/preferences.yaml`).** The launcher reads
+these on entry and updates them on exit, so the next invocation
+reuses the last known good state:
+
+| Key | Type | Updated by |
+|---|---|---|
+| `vram` | int (GB) | `--init`; hand-edit |
+| `context` | int (tokens) | the picker's per-row context tier |
+| `last_model` | str | the picker's model selection |
+| `last_agent` | str | the picker's agent selection |
+| `last_work_dir` | path | `-C/--workdir` or current value |
+| `agent_session_file` | path \| null | computed from `(last_agent, last_model)` for agents that support session history (claude, codex, aider) |
+
+The picker writes its choice to `~/.devai/.last-pick.json` (one-shot,
+auto-cleaned) so the launcher knows what the user actually selected.
+If the user backs out of the picker, the previous values are kept.
 Prerequisites: `make build-{cpu,gpu}` and `make cache-up` once from
-the repo (`devai-shell` prints an actionable message if either is
-missing).
+the repo — `devai-shell` prints an actionable message if either is
+missing.
 
 ## Architecture
 
