@@ -106,7 +106,7 @@ endif
 
 .PHONY: all build build-cpu build-gpu build-base-cpu build-base-gpu build-router
 .PHONY: lab-cpu lab-gpu shell-cpu shell-gpu
-.PHONY: cache-up cache-down cache-status cache-clean
+.PHONY: cache-up cache-down cache-status cache-clean logs
 .PHONY: ollama-rm ollama-list ollama-status ollama-clean ollama-df
 .PHONY: vllm-list vllm-rm vllm-status vllm-df
 .PHONY: clean clean-cpu clean-gpu clean-router prune
@@ -470,8 +470,10 @@ cache-up: ## Start infrastructure services (caches + Ollama + Open WebUI; vLLM/S
 	@echo "  Ollama:            devai-ollama:11434 (GGUF models)"
 	@echo "  vLLM/SGLang:       dormant (see docs/sidelined-backends.md)"
 	@echo "  Open WebUI:        https://localhost:$(WEBUI_PORT)"
+	@echo "  Logger:            $(CACHE_DIR)/logs/<container>.log (per-service stdout)"
 	@echo ""
 	@echo "To pull and probe models:  make model-pull [FAMILY=qwen3.5] && make probe"
+	@echo "To tail a service's log:   make logs SERVICE=devai-ollama"
 
 cache-down: ## Stop and remove ALL infrastructure services (running, stopped, orphaned)
 	@# -t 0 kills immediately; --remove-orphans catches containers no longer in compose.
@@ -484,6 +486,19 @@ cache-down: ## Stop and remove ALL infrastructure services (running, stopped, or
 		echo "Removing stragglers: $$ids"; \
 		$(CONTAINER_RUNTIME) rm -f $$ids; \
 	fi
+
+logs: ## Tail container stdout via the logger sidecar (SERVICE=devai-X, default devai-ollama; LINES=N to seed).
+	@svc="$${SERVICE:-devai-ollama}"; \
+	 lines="$${LINES:-50}"; \
+	 file="$(CACHE_DIR)/logs/$$svc.log"; \
+	 if [ ! -f "$$file" ]; then \
+	    echo "no log for $$svc at $$file"; \
+	    echo "available services:"; \
+	    ls -1 $(CACHE_DIR)/logs 2>/dev/null | sed 's/^/  /; s/\.log$$//'; \
+	    exit 1; \
+	 fi; \
+	 echo "tailing $$file (Ctrl-C to stop)"; \
+	 tail -n $$lines -f "$$file"
 
 cache-status: ## Show infrastructure service status and disk usage
 	@$(COMPOSE) -f $(CACHE_COMPOSE) ps
