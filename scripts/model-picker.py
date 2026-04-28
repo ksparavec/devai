@@ -409,7 +409,6 @@ _STATUS_ORDER = {
     "native": 0,
     "inline": 1,
     "none": 2,
-    "cpu_offload": 3,
 }
 
 
@@ -474,6 +473,13 @@ def _measured_point_at(v: dict, context: int) -> dict:
 def _vram_info_at(v: dict, context: int) -> dict | None:
     exact = _measured_point_at(v, context)
     if exact:
+        # Cells whose chat probe errored before VRAM was measured have
+        # no actual_total_gb — return None so the picker bins them as
+        # "missing VRAM data". Cells that loaded but spilled DO carry
+        # VRAM (with fully_on_gpu=False) and flow through; the spill
+        # filter in _build_menu hides them under the "spilled" bin.
+        if exact.get("actual_total_gb") is None:
+            return None
         total = round(float(exact["actual_total_gb"]), 2)
         vram_gb = round(float(exact.get("actual_vram_gb") or total), 2)
         return {
@@ -502,8 +508,12 @@ def _vram_info_at(v: dict, context: int) -> dict | None:
 
 
 def _reasoning_status(m: dict, info: dict) -> tuple[str, str, str] | None:
-    if not info.get("fully_on_gpu", True):
-        return "cpu_offload", "!", "CPU offload"
+    """Map a fitting probe cell to (status_key, glyph, label).
+
+    Spilled cells are filtered upstream in _build_menu — by the time we
+    get here, info is guaranteed fully_on_gpu. Returns None for unprobed
+    or error capabilities so the caller can hide the row.
+    """
     cap = m.get("capability", "unknown")
     if cap == "structured":
         return "native", _CAP_GLYPH[cap], _REASONING_LABEL[cap]
@@ -627,12 +637,14 @@ def _build_menu(models: list[dict]) -> tuple[list[str], list[bool], list[dict | 
     #   - non_ollama_dormant: vLLM/SGLang entries are not part of the
     #     current Ollama reasoning flow.
     #   - missing_vram: no usable coefficients or formula totals
-    #   - missing_capability: probed state is unknown/error and not CPU offload
+    #   - missing_capability: probed state is unknown/error
+    #   - spilled: probe shows fully_on_gpu=false at this (vram, ctx)
     hidden = {
         "non_ollama_dormant": 0,
         "context_capped": 0,
         "missing_vram": 0,
         "missing_capability": 0,
+        "spilled": 0,
     }
     for m in models:
         backend = m.get("backend", "ollama")
@@ -647,6 +659,12 @@ def _build_menu(models: list[dict]) -> tuple[list[str], list[bool], list[dict | 
                 continue
             if int(info.get("context") or 0) < ctx:
                 hidden["context_capped"] += 1
+                continue
+            # Eliminate models that don't fit fully on GPU at this
+            # (VRAM band, context). The cache record decides — we don't
+            # second-guess it.
+            if not info.get("fully_on_gpu", False):
+                hidden["spilled"] += 1
                 continue
             status = _reasoning_status(m, info)
             if status is None:
@@ -741,6 +759,8 @@ def _build_menu(models: list[dict]) -> tuple[list[str], list[bool], list[dict | 
             bits.append(f"{hidden['missing_vram']} missing VRAM data")
         if hidden["context_capped"]:
             bits.append(f"{hidden['context_capped']} below requested context")
+        if hidden["spilled"]:
+            bits.append(f"{hidden['spilled']} spill to CPU/RAM at this VRAM")
         if hidden["missing_capability"]:
             bits.append(f"{hidden['missing_capability']} not probed/probe failed")
         emit(f"  {_DIM}hidden: {', '.join(bits)}  ·  "
