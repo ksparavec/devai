@@ -61,14 +61,56 @@ def _http_text(url: str, timeout: int = 25) -> str:
 
 # ── HuggingFace ──────────────────────────────────────────────────────────────
 
+# Per-run memo of /api/models/{repo}?blobs=true responses. The HF API
+# returns size-per-file AND the repo's `main` commit sha in one call;
+# caching avoids duplicate fetches when both pieces are needed by
+# downstream Entry construction.
+_hf_blobs_cache: dict[str, dict] = {}
+
+
+def _hf_blobs(repo: str) -> dict:
+    if repo not in _hf_blobs_cache:
+        _hf_blobs_cache[repo] = _http_json(f"{HF_API}/{repo}?blobs=true")
+    return _hf_blobs_cache[repo]
+
+
+_HF_WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pth")
+
+
 def hf_weight_bytes(repo: str) -> int:
     """Sum all weight file sizes from the HF API (safetensors/bin/pth only)."""
-    data = _http_json(f"{HF_API}/{repo}?blobs=true")
+    data = _hf_blobs(repo)
     return sum(
         (f.get("size") or 0)
         for f in data.get("siblings", [])
-        if f.get("rfilename", "").endswith((".safetensors", ".bin", ".pth"))
+        if f.get("rfilename", "").endswith(_HF_WEIGHT_SUFFIXES)
     )
+
+
+def hf_repo_sha(repo: str) -> str:
+    """Return a stable short identifier for the repo's current `main`.
+
+    Preferred: first 12 chars of the HF API's top-level `sha` (the git
+    commit on the resolved revision). When the API response lacks a sha
+    field — older proxies, mirror layers, certain private endpoints —
+    fall back to a deterministic fingerprint over the weight-blob list
+    so the cache key remains stable across runs of the same upstream
+    state. The fingerprint is prefixed `f-` so it can never collide
+    with a real (hex) sha.
+    """
+    import hashlib
+
+    data = _hf_blobs(repo)
+    sha = (data.get("sha") or "").strip()
+    if sha:
+        return sha[:12]
+    weight_files = sorted(
+        (f.get("rfilename", ""), int(f.get("size") or 0))
+        for f in data.get("siblings", [])
+        if f.get("rfilename", "").endswith(_HF_WEIGHT_SUFFIXES)
+    )
+    digest = hashlib.sha256(repr((repo, weight_files)).encode()).hexdigest()
+    return "f-" + digest[:10]
 
 
 def hf_config(repo: str) -> dict:
@@ -162,6 +204,9 @@ class Entry:
                             # is determined at runtime by
                             # scripts/probe-ollama-reasoning.py
     gguf_filename: str | None = None  # set on source_kind == "gguf"
+    sha: str | None = None  # short git sha (12 chars) for source_kind == "hf";
+                            # cache key for the vLLM/SGLang probe — `f-...`
+                            # prefix indicates a fingerprint fallback
 
 
 def _gb(bytes_: int) -> float:
@@ -184,6 +229,13 @@ def _entry_hf(repo: str, family: str, fallback_arch: Arch,
         print(f"  [info] HF {repo}: no usable config.json, "
               f"using family arch_ref ({e})", file=sys.stderr)
         arch = fallback_arch
+    # sha capture shares the cached /api/models/{repo}?blobs=true response
+    # with hf_weight_bytes — single network round-trip per repo.
+    try:
+        sha = hf_repo_sha(repo)
+    except Exception as e:
+        print(f"  [warn] HF sha: {repo}: {e}", file=sys.stderr)
+        sha = None
     return Entry(
         name=repo.split("/")[-1],
         family=family,
@@ -193,6 +245,7 @@ def _entry_hf(repo: str, family: str, fallback_arch: Arch,
         arch=arch,
         source_kind="hf",
         thinking=thinking,
+        sha=sha,
     )
 
 
@@ -402,6 +455,8 @@ def main() -> None:
         if e.repo:
             lines.append(f'    repo: "{e.repo}"')
         lines.append(f'    source: {e.source_kind}')
+        if e.sha:
+            lines.append(f'    sha: "{e.sha}"')
         if e.gguf_filename:
             lines.append(f'    gguf_filename: "{e.gguf_filename}"')
         lines.append(f'    size: "{e.size_gb:.2f} GB"')

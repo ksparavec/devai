@@ -257,6 +257,142 @@ func TestModelsForBackend(t *testing.T) {
 	}
 }
 
+// --- TestSynthesizeHFFromCache ---
+
+func TestSynthesizeHFFromCache_FilteringAndShape(t *testing.T) {
+	parser := "qwen3_coder"
+	cache := map[string]*hfCacheEntry{
+		// Healthy model — fits at 24G/32K. Should produce a row.
+		"nvidia/Llama-3.1-8B@bdb54e242984": {
+			SchemaVersion: 1,
+			Repo:          "nvidia/Llama-3.1-8B-Instruct-NVFP4",
+			Sha:           "bdb54e242984",
+			Aliases:       []string{"Llama-3.1-8B-Instruct-NVFP4"},
+			ModelKind:     "dense",
+			SizeGB:        5.61, // weight size; distinct from ActualVRAMGB (post-load)
+			MaxContext:    131072,
+			Capability:    "inline",
+			ToolParser:    &parser,
+			Probes: map[string]map[string]hfCacheProbe{
+				"24": {
+					"32768": {Ctx: 32768, VramGB: 24, Fits: true,
+						ActualVRAMGB: 22.49, ActualContext: 32768},
+					"65536": {Ctx: 65536, VramGB: 24, Fits: false}, // skipped — not fits
+				},
+			},
+		},
+		// Custom-arch failure — must be dropped entirely.
+		"talkie-lm/talkie@abc123": {
+			SchemaVersion: 1,
+			Repo:          "talkie-lm/talkie-1930-13b-it",
+			Aliases:       []string{"talkie-1930"},
+			Capability:    "unsupported_arch",
+			Probes:        map[string]map[string]hfCacheProbe{},
+		},
+		// Infra failure — also dropped.
+		"some/sglang-fp4@def456": {
+			SchemaVersion: 1,
+			Repo:          "some/sglang-fp4",
+			Aliases:       []string{"sglang-fp4"},
+			Capability:    "error",
+			Probes: map[string]map[string]hfCacheProbe{
+				"24": {"32768": {Ctx: 32768, VramGB: 24, Fits: false}},
+			},
+		},
+		// Probe at wrong VRAM band — dropped.
+		"x/wrong-band@e": {
+			SchemaVersion: 1,
+			Repo:          "x/wrong-band",
+			Aliases:       []string{"wrong-band"},
+			Capability:    "inline",
+			Probes: map[string]map[string]hfCacheProbe{
+				"16": {"32768": {Ctx: 32768, VramGB: 16, Fits: true}},
+			},
+		},
+	}
+	rows := synthesizeHFFromCache(cache, "vllm", 24, 131072)
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 emitted row, got %d: %+v", len(rows), rows)
+	}
+	r := rows[0]
+	if r.Name != "Llama-3.1-8B-Instruct-NVFP4" {
+		t.Errorf("Name=%q want Llama-3.1-8B-Instruct-NVFP4", r.Name)
+	}
+	if len(r.Backend) != 1 || r.Backend[0] != "vllm" {
+		t.Errorf("Backend=%v want [vllm]", r.Backend)
+	}
+	if r.Context != 131072 {
+		t.Errorf("Context=%d want 131072 (operator cap)", r.Context)
+	}
+	if r.ToolParser != "qwen3_coder" {
+		t.Errorf("ToolParser=%q want qwen3_coder", r.ToolParser)
+	}
+	// Size MUST be the catalog weight size (5.61 GB), NOT the post-load
+	// ActualVRAMGB (22.49 GB). containerRecreate consumes this for
+	// memFraction; using the post-load total would clamp KV to a few
+	// thousand tokens.
+	if r.Size != "5.61 GB" {
+		t.Errorf("Size=%q want \"5.61 GB\" (weight size, not post-load total)", r.Size)
+	}
+	if r.Reasoning == nil || r.Reasoning.Capability != "inline" {
+		t.Errorf("Reasoning=%+v want capability=inline", r.Reasoning)
+	}
+}
+
+func TestSynthesizeHFFromCache_FallbackWhenSizeGBMissing(t *testing.T) {
+	// Pre-fix cache rows lack SizeGB. The fallback (half of ActualVRAMGB)
+	// keeps launch math safe-ish until the operator re-probes. This test
+	// pins that fallback so a future "remove the fallback" change
+	// surfaces in CI as an intentional behavioural change.
+	cache := map[string]*hfCacheEntry{
+		"r/m@abc": {
+			SchemaVersion: 1,
+			Aliases:       []string{"m"},
+			MaxContext:    65536,
+			Capability:    "inline",
+			// SizeGB intentionally missing
+			Probes: map[string]map[string]hfCacheProbe{
+				"24": {"32768": {Ctx: 32768, VramGB: 24, Fits: true,
+					ActualVRAMGB: 22.0, ActualContext: 32768}},
+			},
+		},
+	}
+	rows := synthesizeHFFromCache(cache, "vllm", 24, 65536)
+	if len(rows) != 1 {
+		t.Fatalf("want 1 row, got %d", len(rows))
+	}
+	// Fallback: 0.5 × ActualVRAMGB = 11.0 GB
+	if rows[0].Size != "11.00 GB" {
+		t.Errorf("Size=%q want 11.00 GB (fallback for pre-fix cache)", rows[0].Size)
+	}
+}
+
+func TestSynthesizeHFFromCache_OperatorCtxCapClamps(t *testing.T) {
+	cache := map[string]*hfCacheEntry{
+		"x/y@z": {
+			SchemaVersion: 1,
+			Aliases:       []string{"y"},
+			MaxContext:    262144, // model declares big ceiling
+			Capability:    "inline",
+			Probes: map[string]map[string]hfCacheProbe{
+				"24": {
+					"32768":  {Ctx: 32768, VramGB: 24, Fits: true},
+					"65536":  {Ctx: 65536, VramGB: 24, Fits: true},
+					"131072": {Ctx: 131072, VramGB: 24, Fits: true},
+					"262144": {Ctx: 262144, VramGB: 24, Fits: true},
+				},
+			},
+		},
+	}
+	rows := synthesizeHFFromCache(cache, "vllm", 24, 65536) // operator caps at 64K
+	if len(rows) != 1 {
+		t.Fatalf("want 1 row, got %d", len(rows))
+	}
+	if rows[0].Context != 65536 {
+		t.Errorf("Context=%d want 65536 (operator cap)", rows[0].Context)
+	}
+}
+
 // --- TestGPUExclusion ---
 
 func TestEnsureBackendRunning_OllamaAlwaysSucceeds(t *testing.T) {
@@ -267,7 +403,7 @@ func TestEnsureBackendRunning_OllamaAlwaysSucceeds(t *testing.T) {
 	a := testArbiter(bs)
 
 	a.mu.Lock()
-	err := a.ensureBackendRunning(bs, "")
+	err := a.ensureBackendRunning(bs, "", 0)
 	a.mu.Unlock()
 
 	if err != nil {
@@ -289,7 +425,7 @@ func TestEnsureBackendRunning_RequiresModelForNonOllama(t *testing.T) {
 	a := testArbiter(bs)
 
 	a.mu.Lock()
-	err := a.ensureBackendRunning(bs, "")
+	err := a.ensureBackendRunning(bs, "", 0)
 	a.mu.Unlock()
 
 	if err == nil {

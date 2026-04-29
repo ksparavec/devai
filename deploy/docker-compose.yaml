@@ -40,29 +40,20 @@ services:
       - label=disable
     restart: unless-stopped
 
-  # vLLM and SGLang are dormant — see docs/sidelined-backends.md.
-  # The `backends-disabled` profile keeps them out of the default
-  # `compose up -d` (used by `make cache-up`) so they don't start with
-  # broken/placeholder configs and litter `podman ps` with failed
-  # containers. Their lifecycle is still managed at runtime by the
-  # router (gpu-arbiter) when re-enabled. To re-enable temporarily:
-  #   compose --profile backends-disabled up -d vllm sglang
+  # vLLM and SGLang are router-managed: the gpu-arbiter replaces these
+  # containers on demand via libpod when a request arrives on the
+  # backend's port (11435/11436). The compose `entrypoint: sleep` is a
+  # placeholder so `make cache-up` produces a clean idle container the
+  # router can stop+recreate atomically — without it, a real entrypoint
+  # would either fail at boot (wrong model path) or claim the GPU
+  # before ollama could load. See docs/backends.md.
   vllm:
-    profiles: ["backends-disabled"]
-    image: vllm/vllm-openai:latest-cu130-ubuntu2404
+    image: ${VLLM_IMAGE:-docker.io/vllm/vllm-openai:latest-cu130-ubuntu2404}
     container_name: devai-vllm
     hostname: vllm
     volumes:
       - /var/cache/devai/ollama/models/vllm:/models:ro
-    entrypoint: ["python3", "-m", "vllm.entrypoints.openai.api_server",
-      "--model", "${VLLM_MODEL_PATH:-/models/NVIDIA-Nemotron-Nano-9B-v2-NVFP4}",
-      "--host", "0.0.0.0",
-      "--port", "11434",
-      "--tensor-parallel-size", "1",
-      "--max-model-len", "${VLLM_CTX_LEN:-16384}",
-      "--gpu-memory-utilization", "${VLLM_GPU_UTIL:-0.95}",
-      "--trust-remote-code",
-      "--served-model-name", "${VLLM_MODEL_NAME:-NVIDIA-Nemotron-Nano-9B-v2-NVFP4}"]
+    entrypoint: ["sleep", "infinity"]
     devices:
       - nvidia.com/gpu=all
     security_opt:
@@ -70,12 +61,12 @@ services:
     restart: "no"
 
   sglang:
-    profiles: ["backends-disabled"]
     image: ${SGLANG_IMAGE:-docker.io/lmsysorg/sglang:latest}
     container_name: devai-sglang
     hostname: sglang
     volumes:
       - /var/cache/devai/ollama/models/vllm:/models:ro
+    entrypoint: ["sleep", "infinity"]
     devices:
       - nvidia.com/gpu=all
     security_opt:
@@ -115,10 +106,14 @@ services:
       - PODMAN_SOCKET=/run/podman/podman.sock
     volumes:
       - ${XDG_RUNTIME_DIR:-/run/user/1000}/podman/podman.sock:/run/podman/podman.sock
-      # Probe cache (schema v3) is the single source of truth for model
-      # fit data. The router reads it via the PROBE_CACHE env (default
-      # path matches this mount point).
+      # Probe caches (schema v3 for Ollama digest-keyed; schema v1 for
+      # vLLM/SGLang repo+sha-keyed). Each is independent — missing
+      # files are not fatal, the corresponding backend just exposes no
+      # models. The router reads them via PROBE_CACHE / VLLM_PROBE_CACHE
+      # / SGLANG_PROBE_CACHE env vars (defaults match these mount paths).
       - ./.ollama-reasoning-cache.json:/etc/devai/.ollama-reasoning-cache.json:ro
+      - ./.vllm-reasoning-cache.json:/etc/devai/.vllm-reasoning-cache.json:ro
+      - ./.sglang-reasoning-cache.json:/etc/devai/.sglang-reasoning-cache.json:ro
     depends_on:
       - ollama
     restart: unless-stopped

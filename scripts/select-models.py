@@ -37,6 +37,8 @@ from _contexts import effective_targets as _ctx_effective_targets  # noqa: E402
 
 CATALOG = REPO_ROOT / "deploy" / "models.yaml"
 PROBE_CACHE = REPO_ROOT / "deploy" / ".ollama-reasoning-cache.json"
+VLLM_PROBE_CACHE = REPO_ROOT / "deploy" / ".vllm-reasoning-cache.json"
+SGLANG_PROBE_CACHE = REPO_ROOT / "deploy" / ".sglang-reasoning-cache.json"
 
 # vLLM/SGLang serve models fully in VRAM — weights + full KV cache +
 # CUDA graphs + activations. Ollama (llama.cpp) has a much smaller
@@ -531,6 +533,91 @@ def lookup_capability(model_name: str, cache: ProbeCache) -> tuple[str, str | No
     return cap, None
 
 
+@dataclass(frozen=True)
+class HFProbeCaches:
+    """vLLM and SGLang probe caches, keyed by `<repo>@<sha>`.
+
+    Schema v1 — see scripts/_probe_hf_common.py for the full shape.
+    Each backend's cache is independent; missing files resolve to {}.
+    """
+
+    vllm: dict
+    sglang: dict
+
+    def cache_for(self, backend: str) -> dict:
+        if backend == "vllm":
+            return self.vllm
+        if backend == "sglang":
+            return self.sglang
+        return {}
+
+    def lookup(self, repo: str, sha: str, backend: str) -> dict:
+        if not (repo and sha):
+            return {}
+        return self.cache_for(backend).get(f"{repo}@{sha}") or {}
+
+    def has_working_probe(self, backend: str) -> bool:
+        """True iff *any* row in the backend's cache has a fits=true cell.
+
+        Used as a coarse gate: when a backend has at least one model
+        confirmed loadable, HF rows for that backend become eligible
+        trial candidates (the user can probe specific rows to confirm
+        their fit later — the formula path provides the size estimate
+        in the meantime).
+        """
+        for entry in self.cache_for(backend).values():
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("capability") in ("error", "unsupported_arch"):
+                continue
+            for band in (entry.get("probes") or {}).values():
+                if not isinstance(band, dict):
+                    continue
+                for cell in band.values():
+                    if isinstance(cell, dict) and cell.get("fits"):
+                        return True
+        return False
+
+
+def load_hf_probe_caches() -> HFProbeCaches:
+    """Read both HF probe cache files. Missing or malformed → empty dict."""
+    import json
+
+    def _read(path: Path) -> dict:
+        if not path.is_file():
+            return {}
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    return HFProbeCaches(
+        vllm=_read(VLLM_PROBE_CACHE),
+        sglang=_read(SGLANG_PROBE_CACHE),
+    )
+
+
+def hf_probe_at_context(
+    entry: dict, vram_gb: int, context: int,
+) -> dict | None:
+    """Return the HF cache cell at (vram, ctx) or None.
+
+    Mirrors probe_at_context for the schema v1 shape: cells live under
+    `entry["probes"][<vram>][<ctx>]` and carry `fits` instead of
+    `fully_on_gpu`. The effective ctx is min(context, max_context).
+    """
+    if not entry:
+        return None
+    max_ctx = int(entry.get("max_context") or 0)
+    eff_ctx = min(context, max_ctx) if max_ctx else context
+    band = (entry.get("probes") or {}).get(str(int(vram_gb)))
+    if not isinstance(band, dict):
+        return None
+    rec = band.get(str(eff_ctx))
+    return rec if isinstance(rec, dict) else None
+
+
 def probe_at_context(entry: dict, vram_gb: int, context: int) -> dict | None:
     """Return the per-(vram, ctx) probe cell from a v3 digest entry.
 
@@ -596,28 +683,41 @@ class Row:
     active_eligible: bool = False
 
 
+_PROBED_SOURCES = ("probe", "hf-probe")
+
+
 def active_eligible(row: Row) -> bool:
-    """Return whether this row is allowed into active-models.yaml."""
+    """Return whether this row is allowed into the active set.
+
+    A row is active iff it fits, is downloaded, AND its measurement
+    came from a real probe (Ollama or vLLM/SGLang) — not the analytic
+    formula. The fully_on_gpu/fits flag must be true.
+    """
     if not (row.fits and row.downloaded):
         return False
-    if not is_ollama_only(row.model):
-        return True
     vram = row.model.get("vram") or {}
-    if vram.get("source") != "probe":
+    if vram.get("source") not in _PROBED_SOURCES:
         return False
     return bool(vram.get("fully_on_gpu", True))
 
 
 def trusted_for_family_gate(row: Row) -> bool:
-    """Return whether this row can suppress smaller same-family candidates."""
+    """Return whether this row can suppress smaller same-family candidates.
+
+    Trusted == fits AND (not yet downloaded, or probed-and-loadable).
+    Formula-only downloaded rows do not gate the family — they could
+    still spill at runtime, so a smaller probed alternative shouldn't
+    be hidden behind them.
+    """
     if not row.fits:
         return False
     if not row.downloaded:
         return True
-    if not is_ollama_only(row.model):
-        return True
     vram = row.model.get("vram") or {}
-    return vram.get("source") == "probe" and bool(vram.get("fully_on_gpu", True))
+    return (
+        vram.get("source") in _PROBED_SOURCES
+        and bool(vram.get("fully_on_gpu", True))
+    )
 
 
 def candidate_signature(row: Row) -> tuple:
@@ -680,21 +780,45 @@ def trial_score(row: Row, vram: float) -> tuple[float, bool, int]:
     return (-unused_gb, *name_priority(row.model))
 
 
+def _is_eligible_backend(row: Row, hf_caches: HFProbeCaches) -> bool:
+    """A row's backend is eligible if it's Ollama (always probed) or an
+    HF backend that has at least one fits=true entry in its cache.
+
+    The gate is coarse: a working probe somewhere in the vLLM cache
+    proves vLLM serves at least one model, which is enough signal to
+    download other vLLM rows speculatively. Fine-grained per-row checks
+    happen at picker time, when the user actually picks a model.
+    """
+    if is_ollama_only(row.model):
+        return True
+    backends = row.model.get("backend") or []
+    for b in ("vllm", "sglang"):
+        if b in backends and hf_caches.has_working_probe(b):
+            return True
+    return False
+
+
 def assign_trial_candidates(
-    rows: list[Row], max_downloads_per_family: int, vram: float,
+    rows: list[Row],
+    max_downloads_per_family: int,
+    vram: float,
+    hf_caches: HFProbeCaches,
 ) -> list[Row]:
-    """Mark bounded missing Ollama rows that are worth a trial download.
+    """Mark bounded missing rows worth a trial download.
 
     Candidate status is intentionally stricter than formula fit:
-    - only missing Ollama rows are considered while vLLM/SGLang are dormant;
+    - only rows whose backend is currently working are considered
+      (Ollama unconditionally; vLLM/SGLang only when their probe cache
+      has at least one fitting entry);
     - :latest loses whenever a descriptive same-family fit exists;
-    - smaller same-family rows are suppressed when a larger quality tier fits;
+    - smaller same-family rows are suppressed when a larger quality
+      tier fits;
     - aliases with the same estimated shape collapse to one explicit tag;
     - downloads are capped per family.
     """
     by_family: dict[str, list[Row]] = {}
     for row in rows:
-        if row.fits and is_ollama_only(row.model):
+        if row.fits and _is_eligible_backend(row, hf_caches):
             family = row.model.get("family") or ""
             by_family.setdefault(family, []).append(row)
 
@@ -790,6 +914,24 @@ def assign_trial_candidates(
     return selected
 
 
+def _hf_lookup_with_priority(
+    m: dict, hf_caches: HFProbeCaches,
+) -> tuple[dict, str | None]:
+    """Find the first HF backend (vllm > sglang) with a non-failed entry
+    for this catalog row. Returns (entry, backend) or ({}, None).
+    """
+    backends = m.get("backend") or []
+    repo = m.get("repo") or ""
+    sha = (m.get("sha") or "").strip()
+    for b in ("vllm", "sglang"):
+        if b not in backends:
+            continue
+        entry = hf_caches.lookup(repo, sha, b)
+        if entry and entry.get("capability") not in ("error", "unsupported_arch"):
+            return entry, b
+    return {}, None
+
+
 def build_rows(
     models: list[dict],
     context: int,
@@ -797,13 +939,19 @@ def build_rows(
     min_total: float,
     vram_budget: float,
     probe_cache: ProbeCache,
+    hf_caches: HFProbeCaches,
 ) -> list[Row]:
     """One Row per catalog entry, annotated with the measurement at CONTEXT.
 
-    Ollama models read straight from the v2 probe cache: probes[ctx] is the
-    truth, no interpolation. vLLM/SGLang models still use the analytic
-    formula (those backends have no probe runner yet — see
-    docs/sidelined-backends.md).
+    Sources of `vram` data, in priority order:
+      1. Ollama digest cache  (source == "probe")
+      2. vLLM/SGLang HF cache (source == "hf-probe")
+      3. Analytic formula     (source == "formula") — fallback when no
+         cache has a row, or the cache has no cell at (vram, ctx).
+
+    The HF caches are consulted in priority vllm > sglang for rows
+    declaring multiple backends. The first backend with a non-failed
+    entry wins; future work could surface both verdicts to the picker.
     """
     rows: list[Row] = []
     for original in models:
@@ -854,6 +1002,49 @@ def build_rows(
                 "max_context": probe_entry.get("max_context"),
                 "context_capability": "unknown",
             }
+        elif not model_is_ollama_only:
+            hf_entry, hf_backend = _hf_lookup_with_priority(m, hf_caches)
+            hf_record = (
+                hf_probe_at_context(hf_entry, vram_gb, context)
+                if hf_entry else None
+            )
+            if hf_record:
+                vram_actual = float(hf_record.get("actual_vram_gb") or 0.0)
+                eff_ctx = int(hf_record.get("actual_context") or hf_record.get("ctx") or context)
+                fits_flag = bool(hf_record.get("fits", False))
+                ctx_capability = str(hf_record.get("capability") or hf_entry.get("capability") or "unknown")
+                # vLLM/SGLang load weights+KV+CUDA-graphs into the static
+                # pool — actual_vram_gb is the most honest "total" we have.
+                total = vram_actual or float(hf_entry.get("max_context") and parse_size_gb(m.get("size", "0")) or 0.0)
+                breakdown = {
+                    "source": "hf-probe",
+                    "backend": hf_backend,
+                    "total_gb": round(total, 2),
+                    "vram_gb": round(vram_actual, 2),
+                    "fully_on_gpu": fits_flag,
+                    "context": eff_ctx,
+                    "max_context": hf_entry.get("max_context"),
+                    "context_capability": ctx_capability,
+                }
+            elif hf_entry:
+                # Cache knows the model but not at this (vram, ctx). Same
+                # signal as Ollama's "probe-missing" — show as un-fitting
+                # so the user knows to re-probe at this tier.
+                total = 0.0
+                breakdown = {
+                    "source": "hf-probe-missing",
+                    "backend": hf_backend,
+                    "total_gb": 0.0,
+                    "vram_gb": 0.0,
+                    "fully_on_gpu": False,
+                    "context": context,
+                    "max_context": hf_entry.get("max_context"),
+                    "context_capability": "unknown",
+                }
+            else:
+                formula = vram_breakdown(m, context, kv_dtype)
+                total = formula["total_gb"]
+                breakdown = {**formula, "source": "formula"}
         else:
             formula = vram_breakdown(m, context, kv_dtype)
             total = formula["total_gb"]
@@ -878,6 +1069,7 @@ def print_context_candidate_summary(
     min_total: float,
     vram_budget: float,
     probe_cache: ProbeCache,
+    hf_caches: HFProbeCaches,
     max_downloads: int,
 ) -> None:
     if not contexts:
@@ -886,8 +1078,12 @@ def print_context_candidate_summary(
     print(f"  {'CTX':>5s}  {'ACTIVE':>6s}  {'FITTING':>7s}  {'CANDIDATE'}")
     print(f"  {'-' * 78}")
     for ctx in contexts:
-        rows = build_rows(models, ctx, kv_dtype, min_total, vram_budget, probe_cache)
-        candidates = assign_trial_candidates(rows, max_downloads, vram_budget)
+        rows = build_rows(
+            models, ctx, kv_dtype, min_total, vram_budget, probe_cache, hf_caches,
+        )
+        candidates = assign_trial_candidates(
+            rows, max_downloads, vram_budget, hf_caches,
+        )
         active_count = sum(1 for r in rows if r.active_eligible)
         fitting_count = sum(1 for r in rows if r.fits)
         if candidates:
@@ -965,14 +1161,18 @@ def main() -> None:
     # guess it.
     min_total = args.vram * max(0.0, args.min_vram_fraction)
     probe_cache = load_probe_cache()
+    hf_caches = load_hf_probe_caches()
 
     candidate_contexts = parse_context_list(args.candidate_contexts)
     rows = build_rows(
         models, args.context, args.kv_dtype, min_total, args.vram, probe_cache,
+        hf_caches,
     )
 
     missing = [r for r in rows if r.fits and not r.downloaded]
-    trial_candidates = assign_trial_candidates(rows, args.max_downloads, args.vram)
+    trial_candidates = assign_trial_candidates(
+        rows, args.max_downloads, args.vram, hf_caches,
+    )
     missing_bytes_gb = sum(parse_size_gb(r.model["size"]) for r in missing)
     candidate_bytes_gb = sum(parse_size_gb(r.model["size"]) for r in trial_candidates)
     # Prune candidates: on disk AND outside the [min_total, args.vram] window —
@@ -1058,7 +1258,7 @@ def main() -> None:
         else:
             action = "missing, not selected for trial"
         v = m.get("vram") or {}
-        if v.get("source") == "probe":
+        if v.get("source") in ("probe", "hf-probe"):
             vram_str = f"{r.total_gb:>6.1f}G"
             ctx_k = (v.get("context") or 0) // 1024
             ctx_str = f"{ctx_k}K"
@@ -1069,11 +1269,11 @@ def main() -> None:
         else:
             vram_str = "—"
             ctx_str = "—"
-        # Capability is from the probe; for non-ollama or unprobed models
-        # it's "unknown".
-        if "ollama" in m.get("backend", []):
-            cap, _ = lookup_capability(m["name"], probe_cache)
-            if v.get("source") == "probe" and not v.get("fully_on_gpu", True):
+        # Capability comes from the per-cell context_capability when the
+        # measurement is real (probe or hf-probe); otherwise unknown.
+        if v.get("source") in ("probe", "hf-probe"):
+            cap = str(v.get("context_capability") or "unknown")
+            if not v.get("fully_on_gpu", True):
                 cap = "error"
         else:
             cap = "unknown"
@@ -1115,7 +1315,7 @@ def main() -> None:
     print()
     print_context_candidate_summary(
         models, candidate_contexts, args.kv_dtype, min_total, args.vram,
-        probe_cache, args.max_downloads,
+        probe_cache, hf_caches, args.max_downloads,
     )
 
     # Shadow aliases cross families (e.g. `nemotron70b` vs `nemotron`), so

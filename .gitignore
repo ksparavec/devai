@@ -106,6 +106,8 @@ tests/.matrix-logs
 .aider*
 .codex
 deploy/.ollama-reasoning-cache.json
+deploy/.vllm-reasoning-cache.json
+deploy/.sglang-reasoning-cache.json
 
 # Go build artifacts (router binary built by `make build-router` lands here
 # on hosts that compile outside the container; the repo only tracks source).

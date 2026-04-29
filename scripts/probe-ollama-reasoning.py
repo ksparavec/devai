@@ -76,7 +76,6 @@ Errors propagate verbatim. No exception swallowing.
 from __future__ import annotations
 
 import argparse
-import datetime as dt
 import json
 import os
 import re
@@ -96,27 +95,22 @@ from _contexts import (  # noqa: E402  — local import after sys.path fix
     parse_vram_token,
     vram_label,
 )
+from _probe_core import (  # noqa: E402  — local import after sys.path fix
+    canonical_alias,
+    has_inline_think_markers,
+    http_get,
+    http_post,
+    load_cache,
+    now_iso,
+    propagate_implied_fail,
+    save_cache,
+    smallest_clean_probe,
+    update_canonical_capability,
+)
 
 DEFAULT_CACHE = REPO_ROOT / "deploy" / ".ollama-reasoning-cache.json"
 DEFAULT_PROMPT = "Answer with only the final number: What is 17 + 25?"
 SCHEMA_VERSION = 3
-
-
-# ── HTTP helpers ─────────────────────────────────────────────────────────────
-
-def _http_post(url: str, body: dict, timeout: float) -> dict:
-    data = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=data, headers={"Content-Type": "application/json"}, method="POST"
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read())
-
-
-def _http_get(url: str, timeout: float) -> dict:
-    req = urllib.request.Request(url, method="GET")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read())
 
 
 # ── Live model lookups (/api/tags, /api/show, /api/ps) ───────────────────────
@@ -131,7 +125,7 @@ def list_models(ollama_url: str, timeout: float) -> list[dict]:
     only to bake a per-session num_ctx into Ollama's load defaults and
     share their digest with the parent (so probing them adds nothing).
     """
-    data = _http_get(f"{ollama_url}/api/tags", timeout)
+    data = http_get(f"{ollama_url}/api/tags", timeout)
     out = []
     for m in data.get("models", []) or []:
         name = m.get("name", "")
@@ -190,7 +184,7 @@ def measure_vram(
     so we fall back to a short-digest match.
     """
     try:
-        ps = _http_get(f"{ollama_url}/api/ps", timeout)
+        ps = http_get(f"{ollama_url}/api/ps", timeout)
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as e:
         return {"error": f"{type(e).__name__}: {e}"}
     entries = ps.get("models", []) or []
@@ -245,7 +239,7 @@ def chat_probe(
         },
     }
     try:
-        return _http_post(f"{ollama_url}/api/chat", body, timeout)
+        return http_post(f"{ollama_url}/api/chat", body, timeout)
     except urllib.error.HTTPError as e:
         return {"error": f"HTTP {e.code}: {e.reason}"}
     except (urllib.error.URLError, TimeoutError, OSError) as e:
@@ -266,29 +260,12 @@ def classify(resp: dict) -> tuple[str, dict]:
             "thinking_chars": len(thinking),
             "content_preview": content[:80],
         }
-    has_inline = "<think>" in content or "</think>" in content
-    if has_inline:
+    if has_inline_think_markers(content):
         return "inline", {"content_preview": content[:200]}
     return "unsupported", {"content_preview": content[:120]}
 
 
 # ── Probe orchestration ──────────────────────────────────────────────────────
-
-def now_iso() -> str:
-    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
-
-
-def canonical_alias(aliases: list[str]) -> str:
-    """Pick the canonical name from a digest's alias list.
-
-    Preference: explicit tag over `:latest`, longer (more descriptive)
-    over shorter. Ollama treats aliases of one digest interchangeably,
-    so the choice only affects log readability and downstream display.
-    """
-    if not aliases:
-        return ""
-    return sorted(aliases, key=lambda n: (n.endswith(":latest"), -len(n)))[0]
-
 
 def _is_think_param_rejection(evidence: dict) -> bool:
     """Heuristic: HTTP 400 from /api/chat with `think:true` is Ollama's
@@ -369,58 +346,6 @@ def probe_one_context(
     return record
 
 
-def smallest_clean_probe(entry: dict) -> dict | None:
-    """Smallest-ctx probe whose capability is a non-error reasoning value.
-
-    Handles both schema layouts:
-      v3 (nested):  probes[<vram>][<ctx>]  → walk both levels.
-      v2 (flat):    probes[<ctx>]          → walk one level. Encountered
-                    transiently while migrating v1 → v2 → v3.
-
-    Distinguishes the two at each value by checking for the `capability`
-    key — present on a probe record, absent on a vram bucket (which
-    contains probe records as its values). Ties broken by smallest vram
-    so the "tightest" GPU that still classified cleanly wins.
-    """
-    probes = entry.get("probes") or {}
-    candidates: list[dict] = []
-    for value in probes.values():
-        if not isinstance(value, dict):
-            continue
-        if "capability" in value:
-            # v2 probe record (flat layout).
-            if value.get("capability") not in (None, "error"):
-                candidates.append(value)
-        else:
-            # v3 vram bucket (nested layout).
-            for p in value.values():
-                if isinstance(p, dict) and p.get("capability") not in (None, "error"):
-                    candidates.append(p)
-    if not candidates:
-        return None
-    candidates.sort(
-        key=lambda p: (int(p.get("ctx") or 0), int(p.get("vram_gb") or 0)),
-    )
-    return candidates[0]
-
-
-def update_canonical_capability(entry: dict) -> None:
-    """Refresh top-level `capability` from the smallest clean probe.
-
-    The smallest fitting tier is the most-trustworthy capability signal
-    (highest chance of fitting on GPU, no spill). When every probe
-    errored we fall back to "error"; with no probes at all, "unknown".
-    """
-    smallest = smallest_clean_probe(entry)
-    if smallest:
-        entry["capability"] = smallest.get("capability") or "unknown"
-        return
-    if entry.get("probes"):
-        entry["capability"] = "error"
-    else:
-        entry.setdefault("capability", "unknown")
-
-
 def maybe_probe_disable(
     ollama_url: str,
     canonical_name: str,
@@ -465,21 +390,7 @@ def maybe_probe_disable(
     return True
 
 
-# ── Cache I/O + migration ────────────────────────────────────────────────────
-
-def load_cache(path: Path) -> dict:
-    if not path.is_file():
-        return {}
-    try:
-        return json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
-def save_cache(path: Path, cache: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(cache, indent=2, sort_keys=True) + "\n")
-
+# ── Schema migration (v1 → v2 → v3, Ollama-specific) ─────────────────────────
 
 def is_v3_entry(entry: dict) -> bool:
     return isinstance(entry, dict) and entry.get("schema_version") == 3
@@ -926,33 +837,46 @@ def main() -> None:
                 spill_total = rec.get("actual_total_gb")
                 spill_vram = rec.get("actual_vram_gb")
                 spill_at = rec["probed_at"]
-                for larger in (t for t in targets if t > ctx):
-                    larger_key = str(larger)
-                    # Respect cached cells that aren't being forced.
-                    if larger_key in vram_band and larger not in force_set:
-                        continue
-                    vram_band[larger_key] = {
+
+                def build_implied(
+                    larger: int,
+                    _total=spill_total,
+                    _vram=spill_vram,
+                    _at=spill_at,
+                    _ctx=ctx,
+                    _vram_gb=vram_gb,
+                ) -> dict:
+                    return {
                         "ctx": larger,
-                        "vram_gb": vram_gb,
-                        "actual_total_gb": spill_total,
-                        "actual_vram_gb": spill_vram,
+                        "vram_gb": _vram_gb,
+                        "actual_total_gb": _total,
+                        "actual_vram_gb": _vram,
                         "actual_context": larger,
                         "fully_on_gpu": False,
                         "capability": "error",
                         "evidence": {
                             "error": (
                                 f"implied spill: "
-                                f"{context_label(ctx)} at "
-                                f"{vram_label(vram_gb)} already spilled"
+                                f"{context_label(_ctx)} at "
+                                f"{vram_label(_vram_gb)} already spilled"
                             ),
-                            "implied_from_ctx": ctx,
+                            "implied_from_ctx": _ctx,
                         },
-                        "probed_at": spill_at,
+                        "probed_at": _at,
                         "probe_seconds": 0.0,
                         "implied": True,
                     }
+
+                new_implied = propagate_implied_fail(
+                    vram_band=vram_band,
+                    targets=targets,
+                    failed_ctx=ctx,
+                    force_set=force_set,
+                    build_implied_record=build_implied,
+                )
+                if new_implied:
                     entry["last_probed_at"] = spill_at
-                    ctxs_implied.append(larger)
+                    ctxs_implied.extend(new_implied)
                 save_cache(args.cache, cache)
                 break
 

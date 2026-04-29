@@ -2,7 +2,7 @@
 #
 # Regenerate with: make catalog-regen
 # Source of truth:  scripts/model-families.yaml
-# Generated at:     2026-04-28T16:04:58+00:00
+# Generated at:     2026-04-28T19:59:10+00:00
 #
 # Every 'size' and 'arch' below was fetched live from the
 # upstream provider at generation time. Do not hand-edit.
@@ -13,6 +13,7 @@ models:
     backend: [vllm, sglang]
     repo: "google/gemma-4-e2b-it"
     source: hf
+    sha: "6b7e72c67d3c"
     size: "9.54 GB"
     arch: { layers: 35, kv_heads: 1, head_dim: 256, k_eq_v: false }
     arch_source: "google/gemma-4-e2b-it/config.json"
@@ -23,6 +24,7 @@ models:
     backend: [vllm, sglang]
     repo: "google/gemma-4-e4b-it"
     source: hf
+    sha: "c53e9d33178b"
     size: "14.89 GB"
     arch: { layers: 42, kv_heads: 2, head_dim: 256, k_eq_v: false }
     arch_source: "google/gemma-4-e4b-it/config.json"
@@ -33,6 +35,7 @@ models:
     backend: [vllm, sglang]
     repo: "google/gemma-4-26b-a4b-it"
     source: hf
+    sha: "4c55b528bdc4"
     size: "48.07 GB"
     arch: { layers: 30, kv_heads: 8, head_dim: 256, k_eq_v: true }
     arch_source: "google/gemma-4-26b-a4b-it/config.json"
@@ -43,6 +46,7 @@ models:
     backend: [vllm, sglang]
     repo: "google/gemma-4-31b-it"
     source: hf
+    sha: "145dc2508c48"
     size: "58.25 GB"
     arch: { layers: 60, kv_heads: 16, head_dim: 256, k_eq_v: true }
     arch_source: "google/gemma-4-31b-it/config.json"
@@ -53,6 +57,7 @@ models:
     backend: [vllm, sglang]
     repo: "nvidia/Gemma-4-31B-IT-NVFP4"
     source: hf
+    sha: "61521ee452a4"
     size: "30.39 GB"
     arch: { layers: 60, kv_heads: 16, head_dim: 256, k_eq_v: true }
     arch_source: "nvidia/Gemma-4-31B-IT-NVFP4/config.json"
@@ -63,6 +68,7 @@ models:
     backend: [vllm, sglang]
     repo: "bg-digitalservices/Gemma-4-26B-A4B-it-NVFP4"
     source: hf
+    sha: "a15dd6f16188"
     size: "15.30 GB"
     arch: { layers: 30, kv_heads: 8, head_dim: 256, k_eq_v: true }
     arch_source: "bg-digitalservices/Gemma-4-26B-A4B-it-NVFP4/config.json"
@@ -250,6 +256,7 @@ models:
     backend: [vllm, sglang]
     repo: "ykarout/Qwen3.5-9B-NVFP4"
     source: hf
+    sha: "bd8c8f493d2e"
     size: "11.51 GB"
     arch: { layers: 32, kv_heads: 4, head_dim: 256, k_eq_v: false }
     arch_source: "ykarout/Qwen3.5-9B-NVFP4/config.json"
@@ -260,6 +267,7 @@ models:
     backend: [vllm, sglang]
     repo: "apolo13x/Qwen3.5-27B-NVFP4"
     source: hf
+    sha: "f48cfc832696"
     size: "18.39 GB"
     arch: { layers: 64, kv_heads: 4, head_dim: 256, k_eq_v: false }
     arch_source: "apolo13x/Qwen3.5-27B-NVFP4/config.json"
@@ -270,6 +278,7 @@ models:
     backend: [vllm, sglang]
     repo: "apolo13x/Qwen3.5-35B-A3B-NVFP4"
     source: hf
+    sha: "8dc7106f0a70"
     size: "21.75 GB"
     arch: { layers: 40, kv_heads: 2, head_dim: 256, k_eq_v: false }
     arch_source: "apolo13x/Qwen3.5-35B-A3B-NVFP4/config.json"
@@ -598,6 +607,7 @@ models:
     backend: [vllm, sglang]
     repo: "nvidia/Qwen3-14B-NVFP4"
     source: hf
+    sha: "bc39319a4dc2"
     size: "9.82 GB"
     arch: { layers: 40, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Qwen3-14B-NVFP4/config.json"
@@ -1175,6 +1185,7 @@ models:
     backend: [vllm, sglang]
     repo: "nvidia/Llama-3.1-8B-Instruct-NVFP4"
     source: hf
+    sha: "bdb54e242984"
     size: "5.61 GB"
     arch: { layers: 32, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Llama-3.1-8B-Instruct-NVFP4/config.json"
@@ -1185,6 +1196,7 @@ models:
     backend: [vllm, sglang]
     repo: "nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4"
     source: hf
+    sha: "8556c9164ddb"
     size: "7.30 GB"
     arch: { layers: 56, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4/config.json"

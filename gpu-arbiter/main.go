@@ -99,15 +99,16 @@ type backendConfig struct {
 }
 
 type configModel struct {
-	Name      string           `yaml:"name"`
-	Aliases   []string         `yaml:"aliases,omitempty"`
-	Digest    string           `yaml:"digest,omitempty"`
-	Backend   []string         `yaml:"backend"`
-	Repo      string           `yaml:"repo"`
-	Size      string           `yaml:"size"`
-	Context   int              `yaml:"context"`
-	Purpose   string           `yaml:"purpose"`
-	Reasoning *configReasoning `yaml:"reasoning,omitempty"`
+	Name       string           `yaml:"name"`
+	Aliases    []string         `yaml:"aliases,omitempty"`
+	Digest     string           `yaml:"digest,omitempty"`
+	Backend    []string         `yaml:"backend"`
+	Repo       string           `yaml:"repo"`
+	Size       string           `yaml:"size"`
+	Context    int              `yaml:"context"`
+	Purpose    string           `yaml:"purpose"`
+	Reasoning  *configReasoning `yaml:"reasoning,omitempty"`
+	ToolParser string           `yaml:"tool_parser,omitempty"` // vLLM-only; populated from probe cache
 }
 
 // configReasoning records what the runtime probe observed for this model.
@@ -130,6 +131,7 @@ type configReasoning struct {
 type launchConfig struct {
 	MemFraction float64
 	MaxContext  int
+	ToolParser  string // vLLM --tool-call-parser; empty omits both --tool-call-parser and --enable-auto-tool-choice
 }
 
 type configFile struct {
@@ -232,6 +234,169 @@ func synthesizeFromCache(
 	return out
 }
 
+// hfCacheProbe is one (vram, ctx) cell from a vLLM/SGLang probe cache.
+// Mirrors the schema v1 record in deploy/.vllm-reasoning-cache.json and
+// deploy/.sglang-reasoning-cache.json (see scripts/_probe_hf_common.py).
+//
+// `Fits` is the HF analog of Ollama's `FullyOnGPU`: the model + KV at
+// the requested ctx loaded into the static pool, /v1/models reported
+// the requested context, and a chat round-trip succeeded.
+type hfCacheProbe struct {
+	Ctx           int     `json:"ctx"`
+	VramGB        int     `json:"vram_gb"`
+	Fits          bool    `json:"fits"`
+	ActualVRAMGB  float64 `json:"actual_vram_gb"`
+	ActualContext int     `json:"actual_context"`
+	Capability    string  `json:"capability"`
+}
+
+// hfCacheEntry mirrors the per-(repo, sha) record in the HF probe caches.
+type hfCacheEntry struct {
+	SchemaVersion int                                `json:"schema_version"`
+	Repo          string                             `json:"repo"`
+	Sha           string                             `json:"sha"`
+	Aliases       []string                           `json:"aliases"`
+	ModelKind     string                             `json:"model_kind"`
+	// SizeGB is the catalog-declared weight size on disk. Required for
+	// memFraction launch math — without it, ActualVRAMGB (post-load,
+	// weights + KV + CUDA graphs) would mistakenly be used as the
+	// weight size and clamp --max-model-len to a few thousand tokens.
+	SizeGB     float64                            `json:"size_gb,omitempty"`
+	MaxContext int                                `json:"max_context"`
+	Capability string                             `json:"capability"`
+	ToolParser *string                            `json:"tool_parser"`
+	Probes     map[string]map[string]hfCacheProbe `json:"probes"`
+}
+
+// synthesizeHFFromCache returns one configModel per HF cache entry whose
+// host-VRAM band has a fits=true probe at or below MAX_CONTEXT_LEN.
+//
+// `backendName` ("vllm" or "sglang") tags the row's Backend list so the
+// downstream lookup (modelsForBackend) places it on the correct port.
+//
+// Entries with capability `unsupported_arch`, `error`, or no fitting
+// probe at the host band are skipped — they won't serve. Anything else
+// (inline, unsupported, unknown) is emitted; the picker decides what
+// to surface.
+func synthesizeHFFromCache(
+	cache map[string]*hfCacheEntry,
+	backendName string,
+	hostVRAMGB, operatorMaxCtx int,
+) []configModel {
+	hostKey := strconv.Itoa(hostVRAMGB)
+	out := make([]configModel, 0, len(cache))
+	for _, entry := range cache {
+		if entry == nil || len(entry.Aliases) == 0 {
+			continue
+		}
+		// Terminal failure states never produce a serving row.
+		if entry.Capability == "unsupported_arch" || entry.Capability == "error" {
+			continue
+		}
+		band, ok := entry.Probes[hostKey]
+		if !ok || len(band) == 0 {
+			continue
+		}
+		bestCtx := 0
+		var bestProbe hfCacheProbe
+		for ctxStr, probe := range band {
+			c, err := strconv.Atoi(ctxStr)
+			if err != nil {
+				continue
+			}
+			if operatorMaxCtx > 0 && c > operatorMaxCtx {
+				continue
+			}
+			if !probe.Fits {
+				continue
+			}
+			if c >= bestCtx {
+				bestCtx = c
+				bestProbe = probe
+			}
+		}
+		if bestCtx == 0 {
+			continue
+		}
+		// Effective context cap mirrors the Ollama path:
+		// min(model_max, operator_max).
+		effCtx := entry.MaxContext
+		if operatorMaxCtx > 0 && (effCtx == 0 || effCtx > operatorMaxCtx) {
+			effCtx = operatorMaxCtx
+		}
+		cap := entry.Capability
+		if cap == "" {
+			cap = "unknown"
+		}
+		canonical := entry.Aliases[0]
+		var aliases []string
+		if len(entry.Aliases) > 1 {
+			aliases = append([]string(nil), entry.Aliases[1:]...)
+		}
+		toolParser := ""
+		if entry.ToolParser != nil {
+			toolParser = *entry.ToolParser
+		}
+		// Prefer the catalog-declared weight size for the Size field —
+		// it feeds memFraction at containerRecreate time, which needs
+		// the WEIGHT footprint, not the post-load total. Older cache
+		// entries (pre-fix) lack size_gb; fall back to ActualVRAMGB
+		// minus a rough KV estimate so launch math doesn't collapse.
+		// Operators should re-probe once to populate size_gb cleanly.
+		sizeGB := entry.SizeGB
+		if sizeGB <= 0 {
+			// Fallback: assume the probe ran at ~half the model's
+			// declared max context, so KV is ~half of total. This is
+			// approximate but safer than passing the full footprint.
+			sizeGB = bestProbe.ActualVRAMGB * 0.5
+			if sizeGB <= 0 {
+				sizeGB = bestProbe.ActualVRAMGB
+			}
+		}
+		out = append(out, configModel{
+			Name:       canonical,
+			Aliases:    aliases,
+			Backend:    []string{backendName},
+			Repo:       entry.Repo,
+			Size:       fmt.Sprintf("%.2f GB", sizeGB),
+			Context:    effCtx,
+			ToolParser: toolParser,
+			Reasoning: &configReasoning{
+				Capability: cap,
+			},
+		})
+	}
+	return out
+}
+
+// loadHFCache reads a vLLM/SGLang cache file from `path` and returns
+// parsed entries plus a synthesized configModel slice for `backendName`.
+// Missing files are reported informationally (probing hasn't run yet);
+// parse failures emit a warning and skip without aborting.
+func loadHFCache(
+	path, backendName string, hostVRAMGB, operatorMaxCtx int,
+) []configModel {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			log.Printf("probe cache: %s not present — no %s rows registered",
+				path, backendName)
+			return nil
+		}
+		log.Printf("warning: %s probe cache read failed: %v", backendName, err)
+		return nil
+	}
+	var cache map[string]*hfCacheEntry
+	if jerr := json.Unmarshal(data, &cache); jerr != nil {
+		log.Printf("warning: %s probe cache parse failed: %v", backendName, jerr)
+		return nil
+	}
+	rows := synthesizeHFFromCache(cache, backendName, hostVRAMGB, operatorMaxCtx)
+	log.Printf("probe cache: %s loaded (%d entries → %d %s serving rows)",
+		path, len(cache), len(rows), backendName)
+	return rows
+}
+
 func modelsForBackend(models []configModel, backend string) []string {
 	var names []string
 	for _, m := range models {
@@ -248,13 +413,14 @@ func modelsForBackend(models []configModel, backend string) []string {
 // --- Backend state ---
 
 type backendState struct {
-	config       backendConfig
-	proxy        *httputil.ReverseProxy
-	modelNames   []string
-	running      bool
-	currentModel string
-	lastRequest  time.Time
-	activeReqs   int64
+	config         backendConfig
+	proxy          *httputil.ReverseProxy
+	modelNames     []string
+	running        bool
+	currentModel   string
+	currentContext int // baked --max-model-len / --context-length for vLLM/SGLang; 0 for Ollama
+	lastRequest    time.Time
+	activeReqs     int64
 }
 
 type arbiter struct {
@@ -264,10 +430,12 @@ type arbiter struct {
 	podmanClient    *http.Client
 	idleTimeout     time.Duration
 	drainTimeout    time.Duration
+	healthTimeout   time.Duration      // configurable per HEALTH_TIMEOUT_SECONDS env (default 300s)
 	modelSizes      map[string]float64 // model name → weight size in GB
 	modelContexts   map[string]int     // model name → declared max context (from models.yaml)
 	modelCapability map[string]string  // model name → reasoning.capability
 	modelDisableOK  map[string]bool    // model name → disable_verified (only when present)
+	modelToolParser map[string]string  // model name → vLLM --tool-call-parser (empty omits the flag)
 	defaultPolicy   string             // DEVAI_REASONING env value: auto|off|low|medium|high
 	totalVRAMGB     float64
 	maxContextLen   int // global default from MAX_CONTEXT_LEN env (default 131072)
@@ -442,7 +610,7 @@ func computeLaunchConfig(modelSizeGB, totalVRAMGB float64, backend string, desir
 // --- Entrypoint builders ---
 
 func vllmEntrypoint(modelName string, lc launchConfig) []string {
-	return []string{
+	args := []string{
 		"python3", "-m", "vllm.entrypoints.openai.api_server",
 		"--model", "/models/" + modelName,
 		"--host", "0.0.0.0",
@@ -451,11 +619,17 @@ func vllmEntrypoint(modelName string, lc launchConfig) []string {
 		"--max-model-len", fmt.Sprintf("%d", lc.MaxContext),
 		"--gpu-memory-utilization", fmt.Sprintf("%.2f", lc.MemFraction),
 		"--enable-prefix-caching",
-		"--enable-auto-tool-choice",
-		"--tool-call-parser", "qwen3_coder",
 		"--trust-remote-code",
 		"--served-model-name", modelName,
 	}
+	// Tool-call parser is per-model. We omit both flags when unknown so a
+	// non-Qwen model isn't crashed at load time by a Qwen-specific parser
+	// (the original cause of vLLM probe failures pre-refactor). Phase 5
+	// wires modelToolParser from the vLLM probe cache.
+	if lc.ToolParser != "" {
+		args = append(args, "--enable-auto-tool-choice", "--tool-call-parser", lc.ToolParser)
+	}
+	return args
 }
 
 func sglangEntrypoint(modelName string, lc launchConfig) []string {
@@ -514,6 +688,19 @@ func main() {
 		log.Printf("probe cache: %s not present — no models registered (run `make probe`)", cachePath)
 	}
 
+	// Append HF-backend rows synthesized from the per-backend probe caches.
+	// Each cache is independent; missing files are not fatal — the
+	// corresponding backend just exposes no models. Tool-parser values
+	// flow through the configModel.ToolParser field into the
+	// modelToolParser lookup, which the parameterized vllmEntrypoint
+	// (Phase 0) reads when starting the backend.
+	vllmCachePath := env("VLLM_PROBE_CACHE", "/etc/devai/.vllm-reasoning-cache.json")
+	cfg.Models = append(cfg.Models,
+		loadHFCache(vllmCachePath, "vllm", hostVRAMGB, operatorMaxCtx)...)
+	sglangCachePath := env("SGLANG_PROBE_CACHE", "/etc/devai/.sglang-reasoning-cache.json")
+	cfg.Models = append(cfg.Models,
+		loadHFCache(sglangCachePath, "sglang", hostVRAMGB, operatorMaxCtx)...)
+
 	backends := []backendConfig{
 		{
 			Name:          "ollama",
@@ -560,6 +747,7 @@ func main() {
 	modelContexts := make(map[string]int)
 	modelCapability := make(map[string]string)
 	modelDisableOK := make(map[string]bool)
+	modelToolParser := make(map[string]string) // populated by Phase 5 vLLM cache integration
 	capCounts := make(map[string]int)
 	for _, m := range cfg.Models {
 		names := append([]string{m.Name}, m.Aliases...)
@@ -585,6 +773,9 @@ func main() {
 			if disableOK {
 				modelDisableOK[name] = true
 			}
+			if m.ToolParser != "" {
+				modelToolParser[name] = m.ToolParser
+			}
 		}
 		// Count capability once per canonical row, not once per alias —
 		// otherwise a model with N aliases would dominate the histogram.
@@ -605,10 +796,12 @@ func main() {
 		podmanClient:    podmanClient,
 		idleTimeout:     time.Duration(envInt("IDLE_TIMEOUT", 300)) * time.Second,
 		drainTimeout:    time.Duration(envInt("DRAIN_TIMEOUT", 30)) * time.Second,
+		healthTimeout:   time.Duration(envInt("HEALTH_TIMEOUT_SECONDS", 300)) * time.Second,
 		modelSizes:      modelSizes,
 		modelContexts:   modelContexts,
 		modelCapability: modelCapability,
 		modelDisableOK:  modelDisableOK,
+		modelToolParser: modelToolParser,
 		defaultPolicy:   policy,
 		totalVRAMGB:     totalVRAMGB,
 		maxContextLen:   maxCtx,
@@ -708,7 +901,34 @@ func (a *arbiter) containerIsRunning(name string) bool {
 	return info.State.Status == "running"
 }
 
-func (a *arbiter) containerRecreate(bs *backendState, modelName string) error {
+// backendIsServing checks whether the backend container is not just
+// "running" (which is true for the `sleep infinity` placeholders set by
+// docker-compose) but also actually has its inference server listening
+// on the backend's health endpoint. Without this, a request that arrives
+// when only the placeholder is up would proxy to a container that has
+// no listener, returning 502 with no recovery.
+//
+// 2-second budget — a real backend that's been started should respond
+// to /health in <100ms. Anything slower is treated as "not serving" and
+// triggers a containerRecreate at the call site.
+func (a *arbiter) backendIsServing(bs *backendState) bool {
+	healthURL := bs.config.BackendURL.String() + bs.config.HealthPath
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(healthURL)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode == http.StatusOK
+}
+
+// containerRecreate launches the backend container with the given model.
+// `desiredCtx > 0` overrides the catalog cap (used when a request carries a
+// "<model>@<ctx>" picker override); 0 falls back to the catalog cap. The
+// chosen context is always clamped against MAX_CONTEXT_LEN and against the
+// memory-driven fittableContext inside computeLaunchConfig.
+func (a *arbiter) containerRecreate(bs *backendState, modelName string, desiredCtx int) error {
 	cfg := bs.config
 	a.containerStop(cfg.ContainerName)
 	a.containerRemove(cfg.ContainerName)
@@ -718,7 +938,17 @@ func (a *arbiter) containerRecreate(bs *backendState, modelName string) error {
 	if declaredCtx == 0 {
 		declaredCtx = a.maxContextLen
 	}
-	lc := computeLaunchConfig(modelSizeGB, a.totalVRAMGB, cfg.Name, declaredCtx)
+	requestedCtx := declaredCtx
+	if desiredCtx > 0 {
+		requestedCtx = desiredCtx
+		if a.maxContextLen > 0 && requestedCtx > a.maxContextLen {
+			requestedCtx = a.maxContextLen
+		}
+	}
+	lc := computeLaunchConfig(modelSizeGB, a.totalVRAMGB, cfg.Name, requestedCtx)
+	if parser := a.modelToolParser[modelName]; parser != "" {
+		lc.ToolParser = parser
+	}
 	log.Printf("  %s launch: model=%.1f GB, gpu=%.1f GB → fraction=%.2f, context=%dk",
 		cfg.Name, modelSizeGB, a.totalVRAMGB, lc.MemFraction, lc.MaxContext/1024)
 
@@ -849,12 +1079,20 @@ func (a *arbiter) stopOtherBackends(targetName string) {
 		}
 		bs.running = false
 		bs.currentModel = ""
+		bs.currentContext = 0
 	}
 }
 
-// ensureBackendRunning makes sure the target backend is up with the given model.
-// Called with the arbiter mutex held.
-func (a *arbiter) ensureBackendRunning(bs *backendState, modelName string) error {
+// ensureBackendRunning makes sure the target backend is up with the given
+// model and context. Called with the arbiter mutex held.
+//
+// `desiredCtx` is the per-request context cap resolved upstream (picker
+// "@<int>" override or registered modelContexts cap). For Ollama it is
+// passed only to the backend via the request body — Ollama doesn't bake
+// max-ctx into the container. For vLLM and SGLang the context is baked
+// into the entrypoint at startup, so a context change requires a full
+// recreate even when the model is unchanged.
+func (a *arbiter) ensureBackendRunning(bs *backendState, modelName string, desiredCtx int) error {
 	if bs.config.Name == "ollama" {
 		if !bs.running {
 			a.stopOtherBackends("ollama")
@@ -863,14 +1101,30 @@ func (a *arbiter) ensureBackendRunning(bs *backendState, modelName string) error
 		return nil
 	}
 
-	// Verify container is actually running (may have been stopped externally)
-	if bs.running && a.podmanClient != nil && !a.containerIsRunning(bs.config.ContainerName) {
-		log.Printf("%s container not running (externally stopped), resetting state", bs.config.Name)
+	// Verify the backend is actually serving. Two reasons a previously-
+	// recreated workload may no longer be reachable:
+	//   1. The container was stopped externally (operator, crash, etc.).
+	//   2. Docker-compose's `cache-up` replaced our dynamic container
+	//      with the `sleep infinity` placeholder while bs.running was
+	//      still true. The placeholder responds to `containerIsRunning`
+	//      with `running` but has no listener on the backend port.
+	//
+	// `backendIsServing` polls /health to distinguish these cases. If
+	// it fails, the state is reset so the recreate path fires below.
+	if bs.running && a.podmanClient != nil &&
+		(!a.containerIsRunning(bs.config.ContainerName) || !a.backendIsServing(bs)) {
+		log.Printf("%s not serving (container gone or placeholder up), resetting state",
+			bs.config.Name)
 		bs.running = false
 		bs.currentModel = ""
+		bs.currentContext = 0
 	}
 
-	needRecreate := !bs.running || (modelName != "" && bs.currentModel != modelName)
+	// Recreate when the model OR the baked context cap changed. Context
+	// only matters here for vLLM/SGLang because Ollama returned above.
+	modelChanged := modelName != "" && bs.currentModel != modelName
+	contextChanged := desiredCtx > 0 && bs.currentContext > 0 && bs.currentContext != desiredCtx
+	needRecreate := !bs.running || modelChanged || contextChanged
 	if !needRecreate {
 		return nil
 	}
@@ -883,15 +1137,18 @@ func (a *arbiter) ensureBackendRunning(bs *backendState, modelName string) error
 
 	if bs.currentModel != "" && bs.currentModel != modelName {
 		log.Printf("switching %s model: %s → %s", bs.config.Name, bs.currentModel, modelName)
+	} else if contextChanged {
+		log.Printf("switching %s context (model %s): %d → %d",
+			bs.config.Name, modelName, bs.currentContext, desiredCtx)
 	}
-	log.Printf("starting %s with model %s...", bs.config.Name, modelName)
-	if err := a.containerRecreate(bs, modelName); err != nil {
+	log.Printf("starting %s with model %s (ctx=%d)...", bs.config.Name, modelName, desiredCtx)
+	if err := a.containerRecreate(bs, modelName, desiredCtx); err != nil {
 		return fmt.Errorf("failed to start %s: %w", bs.config.Name, err)
 	}
 
 	// Release lock during health wait
 	a.mu.Unlock()
-	err := a.waitForHealthy(bs, 300*time.Second)
+	err := a.waitForHealthy(bs, a.healthTimeout)
 	a.mu.Lock()
 
 	if err != nil {
@@ -900,6 +1157,13 @@ func (a *arbiter) ensureBackendRunning(bs *backendState, modelName string) error
 
 	bs.running = true
 	bs.currentModel = modelName
+	// Record the context the launch config actually settled on (after
+	// memory-driven clamping inside computeLaunchConfig). Without this the
+	// modelChanged-only check could miss legitimate ctx-only switches when
+	// the operator's MAX_CONTEXT_LEN clamps down a picker request.
+	if desiredCtx > 0 {
+		bs.currentContext = desiredCtx
+	}
 	return nil
 }
 
@@ -915,6 +1179,7 @@ func (a *arbiter) makeRequestHandler(backendName string) http.HandlerFunc {
 		// for backend lifecycle decisions and (b) apply the reasoning
 		// policy via the backend's native protocol field.
 		var modelName string
+		var numCtx int
 		if req.Method == http.MethodPost && req.Body != nil {
 			body, err := io.ReadAll(req.Body)
 			if err != nil {
@@ -935,7 +1200,7 @@ func (a *arbiter) makeRequestHandler(backendName string) http.HandlerFunc {
 			//      only set when the client didn't supply num_ctx.
 			//   3. None → request passes through unchanged.
 			cleanName, override := parseCtxOverride(parsed.Model)
-			numCtx := override
+			numCtx = override
 			force := override > 0
 			if numCtx == 0 {
 				if cap, ok := a.modelContexts[cleanName]; ok && cap > 0 {
@@ -965,7 +1230,7 @@ func (a *arbiter) makeRequestHandler(backendName string) http.HandlerFunc {
 
 		a.mu.Lock()
 		bs.lastRequest = time.Now()
-		if err := a.ensureBackendRunning(bs, modelName); err != nil {
+		if err := a.ensureBackendRunning(bs, modelName, numCtx); err != nil {
 			a.mu.Unlock()
 			log.Printf("error: %v", err)
 			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err), http.StatusServiceUnavailable)
@@ -1010,21 +1275,43 @@ const (
 // directive expected by the incoming protocol path. Per docs/ollama_models.md:
 // prefer protocol fields over prompt-text tricks.
 func (a *arbiter) applyReasoningPolicy(backendName, path, modelName, policy string, body []byte) []byte {
-	if backendName != "ollama" {
-		// vLLM/SGLang are dormant and need separate probe/policy recipes.
-		return body
+	switch backendName {
+	case "ollama":
+		switch strings.TrimRight(path, "/") {
+		case "/api/chat", "/api/generate":
+			return a.applyOllamaNativePolicy(modelName, policy, body)
+		case "/v1/chat/completions":
+			return a.applyOllamaOpenAIChatPolicy(modelName, policy, body)
+		case "/v1/messages":
+			return a.applyOllamaAnthropicMessagesPolicy(modelName, policy, body)
+		}
+	case "vllm":
+		return a.applyVLLMPolicy(path, modelName, policy, body)
+	case "sglang":
+		return a.applySGLangPolicy(path, modelName, policy, body)
 	}
+	return body
+}
 
-	switch strings.TrimRight(path, "/") {
-	case "/api/chat", "/api/generate":
-		return a.applyOllamaNativePolicy(modelName, policy, body)
-	case "/v1/chat/completions":
-		return a.applyOllamaOpenAIChatPolicy(modelName, policy, body)
-	case "/v1/messages":
-		return a.applyOllamaAnthropicMessagesPolicy(modelName, policy, body)
-	default:
-		return body
-	}
+// applyVLLMPolicy is the vLLM half of the reasoning router.
+//
+// v1: passthrough. Models classified `inline` already emit `<think>` blocks
+// without API-side help; `unsupported`/`unknown` have no useful action. The
+// `structured` rewrite (e.g. `extra_body.chat_template_kwargs.enable_thinking`)
+// needs a probe-cache-supplied parser hint to be safe across architectures, so
+// it is deferred until Phase 5 wires the vLLM cache. The capability lookup is
+// retained as the seam for that future work — when removing the underscore
+// assignment, ensure the surrounding policy switch still type-checks.
+func (a *arbiter) applyVLLMPolicy(path, modelName, policy string, body []byte) []byte {
+	_ = a.modelCapability[modelName]
+	return body
+}
+
+// applySGLangPolicy mirrors applyVLLMPolicy. Same v1 stance: passthrough until
+// the SGLang probe cache lands and a structured rewrite has measured support.
+func (a *arbiter) applySGLangPolicy(path, modelName, policy string, body []byte) []byte {
+	_ = a.modelCapability[modelName]
+	return body
 }
 
 func (a *arbiter) reasoningAction(modelName, policy string) reasoningAction {

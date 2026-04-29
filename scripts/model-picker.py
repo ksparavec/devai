@@ -43,6 +43,16 @@ _PROBE_CACHE_PATHS = [
     str(Path(__file__).resolve().parent.parent / "deploy" / ".ollama-reasoning-cache.json"),
 ]
 
+_VLLM_PROBE_CACHE_PATHS = [
+    "/etc/devai/.vllm-reasoning-cache.json",
+    str(Path(__file__).resolve().parent.parent / "deploy" / ".vllm-reasoning-cache.json"),
+]
+
+_SGLANG_PROBE_CACHE_PATHS = [
+    "/etc/devai/.sglang-reasoning-cache.json",
+    str(Path(__file__).resolve().parent.parent / "deploy" / ".sglang-reasoning-cache.json"),
+]
+
 _ROUTER = os.environ.get("DEVAI_ROUTER_HOST", "devai-router")
 _VLLM_DIR = os.environ.get("VLLM_MODELS_DIR", "/var/cache/devai/ollama/models/vllm")
 _OLLAMA_MANIFESTS = os.environ.get(
@@ -181,6 +191,33 @@ def _load_probe_records() -> dict[str, dict]:
     return {}
 
 
+def _load_hf_probe_records(paths: list[str]) -> dict[str, dict]:
+    """Lookup of model name → schema-v1 HF probe entry.
+
+    The HF caches (vLLM, SGLang) are repo+sha keyed at top level; each
+    entry carries an `aliases` list whose first element is the catalog
+    `name` (= directory basename on disk). Index by alias here so the
+    picker's name-based discovery loop can find probe data with one
+    lookup. Returns {} when no readable cache file exists.
+    """
+    for path in paths:
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path) as fh:
+                data = json.load(fh) or {}
+        except (OSError, json.JSONDecodeError):
+            return {}
+        records: dict[str, dict] = {}
+        for _key, entry in data.items():
+            if not isinstance(entry, dict):
+                continue
+            for alias in entry.get("aliases") or []:
+                records[alias] = entry
+        return records
+    return {}
+
+
 def _migrate_in_memory(raw: dict) -> dict:
     """Run probe-ollama-reasoning's v1/v2 → v3 conversion without touching disk."""
     import importlib.util
@@ -254,6 +291,43 @@ def _vram_from_probe(probe: dict) -> dict:
     return out
 
 
+def _vram_from_hf_probe(probe: dict) -> dict:
+    """Convert a vLLM/SGLang schema-v1 probe entry to the picker's
+    Ollama-shape vram dict.
+
+    HF cells use `fits` and `actual_vram_gb`; the picker downstream
+    expects `fully_on_gpu` and `actual_total_gb`. Synthesize:
+      * fully_on_gpu = fits
+      * actual_total_gb = actual_vram_gb (vLLM/SGLang hold weights+KV+
+        CUDA-graphs together in the static pool — the measured GPU
+        memory is the model's effective total)
+    Anything else is passed through verbatim. Empty input → {}.
+    """
+    if not probe:
+        return {}
+    out: dict = {"source": "probe"}
+    if probe.get("max_context") is not None:
+        out["max_context"] = probe["max_context"]
+    raw_probes = probe.get("probes") or {}
+    converted: dict = {}
+    for vram_key, band in raw_probes.items():
+        if not isinstance(band, dict):
+            continue
+        new_band: dict = {}
+        for ctx_key, cell in band.items():
+            if not isinstance(cell, dict):
+                continue
+            new_cell = dict(cell)
+            new_cell.setdefault("fully_on_gpu", bool(cell.get("fits", False)))
+            actual_vram = cell.get("actual_vram_gb")
+            if actual_vram is not None and "actual_total_gb" not in new_cell:
+                new_cell["actual_total_gb"] = actual_vram
+            new_band[ctx_key] = new_cell
+        converted[vram_key] = new_band
+    out["probes"] = converted
+    return out
+
+
 def _capability_from_probe(probe: dict, fallback: str = "unknown") -> str:
     """Read the canonical capability from a v2 entry.
 
@@ -316,9 +390,28 @@ def _discover_models() -> list[dict]:
                     "details": probe_details,
                 })
 
-    # HF/vLLM/SGLang: <name>/config.json (no probe runner yet — capability
-    # stays "unknown" and rows are hidden by the picker filter until those
-    # backends get their own probe driver).
+    # HF/vLLM/SGLang: <name>/config.json. Each backend has its own probe
+    # cache (schema v1, repo+sha keyed); we look up via the catalog name
+    # (= directory basename, also the first alias in the cache entry).
+    # Backend selection priority:
+    #   1. The first cache that has a fitting non-failed entry wins.
+    #   2. Otherwise fall back to DEVAI_HF_BACKEND (default vllm) so the
+    #      row still appears in the picker — but with capability=unknown
+    #      so _reasoning_status hides it from the menu.
+    vllm_probes = _load_hf_probe_records(_VLLM_PROBE_CACHE_PATHS)
+    sglang_probes = _load_hf_probe_records(_SGLANG_PROBE_CACHE_PATHS)
+    fallback_backend = _HF_BACKEND if _HF_BACKEND in ("vllm", "sglang") else "vllm"
+
+    def _hf_probe_for(name: str) -> tuple[dict, str]:
+        for backend, store in (("vllm", vllm_probes), ("sglang", sglang_probes)):
+            entry = store.get(name)
+            if not entry:
+                continue
+            if entry.get("capability") in ("error", "unsupported_arch"):
+                continue
+            return entry, backend
+        return {}, fallback_backend
+
     vbase = Path(_VLLM_DIR)
     if vbase.is_dir():
         for d in sorted(vbase.iterdir()):
@@ -327,16 +420,18 @@ def _discover_models() -> list[dict]:
             name = d.name
             meta = catalog.get(name, {})
             disk_gb = _hf_disk_size_gb(d)
-            backend = _HF_BACKEND if _HF_BACKEND in ("vllm", "sglang") else "vllm"
+            probe, backend = _hf_probe_for(name)
+            cap = _capability_from_probe(probe, "unknown") if probe else "unknown"
             out.append({
                 "name": name,
                 "source": "hf",
                 "backend": backend,
                 "size": meta.get("size") or f"{disk_gb:.2f} GB",
                 "purpose": meta.get("purpose", ""),
-                "vram": None,
+                "vram": _vram_from_hf_probe(probe) if probe else None,
                 "family": meta.get("family", ""),
-                "capability": "unknown",
+                "capability": cap,
+                "probe": probe,
                 "moe": None,
             })
 
@@ -662,15 +757,12 @@ def _build_menu(models: list[dict]) -> tuple[list[str], list[bool], list[dict | 
     """
     # backend → family → (context, status) → model
     grouped: dict[str, dict[str, dict[tuple[int, str], dict]]] = {}
-    # Track why models were hidden so the footer can explain. The big
-    # categories worth distinguishing today:
-    #   - non_ollama_dormant: vLLM/SGLang entries are not part of the
-    #     current Ollama reasoning flow.
-    #   - missing_vram: no usable coefficients or formula totals
-    #   - missing_capability: probed state is unknown/error
+    # Track why models were hidden so the footer can explain. Categories:
+    #   - context_capped: model's max_context is below the requested tier
+    #   - missing_vram: no usable probe cell (band/ctx not yet probed)
+    #   - missing_capability: capability is unknown/error/unsupported_arch
     #   - spilled: probe shows fully_on_gpu=false at this (vram, ctx)
     hidden = {
-        "non_ollama_dormant": 0,
         "context_capped": 0,
         "missing_vram": 0,
         "missing_capability": 0,
@@ -678,9 +770,6 @@ def _build_menu(models: list[dict]) -> tuple[list[str], list[bool], list[dict | 
     }
     for m in models:
         backend = m.get("backend", "ollama")
-        if backend != "ollama":
-            hidden["non_ollama_dormant"] += 1
-            continue
         for ctx in _CONTEXT_CHOICES:
             v = m.get("vram") or {}
             info = _vram_info_at(v, ctx)
@@ -753,7 +842,7 @@ def _build_menu(models: list[dict]) -> tuple[list[str], list[bool], list[dict | 
              selectable_=False, model=None)
         emit(f"  {_BOLD}{column_header}{_RESET}",
              selectable_=False, model=None)
-        emit(f"  {_DIM}* = formula estimate (vLLM/SGLang have no probe runner yet){_RESET}",
+        emit(f"  {_DIM}* = formula estimate (no probe cell at this VRAM/ctx — run `make probe-{backend}`){_RESET}",
              selectable_=False, model=None)
 
         # Order families within this backend by their best selected variant.
@@ -783,8 +872,6 @@ def _build_menu(models: list[dict]) -> tuple[list[str], list[bool], list[dict | 
     if total_hidden:
         emit("", selectable_=False, model=None)
         bits: list[str] = []
-        if hidden["non_ollama_dormant"]:
-            bits.append(f"{hidden['non_ollama_dormant']} vLLM/SGLang (dormant)")
         if hidden["missing_vram"]:
             bits.append(f"{hidden['missing_vram']} missing VRAM data")
         if hidden["context_capped"]:
@@ -1014,14 +1101,21 @@ def main() -> None:
             os.execvp("bash", ["bash"])
         agent = _AGENTS[idx]
 
-    # For Ollama-backed models, materialise a Modelfile-derived tag with
-    # the chosen num_ctx baked in. Hands the derived name to the agent;
-    # all wire protocols (Anthropic /v1/messages, OpenAI /v1/chat/completions,
-    # Ollama /api/chat) then pick up the right context automatically.
+    # Per-session context binding. Two paths because the backends differ:
+    #
+    #   * Ollama: materialise a Modelfile-derived tag with PARAMETER
+    #     num_ctx baked in. Required because Ollama 0.21+ honours
+    #     `options.num_ctx` only on the native /api/chat path; the
+    #     OpenAI- and Anthropic-compat layers ignore the field.
+    #   * vLLM / SGLang: append `@<ctx>` to the model name. The router
+    #     (gpu-arbiter, Phase 0) parses this via parseCtxOverride and
+    #     recreates the backend container with --max-model-len /
+    #     --context-length set accordingly. No client-side tag
+    #     materialisation needed.
     if model["backend"] == "ollama":
         serving_name = _ensure_ctx_variant(model["name"], selected_context)
     else:
-        serving_name = model["name"]
+        serving_name = f"{model['name']}@{selected_context}"
 
     cmd = _build(agent[0], serving_name, model["backend"])
     _record_pick(model["name"], agent[0], selected_context)

@@ -68,8 +68,8 @@ make build           # Build all images (CPU + GPU + router)
 ### 3. Start Infrastructure
 
 ```bash
-make cache-up        # Start Ollama, router, Open WebUI, caches
-                     # (vLLM/SGLang are dormant — see docs/sidelined-backends.md)
+make cache-up        # Start all services. vLLM/SGLang start as `sleep` placeholders;
+                     # router recreates them on demand. See docs/backends.md.
 ```
 
 ### 4. Pull, Probe & Select
@@ -211,7 +211,7 @@ The router (`devai-router`) is a small Go reverse proxy (~9 MB distroless) that:
 - Auto-stops idle backends after `IDLE_TIMEOUT` seconds.
 - Applies the **reasoning policy** to each request (see below).
 
-> **Status:** the vLLM and SGLang code paths in the router are still compiled in and exercised by `make test-router`, but the auxiliary containers are dormant — `deploy/docker-compose.yaml` keeps them in a `backends-disabled` profile so `make cache-up` only starts Ollama. The picker filter therefore admits Ollama models only. See [`docs/sidelined-backends.md`](docs/sidelined-backends.md) for what's frozen and how to reactivate.
+> **Status:** all three backends are wired. vLLM and SGLang start as `sleep infinity` placeholders (compose can't know which model the user will pick); the router replaces them on demand via libpod when a request arrives on port 11435 / 11436. The picker shows HF rows once they have a fitting probe entry. See [`docs/backends.md`](docs/backends.md) for the lifecycle, probing procedure, cache hygiene, and failure-mode taxonomy.
 
 ### Reasoning & MoE
 

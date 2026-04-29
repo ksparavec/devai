@@ -110,8 +110,8 @@ endif
 .PHONY: ollama-rm ollama-list ollama-status ollama-clean ollama-df
 .PHONY: vllm-list vllm-rm vllm-status vllm-df
 .PHONY: clean clean-cpu clean-gpu clean-router prune
-.PHONY: fetch-cli pull-images install install-systemd uninstall test test-router test-ollama test-agents test-models help
-.PHONY: catalog-regen probe model-fit model-pull vram-fit
+.PHONY: fetch-cli pull-images install install-systemd uninstall test test-router test-ollama test-agents test-models test-probe-vllm test-probe-sglang test-probe-ollama-idempotent test-vllm test-sglang test-e2e test-full help
+.PHONY: catalog-regen probe probe-vllm probe-sglang model-fit model-pull vram-fit
 
 all: help
 
@@ -385,10 +385,53 @@ test-router: ## Run Go unit tests for gpu-arbiter router
 test-ollama: cache-up ## Run Ollama-only integration tests
 	./tests/test-router.sh
 
-# test-vllm and test-idle are dormant alongside the vLLM/SGLang sideline
-# (see docs/sidelined-backends.md). The recipes for ./tests/test-router-vllm.sh
-# and ./tests/test-router-idle.sh stay in the tree so reactivation is
-# trivial; rerun once vLLM is moved out of the backends-disabled profile.
+# test-vllm and test-idle remain manual-only. The recipes for
+# ./tests/test-router-vllm.sh and ./tests/test-router-idle.sh stay in the
+# tree but exercise containerRecreate against a live GPU — too slow for
+# the default `make test` aggregate. Run them directly when changing
+# vLLM/SGLang lifecycle code. See docs/backends.md.
+
+test-probe-vllm: ## Smoke test: probe one HF model via vLLM, assert cache schema
+	@# Wall time ~60-120s (one cold vLLM start). Requires `make cache-down`
+	@# first — the prober self-checks for running router/vllm/sglang
+	@# containers and aborts otherwise.
+	./tests/test-probe-vllm.sh
+
+test-probe-sglang: ## Smoke test: probe one HF model via SGLang, assert cache schema
+	@# Wall time ~60-120s. Same precondition as test-probe-vllm.
+	@# Notes that the schema is correct even when the model can't load
+	@# (e.g. SGLang+FP4 on this image — the cache records `fits: false`
+	@# with `evidence.kind: "infra"`).
+	./tests/test-probe-sglang.sh
+
+test-probe-ollama-idempotent: cache-up ## Verify the refactored Ollama prober is byte-idempotent on a populated cache
+	@# Phase 1 byte-identical regression check. Runs `make probe` against
+	@# the existing cache (which skips already-cached cells) and diffs
+	@# the result. Catches drift in cache I/O, alias reconciliation,
+	@# implied-spill builder shape, etc. Wall time ~10-30s.
+	./tests/test-probe-ollama-idempotent.sh
+
+test-vllm: cache-up ## Live integration tests for the vLLM backend (chat, ctx switch, GPU exclusion)
+	@# Wall time ~3-5 min. Reads deploy/.vllm-reasoning-cache.json to
+	@# pick models — skips cleanly when nothing's cached. See
+	@# tests/test-router-vllm.sh for the test surface.
+	./tests/test-router-vllm.sh
+
+test-sglang: cache-up ## Live integration tests for the SGLang backend (mirror of test-vllm)
+	@# Skips entirely when the SGLang cache has no fitting entries
+	@# (e.g. when SGLang+FP4 fails on this image — see docs/backends.md).
+	./tests/test-router-sglang.sh
+
+test-e2e: cache-up ## End-to-end: picker discovery → agent command → live router chat
+	@# Bridges Phase 7 picker tests and Phase 5 router tests. Imports
+	@# model-picker.py, runs _discover_models + _build_menu against
+	@# live caches, picks an HF row, replays the agent-emitted request
+	@# through the router. Skips when no HF row is selectable.
+	./tests/test-e2e-picker.sh
+
+test-full: test ## Alias for `make test` (kept for backwards-compat; both run the full suite)
+	@true
+
 
 test-models: cache-up ## Matrix test: every probed model × wire protocol × scenario.
 	@# Drives /api/chat, /v1/chat/completions, /v1/messages directly via curl
@@ -402,9 +445,8 @@ test-models: cache-up ## Matrix test: every probed model × wire protocol × sce
 	  ./tests/test-model-matrix.sh
 
 test-agents: ## Smoke-test every (agent × backend) cell against the live router
-	@# Defensive cleanup: a previous run with the dormant backends profile
-	@# disabled may have left vllm/sglang containers behind. Harmless when
-	@# they don't exist.
+	@# Defensive cleanup: previous probe runs may have left
+	@# vllm/sglang containers behind. Harmless when they don't exist.
 	@$(CONTAINER_RUNTIME) rm -f devai-vllm devai-sglang 2>/dev/null || true
 	@$(MAKE) cache-up
 	@mkdir -p $(CURDIR)/tests/.matrix-logs
@@ -428,7 +470,23 @@ test-agents: ## Smoke-test every (agent × backend) cell against the live router
 		$(IMAGE_NAME_GPU) /usr/local/bin/agent-matrix
 	@echo "  logs preserved at $(CURDIR)/tests/.matrix-logs/"
 
-test: test-router test-ollama test-models ## Run all tests in sequence (vLLM/idle tests dormant — see docs/sidelined-backends.md)
+test: test-router test-probe-ollama-idempotent test-ollama test-e2e test-vllm test-sglang test-models ## Run every available test in sequence (Go unit + Ollama + E2E + vLLM/SGLang integration + matrix + probes; ~30-60 min)
+	@# The cache-up suite runs as prerequisites above. Probe smoke tests
+	@# require the live backends to be DOWN (the prober self-checks for
+	@# router/vllm/sglang containers and aborts otherwise) — they run
+	@# last with cache-down/cache-up bracketing so the operator's stack
+	@# ends in a known-good state. Failures from probe tests are
+	@# captured and re-emitted after `cache-up` so we never leave the
+	@# stack down.
+	@set -u; \
+	echo ""; echo "=== Running cache-down probe tests (final phase) ==="; \
+	$(MAKE) cache-down >/dev/null 2>&1 || true; \
+	./tests/test-probe-vllm.sh;   vrc=$$?; \
+	./tests/test-probe-sglang.sh; src=$$?; \
+	$(MAKE) cache-up >/dev/null 2>&1 || true; \
+	if [ "$$vrc" -ne 0 ] || [ "$$src" -ne 0 ]; then \
+	    echo "probe-vllm rc=$$vrc, probe-sglang rc=$$src"; exit 1; \
+	fi
 
 help: ## Show this help message
 	@printf "\nDevAI Lab — Containerized AI Development Environment\n\n"
@@ -448,7 +506,7 @@ help: ## Show this help message
 	@printf "  %-44s%s\n" "" "prune            Prune dangling images"
 	@printf "  %-44s%s\n" "" "test             Run integration tests"
 	@printf "\n"
-	@printf "  %-44s%s\n" "MODELS" "vLLM (dormant — see docs/sidelined-backends.md)"
+	@printf "  %-44s%s\n" "MODELS" "vLLM / SGLang (lifecycle: docs/backends.md)"
 	@printf "  %-44s%s\n" "probe            Populate cache for every (VRAM, ctx) tier" "vllm-list        List on-disk vLLM weights"
 	@printf "  %-44s%s\n" "model-fit        Print fitting models at VRAM/CONTEXT" "vllm-rm          Remove model"
 	@printf "  %-44s%s\n" "model-pull       Download best-fit candidates" "vllm-status      Show status"
@@ -467,7 +525,7 @@ help: ## Show this help message
 # Infrastructure services (caches + Ollama + vLLM + Open WebUI)
 # =============================================================================
 
-cache-up: ## Start infrastructure services (caches + Ollama + Open WebUI; vLLM/SGLang dormant)
+cache-up: ## Start all infrastructure (caches + Ollama + router + Open WebUI; vLLM/SGLang as `sleep` placeholders, recreated on demand)
 	@if [ "$(CONTAINER_RUNTIME)" = "podman" ] && ! systemctl --user is-active --quiet podman.socket; then \
 		echo "Starting Podman API socket..."; \
 		systemctl --user enable --now podman.socket; \
@@ -479,7 +537,7 @@ cache-up: ## Start infrastructure services (caches + Ollama + Open WebUI; vLLM/S
 	@echo "  Registry mirror:   http://localhost:5000"
 	@echo "  Router:            devai-router:11434 (unified endpoint)"
 	@echo "  Ollama:            devai-ollama:11434 (GGUF models)"
-	@echo "  vLLM/SGLang:       dormant (see docs/sidelined-backends.md)"
+	@echo "  vLLM/SGLang:       devai-router:11435 / 11436 (recreated on first request — see docs/backends.md)"
 	@echo "  Open WebUI:        https://localhost:$(WEBUI_PORT)"
 	@echo "  Logger:            $(CACHE_DIR)/logs/<container>.log (per-service stdout)"
 	@echo ""
@@ -708,6 +766,40 @@ probe: ## Probe every downloaded ollama digest at every (VRAM, CONTEXT) tier.
 	 $(CONTAINER_RUNTIME) rm -f $(OLLAMA_CONTAINER) >/dev/null 2>&1 || true; \
 	 OLLAMA_GPU_OVERHEAD=0 $(COMPOSE) -f $(CACHE_COMPOSE) up -d ollama
 
+probe-vllm: ## Probe every downloaded vLLM/HF model per (VRAM, CONTEXT) cell.
+	@# Pre-condition: devai-router, devai-vllm, and devai-sglang must
+	@# be stopped — the prober launches devai-vllm-probe with explicit
+	@# GPU exclusivity. The script self-checks and aborts otherwise.
+	@# Knobs:
+	@#   PROBE_VRAMS_VLLM=16G,24G    target VRAM bands
+	@#   PROBE_CONTEXTS=32K,...      ctx tiers
+	@#   PROBE_REPO=<regex>          filter catalog rows by repo
+	@#   PROBE_FORCE=1               re-probe every cell
+	@#   PROBE_FORCE_ARCH=1          re-probe top-level capability/arch
+	python3 scripts/probe-vllm-reasoning.py \
+	    --host-vram-gb $(GPU_MEMORY_GB) \
+	    $(if $(PROBE_VRAMS_VLLM),--vram $(PROBE_VRAMS_VLLM),) \
+	    $(if $(PROBE_CONTEXTS),--ctx $(PROBE_CONTEXTS),) \
+	    $(if $(PROBE_REPO),--repo $(PROBE_REPO),) \
+	    $(if $(PROBE_FORCE),--force,) \
+	    $(if $(PROBE_FORCE_ARCH),--force-arch,)
+
+probe-sglang: ## Probe every downloaded SGLang/HF model per (VRAM, CONTEXT) cell.
+	@# Pre-condition: same as probe-vllm — all GPU-owning backends down.
+	@# Knobs:
+	@#   PROBE_VRAMS_SGLANG=16G,24G  target VRAM bands
+	@#   PROBE_CONTEXTS=32K,...      ctx tiers
+	@#   PROBE_REPO=<regex>          filter catalog rows by repo
+	@#   PROBE_FORCE=1               re-probe every cell
+	@#   PROBE_FORCE_ARCH=1          re-probe top-level capability/arch
+	python3 scripts/probe-sglang-reasoning.py \
+	    --host-vram-gb $(GPU_MEMORY_GB) \
+	    $(if $(PROBE_VRAMS_SGLANG),--vram $(PROBE_VRAMS_SGLANG),) \
+	    $(if $(PROBE_CONTEXTS),--ctx $(PROBE_CONTEXTS),) \
+	    $(if $(PROBE_REPO),--repo $(PROBE_REPO),) \
+	    $(if $(PROBE_FORCE),--force,) \
+	    $(if $(PROBE_FORCE_ARCH),--force-arch,)
+
 model-fit: ## Print which models fit at the chosen (VRAM, CONTEXT) — diagnostic, no writes.
 	@OLLAMA_CONTAINER=$(OLLAMA_CONTAINER) CONTAINER_RUNTIME=$(CONTAINER_RUNTIME) \
 	 VLLM_MODELS_DIR=$(VLLM_MODELS_DIR) HF_CLI=$(HF_CLI) \
@@ -778,16 +870,20 @@ install: ## Install bin/devai-shell to $(INSTALL_PREFIX)/bin and stage config in
 	@# bind-mount; re-running `make install` after picker edits picks up the
 	@# new code without a full image rebuild.
 	@ln -sf "$(CURDIR)/scripts/model-picker.py" $(DEVAI_HOME)/model-picker.py
-	@# Symlink the probe cache so it stays fresh as `make probe` regenerates
-	@# it. If users want a frozen snapshot they can replace the link with a
-	@# copy after install.
-	@if [ -f deploy/.ollama-reasoning-cache.json ]; then \
-		ln -sf "$(CURDIR)/deploy/.ollama-reasoning-cache.json" \
-		       $(DEVAI_HOME)/.ollama-reasoning-cache.json; \
-		echo "  linked: $(DEVAI_HOME)/.ollama-reasoning-cache.json"; \
-	else \
-		echo "  WARNING: deploy/.ollama-reasoning-cache.json missing — run 'make probe' first"; \
-	fi
+	@# Symlink each backend's probe cache so it stays fresh as the prober
+	@# regenerates it. If users want a frozen snapshot they can replace the
+	@# link with a copy after install. Missing caches are warned but not
+	@# fatal — the picker tolerates absent backend caches.
+	@for cache in ollama vllm sglang; do \
+		src="$(CURDIR)/deploy/.$$cache-reasoning-cache.json"; \
+		dst="$(DEVAI_HOME)/.$$cache-reasoning-cache.json"; \
+		if [ -f "$$src" ]; then \
+			ln -sf "$$src" "$$dst"; \
+			echo "  linked: $$dst"; \
+		else \
+			echo "  WARNING: $$src missing — run 'make probe' (or probe-$$cache) first"; \
+		fi; \
+	done
 	@echo "  linked: $(DEVAI_HOME)/model-picker.py"
 	@echo "  installed: $(INSTALL_PREFIX)/bin/devai-shell"
 	@echo
@@ -799,6 +895,8 @@ install: ## Install bin/devai-shell to $(INSTALL_PREFIX)/bin and stage config in
 uninstall: ## Remove devai-shell launcher and the staged config dir
 	@rm -f $(INSTALL_PREFIX)/bin/devai-shell
 	@rm -f $(DEVAI_HOME)/.ollama-reasoning-cache.json
+	@rm -f $(DEVAI_HOME)/.vllm-reasoning-cache.json
+	@rm -f $(DEVAI_HOME)/.sglang-reasoning-cache.json
 	@rm -f $(DEVAI_HOME)/model-picker.py
 	@echo "Removed $(INSTALL_PREFIX)/bin/devai-shell and the symlinks under $(DEVAI_HOME)/."
 	@echo "preferences.yaml and sessions/ are kept; remove $(DEVAI_HOME)/ manually if you want a clean slate."

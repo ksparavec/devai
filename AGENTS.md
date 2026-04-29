@@ -4,11 +4,12 @@
 
 DevAI is a containerized local AI development environment. It provides
 JupyterLab, multiple AI CLIs, an interactive model picker, Open WebUI, and a
-GPU-aware inference router. The current active inference backend is Ollama for
-GGUF models. vLLM and SGLang lifecycle code is still compiled into the router
-and covered by router tests, but their compose services are dormant behind the
-`backends-disabled` profile while Ollama behavior is stabilized. See
-`docs/sidelined-backends.md` before changing vLLM or SGLang behavior.
+GPU-aware inference router. All three inference backends (Ollama, vLLM, SGLang)
+are wired and covered by router tests. vLLM and SGLang start as `sleep infinity`
+placeholders so `make cache-up` is hermetic; the router replaces them via libpod
+on demand when a request arrives on the backend's port. See
+`docs/backends.md` for the lifecycle, probing procedure, and failure-mode
+taxonomy before changing backend behavior.
 
 The project supports both Podman and Docker. Most workflows are intentionally
 driven through `make` targets so contributors do not need to remember container
@@ -82,13 +83,27 @@ Use `make help` to list supported targets. Common commands:
   thin LV in `vgais/cachepool` for `/var/cache/devai/logs` so log
   growth never crowds the model cache. `RECREATE=1` re-creates an
   existing volume.
-- `make test-router`: run Go router tests in a Go container.
+- `make test-router`: Go router unit tests in a Go container (~2s).
+- `make test-ollama`: Ollama integration tests via the live router.
 - `make test-models`: matrix test over every probed digest × wire
   protocol (`/api/chat`, `/v1/chat/completions`, `/v1/messages`) ×
   scenario (basic, tools, reasoning auto/off, ctx). Reads the probe
-  cache to enumerate cells.
-- `make test`: run router tests plus Ollama integration tests plus
-  the model matrix test.
+  cache to enumerate cells (slow — minutes-to-tens-of-minutes).
+- `make test-vllm` / `make test-sglang`: live HF-backend integration
+  tests through the router (cold-start chat, ctx switch, model switch
+  when ≥2 models cached, GPU exclusion, parameter forwarding).
+  Skip cleanly when no fitting model is in the corresponding cache.
+- `make test-e2e`: bridges picker discovery, agent-command construction,
+  and a live router round-trip — proves the full picker→agent→router
+  chain serves a real chat completion.
+- `make test-probe-vllm` / `make test-probe-sglang`: single-cell probe
+  smoke tests with cache-schema assertion (require `cache-down` first).
+- `make test-probe-ollama-idempotent`: byte-identical regression check
+  on the refactored Ollama prober.
+- `make test`: runs **every** available test in sequence — Go unit +
+  Ollama integration + matrix + vLLM/SGLang integration + E2E + probe
+  smoke. Wall time 30-60+ min. Each layer skips cleanly when its
+  prerequisites aren't met.
 
 JupyterLab extension changes must be built inside a container, not directly on
 the host. Use the documented container build flow from `CLAUDE.md` or
