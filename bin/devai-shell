@@ -6,12 +6,14 @@ container with the picker as entry point, and writes preferences back
 on exit so the next invocation reuses the same model/agent/work-dir.
 
 Install once via `make install` from the devai repo, then run from
-anywhere on the host:
+anywhere on the host. The work directory mounted as
+/home/devai/work is the shell's $PWD at the time of invocation —
+just `cd` to the project you want to work on first.
 
-    devai-shell             # launch lab + picker (auto-init prefs if missing)
-    devai-shell --init      # reset preferences to defaults
-    devai-shell --cpu       # use the CPU lab image
-    devai-shell -C ~/myapp  # override last_work_dir for this run
+    cd ~/myapp && devai-shell             # launch with myapp/ as work dir
+    devai-shell --init                    # reset preferences to defaults
+    devai-shell --cpu                     # use the CPU lab image
+    devai-shell -C ~/other                # override work dir for this run
     devai-shell --model qwen3.5:9b-q8_0 --agent claude  # pre-set picks
 
 Preferences (in ~/.devai/preferences.yaml):
@@ -19,7 +21,9 @@ Preferences (in ~/.devai/preferences.yaml):
     context             int       default context cap, tokens
     last_model          str|null  most recent picker selection
     last_agent          str|null  most recent agent pick
-    last_work_dir       str       directory mounted as /home/devai/work
+    last_work_dir       str       record of the last directory the
+                                  launcher ran from (informational —
+                                  the work dir is always $PWD)
     agent_session_file  str|null  per-(agent,model) session, if supported
 
 The script does NOT read the repo's .env, NOT modify the parent shell,
@@ -63,7 +67,7 @@ DEFAULTS: dict = {
     "context": 131072,
     "last_model": None,
     "last_agent": None,
-    "last_work_dir": str(Path.home()),
+    "last_work_dir": None,        # set by the first run; informational only
     "agent_session_file": None,
 }
 
@@ -260,8 +264,9 @@ def make_parser() -> argparse.ArgumentParser:
     ap.add_argument("--cpu", action="store_true",
                     help="use the CPU lab image instead of GPU")
     ap.add_argument("-C", "--workdir",
-                    help="override last_work_dir for this run "
-                         "(persisted to preferences on exit)")
+                    help="mount this directory as /home/devai/work "
+                         "instead of the current $PWD "
+                         "(persisted to last_work_dir on exit)")
     ap.add_argument("--model",
                     help="override last_model for this run "
                          "(persisted to preferences on exit)")
@@ -287,10 +292,14 @@ def main() -> int:
     runtime = os.environ.get("CONTAINER_RUNTIME", "podman")
     image = "devai-lab-cpu" if args.cpu else "devai-lab-gpu"
 
-    work_dir = Path(args.workdir or prefs["last_work_dir"]).expanduser().resolve()
+    # Work dir defaults to the current shell's $PWD, NOT to prefs.last_work_dir.
+    # `last_work_dir` is a record of where the user last ran from (kept for
+    # display / scripting), not a sticky default. The user expects
+    # `cd ~/projects/foo && devai-shell` to mount foo at /home/devai/work.
+    work_dir = Path(args.workdir or os.getcwd()).expanduser().resolve()
     if not work_dir.is_dir():
         sys.exit(f"error: work_dir {work_dir} is not an existing directory.\n"
-                 f"       Pass --workdir <path> or fix preferences.yaml.")
+                 f"       Pass --workdir <path> or `cd` to a real directory.")
 
     pref_model = args.model or prefs.get("last_model")
     pref_agent = args.agent or prefs.get("last_agent")

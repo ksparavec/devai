@@ -94,9 +94,9 @@ make lab-gpu         # Start JupyterLab with GPU (or make lab-cpu)
 # OR
 make shell-gpu       # Drop straight into the model picker (cwd = repo)
 # OR (standalone host launcher — see "devai-shell" below)
-make install         # one-time: stage launcher + config in ~/.local/bin and ~/.devai/
-devai-shell --init   # one-time: write default ~/.devai/preferences.yaml
-devai-shell          # launch with last-used model/agent/work-dir
+make install                  # one-time: stage launcher + config in ~/.local/bin and ~/.devai/
+devai-shell --init            # one-time: write default ~/.devai/preferences.yaml
+cd ~/myproject && devai-shell # launch with myproject/ mounted as work dir
 ```
 
 Access:
@@ -128,12 +128,14 @@ This writes:
 Then add `~/.local/bin` to `PATH` and run `devai-shell --init` to seed
 `~/.devai/preferences.yaml` with defaults.
 
-**Run:**
+**Run.** The work directory mounted as `/home/devai/work` is the
+shell's `$PWD` at the time of invocation — `cd` into the project you
+want to work on first.
 
 ```bash
-devai-shell                         # GPU; reads ~/.devai/preferences.yaml
+cd ~/projects/my-app && devai-shell # GPU; my-app/ becomes /home/devai/work
 devai-shell --cpu                   # CPU lab
-devai-shell -C ~/projects/my-app    # override last_work_dir for this run
+devai-shell -C ~/other              # mount ~/other instead of $PWD this run
 devai-shell --model qwen3.5:9b-q8_0 --agent claude
 devai-shell --show                  # print resolved prefs + container cmd, no run
 devai-shell --init                  # reset preferences.yaml to defaults
@@ -142,7 +144,8 @@ uninstall via:  make uninstall      # removes the launcher + symlinks
 
 **Preferences (`~/.devai/preferences.yaml`).** The launcher reads
 these on entry and updates them on exit, so the next invocation
-reuses the last known good state:
+reuses the last known good state for model/agent and surfaces a
+record of where you last ran:
 
 | Key | Type | Updated by |
 |---|---|---|
@@ -150,7 +153,7 @@ reuses the last known good state:
 | `context` | int (tokens) | the picker's per-row context tier |
 | `last_model` | str | the picker's model selection |
 | `last_agent` | str | the picker's agent selection |
-| `last_work_dir` | path | `-C/--workdir` or current value |
+| `last_work_dir` | path | the actual directory mounted on the last run (informational — the work dir is always `$PWD`, never read back from this field) |
 | `agent_session_file` | path \| null | computed from `(last_agent, last_model)` for agents that support session history (claude, codex, aider) |
 
 The picker writes its choice to `~/.devai/.last-pick.json` (one-shot,

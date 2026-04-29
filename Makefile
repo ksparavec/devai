@@ -865,7 +865,11 @@ DEVAI_HOME ?= $(HOME)/.devai
 
 install: ## Install bin/devai-shell to $(INSTALL_PREFIX)/bin and stage config in $(DEVAI_HOME)
 	@install -d $(INSTALL_PREFIX)/bin $(DEVAI_HOME) $(DEVAI_HOME)/sessions
-	@install -m 755 bin/devai-shell $(INSTALL_PREFIX)/bin/devai-shell
+	@# Symlink rather than copy — picks up edits to bin/devai-shell without
+	@# re-running `make install`. argparse's prog name will show the repo
+	@# path in --help; that's honest and a non-issue in practice.
+	@ln -sf "$(CURDIR)/bin/devai-shell" $(INSTALL_PREFIX)/bin/devai-shell
+	@chmod +x "$(CURDIR)/bin/devai-shell"
 	@# Symlink the picker so devai-shell can override the in-image copy via
 	@# bind-mount; re-running `make install` after picker edits picks up the
 	@# new code without a full image rebuild.
