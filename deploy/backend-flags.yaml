@@ -1,0 +1,50 @@
+# Backend launch flags — names of CLI arguments per backend image.
+#
+# This file pins the *name* of each launch-time flag the router and
+# probers emit. The value passed to each flag is dynamic (model path,
+# context length, parser names from the probe cache) — only the flag
+# name itself is curated here.
+#
+# Why this exists: SGLang and vLLM both rename CLI surfaces between
+# minor versions. When bumping either image, run:
+#
+#   make verify-backend-flags
+#
+# which dumps `--help` from each pinned image and asserts every flag
+# below is present. Drift fails fast with a clear pointer to this file
+# instead of producing silent infra-class probe failures or busted
+# router launches.
+#
+# Pinned images (override via env var if you need a different build):
+#
+#   VLLM_IMAGE   = docker.io/vllm/vllm-openai:latest-cu130-ubuntu2404
+#                  (vLLM 0.19.1+, CUDA 13, Ubuntu 24.04)
+#   SGLANG_IMAGE = docker.io/lmsysorg/sglang:v0.5.10.post1-cu130
+#                  (SGLang 0.5.10.post1, CUDA 13)
+#
+# Verified 2026-04-29 against the images above.
+
+vllm:
+  model:                "--model"
+  served_model_name:    "--served-model-name"
+  host:                 "--host"
+  port:                 "--port"
+  tensor_parallel_size: "--tensor-parallel-size"
+  max_model_len:        "--max-model-len"
+  gpu_memory_util:      "--gpu-memory-utilization"
+  enable_prefix_cache:  "--enable-prefix-caching"
+  trust_remote_code:    "--trust-remote-code"
+  enable_auto_tool:     "--enable-auto-tool-choice"
+  tool_call_parser:     "--tool-call-parser"
+  reasoning_parser:     "--reasoning-parser"
+
+sglang:
+  model_path:           "--model-path"
+  host:                 "--host"
+  port:                 "--port"
+  tp:                   "--tp"
+  context_length:       "--context-length"
+  mem_fraction_static:  "--mem-fraction-static"
+  trust_remote_code:    "--trust-remote-code"
+  tool_call_parser:     "--tool-call-parser"
+  reasoning_parser:     "--reasoning-parser"
