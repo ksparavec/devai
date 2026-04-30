@@ -82,11 +82,16 @@ RUN_FLAGS =
 # disk-based "is downloaded?" detection (ollama manifests + vllm/sglang dirs).
 MODEL_CACHE_MOUNT = $(if $(wildcard $(CACHE_DIR)/ollama),-v $(CACHE_DIR)/ollama:/var/cache/devai/ollama:ro)
 
-# Read-only mount of the probe cache so the picker can render the per-tier
-# menu and the router can build its name → context-cap map. The cache is the
-# single source of truth for fit data after the resilient-splashing-peach
-# refactor; deploy/active-models.yaml no longer exists.
-PROBE_CACHE_MOUNT = $(if $(wildcard deploy/.ollama-reasoning-cache.json),-v $(CURDIR)/deploy/.ollama-reasoning-cache.json:/etc/devai/.ollama-reasoning-cache.json:ro)
+# Read-only mount of the probe caches so the in-container picker can
+# render the per-tier menu for every backend and the router can build
+# its name → context-cap map. All three caches must be exposed under
+# /etc/devai/.<backend>-reasoning-cache.json — model-picker.py looks
+# them up by that path. Without the vLLM/SGLang mounts the picker
+# falls back to "no HF probes" and shows Ollama rows only.
+PROBE_CACHE_MOUNT = \
+	$(if $(wildcard deploy/.ollama-reasoning-cache.json),-v $(CURDIR)/deploy/.ollama-reasoning-cache.json:/etc/devai/.ollama-reasoning-cache.json:ro) \
+	$(if $(wildcard deploy/.vllm-reasoning-cache.json),-v $(CURDIR)/deploy/.vllm-reasoning-cache.json:/etc/devai/.vllm-reasoning-cache.json:ro) \
+	$(if $(wildcard deploy/.sglang-reasoning-cache.json),-v $(CURDIR)/deploy/.sglang-reasoning-cache.json:/etc/devai/.sglang-reasoning-cache.json:ro)
 
 # User switching: only needed for docker (rootless podman root = host user)
 USER_ENV =
@@ -111,7 +116,7 @@ endif
 .PHONY: vllm-list vllm-rm vllm-status vllm-df
 .PHONY: clean clean-cpu clean-gpu clean-router prune
 .PHONY: fetch-cli pull-images install install-systemd uninstall test test-router test-ollama test-agents test-models test-probe-vllm test-probe-sglang test-probe-ollama-idempotent test-vllm test-sglang test-e2e test-full help
-.PHONY: catalog-regen probe probe-vllm probe-sglang model-fit model-pull vram-fit
+.PHONY: catalog-regen probe probe-vllm probe-sglang model-fit model-pull vram-fit verify-backend-flags ollama-cleanup-ctx-variants
 
 all: help
 
@@ -589,13 +594,22 @@ cache-status: ## Show infrastructure service status and disk usage
 	@du -sh $(CACHE_DIR)/*/ 2>/dev/null; true; true
 	@echo ""
 	@echo "Ollama models:"
-	@$(OLLAMA_EXEC) list 2>/dev/null || echo "  (ollama not running)"
+	@out=$$($(OLLAMA_EXEC) list 2>/dev/null); \
+	if [ -n "$$out" ]; then \
+		header=$$(printf '%s' "$$out" | head -n1); \
+		body=$$(printf '%s' "$$out" | tail -n +2 | sort -V -f); \
+		printf '%s\n%s\n' "$$header" "$$body"; \
+	else \
+		echo "  (ollama not running)"; \
+	fi
 	@echo ""
-	@echo "vLLM models:"
-	@found=false; for dir in $(VLLM_MODELS_DIR)/*/; do \
+	@echo "vLLM/SGLang models:"
+	@vllm_cache=$(CURDIR)/deploy/.vllm-reasoning-cache.json; \
+	sglang_cache=$(CURDIR)/deploy/.sglang-reasoning-cache.json; \
+	found=false; for dir in $$(ls -d $(VLLM_MODELS_DIR)/*/ 2>/dev/null | sort -V -f); do \
 		[ -f "$$dir/config.json" ] || continue; \
 		if ! $$found; then \
-			printf "%-46s%-16s%-10s%-20s\n" "NAME" "ID" "SIZE" "MODIFIED"; \
+			printf "%-46s%-16s%-14s%-10s%-20s\n" "NAME" "ID" "BACKENDS" "SIZE" "MODIFIED"; \
 			found=true; \
 		fi; \
 		name=$$(basename "$$dir"); \
@@ -609,7 +623,11 @@ cache-status: ## Show infrastructure service status and disk usage
 		elif [ $$diff_sec -lt 86400 ]; then modified="$$((diff_sec / 3600)) hours ago"; \
 		elif [ $$diff_sec -lt 604800 ]; then modified="$$((diff_sec / 86400)) days ago"; \
 		else modified="$$((diff_sec / 604800)) weeks ago"; fi; \
-		printf "%-46s%-16s%-10s%-20s\n" "$$name" "$$id" "$$size" "$$modified"; \
+		backends=""; \
+		[ -f "$$vllm_cache" ]   && grep -q "\"$$name\"" "$$vllm_cache"   && backends="vllm"; \
+		[ -f "$$sglang_cache" ] && grep -q "\"$$name\"" "$$sglang_cache" && backends="$${backends:+$$backends,}sglang"; \
+		[ -z "$$backends" ] && backends="-"; \
+		printf "%-46s%-16s%-14s%-10s%-20s\n" "$$name" "$$id" "$$backends" "$$size" "$$modified"; \
 	done; \
 	$$found || echo "  (none — run 'make model-pull' to populate)"
 
@@ -809,6 +827,7 @@ model-fit: ## Print which models fit at the chosen (VRAM, CONTEXT) — diagnosti
 			$(if $(FAMILY),--family $(FAMILY),) \
 			$(if $(VRAM),--vram $(VRAM),) \
 			$(if $(CONTEXT),--context $(CONTEXT),) \
+			$(if $(CONTEXTS),--contexts $(CONTEXTS),) \
 			$(if $(KV),--kv-dtype $(KV),)
 
 model-pull: ## Pull missing best-fit candidates from the catalog (catalog-driven downloads).
@@ -821,6 +840,7 @@ model-pull: ## Pull missing best-fit candidates from the catalog (catalog-driven
 			$(if $(FAMILY),--family $(FAMILY),) \
 			$(if $(VRAM),--vram $(VRAM),) \
 			$(if $(CONTEXT),--context $(CONTEXT),) \
+			$(if $(CONTEXTS),--contexts $(CONTEXTS),) \
 			$(if $(KV),--kv-dtype $(KV),) \
 			--download \
 			$(if $(DOWNLOAD_LIMIT),--max-downloads $(DOWNLOAD_LIMIT),) \
@@ -832,6 +852,21 @@ model-pull: ## Pull missing best-fit candidates from the catalog (catalog-driven
 
 catalog-regen: ## Regenerate deploy/models.yaml from scripts/model-families.yaml using live upstream data
 	python3 scripts/generate-catalog.py
+
+verify-backend-flags: ## Assert pinned vLLM/SGLang images expose every flag in deploy/backend-flags.yaml (run after image bump)
+	python3 scripts/verify-backend-flags.py
+
+ollama-cleanup-ctx-variants: ## Remove every derived `-ctx<N>` tag from Ollama. Safe — they share weight blobs with parents; only Modelfile metadata is freed.
+	@$(CONTAINER_RUNTIME) exec devai-ollama sh -c 'ollama list | awk "NR>1 && \$$1 ~ /-ctx[0-9]+\$$/ {print \$$1}"' | \
+	  while IFS= read -r tag; do \
+	    [ -n "$$tag" ] || continue; \
+	    printf '  rm %s ... ' "$$tag"; \
+	    $(CONTAINER_RUNTIME) exec devai-ollama ollama rm "$$tag" >/dev/null 2>&1 \
+	      && echo "ok" || echo "FAILED"; \
+	  done; \
+	  echo; \
+	  remaining=$$($(CONTAINER_RUNTIME) exec devai-ollama sh -c 'ollama list | grep -cE -- "-ctx[0-9]+\b"' 2>/dev/null); \
+	  echo "  remaining -ctx<N> tags: $$remaining"
 
 vllm-status: ## Show vLLM container status
 	@$(CONTAINER_RUNTIME) inspect -f '{{.State.Status}}' devai-vllm 2>/dev/null || echo "not running"
@@ -863,14 +898,14 @@ build-router: ## Build the gpu-arbiter router image
 INSTALL_PREFIX ?= $(HOME)/.local
 DEVAI_HOME ?= $(HOME)/.devai
 
-install: ## Install bin/devai-shell to $(INSTALL_PREFIX)/bin and stage config in $(DEVAI_HOME)
+install: ## Install bin/devai-agent to $(INSTALL_PREFIX)/bin and stage config in $(DEVAI_HOME)
 	@install -d $(INSTALL_PREFIX)/bin $(DEVAI_HOME) $(DEVAI_HOME)/sessions
-	@# Symlink rather than copy — picks up edits to bin/devai-shell without
+	@# Symlink rather than copy — picks up edits to bin/devai-agent without
 	@# re-running `make install`. argparse's prog name will show the repo
 	@# path in --help; that's honest and a non-issue in practice.
-	@ln -sf "$(CURDIR)/bin/devai-shell" $(INSTALL_PREFIX)/bin/devai-shell
-	@chmod +x "$(CURDIR)/bin/devai-shell"
-	@# Symlink the picker so devai-shell can override the in-image copy via
+	@ln -sf "$(CURDIR)/bin/devai-agent" $(INSTALL_PREFIX)/bin/devai-agent
+	@chmod +x "$(CURDIR)/bin/devai-agent"
+	@# Symlink the picker so devai-agent can override the in-image copy via
 	@# bind-mount; re-running `make install` after picker edits picks up the
 	@# new code without a full image rebuild.
 	@ln -sf "$(CURDIR)/scripts/model-picker.py" $(DEVAI_HOME)/model-picker.py
@@ -889,20 +924,20 @@ install: ## Install bin/devai-shell to $(INSTALL_PREFIX)/bin and stage config in
 		fi; \
 	done
 	@echo "  linked: $(DEVAI_HOME)/model-picker.py"
-	@echo "  installed: $(INSTALL_PREFIX)/bin/devai-shell"
+	@echo "  installed: $(INSTALL_PREFIX)/bin/devai-agent"
 	@echo
 	@echo "Next steps:"
 	@echo "  1. Add $(INSTALL_PREFIX)/bin to PATH if not already."
-	@echo "  2. devai-shell --init     # create $(DEVAI_HOME)/preferences.yaml"
-	@echo "  3. devai-shell            # launch the lab + picker"
+	@echo "  2. devai-agent --init     # create $(DEVAI_HOME)/preferences.yaml"
+	@echo "  3. devai-agent            # launch the lab + picker"
 
-uninstall: ## Remove devai-shell launcher and the staged config dir
-	@rm -f $(INSTALL_PREFIX)/bin/devai-shell
+uninstall: ## Remove devai-agent launcher and the staged config dir
+	@rm -f $(INSTALL_PREFIX)/bin/devai-agent
 	@rm -f $(DEVAI_HOME)/.ollama-reasoning-cache.json
 	@rm -f $(DEVAI_HOME)/.vllm-reasoning-cache.json
 	@rm -f $(DEVAI_HOME)/.sglang-reasoning-cache.json
 	@rm -f $(DEVAI_HOME)/model-picker.py
-	@echo "Removed $(INSTALL_PREFIX)/bin/devai-shell and the symlinks under $(DEVAI_HOME)/."
+	@echo "Removed $(INSTALL_PREFIX)/bin/devai-agent and the symlinks under $(DEVAI_HOME)/."
 	@echo "preferences.yaml and sessions/ are kept; remove $(DEVAI_HOME)/ manually if you want a clean slate."
 
 install-systemd: ## Install and enable systemd service for infrastructure

@@ -117,13 +117,16 @@ _AGENTS: list[tuple[str, str, str]] = [
     ("interpreter", "Open Interpreter",  "Natural language computer control"),
 ]
 
-# ANSI helpers
+# ANSI helpers — chosen for legibility on a black terminal background.
+# `_DIM` uses a 256-colour light-grey rather than `\033[2m` (faint),
+# which most terminals render too dim to read on black. Bold remains a
+# brightness/weight cue for headers and labels.
 _BOLD = "\033[1m"
-_DIM = "\033[2m"
+_DIM = "\033[38;5;245m"     # light-grey foreground (≈ #8a8a8a)
 _RESET = "\033[0m"
 
 
-# Pick-back-channel: when the host launcher (`bin/devai-shell`) bind-mounts
+# Pick-back-channel: when the host launcher (`bin/devai-agent`) bind-mounts
 # `~/.devai/` to `/devai-host`, the picker drops a one-shot JSON file the
 # launcher reads after exit so it can persist (model, agent, context) into
 # `preferences.yaml`. Silent no-op when the path is absent — this is what
@@ -258,6 +261,63 @@ def _hf_disk_size_gb(model_dir: Path) -> float:
     return total / (1024 ** 3)
 
 
+_DTYPE_LABEL = {
+    "bfloat16": "BF16",
+    "float16":  "FP16",
+    "half":     "FP16",
+    "float32":  "FP32",
+    "float":    "FP32",
+}
+
+_NAME_QUANT_TOKENS = ("NVFP4", "FP8", "INT8", "INT4", "AWQ", "GPTQ", "MARLIN")
+
+
+def _hf_format_label(model_dir: Path) -> str:
+    """Short data-format label for an HF model on disk.
+
+    Priority:
+      1. `quantization_config.quant_algo` / `quant_method` — most reliable
+         when populated.
+      2. Quantization token in the directory name (NVFP4, FP8, AWQ, …) —
+         some NVIDIA NVFP4 checkpoints (e.g., Nemotron) ship without a
+         `quantization_config` block; the convention is the token in
+         the repo/dir name.
+      3. `torch_dtype` / `dtype` mapped to BF16 / FP16 / FP32 — the native
+         precision when no quantization is applied.
+    Returns "?" only when config.json is unreadable. Probe caches don't
+    record this for vLLM/SGLang (schema-v2), so config.json + name are
+    the authoritative sources.
+    """
+    try:
+        with open(model_dir / "config.json") as fh:
+            cfg = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return "?"
+    qc = cfg.get("quantization_config") or {}
+    algo = qc.get("quant_algo") or qc.get("quant_method")
+    if algo:
+        return str(algo).upper()
+    upper_name = model_dir.name.upper()
+    for token in _NAME_QUANT_TOKENS:
+        if token in upper_name:
+            return token
+    dtype = cfg.get("torch_dtype") or cfg.get("dtype")
+    if dtype:
+        return _DTYPE_LABEL.get(str(dtype).lower(), str(dtype).upper())
+    return "?"
+
+
+def _strip_latest(name: str) -> str:
+    """Drop a literal trailing `:latest` Ollama moving-alias suffix.
+
+    Only operates on the tag delimiter — a tag like `8b-latest-tag` is
+    left alone. Used for display, the agent launch command, and the
+    pick-back-channel record so the user never sees `:latest`.
+    """
+    suffix = ":latest"
+    return name[: -len(suffix)] if name.endswith(suffix) else name
+
+
 def _details_from_probe(probe: dict) -> dict:
     details: dict = {}
     if probe.get("param_size_label"):
@@ -291,17 +351,85 @@ def _vram_from_probe(probe: dict) -> dict:
     return out
 
 
-def _vram_from_hf_probe(probe: dict) -> dict:
-    """Convert a vLLM/SGLang schema-v1 probe entry to the picker's
-    Ollama-shape vram dict.
+# vLLM/SGLang engines pre-allocate `gpu_memory_utilization * total_vram`
+# at startup, regardless of the per-session context. So `actual_vram_gb`
+# from the probe is constant across cells and useless for "VRAM at this
+# context" display. The picker overrides it with a formula breakdown
+# (weights + KV(ctx) + overhead) so the user sees per-ctx growth that
+# actually reflects the model's resource footprint at that tier.
+#
+# These constants mirror scripts/select-models.py:51, 65 — keeping them
+# in sync is a manual operation but each side has small enough surface
+# area that drift is unlikely. See `vram_breakdown` over there for the
+# canonical formula.
+_KV_BYTES_FP16 = 2
+_HF_OVERHEAD_GB = 3.0
 
-    HF cells use `fits` and `actual_vram_gb`; the picker downstream
-    expects `fully_on_gpu` and `actual_total_gb`. Synthesize:
-      * fully_on_gpu = fits
-      * actual_total_gb = actual_vram_gb (vLLM/SGLang hold weights+KV+
-        CUDA-graphs together in the static pool — the measured GPU
-        memory is the model's effective total)
-    Anything else is passed through verbatim. Empty input → {}.
+
+def _hf_kv_gb(arch: dict, context: int) -> float:
+    """KV cache size in GB for a given (arch, ctx) at fp16."""
+    if not arch:
+        return 0.0
+    copies = 1 if arch.get("k_eq_v") else 2
+    bytes_per_token = (
+        copies
+        * int(arch.get("layers") or 0)
+        * int(arch.get("kv_heads") or 0)
+        * int(arch.get("head_dim") or 0)
+        * _KV_BYTES_FP16
+    )
+    return (bytes_per_token * context) / (1024 ** 3)
+
+
+def _parse_size_gb(s: str) -> float:
+    if not s:
+        return 0.0
+    s = s.replace("GB", "").replace("G", "").strip()
+    try:
+        return float(s.split()[0])
+    except (ValueError, IndexError):
+        return 0.0
+
+
+def _params_label_from_name(name: str) -> str:
+    """Extract a `<digits>B` (or `<digits>B/<digits>B` for MoE) param
+    label from an HF model directory basename.
+
+    Matches the conventional NVIDIA/HF naming where param count appears
+    as `<N>B` somewhere in the path: `Qwen3-14B-NVFP4` → `14B`,
+    `NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4` → `30B/A3B`. Returns "" when
+    no recognised tokens appear.
+    """
+    import re as _re
+    upper = name.upper()
+    total_match = _re.search(r"(?<![A-Z0-9])(\d+(?:\.\d+)?)B(?![A-Z0-9])", upper)
+    if not total_match:
+        return ""
+    total = total_match.group(0)  # e.g. "14B"
+    # MoE active-experts notation, e.g. "A3B" / "A4B" appearing after the
+    # total params token.
+    active = ""
+    tail = upper[total_match.end():]
+    active_match = _re.search(r"(?<![A-Z0-9])(A\d+(?:\.\d+)?B)(?![A-Z0-9])", tail)
+    if active_match:
+        active = active_match.group(1)
+    return f"{total}/{active}" if active else total
+
+
+def _vram_from_hf_probe(probe: dict, arch: dict | None = None,
+                        weight_gb: float = 0.0) -> dict:
+    """Convert a vLLM/SGLang schema-v1 probe entry to the picker's
+    Ollama-shape vram dict, with per-ctx formula override.
+
+    The probe's `fits` flag still gates eligibility — that's the engine's
+    truth about whether the model actually loaded. But the displayed
+    VRAM number per (vram, ctx) cell is recomputed as
+    `weight_gb + KV(arch, ctx) + overhead` so the picker shows growth
+    with context. Without this, vLLM/SGLang rows appear flat across all
+    contexts (they all read back the engine's pre-allocated pool size).
+
+    When arch or weight_gb is missing, falls back to passing through
+    the probe's actual_vram_gb.
     """
     if not probe:
         return {}
@@ -319,13 +447,53 @@ def _vram_from_hf_probe(probe: dict) -> dict:
                 continue
             new_cell = dict(cell)
             new_cell.setdefault("fully_on_gpu", bool(cell.get("fits", False)))
-            actual_vram = cell.get("actual_vram_gb")
-            if actual_vram is not None and "actual_total_gb" not in new_cell:
-                new_cell["actual_total_gb"] = actual_vram
+            try:
+                ctx = int(ctx_key)
+            except (TypeError, ValueError):
+                ctx = 0
+            if arch and weight_gb > 0 and ctx > 0:
+                # Per-ctx formula display. The probe's actual_vram_gb
+                # would be the engine's pre-allocated pool — replace
+                # with weights + KV(ctx) + overhead so contexts differ.
+                # Tag the cell as formula-derived so _vram_info_at can
+                # surface this to the formatter via measured=False (the
+                # picker shows `*` next to values that aren't ground-
+                # truth measurements).
+                kv_gb = _hf_kv_gb(arch, ctx)
+                total = weight_gb + kv_gb + _HF_OVERHEAD_GB
+                new_cell["actual_total_gb"] = round(total, 2)
+                new_cell["actual_vram_gb"] = round(total, 2)
+                new_cell["_formula_override"] = True
+            else:
+                actual_vram = cell.get("actual_vram_gb")
+                if actual_vram is not None and "actual_total_gb" not in new_cell:
+                    new_cell["actual_total_gb"] = actual_vram
             new_band[ctx_key] = new_cell
         converted[vram_key] = new_band
     out["probes"] = converted
     return out
+
+
+def _resolve_tool_parser(probe: dict, catalog_parsers: dict, backend: str) -> str:
+    """Return the canonical vLLM/SGLang tool-call-parser name for a row.
+
+    Priority:
+      1. Probe-confirmed value — `entry.tool_parser` in the v2 cache.
+         Set only when the probe actually round-tripped a tool call.
+      2. Catalog hint from `scripts/model-families.yaml` (parsers.<backend>.tool).
+         Curated by hand; the prober consumes it as a launch-flag hint.
+      3. "N/A" — no parser known. The router strips `tools`/`tool_choice`
+         for this model so chat works but agentic tool calls are absent.
+    """
+    if isinstance(probe, dict):
+        probed = probe.get("tool_parser")
+        if probed:
+            return str(probed)
+    backend_block = (catalog_parsers or {}).get(backend) or {}
+    curated = backend_block.get("tool")
+    if curated:
+        return str(curated)
+    return "N/A"
 
 
 def _capability_from_probe(probe: dict, fallback: str = "unknown") -> str:
@@ -386,31 +554,49 @@ def _discover_models() -> list[dict]:
                     "family": meta.get("family", ""),
                     "capability": cap,
                     "probe": probe,
+                    "catalog_meta": meta,
                     "moe": _moe_from_probe(probe),
                     "details": probe_details,
+                    # Ollama negotiates tool calls natively per-request via
+                    # `/api/chat`; no engine-startup parser flag is needed.
+                    # Show `native` so the user knows tools work for any
+                    # tool-trained Ollama model without configuration.
+                    "tool_parser": "native",
                 })
 
-    # HF/vLLM/SGLang: <name>/config.json. Each backend has its own probe
-    # cache (schema v1, repo+sha keyed); we look up via the catalog name
-    # (= directory basename, also the first alias in the cache entry).
-    # Backend selection priority:
-    #   1. The first cache that has a fitting non-failed entry wins.
-    #   2. Otherwise fall back to DEVAI_HF_BACKEND (default vllm) so the
-    #      row still appears in the picker — but with capability=unknown
-    #      so _reasoning_status hides it from the menu.
+    # HF/vLLM/SGLang: <name>/config.json. Each backend keeps its own
+    # probe cache (schema v1, repo+sha keyed); look up by directory
+    # basename, which is also the catalog `name` and the first alias.
+    #
+    # vLLM and SGLang are NOT 100% interchangeable: architecture and
+    # quantization-format support diverge. So we emit ONE row per
+    # (file, backend) pair where the backend has a non-error probe.
+    # A safetensors checkpoint probed by both backends produces TWO
+    # rows that the picker presents in separate sections — the user
+    # explicitly chooses which backend to benchmark on.
+    #
+    # When a backend has no probe at all for a file, we fall back to
+    # emitting a single placeholder row using DEVAI_HF_BACKEND so the
+    # file still appears (with capability=unknown). _reasoning_status
+    # filters those out of the menu, but they're useful for debugging
+    # `model-picker --show` style listings.
     vllm_probes = _load_hf_probe_records(_VLLM_PROBE_CACHE_PATHS)
     sglang_probes = _load_hf_probe_records(_SGLANG_PROBE_CACHE_PATHS)
     fallback_backend = _HF_BACKEND if _HF_BACKEND in ("vllm", "sglang") else "vllm"
 
-    def _hf_probe_for(name: str) -> tuple[dict, str]:
+    def _hf_probes_for(name: str) -> list[tuple[dict, str]]:
+        """Return one (probe_entry, backend) pair per backend with a
+        non-error probe for this model. Empty list when neither backend
+        has a usable entry — the caller emits a single placeholder."""
+        out_pairs: list[tuple[dict, str]] = []
         for backend, store in (("vllm", vllm_probes), ("sglang", sglang_probes)):
             entry = store.get(name)
             if not entry:
                 continue
             if entry.get("capability") in ("error", "unsupported_arch"):
                 continue
-            return entry, backend
-        return {}, fallback_backend
+            out_pairs.append((entry, backend))
+        return out_pairs
 
     vbase = Path(_VLLM_DIR)
     if vbase.is_dir():
@@ -420,20 +606,61 @@ def _discover_models() -> list[dict]:
             name = d.name
             meta = catalog.get(name, {})
             disk_gb = _hf_disk_size_gb(d)
-            probe, backend = _hf_probe_for(name)
-            cap = _capability_from_probe(probe, "unknown") if probe else "unknown"
-            out.append({
+            fmt_label = _hf_format_label(d)
+            # Catalog metadata for per-ctx VRAM formula. arch comes from
+            # generate-catalog.py walking the HF config.json; weight_gb
+            # parsed from the catalog `size` ("9.82 GB" → 9.82).
+            arch = meta.get("arch")
+            weight_gb = _parse_size_gb(str(meta.get("size") or f"{disk_gb:.2f} GB"))
+            # Params label parsed from the directory basename (e.g.,
+            # `Qwen3-14B-NVFP4` → `14B`). HF probes don't expose a
+            # param_size_label like Ollama's /api/show does, so the
+            # display column would otherwise read `?` for every HF row.
+            params_label = _params_label_from_name(name)
+            details = {"quantization": fmt_label}
+            if params_label:
+                details["param_size"] = params_label
+            common = {
                 "name": name,
                 "source": "hf",
-                "backend": backend,
                 "size": meta.get("size") or f"{disk_gb:.2f} GB",
                 "purpose": meta.get("purpose", ""),
-                "vram": _vram_from_hf_probe(probe) if probe else None,
                 "family": meta.get("family", ""),
-                "capability": cap,
-                "probe": probe,
                 "moe": None,
-            })
+                "details": details,
+                # Catalog metadata (incl. `conversational`) is consumed
+                # by _tuning_label downstream to populate the TUNE column
+                # without resorting to name-pattern guesswork.
+                "catalog_meta": meta,
+            }
+            # Catalog parser hints (curated in scripts/model-families.yaml,
+            # propagated into deploy/models.yaml by generate-catalog.py).
+            # Used as fallback when the probe didn't (yet) confirm a parser.
+            cat_parsers = (meta.get("parsers") or {}) if isinstance(meta, dict) else {}
+            pairs = _hf_probes_for(name)
+            if pairs:
+                # One row per (file, backend) so vLLM and SGLang appear
+                # independently in the picker.
+                for probe, backend in pairs:
+                    out.append({
+                        **common,
+                        "backend": backend,
+                        "vram": _vram_from_hf_probe(probe, arch, weight_gb),
+                        "capability": _capability_from_probe(probe, "unknown"),
+                        "probe": probe,
+                        "tool_parser": _resolve_tool_parser(probe, cat_parsers, backend),
+                    })
+            else:
+                # No working probe on either backend — emit one placeholder
+                # row that _reasoning_status() will filter out of the menu.
+                out.append({
+                    **common,
+                    "backend": fallback_backend,
+                    "vram": None,
+                    "capability": "unknown",
+                    "probe": {},
+                    "tool_parser": _resolve_tool_parser({}, cat_parsers, fallback_backend),
+                })
 
     return out
 
@@ -475,7 +702,25 @@ def _fzf(lines: list[str], header: str,
                     "--header", header,
                     "--pointer", "▶", "--prompt", "  ",
                     "--margin", "1,2",
-                    "--color", "pointer:3,header:4,hl:3,hl+:3,gutter:-1",
+                    # Colours tuned for a BLACK terminal background.
+                    # Avoid the dim ANSI 0–7 bank (especially blue/4 and
+                    # green/2 which vanish on black). Use the bright bank
+                    # (8–15) for foreground accents and an explicit dark-
+                    # grey (`bg+:236`) bar for the current line so the
+                    # cursor row pops without the colours hurting eyes.
+                    #   fg:15      bright white         normal text
+                    #   fg+:15     bright white         current row text
+                    #   bg+:236    dark-grey            current row bar
+                    #   pointer:11 bright yellow        ▶ glyph
+                    #   header:14  bright cyan          fzf header line
+                    #   hl:11      bright yellow        match highlight
+                    #   hl+:11     bright yellow        match highlight (cur)
+                    #   prompt:14  bright cyan          search prompt
+                    #   info:8     bright black (grey)  match counter
+                    #   gutter:-1  terminal default     left margin column
+                    "--color",
+                    "fg:15,fg+:15,bg+:236,pointer:11,header:14,"
+                    "hl:11,hl+:11,prompt:14,info:8,gutter:-1",
                 ],
                 input="\n".join(indexed),
                 stdout=subprocess.PIPE,
@@ -530,11 +775,21 @@ _REASONING_LABEL = {
     "unsupported": "No reasoning",
 }
 
+# Inline-reasoning models leak `<think>` blocks into content. The picker
+# emits TWO rows for them — one that lets the model think (default), one
+# that forces thinking off via the router's `::nothink` suffix. The
+# router applies enable_thinking=false for inline+off requests.
+_INLINE_OFF_LABEL = "Reasoning off"
+_INLINE_OFF_GLYPH = "·"
+
 _STATUS_ORDER = {
     "native": 0,
     "inline": 1,
-    "none": 2,
+    "inline_off": 2,
+    "none": 3,
 }
+
+_MODE_ORDER = {"default": 0, "nothink": 1}
 
 
 def _context_label(context: int) -> str:
@@ -607,6 +862,11 @@ def _vram_info_at(v: dict, context: int) -> dict | None:
             return None
         total = round(float(exact["actual_total_gb"]), 2)
         vram_gb = round(float(exact.get("actual_vram_gb") or total), 2)
+        # Cells overridden with formula-derived VRAM (HF rows — vLLM
+        # and SGLang probes don't measure per-ctx VRAM since the
+        # engine pre-allocates a constant pool) flag themselves so the
+        # formatter can render an asterisk and footnote.
+        is_measured = not bool(exact.get("_formula_override", False))
         return {
             "total_gb": total,
             "vram_gb": vram_gb,
@@ -614,7 +874,7 @@ def _vram_info_at(v: dict, context: int) -> dict | None:
             "fully_on_gpu": bool(exact.get("fully_on_gpu", True))
             and total <= _VRAM_BUDGET,
             "over_budget": total > _VRAM_BUDGET,
-            "measured": True,
+            "measured": is_measured,
         }
     total, eff_ctx = _vram_at(v, context)
     if total is None:
@@ -632,46 +892,86 @@ def _vram_info_at(v: dict, context: int) -> dict | None:
     }
 
 
-def _reasoning_status(m: dict, info: dict) -> tuple[str, str, str] | None:
-    """Map a fitting probe cell to (status_key, glyph, label).
+def _reasoning_variants(m: dict) -> list[tuple[str, str, str, str]]:
+    """Map a model's probed capability to (status_key, glyph, label, mode)
+    rows for the picker. Returns an empty list for unprobed / error
+    capabilities so the caller can hide the row entirely.
 
-    Spilled cells are filtered upstream in _build_menu — by the time we
-    get here, info is guaranteed fully_on_gpu. Returns None for unprobed
-    or error capabilities so the caller can hide the row.
+    Inline-reasoning models produce TWO rows: a default row that lets the
+    model think (router takes no action) and a `::nothink` row that
+    forces enable_thinking=false. Structured and unsupported produce one
+    row each.
     """
     cap = m.get("capability", "unknown")
     if cap == "structured":
-        return "native", _CAP_GLYPH[cap], _REASONING_LABEL[cap]
+        return [("native", _CAP_GLYPH[cap], _REASONING_LABEL[cap], "default")]
     if cap == "inline":
-        return "inline", _CAP_GLYPH[cap], _REASONING_LABEL[cap]
+        return [
+            ("inline", _CAP_GLYPH[cap], _REASONING_LABEL[cap], "default"),
+            ("inline_off", _INLINE_OFF_GLYPH, _INLINE_OFF_LABEL, "nothink"),
+        ]
     if cap == "unsupported":
-        return "none", _CAP_GLYPH[cap], _REASONING_LABEL[cap]
-    return None
+        return [("none", _CAP_GLYPH[cap], _REASONING_LABEL[cap], "default")]
+    return []
 
 
-def _infer_tuning(name: str) -> str:
-    """Best-effort tuning style from the tag suffix. Ollama has no API
-    field for this — name suffix is the only signal. Returns short label
-    or empty string if unknown."""
+def _tuning_label(m: dict) -> str:
+    """Return the post-training tuning label for the TUNE column.
+
+    Three reliable signals, OR'd as positive evidence for IT:
+      a) Ollama probe `capabilities` (from /api/show): presence of
+         `tools` / `thinking` / `vision` ⇒ instruction-tuned.
+      b) HF catalog `conversational` flag (from /api/models/{repo}.tags):
+         True ⇒ instruction-tuned.
+      c) Name suffix pattern (`-instruct`, `:instruct`, `-it`, `-chat`):
+         instruction-tuned.
+
+    Negative evidence (BASE) requires NO positive signal AND either:
+      - Ollama `capabilities == [completion]` (the daemon explicitly
+        says no tools / thinking — strong signal), or
+      - HF `conversational == false` AND no IT-style name pattern, or
+      - Name pattern `-text` / `-base`.
+
+    The OR logic compensates for NVIDIA's HF quants that ship without
+    the `conversational` tag despite obviously being instruct-tuned
+    (`Llama-3.1-8B-Instruct-NVFP4` is the canonical example). When all
+    sources are silent, returns "" so the column doesn't lie.
+    """
+    name = m.get("name") or ""
     n = name.lower()
-    # Order matters: more-specific first.
-    if "-instruct" in n or n.endswith(":instruct") or "-it" in n:
-        return "IT"
-    if "-text" in n or "-base" in n:
+    name_says_it = (
+        "-instruct" in n or n.endswith(":instruct")
+        or "-it" in n or "-chat" in n
+    )
+    name_says_base = "-text" in n or "-base" in n
+
+    probe = m.get("probe") or {}
+    caps = probe.get("capabilities")
+    caps_says_it = isinstance(caps, list) and any(
+        c in caps for c in ("tools", "thinking", "vision")
+    )
+    caps_says_base = (
+        isinstance(caps, list) and caps and not caps_says_it
+        and "completion" in caps
+    )
+
+    catalog_meta = m.get("catalog_meta") or {}
+    conv = catalog_meta.get("conversational")
+
+    # Positive evidence wins over negative.
+    if caps_says_it or conv is True or name_says_it:
+        return "CHAT" if "-chat" in n and not (caps_says_it or conv is True) else "IT"
+    if caps_says_base or conv is False or name_says_base:
         return "BASE"
-    if "-chat" in n:
-        return "CHAT"
     return ""
 
 
 def _format_model_row(m: dict) -> str:
     info = m.get("_picker_vram") or {}
     vram_num = "?"
-    gpu_num = "?"
     if info:
         suffix = "" if info.get("measured") else "*"
         vram_num = f"{info['total_gb']:.2f}{suffix}"
-        gpu_num = f"{info['vram_gb']:.2f}"
 
     ctx_str = _context_label(int(m.get("_picker_context") or 0))
     glyph = m.get("_picker_glyph", "?")
@@ -693,19 +993,23 @@ def _format_model_row(m: dict) -> str:
         params_col = params_label
         type_col = "dense"
 
-    quant = details.get("quantization") or "?"
-    tuning = _infer_tuning(m["name"])
+    fmt = details.get("quantization") or "?"
+    tuning = _tuning_label(m)
+    display_name = _strip_latest(m["name"])
+    backend_col = str(m.get("backend") or "?")
+    parser_col = str(m.get("tool_parser") or "N/A")
 
     return (
         f"      {ctx_str:>4s}  "
         f"{glyph} {status_label:<16s}  "
-        f"{m['name']:<32s}  "
+        f"{display_name:<32s}  "
+        f"{backend_col:<7s}  "
         f"{params_col:>10s}  "
-        f"{quant:>8s}  "
+        f"{fmt:>8s}  "
         f"{tuning:>5s}  "
         f"{type_col:>5s}  "
-        f"{vram_num:>10s}  "
-        f"{gpu_num:>8s}"
+        f"{parser_col:>14s}  "
+        f"{vram_num:>10s}"
     )
 
 
@@ -722,22 +1026,33 @@ def _name_priority(m: dict) -> tuple:
 
 def _parse_param_b(label: str) -> float:
     import re
-    match = re.search(r"(\d+(?:\.\d+)?)\s*b", label.lower())
+    match = re.search(r"(?<![A-Za-z0-9])(\d+(?:\.\d+)?)\s*b\b", label.lower())
     return float(match.group(1)) if match else 0.0
+
+
+def _params_hint(m: dict) -> float:
+    """Parameter count in billions. Probe-supplied label preferred;
+    falls back to parsing the model name (e.g., `Qwen3-14B-NVFP4` → 14)
+    so HF rows aren't penalised when the probe didn't expose param_size."""
+    details = m.get("details") or {}
+    parsed = _parse_param_b(str(details.get("param_size") or ""))
+    if parsed:
+        return parsed
+    return _parse_param_b(str(m.get("name") or ""))
 
 
 def _quality(m: dict) -> tuple[float, float, float]:
     """Quality proxy used to rank within a family. Higher tuple wins.
 
     Tuple components in priority order:
-      1. parameter count from /api/show details (probe-backed) — most
-         meaningful "scale" signal (a 27B Q4 beats a 9B BF16).
+      1. parameter count — most meaningful "scale" signal (a 27B Q4
+         beats a 9B BF16). Probe-supplied label first, then parsed
+         from name when probe lacks the field (HF rows).
       2. actual VRAM at the picker's context — at fixed param count the
          higher-precision quant uses more memory and is preferred.
       3. raw disk size — last-resort tiebreaker for missing metadata.
     """
-    details = m.get("details") or {}
-    params_b = _parse_param_b(str(details.get("param_size") or ""))
+    params_b = _params_hint(m)
     info = m.get("_picker_vram") or {}
     vram_total = float(info.get("total_gb") or 0.0)
     try:
@@ -785,28 +1100,48 @@ def _build_menu(models: list[dict]) -> tuple[list[str], list[bool], list[dict | 
             if not info.get("fully_on_gpu", False):
                 hidden["spilled"] += 1
                 continue
-            status = _reasoning_status(m, info)
-            if status is None:
+            variants = _reasoning_variants(m)
+            if not variants:
                 hidden["missing_capability"] += 1
                 continue
-            status_key, glyph, status_label = status
-            family = m.get("family") or "(uncategorized)"
-            candidate = dict(m)
-            candidate["_picker_context"] = ctx
-            candidate["_picker_vram"] = info
-            candidate["_picker_status"] = status_key
-            candidate["_picker_glyph"] = glyph
-            candidate["_picker_status_label"] = status_label
-
-            bucket = (ctx, status_key)
+            # Family resolution priority:
+            #   1. Catalog metadata (`m["family"]`) — set when the
+            #      tag/repo appears in deploy/models.yaml.
+            #   2. The Ollama tag's library prefix (text before the
+            #      `:` in `<lib>:<tag>`) — handles locally-renamed
+            #      tags like `nemotron-3-nano:4b-q4_K_M` that we
+            #      created via `ollama cp` and that have no upstream
+            #      registry entry. The library prefix matches the
+            #      family name 1:1 in this project.
+            #   3. "(uncategorized)" — last-resort fallback so the row
+            #      still appears in the menu.
+            family = m.get("family") or ""
+            if not family and m.get("source") == "ollama":
+                tag_name = m.get("name") or ""
+                if ":" in tag_name:
+                    family = tag_name.split(":", 1)[0]
+            if not family:
+                family = "(uncategorized)"
             family_rows = grouped.setdefault(backend, {}).setdefault(family, {})
-            previous = family_rows.get(bucket)
-            if (
-                previous is None
-                or (_quality(candidate), _name_priority(candidate))
-                > (_quality(previous), _name_priority(previous))
-            ):
-                family_rows[bucket] = candidate
+            for status_key, glyph, status_label, mode in variants:
+                candidate = dict(m)
+                candidate["_picker_context"] = ctx
+                candidate["_picker_vram"] = info
+                candidate["_picker_status"] = status_key
+                candidate["_picker_glyph"] = glyph
+                candidate["_picker_status_label"] = status_label
+                candidate["_picker_mode"] = mode
+
+                # Bucket key includes mode so default and ::nothink rows
+                # for the same inline model coexist as separate picks.
+                bucket = (ctx, status_key, mode)
+                previous = family_rows.get(bucket)
+                if (
+                    previous is None
+                    or (_quality(candidate), _name_priority(candidate))
+                    > (_quality(previous), _name_priority(previous))
+                ):
+                    family_rows[bucket] = candidate
 
     lines: list[str] = []
     selectable: list[bool] = []
@@ -824,12 +1159,13 @@ def _build_menu(models: list[dict]) -> tuple[list[str], list[bool], list[dict | 
         f"      {'CTX':>4s}  "
         f"{'REASONING':<18s}  "
         f"{'TAG':<32s}  "
+        f"{'BACKEND':<7s}  "
         f"{'PARAMS':>10s}  "
-        f"{'QUANT':>8s}  "
+        f"{'FORMAT':>8s}  "
         f"{'TUNE':>5s}  "
         f"{'TYPE':>5s}  "
-        f"{'VRAM (GB)':>10s}  "
-        f"{'GPU GB':>8s}"
+        f"{'PARSER':>14s}  "
+        f"{'VRAM (GB)':>10s}"
     )
     for backend in ("ollama", "vllm", "sglang"):
         if backend not in grouped:
@@ -840,9 +1176,27 @@ def _build_menu(models: list[dict]) -> tuple[list[str], list[bool], list[dict | 
         label = _BACKENDS[backend][0]
         emit(f"  {_BOLD}── {label} ──{_RESET}",
              selectable_=False, model=None)
-        emit(f"  {_BOLD}{column_header}{_RESET}",
+        # The column header carries its own leading whitespace that
+        # matches `_format_model_row` exactly. Don't add a `  ` prefix
+        # here — that would shift the header 2 chars right of every
+        # data row and the columns would look misaligned.
+        emit(f"{_BOLD}{column_header}{_RESET}",
              selectable_=False, model=None)
-        emit(f"  {_DIM}* = formula estimate (no probe cell at this VRAM/ctx — run `make probe-{backend}`){_RESET}",
+        if backend == "ollama":
+            note = (f"* = formula estimate (no probe cell at this VRAM/ctx — "
+                    f"run `make probe-{backend}`)")
+        else:
+            # vLLM and SGLang engines pre-allocate gpu_memory_utilization ×
+            # total_vram, so the probe records the same actual_vram_gb
+            # for every (vram, ctx) cell — useless for per-ctx display.
+            # The picker overrides with a formula breakdown
+            # (weights + KV(arch, ctx) + 3 GB overhead) and marks it `*`.
+            # Real measured per-ctx VRAM would require a long-prompt
+            # probe with engine memory utilisation tuned per cell — not
+            # implemented yet.
+            note = (f"* = formula estimate (weights + KV(arch, ctx) + 3 GB; "
+                    f"{backend} probe doesn't measure per-ctx VRAM directly)")
+        emit(f"  {_DIM}{note}{_RESET}",
              selectable_=False, model=None)
 
         # Order families within this backend by their best selected variant.
@@ -861,6 +1215,7 @@ def _build_menu(models: list[dict]) -> tuple[list[str], list[bool], list[dict | 
                 key=lambda m: (
                     int(m.get("_picker_context") or 0),
                     _STATUS_ORDER.get(str(m.get("_picker_status")), 99),
+                    _MODE_ORDER.get(str(m.get("_picker_mode") or "default"), 99),
                 ),
             )
             for m in top:
@@ -893,83 +1248,6 @@ def _format_agent_row(agent: tuple[str, str, str]) -> str:
 
 
 # ── Command builder ──────────────────────────────────────────────────────────
-
-def _ensure_ctx_variant(parent: str, ctx: int) -> str:
-    """Materialise a Modelfile-derived Ollama tag with `PARAMETER num_ctx <ctx>`
-    baked in, return its name.
-
-    Background: Ollama 0.21+ honours `options.num_ctx` only on its native
-    /api/chat path. The OpenAI-compat (/v1/chat/completions) and Anthropic-
-    compat (/v1/messages) layers silently ignore the field — they read
-    only the model's baked-in defaults. Claude Code, Open Interpreter,
-    LATE, and OpenAI-compatible Aider modes all hit those paths.
-
-    The fix is to encode the chosen num_ctx into a derived model whose
-    Modelfile carries `PARAMETER num_ctx <ctx>`. Layers (weights) are
-    shared with the parent — only the manifest differs (~1 KB).
-
-    Naming: `<parent>-ctx<N>` (e.g. `qwen3.5:9b-q8_0-ctx32768`). The
-    suffix is recognised by probe-ollama-reasoning.py and the picker so
-    these derived tags don't pollute the menu.
-
-    Idempotent: if the derived tag already exists in /api/tags, reuse it.
-    """
-    import urllib.error
-    import urllib.request
-
-    if ":" in parent:
-        lib, tag = parent.split(":", 1)
-        derived = f"{lib}:{tag}-ctx{ctx}"
-    else:
-        derived = f"{parent}-ctx{ctx}"
-
-    ollama_url = os.environ.get("OLLAMA_HOST", "http://devai-ollama:11434")
-
-    # Existence check via /api/show (POST {"name": "..."}).
-    show_body = json.dumps({"name": derived}).encode("utf-8")
-    show_req = urllib.request.Request(
-        f"{ollama_url}/api/show",
-        data=show_body,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(show_req, timeout=5) as resp:
-            if resp.status == 200:
-                return derived
-    except urllib.error.HTTPError as e:
-        if e.code != 404:
-            raise
-    except urllib.error.URLError as e:
-        sys.exit(f"error: cannot reach ollama at {ollama_url}: {e}")
-
-    # Create the derived tag. /api/create accepts a JSON body with the
-    # Modelfile content. The call blocks until creation completes; status
-    # comes back as a stream of progress events — we drain to EOF and
-    # check the final HTTP code.
-    # Ollama 0.21+ deprecated the `modelfile` string field on /api/create;
-    # the structured form is {model, from, parameters}.
-    create_body = json.dumps({
-        "model": derived,
-        "from": parent,
-        "parameters": {"num_ctx": ctx},
-    }).encode("utf-8")
-    create_req = urllib.request.Request(
-        f"{ollama_url}/api/create",
-        data=create_body,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(create_req, timeout=120) as resp:
-            for _line in resp:  # drain progress stream
-                pass
-    except urllib.error.HTTPError as e:
-        sys.exit(f"error: ollama /api/create {derived} failed: HTTP {e.code} {e.reason}")
-    except urllib.error.URLError as e:
-        sys.exit(f"error: ollama /api/create {derived} failed: {e}")
-    return derived
-
 
 def _build(agent_id: str, model_name: str, backend: str) -> list[str]:
     _, _, port = _BACKENDS[backend]
@@ -1073,10 +1351,15 @@ def main() -> None:
     )
     idx = _fzf(lines, header, selectable=selectable)
     if idx is None:
-        os.execvp("bash", ["bash"])
+        # User cancelled (Ctrl-C / Esc) before picking a model. Exit
+        # the picker cleanly so the container's PID 1 (this process)
+        # terminates and `podman run --rm` reclaims the container —
+        # same lifecycle as quitting an agent. Dropping to bash here
+        # would keep the container alive indefinitely.
+        sys.exit(0)
     model = item_models[idx]
     if model is None:  # defensive — _fzf already filters headers
-        os.execvp("bash", ["bash"])
+        sys.exit(0)
     selected_context = int(model.get("_picker_context") or _DEFAULT_CONTEXT)
     os.environ["CONTEXT"] = str(selected_context)
 
@@ -1092,40 +1375,65 @@ def main() -> None:
         alines = [_format_agent_row(a) for a in _AGENTS]
         header = (
             f"Step 2/2: pick an agent for "
-            f"{_BOLD}{model['name']}{_RESET}"
+            f"{_BOLD}{_strip_latest(model['name'])}{_RESET}"
             f" @ {_context_label(selected_context)}"
             f" via {_BACKENDS[model['backend']][0]}"
         )
         idx = _fzf(alines, header)
         if idx is None:
-            os.execvp("bash", ["bash"])
+            # User cancelled at the agent step. Exit cleanly so the
+            # container terminates instead of dropping into bash.
+            sys.exit(0)
         agent = _AGENTS[idx]
 
-    # Per-session context binding. Two paths because the backends differ:
+    # Per-session context binding — only for vLLM / SGLang. The router
+    # (gpu-arbiter) parses the `@<ctx>` suffix via parseCtxOverride and
+    # recreates the backend container with --max-model-len (vLLM) or
+    # --context-length (SGLang) set accordingly. KV pool is allocated
+    # at startup; the suffix drives that allocation.
     #
-    #   * Ollama: materialise a Modelfile-derived tag with PARAMETER
-    #     num_ctx baked in. Required because Ollama 0.21+ honours
-    #     `options.num_ctx` only on the native /api/chat path; the
-    #     OpenAI- and Anthropic-compat layers ignore the field.
-    #   * vLLM / SGLang: append `@<ctx>` to the model name. The router
-    #     (gpu-arbiter, Phase 0) parses this via parseCtxOverride and
-    #     recreates the backend container with --max-model-len /
-    #     --context-length set accordingly. No client-side tag
-    #     materialisation needed.
+    # Ollama is different: KV is allocated dynamically per request, and
+    # the picker emits just the parent name. Per-request num_ctx for
+    # native /api/chat is injected by the router's setNumCtx (still
+    # honoured by Ollama on the native API). Agents that hit Ollama via
+    # /v1/chat/completions or /v1/messages get the global
+    # OLLAMA_CONTEXT_LENGTH env (an Ollama upstream limitation — the
+    # /v1/* paths ignore options.num_ctx).
+    base_name = _strip_latest(model["name"])
+    # Append `::nothink` for the inline-reasoning forced-off pick. The
+    # router's parseReasoningOverride strips this suffix and treats
+    # the request as policy=off, injecting enable_thinking=false (or
+    # the equivalent per-backend disable shape). The user gets
+    # think-disabled output without the model's <think> blocks.
+    reasoning_suffix = ""
+    if model.get("_picker_mode") == "nothink":
+        reasoning_suffix = "::nothink"
     if model["backend"] == "ollama":
-        serving_name = _ensure_ctx_variant(model["name"], selected_context)
+        # Ollama: KV is dynamic per request; only the reasoning suffix
+        # rides on the model name. No `@<ctx>` needed.
+        serving_name = f"{base_name}{reasoning_suffix}"
     else:
-        serving_name = f"{model['name']}@{selected_context}"
+        # vLLM / SGLang: order is `<name>::<reasoning>@<ctx>` so the
+        # router's parseCtxOverride (which strips trailing @<int>)
+        # runs cleanly before parseReasoningOverride.
+        serving_name = f"{base_name}{reasoning_suffix}@{selected_context}"
 
     cmd = _build(agent[0], serving_name, model["backend"])
-    _record_pick(model["name"], agent[0], selected_context)
+    _record_pick(base_name, agent[0], selected_context)
+    mode_note = " [no reasoning]" if reasoning_suffix else ""
     print(
         f"\n  {_BOLD}{agent[0]}{_RESET}"
-        f" → {model['name']} @ {_context_label(selected_context)}"
+        f" → {base_name}{mode_note} @ {_context_label(selected_context)}"
         f" via {_BACKENDS[model['backend']][0]}\n"
     )
     os.execvp(cmd[0], cmd)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # Ctrl-C raised between fzf invocations (rare — fzf intercepts
+        # SIGINT itself). Exit silently so the container terminates
+        # instead of dumping a traceback.
+        sys.exit(130)

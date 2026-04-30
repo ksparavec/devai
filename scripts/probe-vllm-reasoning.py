@@ -39,13 +39,16 @@ DEFAULT_VLLM_IMAGE = os.environ.get(
 
 
 def vllm_command_args(
-    model_name: str, max_ctx: int, host_frac: float
+    model_name: str, max_ctx: int, host_frac: float,
+    *, reasoning_parser: str | None = None, tool_parser: str | None = None,
 ) -> list[str]:
-    """Build the vLLM serve arguments. Mirrors gpu-arbiter vllmEntrypoint
-    minus the tool-parser flags (Phase 0 made those parameter-driven and
-    the prober omits them — tool detection is a follow-on).
+    """Build the vLLM serve arguments. Mirrors gpu-arbiter vllmEntrypoint.
+
+    Parser flags are appended only when the catalog row's `parsers.vllm`
+    block supplied a value. Omitting them keeps the launch in inline /
+    no-tool mode (same shape as a model with no curated hints).
     """
-    return [
+    args = [
         "-m", "vllm.entrypoints.openai.api_server",
         "--model", f"/models/{model_name}",
         "--host", "0.0.0.0",
@@ -57,6 +60,11 @@ def vllm_command_args(
         "--trust-remote-code",
         "--served-model-name", model_name,
     ]
+    if reasoning_parser:
+        args.extend(["--reasoning-parser", reasoning_parser])
+    if tool_parser:
+        args.extend(["--enable-auto-tool-choice", "--tool-call-parser", tool_parser])
+    return args
 
 
 SPEC = BackendSpec(

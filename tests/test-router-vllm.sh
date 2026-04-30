@@ -93,7 +93,6 @@ for entry in cache.values():
     if not isinstance(band, dict):
         continue
     smallest_ctx = None
-    smallest_total = None
     for ctx_str, cell in band.items():
         if not isinstance(cell, dict) or not cell.get("fits"):
             continue
@@ -101,12 +100,16 @@ for entry in cache.values():
             ctx_val = int(ctx_str)
         except ValueError:
             continue
-        total = cell.get("actual_vram_gb") or 0
         if smallest_ctx is None or ctx_val < smallest_ctx:
             smallest_ctx = ctx_val
-            smallest_total = total
-    if smallest_ctx:
-        fits.append((smallest_total or 0, entry["aliases"][0], smallest_ctx))
+    if smallest_ctx is not None:
+        # Sort key: weight bytes on disk, NOT actual_vram_gb (which is
+        # the engine's pre-allocated pool — same across NVFP4 and BF16
+        # models at fixed gpu_memory_utilization). Cold-start time
+        # scales with weight transfer + GPU copy, so smallest weights
+        # = fastest swap = most reliable test under tight timeouts.
+        weight_gb = float(entry.get("size_gb") or 0.0)
+        fits.append((weight_gb, entry["aliases"][0], smallest_ctx))
 fits.sort()
 for _, name, ctx in fits:
     print(f"{name}\t{ctx}")
@@ -163,13 +166,24 @@ curl_get_ollama_chat() {
 
 assert_chat_ok() {
     local label="$1" resp="$2"
+    # Structured-reasoning models (Qwen3, etc.) return content=null and
+    # put their output into message.reasoning_content / .reasoning when
+    # max_tokens is tight. Both shapes prove the round-trip; the test is
+    # 'backend reachable + producing output', not 'content field is set'.
     if echo "$resp" | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
 assert 'choices' in d, f'no choices in response: {list(d.keys())}'
 assert d['choices'], 'choices array empty'
-content = (d['choices'][0].get('message') or {}).get('content', '')
-assert isinstance(content, str), f'content not string: {type(content).__name__}'
+msg = d['choices'][0].get('message') or {}
+candidates = [
+    msg.get('content'),
+    msg.get('reasoning_content'),
+    msg.get('reasoning'),
+    msg.get('refusal'),
+]
+texts = [c for c in candidates if isinstance(c, str) and c.strip()]
+assert texts, f'no non-empty content/reasoning/refusal in message: keys={sorted(msg.keys())}'
 " 2>/dev/null; then
         pass "$label"
         return 0
@@ -340,10 +354,19 @@ if echo "$resp" | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
 assert 'choices' in d, 'no choices'
-content = (d['choices'][0].get('message') or {}).get('content', '')
-# max_tokens=1 should yield a tiny response — empirically <30 chars.
-# Some models emit a leading space + 1 token of text.
-assert len(content) < 80, f'expected ≤80 chars at max_tokens=1, got {len(content)}'
+msg = d['choices'][0].get('message') or {}
+# Structured-reasoning models put output in reasoning/reasoning_content
+# when content is short or null. Sum lengths across all standard payload
+# fields — max_tokens=1 should still produce ≤80 chars total regardless
+# of which field carries it.
+total = sum(
+    len(s) for s in (
+        msg.get('content'),
+        msg.get('reasoning_content'),
+        msg.get('reasoning'),
+    ) if isinstance(s, str)
+)
+assert total < 80, f'expected ≤80 chars total at max_tokens=1, got {total}'
 " 2>/dev/null; then
     pass "max_tokens=1 produces short response"
 else

@@ -150,27 +150,74 @@ fi
 # ============================================================================
 info "=== Test 8: GGUF model via Ollama port ==="
 # ============================================================================
-
-resp=$(ollama_curl_long /v1/chat/completions 60 \
-    '{"model":"qwen3.5:9b","messages":[{"role":"user","content":"Say hi"}],"max_tokens":5}')
-if echo "$resp" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['model']=='qwen3.5:9b'" 2>/dev/null; then
-    pass "GGUF model via Ollama port"
+# Pick the SMALLEST Ollama tag by weight bytes — cold-start time scales
+# with weight transfer + GPU copy, so smallest = fastest round-trip
+# under the curl timeout. After test-probe-ollama-idempotent cycles
+# devai-ollama, /api/tags transiently returns size=0 entries while
+# disk indexing finishes (~5-10s); poll until at least one entry has
+# size>0 before deciding. Falls through to alphabetic-first only after
+# the timeout to avoid a flaky "no tags" failure when the daemon is
+# in the middle of indexing.
+TEST_MODEL=""
+for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    TEST_MODEL=$(ollama_curl /api/tags | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+models = d.get('models', []) or []
+sized = [m for m in models if int(m.get('size') or 0) > 0]
+if sized:
+    sized.sort(key=lambda m: int(m['size']))
+    print(sized[0]['name'])
+" 2>/dev/null)
+    [ -n "$TEST_MODEL" ] && break
+    sleep 2
+done
+if [ -z "$TEST_MODEL" ]; then
+    # Last-ditch: pick whatever's there even with size=0.
+    TEST_MODEL=$(ollama_curl /api/tags | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+models = d.get('models', []) or []
+print(sorted(m['name'] for m in models)[0] if models else '')
+" 2>/dev/null)
+fi
+if [ -z "$TEST_MODEL" ]; then
+    fail "GGUF via Ollama" "no Ollama tags downloaded — run 'make model-pull' first"
 else
-    fail "GGUF via Ollama" "$resp"
+    # Cold-start budget: even the smallest GGUF can take 60-120s to
+    # warm up after a fresh container cycle. 240s gives reasonable
+    # headroom without blocking the suite for an unreasonable time.
+    resp=$(ollama_curl_long /v1/chat/completions 240 \
+        "{\"model\":\"$TEST_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Say hi\"}],\"max_tokens\":5}")
+    if echo "$resp" | TEST_MODEL="$TEST_MODEL" python3 -c "
+import os, sys, json
+d = json.load(sys.stdin)
+assert d['model'] == os.environ['TEST_MODEL'], f\"model={d.get('model')!r} want {os.environ['TEST_MODEL']!r}\"
+" 2>/dev/null; then
+        pass "GGUF model via Ollama port ($TEST_MODEL)"
+    else
+        fail "GGUF via Ollama" "$resp"
+    fi
 fi
 
 # ============================================================================
 info "=== Test 9: Streaming (SSE via Ollama port) ==="
 # ============================================================================
+# Reuses TEST_MODEL discovered above so the test stays in lockstep with
+# whatever's on disk.
 
-resp=$($RUNTIME exec devai-open-webui curl -s --max-time 30 \
-    -H "Content-Type: application/json" \
-    "http://router:11434/v1/chat/completions" \
-    -d '{"model":"qwen3.5:9b","messages":[{"role":"user","content":"Count to 3"}],"max_tokens":20,"stream":true}' 2>&1)
-if echo "$resp" | grep -q "data:"; then
-    pass "Ollama SSE streaming works"
+if [ -z "$TEST_MODEL" ]; then
+    fail "Ollama SSE streaming" "no Ollama tags downloaded"
 else
-    fail "Ollama SSE streaming" "no SSE data received"
+    resp=$($RUNTIME exec devai-open-webui curl -s --max-time 30 \
+        -H "Content-Type: application/json" \
+        "http://router:11434/v1/chat/completions" \
+        -d "{\"model\":\"$TEST_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Count to 3\"}],\"max_tokens\":20,\"stream\":true}" 2>&1)
+    if echo "$resp" | grep -q "data:"; then
+        pass "Ollama SSE streaming works ($TEST_MODEL)"
+    else
+        fail "Ollama SSE streaming" "no SSE data received"
+    fi
 fi
 
 # ============================================================================

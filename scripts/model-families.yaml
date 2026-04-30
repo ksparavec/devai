@@ -32,6 +32,24 @@
 #                     the probe cache as `reasoning.capability`.
 #                     This flag is informational; the picker and router
 #                     ignore it and use the probe result instead.
+#   parsers         – CURATED HINT for vLLM/SGLang only. Names the backend
+#                     server-startup parser flags this family expects to
+#                     work with. The probe drivers launch with these flags
+#                     set and verify them in a single round-trip; the
+#                     router reads the probe-confirmed values back from the
+#                     cache. Shape:
+#                       parsers:
+#                         vllm:
+#                           reasoning: <vllm --reasoning-parser value>
+#                           tool: <vllm --tool-call-parser value>
+#                         sglang:
+#                           reasoning: <sglang --reasoning-parser value>
+#                           tool: <sglang --tool-call-parser value>
+#                     All four sub-fields are optional. A family without a
+#                     `parsers:` block probes in inline/no-tool mode (no
+#                     parser flags emitted; same behavior as today). Only
+#                     applies to hf_repos / NVFP4 / safetensors variants —
+#                     Ollama handles reasoning and tool-calling natively.
 #   defaults        – advisory default tags per backend (optional)
 #
 # YAML formatting rule: every list element on its own line. Do NOT use
@@ -73,6 +91,15 @@ families:
       - ykarout/Qwen3.5-9B-NVFP4
       - apolo13x/Qwen3.5-27B-NVFP4
       - apolo13x/Qwen3.5-35B-A3B-NVFP4
+    parsers:
+      vllm:
+        reasoning: qwen3
+        tool: hermes
+      sglang:
+        reasoning: qwen3
+        # `qwen` is forward-compat. Older `qwen25` still works in
+        # v0.5.10.post1 stable but is deprecation-warned in dev builds.
+        tool: qwen
     gguf_repos:
       # 27B dense — Q4_K_M from registry spills hard at 24G; sub-Q4
       # Unsloth quants fit. UD-Q3_K_XL is the recommended sweet spot;
@@ -96,32 +123,85 @@ families:
     thinking: true
 
   - name: qwen3
+    # Same model on both backends so the picker can show side-by-side
+    # rows for benchmarking. The tag filter in generate-catalog.py
+    # drops bare aliases (`:8b`, `:14b`) and routing variants
+    # (`:30b-instruct`, `:235b-thinking`) so only quantization-bearing
+    # tags reach the catalog.
+    ollama_repos:
+      - qwen3
     hf_repos:
+      # Dense — pick one (or more) that fits your VRAM band. NVFP4 weights:
+      #   8B  → ~6 GB    (fast iteration, fits everywhere)
+      #   14B → ~8 GB    (sweet spot on 24G)
+      #   32B → ~19 GB   (largest dense that fits 24G with KV)
+      - nvidia/Qwen3-8B-NVFP4
       - nvidia/Qwen3-14B-NVFP4
+      - nvidia/Qwen3-32B-NVFP4
+      # MoE — 30B total, 3B active per token. Loads like a 30B (~17 GB
+      # NVFP4) but compute-light. Distinct from the qwen3.5 family's
+      # 35B-A3B variants which have a different tokenizer.
+      - nvidia/Qwen3-30B-A3B-NVFP4
+    parsers:
+      vllm:
+        reasoning: qwen3
+        tool: hermes
+      sglang:
+        reasoning: qwen3
+        tool: qwen
     arch_ref: nvidia/Qwen3-14B-NVFP4
     thinking: true
 
   - name: llama3.2
+    # Ollama-only — NVIDIA hasn't published an NVFP4 quant for the
+    # Llama-3.2 1B/3B line (too small for the Blackwell tensor-core
+    # target). No HF sibling to add for cross-backend comparison.
     ollama_repos:
       - llama3.2
     arch_ref: nvidia/Llama-3.1-8B-Instruct-NVFP4
     thinking: false
 
   - name: llama3.1
+    # Both backends. Ollama's llama3.1 library covers 8B/70B/405B in
+    # every k-quant; the HF NVFP4 sibling is the 8B Instruct so picker
+    # rows align on size class for side-by-side benchmarking.
+    ollama_repos:
+      - llama3.1
     hf_repos:
       - nvidia/Llama-3.1-8B-Instruct-NVFP4
+    parsers:
+      # Llama-3.1 Instruct has no structured-reasoning surface — only
+      # tool-calling is curated here. Reasoning probe will fall back to
+      # inline/unsupported classification.
+      vllm:
+        tool: llama3_json
+      sglang:
+        tool: llama3
     arch_ref: nvidia/Llama-3.1-8B-Instruct-NVFP4
     thinking: false
 
   - name: nemotron-nano-v2
     hf_repos:
       - nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4
+    # Tool parser intentionally not curated. The 9B-v2 chat template uses
+    # NVIDIA's custom uppercase `<TOOLCALL>[...]</TOOLCALL>` /
+    # `<AVAILABLE_TOOLS>` / `<TOOL_RESPONSE>` format — no shipped vLLM
+    # or SGLang parser matches it (all stock parsers expect lowercase
+    # `<tool_call>` Hermes-style or family-specific tokens). Without a
+    # custom parser, the router strips `tools`/`tool_choice` for this
+    # model: agentic tool calls are silently absent, plain chat works.
     arch_ref: nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4
     thinking: true        # hint; vLLM/SGLang variants probed separately later
 
   - name: nemotron-3-nano
     ollama_repos:
       - nemotron-3-nano
+    hf_repos:
+      # 30B-A3B MoE, NVFP4 — dense compute footprint of ~3B active params
+      # per token but the full 30B knowledge surface. ~18 GB on disk.
+      - nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4
+      # Multimodal reasoning variant of the same MoE — omni I/O.
+      - nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4
     gguf_repos:
       # Nemotron-3-Nano-Omni-30B-A3B-Reasoning — MoE successor with
       # multimodal (omni) reasoning. ~3B active params per token so
@@ -131,17 +211,66 @@ families:
         include:
           - UD-Q3_K_XL
           - UD-IQ3_XXS
+    parsers:
+      # Reasoning parser: SGLang ships `nemotron_3`; vLLM accepts the
+      # same name (its --reasoning-parser is free-form).
+      # Tool parser: the 30B-A3B-NVFP4 chat template emits standard
+      # Hermes-style `<tool_call>...</tool_call>` tags (verified via
+      # `jq -r .chat_template tokenizer_config.json`), so `hermes` is
+      # the right choice on both backends. The probe verifies the
+      # round-trip before the router uses it.
+      vllm:
+        reasoning: nemotron_3
+        tool: hermes
+      sglang:
+        reasoning: nemotron_3
+        tool: hermes
     arch_ref: nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4
     thinking: true        # hint upgraded after probe verified structured
 
   - name: nemotron-cascade-2
+    # Ollama-only — no Cascade-2 NVFP4 published on the NVIDIA HF org
+    # (the NVFP4 line currently covers Nemotron-3-Nano and -Super
+    # variants, not Cascade). No HF sibling to add.
     ollama_repos:
       - nemotron-cascade-2
     arch_ref: nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4
     thinking: true        # hint upgraded after probe verified structured
 
   - name: nemotron
+    # Ollama-only — the legacy `nemotron` library hosts the 70B
+    # Llama-3-Nemotron variant in k-quants only. NVIDIA's NVFP4 line
+    # for that generation never shipped publicly.
     ollama_repos:
       - nemotron
     arch_ref: nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4
     thinking: false       # generic Nemotron, no reasoning per model card
+
+  - name: deepseek-r1-distill
+    # Both backends. Ollama's `deepseek-r1` library publishes the
+    # full distill matrix (1.5B/7B/8B/14B/32B/70B Qwen + Llama). HF
+    # mirrors are the BF16 originals — no NVFP4 distill exists.
+    # Tag scheme on Ollama side: `<size>-<base>-distill-<quant>`,
+    # e.g., `deepseek-r1:14b-qwen-distill-q4_K_M`.
+    ollama_repos:
+      - deepseek-r1
+    hf_repos:
+      # Official DeepSeek R1 distills — BF16 safetensors. NVIDIA hasn't
+      # published NVFP4 variants of the distills, and the community
+      # quants are unverified. BF16 fits on 24G:
+      #   Qwen-7B  → ~14 GB (Qwen2 arch)
+      #   Llama-8B → ~15 GB (Llama-3 arch)
+      # Both emit R1-style `<think>` blocks; the deepseek-r1 reasoning
+      # parser strips them into `reasoning_content`. Tool calling uses
+      # the deepseek_v3 family parser on both backends.
+      - deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+      - deepseek-ai/DeepSeek-R1-Distill-Llama-8B
+    parsers:
+      vllm:
+        reasoning: deepseek_r1
+        tool: deepseek_v3
+      sglang:
+        reasoning: deepseek-r1
+        tool: deepseekv3
+    arch_ref: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+    thinking: true

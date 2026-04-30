@@ -98,9 +98,15 @@ assert isinstance(cache, dict) and cache, f"cache empty or non-dict: {type(cache
 key = next(iter(cache))
 entry = cache[key]
 assert "@" in key, f"top-level key not <repo>@<sha>: {key!r}"
-assert entry.get("schema_version") == 1, f"schema_version != 1: {entry.get('schema_version')!r}"
+sv = entry.get("schema_version")
+assert sv in (1, 2), f"schema_version not in (1, 2): {sv!r}"
 for field in ("repo", "sha", "aliases", "probes"):
     assert field in entry, f"top-level missing {field!r}: {sorted(entry.keys())}"
+# v2 added top-level reasoning_parser / tool_parser / disable_verified.
+# Fields must exist even when null (= "prober looked, didn't confirm").
+if sv == 2:
+    for v2_field in ("reasoning_parser", "tool_parser", "disable_verified"):
+        assert v2_field in entry, f"v2 entry missing {v2_field!r}: {sorted(entry.keys())}"
 assert isinstance(entry["aliases"], list) and entry["aliases"], "aliases empty"
 assert isinstance(entry["probes"], dict), "probes not a dict"
 band = entry["probes"].get(str(vram))

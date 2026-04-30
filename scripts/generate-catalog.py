@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -134,15 +135,51 @@ def hf_gguf_files(repo: str) -> list[dict]:
 
 # ── Ollama ───────────────────────────────────────────────────────────────────
 
+# Quantization markers that distinguish a real model variant from a
+# bare-size alias / `:latest` / `:cloud` placeholder. Tags that don't
+# carry one of these tokens collapse onto the same blob as a sibling
+# that does, so emitting them in the catalog produces shadow rows.
+# Recognised: q[0-9] / iq[0-9] (llama.cpp k-quants), bf16 / fp16 / f16 /
+# f32 (full-precision), mxfp[0-9] (Microsoft FP4/FP8), nvfp[0-9] (NVIDIA
+# NVFP4/FP8), int[0-9] (INT4/INT8). Case-insensitive substring match.
+_OLLAMA_QUANT_RE = re.compile(
+    r"q[0-9]|iq[0-9]|bf16|fp16|f16|f32|mxfp[0-9]|nvfp[0-9]|int[0-9]",
+    re.IGNORECASE,
+)
+
+
+def _is_aliased_ollama_tag(tag: str) -> bool:
+    """True when the tag is a moving alias / placeholder rather than a
+    real downloadable variant.
+
+    Drops:
+      - `latest`                     (moving alias)
+      - any tag with no quantization marker (bare-size aliases like
+        `9b`, `27b`, `e2b`, routing variants like `30b-instruct`,
+        platform placeholders like `30b-cloud`, family-branch aliases
+        like `phi4-reasoning:plus`)
+    """
+    if tag == "latest":
+        return True
+    return not _OLLAMA_QUANT_RE.search(tag)
+
+
 def ollama_tags(library: str) -> list[str]:
     """Scrape tag names from ollama.com (the /v2/<x>/tags/list endpoint
-    is not publicly exposed and returns 404)."""
-    import re
+    is not publicly exposed and returns 404).
+
+    Filters out aliases / placeholders via `_is_aliased_ollama_tag` so
+    the generated catalog never re-emits the bare-size and `:latest`
+    tags we cleaned out of the local Ollama daemon.
+    """
     html = _http_text(f"{OLLAMA_WEB}/{library}/tags")
     pattern = re.compile(rf"{re.escape(library)}:[A-Za-z0-9_.\-]+")
     seen: dict[str, None] = {}
     for m in pattern.findall(html):
-        seen.setdefault(m.split(":", 1)[1], None)
+        tag = m.split(":", 1)[1]
+        if _is_aliased_ollama_tag(tag):
+            continue
+        seen.setdefault(tag, None)
     return list(seen)
 
 
@@ -207,6 +244,16 @@ class Entry:
     sha: str | None = None  # short git sha (12 chars) for source_kind == "hf";
                             # cache key for the vLLM/SGLang probe — `f-...`
                             # prefix indicates a fingerprint fallback
+    parsers: dict | None = None  # curated vLLM/SGLang parser hints from the
+                                 # family's `parsers:` block. Shape:
+                                 # {"vllm": {"reasoning": ..., "tool": ...},
+                                 #  "sglang": {"reasoning": ..., "tool": ...}}.
+                                 # Sub-fields optional. None when the family
+                                 # declared nothing — probers fall back to
+                                 # inline/no-tool mode.
+    conversational: bool | None = None  # presence of HF API tag
+                                        # "conversational" — instruct/chat
+                                        # tuned. None for non-HF rows.
 
 
 def _gb(bytes_: int) -> float:
@@ -214,7 +261,7 @@ def _gb(bytes_: int) -> float:
 
 
 def _entry_hf(repo: str, family: str, fallback_arch: Arch,
-              thinking: bool) -> Entry | None:
+              thinking: bool, parsers: dict | None) -> Entry | None:
     try:
         size_bytes = hf_weight_bytes(repo)
     except Exception as e:
@@ -236,6 +283,17 @@ def _entry_hf(repo: str, family: str, fallback_arch: Arch,
     except Exception as e:
         print(f"  [warn] HF sha: {repo}: {e}", file=sys.stderr)
         sha = None
+    # The HF API tag set distinguishes instruct/chat models from base
+    # ones via the `conversational` tag. More reliable than checking
+    # tokenizer_config.json's chat_template (NVIDIA's NVFP4 quants
+    # routinely strip it). Same cached response as size + sha — no
+    # extra network round-trip.
+    try:
+        hf_tags = _hf_blobs(repo).get("tags") or []
+        conversational = "conversational" in hf_tags
+    except Exception as e:
+        print(f"  [warn] HF tags: {repo}: {e}", file=sys.stderr)
+        conversational = None
     return Entry(
         name=repo.split("/")[-1],
         family=family,
@@ -246,7 +304,33 @@ def _entry_hf(repo: str, family: str, fallback_arch: Arch,
         source_kind="hf",
         thinking=thinking,
         sha=sha,
+        parsers=_normalize_parsers(parsers),
+        conversational=conversational,
     )
+
+
+def _normalize_parsers(parsers: dict | None) -> dict | None:
+    """Validate and normalize the family's `parsers:` block.
+
+    Accepts only the documented shape and known sub-keys; drops empty
+    entries so the generated catalog row is minimal. Returns None when
+    the input has no usable content.
+    """
+    if not parsers or not isinstance(parsers, dict):
+        return None
+    out: dict = {}
+    for backend in ("vllm", "sglang"):
+        block = parsers.get(backend)
+        if not isinstance(block, dict):
+            continue
+        kept: dict = {}
+        for key in ("reasoning", "tool"):
+            val = block.get(key)
+            if isinstance(val, str) and val.strip():
+                kept[key] = val.strip()
+        if kept:
+            out[backend] = kept
+    return out or None
 
 
 def _gguf_tag_token(filename: str) -> str:
@@ -347,7 +431,10 @@ def main() -> None:
     for fam in fams:
         name = fam["name"]
         thinking = bool(fam.get("thinking", False))
-        print(f"\n── family: {name}  (thinking-hint={thinking})")
+        parsers = fam.get("parsers")
+        parser_label = "—" if not parsers else ",".join(sorted(parsers.keys()))
+        print(f"\n── family: {name}  (thinking-hint={thinking}, "
+              f"parsers={parser_label})")
         arch_ref = fam.get("arch_ref")
         if not arch_ref:
             print(f"  [error] family {name} has no arch_ref — skipping",
@@ -359,7 +446,7 @@ def main() -> None:
 
         for repo in fam.get("hf_repos") or []:
             print(f"  HF: {repo} ... ", end="", flush=True)
-            e = _entry_hf(repo, name, fam_arch, thinking)
+            e = _entry_hf(repo, name, fam_arch, thinking, parsers)
             if e:
                 print(f"{e.size_gb:.1f} GB  arch={e.arch.layers}L/"
                       f"{e.arch.kv_heads}kv/{e.arch.head_dim}h")
@@ -463,11 +550,31 @@ def main() -> None:
         lines.append(f"    arch: {e.arch.to_yaml()}")
         lines.append(f'    arch_source: "{e.arch.source}"')
         lines.append(f'    purpose: "{purpose}"')
+        # `conversational: true|false` from the HF API tag set —
+        # consumed by the picker to label tuning style (IT vs BASE).
+        # Omitted on non-HF rows (where it'd always be None).
+        if e.conversational is not None:
+            lines.append(f'    conversational: {str(e.conversational).lower()}')
         # Note: a `thinking:` field used to be written here as a family-level
         # pre-probe hint, but no consumer reads it — capability is determined
         # at runtime by scripts/probe-ollama-reasoning.py and recorded in
         # active-models.yaml under `reasoning.capability`. Field removed to
         # avoid the impression that catalog metadata can override the probe.
+        if e.parsers:
+            # Curated parser hints from scripts/model-families.yaml. The
+            # probe drivers consume these to launch with the correct
+            # --reasoning-parser / --tool-call-parser flags; the router
+            # reads the probe-confirmed values back from the cache. Only
+            # emitted for HF entries — Ollama handles parsing natively.
+            lines.append("    parsers:")
+            for backend in ("vllm", "sglang"):
+                block = e.parsers.get(backend)
+                if not block:
+                    continue
+                lines.append(f"      {backend}:")
+                for key in ("reasoning", "tool"):
+                    if key in block:
+                        lines.append(f"        {key}: {block[key]}")
         lines.append("")
 
     OUTPUT_YAML.write_text("\n".join(lines))

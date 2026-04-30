@@ -681,6 +681,9 @@ class Row:
     candidate: bool = False
     suppress_reason: str = ""
     active_eligible: bool = False
+    # (family, backend, ctx) cells this row was selected to fill. Populated
+    # by assign_cell_candidates when the row is a chosen candidate.
+    cells_filled: list = field(default_factory=list)
 
 
 _PROBED_SOURCES = ("probe", "hf-probe")
@@ -798,120 +801,284 @@ def _is_eligible_backend(row: Row, hf_caches: HFProbeCaches) -> bool:
     return False
 
 
-def assign_trial_candidates(
-    rows: list[Row],
-    max_downloads_per_family: int,
-    vram: float,
-    hf_caches: HFProbeCaches,
-) -> list[Row]:
-    """Mark bounded missing rows worth a trial download.
+# Quantization rank table — higher = higher precision. Used as the
+# secondary tiebreak in cell_quality(). Strings are uppercased before
+# lookup; longer keys take precedence (`Q4_K_M` beats `Q4`). Values are
+# loosely calibrated against effective bits-per-weight.
+_QUANT_RANK = {
+    # full precision
+    "F32": 32.0, "FP32": 32.0,
+    "F16": 16.0, "FP16": 16.0, "BF16": 16.0, "HALF": 16.0,
+    # 8-bit
+    "Q8_0": 8.0, "Q8_K": 8.0,
+    "INT8": 8.0, "FP8": 8.0, "MXFP8": 8.0,
+    # 6-bit
+    "Q6_K": 6.0,
+    # 5-bit
+    "Q5_K_M": 5.5, "Q5_K_S": 5.3, "Q5_1": 5.1, "Q5_0": 5.0,
+    # 4-bit
+    "Q4_K_M": 4.5, "Q4_K_S": 4.3, "Q4_1": 4.1, "Q4_0": 4.0,
+    "INT4": 4.0, "NVFP4": 4.0, "FP4": 4.0, "MXFP4": 4.0,
+    "AWQ": 4.0, "GPTQ": 4.0,
+    # 3-bit
+    "Q3_K_L": 3.7, "Q3_K_M": 3.5, "Q3_K_S": 3.3,
+    "IQ3_XXS": 3.0, "IQ3_M": 3.2, "IQ3_S": 3.1,
+    "UD-Q3_K_XL": 3.6, "UD-IQ3_XXS": 3.0,
+    # 2-bit
+    "Q2_K": 2.0, "IQ2_M": 2.2, "IQ2_S": 2.1, "IQ2_XS": 2.0, "IQ2_XXS": 1.9,
+}
 
-    Candidate status is intentionally stricter than formula fit:
-    - only rows whose backend is currently working are considered
-      (Ollama unconditionally; vLLM/SGLang only when their probe cache
-      has at least one fitting entry);
-    - :latest loses whenever a descriptive same-family fit exists;
-    - smaller same-family rows are suppressed when a larger quality
-      tier fits;
-    - aliases with the same estimated shape collapse to one explicit tag;
-    - downloads are capped per family.
+# Module-level cached sort of quant tokens by length descending so the
+# substring search prefers `Q5_K_M` over `Q5_K`, etc.
+_QUANT_TOKENS = sorted(_QUANT_RANK.keys(), key=lambda k: -len(k))
+
+
+def quant_rank(model: dict) -> float:
+    """Numeric rank of a model's quantization. Higher = higher precision.
+
+    Lookup priority:
+      1. Probe-derived `details.quantization` (Ollama).
+      2. Token in catalog `name` (matches the longest token first so
+         `Q4_K_M` wins over a bare `Q4`).
+      3. Default 4.0 — assume mid-range when unknown.
     """
-    by_family: dict[str, list[Row]] = {}
-    for row in rows:
-        if row.fits and _is_eligible_backend(row, hf_caches):
+    details = model.get("details") or {}
+    q = (details.get("quantization") or "").upper().strip()
+    if q and q in _QUANT_RANK:
+        return _QUANT_RANK[q]
+    name = str(model.get("name") or "").upper()
+    for token in _QUANT_TOKENS:
+        if token in name:
+            return _QUANT_RANK[token]
+    return 4.0
+
+
+def cell_quality(row: Row) -> tuple[float, float, float, int]:
+    """Sort key for picking the best variant within a (family, backend, ctx)
+    cell. Higher is better.
+
+      1. param_size_hint (params dominate; 14B > 7B regardless of quant).
+      2. quant_rank (14B-Q8 beats 14B-Q4).
+      3. total_gb (closer-to-budget fit wins ties).
+      4. name_priority[1] (longer / more-explicit tag breaks ties).
+    """
+    return (
+        param_size_hint(row.model),
+        quant_rank(row.model),
+        row.total_gb,
+        name_priority(row.model)[1],
+    )
+
+
+def _row_probe_entry(
+    row: Row, backend: str,
+    probe_cache: ProbeCache, hf_caches: HFProbeCaches,
+) -> dict:
+    """Return the top-level probe entry for (model, backend) or {}.
+
+    Ollama uses its digest cache; vLLM/SGLang use the repo+sha HF caches.
+    Empty dict when the model wasn't probed for this backend at all.
+    """
+    m = row.model
+    if backend == "ollama":
+        if not is_ollama_only(m):
+            return {}
+        return lookup_probe(m["name"], probe_cache)
+    if backend in ("vllm", "sglang"):
+        if is_ollama_only(m):
+            return {}
+        return hf_caches.lookup(m.get("repo") or "", m.get("sha") or "", backend)
+    return {}
+
+
+def _row_probe_cell(
+    row: Row, backend: str, vram_band: int, ctx: int,
+    probe_cache: ProbeCache, hf_caches: HFProbeCaches,
+) -> dict | None:
+    """Return the probe cell at (model, backend, vram, ctx), or None if
+    no measurement exists at that exact tier."""
+    entry = _row_probe_entry(row, backend, probe_cache, hf_caches)
+    if not entry:
+        return None
+    if backend == "ollama":
+        return probe_at_context(entry, vram_band, ctx)
+    return hf_probe_at_context(entry, vram_band, ctx)
+
+
+def _row_probe_passed(
+    row: Row, backend: str, vram_band: int, ctx: int,
+    probe_cache: ProbeCache, hf_caches: HFProbeCaches,
+) -> bool:
+    """True iff the probe explicitly confirmed (model, backend, vram, ctx)
+    fits and runs fully on GPU. Used to decide if a cell is already
+    filled by a downloaded variant — pending-probe variants do NOT count."""
+    cell = _row_probe_cell(row, backend, vram_band, ctx, probe_cache, hf_caches)
+    if not cell:
+        return False
+    if backend == "ollama":
+        return bool(cell.get("fully_on_gpu", False))
+    return bool(cell.get("fits", False))
+
+
+def _row_probe_rejected(
+    row: Row, backend: str, vram_band: int, ctx: int,
+    probe_cache: ProbeCache, hf_caches: HFProbeCaches,
+) -> bool:
+    """True iff the probe explicitly rejected (model, backend, vram, ctx).
+
+    Rejection reasons:
+      - top-level capability is `error` or `unsupported_arch` (the model
+        can't load on this backend at any tier);
+      - this exact (vram, ctx) cell exists with fits=false (HF) or
+        fully_on_gpu=false (Ollama).
+    Cells absent from the cache do NOT count as rejection — they're just
+    unprobed at that tier.
+    """
+    entry = _row_probe_entry(row, backend, probe_cache, hf_caches)
+    if entry.get("capability") in ("error", "unsupported_arch"):
+        return True
+    cell = _row_probe_cell(row, backend, vram_band, ctx, probe_cache, hf_caches)
+    if not cell:
+        return False
+    if backend == "ollama":
+        return cell.get("fully_on_gpu") is False
+    return cell.get("fits") is False
+
+
+def _model_file_id(model: dict) -> tuple:
+    """Identity for download dedup. Two catalog rows referencing the same
+    on-disk file share an id (e.g., one HF safetensors directory backs
+    both vLLM and SGLang cells — pull once, two probes can run later)."""
+    if is_ollama_only(model):
+        return ("ollama", model.get("name"))
+    return ("hf", model.get("repo"))
+
+
+def _backends_for(model: dict) -> list[str]:
+    """Return the backends ('ollama', 'vllm', 'sglang') a catalog row
+    advertises. Each backend is its own cell axis in the matrix."""
+    out: list[str] = []
+    for b in model.get("backend") or []:
+        if b in ("ollama", "vllm", "sglang"):
+            out.append(b)
+    return out
+
+
+def assign_cell_candidates(
+    models: list[dict],
+    contexts: list[int],
+    kv_dtype: str,
+    min_total: float,
+    vram_budget: float,
+    probe_cache: ProbeCache,
+    hf_caches: HFProbeCaches,
+    max_per_cell: int = 1,
+) -> tuple[list[Row], dict[tuple, dict], dict[int, list[Row]]]:
+    """Build the (family, backend, ctx) cell matrix and select trial
+    candidates per cell.
+
+    Per cell:
+      - skip if any downloaded variant has a probe-passed cell here;
+      - drop probe-rejected variants (capability error or fits=false at
+        this exact (vram, ctx));
+      - rank surviving variants by `cell_quality` (params → quant rank
+        → total VRAM) and pick the top `max_per_cell`.
+
+    Returns:
+      - candidate_rows: file-deduplicated list of Rows to download.
+        Each row has `r.candidate = True` set as a side effect, and
+        `r.cells_filled` lists the cells the row was selected for.
+      - cell_index: {(family, backend, ctx): {"status": ..., "row": ...}}
+        with status ∈ {filled, candidate, pending_probe, no_options}.
+      - rows_by_ctx: per-context Row lists (for downstream display).
+    """
+    vram_band = int(round(vram_budget))
+    rows_by_ctx: dict[int, list[Row]] = {}
+    for ctx in contexts:
+        rows_by_ctx[ctx] = build_rows(
+            models, ctx, kv_dtype, min_total, vram_budget,
+            probe_cache, hf_caches,
+        )
+
+    cell_index: dict[tuple, dict] = {}
+
+    for ctx, rows in rows_by_ctx.items():
+        # Group fitting rows by (family, backend) for this ctx
+        bucket: dict[tuple[str, str], list[Row]] = {}
+        for row in rows:
+            if not row.fits:
+                continue
             family = row.model.get("family") or ""
-            by_family.setdefault(family, []).append(row)
+            for backend in _backends_for(row.model):
+                if backend in ("vllm", "sglang") and not hf_caches.has_working_probe(backend):
+                    continue
+                bucket.setdefault((family, backend), []).append(row)
 
-    selected: list[Row] = []
-    for family_rows in by_family.values():
-        reference_rows = [
-            r for r in family_rows
-            if not is_latest_tag(r.model) and trusted_for_family_gate(r)
-        ]
-        if not reference_rows:
-            reference_rows = [r for r in family_rows if trusted_for_family_gate(r)]
-        if not reference_rows:
+        for (family, backend), cell_rows in bucket.items():
+            cell_key = (family, backend, ctx)
+
+            # Cell-fill check: any downloaded variant probe-passed at this cell?
+            filled_by: Row | None = None
+            for r in cell_rows:
+                if r.downloaded and _row_probe_passed(
+                    r, backend, vram_band, ctx, probe_cache, hf_caches,
+                ):
+                    filled_by = r
+                    break
+            if filled_by is not None:
+                cell_index[cell_key] = {"status": "filled", "row": filled_by}
+                continue
+
+            # Drop probe-rejected variants for this exact cell
+            usable = [
+                r for r in cell_rows
+                if not _row_probe_rejected(
+                    r, backend, vram_band, ctx, probe_cache, hf_caches,
+                )
+            ]
+
+            missing = [r for r in usable if not r.downloaded]
+            on_disk_unprobed = [r for r in usable if r.downloaded]
+
+            if not missing:
+                # No new download needed. Cell may resolve once the
+                # on-disk variant gets probed at this tier.
+                if on_disk_unprobed:
+                    on_disk_unprobed.sort(key=cell_quality, reverse=True)
+                    cell_index[cell_key] = {
+                        "status": "pending_probe", "row": on_disk_unprobed[0],
+                    }
+                else:
+                    cell_index[cell_key] = {"status": "no_options", "row": None}
+                continue
+
+            # Rank by quality — params first, then quant precision
+            missing.sort(key=cell_quality, reverse=True)
+            picked = missing[:max(0, max_per_cell)]
+            if not picked:
+                cell_index[cell_key] = {"status": "no_options", "row": None}
+                continue
+            cell_index[cell_key] = {"status": "candidate", "row": picked[0]}
+            for r in picked:
+                r.candidate = True
+                r.cells_filled.append(cell_key)
+
+    # File-level dedup of the candidate list — two cells targeting the
+    # same on-disk file (e.g., the vLLM and SGLang versions of one HF
+    # repo) trigger one download.
+    seen: set = set()
+    deduped: list[Row] = []
+    for cell_key, info in cell_index.items():
+        if info.get("status") != "candidate":
             continue
-        best_quality = max(row_quality(r) for r in reference_rows)
-        descriptive_fit_exists = any(not is_latest_tag(r.model) for r in reference_rows)
-        downloaded_signatures = {
-            candidate_signature(r) for r in family_rows if r.downloaded
-        }
+        row = info["row"]
+        fid = _model_file_id(row.model)
+        if fid in seen:
+            continue
+        seen.add(fid)
+        deduped.append(row)
 
-        missing = [r for r in family_rows if not r.downloaded]
-        eligible: list[Row] = []
-        for row in missing:
-            if candidate_signature(row) in downloaded_signatures:
-                row.suppress_reason = "equivalent family model already on disk"
-                continue
-            if is_latest_tag(row.model) and descriptive_fit_exists:
-                row.suppress_reason = "latest alias; descriptive tag fits"
-                continue
-            if row_quality(row) < best_quality - 0.05:
-                better = max(
-                    reference_rows,
-                    key=lambda r: (row_quality(r), r.total_gb, *name_priority(r.model)),
-                )
-                if better.downloaded:
-                    row.suppress_reason = (
-                        f"larger family model already fits: {better.model['name']}"
-                    )
-                else:
-                    row.suppress_reason = (
-                        f"larger family candidate fits: {better.model['name']}"
-                    )
-                continue
-            eligible.append(row)
-
-        deduped: dict[tuple, Row] = {}
-        for row in eligible:
-            sig = candidate_signature(row)
-            previous = deduped.get(sig)
-            if (
-                previous is None
-                or name_priority(row.model) > name_priority(previous.model)
-            ):
-                if previous is not None:
-                    previous.suppress_reason = (
-                        f"duplicate estimated alias; using {row.model['name']}"
-                    )
-                deduped[sig] = row
-            else:
-                row.suppress_reason = (
-                    f"duplicate estimated alias; using {previous.model['name']}"
-                )
-
-        if deduped:
-            ranked = sorted(
-                deduped.values(), key=lambda r: trial_score(r, vram), reverse=True,
-            )
-            family_selected = ranked[:max(0, max_downloads_per_family)]
-            selected_ids = {id(row) for row in family_selected}
-            best = ranked[0]
-            for row in ranked:
-                if id(row) in selected_ids:
-                    continue
-                if max_downloads_per_family <= 0:
-                    row.suppress_reason = (
-                        "candidate over per-family download limit (0)"
-                    )
-                else:
-                    row.suppress_reason = (
-                        f"candidate over per-family download limit "
-                        f"({max_downloads_per_family})"
-                    )
-            for row in deduped.values():
-                if id(row) in selected_ids or row.suppress_reason:
-                    continue
-                row.suppress_reason = (
-                    f"better family candidate fits: {best.model['name']}"
-                )
-            selected.extend(family_selected)
-
-    selected = sorted(selected, key=lambda r: trial_score(r, vram), reverse=True)
-    for row in selected:
-        row.candidate = True
-    return selected
+    return deduped, cell_index, rows_by_ctx
 
 
 def _hf_lookup_with_priority(
@@ -1062,41 +1229,76 @@ def build_rows(
     return rows
 
 
-def print_context_candidate_summary(
-    models: list[dict],
+def _format_cell(info: dict, width: int) -> str:
+    """Render one matrix cell as a fixed-width string with status glyph."""
+    glyph_by_status = {
+        "filled": "✓", "candidate": "↓", "pending_probe": "◌",
+        "no_options": "-",
+    }
+    status = info.get("status") if info else "no_options"
+    glyph = glyph_by_status.get(status, "?")
+    if status == "no_options" or not info or not info.get("row"):
+        return f"{glyph:<{width}s}"
+    name = info["row"].model.get("name") or "?"
+    # Truncate from the LEFT — quant suffix is more informative than
+    # the family prefix when names get crowded.
+    body = f"{glyph} {name}"
+    if len(body) > width:
+        body = f"{glyph} …{name[-(width - 4):]}"
+    return f"{body:<{width}s}"
+
+
+def print_cell_matrix(
+    cell_index: dict[tuple, dict],
     contexts: list[int],
-    kv_dtype: str,
-    min_total: float,
     vram_budget: float,
-    probe_cache: ProbeCache,
-    hf_caches: HFProbeCaches,
-    max_downloads: int,
+    kv_dtype: str,
 ) -> None:
-    if not contexts:
+    """Render the (family, backend) × ctx matrix the selector built.
+
+    One row per (family, backend) pair, one column per context. Cells
+    show the variant filling that cell (downloaded + probed, marked ✓),
+    the trial candidate the selector would pull (marked ↓), an on-disk
+    variant awaiting probe (◌), or no fitting option (-).
+    """
+    if not cell_index or not contexts:
         return
-    print("  context trial candidates:")
-    print(f"  {'CTX':>5s}  {'ACTIVE':>6s}  {'FITTING':>7s}  {'CANDIDATE'}")
-    print(f"  {'-' * 78}")
-    for ctx in contexts:
-        rows = build_rows(
-            models, ctx, kv_dtype, min_total, vram_budget, probe_cache, hf_caches,
-        )
-        candidates = assign_trial_candidates(
-            rows, max_downloads, vram_budget, hf_caches,
-        )
-        active_count = sum(1 for r in rows if r.active_eligible)
-        fitting_count = sum(1 for r in rows if r.fits)
-        if candidates:
-            candidate_text = ", ".join(
-                f"{r.model['name']} ({r.total_gb:.1f}G)" for r in candidates
+    families = sorted({k[0] for k in cell_index.keys()})
+    backends_seen = sorted({k[1] for k in cell_index.keys()},
+                           key=lambda b: ("ollama", "vllm", "sglang").index(b)
+                           if b in ("ollama", "vllm", "sglang") else 99)
+
+    col_w = 22
+    name_w = 18
+    backend_w = 7
+
+    def header_line() -> str:
+        cols = "  ".join(f"{context_label(c):<{col_w}s}" for c in contexts)
+        return (f"  {'FAMILY':<{name_w}s}  {'BACKEND':<{backend_w}s}  {cols}")
+
+    print(f"  ── Cell matrix: vram={vram_budget:g} GB, kv={kv_dtype}, "
+          f"contexts=[{', '.join(context_label(c) for c in contexts)}] ──")
+    print()
+    print(header_line())
+    print(f"  {'-' * (name_w + backend_w + 4 + (col_w + 2) * len(contexts) - 2)}")
+
+    for family in families:
+        printed_header = False
+        for backend in backends_seen:
+            # Skip a (family, backend) row entirely if the matrix has no
+            # cell at all for this pair (e.g., HF-only family + ollama).
+            if not any((family, backend, c) in cell_index for c in contexts):
+                continue
+            cells = "  ".join(
+                _format_cell(cell_index.get((family, backend, c)), col_w)
+                for c in contexts
             )
-        else:
-            candidate_text = "-"
-        print(
-            f"  {context_label(ctx):>5s}  {active_count:>6d}  "
-            f"{fitting_count:>7d}  {candidate_text}"
-        )
-    print("  set CONTEXT=<tokens> to make one of these contexts the active write target")
+            label = "" if printed_header else family
+            print(f"  {label:<{name_w}s}  {backend:<{backend_w}s}  {cells}")
+            printed_header = True
+    print()
+    print("  Legend:  ✓ filled (probed)   ↓ candidate (will pull)   "
+          "◌ pending probe   - no option")
     print()
 
 
@@ -1105,10 +1307,18 @@ def main() -> None:
     ap.add_argument("--family", default="")
     ap.add_argument("--vram", type=float,
                     default=float(os.environ.get("GPU_MEMORY_GB", "24")))
-    ap.add_argument("--context", type=parse_context_value,
-                    default=parse_context_value(
-                        os.environ.get("MAX_CONTEXT_LEN", "131072"),
-                    ))
+    # --context: single-context override. When omitted, the selector
+    # iterates the matrix from --contexts (default 32K/64K/128K/256K).
+    # The MAX_CONTEXT_LEN env still seeds a default, but the matrix
+    # mode is the right answer for cross-backend benchmarking.
+    ap.add_argument("--context", type=parse_context_value, default=None,
+                    help="Single context (tokens or 32K/64K notation) to plan "
+                         "against. Omit for matrix mode iterating --contexts.")
+    ap.add_argument("--contexts",
+                    default=os.environ.get("CONTEXTS", DEFAULT_CANDIDATE_CONTEXTS),
+                    help="Comma-separated contexts for matrix mode "
+                         "(default 32K,64K,128K,256K). Ignored when --context "
+                         "is set.")
     ap.add_argument("--kv-dtype", choices=list(KV_BYTES), default="fp16")
     ap.add_argument("--min-vram-fraction", type=float,
                     default=float(os.environ.get("MIN_VRAM_FRACTION", "0.5")),
@@ -1120,17 +1330,11 @@ def main() -> None:
                     help="Pull bounded trial candidates that are not yet on disk")
     ap.add_argument("--max-downloads", type=int,
                     default=int(os.environ.get("DOWNLOAD_LIMIT", "1")),
-                    help="Maximum missing trial candidates to pull per family "
-                         "(default $DOWNLOAD_LIMIT or 1)")
+                    help="Maximum trial candidates to pull per "
+                         "(family, backend, ctx) cell (default "
+                         "$DOWNLOAD_LIMIT or 1).")
     ap.add_argument("--download-report", type=Path,
                     help="Write names actually pulled, one per line")
-    ap.add_argument("--candidate-contexts",
-                    default=os.environ.get(
-                        "CANDIDATE_CONTEXTS", DEFAULT_CANDIDATE_CONTEXTS,
-                    ),
-                    help="Comma-separated contexts to summarize as trial "
-                         "candidates (default 32K,64K,128K,256K; use none "
-                         "to disable)")
     ap.add_argument("--prune", action="store_true",
                     help="Delete on-disk models that don't fit. Scoped by --family.")
     ap.add_argument("--prune-shadows", action="store_true",
@@ -1155,24 +1359,31 @@ def main() -> None:
     if not models:
         sys.exit(f"error: no models in catalog match family='{args.family}'")
 
-    # Use the user's --context exactly for every backend. No clamping
-    # to OLLAMA_CONTEXT_LENGTH or any other runtime cap — the planner's
-    # job is to compute fit at the requested context, not to second-
-    # guess it.
+    # Resolve the context list: --context overrides to single-ctx mode;
+    # otherwise the matrix from --contexts is iterated.
+    if args.context is not None:
+        contexts = [args.context]
+    else:
+        contexts = parse_context_list(args.contexts)
+    if not contexts:
+        sys.exit("error: at least one context is required (--context or --contexts)")
+
+    # Display ctx for the per-row table — when in matrix mode we pick
+    # the largest context as the "primary" view; smaller contexts are
+    # more inclusive (more rows fit) but the user usually cares about
+    # the highest tier first.
+    display_ctx = max(contexts)
+
     min_total = args.vram * max(0.0, args.min_vram_fraction)
     probe_cache = load_probe_cache()
     hf_caches = load_hf_probe_caches()
 
-    candidate_contexts = parse_context_list(args.candidate_contexts)
-    rows = build_rows(
-        models, args.context, args.kv_dtype, min_total, args.vram, probe_cache,
-        hf_caches,
+    trial_candidates, cell_index, rows_by_ctx = assign_cell_candidates(
+        models, contexts, args.kv_dtype, min_total, args.vram,
+        probe_cache, hf_caches, max_per_cell=args.max_downloads,
     )
-
+    rows = rows_by_ctx[display_ctx]
     missing = [r for r in rows if r.fits and not r.downloaded]
-    trial_candidates = assign_trial_candidates(
-        rows, args.max_downloads, args.vram, hf_caches,
-    )
     missing_bytes_gb = sum(parse_size_gb(r.model["size"]) for r in missing)
     candidate_bytes_gb = sum(parse_size_gb(r.model["size"]) for r in trial_candidates)
     # Prune candidates: on disk AND outside the [min_total, args.vram] window —
@@ -1185,102 +1396,97 @@ def main() -> None:
     # ── Print plan ───────────────────────────────────────────────────────
     print()
     filter_note = f"family={args.family}  " if args.family else ""
+    ctx_note = (f"context={args.context}" if args.context is not None
+                else f"contexts=[{', '.join(context_label(c) for c in contexts)}]")
     print(f"  [select] {filter_note}vram={args.vram:g} GB  "
           f"min={min_total:.1f} GB ({args.min_vram_fraction:g}×)  "
-          f"context={args.context}  kv={args.kv_dtype}  "
-          f"download_limit_per_family={args.max_downloads}"
+          f"{ctx_note}  kv={args.kv_dtype}  "
+          f"max_per_cell={args.max_downloads}"
           + ("  (dry-run)" if args.dry_run else ""))
     print()
-    print(f"  {'MODEL':<42s} {'SRC':<7s} {'WEIGHTS':>8s} {'SIZE':>8s} "
-          f"{'CTX':>5s}  {'CAP':<11s} FIT  DISK  ACTION")
-    print(f"  {'-'*120}")
-    suppressed_small = 0
-    suppressed_large = 0
-    for r in rows:
-        m = r.model
-        size = m.get("size", "?")
-        too_large = r.total_gb > args.vram
-        too_small = r.total_gb < min_total
-        # Default view shows only fitting models. Non-fitting rows are
-        # suppressed UNLESS verbose is on OR they're on-disk and prunable
-        # (which is destructive — user must see what's being deleted).
-        if not args.verbose and not r.fits:
-            visible = r.downloaded and args.prune
-            if not visible:
-                if too_small:
-                    suppressed_small += 1
+
+    # Matrix view — one row per (family, backend), one column per context.
+    print_cell_matrix(cell_index, contexts, args.vram, args.kv_dtype)
+
+    if not args.verbose:
+        # Verbose mode below adds the per-row table at display_ctx for debug.
+        pass
+    else:
+        print(f"  Per-row view at ctx={context_label(display_ctx)}:")
+        print()
+    if args.verbose:
+        print(f"  {'MODEL':<42s} {'SRC':<7s} {'WEIGHTS':>8s} {'SIZE':>8s} "
+              f"{'CTX':>5s}  {'CAP':<11s} FIT  DISK  ACTION")
+        print(f"  {'-'*120}")
+        for r in rows:
+            m = r.model
+            size = m.get("size", "?")
+            too_large = r.total_gb > args.vram
+            too_small = r.total_gb < min_total
+            fit_mark = "✓" if r.fits else ("↓" if too_small else "✗")
+            disk_mark = "✓" if r.downloaded else "·"
+            if too_large and r.downloaded:
+                if args.prune:
+                    action = "→ PRUNE (on disk, too large)"
                 else:
-                    suppressed_large += 1
-                continue
-        fit_mark = "✓" if r.fits else ("↓" if too_small else "✗")
-        disk_mark = "✓" if r.downloaded else "·"
-        if too_large and r.downloaded:
-            if args.prune:
-                action = "→ PRUNE (on disk, too large)"
+                    action = "on disk but skipped (pass --prune to delete)"
+            elif too_small and r.downloaded:
+                if args.prune:
+                    action = (f"→ PRUNE (on disk, too small for "
+                              f"--min-vram-fraction={args.min_vram_fraction:g})")
+                else:
+                    action = (f"on disk but skipped, too small for floor "
+                              f"({min_total:.0f} GB) — pass --prune to delete")
+            elif too_large:
+                action = "skip (too large)"
+            elif too_small:
+                action = (f"skip (too small, <{min_total:.0f} GB; lower "
+                          f"--min-vram-fraction to include)")
+            elif r.downloaded:
+                v = r.model.get("vram") or {}
+                if r.active_eligible:
+                    action = "already on disk → active"
+                elif is_ollama_only(r.model) and v.get("source") != "probe":
+                    action = "on disk, needs probe before active"
+                elif is_ollama_only(r.model) and not v.get("fully_on_gpu", True):
+                    action = "on disk but skipped (probe showed CPU spill)"
+                else:
+                    action = "on disk but skipped"
+            elif r.candidate and args.dry_run:
+                cells_n = len(r.cells_filled)
+                action = f"would download candidate (fills {cells_n} cell(s))"
+            elif r.candidate and args.download:
+                action = "→ DOWNLOAD (candidate)"
+            elif r.candidate:
+                action = "candidate (pass --download to pull)"
+            elif not is_ollama_only(r.model):
+                action = "skip (backend dormant)"
+            elif args.dry_run or args.download:
+                action = "missing, not selected for trial"
             else:
-                action = "on disk but skipped (pass --prune to delete)"
-        elif too_small and r.downloaded:
-            if args.prune:
-                action = (f"→ PRUNE (on disk, too small for "
-                          f"--min-vram-fraction={args.min_vram_fraction:g})")
+                action = "missing, not selected for trial"
+            v = m.get("vram") or {}
+            if v.get("source") in ("probe", "hf-probe"):
+                vram_str = f"{r.total_gb:>6.1f}G"
+                ctx_k = (v.get("context") or 0) // 1024
+                ctx_str = f"{ctx_k}K"
+            elif v.get("source") == "formula":
+                vram_str = f"{r.total_gb:>5.1f}G*"
+                ctx_k = (v.get("context") or 0) // 1024
+                ctx_str = f"{ctx_k}K"
             else:
-                action = (f"on disk but skipped, too small for floor "
-                          f"({min_total:.0f} GB) — pass --prune to delete")
-        elif too_large:
-            action = "skip (too large)"
-        elif too_small:
-            action = (f"skip (too small, <{min_total:.0f} GB; lower "
-                      f"--min-vram-fraction to include)")
-        elif r.downloaded:
-            v = r.model.get("vram") or {}
-            if r.active_eligible:
-                action = "already on disk → active"
-            elif is_ollama_only(r.model) and v.get("source") != "probe":
-                action = "on disk, needs probe before active"
-            elif is_ollama_only(r.model) and not v.get("fully_on_gpu", True):
-                action = "on disk but skipped (probe showed CPU spill)"
+                vram_str = "—"
+                ctx_str = "—"
+            if v.get("source") in ("probe", "hf-probe"):
+                cap = str(v.get("context_capability") or "unknown")
+                if not v.get("fully_on_gpu", True):
+                    cap = "error"
             else:
-                action = "on disk but skipped"
-        elif not is_ollama_only(r.model):
-            action = "skip (backend dormant)"
-        elif r.candidate and args.dry_run:
-            action = "would download candidate"
-        elif r.candidate and args.download:
-            action = "→ DOWNLOAD (candidate: best family fit)"
-        elif r.candidate:
-            action = "candidate: best family fit (pass --download to pull)"
-        elif r.suppress_reason:
-            action = f"suppressed: {r.suppress_reason}"
-        elif args.dry_run:
-            action = "missing, not selected for trial"
-        elif args.download:
-            action = "missing, not selected for trial"
-        else:
-            action = "missing, not selected for trial"
-        v = m.get("vram") or {}
-        if v.get("source") in ("probe", "hf-probe"):
-            vram_str = f"{r.total_gb:>6.1f}G"
-            ctx_k = (v.get("context") or 0) // 1024
-            ctx_str = f"{ctx_k}K"
-        elif v.get("source") == "formula":
-            vram_str = f"{r.total_gb:>5.1f}G*"     # * = estimated
-            ctx_k = (v.get("context") or 0) // 1024
-            ctx_str = f"{ctx_k}K"
-        else:
-            vram_str = "—"
-            ctx_str = "—"
-        # Capability comes from the per-cell context_capability when the
-        # measurement is real (probe or hf-probe); otherwise unknown.
-        if v.get("source") in ("probe", "hf-probe"):
-            cap = str(v.get("context_capability") or "unknown")
-            if not v.get("fully_on_gpu", True):
-                cap = "error"
-        else:
-            cap = "unknown"
-        print(f"  {m['name']:<42s} {m['source']:<7s} {size:>8s} "
-              f"{vram_str:>8s} {ctx_str:>5s}  {cap:<11s} "
-              f"{fit_mark:<3s}  {disk_mark:<4s}  {action}")
-    print()
+                cap = "unknown"
+            print(f"  {m['name']:<42s} {m['source']:<7s} {size:>8s} "
+                  f"{vram_str:>8s} {ctx_str:>5s}  {cap:<11s} "
+                  f"{fit_mark:<3s}  {disk_mark:<4s}  {action}")
+        print()
     fit_count = sum(1 for r in rows if r.fits)
     too_small_count = sum(1 for r in rows if r.total_gb < min_total)
     too_large_count = sum(1 for r in rows if r.total_gb > args.vram)
@@ -1288,19 +1494,24 @@ def main() -> None:
     active_count = sum(1 for r in rows if r.active_eligible)
     prunable_bytes = sum(reclaim_bytes(r.model) for r in prunable)
     prunable_gb = prunable_bytes / (1024 ** 3)
-    print(f"  {fit_count} of {len(rows)} variants fit in "
-          f"[{min_total:.1f}, {args.vram:g}] GB "
-          f"@ {args.context} ctx / {args.kv_dtype} KV  "
+    cell_filled = sum(1 for v in cell_index.values() if v.get("status") == "filled")
+    cell_candidate = sum(1 for v in cell_index.values() if v.get("status") == "candidate")
+    cell_pending = sum(1 for v in cell_index.values() if v.get("status") == "pending_probe")
+    cell_empty = sum(1 for v in cell_index.values() if v.get("status") == "no_options")
+
+    print(f"  {fit_count} of {len(rows)} variants fit at ctx="
+          f"{context_label(display_ctx)} in [{min_total:.1f}, {args.vram:g}] GB / "
+          f"{args.kv_dtype} KV "
           f"(skipped: {too_small_count} too small, {too_large_count} too large).")
-    hidden = suppressed_small + suppressed_large
-    if hidden and not args.verbose:
-        print(f"  {hidden} non-fitting rows hidden "
-              f"({suppressed_small} too small, {suppressed_large} too large) "
-              f"— run with VERBOSE=1 to see them.")
-    print(f"  {active_count} active  ·  {on_disk_count} fitting on disk  ·  "
-          f"{len(missing)} fitting missing (~{missing_bytes_gb:.1f} GB total).")
+    print(f"  matrix: {len(cell_index)} cell(s)  ·  {cell_filled} filled  "
+          f"·  {cell_candidate} candidate  ·  {cell_pending} pending probe  "
+          f"·  {cell_empty} no option")
+    print(f"  {active_count} active  ·  {on_disk_count} fitting on disk @ "
+          f"{context_label(display_ctx)}  ·  "
+          f"{len(missing)} fitting-but-missing (~{missing_bytes_gb:.1f} GB total).")
     print(f"  {len(trial_candidates)} trial download candidate(s) "
-          f"(~{candidate_bytes_gb:.1f} GB; limit {args.max_downloads}/family).")
+          f"(~{candidate_bytes_gb:.1f} GB; limit {args.max_downloads}/cell, "
+          f"file-deduplicated).")
     if prunable:
         n_large = sum(1 for r in prunable if r.total_gb > args.vram)
         n_small = len(prunable) - n_large
@@ -1313,10 +1524,6 @@ def main() -> None:
               f"({', '.join(breakdown)}; "
               f"~{prunable_gb:.1f} GB reclaimable with --prune).")
     print()
-    print_context_candidate_summary(
-        models, candidate_contexts, args.kv_dtype, min_total, args.vram,
-        probe_cache, hf_caches, args.max_downloads,
-    )
 
     # Shadow aliases cross families (e.g. `nemotron70b` vs `nemotron`), so
     # always scan the full catalog regardless of --family. The active-set
@@ -1380,7 +1587,7 @@ def main() -> None:
     # ── Eligible set summary ────────────────────────────────────────────
     # The probe cache is the source of truth; this is informational only.
     # Router and picker read deploy/.ollama-reasoning-cache.json directly.
-    print_active_set(rows, args.vram, args.context)
+    print_active_set(rows, args.vram, display_ctx)
     print()
 
 

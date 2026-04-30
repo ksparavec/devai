@@ -171,13 +171,24 @@ d = json.load(sys.stdin)
 assert 'choices' in d, f'no choices in response: {sorted(d.keys())}'
 assert d['choices'], 'choices array empty'
 msg = d['choices'][0].get('message') or {}
-content = msg.get('content', '')
-assert isinstance(content, str), f'content not string: {type(content).__name__}'
-# Don't assert specific text — backend behaviour varies. Just prove
-# we got a real response with non-empty content.
-assert len(content.strip()) > 0, 'empty content from backend'
+# Structured-reasoning models (Qwen3 in thinking mode, etc.) put the
+# answer entirely in reasoning_content / reasoning when max_tokens is
+# tight, and leave content=null. Inline-reasoning models put think
+# tags + answer in content. Plain models put the answer in content.
+# The intent of this test is 'backend round-trip works' — all three
+# shapes prove that. Accept any of the four standard payload fields
+# carrying non-empty text; refusal also counts as a valid response.
+candidates = [
+    msg.get('content'),
+    msg.get('reasoning_content'),
+    msg.get('reasoning'),
+    msg.get('refusal'),
+]
+texts = [c for c in candidates if isinstance(c, str) and c.strip()]
+assert texts, f'no non-empty content/reasoning/refusal in message: keys={sorted(msg.keys())}'
 print(f'  response model: {d.get(\"model\", \"?\")}')
-print(f'  content snippet: {content.strip()[:80]!r}')
+print(f'  payload field:  {(\"content\" if msg.get(\"content\") else \"reasoning_content\" if msg.get(\"reasoning_content\") else \"reasoning\" if msg.get(\"reasoning\") else \"refusal\")}')
+print(f'  snippet:        {texts[0].strip()[:80]!r}')
 " 2>/dev/null; then
     pass "router routed picker-emitted serving name to $PICKED_BACKEND"
 else

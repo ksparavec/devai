@@ -99,16 +99,17 @@ type backendConfig struct {
 }
 
 type configModel struct {
-	Name       string           `yaml:"name"`
-	Aliases    []string         `yaml:"aliases,omitempty"`
-	Digest     string           `yaml:"digest,omitempty"`
-	Backend    []string         `yaml:"backend"`
-	Repo       string           `yaml:"repo"`
-	Size       string           `yaml:"size"`
-	Context    int              `yaml:"context"`
-	Purpose    string           `yaml:"purpose"`
-	Reasoning  *configReasoning `yaml:"reasoning,omitempty"`
-	ToolParser string           `yaml:"tool_parser,omitempty"` // vLLM-only; populated from probe cache
+	Name            string           `yaml:"name"`
+	Aliases         []string         `yaml:"aliases,omitempty"`
+	Digest          string           `yaml:"digest,omitempty"`
+	Backend         []string         `yaml:"backend"`
+	Repo            string           `yaml:"repo"`
+	Size            string           `yaml:"size"`
+	Context         int              `yaml:"context"`
+	Purpose         string           `yaml:"purpose"`
+	Reasoning       *configReasoning `yaml:"reasoning,omitempty"`
+	ToolParser      string           `yaml:"tool_parser,omitempty"`      // populated from HF probe cache
+	ReasoningParser string           `yaml:"reasoning_parser,omitempty"` // populated from HF probe cache
 }
 
 // configReasoning records what the runtime probe observed for this model.
@@ -129,9 +130,10 @@ type configReasoning struct {
 
 // launchConfig holds computed GPU parameters passed to backend entrypoints.
 type launchConfig struct {
-	MemFraction float64
-	MaxContext  int
-	ToolParser  string // vLLM --tool-call-parser; empty omits both --tool-call-parser and --enable-auto-tool-choice
+	MemFraction     float64
+	MaxContext      int
+	ToolParser      string // empty omits backend-specific tool flags
+	ReasoningParser string // empty omits --reasoning-parser
 }
 
 type configFile struct {
@@ -251,21 +253,29 @@ type hfCacheProbe struct {
 }
 
 // hfCacheEntry mirrors the per-(repo, sha) record in the HF probe caches.
+//
+// Schema v2 added ReasoningParser, DisableVerified, and populated the
+// previously-null ToolParser field. Pre-v2 caches read with ToolParser
+// = nil and the new fields zero-valued; the synthesizer treats those
+// as "no curated parsers" and emits a serving row with no parser flags
+// — same behaviour as a model whose family declared no `parsers:` block.
 type hfCacheEntry struct {
-	SchemaVersion int                                `json:"schema_version"`
-	Repo          string                             `json:"repo"`
-	Sha           string                             `json:"sha"`
-	Aliases       []string                           `json:"aliases"`
-	ModelKind     string                             `json:"model_kind"`
+	SchemaVersion int      `json:"schema_version"`
+	Repo          string   `json:"repo"`
+	Sha           string   `json:"sha"`
+	Aliases       []string `json:"aliases"`
+	ModelKind     string   `json:"model_kind"`
 	// SizeGB is the catalog-declared weight size on disk. Required for
 	// memFraction launch math — without it, ActualVRAMGB (post-load,
 	// weights + KV + CUDA graphs) would mistakenly be used as the
 	// weight size and clamp --max-model-len to a few thousand tokens.
-	SizeGB     float64                            `json:"size_gb,omitempty"`
-	MaxContext int                                `json:"max_context"`
-	Capability string                             `json:"capability"`
-	ToolParser *string                            `json:"tool_parser"`
-	Probes     map[string]map[string]hfCacheProbe `json:"probes"`
+	SizeGB          float64                            `json:"size_gb,omitempty"`
+	MaxContext      int                                `json:"max_context"`
+	Capability      string                             `json:"capability"`
+	ToolParser      *string                            `json:"tool_parser"`
+	ReasoningParser *string                            `json:"reasoning_parser,omitempty"`
+	DisableVerified *bool                              `json:"disable_verified,omitempty"`
+	Probes          map[string]map[string]hfCacheProbe `json:"probes"`
 }
 
 // synthesizeHFFromCache returns one configModel per HF cache entry whose
@@ -337,6 +347,10 @@ func synthesizeHFFromCache(
 		if entry.ToolParser != nil {
 			toolParser = *entry.ToolParser
 		}
+		reasoningParser := ""
+		if entry.ReasoningParser != nil {
+			reasoningParser = *entry.ReasoningParser
+		}
 		// Prefer the catalog-declared weight size for the Size field —
 		// it feeds memFraction at containerRecreate time, which needs
 		// the WEIGHT footprint, not the post-load total. Older cache
@@ -354,15 +368,17 @@ func synthesizeHFFromCache(
 			}
 		}
 		out = append(out, configModel{
-			Name:       canonical,
-			Aliases:    aliases,
-			Backend:    []string{backendName},
-			Repo:       entry.Repo,
-			Size:       fmt.Sprintf("%.2f GB", sizeGB),
-			Context:    effCtx,
-			ToolParser: toolParser,
+			Name:            canonical,
+			Aliases:         aliases,
+			Backend:         []string{backendName},
+			Repo:            entry.Repo,
+			Size:            fmt.Sprintf("%.2f GB", sizeGB),
+			Context:         effCtx,
+			ToolParser:      toolParser,
+			ReasoningParser: reasoningParser,
 			Reasoning: &configReasoning{
-				Capability: cap,
+				Capability:      cap,
+				DisableVerified: entry.DisableVerified,
 			},
 		})
 	}
@@ -424,21 +440,22 @@ type backendState struct {
 }
 
 type arbiter struct {
-	backends        map[string]*backendState
-	mu              sync.Mutex
-	ollamaURL       *url.URL
-	podmanClient    *http.Client
-	idleTimeout     time.Duration
-	drainTimeout    time.Duration
-	healthTimeout   time.Duration      // configurable per HEALTH_TIMEOUT_SECONDS env (default 300s)
-	modelSizes      map[string]float64 // model name → weight size in GB
-	modelContexts   map[string]int     // model name → declared max context (from models.yaml)
-	modelCapability map[string]string  // model name → reasoning.capability
-	modelDisableOK  map[string]bool    // model name → disable_verified (only when present)
-	modelToolParser map[string]string  // model name → vLLM --tool-call-parser (empty omits the flag)
-	defaultPolicy   string             // DEVAI_REASONING env value: auto|off|low|medium|high
-	totalVRAMGB     float64
-	maxContextLen   int // global default from MAX_CONTEXT_LEN env (default 131072)
+	backends             map[string]*backendState
+	mu                   sync.Mutex
+	ollamaURL            *url.URL
+	podmanClient         *http.Client
+	idleTimeout          time.Duration
+	drainTimeout         time.Duration
+	healthTimeout        time.Duration      // configurable per HEALTH_TIMEOUT_SECONDS env (default 600s — vLLM/SGLang cold-start with NVFP4 weights + CUDA graph compilation can exceed 5 min on consumer GPUs)
+	modelSizes           map[string]float64 // model name → weight size in GB
+	modelContexts        map[string]int     // model name → declared max context (from models.yaml)
+	modelCapability      map[string]string  // model name → reasoning.capability
+	modelDisableOK       map[string]bool    // model name → disable_verified (only when present)
+	modelToolParser      map[string]string  // model name → backend --tool-call-parser (empty omits the flag)
+	modelReasoningParser map[string]string  // model name → backend --reasoning-parser (empty omits the flag)
+	defaultPolicy        string             // DEVAI_REASONING env value: auto|off|low|medium|high
+	totalVRAMGB          float64
+	maxContextLen        int // global default from MAX_CONTEXT_LEN env (default 131072)
 }
 
 // --- Proxy factories ---
@@ -622,10 +639,12 @@ func vllmEntrypoint(modelName string, lc launchConfig) []string {
 		"--trust-remote-code",
 		"--served-model-name", modelName,
 	}
-	// Tool-call parser is per-model. We omit both flags when unknown so a
-	// non-Qwen model isn't crashed at load time by a Qwen-specific parser
-	// (the original cause of vLLM probe failures pre-refactor). Phase 5
-	// wires modelToolParser from the vLLM probe cache.
+	// Parser flags are per-model and read from the probe cache. Omit
+	// when unverified so a non-matching parser doesn't crash the launch.
+	// See deploy/backend-flags.yaml for the verified flag names.
+	if lc.ReasoningParser != "" {
+		args = append(args, "--reasoning-parser", lc.ReasoningParser)
+	}
 	if lc.ToolParser != "" {
 		args = append(args, "--enable-auto-tool-choice", "--tool-call-parser", lc.ToolParser)
 	}
@@ -633,7 +652,7 @@ func vllmEntrypoint(modelName string, lc launchConfig) []string {
 }
 
 func sglangEntrypoint(modelName string, lc launchConfig) []string {
-	return []string{
+	args := []string{
 		"python3", "-m", "sglang.launch_server",
 		"--model-path", "/models/" + modelName,
 		"--host", "0.0.0.0",
@@ -643,6 +662,17 @@ func sglangEntrypoint(modelName string, lc launchConfig) []string {
 		"--context-length", fmt.Sprintf("%d", lc.MaxContext),
 		"--trust-remote-code",
 	}
+	// SGLang flags verified against v0.5.10.post1-cu130 — see
+	// deploy/backend-flags.yaml. SGLang accepts --tool-call-parser
+	// without an --enable-auto-tool-choice analogue (unlike vLLM); the
+	// flag is sufficient on its own to enable tool parsing.
+	if lc.ReasoningParser != "" {
+		args = append(args, "--reasoning-parser", lc.ReasoningParser)
+	}
+	if lc.ToolParser != "" {
+		args = append(args, "--tool-call-parser", lc.ToolParser)
+	}
+	return args
 }
 
 // --- Main ---
@@ -726,7 +756,7 @@ func main() {
 			ListenPort:    envInt("SGLANG_PORT", 11436),
 			BackendURL:    sglangURL,
 			ContainerName: env("SGLANG_CONTAINER", "devai-sglang"),
-			Image:         env("SGLANG_IMAGE", "docker.io/lmsysorg/sglang:latest"),
+			Image:         env("SGLANG_IMAGE", "docker.io/lmsysorg/sglang:v0.5.10.post1-cu130"),
 			ModelsDir:     env("SGLANG_MODELS_DIR", "/var/cache/devai/ollama/models/vllm"),
 			Network:       network,
 			HealthPath:    "/health",
@@ -747,7 +777,8 @@ func main() {
 	modelContexts := make(map[string]int)
 	modelCapability := make(map[string]string)
 	modelDisableOK := make(map[string]bool)
-	modelToolParser := make(map[string]string) // populated by Phase 5 vLLM cache integration
+	modelToolParser := make(map[string]string)      // backend startup flag, populated from probe cache
+	modelReasoningParser := make(map[string]string) // backend startup flag, populated from probe cache
 	capCounts := make(map[string]int)
 	for _, m := range cfg.Models {
 		names := append([]string{m.Name}, m.Aliases...)
@@ -776,6 +807,9 @@ func main() {
 			if m.ToolParser != "" {
 				modelToolParser[name] = m.ToolParser
 			}
+			if m.ReasoningParser != "" {
+				modelReasoningParser[name] = m.ReasoningParser
+			}
 		}
 		// Count capability once per canonical row, not once per alias —
 		// otherwise a model with N aliases would dominate the histogram.
@@ -791,20 +825,21 @@ func main() {
 	maxCtx := envInt("MAX_CONTEXT_LEN", 131072)
 
 	a := &arbiter{
-		backends:        make(map[string]*backendState),
-		ollamaURL:       ollamaURL,
-		podmanClient:    podmanClient,
-		idleTimeout:     time.Duration(envInt("IDLE_TIMEOUT", 300)) * time.Second,
-		drainTimeout:    time.Duration(envInt("DRAIN_TIMEOUT", 30)) * time.Second,
-		healthTimeout:   time.Duration(envInt("HEALTH_TIMEOUT_SECONDS", 300)) * time.Second,
-		modelSizes:      modelSizes,
-		modelContexts:   modelContexts,
-		modelCapability: modelCapability,
-		modelDisableOK:  modelDisableOK,
-		modelToolParser: modelToolParser,
-		defaultPolicy:   policy,
-		totalVRAMGB:     totalVRAMGB,
-		maxContextLen:   maxCtx,
+		backends:             make(map[string]*backendState),
+		ollamaURL:            ollamaURL,
+		podmanClient:         podmanClient,
+		idleTimeout:          time.Duration(envInt("IDLE_TIMEOUT", 300)) * time.Second,
+		drainTimeout:         time.Duration(envInt("DRAIN_TIMEOUT", 30)) * time.Second,
+		healthTimeout:        time.Duration(envInt("HEALTH_TIMEOUT_SECONDS", 600)) * time.Second,
+		modelSizes:           modelSizes,
+		modelContexts:        modelContexts,
+		modelCapability:      modelCapability,
+		modelDisableOK:       modelDisableOK,
+		modelToolParser:      modelToolParser,
+		modelReasoningParser: modelReasoningParser,
+		defaultPolicy:        policy,
+		totalVRAMGB:          totalVRAMGB,
+		maxContextLen:        maxCtx,
 	}
 
 	for _, bc := range backends {
@@ -949,8 +984,12 @@ func (a *arbiter) containerRecreate(bs *backendState, modelName string, desiredC
 	if parser := a.modelToolParser[modelName]; parser != "" {
 		lc.ToolParser = parser
 	}
-	log.Printf("  %s launch: model=%.1f GB, gpu=%.1f GB → fraction=%.2f, context=%dk",
-		cfg.Name, modelSizeGB, a.totalVRAMGB, lc.MemFraction, lc.MaxContext/1024)
+	if parser := a.modelReasoningParser[modelName]; parser != "" {
+		lc.ReasoningParser = parser
+	}
+	log.Printf("  %s launch: model=%.1f GB, gpu=%.1f GB → fraction=%.2f, context=%dk, reasoning=%q tool=%q",
+		cfg.Name, modelSizeGB, a.totalVRAMGB, lc.MemFraction, lc.MaxContext/1024,
+		lc.ReasoningParser, lc.ToolParser)
 
 	spec := map[string]any{
 		"image":      cfg.Image,
@@ -1192,16 +1231,20 @@ func (a *arbiter) makeRequestHandler(backendName string) http.HandlerFunc {
 			}
 			json.Unmarshal(body, &parsed)
 
-			// Resolve the per-request num_ctx and strip any "@<int>"
-			// suffix from the model name. Override priority:
+			// Resolve the per-request num_ctx and strip any suffixes
+			// from the model name. Suffix order (convention): the
+			// picker emits `<name>::<reasoning>@<ctx>`. We strip in
+			// the same order — @<ctx> first, ::<reasoning> second.
+			// Override priority for num_ctx:
 			//   1. Picker-supplied @<int>  → force-injected (user choice).
 			//   2. Registered modelContexts cap (= min(model_max,
 			//      MAX_CONTEXT_LEN) from the probe cache) → soft cap,
 			//      only set when the client didn't supply num_ctx.
 			//   3. None → request passes through unchanged.
-			cleanName, override := parseCtxOverride(parsed.Model)
-			numCtx = override
-			force := override > 0
+			ctxStripped, ctxOverride := parseCtxOverride(parsed.Model)
+			cleanName, reasoningOverride := parseReasoningOverride(ctxStripped)
+			numCtx = ctxOverride
+			force := ctxOverride > 0
 			if numCtx == 0 {
 				if cap, ok := a.modelContexts[cleanName]; ok && cap > 0 {
 					numCtx = cap
@@ -1222,7 +1265,25 @@ func (a *arbiter) makeRequestHandler(backendName string) http.HandlerFunc {
 			// derived-tag request.
 			policyModel := stripCtxVariantSuffix(modelName)
 			policy := a.requestPolicy(req)
+			// Per-request `::<token>` suffix wins over both the
+			// X-DevAI-Reasoning header and the env-var default. This
+			// is what makes the picker's two-row split for inline
+			// models work — each row dispatches the same agent CLI
+			// but the model-name suffix forces a different policy.
+			if reasoningOverride != "" {
+				policy = reasoningOverride
+			}
 			body = a.applyReasoningPolicy(backendName, req.URL.Path, policyModel, policy, body)
+			// Strip tools/tool_choice for backends that didn't probe a
+			// working tool parser. vLLM rejects `tool_choice="auto"`
+			// outright when launched without --enable-auto-tool-choice;
+			// SGLang's default tool-call path also requires
+			// --tool-call-parser. Agents like Claude Code always send
+			// tools — without this rewrite, every chat would fail with
+			// `BadRequestError: "auto" tool choice requires ...`. Cost:
+			// agentic tool-call loops won't function for these models;
+			// plain text chat works.
+			body = a.maybeStripTools(backendName, policyModel, body)
 			req.Body = io.NopCloser(bytes.NewReader(body))
 			req.ContentLength = int64(len(body))
 			req.Header.Set("Content-Length", strconv.Itoa(len(body)))
@@ -1263,6 +1324,50 @@ func (a *arbiter) requestPolicy(req *http.Request) string {
 	return a.defaultPolicy
 }
 
+// maybeStripTools removes `tools` and `tool_choice` from the request
+// body when the upstream backend was launched without tool-call support
+// for this model.
+//
+// vLLM and SGLang only enable tool calls when their respective
+// --tool-call-parser flag is set at engine launch (vLLM additionally
+// requires --enable-auto-tool-choice). The router omits those flags
+// when the probe didn't verify a working parser for the model — see
+// modelToolParser population. Agents like Claude Code unconditionally
+// send a tool spec, so without this strip every request fails with
+// `BadRequestError: "auto" tool choice requires ...`. Stripping is a
+// graceful degradation: chat works, tool-calling functionality is
+// silently absent for that model.
+//
+// Ollama is unaffected: its protocol negotiates tool support per
+// request and tolerates `tools=[]` without launch-time flags.
+//
+// On JSON-decode failure the body is returned unchanged — same defensive
+// behavior as the other rewrite helpers.
+func (a *arbiter) maybeStripTools(backendName, modelName string, body []byte) []byte {
+	if backendName != "vllm" && backendName != "sglang" {
+		return body
+	}
+	if a.modelToolParser[modelName] != "" {
+		return body
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return body
+	}
+	_, hadTools := doc["tools"]
+	_, hadChoice := doc["tool_choice"]
+	if !hadTools && !hadChoice {
+		return body
+	}
+	delete(doc, "tools")
+	delete(doc, "tool_choice")
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
 type reasoningAction int
 
 const (
@@ -1295,34 +1400,116 @@ func (a *arbiter) applyReasoningPolicy(backendName, path, modelName, policy stri
 
 // applyVLLMPolicy is the vLLM half of the reasoning router.
 //
-// v1: passthrough. Models classified `inline` already emit `<think>` blocks
-// without API-side help; `unsupported`/`unknown` have no useful action. The
-// `structured` rewrite (e.g. `extra_body.chat_template_kwargs.enable_thinking`)
-// needs a probe-cache-supplied parser hint to be safe across architectures, so
-// it is deferred until Phase 5 wires the vLLM cache. The capability lookup is
-// retained as the seam for that future work — when removing the underscore
-// assignment, ensure the surrounding policy switch still type-checks.
+// Both vLLM and SGLang serve OpenAI-compatible /v1/chat/completions only,
+// so the rewrite operates on that surface. Models classified `structured`
+// got launched with `--reasoning-parser <X>` and emit `reasoning_content`
+// when `enable_thinking` is true. `inline` and `unsupported` have no
+// reliable structured switch, so we leave the body alone — same as
+// Ollama's policy for non-structured capabilities.
+//
+// Enable shape:
+//
+//	extra_body.chat_template_kwargs.enable_thinking = true
+//	reasoning_effort = "low" | "medium" | "high"
+//
+// Disable shape (only when disable_verified is true):
+//
+//	extra_body.chat_template_kwargs.enable_thinking = false
+//	reasoning_effort = "none"
+//
+// Client-supplied fields always win.
 func (a *arbiter) applyVLLMPolicy(path, modelName, policy string, body []byte) []byte {
-	_ = a.modelCapability[modelName]
-	return body
+	if strings.TrimRight(path, "/") != "/v1/chat/completions" {
+		return body
+	}
+	switch a.reasoningAction(modelName, policy) {
+	case reasoningEnable:
+		body = setJSONFieldIfAbsent(
+			body,
+			[]string{"reasoning_effort", "reasoning"},
+			"reasoning_effort",
+			openAIReasoningEffort(policy),
+		)
+		return setNestedJSONFieldIfAbsent(
+			body,
+			[]string{"extra_body", "chat_template_kwargs", "enable_thinking"},
+			true,
+		)
+	case reasoningDisable:
+		body = setJSONFieldIfAbsent(
+			body,
+			[]string{"reasoning_effort", "reasoning"},
+			"reasoning_effort",
+			"none",
+		)
+		return setNestedJSONFieldIfAbsent(
+			body,
+			[]string{"extra_body", "chat_template_kwargs", "enable_thinking"},
+			false,
+		)
+	default:
+		return body
+	}
 }
 
-// applySGLangPolicy mirrors applyVLLMPolicy. Same v1 stance: passthrough until
-// the SGLang probe cache lands and a structured rewrite has measured support.
+// applySGLangPolicy mirrors applyVLLMPolicy. SGLang exposes a top-level
+// `separate_reasoning` field on /v1/chat/completions plus the same
+// `extra_body.chat_template_kwargs.enable_thinking` path for Qwen3-style
+// templates. Setting both makes the disable directive robust regardless
+// of which surface SGLang's runtime honours.
 func (a *arbiter) applySGLangPolicy(path, modelName, policy string, body []byte) []byte {
-	_ = a.modelCapability[modelName]
-	return body
+	if strings.TrimRight(path, "/") != "/v1/chat/completions" {
+		return body
+	}
+	switch a.reasoningAction(modelName, policy) {
+	case reasoningEnable:
+		body = setJSONFieldIfAbsent(
+			body, []string{"separate_reasoning"}, "separate_reasoning", true,
+		)
+		return setNestedJSONFieldIfAbsent(
+			body,
+			[]string{"extra_body", "chat_template_kwargs", "enable_thinking"},
+			true,
+		)
+	case reasoningDisable:
+		body = setJSONFieldIfAbsent(
+			body, []string{"separate_reasoning"}, "separate_reasoning", false,
+		)
+		return setNestedJSONFieldIfAbsent(
+			body,
+			[]string{"extra_body", "chat_template_kwargs", "enable_thinking"},
+			false,
+		)
+	default:
+		return body
+	}
 }
 
 func (a *arbiter) reasoningAction(modelName, policy string) reasoningAction {
-	if a.modelCapability[modelName] != "structured" {
-		return reasoningNoop
-	}
-	switch policy {
-	case "auto", "low", "medium", "high":
-		return reasoningEnable
-	case "off":
-		if a.modelDisableOK[modelName] {
+	switch a.modelCapability[modelName] {
+	case "structured":
+		switch policy {
+		case "auto", "low", "medium", "high":
+			return reasoningEnable
+		case "off":
+			// Disable only when the prober verified the model honours
+			// `enable_thinking=false` / equivalent. Without that
+			// confirmation the disable injection is a footgun.
+			if a.modelDisableOK[modelName] {
+				return reasoningDisable
+			}
+		}
+	case "inline":
+		// Inline models leak `<think>` blocks into content — there's
+		// no parser that strips them. But the chat template typically
+		// honours `enable_thinking=false`, so an EXPLICIT user opt-out
+		// (policy=off, set via the picker's `::nothink` suffix or the
+		// X-DevAI-Reasoning header) suppresses thinking. We don't
+		// gate this on modelDisableOK because the suffix is itself an
+		// explicit user opt-in to the disable path — they're saying
+		// "I want this off, accept the consequences if it doesn't
+		// work for this particular model".
+		if policy == "off" {
 			return reasoningDisable
 		}
 	}
@@ -1409,6 +1596,40 @@ func anthropicThinkingBudget(policy string) int {
 	default:
 		return 2048
 	}
+}
+
+// parseReasoningOverride extracts a "<name>::<token>" suffix carrying a
+// per-request reasoning policy override. Recognised tokens:
+//
+//	nothink             → "off"
+//	think               → "auto"
+//	off|auto|low|medium|high → that policy verbatim
+//
+// The picker emits this suffix to expose explicit reasoning toggles for
+// inline-reasoning models (where the global DEVAI_REASONING env var
+// can't be toggled per-pick because each agent inherits one shared
+// process environment). Returns the clean name and the override; an
+// empty override means no recognised suffix was present.
+//
+// Suffix ordering convention: `<name>::<reasoning>@<ctx>`. parseCtxOverride
+// runs first to strip the trailing @<int>, then this function strips the
+// reasoning token from the result.
+func parseReasoningOverride(name string) (clean string, override string) {
+	const sep = "::"
+	idx := strings.LastIndex(name, sep)
+	if idx < 0 {
+		return name, ""
+	}
+	token := strings.ToLower(strings.TrimSpace(name[idx+len(sep):]))
+	switch token {
+	case "nothink":
+		return name[:idx], "off"
+	case "think":
+		return name[:idx], "auto"
+	case "off", "auto", "low", "medium", "high":
+		return name[:idx], token
+	}
+	return name, ""
 }
 
 // parseCtxOverride extracts a "<name>@<int>" suffix carrying an explicit
@@ -1527,6 +1748,63 @@ func setJSONFieldIfAbsent(body []byte, existingKeys []string, setKey string, val
 	}
 	raw[setKey] = v
 	out, err := encodeJSON(raw)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// setNestedJSONFieldIfAbsent walks `path` into the JSON body, creating
+// intermediate object nodes as needed, and sets the leaf key to `value`
+// — but only when no key on the path already has a non-object value
+// (which would mean the client owns it). The leaf is only written when
+// it doesn't exist; "client supplied wins" applies at the leaf.
+//
+// Returns the body unchanged on parse failure or path conflict.
+//
+// Example: path=["extra_body", "chat_template_kwargs", "enable_thinking"],
+// value=true on body {"model":"x"}
+//
+//	→ {"model":"x","extra_body":{"chat_template_kwargs":{"enable_thinking":true}}}
+//
+// On body that already carries
+// {"extra_body":{"chat_template_kwargs":{"enable_thinking":false}}} the
+// leaf exists, so the client's `false` is preserved.
+func setNestedJSONFieldIfAbsent(body []byte, path []string, value any) []byte {
+	if len(path) == 0 {
+		return body
+	}
+	var root map[string]any
+	if json.Unmarshal(body, &root) != nil {
+		return body
+	}
+	if root == nil {
+		root = make(map[string]any)
+	}
+	cur := root
+	for i, key := range path[:len(path)-1] {
+		next, ok := cur[key]
+		if !ok || next == nil {
+			child := make(map[string]any)
+			cur[key] = child
+			cur = child
+			continue
+		}
+		obj, ok := next.(map[string]any)
+		if !ok {
+			// Intermediate exists but isn't an object — refuse to
+			// rewrite the client's typed value.
+			_ = i
+			return body
+		}
+		cur = obj
+	}
+	leaf := path[len(path)-1]
+	if _, exists := cur[leaf]; exists {
+		return body
+	}
+	cur[leaf] = value
+	out, err := encodeJSON(root)
 	if err != nil {
 		return body
 	}

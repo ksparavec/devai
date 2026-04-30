@@ -339,6 +339,96 @@ func TestSynthesizeHFFromCache_FilteringAndShape(t *testing.T) {
 	}
 }
 
+func TestSynthesizeHFFromCache_V2FieldsPropagated(t *testing.T) {
+	// Phase 6: v2 cache entries carry reasoning_parser, tool_parser, and
+	// disable_verified. The synthesizer must propagate all three onto
+	// the configModel — the router's launch and policy paths read them
+	// from there at containerRecreate / applyVLLMPolicy time.
+	rp := "qwen3"
+	tp := "hermes"
+	dv := true
+	cache := map[string]*hfCacheEntry{
+		"nvidia/Qwen3-14B@deadbeef0001": {
+			SchemaVersion:   2,
+			Repo:            "nvidia/Qwen3-14B-NVFP4",
+			Sha:             "deadbeef0001",
+			Aliases:         []string{"Qwen3-14B-NVFP4"},
+			ModelKind:       "dense",
+			SizeGB:          7.4,
+			MaxContext:      32768,
+			Capability:      "structured",
+			ReasoningParser: &rp,
+			ToolParser:      &tp,
+			DisableVerified: &dv,
+			Probes: map[string]map[string]hfCacheProbe{
+				"24": {
+					"32768": {Ctx: 32768, VramGB: 24, Fits: true,
+						ActualVRAMGB: 21.0, ActualContext: 32768},
+				},
+			},
+		},
+	}
+	rows := synthesizeHFFromCache(cache, "vllm", 24, 131072)
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(rows))
+	}
+	r := rows[0]
+	if r.ReasoningParser != "qwen3" {
+		t.Errorf("ReasoningParser=%q want qwen3", r.ReasoningParser)
+	}
+	if r.ToolParser != "hermes" {
+		t.Errorf("ToolParser=%q want hermes", r.ToolParser)
+	}
+	if r.Reasoning == nil ||
+		r.Reasoning.DisableVerified == nil ||
+		!*r.Reasoning.DisableVerified {
+		t.Errorf("DisableVerified must propagate as true, got %+v", r.Reasoning)
+	}
+	if r.Reasoning == nil || r.Reasoning.Capability != "structured" {
+		t.Errorf("Capability=%v want structured", r.Reasoning)
+	}
+}
+
+func TestSynthesizeHFFromCache_V1BackwardCompat(t *testing.T) {
+	// v1 cache entries lack ReasoningParser / DisableVerified. The
+	// synthesizer must still emit a serving row, with both fields
+	// zero-valued so the router falls back to inline / no-disable.
+	tp := "llama3_json"
+	cache := map[string]*hfCacheEntry{
+		"nvidia/llama@v1deadbeef": {
+			SchemaVersion: 1,
+			Repo:          "nvidia/Llama-3.1-8B-Instruct-NVFP4",
+			Sha:           "v1deadbeef",
+			Aliases:       []string{"Llama-3.1-8B-Instruct-NVFP4"},
+			ModelKind:     "dense",
+			SizeGB:        5.6,
+			MaxContext:    131072,
+			Capability:    "inline",
+			ToolParser:    &tp,
+			Probes: map[string]map[string]hfCacheProbe{
+				"24": {
+					"32768": {Ctx: 32768, VramGB: 24, Fits: true,
+						ActualVRAMGB: 19.0, ActualContext: 32768},
+				},
+			},
+		},
+	}
+	rows := synthesizeHFFromCache(cache, "vllm", 24, 131072)
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(rows))
+	}
+	r := rows[0]
+	if r.ReasoningParser != "" {
+		t.Errorf("v1 entry ReasoningParser must be empty, got %q", r.ReasoningParser)
+	}
+	if r.ToolParser != "llama3_json" {
+		t.Errorf("ToolParser=%q want llama3_json", r.ToolParser)
+	}
+	if r.Reasoning == nil || r.Reasoning.DisableVerified != nil {
+		t.Errorf("DisableVerified must remain nil for v1, got %+v", r.Reasoning)
+	}
+}
+
 func TestSynthesizeHFFromCache_FallbackWhenSizeGBMissing(t *testing.T) {
 	// Pre-fix cache rows lack SizeGB. The fallback (half of ActualVRAMGB)
 	// keeps launch math safe-ish until the operator re-probes. This test
@@ -522,6 +612,89 @@ func TestSmartProxy_PassesThroughOtherErrors(t *testing.T) {
 
 	if w.Code != http.StatusInternalServerError {
 		t.Errorf("expected 500, got %d", w.Code)
+	}
+}
+
+// --- Entrypoint builders: parser flag emission ---
+
+func sliceContains(haystack []string, needles ...string) bool {
+	if len(needles) == 0 {
+		return true
+	}
+	for i := 0; i <= len(haystack)-len(needles); i++ {
+		match := true
+		for j, n := range needles {
+			if haystack[i+j] != n {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
+func TestVLLMEntrypoint_OmitsParserFlagsWhenEmpty(t *testing.T) {
+	args := vllmEntrypoint("Qwen3.5-9B-NVFP4", launchConfig{
+		MemFraction: 0.9, MaxContext: 32768,
+	})
+	for _, flag := range []string{"--reasoning-parser", "--tool-call-parser", "--enable-auto-tool-choice"} {
+		for _, a := range args {
+			if a == flag {
+				t.Fatalf("expected %s absent, got args=%v", flag, args)
+			}
+		}
+	}
+}
+
+func TestVLLMEntrypoint_EmitsBothParserFlags(t *testing.T) {
+	args := vllmEntrypoint("Qwen3.5-9B-NVFP4", launchConfig{
+		MemFraction: 0.9, MaxContext: 32768,
+		ReasoningParser: "qwen3", ToolParser: "hermes",
+	})
+	if !sliceContains(args, "--reasoning-parser", "qwen3") {
+		t.Errorf("--reasoning-parser qwen3 missing: %v", args)
+	}
+	if !sliceContains(args, "--enable-auto-tool-choice") {
+		t.Errorf("--enable-auto-tool-choice missing: %v", args)
+	}
+	if !sliceContains(args, "--tool-call-parser", "hermes") {
+		t.Errorf("--tool-call-parser hermes missing: %v", args)
+	}
+}
+
+func TestSGLangEntrypoint_OmitsParserFlagsWhenEmpty(t *testing.T) {
+	args := sglangEntrypoint("Qwen3.5-9B-NVFP4", launchConfig{
+		MemFraction: 0.85, MaxContext: 32768,
+	})
+	for _, flag := range []string{"--reasoning-parser", "--tool-call-parser"} {
+		for _, a := range args {
+			if a == flag {
+				t.Fatalf("expected %s absent, got args=%v", flag, args)
+			}
+		}
+	}
+}
+
+func TestSGLangEntrypoint_EmitsBothParserFlags(t *testing.T) {
+	args := sglangEntrypoint("Qwen3.5-9B-NVFP4", launchConfig{
+		MemFraction: 0.85, MaxContext: 32768,
+		ReasoningParser: "qwen3", ToolParser: "qwen25",
+	})
+	if !sliceContains(args, "--reasoning-parser", "qwen3") {
+		t.Errorf("--reasoning-parser qwen3 missing: %v", args)
+	}
+	if !sliceContains(args, "--tool-call-parser", "qwen25") {
+		t.Errorf("--tool-call-parser qwen25 missing: %v", args)
+	}
+	// SGLang has no --enable-auto-tool-choice analogue — confirm we
+	// don't accidentally emit it.
+	for _, a := range args {
+		if a == "--enable-auto-tool-choice" {
+			t.Fatalf("SGLang must not emit --enable-auto-tool-choice: %v", args)
+		}
 	}
 }
 

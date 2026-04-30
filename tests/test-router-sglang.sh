@@ -138,13 +138,23 @@ curl_get_ollama_chat() {
 
 assert_chat_ok() {
     local label="$1" resp="$2"
+    # Structured-reasoning models put output in reasoning/reasoning_content
+    # when content is null. All shapes prove the round-trip; the assertion
+    # is 'backend reachable + producing output', not 'content set'.
     if echo "$resp" | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
 assert 'choices' in d, f'no choices in response: {list(d.keys())}'
 assert d['choices'], 'choices array empty'
-content = (d['choices'][0].get('message') or {}).get('content', '')
-assert isinstance(content, str), f'content not string: {type(content).__name__}'
+msg = d['choices'][0].get('message') or {}
+candidates = [
+    msg.get('content'),
+    msg.get('reasoning_content'),
+    msg.get('reasoning'),
+    msg.get('refusal'),
+]
+texts = [c for c in candidates if isinstance(c, str) and c.strip()]
+assert texts, f'no non-empty content/reasoning/refusal in message: keys={sorted(msg.keys())}'
 " 2>/dev/null; then
         pass "$label"
         return 0
@@ -265,8 +275,19 @@ if echo "$resp" | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
 assert 'choices' in d
-content = (d['choices'][0].get('message') or {}).get('content', '')
-assert len(content) < 80, f'expected ≤80 chars at max_tokens=1, got {len(content)}'
+msg = d['choices'][0].get('message') or {}
+# Structured-reasoning models put output in reasoning/reasoning_content
+# when content is null. Sum lengths across all standard payload fields
+# — max_tokens=1 should still produce ≤80 chars total regardless of
+# which field carries it.
+total = sum(
+    len(s) for s in (
+        msg.get('content'),
+        msg.get('reasoning_content'),
+        msg.get('reasoning'),
+    ) if isinstance(s, str)
+)
+assert total < 80, f'expected ≤80 chars total at max_tokens=1, got {total}'
 " 2>/dev/null; then
     pass "max_tokens=1 produces short response"
 else

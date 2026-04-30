@@ -72,11 +72,7 @@ if [ "$(id -u)" = "0" ] && [ -n "${USER_ID:-}" ]; then
         done
         chown -R "$TARGET_UID:$TARGET_GID" "$HOME_DIR/.gitconfig" "$HOME_DIR/.ssh" 2>/dev/null || true
     fi
-
-    echo "Running as $USERNAME (UID:$TARGET_UID GID:$TARGET_GID)"
 else
-    echo "Running as $(id -un) (UID:$(id -u))"
-
     # Create directories if missing
     mkdir -p "$HOME_DIR" "$WORK_DIR" \
              "$HOME_DIR/.local/share/jupyter/runtime" \
@@ -132,5 +128,4 @@ fi
 # Fallback: running as non-root already
 export HOME="$HOME_DIR"
 cd "$WORK_DIR" 2>/dev/null || cd "$HOME_DIR"
-echo "Exec command: ${CMD[*]}"
 exec "${CMD[@]}"

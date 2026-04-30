@@ -121,9 +121,12 @@ _CTX_VARIANT_RE = re.compile(r"-ctx\d+$")
 def list_models(ollama_url: str, timeout: float) -> list[dict]:
     """Return [{name, digest, modified_at, size}, ...] from /api/tags.
 
-    Skips picker-materialised "<parent>-ctx<N>" derived tags — they exist
-    only to bake a per-session num_ctx into Ollama's load defaults and
-    share their digest with the parent (so probing them adds nothing).
+    Skips legacy "<parent>-ctx<N>" derived tags. The picker no longer
+    creates these (per-session ctx is now passed via setNumCtx on
+    /api/chat or via @<ctx> suffix for vLLM/SGLang launch flags), but
+    operators may still have them from prior versions or from manual
+    /api/create calls. They share their digest with the parent so
+    probing them adds nothing — drop them from the work list.
     """
     data = http_get(f"{ollama_url}/api/tags", timeout)
     out = []
@@ -163,6 +166,14 @@ def measure_arch(ollama_url: str, model_name: str, timeout: float) -> dict:
         out["param_size_label"] = details["parameter_size"]
     if details.get("quantization_level"):
         out["quantization"] = details["quantization_level"]
+    # Capability list — Ollama returns it as a flat array of short tokens
+    # (completion / tools / thinking / vision / …). Used by the picker
+    # to label tuning style: presence of `tools` or `thinking` ⇒ IT,
+    # only `completion` ⇒ BASE. More reliable than the legacy name-
+    # suffix heuristic, since many Ollama tags don't include `-instruct`.
+    caps = data.get("capabilities") or []
+    if isinstance(caps, list):
+        out["capabilities"] = [str(c) for c in caps if c]
     # Suffix-match family-prefixed keys (gemma4.context_length,
     # qwen35moe.expert_count, …). The arch prefix varies per family.
     for k, v in mi.items():
@@ -756,8 +767,15 @@ def main() -> None:
 
         canonical = canonical_alias(live_aliases)
 
-        # Step 0: cheap arch lookup. Skipped when max_context already known.
-        if not entry.get("max_context") or "arch_family" not in entry:
+        # Step 0: cheap arch lookup. Run when any of the per-model
+        # metadata fields are missing — including `capabilities`, added
+        # later than the rest. This makes a no-op re-probe enough to
+        # backfill new fields on legacy entries.
+        if (
+            not entry.get("max_context")
+            or "arch_family" not in entry
+            or "capabilities" not in entry
+        ):
             arch = measure_arch(args.ollama_url, canonical, timeout=10.0)
             if "error" in arch:
                 maybe_header()

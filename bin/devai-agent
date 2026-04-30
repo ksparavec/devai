@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""devai-shell — host-side launcher for the devai lab container.
+"""devai-agent — host-side launcher for the devai lab container.
 
 Reads user preferences from ~/.devai/preferences.yaml, runs the lab
 container with the picker as entry point, and writes preferences back
@@ -10,11 +10,11 @@ anywhere on the host. The work directory mounted as
 /home/devai/work is the shell's $PWD at the time of invocation —
 just `cd` to the project you want to work on first.
 
-    cd ~/myapp && devai-shell             # launch with myapp/ as work dir
-    devai-shell --init                    # reset preferences to defaults
-    devai-shell --cpu                     # use the CPU lab image
-    devai-shell -C ~/other                # override work dir for this run
-    devai-shell --model qwen3.5:9b-q8_0 --agent claude  # pre-set picks
+    cd ~/myapp && devai-agent             # launch with myapp/ as work dir
+    devai-agent --init                    # reset preferences to defaults
+    devai-agent --cpu                     # use the CPU lab image
+    devai-agent -C ~/other                # override work dir for this run
+    devai-agent --model qwen3.5:9b-q8_0 --agent claude  # pre-set picks
 
 Preferences (in ~/.devai/preferences.yaml):
     vram                int       advertised VRAM ceiling, GB
@@ -103,7 +103,7 @@ def read_prefs() -> dict:
     raw = yaml.safe_load(PREFS_FILE.read_text()) or {}
     if not isinstance(raw, dict):
         sys.exit(f"error: {PREFS_FILE} is not a YAML mapping. "
-                 f"Run `devai-shell --init` to reset.")
+                 f"Run `devai-agent --init` to reset.")
     merged = dict(DEFAULTS)
     merged.update(raw)
     return merged
@@ -256,7 +256,7 @@ def build_run_cmd(
 
 def make_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
-        prog="devai-shell",
+        prog="devai-agent",
         description="Standalone launcher for the devai lab container.",
     )
     ap.add_argument("--init", action="store_true",
@@ -295,7 +295,7 @@ def main() -> int:
     # Work dir defaults to the current shell's $PWD, NOT to prefs.last_work_dir.
     # `last_work_dir` is a record of where the user last ran from (kept for
     # display / scripting), not a sticky default. The user expects
-    # `cd ~/projects/foo && devai-shell` to mount foo at /home/devai/work.
+    # `cd ~/projects/foo && devai-agent` to mount foo at /home/devai/work.
     work_dir = Path(args.workdir or os.getcwd()).expanduser().resolve()
     if not work_dir.is_dir():
         sys.exit(f"error: work_dir {work_dir} is not an existing directory.\n"

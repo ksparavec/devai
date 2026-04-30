@@ -62,6 +62,7 @@ from _probe_core import (  # noqa: E402
     now_iso,
     propagate_implied_fail,
     save_cache,
+    smallest_clean_probe,
 )
 
 
@@ -71,7 +72,31 @@ DEFAULT_CATALOG = REPO_ROOT / "deploy" / "models.yaml"
 DEFAULT_MODELS_DIR = os.environ.get(
     "VLLM_MODELS_DIR", "/var/cache/devai/ollama/models/vllm"
 )
-DEFAULT_PROMPT = "Answer with only the final number: What is 17 + 25?"
+DEFAULT_PROMPT = (
+    "Solve this step by step. Show your reasoning, then state the final number. "
+    "Problem: A train travels 60 miles in the first hour, then increases speed "
+    "by 20 mph each hour. How far has it traveled after 3 hours?"
+)
+
+# Probe B (tool-call) — minimal tool spec that any backend supporting
+# OpenAI-style tool calling should be able to invoke. Deterministic,
+# parameterless, no model-side guessing.
+TOOL_PROBE_PROMPT = "Use the get_time tool to fetch the current time."
+TOOL_PROBE_SPEC: list[dict] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_time",
+            "description": "Return the current server time.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+]
+
+# Probe C (disable verification) — same prompt as Probe A but with the
+# backend-specific switch that should suppress structured reasoning.
+# Only meaningful when Probe A produced `structured`; else skipped.
+DISABLE_PROBE_PROMPT = DEFAULT_PROMPT
 DEFAULT_HOST_VRAM_GB = int(os.environ.get("GPU_MEMORY_GB", "24"))
 
 # Cold start with CUDA graph capture takes 60–300s on consumer hardware.
@@ -99,9 +124,15 @@ class BackendSpec:
     cache_path: Path            # default cache file
     reserve_gb: float           # memFraction reservation
     entrypoint: str             # container ENTRYPOINT override
-    # build_args(model_name, max_ctx, host_frac) → CMD list (excluding entrypoint).
-    build_args: Callable[[str, int, float], list[str]] = field(repr=False)
-    schema_version: int = 1
+    # build_args(model_name, max_ctx, host_frac, *, reasoning_parser, tool_parser)
+    # → CMD list (excluding entrypoint). The two parser kwargs are
+    # optional — when None, the arg builder must omit the corresponding
+    # backend flag so the launch falls back to inline/no-tool mode.
+    build_args: Callable[..., list[str]] = field(repr=False)
+    # schema_version v2 added reasoning_parser, tool_parser (populated),
+    # disable_verified, and per-cell tool/disable verdicts. v1 readers
+    # backfill defaults on first read.
+    schema_version: int = 2
 
 
 # ── VRAM math (mirrors gpu-arbiter/main.go memFraction) ──────────────────────
@@ -356,13 +387,132 @@ def gpu_memory_used_mb() -> int:
 
 # ── Classification ───────────────────────────────────────────────────────────
 
-def classify_chat_response(resp: dict) -> tuple[str, dict]:
+def _extract_reasoning_content(msg: dict) -> str:
+    """Pull the reasoning trace from a chat message regardless of field
+    name. vLLM ≥0.19 returns it as `reasoning`; SGLang and older vLLM
+    use `reasoning_content`. Future-proof: check both. Returns empty
+    string when neither is present.
+    """
+    if not isinstance(msg, dict):
+        return ""
+    for key in ("reasoning_content", "reasoning"):
+        v = msg.get(key)
+        if isinstance(v, str) and v.strip():
+            return v
+    return ""
+
+
+def response_has_reasoning_content(resp: dict) -> bool:
+    """Return True iff the response carries a non-empty reasoning trace
+    in either `reasoning_content` (SGLang, older vLLM) or `reasoning`
+    (vLLM ≥0.19)."""
+    if not isinstance(resp, dict) or "error" in resp:
+        return False
+    choices = resp.get("choices") or []
+    if not choices:
+        return False
+    return bool(_extract_reasoning_content(choices[0].get("message") or {}))
+
+
+def response_has_valid_tool_call(resp: dict, expected_tool_name: str) -> bool:
+    """Return True iff the response contains a parseable tool call to
+    `expected_tool_name`. Tolerates either OpenAI shape (top-level
+    `tool_calls`) or providers that nest under `function_call`.
+    """
+    if not isinstance(resp, dict) or "error" in resp:
+        return False
+    choices = resp.get("choices") or []
+    if not choices:
+        return False
+    msg = (choices[0].get("message") or {})
+    calls = msg.get("tool_calls") or []
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        fn = call.get("function") or {}
+        if fn.get("name") == expected_tool_name:
+            return True
+    legacy = msg.get("function_call") or {}
+    return legacy.get("name") == expected_tool_name
+
+
+def build_disable_thinking_body(backend: str, base: dict) -> dict:
+    """Mutate-in-place a chat body to request reasoning suppression.
+
+    vLLM (Qwen3-style template):
+        extra_body.chat_template_kwargs.enable_thinking = False
+    SGLang:
+        separate_reasoning = False (top-level field; SGLang's OpenAI-
+        compatible layer reads it from the request body)
+
+    Both fields are no-ops when the model has no template-level
+    thinking switch — the disable verdict is then `False` and the
+    router won't emit a disable directive at serve time.
+    """
+    body = dict(base)
+    if backend == "vllm":
+        extra = dict(body.get("extra_body") or {})
+        ctk = dict(extra.get("chat_template_kwargs") or {})
+        ctk["enable_thinking"] = False
+        extra["chat_template_kwargs"] = ctk
+        body["extra_body"] = extra
+    elif backend == "sglang":
+        body["separate_reasoning"] = False
+        # SGLang also accepts the chat_template_kwargs path on the same
+        # template families it shares with vLLM (Qwen3). Set both so we
+        # disable cleanly regardless of which path the runtime honours.
+        extra = dict(body.get("extra_body") or {})
+        ctk = dict(extra.get("chat_template_kwargs") or {})
+        ctk["enable_thinking"] = False
+        extra["chat_template_kwargs"] = ctk
+        body["extra_body"] = extra
+    return body
+
+
+def build_enable_thinking_body(backend: str, base: dict) -> dict:
+    """Symmetric to build_disable_thinking_body — flips the same fields
+    to enable structured reasoning output. Used by Probe A so models
+    with chat templates that default `enable_thinking=false` (newer
+    Qwen3, etc.) emit a reasoning trace under the curated parser.
+    """
+    body = dict(base)
+    if backend == "vllm":
+        extra = dict(body.get("extra_body") or {})
+        ctk = dict(extra.get("chat_template_kwargs") or {})
+        ctk["enable_thinking"] = True
+        extra["chat_template_kwargs"] = ctk
+        body["extra_body"] = extra
+    elif backend == "sglang":
+        body["separate_reasoning"] = True
+        extra = dict(body.get("extra_body") or {})
+        ctk = dict(extra.get("chat_template_kwargs") or {})
+        ctk["enable_thinking"] = True
+        extra["chat_template_kwargs"] = ctk
+        body["extra_body"] = extra
+    return body
+
+
+def classify_chat_response(
+    resp: dict, *, reasoning_parser_attempted: str | None = None,
+) -> tuple[str, dict]:
     """Map /v1/chat/completions response to (capability, evidence).
 
-    v1: looks for inline `<think>` markers only. Structured-reasoning
-    detection (vLLM's `reasoning_content` field, requires
-    `--reasoning-parser` set at startup) is deferred until tool_parser
-    detection lands.
+    Detection order:
+      1. `message.reasoning_content` non-empty → `structured`
+         (vLLM and SGLang both populate this when launched with
+         `--reasoning-parser <X>` and the model emits a reasoning
+         trace; the parser strips the trace from `content`)
+      2. reasoning_parser was attempted AND finish_reason == "length"
+         AND content is empty → `structured` (model was thinking past
+         max_tokens; parser was buffering inside an unclosed `<think>`
+         block when generation cut off — the parser was clearly active)
+      3. reasoning_parser was attempted AND content starts with the
+         tell-tale `\\n\\n` left by a stripped `<think></think>` block
+         → `structured` (parser stripped an empty trace; common with
+         R1-Distill chat templates)
+      4. inline `<think>` markers in `message.content` → `inline`
+         (any chat surface, no parser flag required)
+      5. otherwise → `unsupported`
     """
     if "error" in resp:
         return "error", {"error": resp["error"]}
@@ -370,7 +520,33 @@ def classify_chat_response(resp: dict) -> tuple[str, dict]:
     if not choices:
         return "unsupported", {"reason": "no choices in response"}
     msg = (choices[0].get("message") or {})
+    reasoning = _extract_reasoning_content(msg)
     content = msg.get("content") or ""
+    finish_reason = (choices[0].get("finish_reason") or "")
+
+    if reasoning:
+        return "structured", {
+            "reasoning_preview": reasoning[:200],
+            "content_preview": content[:120],
+            "structured_reason": "reasoning_content_populated",
+        }
+    if reasoning_parser_attempted and finish_reason == "length" and not content:
+        # Model thought past max_tokens; parser buffered inside <think>
+        # waiting for </think>. The parser was active — the budget was
+        # too low. Classify as structured; the disable probe will
+        # confirm wiring.
+        return "structured", {
+            "structured_reason": "thought_past_max_tokens",
+            "finish_reason": finish_reason,
+        }
+    if reasoning_parser_attempted and content.startswith("\n\n"):
+        # Parser likely stripped an empty `<think></think>` block,
+        # leaving the leading newlines. Distinct from a model that
+        # genuinely starts with newlines (rare with our prompt).
+        return "structured", {
+            "structured_reason": "empty_think_stripped",
+            "content_preview": content[:120],
+        }
     if has_inline_think_markers(content):
         return "inline", {"content_preview": content[:200]}
     return "unsupported", {"content_preview": content[:120]}
@@ -449,17 +625,35 @@ def probe_one_cell(
     host_vram_gb: float,
     model_size_gb: float,
     prompt: str,
+    reasoning_parser: str | None,
+    tool_parser: str | None,
 ) -> dict:
-    """Launch the backend, measure one (vram, ctx) cell, return a record.
+    """Launch the backend once, run up to three HTTP probes against the
+    same container, return a single record.
 
-    Always tears down the container before returning. The record's
-    `fits` field is the single source of truth downstream.
+    Probes (all hit the same running server — no relaunch):
+      A. Reasoning + fit. Send `prompt` to /v1/chat/completions and
+         classify the response. Sets `capability` ∈
+         {structured, inline, unsupported, error}.
+      B. Tool-call. Only when `tool_parser` is set and the launch
+         succeeded. Send TOOL_PROBE_PROMPT with TOOL_PROBE_SPEC; if the
+         response carries a parseable tool_call to `get_time`, record
+         `tool_parser=<curated-name>`; else null.
+      C. Disable verification. Only when Probe A produced `structured`.
+         Send the same prompt with the backend-specific suppression
+         flag. If `reasoning_content` is then absent, record
+         `disable_verified=true`.
+
+    Always tears down the container before returning.
     """
     started = time.time()
     host_frac = host_scaled_fraction(
         model_size_gb, band_gb, host_vram_gb, spec.reserve_gb,
     )
-    cmd_args = spec.build_args(model_name, requested_ctx, host_frac)
+    cmd_args = spec.build_args(
+        model_name, requested_ctx, host_frac,
+        reasoning_parser=reasoning_parser, tool_parser=tool_parser,
+    )
 
     env_vars = {"VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1"}
     container_remove(runtime, container_name)
@@ -471,7 +665,11 @@ def probe_one_cell(
     except RuntimeError as e:
         return _failure_record(
             ctx=requested_ctx, vram_gb=band_gb, started=started,
-            evidence={"kind": "infra", "error": str(e)},
+            evidence={
+                "kind": "infra", "error": str(e),
+                "reasoning_parser_attempted": reasoning_parser,
+                "tool_parser_attempted": tool_parser,
+            },
         )
 
     base_url = f"http://127.0.0.1:{probe_port}"
@@ -505,6 +703,8 @@ def probe_one_cell(
         logs = container_logs(runtime, container_name)
         evidence = classify_failure_logs(logs)
         evidence.setdefault("startup_error", last_err or "unknown")
+        evidence["reasoning_parser_attempted"] = reasoning_parser
+        evidence["tool_parser_attempted"] = tool_parser
         container_remove(runtime, container_name)
         return _failure_record(
             ctx=requested_ctx, vram_gb=band_gb, started=started,
@@ -530,37 +730,59 @@ def probe_one_cell(
                 "kind": "clamped_ctx",
                 "actual_context": actual_max,
                 "requested_context": requested_ctx,
+                "reasoning_parser_attempted": reasoning_parser,
+                "tool_parser_attempted": tool_parser,
             },
         )
 
-    chat_body = {
+    # ── Probe A: fit + reasoning ─────────────────────────────────────
+    # When a reasoning_parser is being attempted, request the backend's
+    # "enable thinking" surface so models with chat templates that
+    # default `enable_thinking=false` (newer Qwen3, some Phi-4) still
+    # emit a reasoning trace. This mirrors what the router's
+    # applyVLLMPolicy / applySGLangPolicy does at serve time. Without it,
+    # the probe sends a vanilla request and these models classify as
+    # `unsupported` even though the parser would work in production.
+    base_chat_body: dict = {
         "model": model_name,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0,
-        "max_tokens": 64,
+        # Reasoning models need room for the full trace before the
+        # final answer. 256 tokens often truncates mid-think; the
+        # parser then can't bracket a `<think>...</think>` block and
+        # silently drops the partial trace. 2048 covers Qwen3-8B's
+        # typical CoT for medium-complexity prompts.
+        "max_tokens": 2048,
         "stream": False,
     }
-    chat_resp: dict
-    try:
-        chat_resp = http_post(
-            f"{base_url}/v1/chat/completions", chat_body, timeout=CHAT_TIMEOUT,
-        )
-    except urllib.error.HTTPError as e:
-        body = e.read() if hasattr(e, "read") else b""
-        chat_resp = {
-            "error": f"HTTP {e.code}: {e.reason}",
-            "body": body[:200].decode(errors='replace'),
-        }
-    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as e:
-        chat_resp = {"error": f"{type(e).__name__}: {e}"}
+    if reasoning_parser:
+        base_chat_body = build_enable_thinking_body(spec.name, base_chat_body)
+    chat_resp = _post_chat(base_url, base_chat_body)
 
     used_mb = gpu_memory_used_mb()
     actual_vram_gb = round(used_mb / 1024, 2)
 
-    container_remove(runtime, container_name)
+    capability, cap_evidence = classify_chat_response(
+        chat_resp, reasoning_parser_attempted=reasoning_parser,
+    )
+    cap_evidence = dict(cap_evidence)
+    cap_evidence["reasoning_parser_attempted"] = reasoning_parser
+    cap_evidence["tool_parser_attempted"] = tool_parser
+    # Forensic snapshot of the raw Probe A response — full content +
+    # reasoning_content (capped) so we can debug parser-content
+    # mismatches without re-launching. Replaces the older 200-char
+    # previews; classify_chat_response still produces those for the
+    # short-form summary.
+    try:
+        msg = ((chat_resp.get("choices") or [{}])[0].get("message") or {})
+        cap_evidence["full_content"] = (msg.get("content") or "")[:2000]
+        cap_evidence["full_reasoning_content"] = _extract_reasoning_content(msg)[:2000]
+        cap_evidence["finish_reason"] = (chat_resp.get("choices") or [{}])[0].get("finish_reason")
+    except (AttributeError, IndexError, TypeError):
+        pass
 
-    capability, cap_evidence = classify_chat_response(chat_resp)
     if capability == "error":
+        container_remove(runtime, container_name)
         return _failure_record(
             ctx=requested_ctx, vram_gb=band_gb, started=started,
             startup_seconds=startup_seconds, actual_vram_gb=actual_vram_gb,
@@ -568,18 +790,91 @@ def probe_one_cell(
             evidence={"kind": "oom_chat", **cap_evidence},
         )
 
-    return {
+    # Confirmed reasoning parser only when Probe A actually produced
+    # `structured`. Any other capability means the curated parser
+    # didn't apply (model emits inline or doesn't reason at all).
+    reasoning_parser_verified = reasoning_parser if capability == "structured" else None
+
+    # ── Probe B: tool-call ───────────────────────────────────────────
+    tool_parser_verified: str | None = None
+    tool_evidence: dict | None = None
+    if tool_parser:
+        tool_body = {
+            "model": model_name,
+            "messages": [{"role": "user", "content": TOOL_PROBE_PROMPT}],
+            "tools": TOOL_PROBE_SPEC,
+            "tool_choice": "auto",
+            "temperature": 0,
+            "max_tokens": 128,
+            "stream": False,
+        }
+        tool_resp = _post_chat(base_url, tool_body)
+        if response_has_valid_tool_call(tool_resp, "get_time"):
+            tool_parser_verified = tool_parser
+            tool_evidence = {"verified": True}
+        else:
+            tool_evidence = {"verified": False, "response_preview": _short(tool_resp)}
+
+    # ── Probe C: disable verification ────────────────────────────────
+    disable_verified = False
+    disable_evidence: dict | None = None
+    if capability == "structured":
+        disable_body = build_disable_thinking_body(spec.name, base_chat_body)
+        disable_resp = _post_chat(base_url, disable_body)
+        if not response_has_reasoning_content(disable_resp) and "error" not in disable_resp:
+            disable_verified = True
+            disable_evidence = {"verified": True}
+        else:
+            disable_evidence = {
+                "verified": False,
+                "response_preview": _short(disable_resp),
+            }
+
+    container_remove(runtime, container_name)
+
+    rec = {
         "ctx": requested_ctx,
         "vram_gb": band_gb,
         "fits": True,
         "actual_vram_gb": actual_vram_gb,
         "actual_context": actual_max or requested_ctx,
         "capability": capability,
+        "reasoning_parser": reasoning_parser_verified,
+        "tool_parser": tool_parser_verified,
+        "disable_verified": disable_verified,
         "startup_seconds": startup_seconds,
         "probe_seconds": round(time.time() - started, 2),
         "probed_at": now_iso(),
         "evidence": cap_evidence,
     }
+    if tool_evidence is not None:
+        rec["evidence"]["tool"] = tool_evidence
+    if disable_evidence is not None:
+        rec["evidence"]["disable"] = disable_evidence
+    return rec
+
+
+def _post_chat(base_url: str, body: dict) -> dict:
+    """POST a chat-completion body, normalize errors to `{error: ...}`."""
+    try:
+        return http_post(
+            f"{base_url}/v1/chat/completions", body, timeout=CHAT_TIMEOUT,
+        )
+    except urllib.error.HTTPError as e:
+        raw = e.read() if hasattr(e, "read") else b""
+        return {
+            "error": f"HTTP {e.code}: {e.reason}",
+            "body": raw[:200].decode(errors="replace"),
+        }
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def _short(resp: dict, n: int = 200) -> str:
+    try:
+        return json.dumps(resp)[:n]
+    except (TypeError, ValueError):
+        return str(resp)[:n]
 
 
 def _failure_record(
@@ -643,7 +938,16 @@ def ensure_entry(
             "size_gb": weight_size_gb,
             "max_context": 0,
             "capability": "unknown",
+            # v2: confirmed parser names from the first probed cell. Null
+            # when the curated family hint did not produce a verified
+            # round-trip (or when no parsers were curated).
+            "reasoning_parser": None,
             "tool_parser": None,
+            # v2: True iff the disable-thinking probe produced a response
+            # with empty `reasoning_content`. Mirrors Ollama's
+            # `disable_verified` field; gates the router's reasoningOff
+            # rewrite.
+            "disable_verified": False,
             "evidence": {},
             "probes": {},
         }
@@ -657,30 +961,90 @@ def ensure_entry(
         # Backfill size_gb on entries written before the field existed.
         if not entry.get("size_gb") and weight_size_gb > 0:
             entry["size_gb"] = weight_size_gb
+        # v1 → v2 backfill. New fields default to non-verified so an
+        # upgraded cache produces the same router behaviour as v1 until
+        # a fresh probe lands.
+        entry.setdefault("reasoning_parser", None)
+        entry.setdefault("tool_parser", None)
+        entry.setdefault("disable_verified", False)
+        if entry.get("schema_version", 1) < schema_version:
+            entry["schema_version"] = schema_version
     return entry
 
 
-def reflect_first_cell_to_top_level(entry: dict, rec: dict) -> None:
-    """Promote the first probe cell's outcome to entry's top level.
+def refresh_top_level_from_cells(entry: dict) -> None:
+    """Re-derive top-level capability and parser fields from ALL recorded
+    cells. Idempotent — call after every cell write.
 
-    Only fires when capability is unknown — preserves terminal states
-    like `unsupported_arch` across re-probes.
+    The bug-prone alternative was setting top-level fields imperatively
+    from the most-recently-written cell: a 16G/oom_startup cell would
+    overwrite a 24G/structured success because each cell's outcome was
+    treated as authoritative. The fix is to derive top-level state
+    from the corpus of cells, picking the smallest-ctx, smallest-vram
+    clean probe as canonical.
+
+    Terminal states are sticky:
+      - `unsupported_arch` (backend doesn't recognise the arch — won't
+        change without an image bump);
+      - `error` with evidence.kind ∈ {arch, quant} (load failed for a
+        reason that's tier-independent).
+    Non-terminal `error` (kind=oom/infra/clamped_ctx) at one tier does
+    NOT downgrade a successful classification at a higher tier — a 16G
+    spill doesn't invalidate a 24G fit.
     """
-    if entry.get("capability") and entry["capability"] != "unknown":
+    cur_cap = entry.get("capability") or "unknown"
+    cur_kind = ((entry.get("evidence") or {}).get("kind") or "")
+    is_terminal = (
+        cur_cap == "unsupported_arch"
+        or (cur_cap == "error" and cur_kind in ("arch", "quant"))
+    )
+    if is_terminal:
         return
-    if rec.get("fits"):
-        entry["capability"] = rec.get("capability") or "unknown"
-        actual_ctx = int(rec.get("actual_context") or 0)
+
+    smallest = smallest_clean_probe(entry)
+    if smallest is not None:
+        entry["capability"] = smallest.get("capability") or "unknown"
+        ev = smallest.get("evidence") or {}
+        if ev:
+            entry["evidence"] = ev
+        # Parser fields propagate from the same canonical cell so the
+        # router reads the launch flags that actually worked.
+        entry["reasoning_parser"] = smallest.get("reasoning_parser")
+        entry["tool_parser"] = smallest.get("tool_parser")
+        entry["disable_verified"] = bool(smallest.get("disable_verified", False))
+        actual_ctx = int(smallest.get("actual_context") or 0)
         if actual_ctx and (entry.get("max_context") or 0) < actual_ctx:
             entry["max_context"] = actual_ctx
-        entry["evidence"] = rec.get("evidence") or {}
         return
-    ev = rec.get("evidence") or {}
-    if ev.get("kind") == "arch":
+
+    # No clean probe in the corpus — pick the most-severe failure kind
+    # to set capability.
+    severities = {"arch": 3, "quant": 2}  # other kinds = severity 1
+    chosen_severity = 0
+    chosen_ev: dict = {}
+    for value in (entry.get("probes") or {}).values():
+        if not isinstance(value, dict):
+            continue
+        cells = [value] if "capability" in value else [
+            c for c in value.values() if isinstance(c, dict)
+        ]
+        for cell in cells:
+            ev = cell.get("evidence") or {}
+            kind = ev.get("kind")
+            if not kind:
+                continue
+            sev = severities.get(kind, 1)
+            if sev > chosen_severity:
+                chosen_severity = sev
+                chosen_ev = ev
+    if chosen_severity == 3:
         entry["capability"] = "unsupported_arch"
-    else:
+        entry["evidence"] = chosen_ev
+    elif chosen_severity >= 1:
         entry["capability"] = "error"
-    entry["evidence"] = ev
+        entry["evidence"] = chosen_ev
+    else:
+        entry.setdefault("capability", "unknown")
 
 
 # ── Argparse builder ─────────────────────────────────────────────────────────
@@ -787,6 +1151,14 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
             cache, key, repo, sha, name, spec.schema_version, kind, size_gb,
         )
 
+        # Pull curated parser hints for this backend from the catalog
+        # row. The probe driver passes these to spec.build_args; the
+        # cell record only confirms them when the backend round-trip
+        # produces the expected response shape.
+        row_parsers = (row.get("parsers") or {}).get(spec.name) or {}
+        row_reasoning_parser = row_parsers.get("reasoning") or None
+        row_tool_parser = row_parsers.get("tool") or None
+
         if args.force_arch:
             entry["capability"] = "unknown"
             entry["evidence"] = {}
@@ -817,8 +1189,13 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
                 fully_cached += 1
                 continue
 
+            parser_label = (
+                f"R={row_reasoning_parser or '—'} "
+                f"T={row_tool_parser or '—'}"
+            )
             print(f"  {name} @ {vram_label(vram_gb)}: probing "
-                  f"{','.join(context_label(c) for c in missing)} ...",
+                  f"{','.join(context_label(c) for c in missing)} "
+                  f"[{parser_label}] ...",
                   file=sys.stderr)
 
             for ctx in missing:
@@ -835,22 +1212,32 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
                     host_vram_gb=args.host_vram_gb,
                     model_size_gb=size_gb,
                     prompt=args.prompt,
+                    reasoning_parser=row_reasoning_parser,
+                    tool_parser=row_tool_parser,
                 )
                 band[str(ctx)] = rec
                 entry.setdefault("first_probed_at", rec["probed_at"])
                 entry["last_probed_at"] = rec["probed_at"]
                 if first_seen_record is None:
                     first_seen_record = rec
-                    reflect_first_cell_to_top_level(entry, rec)
+                # Re-derive top-level capability + parser fields from
+                # the full corpus of recorded cells (not just this one).
+                # Idempotent — invariant: a successful classification at
+                # any (vram, ctx) tier is preserved even if a different
+                # tier later fails on oom/infra/clamped_ctx.
+                refresh_top_level_from_cells(entry)
                 fresh_probes += 1
                 if not args.no_cache_write:
                     save_cache(args.cache, cache)
 
                 cap_marker = rec.get("capability", "?")
                 if rec.get("fits"):
+                    rp = rec.get("reasoning_parser") or "—"
+                    tp = rec.get("tool_parser") or "—"
+                    dv = "y" if rec.get("disable_verified") else "n"
                     print(f"    {context_label(ctx):>4s} fits  "
                           f"vram={rec.get('actual_vram_gb', '?')} "
-                          f"cap={cap_marker} "
+                          f"cap={cap_marker} R={rp} T={tp} dis={dv} "
                           f"({rec.get('startup_seconds', 0):.1f}s start)",
                           file=sys.stderr)
                 else:
@@ -910,9 +1297,11 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
                         save_cache(args.cache, cache)
                     break
 
-        # capability is set by reflect_first_cell_to_top_level on the first
-        # observed cell and is NOT re-derived from probe records, so terminal
-        # states like `unsupported_arch` survive cache-write boundaries.
+        # Top-level capability is re-derived from the full cell corpus
+        # via refresh_top_level_from_cells after each cell write. Final
+        # save here just persists the last state; terminal states like
+        # `unsupported_arch` are sticky inside that helper.
+        refresh_top_level_from_cells(entry)
         if not args.no_cache_write:
             save_cache(args.cache, cache)
 

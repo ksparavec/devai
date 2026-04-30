@@ -61,7 +61,7 @@ services:
     restart: "no"
 
   sglang:
-    image: ${SGLANG_IMAGE:-docker.io/lmsysorg/sglang:latest}
+    image: ${SGLANG_IMAGE:-docker.io/lmsysorg/sglang:v0.5.10.post1-cu130}
     container_name: devai-sglang
     hostname: sglang
     volumes:
@@ -95,7 +95,7 @@ services:
       - SGLANG_URL=http://sglang:11434
       - SGLANG_PORT=11436
       - SGLANG_CONTAINER=devai-sglang
-      - SGLANG_IMAGE=${SGLANG_IMAGE:-docker.io/lmsysorg/sglang:latest}
+      - SGLANG_IMAGE=${SGLANG_IMAGE:-docker.io/lmsysorg/sglang:v0.5.10.post1-cu130}
       - SGLANG_MODELS_DIR=/var/cache/devai/ollama/models/vllm
       - NETWORK=devai-net
       - IDLE_TIMEOUT=${IDLE_TIMEOUT:-300}

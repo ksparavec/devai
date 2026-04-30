@@ -21,13 +21,13 @@ For tasks where cloud AI is appropriate, the JupyterLab environment also include
 
 ## Features
 
-- **Two-step interactive picker** — pick a model, then an agent. Arrow-key navigation via fzf in the shell (`make shell-gpu`); same flow from JupyterLab launcher cards.
-- **Probe-verified model facts** — every downloaded model is probed against the live ollama runtime. Reasoning behavior (Native reasoning / Inline reasoning / No reasoning) plus CPU offload, MoE expert counts, and *actual* VRAM use at the configured context length are measured, not guessed. Cached by model digest so re-runs are fast.
-- **MoE / dense awareness** — the picker labels each model with `MoE 8/128` (8 of 128 experts active per token) or `dense`. Same fit rules apply (full weights must be GPU-resident), but you can see at a glance which models give big-model-quality at small-model speed.
+- **Two-step interactive picker** — pick a model (+ backend for HF repos), then an agent. Arrow-key navigation via fzf in the shell (`make shell-gpu`); same flow from JupyterLab launcher cards. Renders per-backend discovery with FORMAT, PARSER, and reasoning-off variants. Inline-reasoning models produce two rows (default + "Reasoning off").
+- **Probe-verified model facts** — every downloaded model is probed against the live runtime (Ollama, vLLM, or SGLang). Reasoning behavior (Structured / Inline / Unsupported / Error) plus actual VRAM use at every (VRAM band, context tier) cell, full on-GPU confirmation, and tool-parser verification are measured, not guessed. Cells are probed independently; no interpolation.
+- **MoE / dense awareness** — Ollama probe captures `expert_count` / `expert_used_count` from `/api/show`, surfaced in the picker as `MoE 8/128` or `dense`. Same fit rules apply (full weights must be GPU-resident), but you can see at a glance which models give big-model-quality at small-model speed.
 - **Multiple AI CLIs pre-installed** — Claude Code, OpenAI Codex, Google Gemini CLI, Aider, LATE, Open Interpreter, Ollama. All wired through the local router by default.
 - **VS Code in the browser** — code-server provides a full Visual Studio Code experience accessible from any browser.
 - **Automatic GPU-arbitrated model serving** — Ollama for GGUF models, vLLM/SGLang for NVFP4 models. The gpu-arbiter router transparently switches backends and exposes a single endpoint per protocol (`/api/chat`, `/v1/chat/completions`, `/v1/messages`).
-- **Reasoning policy at the router** — set `DEVAI_REASONING=auto|off|low|medium|high` to control thinking mode globally; override per-request via `X-DevAI-Reasoning` header. The router maps your policy to the right native protocol field (Ollama's `think:`) based on each model's verified capability.
+- **Reasoning policy at the router** — set `DEVAI_REASONING=auto|off|low|medium|high` to control thinking mode globally; override per-request via `X-DevAI-Reasoning` header or per-session via `<model>::<reasoning>` suffix (e.g., `qwen3.5:9b::nothink` forces thinking off even for structured-capable models). The router maps your policy to the right native protocol field (Ollama's `think:`, vLLM/SGLang's `enable_thinking`) based on each model's verified capability.
 - **Open WebUI chat interface** — web-based chat UI over HTTPS that sees all available models.
 - **Fast iteration** — two-layer container build separates rarely-changing system packages from frequently-updated tools.
 - **Aggressive caching** — CLI binaries via ETags, APT proxy, Docker Hub mirror.
@@ -74,15 +74,27 @@ make cache-up        # Start all services. vLLM/SGLang start as `sleep` placehol
 
 ### 4. Pull, Probe & Select
 
-Three orthogonal commands. `make probe` populates the probe cache (single source
-of truth); `make model-fit` queries it; `make model-pull` downloads.
-Add `DOWNLOAD=1` to also pull missing variants in the same run.
+Three orthogonal commands. `make probe` (Ollama) + `make probe-vllm` / `make probe-sglang` populate the probe caches; `make model-fit` queries them; `make model-pull` downloads best-fit candidates across a (family, backend, context) matrix.
 
 ```bash
+# Ollama probing (Make-orchestrated per PROBE_VRAMS bands)
 make probe                                    # probe every (VRAM, ctx) cell
 make probe PROBE_VRAMS=24G PROBE_CONTEXTS=128K # one band, one tier
-make model-pull                               # download missing best-fit candidates
-make model-pull FAMILY=qwen3.5                # scope to one family
+make probe PROBE_FORCE=1                      # re-probe everything, ignore cache
+
+# vLLM/SGLang probing (requires `make cache-down` first for exclusive GPU access)
+make cache-down
+make probe-vllm                               # probe vLLM across all (VRAM, ctx)
+make probe-sglang                             # probe SGLang across all (VRAM, ctx)
+make cache-up
+
+# Matrix-mode downloading (iterates all context tiers per family/backend)
+make model-pull                               # download best-fit (family, backend, ctx) triplets
+make model-pull FAMILY=qwen3.5                # scope to one family; still iterates all contexts + backends
+make model-pull CONTEXT=32768                 # single context; disables matrix, picks one best per (family, backend)
+make model-pull CONTEXTS=32K,128K             # override the context tier list
+
+# Fit queries (probe-cache backed, no side effects)
 make model-fit                                # print fitting models at host VRAM × MAX_CONTEXT_LEN
 make model-fit VRAM=16 CONTEXT=32768          # query a different (VRAM, ctx)
 ```
@@ -93,21 +105,21 @@ make model-fit VRAM=16 CONTEXT=32768          # query a different (VRAM, ctx)
 make lab-gpu         # Start JupyterLab with GPU (or make lab-cpu)
 # OR
 make shell-gpu       # Drop straight into the model picker (cwd = repo)
-# OR (standalone host launcher — see "devai-shell" below)
+# OR (standalone host launcher — see "devai-agent" below)
 make install                  # one-time: stage launcher + config in ~/.local/bin and ~/.devai/
-devai-shell --init            # one-time: write default ~/.devai/preferences.yaml
-cd ~/myproject && devai-shell # launch with myproject/ mounted as work dir
+devai-agent --init            # one-time: write default ~/.devai/preferences.yaml
+cd ~/myproject && devai-agent # launch with myproject/ mounted as work dir
 ```
 
 Access:
 - **JupyterLab**: `https://<HOST_IP>:8888`
 - **Open WebUI**: `https://<HOST_IP>:8443`
 
-### `devai-shell` — standalone host launcher
+### `devai-agent` — standalone host launcher
 
-`bin/devai-shell` is the same lab container as `make shell-gpu`,
-runnable from anywhere on the host without invoking Make. State lives
-under `~/.devai/`; the repo is only consulted at `make install` time.
+`bin/devai-agent` is the same lab container as `make shell-gpu`,
+runnable from anywhere on the host without invoking Make or being inside the repo directory. State lives
+under `~/.devai/`; the repo is only consulted once at `make install` time.
 
 **Install once:**
 
@@ -120,12 +132,12 @@ This writes:
 
 | Target | Purpose |
 |---|---|
-| `~/.local/bin/devai-shell` | The launcher script. |
+| `~/.local/bin/devai-agent` | The launcher script. |
 | `~/.devai/.ollama-reasoning-cache.json` | Symlink to the repo's probe cache so it stays fresh as `make probe` regenerates it. |
 | `~/.devai/model-picker.py` | Symlink so the launcher can override the in-image picker via bind-mount (no rebuild needed). |
 | `~/.devai/sessions/` | Per-`(agent, model)` session-history dir. |
 
-Then add `~/.local/bin` to `PATH` and run `devai-shell --init` to seed
+Then add `~/.local/bin` to `PATH` and run `devai-agent --init` to seed
 `~/.devai/preferences.yaml` with defaults.
 
 **Run.** The work directory mounted as `/home/devai/work` is the
@@ -133,12 +145,12 @@ shell's `$PWD` at the time of invocation — `cd` into the project you
 want to work on first.
 
 ```bash
-cd ~/projects/my-app && devai-shell # GPU; my-app/ becomes /home/devai/work
-devai-shell --cpu                   # CPU lab
-devai-shell -C ~/other              # mount ~/other instead of $PWD this run
-devai-shell --model qwen3.5:9b-q8_0 --agent claude
-devai-shell --show                  # print resolved prefs + container cmd, no run
-devai-shell --init                  # reset preferences.yaml to defaults
+cd ~/projects/my-app && devai-agent # GPU; my-app/ becomes /home/devai/work
+devai-agent --cpu                   # CPU lab
+devai-agent -C ~/other              # mount ~/other instead of $PWD this run
+devai-agent --model qwen3.5:9b-q8_0 --agent claude
+devai-agent --show                  # print resolved prefs + container cmd, no run
+devai-agent --init                  # reset preferences.yaml to defaults
 uninstall via:  make uninstall      # removes the launcher + symlinks
 ```
 
@@ -160,7 +172,7 @@ The picker writes its choice to `~/.devai/.last-pick.json` (one-shot,
 auto-cleaned) so the launcher knows what the user actually selected.
 If the user backs out of the picker, the previous values are kept.
 Prerequisites: `make build-{cpu,gpu}` and `make cache-up` once from
-the repo — `devai-shell` prints an actionable message if either is
+the repo — `devai-agent` prints an actionable message if either is
 missing.
 
 ## Architecture
@@ -267,9 +279,11 @@ deploy/.ollama-reasoning-cache.json   per-digest, per-(VRAM, ctx) cells
 
 Day-to-day after pulling a new model: `make probe && podman rm -f devai-router && make cache-up`.
 
-The interactive model picker reads the probe cache directly. It shows the best Ollama row per family, per context tier (32K, 64K, 128K, 256K), and per user-facing status: Native reasoning, Inline reasoning, No reasoning, CPU offload — all filtered to the picker's VRAM band (env `VRAM` or `GPU_MEMORY_GB`).
+The interactive model picker reads the probe caches directly. It shows one row per `(model_dir, backend)` for HF repos (both vLLM and SGLang rows appear) and per Ollama family/quantization. Each row is filtered to the picker's VRAM band (env `VRAM` or `GPU_MEMORY_GB`). Inline-reasoning models produce two rows: default mode + "Reasoning off" variant with `::nothink` suffix appended.
 
-**Per-session context binding.** When you select a (model, context) pair in the picker, it derives a session-scoped Ollama tag `<parent>-ctx<N>` (e.g. `qwen3.5:9b-q8_0-ctx32768`) using `/api/create` so `PARAMETER num_ctx N` is baked into the Modelfile. Derived tags share weight blobs with the parent (sub-second creation, no extra disk). This makes the chosen context binding for every wire protocol — Ollama 0.21.x silently ignores `options.num_ctx` on `/v1/chat/completions` and `/v1/messages`, so per-session Modelfile overrides are the only universal mechanism. The router peels the `-ctx<N>` suffix when resolving capability/policy so the parent's reasoning entry still applies. The probe driver also filters `-ctx<N>` derived tags out of `/api/tags` so they're never re-probed.
+**Per-session context binding & reasoning overrides:**
+- **Ollama**: the picker emits the parent name (or `<name>::nothink` to force reasoning off). KV cache allocation is dynamic per request from the global `OLLAMA_CONTEXT_LENGTH` (default 256K). The `/api/chat` and `/api/generate` endpoints honour `options.num_ctx` injected by the router; OpenAI- and Anthropic-compat endpoints get the global ceiling.
+- **vLLM / SGLang**: the picker emits `<name>@<ctx>` (e.g., `Llama-3.1-8B@32768`) or `<name>::<reasoning>@<ctx>` (e.g., `Llama-3.1-8B::low@32768`) to bind both context and reasoning policy per session. The router's `parseCtxOverride` and `parseReasoningOverride` strip these suffixes, rewrite the request body's `model` field to the clean name, and trigger a container recreate if the context or reasoning setting differs from the previous run.
 
 ## Configuration
 
@@ -481,7 +495,7 @@ sudo xfs_growfs /var/cache/devai/ollama
 ```
 .env                              — Host/runtime configuration
 .env.example                      — Configuration template
-bin/devai-shell                   — Standalone shell-agent launcher (no Make required)
+bin/devai-agent                   — Standalone shell-agent launcher (no Make required)
 deploy/
   models.yaml                     — Generated catalog (ollama + hf + gguf rows)
   .ollama-reasoning-cache.json    — Probe cache (schema v3, digest-keyed,

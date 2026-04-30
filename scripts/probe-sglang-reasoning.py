@@ -46,15 +46,22 @@ from _probe_hf_common import (  # noqa: E402  — local import after sys.path fi
 
 SGLANG_RESERVE_GB = 3.0  # mirrors gpu-arbiter/main.go memFraction
 DEFAULT_SGLANG_IMAGE = os.environ.get(
-    "SGLANG_IMAGE", "docker.io/lmsysorg/sglang:latest"
+    "SGLANG_IMAGE", "docker.io/lmsysorg/sglang:v0.5.10.post1-cu130"
 )
 
 
 def sglang_command_args(
-    model_name: str, max_ctx: int, host_frac: float
+    model_name: str, max_ctx: int, host_frac: float,
+    *, reasoning_parser: str | None = None, tool_parser: str | None = None,
 ) -> list[str]:
-    """Build SGLang launch arguments. Mirrors gpu-arbiter sglangEntrypoint."""
-    return [
+    """Build SGLang launch arguments. Mirrors gpu-arbiter sglangEntrypoint.
+
+    Parser flags are appended only when the catalog row's
+    `parsers.sglang` block supplied a value. Omitting them keeps the
+    launch in inline / no-tool mode. Both flag names verified against
+    the v0.5.10.post1-cu130 image — see deploy/backend-flags.yaml.
+    """
+    args = [
         "-m", "sglang.launch_server",
         "--model-path", f"/models/{model_name}",
         "--host", "0.0.0.0",
@@ -64,6 +71,11 @@ def sglang_command_args(
         "--context-length", str(max_ctx),
         "--trust-remote-code",
     ]
+    if reasoning_parser:
+        args.extend(["--reasoning-parser", reasoning_parser])
+    if tool_parser:
+        args.extend(["--tool-call-parser", tool_parser])
+    return args
 
 
 SPEC = BackendSpec(

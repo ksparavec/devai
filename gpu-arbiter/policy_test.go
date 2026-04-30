@@ -239,12 +239,15 @@ func TestPolicy_UnknownOllamaPathIsNoOp(t *testing.T) {
 	}
 }
 
-func TestPolicy_NonOllamaBackendIsNoOp(t *testing.T) {
+func TestPolicy_VLLMUnknownCapabilityIsNoOp(t *testing.T) {
+	// Phase 7+: vLLM is a no-op only when the model's capability is
+	// not `structured` — same semantics as Ollama. `some-vllm-model`
+	// has capability `unknown` in newTestArbiter().
 	a := newTestArbiter()
 	in := []byte(`{"model":"some-vllm-model","messages":[]}`)
 	out := a.applyReasoningPolicy("vllm", "/v1/chat/completions", "some-vllm-model", "auto", in)
 	if string(out) != string(in) {
-		t.Fatalf("vllm path should pass body through unchanged; got %s", out)
+		t.Fatalf("vllm path should pass body through unchanged for unknown; got %s", out)
 	}
 }
 
@@ -274,5 +277,402 @@ func TestValidPolicy(t *testing.T) {
 		if validPolicy(p) {
 			t.Errorf("%q should NOT be valid", p)
 		}
+	}
+}
+
+// ── Phase 7: vLLM / SGLang reasoning-policy rewrite ─────────────────────
+
+// newTestArbiterHF builds an arbiter populated for vLLM/SGLang-style
+// model names. Uses canonical HF repo basenames. `Qwen3.5-9B-NVFP4` has
+// disable_verified=true; `Llama-3.1-8B-Instruct-NVFP4` is inline (no
+// structured switch); `Untouched-Model` is unknown (the new noop case).
+func newTestArbiterHF() *arbiter {
+	return &arbiter{
+		modelCapability: map[string]string{
+			"Qwen3.5-9B-NVFP4":            "structured",
+			"Qwen3-14B-NVFP4":             "structured",
+			"Llama-3.1-8B-Instruct-NVFP4": "inline",
+			"Untouched-Model":             "unknown",
+		},
+		modelDisableOK: map[string]bool{
+			"Qwen3.5-9B-NVFP4": true,
+			// Qwen3-14B-NVFP4 has structured but disable not verified.
+		},
+		// Qwen3.5-9B-NVFP4 has a probe-verified tool parser (used by the
+		// strip-tools test); Qwen3-14B-NVFP4 doesn't.
+		modelToolParser: map[string]string{
+			"Qwen3.5-9B-NVFP4": "hermes",
+		},
+		defaultPolicy: "auto",
+	}
+}
+
+// readEnableThinking returns the value of
+// extra_body.chat_template_kwargs.enable_thinking, or (false, false)
+// when the path is missing.
+func readEnableThinking(t *testing.T, body []byte) (set bool, val bool) {
+	t.Helper()
+	var root map[string]any
+	if err := json.Unmarshal(body, &root); err != nil {
+		t.Fatalf("body not valid JSON: %v", err)
+	}
+	eb, ok := root["extra_body"].(map[string]any)
+	if !ok {
+		return false, false
+	}
+	ctk, ok := eb["chat_template_kwargs"].(map[string]any)
+	if !ok {
+		return false, false
+	}
+	v, ok := ctk["enable_thinking"]
+	if !ok {
+		return false, false
+	}
+	b, ok := v.(bool)
+	if !ok {
+		t.Fatalf("enable_thinking not bool: %T %v", v, v)
+	}
+	return true, b
+}
+
+func TestPolicy_VLLMStructuredEnable(t *testing.T) {
+	a := newTestArbiterHF()
+	for _, p := range []string{"auto", "low", "medium", "high"} {
+		in := []byte(`{"model":"Qwen3.5-9B-NVFP4","messages":[]}`)
+		out := a.applyReasoningPolicy("vllm", "/v1/chat/completions", "Qwen3.5-9B-NVFP4", p, in)
+		setT, valT := readEnableThinking(t, out)
+		if !setT || !valT {
+			t.Fatalf("policy=%s: expected enable_thinking=true, got set=%v val=%v body=%s", p, setT, valT, out)
+		}
+		_, effort := bodyStringField(t, out, "reasoning_effort")
+		want := openAIReasoningEffort(p)
+		if effort != want {
+			t.Fatalf("policy=%s: expected reasoning_effort=%q, got %q body=%s", p, want, effort, out)
+		}
+	}
+}
+
+func TestPolicy_VLLMOffDisableVerified(t *testing.T) {
+	a := newTestArbiterHF()
+	in := []byte(`{"model":"Qwen3.5-9B-NVFP4","messages":[]}`)
+	out := a.applyReasoningPolicy("vllm", "/v1/chat/completions", "Qwen3.5-9B-NVFP4", "off", in)
+	setT, valT := readEnableThinking(t, out)
+	if !setT || valT {
+		t.Fatalf("expected enable_thinking=false, got set=%v val=%v body=%s", setT, valT, out)
+	}
+	_, effort := bodyStringField(t, out, "reasoning_effort")
+	if effort != "none" {
+		t.Fatalf("expected reasoning_effort=none, got %q body=%s", effort, out)
+	}
+}
+
+func TestPolicy_VLLMOffWithoutDisableVerifiedNoop(t *testing.T) {
+	a := newTestArbiterHF()
+	// Qwen3-14B-NVFP4 is structured but disable not verified.
+	in := []byte(`{"model":"Qwen3-14B-NVFP4","messages":[]}`)
+	out := a.applyReasoningPolicy("vllm", "/v1/chat/completions", "Qwen3-14B-NVFP4", "off", in)
+	if string(out) != string(in) {
+		t.Fatalf("off without disable_verified must not modify body, got %s", out)
+	}
+}
+
+func TestPolicy_VLLMInlineNonOffNoop(t *testing.T) {
+	a := newTestArbiterHF()
+	in := []byte(`{"model":"Llama-3.1-8B-Instruct-NVFP4","messages":[]}`)
+	// Non-off policies: inline capability has no structured switch, so
+	// we leave the body alone. Applies to auto/low/medium/high.
+	for _, p := range []string{"auto", "low", "medium", "high"} {
+		out := a.applyReasoningPolicy("vllm", "/v1/chat/completions", "Llama-3.1-8B-Instruct-NVFP4", p, in)
+		if setT, _ := readEnableThinking(t, out); setT {
+			t.Fatalf("policy=%s: inline must not set enable_thinking, got body=%s", p, out)
+		}
+		if setE, _ := bodyStringField(t, out, "reasoning_effort"); setE {
+			t.Fatalf("policy=%s: inline must not set reasoning_effort, got body=%s", p, out)
+		}
+	}
+}
+
+func TestPolicy_VLLMInlineOffDisables(t *testing.T) {
+	a := newTestArbiterHF()
+	in := []byte(`{"model":"Llama-3.1-8B-Instruct-NVFP4","messages":[]}`)
+	// Inline + off injects the disable shape. The policy is set
+	// explicitly by the user (typically via the picker's `::nothink`
+	// suffix), so we honour it without a modelDisableOK gate.
+	out := a.applyReasoningPolicy("vllm", "/v1/chat/completions", "Llama-3.1-8B-Instruct-NVFP4", "off", in)
+	setT, valT := readEnableThinking(t, out)
+	if !setT || valT {
+		t.Fatalf("inline+off: expected enable_thinking=false, got set=%v val=%v body=%s", setT, valT, out)
+	}
+	setE, valE := bodyStringField(t, out, "reasoning_effort")
+	if !setE || valE != "none" {
+		t.Fatalf("inline+off: expected reasoning_effort=none, got set=%v val=%q body=%s", setE, valE, out)
+	}
+}
+
+func TestPolicy_VLLMClientExtraBodyWins(t *testing.T) {
+	a := newTestArbiterHF()
+	in := []byte(`{"model":"Qwen3.5-9B-NVFP4","messages":[],"extra_body":{"chat_template_kwargs":{"enable_thinking":false}}}`)
+	out := a.applyReasoningPolicy("vllm", "/v1/chat/completions", "Qwen3.5-9B-NVFP4", "auto", in)
+	setT, valT := readEnableThinking(t, out)
+	if !setT || valT {
+		t.Fatalf("client enable_thinking=false must survive, got set=%v val=%v body=%s", setT, valT, out)
+	}
+}
+
+func TestPolicy_VLLMClientReasoningEffortWins(t *testing.T) {
+	a := newTestArbiterHF()
+	in := []byte(`{"model":"Qwen3.5-9B-NVFP4","messages":[],"reasoning_effort":"low"}`)
+	out := a.applyReasoningPolicy("vllm", "/v1/chat/completions", "Qwen3.5-9B-NVFP4", "high", in)
+	_, effort := bodyStringField(t, out, "reasoning_effort")
+	if effort != "low" {
+		t.Fatalf("client reasoning_effort=low must survive, got %q body=%s", effort, out)
+	}
+}
+
+func TestPolicy_VLLMNonChatPathNoop(t *testing.T) {
+	a := newTestArbiterHF()
+	in := []byte(`{"model":"Qwen3.5-9B-NVFP4"}`)
+	for _, p := range []string{"/v1/embeddings", "/health", "/v1/completions"} {
+		out := a.applyReasoningPolicy("vllm", p, "Qwen3.5-9B-NVFP4", "auto", in)
+		if string(out) != string(in) {
+			t.Fatalf("path=%s: vllm non-chat path must noop, got %s", p, out)
+		}
+	}
+}
+
+// SGLang variants — same semantics, different surface fields.
+
+func TestPolicy_SGLangStructuredEnable(t *testing.T) {
+	a := newTestArbiterHF()
+	in := []byte(`{"model":"Qwen3.5-9B-NVFP4","messages":[]}`)
+	out := a.applyReasoningPolicy("sglang", "/v1/chat/completions", "Qwen3.5-9B-NVFP4", "auto", in)
+	setSR, valSR := bodyBoolField(t, out, "separate_reasoning")
+	if !setSR || !valSR {
+		t.Fatalf("expected separate_reasoning=true, got set=%v val=%v body=%s", setSR, valSR, out)
+	}
+	setT, valT := readEnableThinking(t, out)
+	if !setT || !valT {
+		t.Fatalf("expected enable_thinking=true, got set=%v val=%v body=%s", setT, valT, out)
+	}
+}
+
+func TestPolicy_SGLangOffDisableVerified(t *testing.T) {
+	a := newTestArbiterHF()
+	in := []byte(`{"model":"Qwen3.5-9B-NVFP4","messages":[]}`)
+	out := a.applyReasoningPolicy("sglang", "/v1/chat/completions", "Qwen3.5-9B-NVFP4", "off", in)
+	setSR, valSR := bodyBoolField(t, out, "separate_reasoning")
+	if !setSR || valSR {
+		t.Fatalf("expected separate_reasoning=false, got set=%v val=%v body=%s", setSR, valSR, out)
+	}
+	setT, valT := readEnableThinking(t, out)
+	if !setT || valT {
+		t.Fatalf("expected enable_thinking=false, got set=%v val=%v body=%s", setT, valT, out)
+	}
+}
+
+func TestPolicy_SGLangOffWithoutDisableVerifiedNoop(t *testing.T) {
+	a := newTestArbiterHF()
+	in := []byte(`{"model":"Qwen3-14B-NVFP4","messages":[]}`)
+	out := a.applyReasoningPolicy("sglang", "/v1/chat/completions", "Qwen3-14B-NVFP4", "off", in)
+	if string(out) != string(in) {
+		t.Fatalf("off without disable_verified must not modify body, got %s", out)
+	}
+}
+
+func TestPolicy_SGLangInlineNonOffNoop(t *testing.T) {
+	a := newTestArbiterHF()
+	in := []byte(`{"model":"Llama-3.1-8B-Instruct-NVFP4","messages":[]}`)
+	// Non-off policies: inline + auto/L/M/H must not inject anything.
+	for _, p := range []string{"auto", "low", "medium", "high"} {
+		out := a.applyReasoningPolicy("sglang", "/v1/chat/completions", "Llama-3.1-8B-Instruct-NVFP4", p, in)
+		if setSR, _ := bodyBoolField(t, out, "separate_reasoning"); setSR {
+			t.Fatalf("policy=%s: inline must not set separate_reasoning, got body=%s", p, out)
+		}
+		if setT, _ := readEnableThinking(t, out); setT {
+			t.Fatalf("policy=%s: inline must not set enable_thinking, got body=%s", p, out)
+		}
+	}
+}
+
+func TestPolicy_SGLangInlineOffDisables(t *testing.T) {
+	a := newTestArbiterHF()
+	in := []byte(`{"model":"Llama-3.1-8B-Instruct-NVFP4","messages":[]}`)
+	// Inline + off: explicit user opt-out injects the disable shape on
+	// SGLang too. No modelDisableOK gate — the suffix IS the opt-in.
+	out := a.applyReasoningPolicy("sglang", "/v1/chat/completions", "Llama-3.1-8B-Instruct-NVFP4", "off", in)
+	setSR, valSR := bodyBoolField(t, out, "separate_reasoning")
+	if !setSR || valSR {
+		t.Fatalf("inline+off: expected separate_reasoning=false, got set=%v val=%v body=%s", setSR, valSR, out)
+	}
+	setT, valT := readEnableThinking(t, out)
+	if !setT || valT {
+		t.Fatalf("inline+off: expected enable_thinking=false, got set=%v val=%v body=%s", setT, valT, out)
+	}
+}
+
+func TestPolicy_SGLangClientSeparateReasoningWins(t *testing.T) {
+	a := newTestArbiterHF()
+	in := []byte(`{"model":"Qwen3.5-9B-NVFP4","messages":[],"separate_reasoning":false}`)
+	out := a.applyReasoningPolicy("sglang", "/v1/chat/completions", "Qwen3.5-9B-NVFP4", "auto", in)
+	_, valSR := bodyBoolField(t, out, "separate_reasoning")
+	if valSR {
+		t.Fatalf("client separate_reasoning=false must survive, got body=%s", out)
+	}
+}
+
+// ── setNestedJSONFieldIfAbsent ───────────────────────────────────────────
+
+func TestSetNestedJSONFieldIfAbsent_CreatesPath(t *testing.T) {
+	in := []byte(`{"model":"x"}`)
+	out := setNestedJSONFieldIfAbsent(in,
+		[]string{"extra_body", "chat_template_kwargs", "enable_thinking"}, true)
+	setT, valT := readEnableThinking(t, out)
+	if !setT || !valT {
+		t.Fatalf("expected enable_thinking=true, got set=%v val=%v body=%s", setT, valT, out)
+	}
+}
+
+func TestSetNestedJSONFieldIfAbsent_PreservesExistingLeaf(t *testing.T) {
+	in := []byte(`{"extra_body":{"chat_template_kwargs":{"enable_thinking":false}}}`)
+	out := setNestedJSONFieldIfAbsent(in,
+		[]string{"extra_body", "chat_template_kwargs", "enable_thinking"}, true)
+	_, valT := readEnableThinking(t, out)
+	if valT {
+		t.Fatalf("existing leaf must not be overwritten, got body=%s", out)
+	}
+}
+
+func TestSetNestedJSONFieldIfAbsent_PreservesSiblings(t *testing.T) {
+	in := []byte(`{"extra_body":{"cache_control":{"ttl":"1h"}}}`)
+	out := setNestedJSONFieldIfAbsent(in,
+		[]string{"extra_body", "chat_template_kwargs", "enable_thinking"}, true)
+	var root map[string]any
+	if err := json.Unmarshal(out, &root); err != nil {
+		t.Fatalf("body not valid JSON: %v", err)
+	}
+	eb, ok := root["extra_body"].(map[string]any)
+	if !ok {
+		t.Fatalf("extra_body missing or not object: %v", root["extra_body"])
+	}
+	if cc, ok := eb["cache_control"].(map[string]any); !ok || cc["ttl"] != "1h" {
+		t.Fatalf("client cache_control must survive, got %v", eb["cache_control"])
+	}
+	setT, valT := readEnableThinking(t, out)
+	if !setT || !valT {
+		t.Fatalf("expected enable_thinking=true alongside existing siblings, body=%s", out)
+	}
+}
+
+func TestSetNestedJSONFieldIfAbsent_RefusesNonObjectIntermediate(t *testing.T) {
+	// Client supplied extra_body as a string — refuse to rewrite.
+	in := []byte(`{"extra_body":"not-an-object"}`)
+	out := setNestedJSONFieldIfAbsent(in,
+		[]string{"extra_body", "chat_template_kwargs", "enable_thinking"}, true)
+	if string(out) != string(in) {
+		t.Fatalf("non-object intermediate must produce passthrough, got %s", out)
+	}
+}
+
+func TestSetNestedJSONFieldIfAbsent_InvalidJSONPassthrough(t *testing.T) {
+	in := []byte(`not-json`)
+	out := setNestedJSONFieldIfAbsent(in,
+		[]string{"extra_body", "chat_template_kwargs", "enable_thinking"}, true)
+	if string(out) != string(in) {
+		t.Fatalf("invalid JSON must passthrough, got %s", out)
+	}
+}
+
+// parseReasoningOverride parses the `::<token>` suffix the picker emits
+// for inline-reasoning two-row picks. Cover the recognised tokens plus
+// the negative cases (no suffix, unknown token).
+func TestParseReasoningOverride_TokenMapping(t *testing.T) {
+	cases := []struct {
+		in       string
+		wantName string
+		wantPol  string
+	}{
+		{"qwen3:14b-q4_K_M", "qwen3:14b-q4_K_M", ""},
+		{"qwen3:14b-q4_K_M::nothink", "qwen3:14b-q4_K_M", "off"},
+		{"qwen3:14b-q4_K_M::think", "qwen3:14b-q4_K_M", "auto"},
+		{"qwen3:14b-q4_K_M::off", "qwen3:14b-q4_K_M", "off"},
+		{"qwen3:14b-q4_K_M::auto", "qwen3:14b-q4_K_M", "auto"},
+		{"qwen3:14b-q4_K_M::low", "qwen3:14b-q4_K_M", "low"},
+		{"qwen3:14b-q4_K_M::medium", "qwen3:14b-q4_K_M", "medium"},
+		{"qwen3:14b-q4_K_M::high", "qwen3:14b-q4_K_M", "high"},
+		// Unknown tokens leave the name untouched.
+		{"qwen3:14b-q4_K_M::garbage", "qwen3:14b-q4_K_M::garbage", ""},
+		// Embedded `::` in the name without a recognised token after
+		// the LAST occurrence is also a noop.
+		{"namespace::model", "namespace::model", ""},
+	}
+	for _, tc := range cases {
+		gotName, gotPol := parseReasoningOverride(tc.in)
+		if gotName != tc.wantName || gotPol != tc.wantPol {
+			t.Errorf("parseReasoningOverride(%q) = (%q, %q), want (%q, %q)",
+				tc.in, gotName, gotPol, tc.wantName, tc.wantPol)
+		}
+	}
+}
+
+// The picker convention is `<name>::<reasoning>@<ctx>`. The router
+// strips them in the order ctx-first, reasoning-second so both end
+// up in the right hands.
+func TestParseSuffixes_OrderingMatchesPickerEmits(t *testing.T) {
+	in := "Qwen3-14B-NVFP4::nothink@65536"
+	ctxStripped, ctxOverride := parseCtxOverride(in)
+	if ctxStripped != "Qwen3-14B-NVFP4::nothink" || ctxOverride != 65536 {
+		t.Fatalf("after parseCtxOverride: got (%q, %d), want (%q, 65536)",
+			ctxStripped, ctxOverride, "Qwen3-14B-NVFP4::nothink")
+	}
+	cleanName, reasoning := parseReasoningOverride(ctxStripped)
+	if cleanName != "Qwen3-14B-NVFP4" || reasoning != "off" {
+		t.Fatalf("after parseReasoningOverride: got (%q, %q), want (%q, %q)",
+			cleanName, reasoning, "Qwen3-14B-NVFP4", "off")
+	}
+}
+
+// maybeStripTools strips `tools` and `tool_choice` for vLLM/SGLang
+// when the model has no probe-verified tool parser (engine launched
+// without --enable-auto-tool-choice / --tool-call-parser).
+func TestMaybeStripTools_VLLMUnverifiedDropsTools(t *testing.T) {
+	a := newTestArbiterHF()
+	in := []byte(`{"model":"Qwen3-14B-NVFP4","messages":[],"tools":[{"type":"function"}],"tool_choice":"auto"}`)
+	out := a.maybeStripTools("vllm", "Qwen3-14B-NVFP4", in)
+	var doc map[string]any
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatalf("rewritten body not valid JSON: %v body=%s", err, out)
+	}
+	if _, ok := doc["tools"]; ok {
+		t.Errorf("tools should have been stripped, body=%s", out)
+	}
+	if _, ok := doc["tool_choice"]; ok {
+		t.Errorf("tool_choice should have been stripped, body=%s", out)
+	}
+}
+
+func TestMaybeStripTools_VLLMVerifiedKeepsTools(t *testing.T) {
+	a := newTestArbiterHF()
+	in := []byte(`{"model":"Qwen3.5-9B-NVFP4","messages":[],"tools":[{"type":"function"}],"tool_choice":"auto"}`)
+	out := a.maybeStripTools("vllm", "Qwen3.5-9B-NVFP4", in)
+	if string(out) != string(in) {
+		t.Fatalf("verified parser must preserve tools, got %s", out)
+	}
+}
+
+func TestMaybeStripTools_OllamaPassthrough(t *testing.T) {
+	a := newTestArbiterHF()
+	in := []byte(`{"model":"some-ollama","messages":[],"tools":[{"type":"function"}]}`)
+	out := a.maybeStripTools("ollama", "some-ollama", in)
+	if string(out) != string(in) {
+		t.Fatalf("ollama path must passthrough; tools negotiated per request, got %s", out)
+	}
+}
+
+func TestMaybeStripTools_NoToolsNoop(t *testing.T) {
+	a := newTestArbiterHF()
+	in := []byte(`{"model":"Qwen3-14B-NVFP4","messages":[]}`)
+	out := a.maybeStripTools("vllm", "Qwen3-14B-NVFP4", in)
+	if string(out) != string(in) {
+		t.Fatalf("body without tools must passthrough byte-for-byte, got %s", out)
 	}
 }
