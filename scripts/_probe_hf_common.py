@@ -549,6 +549,20 @@ def classify_chat_response(
         }
     if has_inline_think_markers(content):
         return "inline", {"content_preview": content[:200]}
+    # Distinguish "model doesn't reason and was never asked to" from
+    # "we tried a reasoning parser and got nothing back". Both render
+    # as `No reasoning` in the picker, but the cache audit needs to
+    # tell apart well-behaved non-reasoning models (Llama-3.1, dense
+    # Gemma) from broken parser pairings.
+    if (
+        not reasoning_parser_attempted
+        and finish_reason == "stop"
+        and content
+    ):
+        return "none", {
+            "none_reason": "clean_answer_no_parser_attempted",
+            "content_preview": content[:120],
+        }
     return "unsupported", {"content_preview": content[:120]}
 
 
@@ -711,6 +725,11 @@ def probe_one_cell(
             evidence=evidence, startup_seconds=startup_seconds,
         )
 
+    # Read what the engine actually accepted for max-model-len. Recorded
+    # for evidence but no longer used as an early-exit gate — the chat
+    # probe below decides whether the cell counts as fits=True. An engine
+    # that silently clamps will still answer; an engine that breaks at
+    # the requested ctx will fail the chat probe naturally.
     actual_max = 0
     try:
         models_resp = http_get(f"{base_url}/v1/models", timeout=10.0)
@@ -720,20 +739,6 @@ def probe_one_cell(
                 actual_max = mm
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
         actual_max = 0
-
-    if actual_max and actual_max < requested_ctx:
-        container_remove(runtime, container_name)
-        return _failure_record(
-            ctx=requested_ctx, vram_gb=band_gb, started=started,
-            startup_seconds=startup_seconds,
-            evidence={
-                "kind": "clamped_ctx",
-                "actual_context": actual_max,
-                "requested_context": requested_ctx,
-                "reasoning_parser_attempted": reasoning_parser,
-                "tool_parser_attempted": tool_parser,
-            },
-        )
 
     # ── Probe A: fit + reasoning ─────────────────────────────────────
     # When a reasoning_parser is being attempted, request the backend's
@@ -1012,9 +1017,29 @@ def refresh_top_level_from_cells(entry: dict) -> None:
         entry["reasoning_parser"] = smallest.get("reasoning_parser")
         entry["tool_parser"] = smallest.get("tool_parser")
         entry["disable_verified"] = bool(smallest.get("disable_verified", False))
-        actual_ctx = int(smallest.get("actual_context") or 0)
-        if actual_ctx and (entry.get("max_context") or 0) < actual_ctx:
-            entry["max_context"] = actual_ctx
+        # max_context = largest actual_context across ALL clean cells.
+        # Using `smallest`'s actual_context here was a long-standing bug:
+        # it left max_context pinned to the smallest verified tier (e.g.
+        # 32K) even when 256K had also been verified as fitting. The
+        # picker's _measured_point_at clamps requested ctx to max_context,
+        # so the bug hid every higher-tier row from the menu.
+        largest_ctx = 0
+        for vram_bucket in (entry.get("probes") or {}).values():
+            if not isinstance(vram_bucket, dict):
+                continue
+            cells = (
+                [vram_bucket]
+                if "capability" in vram_bucket
+                else [c for c in vram_bucket.values() if isinstance(c, dict)]
+            )
+            for cell in cells:
+                if cell.get("capability") in (None, "error"):
+                    continue
+                ac = int(cell.get("actual_context") or 0)
+                if ac > largest_ctx:
+                    largest_ctx = ac
+        if largest_ctx and (entry.get("max_context") or 0) < largest_ctx:
+            entry["max_context"] = largest_ctx
         return
 
     # No clean probe in the corpus — pick the most-severe failure kind
@@ -1105,7 +1130,10 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
     if not models_dir.is_dir():
         sys.exit(f"error: models dir not found: {models_dir}")
 
-    vrams = parse_vram_list(args.vram) if args.vram else standard_vram_budgets()
+    # Default to ONLY the host VRAM. Probing 16G when the host has 24G
+    # produces data nobody on this host can use; the operator can still
+    # ask for sub-host bands explicitly via `--vram 16,24`.
+    vrams = parse_vram_list(args.vram) if args.vram else [int(args.host_vram_gb)]
     ctxs = parse_context_list(args.ctx) if args.ctx else standard_contexts()
     if not vrams or not ctxs:
         sys.exit("error: --vram or --ctx produced an empty list")

@@ -77,15 +77,64 @@ def _hf_blobs(repo: str) -> dict:
 
 _HF_WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pth")
 
+# Subdirectories some repos use to ship duplicate / alternate-format
+# copies of the same weights. vLLM and SGLang load only the top-level
+# safetensors set, so summing these would overstate the on-disk
+# footprint by 2–4×. Examples:
+#   openai/gpt-oss-20b:  ships MXFP4 at root + bf16 mirror under
+#                         original/ + Apple-Metal copy under metal/.
+#   meta-llama/*:        consolidated/ holds a single-file PyTorch
+#                         checkpoint duplicating the safetensors set.
+_HF_NON_PRIMARY_DIRS = ("original/", "metal/", "consolidated/")
+
 
 def hf_weight_bytes(repo: str) -> int:
-    """Sum all weight file sizes from the HF API (safetensors/bin/pth only)."""
+    """Sum the loaded-weight footprint reported by the HF API.
+
+    Strategy:
+      1. If `model.safetensors.index.json` is present at repo root,
+         only count safetensors shards it references (authoritative —
+         that's what the loader uses).
+      2. Otherwise sum top-level weight files (suffixes in
+         `_HF_WEIGHT_SUFFIXES`), excluding any path under a non-primary
+         mirror directory (see `_HF_NON_PRIMARY_DIRS`).
+    """
     data = _hf_blobs(repo)
-    return sum(
-        (f.get("size") or 0)
-        for f in data.get("siblings", [])
-        if f.get("rfilename", "").endswith(_HF_WEIGHT_SUFFIXES)
-    )
+    siblings = data.get("siblings", []) or []
+
+    # Path 1: authoritative shard list from the safetensors index.
+    index_files = [
+        f for f in siblings
+        if f.get("rfilename") == "model.safetensors.index.json"
+    ]
+    if index_files:
+        try:
+            import json as _json
+            import urllib.request as _ur
+            url = f"https://huggingface.co/{repo}/resolve/main/model.safetensors.index.json"
+            with _ur.urlopen(url, timeout=15) as r:
+                index = _json.loads(r.read())
+            shards = set((index.get("weight_map") or {}).values())
+            if shards:
+                return sum(
+                    (f.get("size") or 0)
+                    for f in siblings
+                    if f.get("rfilename") in shards
+                )
+        except Exception:
+            # Network or parse failure → fall through to path 2.
+            pass
+
+    # Path 2: top-level weight files, no mirror subdirs.
+    total = 0
+    for f in siblings:
+        rfn = f.get("rfilename") or ""
+        if not rfn.endswith(_HF_WEIGHT_SUFFIXES):
+            continue
+        if any(rfn.startswith(d) for d in _HF_NON_PRIMARY_DIRS):
+            continue
+        total += f.get("size") or 0
+    return total
 
 
 def hf_repo_sha(repo: str) -> str:

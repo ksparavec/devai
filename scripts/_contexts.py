@@ -144,17 +144,16 @@ def standard_vram_budgets(env_override: str | None = None) -> list[int]:
 
 
 def effective_targets(tiers: list[int], max_context: int) -> list[int]:
-    """Per-model effective probe targets.
+    """Per-model effective probe targets — no clamps.
 
-    Cap each tier at the model's design ceiling and dedup. Returns
-    ascending. A model with max_context=98304 asked for tiers
-    [32K, 64K, 128K, 256K] yields [32768, 65536, 98304] — never above
-    the ceiling, never duplicated.
+    Returns the requested tiers, deduped and ascending. The model's
+    declared max_context is ignored: a model card claiming 131K can
+    still be probed at 256K (rope-extrapolation territory) so the
+    operator sees the actual engine outcome, not a pre-emptive skip.
+    Used to clamp at `max_context`; that hid valid probes whenever
+    the engine accepted ctx beyond the model's nominal ceiling.
     """
-    if max_context <= 0:
-        return sorted({t for t in tiers if t > 0})
-    capped = {min(t, max_context) for t in tiers if t > 0}
-    return sorted(capped)
+    return sorted({t for t in tiers if t > 0})
 
 
 def context_label(context: int) -> str:

@@ -56,6 +56,20 @@
 # inline brackets `[a, b]` or inline maps `{key: val}`.
 #
 # To add a family: add a block below, then run `make catalog-regen`.
+#
+# ── SGLang NVFP4 status (verified 2026-05-01) ────────────────────────────
+# Image `lmsysorg/sglang:v0.5.10.post1-cu130` cannot serve any NVFP4
+# checkpoint. Every probe of an NVFP4 repo (Qwen3*, Llama-3.1-NVFP4,
+# Nemotron-Nano-NVFP4, Gemma-NVFP4) fails at
+#   /sgl-workspace/sglang/python/sglang/srt/layers/quantization/modelopt_quant.py:1482
+#   in fp4_quantize(x, layer.input_scale_inv)
+# vLLM at the same NVFP4 weights loads fine — this is a SGLang-side bug,
+# probably a missing kernel for the cu130 / Blackwell path. Workaround
+# until upstream fixes it: route NVFP4 traffic to vLLM only. The probe
+# cache records `kind=infra` for every SGLang/NVFP4 cell so the picker
+# auto-hides them; no per-family workaround needed below.
+# Tracking: file an issue at https://github.com/sgl-project/sglang/issues
+# referencing the modelopt_quant trace if not already reported.
 
 families:
   - name: gemma4
@@ -94,11 +108,21 @@ families:
     parsers:
       vllm:
         reasoning: qwen3
-        tool: hermes
+        # Qwen3.5 chat template emits XML-shape tool calls
+        # (`<tool_call><function=...><parameter=key>value</parameter></function></tool_call>`),
+        # not plain hermes (`<tool_call>{json}</tool_call>`). Probe
+        # confirmed `hermes` left tool_calls empty on Qwen3.5-9B-NVFP4
+        # while it worked on Qwen3-8B-NVFP4. Verified via
+        # tokenizer_config.json chat_template inspection 2026-05-01.
+        tool: qwen3_xml
       sglang:
         reasoning: qwen3
-        # `qwen` is forward-compat. Older `qwen25` still works in
-        # v0.5.10.post1 stable but is deprecation-warned in dev builds.
+        # SGLang has no qwen3_xml parser — `qwen` covers the same
+        # XML-shape via the Qwen25 detector. NVFP4 weights fail at
+        # SGLang's modelopt_quant in v0.5.10.post1-cu130 anyway, so
+        # this parser never gets exercised on the NVFP4 variants
+        # currently in this family. Re-evaluate when SGLang ships
+        # an NVFP4-capable image.
         tool: qwen
     gguf_repos:
       # 27B dense — Q4_K_M from registry spills hard at 24G; sub-Q4
@@ -193,13 +217,27 @@ families:
     arch_ref: nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4
     thinking: true        # hint; vLLM/SGLang variants probed separately later
 
+  # Parser-name verification source: vLLM v0.x (cu130 image) registers
+  # reasoning parsers in vllm/reasoning/__init__.py:_REASONING_PARSERS_TO_REGISTER
+  # and tool-call parsers in --help under --tool-call-parser choices.
+  # SGLang v0.5.10 registers reasoning detectors in
+  # python/sglang/srt/parser/reasoning_parser.py and tool detectors in
+  # python/sglang/srt/function_call/function_call_parser.py.
+  # Drift here breaks container startup — keep names verbatim per backend.
+
   - name: nemotron-3-nano
     ollama_repos:
       - nemotron-3-nano
     hf_repos:
-      # 30B-A3B MoE, NVFP4 — dense compute footprint of ~3B active params
-      # per token but the full 30B knowledge surface. ~18 GB on disk.
-      - nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4
+      # NOTE: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4 was previously
+      # listed here. Removed 2026-05-01 — the 30B-A3B NVFP4 weights
+      # (~19 GB) plus vLLM startup overhead + 32K KV cache + CUDA graph
+      # capture exceed 24 GB and OOM on consumer hardware. Re-add when
+      # we have a knob (e.g. --enforce-eager via family `engine_flags`)
+      # to free the ~2 GB CUDA graph budget. The Omni variant below is
+      # the same MoE compute envelope but routed via a different repo
+      # (and OOMd similarly in the last probe — re-evaluate together).
+      #
       # Multimodal reasoning variant of the same MoE — omni I/O.
       - nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4
     gguf_repos:
@@ -220,7 +258,10 @@ families:
       # the right choice on both backends. The probe verifies the
       # round-trip before the router uses it.
       vllm:
-        reasoning: nemotron_3
+        # vLLM registers the parser as `nemotron_v3` in
+        # vllm/reasoning/__init__.py. SGLang registers it as `nemotron_3`.
+        # The names DO NOT match across backends — keep both verbatim.
+        reasoning: nemotron_v3
         tool: hermes
       sglang:
         reasoning: nemotron_3
@@ -229,9 +270,12 @@ families:
     thinking: true        # hint upgraded after probe verified structured
 
   - name: nemotron-cascade-2
-    # Ollama-only — no Cascade-2 NVFP4 published on the NVIDIA HF org
-    # (the NVFP4 line currently covers Nemotron-3-Nano and -Super
-    # variants, not Cascade). No HF sibling to add.
+    # Ollama-only — the only public HF variant (nvidia/Nemotron-Cascade-
+    # 2-30B-A3B) is bf16 safetensors at ~60 GB and OOMs on 24G VRAM.
+    # Probed 2026-05-01 across vLLM + SGLang × {16G,24G} × {32K..256K};
+    # every cell returned oom_startup. NVIDIA hasn't published an
+    # NVFP4 / FP8 / quantized variant of Cascade-2. Re-add hf_repos
+    # only when a quantized release lands.
     ollama_repos:
       - nemotron-cascade-2
     arch_ref: nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4
@@ -261,16 +305,48 @@ families:
       #   Qwen-7B  → ~14 GB (Qwen2 arch)
       #   Llama-8B → ~15 GB (Llama-3 arch)
       # Both emit R1-style `<think>` blocks; the deepseek-r1 reasoning
-      # parser strips them into `reasoning_content`. Tool calling uses
-      # the deepseek_v3 family parser on both backends.
+      # parser strips them into `reasoning_content`.
+      #
+      # Tool calling intentionally NOT wired: the R1-Distill chat
+      # templates use DeepSeek-V3 special tokens (`<｜tool▁call▁begin｜>`
+      # etc.), but the distills inherit the BASE model's tokenizer
+      # (Qwen2 / Llama3) which lacks those tokens as atomic vocab
+      # entries. vLLM's `deepseek_v3`, `deepseek_v31`, and `deepseek_v32`
+      # parsers all do `vocab.get(<token>)` at startup and fail with
+      # HTTP 500: "DeepSeek-V3 Tool parser could not locate tool call
+      # start/end tokens in the tokenizer". No other parser matches the
+      # template's emission either. Until upstream ships a string-based
+      # parser variant or the distills add the tokens to vocab, tool
+      # calls on this family must be disabled — the router strips
+      # `tools`/`tool_choice` from requests when `disable_verified=False`.
+      # Verified 2026-05-01 against vLLM image latest-cu130-ubuntu2404.
       - deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
       - deepseek-ai/DeepSeek-R1-Distill-Llama-8B
     parsers:
       vllm:
         reasoning: deepseek_r1
-        tool: deepseek_v3
       sglang:
         reasoning: deepseek-r1
-        tool: deepseekv3
     arch_ref: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+    thinking: true
+
+  - name: gpt-oss
+    # OpenAI's first open-weight release. The 20B variant ships natively
+    # in MXFP4 (~13 GB on disk) — vLLM and SGLang both load it directly.
+    # Uses the harmony chat format with explicit reasoning channels.
+    hf_repos:
+      - openai/gpt-oss-20b
+    parsers:
+      # Reasoning parser handles the `<|channel|>analysis<|message|>...`
+      # harmony reasoning blocks. vLLM registers it under
+      # `openai_gptoss`; SGLang registers it under `gpt-oss`.
+      # Tool parser: vLLM has dedicated `openai` (handles harmony tool
+      # channels); SGLang exposes `gpt-oss` for the same purpose.
+      vllm:
+        reasoning: openai_gptoss
+        tool: openai
+      sglang:
+        reasoning: gpt-oss
+        tool: gpt-oss
+    arch_ref: openai/gpt-oss-20b
     thinking: true

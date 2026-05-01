@@ -116,7 +116,7 @@ endif
 .PHONY: vllm-list vllm-rm vllm-status vllm-df
 .PHONY: clean clean-cpu clean-gpu clean-router prune
 .PHONY: fetch-cli pull-images install install-systemd uninstall test test-router test-ollama test-agents test-models test-probe-vllm test-probe-sglang test-probe-ollama-idempotent test-vllm test-sglang test-e2e test-full help
-.PHONY: catalog-regen probe probe-vllm probe-sglang model-fit model-pull vram-fit verify-backend-flags ollama-cleanup-ctx-variants
+.PHONY: catalog-regen catalog-suggest probe probe-vllm probe-sglang model-fit model-pull vram-fit verify-backend-flags ollama-cleanup-ctx-variants
 
 all: help
 
@@ -852,6 +852,20 @@ model-pull: ## Pull missing best-fit candidates from the catalog (catalog-driven
 
 catalog-regen: ## Regenerate deploy/models.yaml from scripts/model-families.yaml using live upstream data
 	python3 scripts/generate-catalog.py
+
+catalog-suggest: ## Suggest GGUF candidates llmfit ranks well that aren't yet in scripts/model-families.yaml. Read-only; probe before adding.
+	@command -v llmfit >/dev/null 2>&1 || { \
+	  echo "error: llmfit not found in PATH (install: https://github.com/AlexsJones/llmfit)"; exit 1; }
+	@VRAM=$${VRAM:-$(GPU_MEMORY_GB)}; \
+	 CTX=$${CONTEXT:-$(MAX_CONTEXT_LEN)}; \
+	 LIMIT=$${LIMIT:-30}; \
+	 echo "# llmfit recommend --runtime llamacpp --memory $${VRAM}G --max-context $${CTX} -n $${LIMIT}"; \
+	 echo; \
+	 llmfit --memory "$${VRAM}G" --max-context "$${CTX}" \
+	   recommend --runtime llamacpp --json -n "$${LIMIT}" \
+	   $(if $(USE_CASE),--use-case $(USE_CASE),) \
+	   $(if $(MIN_FIT),--min-fit $(MIN_FIT),) \
+	 | python3 scripts/llmfit-catalog-diff.py
 
 verify-backend-flags: ## Assert pinned vLLM/SGLang images expose every flag in deploy/backend-flags.yaml (run after image bump)
 	python3 scripts/verify-backend-flags.py

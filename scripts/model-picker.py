@@ -451,23 +451,26 @@ def _vram_from_hf_probe(probe: dict, arch: dict | None = None,
                 ctx = int(ctx_key)
             except (TypeError, ValueError):
                 ctx = 0
-            if arch and weight_gb > 0 and ctx > 0:
-                # Per-ctx formula display. The probe's actual_vram_gb
-                # would be the engine's pre-allocated pool — replace
-                # with weights + KV(ctx) + overhead so contexts differ.
-                # Tag the cell as formula-derived so _vram_info_at can
-                # surface this to the formatter via measured=False (the
-                # picker shows `*` next to values that aren't ground-
-                # truth measurements).
+            measured_vram = cell.get("actual_vram_gb")
+            if measured_vram is not None and cell.get("fits"):
+                # Probe truth: the prober launched the engine at this
+                # exact (vram_band, ctx) and measured nvidia-smi after
+                # the chat round-trip. Use it directly. For vLLM that
+                # number is the pre-allocated pool (constant across
+                # ctx); for SGLang it's the actual working set (varies
+                # by ctx). Both are real and authoritative.
+                new_cell["actual_total_gb"] = round(float(measured_vram), 2)
+            elif arch and weight_gb > 0 and ctx > 0:
+                # Formula fallback for cells without probe measurement
+                # (e.g. fits=False, or older cache schemas). Marked so
+                # the formatter renders an asterisk + footnote.
                 kv_gb = _hf_kv_gb(arch, ctx)
                 total = weight_gb + kv_gb + _HF_OVERHEAD_GB
                 new_cell["actual_total_gb"] = round(total, 2)
                 new_cell["actual_vram_gb"] = round(total, 2)
                 new_cell["_formula_override"] = True
-            else:
-                actual_vram = cell.get("actual_vram_gb")
-                if actual_vram is not None and "actual_total_gb" not in new_cell:
-                    new_cell["actual_total_gb"] = actual_vram
+            elif measured_vram is not None and "actual_total_gb" not in new_cell:
+                new_cell["actual_total_gb"] = measured_vram
             new_band[ctx_key] = new_cell
         converted[vram_key] = new_band
     out["probes"] = converted
@@ -764,7 +767,13 @@ def _numbered_fallback(lines: list[str], header: str,
 _CAP_GLYPH = {
     "structured":  "●",  # clean reasoning
     "inline":      "◐",  # reasoning leaks into content
-    "unsupported": "·",  # no reasoning
+    # `none` and `unsupported` both render as "No reasoning" in the menu.
+    # Cache distinguishes them: `none` = model produced a clean answer
+    # without a reasoning parser attempted (e.g. Llama-3.1 — working as
+    # designed); `unsupported` = parser was attempted but the model
+    # didn't emit reasoning content (configuration mismatch).
+    "none":        "·",
+    "unsupported": "·",
     "unknown":     "?",  # not yet probed
     "error":       "✗",  # probe failed
 }
@@ -772,6 +781,7 @@ _CAP_GLYPH = {
 _REASONING_LABEL = {
     "structured": "Native reasoning",
     "inline": "Inline reasoning",
+    "none": "No reasoning",
     "unsupported": "No reasoning",
 }
 
@@ -910,7 +920,7 @@ def _reasoning_variants(m: dict) -> list[tuple[str, str, str, str]]:
             ("inline", _CAP_GLYPH[cap], _REASONING_LABEL[cap], "default"),
             ("inline_off", _INLINE_OFF_GLYPH, _INLINE_OFF_LABEL, "nothink"),
         ]
-    if cap == "unsupported":
+    if cap in ("unsupported", "none"):
         return [("none", _CAP_GLYPH[cap], _REASONING_LABEL[cap], "default")]
     return []
 

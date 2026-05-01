@@ -2,7 +2,7 @@
 #
 # Regenerate with: make catalog-regen
 # Source of truth:  scripts/model-families.yaml
-# Generated at:     2026-04-30T17:22:09+00:00
+# Generated at:     2026-05-01T10:18:40+00:00
 #
 # Every 'size' and 'arch' below was fetched live from the
 # upstream provider at generation time. Do not hand-edit.
@@ -61,7 +61,7 @@ models:
     backend: [vllm, sglang]
     repo: "nvidia/Gemma-4-31B-IT-NVFP4"
     source: hf
-    sha: "61521ee452a4"
+    sha: "05fa17010ac2"
     size: "30.39 GB"
     arch: { layers: 60, kv_heads: 16, head_dim: 256, k_eq_v: true }
     arch_source: "nvidia/Gemma-4-31B-IT-NVFP4/config.json"
@@ -226,7 +226,7 @@ models:
     parsers:
       vllm:
         reasoning: qwen3
-        tool: hermes
+        tool: qwen3_xml
       sglang:
         reasoning: qwen3
         tool: qwen
@@ -245,7 +245,7 @@ models:
     parsers:
       vllm:
         reasoning: qwen3
-        tool: hermes
+        tool: qwen3_xml
       sglang:
         reasoning: qwen3
         tool: qwen
@@ -264,7 +264,7 @@ models:
     parsers:
       vllm:
         reasoning: qwen3
-        tool: hermes
+        tool: qwen3_xml
       sglang:
         reasoning: qwen3
         tool: qwen
@@ -2312,25 +2312,6 @@ models:
     purpose: "nemotron-nano-v2 · 7.3 GB · 56L/8kv/128h"
     conversational: true
 
-  - name: "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"
-    family: nemotron-3-nano
-    backend: [vllm, sglang]
-    repo: "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"
-    source: hf
-    sha: "ce1b118ae66e"
-    size: "18.01 GB"
-    arch: { layers: 52, kv_heads: 2, head_dim: 128, k_eq_v: false }
-    arch_source: "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4/config.json"
-    purpose: "nemotron-3-nano · 18.0 GB · 52L/2kv/128h"
-    conversational: true
-    parsers:
-      vllm:
-        reasoning: nemotron_3
-        tool: hermes
-      sglang:
-        reasoning: nemotron_3
-        tool: hermes
-
   - name: "Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4"
     family: nemotron-3-nano
     backend: [vllm, sglang]
@@ -2344,7 +2325,7 @@ models:
     conversational: false
     parsers:
       vllm:
-        reasoning: nemotron_3
+        reasoning: nemotron_v3
         tool: hermes
       sglang:
         reasoning: nemotron_3
@@ -2575,10 +2556,8 @@ models:
     parsers:
       vllm:
         reasoning: deepseek_r1
-        tool: deepseek_v3
       sglang:
         reasoning: deepseek-r1
-        tool: deepseekv3
 
   - name: "DeepSeek-R1-Distill-Llama-8B"
     family: deepseek-r1-distill
@@ -2594,10 +2573,8 @@ models:
     parsers:
       vllm:
         reasoning: deepseek_r1
-        tool: deepseek_v3
       sglang:
         reasoning: deepseek-r1
-        tool: deepseekv3
 
   - name: "deepseek-r1:1.5b-qwen-distill-q4_K_M"
     family: deepseek-r1-distill
@@ -2841,3 +2818,22 @@ models:
     arch: { layers: 28, kv_heads: 4, head_dim: 128, k_eq_v: false }
     arch_source: "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B/config.json"
     purpose: "deepseek-r1-distill · 1250.1 GB · 28L/4kv/128h"
+
+  - name: "gpt-oss-20b"
+    family: gpt-oss
+    backend: [vllm, sglang]
+    repo: "openai/gpt-oss-20b"
+    source: hf
+    sha: "6cee5e81ee83"
+    size: "12.82 GB"
+    arch: { layers: 24, kv_heads: 8, head_dim: 64, k_eq_v: false }
+    arch_source: "openai/gpt-oss-20b/config.json"
+    purpose: "gpt-oss · 12.8 GB · 24L/8kv/64h"
+    conversational: true
+    parsers:
+      vllm:
+        reasoning: openai_gptoss
+        tool: openai
+      sglang:
+        reasoning: gpt-oss
+        tool: gpt-oss
