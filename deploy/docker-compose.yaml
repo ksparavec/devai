@@ -104,6 +104,16 @@ services:
       - MAX_CONTEXT_LEN=${MAX_CONTEXT_LEN:-131072}
       - DEVAI_REASONING=${DEVAI_REASONING:-auto}
       - PODMAN_SOCKET=/run/podman/podman.sock
+      # vLLM parser-plugin registry. The router reads the JSON map at
+      # VLLM_PLUGINS_REGISTRY (mounted below) and bind-mounts
+      # VLLM_PLUGINS_HOST_DIR into the recreated vLLM container at
+      # /etc/devai/vllm-plugins so plugin .py files resolve to the
+      # path passed via `--tool-parser-plugin`. Empty host_dir → only
+      # built-in vLLM parsers are usable; any model whose probe cache
+      # row points at a plugin parser will fail at recreate time with
+      # an actionable error rather than silently launching wrong.
+      - VLLM_PLUGINS_REGISTRY=/etc/devai/vllm-plugins.json
+      - VLLM_PLUGINS_HOST_DIR=${VLLM_PLUGINS_HOST_DIR:-}
     volumes:
       - ${XDG_RUNTIME_DIR:-/run/user/1000}/podman/podman.sock:/run/podman/podman.sock
       # Probe caches (schema v3 for Ollama digest-keyed; schema v1 for
@@ -114,6 +124,11 @@ services:
       - ./.ollama-reasoning-cache.json:/etc/devai/.ollama-reasoning-cache.json:ro
       - ./.vllm-reasoning-cache.json:/etc/devai/.vllm-reasoning-cache.json:ro
       - ./.sglang-reasoning-cache.json:/etc/devai/.sglang-reasoning-cache.json:ro
+      # Plugin registry — the JSON map of parser-name → plugin-file.
+      # The host plugin directory is NOT mounted into the router itself;
+      # the router only needs the host path string (passed via env) to
+      # forward to libpod when recreating the vLLM container.
+      - ./vllm-plugins.json:/etc/devai/vllm-plugins.json:ro
     depends_on:
       - ollama
     restart: unless-stopped

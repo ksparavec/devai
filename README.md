@@ -226,7 +226,11 @@ The router (`devai-router`) is a small Go reverse proxy (~9 MB distroless) that:
 - Auto-stops idle backends after `IDLE_TIMEOUT` seconds.
 - Applies the **reasoning policy** to each request (see below).
 
-> **Status:** all three backends are wired. vLLM and SGLang start as `sleep infinity` placeholders (compose can't know which model the user will pick); the router replaces them on demand via libpod when a request arrives on port 11435 / 11436. The picker shows HF rows once they have a fitting probe entry. See [`docs/backends.md`](docs/backends.md) for the lifecycle, probing procedure, cache hygiene, and failure-mode taxonomy.
+> **Status:** all three backends are wired. vLLM and SGLang start as `sleep infinity` placeholders (compose can't know which model the user will pick); the router replaces them on demand via libpod when a request arrives on port 11435 / 11436. The picker shows HF rows once they have a fitting probe entry.
+>
+> Two reference docs:
+> - [`docs/router.md`](docs/router.md) — router architecture, ports, lifecycle, the full request rewrite chain (override parsing, reasoning policy, tool-choice promotion, tool stripping, ctx injection), config env, caches, and failure modes. Start here when reasoning about routing.
+> - [`docs/backends.md`](docs/backends.md) — backend lifecycle, probing procedure, parser plugins, cache hygiene, failure-mode taxonomy.
 
 ### Reasoning & MoE
 

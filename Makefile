@@ -37,6 +37,14 @@ CACHE_COMPOSE = deploy/docker-compose.yaml
 INFERENCE_CONFIG = deploy/models.yaml
 HF_CLI = hf
 VLLM_MODELS_DIR = $(CACHE_DIR)/ollama/models/vllm
+# Absolute host path to scripts/vllm_plugins. The router (running in
+# its own container) bind-mounts this into the recreated vLLM
+# container so models that resolve to a custom tool/reasoning parser
+# in deploy/vllm-plugins.json get the plugin .py file at the path
+# `--tool-parser-plugin` expects. Exported so compose interpolates it
+# into the router's env.
+VLLM_PLUGINS_HOST_DIR = $(abspath scripts/vllm_plugins)
+export VLLM_PLUGINS_HOST_DIR
 OLLAMA_HOST = http://devai-router:11434
 # Pinned to a real catalog tag. The previous shell-out read defaults['ollama']
 # from models.yaml, which generate-catalog.py never writes — so this always

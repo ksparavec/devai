@@ -40,6 +40,13 @@
 - [x] HF rows synthesized into router from probe caches; `tool_parser` plumbed through launchConfig
 - [x] CI flag-drift guard: `deploy/backend-flags.yaml` + `make verify-backend-flags`
 - [x] SGLang validated — NVFP4 broken upstream in `v0.5.10.post1-cu130` at `modelopt_quant.py:1482`; picker auto-hides via `kind=infra`
+- [x] vLLM parser plugin registry (`deploy/vllm-plugins.json` + `scripts/vllm_plugins/`); prober and router both consume it. `deepseek_string` plugin wired for `deepseek-r1-distill` family. Adding new plugins = drop file + one JSON entry.
+- [x] Two-phase tool probe (auto + forced fallback) so reasoning models verify tool parsers; cache row carries `tool_mode`. Router promotes single-tool auto requests, rejects multi-tool auto with HTTP 400 + actionable error. End-to-end verified on R1-Distill-Qwen-7B and R1-Distill-Llama-8B.
+- [x] `refresh_top_level_from_cells` now picks parser fields (tool_parser, reasoning_parser, tool_mode, disable_verified) from the **most-recent clean cell that has them populated** rather than the smallest-tier cell. Fresh `--force` re-probes of a single cell now propagate to the top-level row without requiring a full matrix re-probe; old cells with stale `None`s no longer shadow new evidence.
+- [x] `DeepSeek-R1-Distill-Llama-8B` weights downloaded and probed; cache shows `T=deepseek_string mode=forced`. End-to-end verified through router: single-tool auto → 5-token tool call (vs 525 tokens for Qwen-7B variant — see `docs/backends.md` operational note).
+
+### Documentation
+- [x] `docs/router.md` — comprehensive router reference (architecture, ports, lifecycle, request rewrite chain, config, caches, failure modes, operator tasks). Linked from CLAUDE.md and README.md.
 
 ### Standalone launcher
 - [x] `bin/devai-agent` (renamed from devai-shell): Python launcher, persisted prefs in `~/.devai/preferences.yaml`
@@ -63,7 +70,7 @@
 
 ## Open Items
 
-- [ ] Wire `deepseek_string` vLLM tool-parser plugin — parser written + smoke-tested in `scripts/vllm_plugins/`. Needs probe-driver bind-mount, router flag injection, image-build COPY, family-entry restoration for `deepseek-r1-distill`. See `scripts/vllm_plugins/TODO.md` for the full checklist.
 - [ ] Family-level `engine_flags` field (e.g. `--enforce-eager`) so OOM-prone NVFP4 MoE variants like `Nemotron-3-Nano-30B-A3B-NVFP4` can free the CUDA-graph budget and re-enter `hf_repos`.
 - [ ] Re-evaluate SGLang NVFP4 once upstream fixes `modelopt_quant.py:1482 fp4_quantize`.
-- [ ] End-to-end pull + probe pass for the new `gpt-oss` family on this host (`make model-pull FAMILY=gpt-oss` then `make probe-vllm` / `make probe-sglang`).
+- [ ] Probe context tiers above the model's native rope: 128K/256K cells of R1-Distill-Qwen-7B failed `kind=infra` because Qwen-2 base has 32K positional encodings without rope_scaling. Either skip those tiers in the prober when `max_position_embeddings < requested_ctx`, or extend implied-spill to `infra` failures of the right shape. Today they leave noisy red entries in the cache.
+- [ ] Optional: SGLang `deepseek_string` analogue. SGLang's tool-parser plugin model is Python-import based (a registered class, not a file path); requires a separate implementation against SGLang's detector framework. Out of scope until SGLang's NVFP4 path is unbroken.

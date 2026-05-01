@@ -40,13 +40,24 @@ DEFAULT_VLLM_IMAGE = os.environ.get(
 
 def vllm_command_args(
     model_name: str, max_ctx: int, host_frac: float,
-    *, reasoning_parser: str | None = None, tool_parser: str | None = None,
+    *,
+    reasoning_parser: str | None = None,
+    tool_parser: str | None = None,
+    reasoning_parser_plugin: str | None = None,
+    tool_parser_plugin: str | None = None,
 ) -> list[str]:
     """Build the vLLM serve arguments. Mirrors gpu-arbiter vllmEntrypoint.
 
     Parser flags are appended only when the catalog row's `parsers.vllm`
     block supplied a value. Omitting them keeps the launch in inline /
     no-tool mode (same shape as a model with no curated hints).
+
+    When the parser name resolves to a custom plugin via
+    ``deploy/vllm-plugins.json``, the corresponding ``*_parser_plugin``
+    kwarg carries the in-container absolute path. The plugin flag must
+    precede the parser-name flag — vLLM resolves parser names at the
+    point ``--tool-call-parser`` is evaluated, so the plugin module has
+    to be loaded by then.
     """
     args = [
         "-m", "vllm.entrypoints.openai.api_server",
@@ -60,8 +71,12 @@ def vllm_command_args(
         "--trust-remote-code",
         "--served-model-name", model_name,
     ]
+    if reasoning_parser_plugin:
+        args.extend(["--reasoning-parser-plugin", reasoning_parser_plugin])
     if reasoning_parser:
         args.extend(["--reasoning-parser", reasoning_parser])
+    if tool_parser_plugin:
+        args.extend(["--tool-parser-plugin", tool_parser_plugin])
     if tool_parser:
         args.extend(["--enable-auto-tool-choice", "--tool-call-parser", tool_parser])
     return args
@@ -76,6 +91,7 @@ SPEC = BackendSpec(
     reserve_gb=VLLM_RESERVE_GB,
     entrypoint="python3",
     build_args=vllm_command_args,
+    supports_plugins=True,
 )
 
 

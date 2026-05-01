@@ -64,6 +64,7 @@ from _probe_core import (  # noqa: E402
     save_cache,
     smallest_clean_probe,
 )
+from _vllm_plugins import PluginEntry, PluginRegistry, get_registry  # noqa: E402
 
 
 # ── Defaults ─────────────────────────────────────────────────────────────────
@@ -124,11 +125,23 @@ class BackendSpec:
     cache_path: Path            # default cache file
     reserve_gb: float           # memFraction reservation
     entrypoint: str             # container ENTRYPOINT override
-    # build_args(model_name, max_ctx, host_frac, *, reasoning_parser, tool_parser)
-    # → CMD list (excluding entrypoint). The two parser kwargs are
+    # build_args(model_name, max_ctx, host_frac, *, reasoning_parser,
+    # tool_parser, reasoning_parser_plugin, tool_parser_plugin)
+    # → CMD list (excluding entrypoint). The two parser-name kwargs are
     # optional — when None, the arg builder must omit the corresponding
     # backend flag so the launch falls back to inline/no-tool mode.
+    # The two *_plugin kwargs carry an in-container absolute path to a
+    # plugin .py file when the parser name resolved through the
+    # vllm-plugins registry; the arg builder must emit the
+    # `--*-parser-plugin <path>` flag *before* the matching parser-name
+    # flag (vLLM loads plugin files at parser-resolution time). Backends
+    # without a plugin model (SGLang) accept the kwargs and ignore them.
     build_args: Callable[..., list[str]] = field(repr=False)
+    # When True, parser names are looked up against the vllm-plugins
+    # registry; matches inject the bind-mount + --tool-parser-plugin
+    # flag. Only vLLM supports this today — SGLang's plugin model uses
+    # Python registry imports rather than a file-path arg.
+    supports_plugins: bool = False
     # schema_version v2 added reasoning_parser, tool_parser (populated),
     # disable_verified, and per-cell tool/disable verdicts. v1 readers
     # backfill defaults on first read.
@@ -331,6 +344,7 @@ def container_run_detached(
     env_vars: dict[str, str],
     entrypoint: str,
     command: list[str],
+    extra_volumes: list[tuple[str, str, str]] | None = None,
 ) -> None:
     """Launch a probe container detached on localhost loopback.
 
@@ -338,6 +352,10 @@ def container_run_detached(
     ship with their own ENTRYPOINTs that swallow our CMD args (the
     "vllm: error: unrecognized arguments" we hit on the first probe
     run). Replace it explicitly to match the router's libpod spec.
+
+    `extra_volumes` is an optional list of (host_path, container_path,
+    mode) tuples — currently used to mount the vllm-plugins directory
+    when a model's parser resolved through the plugin registry.
     """
     args = [
         runtime, "run", "--detach",
@@ -348,6 +366,8 @@ def container_run_detached(
         "--device", "nvidia.com/gpu=all",
         "--security-opt", "label=disable",
     ]
+    for host, dst, mode in extra_volumes or []:
+        args.extend(["--volume", f"{host}:{dst}:{mode}"])
     for k, v in env_vars.items():
         args.extend(["--env", f"{k}={v}"])
     args.append(image)
@@ -625,6 +645,58 @@ def classify_failure_logs(logs: str) -> dict:
 
 # ── Probe driver ─────────────────────────────────────────────────────────────
 
+def _resolve_plugins(
+    spec: BackendSpec,
+    reasoning_parser: str | None,
+    tool_parser: str | None,
+) -> tuple[tuple[str, str, str] | None, str | None, str | None]:
+    """Look up parser names against the vllm-plugins registry.
+
+    Returns ``(volume, tool_plugin_path, reasoning_plugin_path)`` where:
+      - ``volume`` is a (host_dir, container_dir, mode) tuple to add to
+        the launch when at least one parser resolved through the
+        registry; ``None`` when no plugins are needed.
+      - ``*_plugin_path`` is the in-container absolute path to pass via
+        ``--*-parser-plugin``; ``None`` when the corresponding parser
+        is a built-in (or absent).
+
+    Backends without ``supports_plugins`` get all-``None`` results, so
+    SGLang's launch is unchanged regardless of registry contents.
+    """
+    if not spec.supports_plugins:
+        return None, None, None
+    registry: PluginRegistry = get_registry()
+    if not registry.entries:
+        return None, None, None
+    tool_entry: PluginEntry | None = registry.lookup(tool_parser)
+    reasoning_entry: PluginEntry | None = registry.lookup(reasoning_parser)
+    if tool_entry is None and reasoning_entry is None:
+        return None, None, None
+    # Validate that a tool plugin is registered under kind=tool and a
+    # reasoning plugin under kind=reasoning. A mis-tagged registry entry
+    # would silently pass the wrong flag — fail loudly instead.
+    if tool_entry is not None and tool_entry.kind != "tool":
+        raise RuntimeError(
+            f"vllm-plugins: parser {tool_entry.name!r} resolved as "
+            f"tool parser but registered under kind={tool_entry.kind!r}"
+        )
+    if reasoning_entry is not None and reasoning_entry.kind != "reasoning":
+        raise RuntimeError(
+            f"vllm-plugins: parser {reasoning_entry.name!r} resolved as "
+            f"reasoning parser but registered under kind={reasoning_entry.kind!r}"
+        )
+    volume = (str(registry.host_dir), registry.container_dir, "ro")
+    tool_path = (
+        tool_entry.container_path(registry.container_dir)
+        if tool_entry is not None else None
+    )
+    reasoning_path = (
+        reasoning_entry.container_path(registry.container_dir)
+        if reasoning_entry is not None else None
+    )
+    return volume, tool_path, reasoning_path
+
+
 def probe_one_cell(
     spec: BackendSpec,
     *,
@@ -664,17 +736,25 @@ def probe_one_cell(
     host_frac = host_scaled_fraction(
         model_size_gb, band_gb, host_vram_gb, spec.reserve_gb,
     )
+    plugin_volume, tool_plugin_path, reasoning_plugin_path = _resolve_plugins(
+        spec, reasoning_parser, tool_parser,
+    )
     cmd_args = spec.build_args(
         model_name, requested_ctx, host_frac,
         reasoning_parser=reasoning_parser, tool_parser=tool_parser,
+        reasoning_parser_plugin=reasoning_plugin_path,
+        tool_parser_plugin=tool_plugin_path,
     )
 
     env_vars = {"VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1"}
+    extra_volumes: list[tuple[str, str, str]] = []
+    if plugin_volume is not None:
+        extra_volumes.append(plugin_volume)
     container_remove(runtime, container_name)
     try:
         container_run_detached(
             runtime, container_name, image, probe_port, models_dir, env_vars,
-            spec.entrypoint, cmd_args,
+            spec.entrypoint, cmd_args, extra_volumes=extra_volumes,
         )
     except RuntimeError as e:
         return _failure_record(
@@ -801,24 +881,68 @@ def probe_one_cell(
     reasoning_parser_verified = reasoning_parser if capability == "structured" else None
 
     # ── Probe B: tool-call ───────────────────────────────────────────
+    # Two-phase verification:
+    #   B1 (auto):   tool_choice="auto"  — does the model spontaneously
+    #                pick the tool? Useful signal for agents that send
+    #                "auto", but reasoning models (R1-Distill et al)
+    #                tend to ramble in reasoning_content instead of
+    #                calling, so a "no" here doesn't mean the parser is
+    #                broken.
+    #   B2 (forced): tool_choice={"type":"function","function":{"name":...}}
+    #                if B1 didn't yield a call. Forces the model to emit
+    #                the tool-call markers so we can verify the parser
+    #                actually extracts. Distinguishes "model declines
+    #                to call" from "parser can't parse what was emitted".
+    # Either path verifying counts as `tool_parser_verified=True` — the
+    # router's strip-tools logic only cares whether the parser CAN
+    # extract; agents that send explicit tool_choice still need the
+    # plugin loaded even if the model wouldn't auto-pick.
     tool_parser_verified: str | None = None
     tool_evidence: dict | None = None
     if tool_parser:
-        tool_body = {
+        # Reasoning models burn 500-2000 tokens on chain-of-thought before
+        # any tool-call markers. The old 128-token budget guaranteed they
+        # never reached the call. 2048 covers typical R1-Distill traces.
+        is_reasoning = capability in ("structured", "inline")
+        tool_max_tokens = 2048 if is_reasoning else 128
+        auto_body = {
             "model": model_name,
             "messages": [{"role": "user", "content": TOOL_PROBE_PROMPT}],
             "tools": TOOL_PROBE_SPEC,
             "tool_choice": "auto",
             "temperature": 0,
-            "max_tokens": 128,
+            "max_tokens": tool_max_tokens,
             "stream": False,
         }
-        tool_resp = _post_chat(base_url, tool_body)
-        if response_has_valid_tool_call(tool_resp, "get_time"):
+        auto_resp = _post_chat(base_url, auto_body)
+        if response_has_valid_tool_call(auto_resp, "get_time"):
             tool_parser_verified = tool_parser
-            tool_evidence = {"verified": True}
+            tool_evidence = {"verified": True, "mode": "auto"}
         else:
-            tool_evidence = {"verified": False, "response_preview": _short(tool_resp)}
+            # Force a call so the parser is exercised even when the model
+            # wouldn't pick a tool on its own. Keep the same prompt and
+            # tools spec; just change tool_choice. Boost the budget once
+            # more so reasoning + the forced call both fit.
+            forced_body = dict(auto_body)
+            forced_body["tool_choice"] = {
+                "type": "function",
+                "function": {"name": "get_time"},
+            }
+            forced_body["max_tokens"] = max(tool_max_tokens, 4096)
+            forced_resp = _post_chat(base_url, forced_body)
+            if response_has_valid_tool_call(forced_resp, "get_time"):
+                tool_parser_verified = tool_parser
+                tool_evidence = {
+                    "verified": True,
+                    "mode": "forced",
+                    "auto_response_preview": _short(auto_resp),
+                }
+            else:
+                tool_evidence = {
+                    "verified": False,
+                    "auto_response_preview": _short(auto_resp),
+                    "forced_response_preview": _short(forced_resp),
+                }
 
     # ── Probe C: disable verification ────────────────────────────────
     disable_verified = False
@@ -921,6 +1045,36 @@ def _is_arch_kind(rec: dict) -> bool:
     return kind in ("arch", "quant")
 
 
+def _latest_cell_with(entry: dict, field: str) -> dict | None:
+    """Return the most-recently-probed clean cell whose `field` is truthy.
+
+    Used by refresh_top_level_from_cells so freshly-probed cells with
+    new parser info supersede stale cells (older probes often have
+    ``tool_parser=None`` / ``reasoning_parser=None`` because they
+    pre-date a curated family hint). Returns None when no cell carries
+    the field.
+    """
+    best: dict | None = None
+    best_at: str = ""
+    for vram_bucket in (entry.get("probes") or {}).values():
+        if not isinstance(vram_bucket, dict):
+            continue
+        cells = (
+            [vram_bucket]
+            if "capability" in vram_bucket
+            else [c for c in vram_bucket.values() if isinstance(c, dict)]
+        )
+        for cell in cells:
+            if not cell.get("fits", False):
+                continue
+            if not cell.get(field):
+                continue
+            at = str(cell.get("probed_at") or "")
+            if at >= best_at:
+                best, best_at = cell, at
+    return best
+
+
 # ── Top-level entry maintenance ──────────────────────────────────────────────
 
 def ensure_entry(
@@ -953,6 +1107,14 @@ def ensure_entry(
             # `disable_verified` field; gates the router's reasoningOff
             # rewrite.
             "disable_verified": False,
+            # tool_mode ("auto"|"forced"|None) records HOW the tool
+            # parser was verified — `auto` if the model spontaneously
+            # called the tool with tool_choice="auto", `forced` if the
+            # call only happened with tool_choice={function:{name:...}}.
+            # The router uses this to promote tool_choice on incoming
+            # requests for `forced` models (single-tool only) or fail
+            # multi-tool requests with an actionable error.
+            "tool_mode": None,
             "evidence": {},
             "probes": {},
         }
@@ -972,6 +1134,11 @@ def ensure_entry(
         entry.setdefault("reasoning_parser", None)
         entry.setdefault("tool_parser", None)
         entry.setdefault("disable_verified", False)
+        # tool_mode (auto|forced|None) — added alongside the two-phase
+        # tool probe. None for v2 entries written before the field
+        # existed; refresh_top_level_from_cells repopulates from
+        # cell-level evidence.tool.mode on the next probe.
+        entry.setdefault("tool_mode", None)
         if entry.get("schema_version", 1) < schema_version:
             entry["schema_version"] = schema_version
     return entry
@@ -1012,11 +1179,33 @@ def refresh_top_level_from_cells(entry: dict) -> None:
         ev = smallest.get("evidence") or {}
         if ev:
             entry["evidence"] = ev
-        # Parser fields propagate from the same canonical cell so the
-        # router reads the launch flags that actually worked.
-        entry["reasoning_parser"] = smallest.get("reasoning_parser")
-        entry["tool_parser"] = smallest.get("tool_parser")
-        entry["disable_verified"] = bool(smallest.get("disable_verified", False))
+        # Parser fields propagate from the most-recently-probed cell that
+        # has them populated — NOT from the smallest_clean_probe. Reason:
+        # older cells often pre-date a curated parser hint or the
+        # two-phase tool probe, so they have `tool_parser=None` /
+        # `tool_mode=None` even when newer cells at higher tiers verified
+        # the parser cleanly. Picking from `smallest` would shadow the
+        # fresh evidence with stale Nones. Walking all cells and taking
+        # the latest probed_at lets `--force` on a single cell update
+        # the top-level row without requiring a full re-probe matrix.
+        rp_cell = _latest_cell_with(entry, "reasoning_parser")
+        tp_cell = _latest_cell_with(entry, "tool_parser")
+        entry["reasoning_parser"] = (rp_cell or {}).get("reasoning_parser")
+        entry["tool_parser"] = (tp_cell or {}).get("tool_parser")
+        # tool_mode tracks WHICH tool-choice path verified — `auto` (the
+        # model spontaneously called) vs `forced` (only forced-choice
+        # round-tripped). Pulled from the same cell as tool_parser so the
+        # two stay consistent. Stays None when no cell verified a parser.
+        if tp_cell is not None:
+            cell_tool_evidence = (tp_cell.get("evidence") or {}).get("tool") or {}
+            entry["tool_mode"] = cell_tool_evidence.get("mode")
+        else:
+            entry["tool_mode"] = None
+        # disable_verified is a per-cell verdict that doesn't drift with
+        # tier the way capability/parser do; pick the latest cell that
+        # ran the disable probe (which only fires on capability=structured).
+        dv_cell = _latest_cell_with(entry, "disable_verified") or smallest
+        entry["disable_verified"] = bool(dv_cell.get("disable_verified", False))
         # max_context = largest actual_context across ALL clean cells.
         # Using `smallest`'s actual_context here was a long-standing bug:
         # it left max_context pinned to the smallest verified tier (e.g.

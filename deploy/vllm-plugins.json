@@ -1,0 +1,27 @@
+{
+  "_comment": [
+    "Registry of custom vLLM parser plugins. Single source of truth for both",
+    "the probe driver (scripts/_probe_hf_common.py) and the router",
+    "(gpu-arbiter/main.go). Adding a new plugin = drop the .py file in",
+    "scripts/vllm_plugins/ and add one entry below — no code changes.",
+    "",
+    "Schema:",
+    "  plugins.<name>.kind  one of {tool, reasoning} (which vLLM flag the",
+    "                       plugin registers under)",
+    "  plugins.<name>.file  basename of the plugin .py inside scripts/vllm_plugins/",
+    "",
+    "Both Python and Go look up parser names against this map: when the",
+    "name is present, the launch gets `--tool-parser-plugin <abs>` (or",
+    "`--reasoning-parser-plugin` for kind=reasoning) BEFORE the parser",
+    "flag, and the plugin directory is bind-mounted into the backend",
+    "container at /etc/devai/vllm-plugins:ro. Names absent from this map",
+    "are treated as built-in vLLM parsers and pass through unchanged."
+  ],
+  "container_dir": "/etc/devai/vllm-plugins",
+  "plugins": {
+    "deepseek_string": {
+      "kind": "tool",
+      "file": "deepseek_string_tool_parser.py"
+    }
+  }
+}

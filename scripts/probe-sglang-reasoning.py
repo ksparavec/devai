@@ -52,7 +52,11 @@ DEFAULT_SGLANG_IMAGE = os.environ.get(
 
 def sglang_command_args(
     model_name: str, max_ctx: int, host_frac: float,
-    *, reasoning_parser: str | None = None, tool_parser: str | None = None,
+    *,
+    reasoning_parser: str | None = None,
+    tool_parser: str | None = None,
+    reasoning_parser_plugin: str | None = None,
+    tool_parser_plugin: str | None = None,
 ) -> list[str]:
     """Build SGLang launch arguments. Mirrors gpu-arbiter sglangEntrypoint.
 
@@ -60,7 +64,13 @@ def sglang_command_args(
     `parsers.sglang` block supplied a value. Omitting them keeps the
     launch in inline / no-tool mode. Both flag names verified against
     the v0.5.10.post1-cu130 image — see deploy/backend-flags.yaml.
+
+    The ``*_parser_plugin`` kwargs are accepted but ignored: SGLang
+    registers parsers via Python imports, not file-path args. They're
+    in the signature for parity with vllm_command_args so the shared
+    probe driver can call both backends through the same kwargs shape.
     """
+    del reasoning_parser_plugin, tool_parser_plugin
     args = [
         "-m", "sglang.launch_server",
         "--model-path", f"/models/{model_name}",

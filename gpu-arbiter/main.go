@@ -110,6 +110,10 @@ type configModel struct {
 	Reasoning       *configReasoning `yaml:"reasoning,omitempty"`
 	ToolParser      string           `yaml:"tool_parser,omitempty"`      // populated from HF probe cache
 	ReasoningParser string           `yaml:"reasoning_parser,omitempty"` // populated from HF probe cache
+	// ToolMode is the verified tool-choice path: "auto" (model called
+	// spontaneously) or "forced" (only forced-choice round-tripped).
+	// Empty when no tool parser was verified or the field pre-dates v2.
+	ToolMode string `yaml:"tool_mode,omitempty"`
 	// ProbedMaxCtx is the highest context length the probe verified fits at
 	// the host's VRAM band — i.e. the largest `fits=true` (HF) or
 	// `fully_on_gpu=true` (Ollama) cell at hostKey in the cache. The router
@@ -141,6 +145,14 @@ type launchConfig struct {
 	MaxContext      int
 	ToolParser      string // empty omits backend-specific tool flags
 	ReasoningParser string // empty omits --reasoning-parser
+	// Plugin paths are populated when ToolParser / ReasoningParser
+	// resolve through the vllm-plugins registry. Each holds the
+	// in-container absolute path to a plugin .py file. Empty values
+	// keep the launch on the built-in path (no plugin flag emitted).
+	// Only vLLM honours these — SGLang's plugin model is Python-import
+	// based, not file-path based, so its entrypoint ignores the fields.
+	ToolParserPlugin      string
+	ReasoningParserPlugin string
 }
 
 type configFile struct {
@@ -277,13 +289,22 @@ type hfCacheEntry struct {
 	// memFraction launch math — without it, ActualVRAMGB (post-load,
 	// weights + KV + CUDA graphs) would mistakenly be used as the
 	// weight size and clamp --max-model-len to a few thousand tokens.
-	SizeGB          float64                            `json:"size_gb,omitempty"`
-	MaxContext      int                                `json:"max_context"`
-	Capability      string                             `json:"capability"`
-	ToolParser      *string                            `json:"tool_parser"`
-	ReasoningParser *string                            `json:"reasoning_parser,omitempty"`
-	DisableVerified *bool                              `json:"disable_verified,omitempty"`
-	Probes          map[string]map[string]hfCacheProbe `json:"probes"`
+	SizeGB          float64 `json:"size_gb,omitempty"`
+	MaxContext      int     `json:"max_context"`
+	Capability      string  `json:"capability"`
+	ToolParser      *string `json:"tool_parser"`
+	ReasoningParser *string `json:"reasoning_parser,omitempty"`
+	DisableVerified *bool   `json:"disable_verified,omitempty"`
+	// ToolMode records HOW the tool parser was verified — `"auto"` if
+	// the model spontaneously called the tool with tool_choice="auto",
+	// `"forced"` if the call only round-tripped with explicit
+	// tool_choice={function:{name:...}}. The router uses this to
+	// promote tool_choice on incoming requests for `forced` models
+	// (single-tool only) or fail multi-tool requests with an actionable
+	// error. Nil for entries that pre-date the field or whose
+	// tool_parser didn't verify.
+	ToolMode *string                            `json:"tool_mode,omitempty"`
+	Probes   map[string]map[string]hfCacheProbe `json:"probes"`
 }
 
 // synthesizeHFFromCache returns one configModel per HF cache entry whose
@@ -359,6 +380,10 @@ func synthesizeHFFromCache(
 		if entry.ReasoningParser != nil {
 			reasoningParser = *entry.ReasoningParser
 		}
+		toolMode := ""
+		if entry.ToolMode != nil {
+			toolMode = *entry.ToolMode
+		}
 		// Prefer the catalog-declared weight size for the Size field —
 		// it feeds memFraction at containerRecreate time, which needs
 		// the WEIGHT footprint, not the post-load total. Older cache
@@ -385,6 +410,7 @@ func synthesizeHFFromCache(
 			ProbedMaxCtx:    bestCtx,
 			ToolParser:      toolParser,
 			ReasoningParser: reasoningParser,
+			ToolMode:        toolMode,
 			Reasoning: &configReasoning{
 				Capability:      cap,
 				DisableVerified: entry.DisableVerified,
@@ -480,6 +506,12 @@ type arbiter struct {
 	// `KeyError: invalid tool call parser` on the wrong engine.
 	modelToolParser      map[string]map[string]string // backend → model name → --tool-call-parser
 	modelReasoningParser map[string]map[string]string // backend → model name → --reasoning-parser
+	// modelToolMode keys (backend, modelName) → "auto" | "forced". Drives
+	// maybePromoteToolChoice — `forced` models with tool_choice="auto"
+	// either get promoted to a specific function (single tool) or
+	// rejected with HTTP 400 (multi-tool). `auto` models pass through
+	// since the probe verified spontaneous tool-calling works.
+	modelToolMode map[string]map[string]string
 	// modelProbedMaxCtx is the highest probe-verified context length per
 	// (backend, model) at the host VRAM band. fittableContext's heuristic
 	// is conservative for MoE/GQA models — when we have a fits=true cell
@@ -488,6 +520,10 @@ type arbiter struct {
 	defaultPolicy     string                    // DEVAI_REASONING env value: auto|off|low|medium|high
 	totalVRAMGB       float64
 	maxContextLen     int // global default from MAX_CONTEXT_LEN env (default 262144)
+	// pluginRegistry resolves vLLM parser plugin names (loaded from
+	// deploy/vllm-plugins.json). Always non-nil; entries map is empty
+	// when the registry file is missing or has no plugins.
+	pluginRegistry *vllmPluginRegistry
 }
 
 // --- Proxy factories ---
@@ -699,8 +735,18 @@ func vllmEntrypoint(modelName string, lc launchConfig) []string {
 	// Parser flags are per-model and read from the probe cache. Omit
 	// when unverified so a non-matching parser doesn't crash the launch.
 	// See deploy/backend-flags.yaml for the verified flag names.
+	//
+	// Plugin flags MUST precede the parser-name flags: vLLM resolves
+	// `--tool-call-parser <name>` against its parser registry at flag-
+	// parse time, so the plugin file has to be loaded by then.
+	if lc.ReasoningParserPlugin != "" {
+		args = append(args, "--reasoning-parser-plugin", lc.ReasoningParserPlugin)
+	}
 	if lc.ReasoningParser != "" {
 		args = append(args, "--reasoning-parser", lc.ReasoningParser)
+	}
+	if lc.ToolParserPlugin != "" {
+		args = append(args, "--tool-parser-plugin", lc.ToolParserPlugin)
 	}
 	if lc.ToolParser != "" {
 		args = append(args, "--enable-auto-tool-choice", "--tool-call-parser", lc.ToolParser)
@@ -836,6 +882,7 @@ func main() {
 	modelDisableOK := make(map[string]bool)
 	modelToolParser := make(map[string]map[string]string)      // backend → model → --tool-call-parser
 	modelReasoningParser := make(map[string]map[string]string) // backend → model → --reasoning-parser
+	modelToolMode := make(map[string]map[string]string)        // backend → model → "auto" | "forced"
 	modelProbedMaxCtx := make(map[string]map[string]int)       // backend → model → highest fits=true ctx
 	capCounts := make(map[string]int)
 	for _, m := range cfg.Models {
@@ -878,6 +925,12 @@ func main() {
 					}
 					modelReasoningParser[backend][name] = m.ReasoningParser
 				}
+				if m.ToolMode != "" {
+					if modelToolMode[backend] == nil {
+						modelToolMode[backend] = make(map[string]string)
+					}
+					modelToolMode[backend][name] = m.ToolMode
+				}
 				if m.ProbedMaxCtx > 0 {
 					if modelProbedMaxCtx[backend] == nil {
 						modelProbedMaxCtx[backend] = make(map[string]int)
@@ -899,6 +952,11 @@ func main() {
 	totalVRAMGB := envFloat("GPU_MEMORY_GB", 24.0)
 	maxCtx := envInt("MAX_CONTEXT_LEN", 262144)
 
+	pluginRegistry := loadVLLMPluginRegistry(
+		env("VLLM_PLUGINS_REGISTRY", "/etc/devai/vllm-plugins.json"),
+		env("VLLM_PLUGINS_HOST_DIR", ""),
+	)
+
 	a := &arbiter{
 		backends:             make(map[string]*backendState),
 		ollamaURL:            ollamaURL,
@@ -912,10 +970,12 @@ func main() {
 		modelDisableOK:       modelDisableOK,
 		modelToolParser:      modelToolParser,
 		modelReasoningParser: modelReasoningParser,
+		modelToolMode:        modelToolMode,
 		modelProbedMaxCtx:    modelProbedMaxCtx,
 		defaultPolicy:        policy,
 		totalVRAMGB:          totalVRAMGB,
 		maxContextLen:        maxCtx,
+		pluginRegistry:       pluginRegistry,
 	}
 
 	for _, bc := range backends {
@@ -1035,6 +1095,64 @@ func (a *arbiter) backendIsServing(bs *backendState) bool {
 	return resp.StatusCode == http.StatusOK
 }
 
+// resolvePluginLaunch consults the vllm-plugins registry for the
+// parser names already populated on lc, fills in lc.ToolParserPlugin /
+// lc.ReasoningParserPlugin when matches are found, and returns the
+// libpod mount spec to bind-mount the plugin directory into the
+// recreated container. Returns (nil, nil) when no plugins are needed —
+// every parser is built-in, the registry has no entries, or the
+// backend doesn't support file-path plugins.
+//
+// A non-nil error is returned only when a plugin IS required (parser
+// name matched a registry entry) but VLLM_PLUGINS_HOST_DIR is unset —
+// otherwise the launch would proceed without the plugin file accessible
+// in the container and crash with "parser not found" at startup.
+func (a *arbiter) resolvePluginLaunch(
+	backendName string, lc *launchConfig,
+) (map[string]any, error) {
+	// Only vLLM honours `--*-parser-plugin <path>`. SGLang registers
+	// parsers via Python imports — file-path mounts wouldn't help.
+	if backendName != "vllm" || a.pluginRegistry == nil {
+		return nil, nil
+	}
+	var matched bool
+	if entry, ok := a.pluginRegistry.Lookup(lc.ToolParser); ok {
+		if entry.Kind != "tool" {
+			return nil, fmt.Errorf(
+				"vllm plugin %q registered under kind=%q but used as tool parser",
+				lc.ToolParser, entry.Kind,
+			)
+		}
+		lc.ToolParserPlugin = a.pluginRegistry.ContainerPath(entry.File)
+		matched = true
+	}
+	if entry, ok := a.pluginRegistry.Lookup(lc.ReasoningParser); ok {
+		if entry.Kind != "reasoning" {
+			return nil, fmt.Errorf(
+				"vllm plugin %q registered under kind=%q but used as reasoning parser",
+				lc.ReasoningParser, entry.Kind,
+			)
+		}
+		lc.ReasoningParserPlugin = a.pluginRegistry.ContainerPath(entry.File)
+		matched = true
+	}
+	if !matched {
+		return nil, nil
+	}
+	if strings.TrimSpace(a.pluginRegistry.HostDir) == "" {
+		return nil, fmt.Errorf(
+			"vllm plugin required (tool=%q reasoning=%q) but VLLM_PLUGINS_HOST_DIR is empty",
+			lc.ToolParser, lc.ReasoningParser,
+		)
+	}
+	return map[string]any{
+		"destination": a.pluginRegistry.ContainerDir,
+		"source":      a.pluginRegistry.HostDir,
+		"type":        "bind",
+		"options":     []string{"ro"},
+	}, nil
+}
+
 // containerRecreate launches the backend container with the given model.
 // `desiredCtx > 0` overrides the catalog cap (used when a request carries a
 // "<model>@<ctx>" picker override); 0 falls back to the catalog cap. The
@@ -1068,21 +1186,33 @@ func (a *arbiter) containerRecreate(bs *backendState, modelName string, desiredC
 	if parser := a.modelReasoningParser[cfg.Name][modelName]; parser != "" {
 		lc.ReasoningParser = parser
 	}
-	log.Printf("  %s launch: model=%.1f GB, gpu=%.1f GB → fraction=%.2f, context=%dk, reasoning=%q tool=%q",
+	// Resolve parser plugin paths and the plugin volume. Only vLLM
+	// supports file-path plugins; SGLang's plugin model is Python-
+	// import based, so its launchConfig plugin fields stay empty.
+	pluginVolume, perr := a.resolvePluginLaunch(cfg.Name, &lc)
+	if perr != nil {
+		return perr
+	}
+	log.Printf("  %s launch: model=%.1f GB, gpu=%.1f GB → fraction=%.2f, context=%dk, reasoning=%q tool=%q tool_plugin=%q",
 		cfg.Name, modelSizeGB, a.totalVRAMGB, lc.MemFraction, lc.MaxContext/1024,
-		lc.ReasoningParser, lc.ToolParser)
+		lc.ReasoningParser, lc.ToolParser, lc.ToolParserPlugin)
+
+	mounts := []map[string]any{{
+		"destination": "/models",
+		"source":      cfg.ModelsDir,
+		"type":        "bind",
+		"options":     []string{"ro"},
+	}}
+	if pluginVolume != nil {
+		mounts = append(mounts, pluginVolume)
+	}
 
 	spec := map[string]any{
-		"image":      cfg.Image,
-		"name":       cfg.ContainerName,
-		"entrypoint": cfg.Entrypoint(modelName, lc),
-		"command":    []string{},
-		"mounts": []map[string]any{{
-			"destination": "/models",
-			"source":      cfg.ModelsDir,
-			"type":        "bind",
-			"options":     []string{"ro"},
-		}},
+		"image":        cfg.Image,
+		"name":         cfg.ContainerName,
+		"entrypoint":   cfg.Entrypoint(modelName, lc),
+		"command":      []string{},
+		"mounts":       mounts,
 		"hostadd":      []string{"host.containers.internal:host-gateway"},
 		"netns":        map[string]any{"nsmode": "bridge"},
 		"Networks":     map[string]any{cfg.Network: map[string]any{}},
@@ -1385,6 +1515,20 @@ func (a *arbiter) makeRequestHandler(backendName string) http.HandlerFunc {
 				policy = reasoningOverride
 			}
 			body = a.applyReasoningPolicy(backendName, req.URL.Path, policyModel, policy, body)
+			// Promote tool_choice for models the probe verified only
+			// via forced choice (mode=forced). Single-tool requests
+			// get auto/absent → {function:{name:...}}; multi-tool
+			// requests are rejected with HTTP 400 instead of silently
+			// running with auto on a model that won't call. Models
+			// with mode=auto or no verified tool_parser pass through.
+			promoted, perr := a.maybePromoteToolChoice(backendName, policyModel, body)
+			if perr != nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(perr.HTTPStatus())
+				_, _ = w.Write(perr.JSON())
+				return
+			}
+			body = promoted
 			// Strip tools/tool_choice for backends that didn't probe a
 			// working tool parser. vLLM rejects `tool_choice="auto"`
 			// outright when launched without --enable-auto-tool-choice;
@@ -1454,6 +1598,133 @@ func (a *arbiter) requestPolicy(req *http.Request) string {
 //
 // On JSON-decode failure the body is returned unchanged — same defensive
 // behavior as the other rewrite helpers.
+// promoteToolChoiceError is the structured payload an HTTP handler should
+// emit when maybePromoteToolChoice rejects a multi-tool auto request. The
+// shape mirrors OpenAI's error envelope so SDKs surface it cleanly.
+type promoteToolChoiceError struct {
+	Model     string
+	ToolNames []string
+}
+
+func (e *promoteToolChoiceError) Error() string {
+	return fmt.Sprintf("tool_choice pinning required for %s with multiple tools", e.Model)
+}
+
+// HTTPStatus is the HTTP status code to return for this error.
+func (e *promoteToolChoiceError) HTTPStatus() int { return http.StatusBadRequest }
+
+// JSON returns the OpenAI-shaped error body.
+func (e *promoteToolChoiceError) JSON() []byte {
+	tools := strings.Join(e.ToolNames, ", ")
+	msg := fmt.Sprintf(
+		"Model %q requires tool_choice to be pinned to a specific function "+
+			"when called with multiple tools. Set tool_choice to "+
+			`{"type":"function","function":{"name":"<one of: %s>"}}`+
+			", or route this request to a non-reasoning model "+
+			"(e.g. Qwen3.5-9B-Q8, Llama-3.1-8B-Instruct) that handles "+
+			"auto tool_choice reliably.",
+		e.Model, tools,
+	)
+	doc := map[string]any{
+		"error": map[string]any{
+			"type":    "invalid_request_error",
+			"code":    "tool_choice_pinning_required",
+			"message": msg,
+			"param":   "tool_choice",
+		},
+	}
+	out, _ := json.Marshal(doc)
+	return out
+}
+
+// maybePromoteToolChoice rewrites the request body to pin tool_choice to a
+// specific function when the model's probe verified tool calls only via
+// forced choice (tool_mode="forced") AND the request leaves tool_choice up
+// to the model. Two cases:
+//
+//  1. Single tool in `tools`: rewrite tool_choice to that function name.
+//     The agent gets a working tool call without any agent-side change.
+//  2. Multiple tools: return *promoteToolChoiceError. The handler turns
+//     it into HTTP 400. The router can't pick a tool for the agent, and
+//     forced-only models won't pick one themselves with auto choice.
+//
+// All other shapes pass through:
+//   - tool_choice already pinned to a function: agent took ownership.
+//   - tool_choice="required": agent forced some call; model picks. Best
+//     effort — for forced-only models this still often fails to elicit a
+//     call within budget, but the agent made the choice.
+//   - tool_choice="none": agent explicitly disabled tools.
+//   - Models with tool_mode="auto": probe verified spontaneous calls work.
+//   - Models without a verified tool_parser: handled by maybeStripTools.
+//
+// Returns (rewritten body, nil) on success, (nil, *promoteToolChoiceError)
+// on the multi-tool reject path, or (original body, nil) when no rewrite
+// applies. JSON-decode failure returns the body unchanged with no error —
+// matches the defensive posture of the other rewrite helpers.
+func (a *arbiter) maybePromoteToolChoice(
+	backendName, modelName string, body []byte,
+) ([]byte, *promoteToolChoiceError) {
+	if backendName != "vllm" && backendName != "sglang" {
+		return body, nil
+	}
+	if a.modelToolMode[backendName][modelName] != "forced" {
+		return body, nil
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return body, nil
+	}
+	tools, _ := doc["tools"].([]any)
+	if len(tools) == 0 {
+		return body, nil
+	}
+	// Inspect tool_choice. Absent or "auto" → eligible for rewrite.
+	// Anything else (a function spec map, "required", "none") → pass.
+	choice, present := doc["tool_choice"]
+	if present {
+		if s, ok := choice.(string); !ok || (s != "" && s != "auto") {
+			return body, nil
+		}
+	}
+	if len(tools) == 1 {
+		name := toolNameAt(tools, 0)
+		if name == "" {
+			return body, nil
+		}
+		doc["tool_choice"] = map[string]any{
+			"type":     "function",
+			"function": map[string]any{"name": name},
+		}
+		out, err := json.Marshal(doc)
+		if err != nil {
+			return body, nil
+		}
+		return out, nil
+	}
+	// Multi-tool reject. Collect names so the error message is
+	// actionable — the agent author can pick one and pin client-side.
+	names := make([]string, 0, len(tools))
+	for i := range tools {
+		if n := toolNameAt(tools, i); n != "" {
+			names = append(names, n)
+		}
+	}
+	return nil, &promoteToolChoiceError{Model: modelName, ToolNames: names}
+}
+
+// toolNameAt extracts the function name from `tools[i]`. OpenAI shape:
+// {"type":"function","function":{"name":"...", ...}}. Returns "" on any
+// type assertion failure — the caller treats that as "no usable name".
+func toolNameAt(tools []any, i int) string {
+	if i < 0 || i >= len(tools) {
+		return ""
+	}
+	t, _ := tools[i].(map[string]any)
+	fn, _ := t["function"].(map[string]any)
+	name, _ := fn["name"].(string)
+	return name
+}
+
 func (a *arbiter) maybeStripTools(backendName, modelName string, body []byte) []byte {
 	if backendName != "vllm" && backendName != "sglang" {
 		return body

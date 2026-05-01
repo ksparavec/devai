@@ -2,7 +2,7 @@
 #
 # Regenerate with: make catalog-regen
 # Source of truth:  scripts/model-families.yaml
-# Generated at:     2026-05-01T10:18:40+00:00
+# Generated at:     2026-05-01T17:57:05+00:00
 #
 # Every 'size' and 'arch' below was fetched live from the
 # upstream provider at generation time. Do not hand-edit.
@@ -2556,6 +2556,7 @@ models:
     parsers:
       vllm:
         reasoning: deepseek_r1
+        tool: deepseek_string
       sglang:
         reasoning: deepseek-r1
 
@@ -2573,6 +2574,7 @@ models:
     parsers:
       vllm:
         reasoning: deepseek_r1
+        tool: deepseek_string
       sglang:
         reasoning: deepseek-r1
 

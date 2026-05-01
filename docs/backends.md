@@ -150,6 +150,93 @@ entry, and the router launches without the flag.
 | `PROBE_FORCE=1` | Re-probe every cell even if cached |
 | `PROBE_FORCE_ARCH=1` | Re-probe top-level capability/arch fields |
 
+### Custom vLLM parser plugins
+
+Some models emit tool calls or reasoning in a format that no built-in
+vLLM parser handles. The DeepSeek R1 distills are the standing
+example: their chat template uses DeepSeek-V3 boundary markers
+(`<｜tool▁call▁begin｜>` etc.), but they inherit the Qwen2 / Llama-3
+tokenizer where those markers aren't atomic vocab entries. vLLM's
+built-in `deepseek_v3` / `_v31` / `_v32` parsers do
+`vocab.get(<token>)` at startup and crash with HTTP 500 on every
+tool-using request.
+
+The fix is a parser plugin: a Python file that registers a parser
+with vLLM's `ToolParserManager`, loaded via the
+`--tool-parser-plugin <abs-path>` flag. DevAI handles the wiring so
+adding a new plugin is a two-step change:
+
+1. Drop the parser file in `scripts/vllm_plugins/`.
+2. Add one entry in `deploy/vllm-plugins.json`:
+
+   ```json
+   {
+     "plugins": {
+       "<parser_name>": {
+         "kind": "tool",          // or "reasoning"
+         "file": "<basename>.py"
+       }
+     }
+   }
+   ```
+
+3. Reference `<parser_name>` from a family's `parsers.vllm.tool` (or
+   `parsers.vllm.reasoning`) in `scripts/model-families.yaml`, then
+   `make catalog-regen` and re-probe.
+
+Both the prober (`scripts/_probe_hf_common.py`) and the router
+(`gpu-arbiter/main.go`) read the registry. When a parser name resolves
+to a plugin entry they:
+
+- bind-mount `scripts/vllm_plugins/` into the launched vLLM container
+  at the registry's `container_dir` (default `/etc/devai/vllm-plugins`);
+- emit `--tool-parser-plugin <abs>` (or `--reasoning-parser-plugin`)
+  *before* the matching `--tool-call-parser <name>` flag — vLLM
+  resolves parser names at flag-parse time, so the plugin module has
+  to be loaded by then.
+
+Names absent from the registry pass through as built-in vLLM parsers
+(no plugin flag, no bind-mount). The behaviour for built-ins is
+identical to pre-plugin builds.
+
+The router learns the host path of the plugin directory via
+`VLLM_PLUGINS_HOST_DIR` (set by the Makefile to
+`$(abspath scripts/vllm_plugins)` and exported into compose). When
+that env is empty and a model still resolves to a plugin, the router
+fails the recreate with an actionable error rather than launching
+without the plugin file accessible.
+
+SGLang has no equivalent: SGLang's plugin model is Python-import based
+(register a class via SGLang's detector framework), not file-path
+based, so a separate plugin would be needed per model. SGLang traffic
+for plugin-only families runs without tool support until that lands.
+
+#### Operational notes — R1-Distill family
+
+Both R1 distills share the same chat template and the same plugin, but
+their tool-calling **behaviour** differs sharply because of base-model
+training. Verified end-to-end through the router with `tool_choice:
+"auto"` and one tool:
+
+| Model | Base tokenizer | `tool_mode` | Completion tokens to call | Reasoning preamble |
+|---|---|---|---|---|
+| `DeepSeek-R1-Distill-Llama-8B` | Llama-3 | forced | **5** | none — calls immediately |
+| `DeepSeek-R1-Distill-Qwen-7B` | Qwen-2  | forced | ~525 | yes — long CoT before the call |
+
+Both ended up `tool_mode=forced` (the auto-choice probe didn't elicit
+a call), so the router's promote rule kicks in for either. The
+**Llama-8B distill is much more usable for tool-calling agents** —
+it's effectively non-reasoning when handed a single tool. Prefer it
+over the Qwen-7B distill when latency matters and the use case
+doesn't need reasoning depth. The Qwen-7B distill is better when you
+want explicit chain-of-thought, but agents must budget for ~500-token
+preamble per tool call.
+
+For multi-tool use cases on either distill, the router rejects with
+HTTP 400 (`tool_choice_pinning_required`). Pin client-side or route
+to a `tool_mode=auto` model (Qwen3.5-9B-Q8, Qwen3-8B-NVFP4,
+Llama-3.1-8B-Instruct-NVFP4) that handles auto choice reliably.
+
 ## Cache hygiene
 
 ### vLLM / SGLang — re-probe when sha changes

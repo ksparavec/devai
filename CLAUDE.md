@@ -6,7 +6,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is **Dev AI Lab** — a containerized development environment for AI experimentation featuring JupyterLab and multiple AI CLIs (Gemini, Claude, OpenAI, Ollama). Built on Debian Trixie with Python 3.13 (uv-managed), Node.js 22 LTS. Two-layer image build for fast iteration. Compatible with Podman and Docker. GPU/CUDA support.
 
-**Backends:** all three are wired — Ollama (GGUF, port 11434), vLLM (NVFP4/safetensors, port 11435), SGLang (NVFP4/safetensors, port 11436). The router enforces GPU mutual exclusion: only one backend serves at a time. vLLM and SGLang start as `sleep infinity` placeholders and are recreated on demand by the router when a request arrives. See `docs/backends.md` for the lifecycle, probing procedure, and failure-mode taxonomy.
+**Backends:** all three are wired — Ollama (GGUF, port 11434), vLLM (NVFP4/safetensors, port 11435), SGLang (NVFP4/safetensors, port 11436). The router enforces GPU mutual exclusion: only one backend serves at a time. vLLM and SGLang start as `sleep infinity` placeholders and are recreated on demand by the router when a request arrives.
+
+**Documentation:**
+- `docs/router.md` — router architecture, ports, lifecycle, request rewrite chain (override parsing → reasoning policy → tool_choice promotion → tool stripping → ctx injection), config, caches, failure modes. **Source of truth for the router.**
+- `docs/backends.md` — backend lifecycle, probing procedure, parser plugins, cache hygiene, failure-mode taxonomy.
 
 ## Build and Run Commands
 

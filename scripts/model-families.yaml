@@ -307,24 +307,29 @@ families:
       # Both emit R1-style `<think>` blocks; the deepseek-r1 reasoning
       # parser strips them into `reasoning_content`.
       #
-      # Tool calling intentionally NOT wired: the R1-Distill chat
-      # templates use DeepSeek-V3 special tokens (`<｜tool▁call▁begin｜>`
-      # etc.), but the distills inherit the BASE model's tokenizer
-      # (Qwen2 / Llama3) which lacks those tokens as atomic vocab
-      # entries. vLLM's `deepseek_v3`, `deepseek_v31`, and `deepseek_v32`
-      # parsers all do `vocab.get(<token>)` at startup and fail with
-      # HTTP 500: "DeepSeek-V3 Tool parser could not locate tool call
-      # start/end tokens in the tokenizer". No other parser matches the
-      # template's emission either. Until upstream ships a string-based
-      # parser variant or the distills add the tokens to vocab, tool
-      # calls on this family must be disabled — the router strips
-      # `tools`/`tool_choice` from requests when `disable_verified=False`.
-      # Verified 2026-05-01 against vLLM image latest-cu130-ubuntu2404.
+      # Tool calling goes through the `deepseek_string` plugin parser
+      # (scripts/vllm_plugins/deepseek_string_tool_parser.py, registered
+      # in deploy/vllm-plugins.json). The R1-Distill chat templates emit
+      # the DeepSeek-V3 boundary markers `<｜tool▁call▁begin｜>` etc.
+      # literally, but the distills inherit the BASE model's tokenizer
+      # (Qwen2 / Llama3) which lacks those markers as atomic vocab
+      # entries. vLLM's built-in `deepseek_v3` / `_v31` / `_v32` parsers
+      # all do `vocab.get(<token>)` at startup and crash with HTTP 500:
+      # "DeepSeek-V3 Tool parser could not locate tool call start/end
+      # tokens in the tokenizer". The `deepseek_string` plugin
+      # re-implements the same parser with substring matching instead
+      # of vocab-id lookups, so it works on any tokenizer that emits
+      # the markers as text — atomic-token or BPE-split.
+      # SGLang side stays empty: SGLang's plugin model is Python-import-
+      # based (not file-path), and a separate plugin would be needed.
+      # Until that lands, SGLang traffic for this family runs without
+      # tool support.
       - deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
       - deepseek-ai/DeepSeek-R1-Distill-Llama-8B
     parsers:
       vllm:
         reasoning: deepseek_r1
+        tool: deepseek_string
       sglang:
         reasoning: deepseek-r1
     arch_ref: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B

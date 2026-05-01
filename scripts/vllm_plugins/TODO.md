@@ -1,118 +1,96 @@
-# `deepseek_string` plugin — wiring TODO
+# `deepseek_string` plugin — wiring DONE + VERIFIED
 
-The parser file `deepseek_string_tool_parser.py` in this directory is
-**written and smoke-tested** but **not yet wired into the probe driver or
-the router**. This file enumerates the remaining work to make it
-production-usable. Pick this up in a fresh session.
+Status: **wired, unit-tested, and verified end-to-end on both R1
+distill variants** as of 2026-05-01.
 
-## Current state — verified working in isolation
+- `DeepSeek-R1-Distill-Qwen-7B`  — Qwen-2 tokenizer  → `T=deepseek_string mode=forced` ✓
+- `DeepSeek-R1-Distill-Llama-8B` — Llama-3 tokenizer → `T=deepseek_string mode=forced` ✓
 
-- Plugin file: `scripts/vllm_plugins/deepseek_string_tool_parser.py` (~250 lines)
-- Imports cleanly inside `vllm/vllm-openai:latest-cu130-ubuntu2404`
-- Registers as `deepseek_string` via `ToolParserManager.register_module(["deepseek_string"])`
-- Smoke-tested 2026-05-01 with the real `deepseek-ai/DeepSeek-R1-Distill-Qwen-7B` tokenizer:
-  - `vocab.get('<｜tool▁call▁begin｜>') == None` (the case that breaks upstream `deepseek_v3`)
-  - Plugin extracted `ToolCall(type=function, name=get_time, args={})` from a sample DeepSeek-shape output
-  - Preceding content (`'Reasoning here.\n'`) preserved correctly
+Both verified through the live router at `http://devai-router:11435`:
+single-tool `tool_choice: "auto"` requests get promoted by the router
+to a specific-function pin, vLLM loads the plugin via
+`--tool-parser-plugin /etc/devai/vllm-plugins/deepseek_string_tool_parser.py`,
+and the plugin extracts a clean `tool_calls: [get_time(...)]` from
+the model's full-width DeepSeek-V3 marker output. Multi-tool auto
+requests get rejected with HTTP 400 + `tool_choice_pinning_required`.
+See `docs/backends.md` "Operational notes — R1-Distill family" for
+the per-model behavioural difference (5-token vs 525-token call latency).
 
-## What's left
+## What's wired
 
-### 1. Probe-driver wiring (`scripts/_probe_hf_common.py`)
-- [ ] In `container_run_detached()` — add a bind-mount of the plugin
-  directory: `--volume <repo>/scripts/vllm_plugins:/plugins:ro`. Only
-  needed when the resolved `tool_parser` is a plugin name (currently
-  just `deepseek_string`).
-- [ ] When the family's `parsers.vllm.tool` is `deepseek_string`, prepend
-  `--tool-parser-plugin /plugins/deepseek_string_tool_parser.py` to the
-  vLLM engine args. The flag must come BEFORE `--tool-call-parser
-  deepseek_string` (vLLM loads plugin files at parser-resolution time).
-- [ ] Decide how the prober knows which parser names are plugins vs.
-  built-ins. Two options:
-    1. Hard-coded set in `_probe_hf_common.py` (simple, explicit)
-    2. Family-level field, e.g. `parsers.vllm.tool_plugin: <path>`,
-       letting the family declare its own plugin path. More flexible
-       but bigger schema change.
-  Lean toward option 1 for now — single-element set with a comment.
+### Plugin registry — single source of truth
+- `deploy/vllm-plugins.json` — JSON map of `parser_name → {kind, file}`.
+  Both Python (probe driver) and Go (router) read this file; adding a
+  new plugin is one JSON entry plus a file in `scripts/vllm_plugins/`.
+- Container path: `/etc/devai/vllm-plugins/<file>`. The host directory
+  is bind-mounted into the recreated vLLM container at recreate time.
 
-### 2. Router wiring (`gpu-arbiter/main.go`)
-- [ ] Mirror the bind-mount + `--tool-parser-plugin` flag injection at
-  container recreate time. The router already injects `--reasoning-parser`
-  and `--tool-call-parser` from the cache row; the new flag follows the
-  same pattern.
-- [ ] Reuse the same plugin-name allowlist source the prober uses (a
-  shared text file or YAML, not duplicated logic in two languages). A
-  small JSON file at `deploy/vllm-plugins.json` with
-  `{"deepseek_string": "/plugins/deepseek_string_tool_parser.py"}` works
-  for both Go and Python consumers.
-- [ ] Add the `--volume` to the `containerCreate` libpod call. Mode
-  `ro,Z` (or whatever the existing volume mounts use).
+### Probe driver (`scripts/_probe_hf_common.py` + `probe-vllm-reasoning.py`)
+- `BackendSpec` gained `supports_plugins` (vLLM=True, SGLang=False).
+- `_resolve_plugins` looks up parser names against the registry; when
+  matched it adds the host→container plugin volume and threads the
+  in-container plugin path into `build_args`.
+- `vllm_command_args` emits `--tool-parser-plugin <abs>` (or
+  `--reasoning-parser-plugin <abs>`) immediately before the parser-name
+  flag; vLLM resolves parser names at flag-parse time so the plugin
+  module has to be loaded by then.
+- Built-in parsers pass through unchanged — no plugin flag, no mount,
+  no behaviour change vs. pre-plugin builds.
+- SGLang accepts the plugin kwargs and drops them (it has no
+  `--*-parser-plugin` analogue).
 
-### 3. Image build (optional but cleanest)
-- [ ] In `deploy/Dockerfile.lab` (and possibly `Dockerfile.router` if it
-  has Python), `COPY scripts/vllm_plugins /usr/local/share/vllm-plugins`
-  so the bind-mount becomes a no-op fallback. Plugins ship inside the
-  image; bind-mount is only needed for hot iteration during development.
-- [ ] Add a build-time test target: `python3 -c "from
-  vllm.utils.import_utils import import_from_path;
-  import_from_path('p', '/usr/local/share/vllm-plugins/deepseek_string_tool_parser.py')"`
-  to catch import-path drift on every image build.
+### Router (`gpu-arbiter/main.go` + `gpu-arbiter/vllm_plugins.go`)
+- Reads `VLLM_PLUGINS_REGISTRY` (default `/etc/devai/vllm-plugins.json`,
+  mounted by compose) and `VLLM_PLUGINS_HOST_DIR` (set by the Makefile
+  to the host's `scripts/vllm_plugins` path) at startup.
+- `arbiter.resolvePluginLaunch` is called from `containerRecreate`. It
+  populates `launchConfig.{Tool,Reasoning}ParserPlugin` and emits the
+  libpod bind-mount spec when at least one plugin is required.
+- Empty `VLLM_PLUGINS_HOST_DIR` + a parser that needs a plugin → the
+  recreate fails loudly with an actionable error (rather than silently
+  launching without the plugin file accessible).
+- Kind mismatch (e.g. a `kind=reasoning` entry used as a tool parser)
+  is rejected with a clear error.
+- 14 new unit tests in `gpu-arbiter/vllm_plugins_test.go` cover loader
+  tolerance, lookup, ordering, host-dir gating, and SGLang ignoring
+  plugin paths.
 
-### 4. Family-entry restoration (`scripts/model-families.yaml`)
-- [ ] Restore `parsers.vllm.tool: deepseek_string` to the
-  `deepseek-r1-distill` family (replacing the current "tool calls
-  intentionally NOT wired" comment block).
-- [ ] Keep the comment but rewrite it to point at the plugin: "Tool
-  calls go through the `deepseek_string` plugin parser; see
-  `scripts/vllm_plugins/deepseek_string_tool_parser.py`. The base
-  tokenizer (Qwen2 / Llama3) lacks atomic vocab entries for the
-  DeepSeek-V3 boundary markers, which broke every built-in parser."
-- [ ] SGLang side stays empty — SGLang's plugin model is different
-  (Python registry import, not file-path arg). A separate plugin
-  would be needed for SGLang. Defer.
+### Family entry (`scripts/model-families.yaml`)
+- `deepseek-r1-distill` family now has `parsers.vllm.tool: deepseek_string`.
+- SGLang side intentionally left empty — see top-level TODO for the
+  optional follow-up.
 
-### 5. Verification
-- [ ] `make cache-down`
-- [ ] Force-probe just `DeepSeek-R1-Distill-Qwen-7B` at one cell:
-  `python3 scripts/probe-vllm-reasoning.py --host-vram-gb 24 --vram 24
-  --ctx 32768 --repo "DeepSeek-R1-Distill-Qwen-7B" --force`
-- [ ] Expect `T=deepseek_string dis=y` in the output.
-- [ ] `make cache-up` and run a tool-using chat through the router to
-  confirm round-trip works end-to-end (not just probe-level).
+### Compose & Makefile
+- `deploy/docker-compose.yaml`: router service mounts `vllm-plugins.json`
+  at `/etc/devai/vllm-plugins.json`, env passes `VLLM_PLUGINS_HOST_DIR`.
+- `Makefile`: `VLLM_PLUGINS_HOST_DIR = $(abspath scripts/vllm_plugins)`,
+  exported so compose interpolation picks it up.
 
-### 6. Documentation
-- [ ] Add a section to `docs/backends.md` titled "Custom tool parser
-  plugins" explaining the bind-mount + flag pattern, the
-  `deploy/vllm-plugins.json` registry, and how to add a new plugin.
-- [ ] Add an entry to the cell schema doc (wherever vLLM cache schema
-  v2 is described) noting that `tool_parser` may now be a plugin
-  name, not just a built-in.
+### Docs
+- `docs/backends.md` gained a "Custom vLLM parser plugins" section
+  describing the registry, the wiring pattern, and how to add a new
+  plugin.
 
-### 7. Out-of-scope for this plugin (future work, separate)
-- DeepSeek-R1-Distill-Llama-8B uses the same chat template; it should
-  work with this plugin too. No code change needed, just add it to the
-  re-probe set after wiring.
-- Original DeepSeek-V3 / R1 weights have atomic vocab tokens, so they
-  should keep using built-in `deepseek_v3` for the (very minor) speed
-  benefit of token-id streaming counts. Don't migrate them.
-- An SGLang equivalent would need its own implementation in SGLang's
-  Python detector framework. Out of scope until SGLang's NVFP4 path
-  is unbroken (separate issue, S1).
+## What's NOT done (deliberate)
 
-## Risks / things to watch
+- **Plugin source baked into an image.** Skipped: vLLM runs in the
+  upstream `vllm/vllm-openai:latest-cu130-ubuntu2404` image which we
+  don't fork, and our lab/router images don't run vLLM. Bind-mount is
+  the only wiring path; the bake step from the original plan was
+  misaligned with how the stack is actually deployed.
+- **SGLang plugin equivalent.** Different plugin model (Python import,
+  not file path). Out of scope until SGLang's NVFP4 path is unbroken.
 
-- **Streaming correctness**: the plugin's streaming path uses
-  substring counts in `current_text` instead of token-id counts in
-  `current_token_ids`. For full-width DeepSeek markers that no
-  tokenizer fragments mid-character this is equivalent, but if a
-  future model emits the markers split across an encoding boundary
-  (e.g., a tokenizer that BPE-splits the full-width separator) the
-  streaming path could miss a count. Non-streaming path uses regex
-  on the complete output; immune to this.
-- **vLLM API drift**: imports come from `vllm.entrypoints.openai.engine.protocol`
-  in this image. vLLM has reorganised the `protocol` modules a few
-  times; the build-time test in step 3 will catch drift on each image
-  bump.
-- **Plugin path inside container**: the prober and router must agree
-  on the in-container path (`/plugins/...` vs.
-  `/usr/local/share/vllm-plugins/...`). Pick one and put it in
-  `deploy/vllm-plugins.json` so both consumers read the same source.
+## Adding a new plugin later
+
+1. Drop the parser file in `scripts/vllm_plugins/`.
+2. Add an entry to `deploy/vllm-plugins.json`:
+   ```json
+   "<parser_name>": {"kind": "tool", "file": "<basename>.py"}
+   ```
+3. Reference `<parser_name>` from a family's `parsers.vllm.tool` (or
+   `parsers.vllm.reasoning`) in `scripts/model-families.yaml`.
+4. `make catalog-regen && make cache-down`.
+5. `python3 scripts/probe-vllm-reasoning.py --repo "<regex>" --force`
+   — expect `T=<parser_name> dis=y` in the output.
+6. `make cache-up` and confirm a live tool-using chat through the router.
