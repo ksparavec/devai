@@ -22,10 +22,13 @@ Errors propagate verbatim. No exception swallowing.
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import yaml
@@ -714,12 +717,20 @@ def _check_cache_visible() -> None:
 # ── fzf wrapper ──────────────────────────────────────────────────────────────
 
 def _fzf(lines: list[str], header: str,
-         selectable: list[bool] | None = None) -> int | None:
+         selectable: list[bool] | None = None,
+         preview_cmd: str | None = None,
+         preview_window: str = "right:45%:wrap") -> int | None:
     """Run fzf; return selected line index or None on cancel.
 
     `selectable[i]=False` marks line i as a non-selectable section header.
     Index sentinel `--` is used for those; if user lands on one fzf still
     returns it but we re-prompt.
+
+    `preview_cmd`, when set, is passed to fzf's `--preview`. The
+    delimiter is `\t` and the row tag is field {1}; `--with-nth 2..`
+    keeps the tag out of the visible row but available for the preview
+    substitution. Header rows produce a blank preview (their tag is
+    `--` and the cmd is expected to fail silently for missing files).
     """
     if selectable is None:
         selectable = [True] * len(lines)
@@ -729,33 +740,51 @@ def _fzf(lines: list[str], header: str,
         indexed.append(f"{tag}\t{line}")
     while True:
         try:
+            args = [
+                "fzf", "--reverse", "--no-sort", "--ansi", "--no-info",
+                "--delimiter", "\t", "--with-nth", "2..",
+                "--header", header,
+                "--pointer", "▶", "--prompt", "  ",
+                "--margin", "1,2",
+                # Always draw a rounded border around every prompt so the
+                # window is clearly delimited on dark terminals. Bright
+                # cyan (color 14) matches the existing header tone.
+                "--border", "rounded",
+                # Colours tuned for a BLACK terminal background.
+                # Avoid the dim ANSI 0–7 bank (especially blue/4 and
+                # green/2 which vanish on black). Use the bright bank
+                # (8–15) for foreground accents and an explicit dark-
+                # grey (`bg+:236`) bar for the current line so the
+                # cursor row pops without the colours hurting eyes.
+                #   fg:15      bright white         normal text
+                #   fg+:15     bright white         current row text
+                #   bg+:236    dark-grey            current row bar
+                #   pointer:11 bright yellow        ▶ glyph
+                #   header:14  bright cyan          fzf header line
+                #   hl:11      bright yellow        match highlight
+                #   hl+:11     bright yellow        match highlight (cur)
+                #   prompt:14  bright cyan          search prompt
+                #   info:8     bright black (grey)  match counter
+                #   gutter:-1  terminal default     left margin column
+                #   border:14  bright cyan          window frame
+                "--color",
+                "fg:15,fg+:15,bg+:236,pointer:11,header:14,"
+                "hl:11,hl+:11,prompt:14,info:8,gutter:-1,border:14",
+            ]
+            if preview_cmd:
+                # Preview pane gets its own rounded frame so the split
+                # between list and details is visually obvious. Older
+                # fzf versions silently ignore the suffix; newer ones
+                # render it in the main `border:` colour.
+                pwindow = preview_window
+                if "border" not in pwindow:
+                    pwindow = f"{pwindow}:border-rounded"
+                args.extend([
+                    "--preview", preview_cmd,
+                    "--preview-window", pwindow,
+                ])
             result = subprocess.run(
-                [
-                    "fzf", "--reverse", "--no-sort", "--ansi", "--no-info",
-                    "--delimiter", "\t", "--with-nth", "2..",
-                    "--header", header,
-                    "--pointer", "▶", "--prompt", "  ",
-                    "--margin", "1,2",
-                    # Colours tuned for a BLACK terminal background.
-                    # Avoid the dim ANSI 0–7 bank (especially blue/4 and
-                    # green/2 which vanish on black). Use the bright bank
-                    # (8–15) for foreground accents and an explicit dark-
-                    # grey (`bg+:236`) bar for the current line so the
-                    # cursor row pops without the colours hurting eyes.
-                    #   fg:15      bright white         normal text
-                    #   fg+:15     bright white         current row text
-                    #   bg+:236    dark-grey            current row bar
-                    #   pointer:11 bright yellow        ▶ glyph
-                    #   header:14  bright cyan          fzf header line
-                    #   hl:11      bright yellow        match highlight
-                    #   hl+:11     bright yellow        match highlight (cur)
-                    #   prompt:14  bright cyan          search prompt
-                    #   info:8     bright black (grey)  match counter
-                    #   gutter:-1  terminal default     left margin column
-                    "--color",
-                    "fg:15,fg+:15,bg+:236,pointer:11,header:14,"
-                    "hl:11,hl+:11,prompt:14,info:8,gutter:-1",
-                ],
+                args,
                 input="\n".join(indexed),
                 stdout=subprocess.PIPE,
                 text=True,
@@ -816,21 +845,10 @@ _REASONING_LABEL = {
     "unsupported": "No reasoning",
 }
 
-# Inline-reasoning models leak `<think>` blocks into content. The picker
-# emits TWO rows for them — one that lets the model think (default), one
-# that forces thinking off via the router's `::nothink` suffix. The
-# router applies enable_thinking=false for inline+off requests.
-_INLINE_OFF_LABEL = "Reasoning off"
-_INLINE_OFF_GLYPH = "·"
-
-_STATUS_ORDER = {
-    "native": 0,
-    "inline": 1,
-    "inline_off": 2,
-    "none": 3,
-}
-
-_MODE_ORDER = {"default": 0, "nothink": 1}
+# Inline-reasoning models leak `<think>` blocks into content. They appear
+# in the flat list once; the user toggles reasoning ON/OFF via the info
+# modal, and the launcher appends `::nothink` when the user picks OFF.
+# The router strips that suffix and forces enable_thinking=false.
 
 
 def _context_label(context: int) -> str:
@@ -933,29 +951,6 @@ def _vram_info_at(v: dict, context: int) -> dict | None:
     }
 
 
-def _reasoning_variants(m: dict) -> list[tuple[str, str, str, str]]:
-    """Map a model's probed capability to (status_key, glyph, label, mode)
-    rows for the picker. Returns an empty list for unprobed / error
-    capabilities so the caller can hide the row entirely.
-
-    Inline-reasoning models produce TWO rows: a default row that lets the
-    model think (router takes no action) and a `::nothink` row that
-    forces enable_thinking=false. Structured and unsupported produce one
-    row each.
-    """
-    cap = m.get("capability", "unknown")
-    if cap == "structured":
-        return [("native", _CAP_GLYPH[cap], _REASONING_LABEL[cap], "default")]
-    if cap == "inline":
-        return [
-            ("inline", _CAP_GLYPH[cap], _REASONING_LABEL[cap], "default"),
-            ("inline_off", _INLINE_OFF_GLYPH, _INLINE_OFF_LABEL, "nothink"),
-        ]
-    if cap in ("unsupported", "none"):
-        return [("none", _CAP_GLYPH[cap], _REASONING_LABEL[cap], "default")]
-    return []
-
-
 def _tuning_label(m: dict) -> str:
     """Return the post-training tuning label for the TUNE column.
 
@@ -1054,17 +1049,6 @@ def _format_model_row(m: dict) -> str:
     )
 
 
-def _name_priority(m: dict) -> tuple:
-    """Tag-name priority for the dedup tiebreak.
-
-    Higher tuple = preferred. Ranking:
-      1. anything-but-:latest beats :latest (moving alias, no info)
-      2. longer name beats shorter (more explicit -q4_K_M / -a3b suffix)
-    """
-    name = m["name"]
-    return (not name.endswith(":latest"), len(name))
-
-
 def _parse_param_b(label: str) -> float:
     import re
     match = re.search(r"(?<![A-Za-z0-9])(\d+(?:\.\d+)?)\s*b\b", label.lower())
@@ -1082,120 +1066,261 @@ def _params_hint(m: dict) -> float:
     return _parse_param_b(str(m.get("name") or ""))
 
 
-def _quality(m: dict) -> tuple[float, float, float]:
-    """Quality proxy used to rank within a family. Higher tuple wins.
+# ── Capability scoring (flat list ordering) ──────────────────────────────────
 
-    Tuple components in priority order:
-      1. parameter count — most meaningful "scale" signal (a 27B Q4
-         beats a 9B BF16). Probe-supplied label first, then parsed
-         from name when probe lacks the field (HF rows).
-      2. actual VRAM at the picker's context — at fixed param count the
-         higher-precision quant uses more memory and is preferred.
-      3. raw disk size — last-resort tiebreaker for missing metadata.
+_REASONING_SCORE: dict[str, int] = {
+    "structured": 2,
+    "inline": 1,
+    "none": 0,
+    "unsupported": 0,
+    "unknown": 0,
+    "error": 0,
+}
+
+
+def _has_tools(m: dict) -> bool:
+    """True when the model can serve tool calls today.
+
+    Ollama negotiates tools per-request natively (parser='native'); HF
+    rows are tools-capable only when the probe confirmed a parser AND
+    didn't flag `disable_verified` (router strips tools/tool_choice in
+    that case to avoid backend rejection).
     """
-    params_b = _params_hint(m)
+    parser = str(m.get("tool_parser") or "").strip()
+    if not parser or parser.upper() == "N/A":
+        return False
+    if parser == "native":
+        return True
+    probe = m.get("probe") or {}
+    return not bool(probe.get("disable_verified"))
+
+
+def _ctx_tier(ctx: int) -> int:
+    """Index of `ctx` in ascending _CONTEXT_CHOICES. Larger ctx → larger tier."""
+    tiers = sorted(_CONTEXT_CHOICES)
+    idx = 0
+    for i, t in enumerate(tiers):
+        if ctx >= t:
+            idx = i
+    return idx
+
+
+def _score(m: dict) -> float:
+    """Weighted capability score. Higher = better; sort descending.
+
+    Priority (high → low): reasoning > tools > context > MoE > params.
+    Weights chosen so each tier dominates the sum of all lower tiers
+    given realistic ranges (reasoning 0..2, tools 0..1, ctx_tier 0..3,
+    MoE 0..1, params 0..~70).
+    """
+    cap = str(m.get("capability") or "unknown")
+    reasoning = _REASONING_SCORE.get(cap, 0)
+    tools = 1 if _has_tools(m) else 0
     info = m.get("_picker_vram") or {}
-    vram_total = float(info.get("total_gb") or 0.0)
-    try:
-        size_gb = float((m.get("size") or "0").split()[0])
-    except (ValueError, IndexError):
-        size_gb = 0.0
-    return (params_b, vram_total, size_gb)
+    ctx = int(info.get("_picker_ctx") or m.get("_picker_context") or 0)
+    moe_flag = 1 if (m.get("moe") or {}).get("experts_total") else 0
+    return (
+        reasoning * 1_000_000
+        + tools * 10_000
+        + _ctx_tier(ctx) * 1_000
+        + moe_flag * 100
+        + _params_hint(m)
+    )
+
+
+def _max_fitting_ctx_info(m: dict) -> dict | None:
+    """Largest probe-confirmed context tier that fits fully on GPU at the
+    picker's VRAM band. Returns the _vram_info_at-style dict (with an
+    extra `_picker_ctx` key) or None if nothing fits.
+    """
+    v = m.get("vram") or {}
+    if not v:
+        return None
+    for ctx in sorted(_CONTEXT_CHOICES, reverse=True):
+        info = _vram_info_at(v, ctx)
+        if info is None:
+            continue
+        if not info.get("fully_on_gpu", False):
+            continue
+        if int(info.get("context") or 0) < ctx:
+            continue
+        info = dict(info)
+        info["_picker_ctx"] = ctx
+        return info
+    return None
+
+
+def _dedup_hf_by_name(models: list[dict]) -> list[dict]:
+    """When the same model name has rows for multiple HF backends, keep
+    the highest-priority one. vLLM > SGLang. Ollama tag names never
+    collide with HF directory names, so Ollama rows pass through
+    unchanged.
+    """
+    hf_priority = {"vllm": 2, "sglang": 1}
+    chosen: dict[str, dict] = {}
+    for m in models:
+        name = m.get("name") or ""
+        prev = chosen.get(name)
+        if prev is None:
+            chosen[name] = m
+            continue
+        cur_p = hf_priority.get(str(m.get("backend") or ""), 0)
+        prev_p = hf_priority.get(str(prev.get("backend") or ""), 0)
+        if cur_p > prev_p:
+            chosen[name] = m
+    return list(chosen.values())
+
+
+# ── Per-family use-case blurbs (info modal copy) ─────────────────────────────
+
+_FAMILY_USE_CASES: dict[str, str] = {
+    "qwen3.5": (
+        "Strong coding, math, and structured reasoning. Long-context "
+        "retrieval and agentic tool use. Default first choice for most "
+        "coding-agent workflows."
+    ),
+    "qwen3": (
+        "Predecessor to Qwen3.5. Inline thinking; solid coding and "
+        "instruction-following. Reasonable fallback when the 3.5 weights "
+        "are not on disk."
+    ),
+    "gpt-oss": (
+        "OpenAI open-weight reasoning model. Harmony channel cleanly "
+        "separates reasoning, tool calls, and answers. Pairs well with "
+        "Codex and Claude Code's tool-heavy flows."
+    ),
+    "llama3.1": (
+        "General-purpose chat and instruction-following. Solid baseline "
+        "for RAG, summarisation, and assistant-style work where "
+        "reasoning is not the primary need."
+    ),
+    "llama3.2": (
+        "Smaller Llama variant. Snappy chat at low VRAM cost; good for "
+        "routing/triage agents and edge-style deployments."
+    ),
+    "gemma4": (
+        "Compact Google-tuned model. Low-latency chat in the 8K-128K "
+        "range; good for interactive REPL-style work where round-trip "
+        "time matters."
+    ),
+    "deepseek-r1-distill": (
+        "Reasoning-distilled from DeepSeek R1. Heavy chain-of-thought; "
+        "best for math, code analysis, and competitive-programming-style "
+        "problems."
+    ),
+    "nemotron-nano-v2": (
+        "NVIDIA-tuned compact Nemotron. Instruction-tuned with tool "
+        "support; good balance of throughput and capability on a single "
+        "mid-range GPU."
+    ),
+    "nemotron-3-nano": (
+        "Latest NVIDIA Nano series. Improved reasoning and tool use over "
+        "earlier Nano variants; suitable for agentic tasks at modest "
+        "VRAM."
+    ),
+    "nemotron-cascade-2": (
+        "NVIDIA Cascade tuning. Strong long-context retrieval and "
+        "structured reasoning. Useful when both context and reasoning "
+        "matter at once."
+    ),
+    "nemotron": (
+        "Original NVIDIA Nemotron line. Dense Llama-derivative; "
+        "conservative choice for stable instruction-following without "
+        "surprises."
+    ),
+    "__default__": (
+        "General-purpose model. Use the columns above to pick the right "
+        "tradeoff between capability, context, and VRAM headroom."
+    ),
+}
+
+
+def _capability_summary_text(m: dict, reasoning_mode: str = "default") -> str:
+    """Body text for the info modal: capabilities + per-family use case."""
+    name = _strip_latest(m.get("name") or "")
+    backend = str(m.get("backend") or "?")
+    info = m.get("_picker_vram") or {}
+    ctx = int(info.get("_picker_ctx") or m.get("_picker_context") or 0)
+    cap = str(m.get("capability") or "unknown")
+    reason_label = _REASONING_LABEL.get(cap, "Unknown")
+    if cap == "inline" and reasoning_mode == "nothink":
+        reason_label = f"{reason_label} (forced OFF for this launch)"
+    tools_label = "Yes" if _has_tools(m) else "No"
+    moe = m.get("moe") or {}
+    type_label = "MoE" if moe.get("experts_total") else "Dense"
+    details = m.get("details") or {}
+    fmt = details.get("quantization") or "?"
+    params = str(details.get("param_size") or "")
+    if not params:
+        hint = _params_hint(m)
+        params = f"{hint:g}B" if hint else "?"
+    parser = str(m.get("tool_parser") or "N/A")
+    vram = info.get("total_gb")
+    vram_str = f"{vram:.2f} GB" if vram else "?"
+    family = (m.get("family") or "").lower()
+    blurb = _FAMILY_USE_CASES.get(family, _FAMILY_USE_CASES["__default__"])
+    return (
+        f"Model:     {name}\n"
+        f"Backend:   {backend}\n"
+        f"Format:    {fmt}\n"
+        f"Params:    {params}    Type: {type_label}\n"
+        f"Context:   {_context_label(ctx)} (max fit at {_VRAM_BUDGET:g} GB)\n"
+        f"VRAM:      {vram_str}\n"
+        f"\n"
+        f"Reasoning: {reason_label}\n"
+        f"Tools:     {tools_label}    (parser: {parser})\n"
+        f"\n"
+        f"Use cases:\n"
+        f"{blurb}"
+    )
 
 
 def _build_menu(models: list[dict]) -> tuple[list[str], list[bool], list[dict | None]]:
     """Build (display_lines, selectable_flags, model_per_line) for fzf.
 
-    For each family and standard context tier, show the best model for
-    each user-facing status: Native reasoning, Inline reasoning, No
-    reasoning, and CPU offload. "Best" means highest model quality proxy,
-    with explicit tags preferred over moving :latest aliases.
-    """
-    # backend → family → (context, status) → model
-    grouped: dict[str, dict[str, dict[tuple[int, str], dict]]] = {}
-    # Track why models were hidden so the footer can explain. Categories:
-    #   - context_capped: model's max_context is below the requested tier
-    #   - missing_vram: no usable probe cell (band/ctx not yet probed)
-    #   - missing_capability: capability is unknown/error/unsupported_arch
-    #   - spilled: probe shows fully_on_gpu=false at this (vram, ctx)
-    hidden = {
-        "context_capped": 0,
-        "missing_vram": 0,
-        "missing_capability": 0,
-        "spilled": 0,
-    }
-    for m in models:
-        backend = m.get("backend", "ollama")
-        for ctx in _CONTEXT_CHOICES:
-            v = m.get("vram") or {}
-            info = _vram_info_at(v, ctx)
-            if info is None:
-                hidden["missing_vram"] += 1
-                continue
-            if int(info.get("context") or 0) < ctx:
-                hidden["context_capped"] += 1
-                continue
-            # Eliminate models that don't fit fully on GPU at this
-            # (VRAM band, context). The cache record decides — we don't
-            # second-guess it.
-            if not info.get("fully_on_gpu", False):
-                hidden["spilled"] += 1
-                continue
-            variants = _reasoning_variants(m)
-            if not variants:
-                hidden["missing_capability"] += 1
-                continue
-            # Family resolution priority:
-            #   1. Catalog metadata (`m["family"]`) — set when the
-            #      tag/repo appears in deploy/models.yaml.
-            #   2. The Ollama tag's library prefix (text before the
-            #      `:` in `<lib>:<tag>`) — handles locally-renamed
-            #      tags like `nemotron-3-nano:4b-q4_K_M` that we
-            #      created via `ollama cp` and that have no upstream
-            #      registry entry. The library prefix matches the
-            #      family name 1:1 in this project.
-            #   3. "(uncategorized)" — last-resort fallback so the row
-            #      still appears in the menu.
-            family = m.get("family") or ""
-            if not family and m.get("source") == "ollama":
-                tag_name = m.get("name") or ""
-                if ":" in tag_name:
-                    family = tag_name.split(":", 1)[0]
-            if not family:
-                family = "(uncategorized)"
-            family_rows = grouped.setdefault(backend, {}).setdefault(family, {})
-            for status_key, glyph, status_label, mode in variants:
-                candidate = dict(m)
-                candidate["_picker_context"] = ctx
-                candidate["_picker_vram"] = info
-                candidate["_picker_status"] = status_key
-                candidate["_picker_glyph"] = glyph
-                candidate["_picker_status_label"] = status_label
-                candidate["_picker_mode"] = mode
+    Flat list ordered by capability score (descending). One row per model:
 
-                # Bucket key includes mode so default and ::nothink rows
-                # for the same inline model coexist as separate picks.
-                bucket = (ctx, status_key, mode)
-                previous = family_rows.get(bucket)
-                if (
-                    previous is None
-                    or (_quality(candidate), _name_priority(candidate))
-                    > (_quality(previous), _name_priority(previous))
-                ):
-                    family_rows[bucket] = candidate
+      - HF rows are deduplicated by name with vLLM preferred over SGLang.
+      - Each model is stamped with its largest probe-confirmed context
+        tier that fits fully on GPU at the picker's VRAM band.
+      - Inline-reasoning models appear once; the user toggles reasoning
+        ON/OFF in the info modal after pressing Enter.
+    """
+    hidden = {
+        "missing_capability": 0,
+        "no_fitting_ctx": 0,
+    }
+    candidates: list[dict] = []
+    for m in models:
+        cap = str(m.get("capability") or "unknown")
+        if cap in ("unknown", "error", "unsupported_arch"):
+            hidden["missing_capability"] += 1
+            continue
+        info = _max_fitting_ctx_info(m)
+        if info is None:
+            hidden["no_fitting_ctx"] += 1
+            continue
+        decorated = dict(m)
+        decorated["_picker_vram"] = info
+        decorated["_picker_context"] = int(info.get("_picker_ctx") or 0)
+        decorated["_picker_status"] = cap
+        decorated["_picker_glyph"] = _CAP_GLYPH.get(cap, "?")
+        decorated["_picker_status_label"] = _REASONING_LABEL.get(cap, "Unknown")
+        # Default reasoning mode; per-model toggle is offered in the info
+        # modal for inline-reasoning rows. No `::nothink` row in the list.
+        decorated["_picker_mode"] = "default"
+        candidates.append(decorated)
+
+    # HF dedup — vLLM preferred over SGLang for the same name. Ollama
+    # tag names never collide with HF directory names so Ollama rows
+    # pass through unchanged.
+    candidates = _dedup_hf_by_name(candidates)
+    candidates.sort(key=_score, reverse=True)
 
     lines: list[str] = []
     selectable: list[bool] = []
     item_models: list[dict | None] = []
 
-    def emit(text: str, *, selectable_: bool, model: dict | None) -> None:
-        lines.append(text)
-        selectable.append(selectable_)
-        item_models.append(model)
-
-    first_section = True
-    # Column header is emitted with a 2-char prefix from emit(); leading
-    # spaces align it with data rows.
     column_header = (
         f"      {'CTX':>4s}  "
         f"{'REASONING':<18s}  "
@@ -1208,77 +1333,40 @@ def _build_menu(models: list[dict]) -> tuple[list[str], list[bool], list[dict | 
         f"{'PARSER':>14s}  "
         f"{'VRAM (GB)':>10s}"
     )
-    for backend in _PICKER_BACKENDS:
-        if backend not in grouped:
-            continue
-        if not first_section:
-            emit("", selectable_=False, model=None)
-        first_section = False
-        label = _BACKENDS[backend][0]
-        emit(f"  {_BOLD}── {label} ──{_RESET}",
-             selectable_=False, model=None)
-        # The column header carries its own leading whitespace that
-        # matches `_format_model_row` exactly. Don't add a `  ` prefix
-        # here — that would shift the header 2 chars right of every
-        # data row and the columns would look misaligned.
-        emit(f"{_BOLD}{column_header}{_RESET}",
-             selectable_=False, model=None)
-        if backend == "ollama":
-            note = (f"* = formula estimate (no probe cell at this VRAM/ctx — "
-                    f"run `make probe-{backend}`)")
-        else:
-            # vLLM and SGLang engines pre-allocate gpu_memory_utilization ×
-            # total_vram, so the probe records the same actual_vram_gb
-            # for every (vram, ctx) cell — useless for per-ctx display.
-            # The picker overrides with a formula breakdown
-            # (weights + KV(arch, ctx) + 3 GB overhead) and marks it `*`.
-            # Real measured per-ctx VRAM would require a long-prompt
-            # probe with engine memory utilisation tuned per cell — not
-            # implemented yet.
-            note = (f"* = formula estimate (weights + KV(arch, ctx) + 3 GB; "
-                    f"{backend} probe doesn't measure per-ctx VRAM directly)")
-        emit(f"  {_DIM}{note}{_RESET}",
-             selectable_=False, model=None)
+    lines.append(f"{_BOLD}{column_header}{_RESET}")
+    selectable.append(False)
+    item_models.append(None)
+    note = (
+        "* = formula estimate (HF probes do not measure per-ctx VRAM; "
+        "Ollama cells without probe data fall back to formula)"
+    )
+    lines.append(f"  {_DIM}{note}{_RESET}")
+    selectable.append(False)
+    item_models.append(None)
 
-        # Order families within this backend by their best selected variant.
-        # _quality returns a tuple (params_b, vram_total, size_gb); negate
-        # via tuple-component sign to keep "higher quality first".
-        def _family_sort_key(kv):
-            best = max(_quality(m) for m in kv[1].values())
-            return tuple(-x for x in best)
+    for m in candidates:
+        lines.append(_format_model_row(m))
+        selectable.append(True)
+        item_models.append(m)
 
-        families = sorted(grouped[backend].items(), key=_family_sort_key)
-        for fam, selected in families:
-            emit(f"    {_BOLD}{fam}:{_RESET}",
-                 selectable_=False, model=None)
-            top = sorted(
-                selected.values(),
-                key=lambda m: (
-                    int(m.get("_picker_context") or 0),
-                    _STATUS_ORDER.get(str(m.get("_picker_status")), 99),
-                    _MODE_ORDER.get(str(m.get("_picker_mode") or "default"), 99),
-                ),
-            )
-            for m in top:
-                emit(_format_model_row(m), selectable_=True, model=m)
-
-    # Footer: explain hidden rows so a user with NVFP4 weights on disk
-    # (or ollama models the probe rejected) knows why they don't appear.
     total_hidden = sum(hidden.values())
     if total_hidden:
-        emit("", selectable_=False, model=None)
+        lines.append("")
+        selectable.append(False)
+        item_models.append(None)
         bits: list[str] = []
-        if hidden["missing_vram"]:
-            bits.append(f"{hidden['missing_vram']} missing VRAM data")
-        if hidden["context_capped"]:
-            bits.append(f"{hidden['context_capped']} below requested context")
-        if hidden["spilled"]:
-            bits.append(f"{hidden['spilled']} spill to CPU/RAM at this VRAM")
+        if hidden["no_fitting_ctx"]:
+            bits.append(
+                f"{hidden['no_fitting_ctx']} no context tier fits "
+                f"≤ {_VRAM_BUDGET:g} GB"
+            )
         if hidden["missing_capability"]:
-            bits.append(f"{hidden['missing_capability']} not probed/probe failed")
-        emit(f"  {_DIM}hidden: {', '.join(bits)}  ·  "
-             f"see docs/ollama_models.md{_RESET}",
-             selectable_=False, model=None)
+            bits.append(
+                f"{hidden['missing_capability']} not probed/probe failed"
+            )
+        lines.append(f"  {_DIM}hidden: {', '.join(bits)}{_RESET}")
+        selectable.append(False)
+        item_models.append(None)
 
     return lines, selectable, item_models
 
@@ -1362,6 +1450,56 @@ def _build(agent_id: str, model_name: str, backend: str) -> list[str]:
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
+def _resolve_agent(agent_filter: str | None, model: dict) -> tuple[str, str] | None:
+    """Drive reasoning toggle (inline-reasoning only) → agent picker.
+
+    The model details are shown live in the model-list preview pane, so
+    there is no separate confirmation step here — Enter on the model row
+    in the outer fzf advances directly to this function.
+
+    Returns (agent_id, reasoning_mode) on launch, or None when the user
+    pressed Esc and the caller should re-enter the model list.
+    """
+    reasoning_mode = "default"
+    cap = str(model.get("capability") or "")
+    if cap == "inline":
+        toggle_lines = [
+            f"  Reasoning ON   {_DIM}(default — model thinks inline){_RESET}",
+            f"  Reasoning OFF  {_DIM}(force enable_thinking=false / ::nothink){_RESET}",
+        ]
+        toggle_header = (
+            f"Reasoning mode  ▸  {_BOLD}{_strip_latest(model['name'])}{_RESET}"
+            f"   {_DIM}(Esc → back to model list){_RESET}"
+        )
+        idx = _fzf(toggle_lines, toggle_header)
+        if idx is None:
+            return None
+        if idx == 1:
+            reasoning_mode = "nothink"
+
+    if agent_filter:
+        agent = next((a for a in _AGENTS if a[0] == agent_filter), None)
+        if agent is None:
+            sys.exit(
+                f"error: unknown agent '{agent_filter}' "
+                f"(known: {', '.join(a[0] for a in _AGENTS)})"
+            )
+        return (agent[0], reasoning_mode)
+
+    alines = [_format_agent_row(a) for a in _AGENTS]
+    mode_note = "  [no reasoning]" if reasoning_mode == "nothink" else ""
+    header = (
+        f"Pick agent  ▸  {_BOLD}{_strip_latest(model['name'])}{_RESET}"
+        f"{mode_note}  @ {_context_label(int(model.get('_picker_context') or 0))}"
+        f"  via {_BACKENDS[model['backend']][0]}"
+        f"   {_DIM}(Esc → back to model list){_RESET}"
+    )
+    idx = _fzf(alines, header)
+    if idx is None:
+        return None
+    return (_AGENTS[idx][0], reasoning_mode)
+
+
 def main() -> None:
     agent_filter: str | None = None
     if "--agent" in sys.argv:
@@ -1384,10 +1522,6 @@ def main() -> None:
             "  Pull models first (e.g. `make ollama-pull`, `make vllm-pull`)."
         )
 
-    # Step 1 — pick a model/context/status row. For each family and
-    # standard context tier, the picker shows the best model per
-    # user-facing status: Native reasoning, Inline reasoning, No reasoning,
-    # and CPU offload.
     lines, selectable, item_models = _build_menu(models)
     if not any(selectable):
         sys.exit(
@@ -1397,90 +1531,73 @@ def main() -> None:
             f"  Or raise the VRAM budget: VRAM=48 ...\n"
             f"  Or pull smaller models: make ollama-pull MODEL=…"
         )
+
     header = (
-        f"DevAI  ▸  Step 1/2: pick a model  "
-        f"(Ollama · {_context_label(_CONTEXT_CHOICES[0])}-"
-        f"{_context_label(_CONTEXT_CHOICES[-1])} ctx · "
-        f"≤ {_VRAM_BUDGET:g} GB)"
+        f"DevAI  ▸  Pick a model  "
+        f"(≤ {_VRAM_BUDGET:g} GB · sorted by capability · "
+        f"details ▶)"
     )
-    idx = _fzf(lines, header, selectable=selectable)
-    if idx is None:
-        # User cancelled (Ctrl-C / Esc) before picking a model. Exit
-        # the picker cleanly so the container's PID 1 (this process)
-        # terminates and `podman run --rm` reclaims the container —
-        # same lifecycle as quitting an agent. Dropping to bash here
-        # would keep the container alive indefinitely.
-        sys.exit(0)
-    model = item_models[idx]
-    if model is None:  # defensive — _fzf already filters headers
-        sys.exit(0)
-    selected_context = int(model.get("_picker_context") or _DEFAULT_CONTEXT)
-    os.environ["CONTEXT"] = str(selected_context)
 
-    # Step 2 — pick an agent (skipped when --agent was passed)
-    if agent_filter:
-        agent = next((a for a in _AGENTS if a[0] == agent_filter), None)
-        if agent is None:
-            sys.exit(
-                f"error: unknown agent '{agent_filter}' "
-                f"(known: {', '.join(a[0] for a in _AGENTS)})"
-            )
-    else:
-        alines = [_format_agent_row(a) for a in _AGENTS]
-        header = (
-            f"Step 2/2: pick an agent for "
-            f"{_BOLD}{_strip_latest(model['name'])}{_RESET}"
-            f" @ {_context_label(selected_context)}"
-            f" via {_BACKENDS[model['backend']][0]}"
+    # Materialise per-row info files for fzf's preview pane. Each
+    # selectable row gets <preview_dir>/<idx>.txt; header rows have
+    # tag `--`, so the cat fails silently and the pane shows blank
+    # while the user is on a non-data row.
+    preview_dir = tempfile.mkdtemp(prefix="devai-picker-")
+    atexit.register(shutil.rmtree, preview_dir, ignore_errors=True)
+    for i, m in enumerate(item_models):
+        if m is None:
+            continue
+        Path(preview_dir, f"{i}.txt").write_text(_capability_summary_text(m))
+    preview_cmd = f"cat {preview_dir}/{{1}}.txt 2>/dev/null"
+
+    while True:
+        idx = _fzf(
+            lines, header,
+            selectable=selectable,
+            preview_cmd=preview_cmd,
         )
-        idx = _fzf(alines, header)
         if idx is None:
-            # User cancelled at the agent step. Exit cleanly so the
-            # container terminates instead of dropping into bash.
+            # User cancelled the model list (Ctrl-C / Esc). Exit cleanly so
+            # the container's PID 1 terminates and `podman run --rm`
+            # reclaims it — same lifecycle as quitting an agent.
             sys.exit(0)
-        agent = _AGENTS[idx]
+        model = item_models[idx]
+        if model is None:  # defensive — _fzf already filters headers
+            continue
 
-    # Per-session context binding — only for vLLM / SGLang. The router
-    # (gpu-arbiter) parses the `@<ctx>` suffix via parseCtxOverride and
-    # recreates the backend container with --max-model-len (vLLM) or
-    # --context-length (SGLang) set accordingly. KV pool is allocated
-    # at startup; the suffix drives that allocation.
-    #
-    # Ollama is different: KV is allocated dynamically per request, and
-    # the picker emits just the parent name. Per-request num_ctx for
-    # native /api/chat is injected by the router's setNumCtx (still
-    # honoured by Ollama on the native API). Agents that hit Ollama via
-    # /v1/chat/completions or /v1/messages get the global
-    # OLLAMA_CONTEXT_LENGTH env (an Ollama upstream limitation — the
-    # /v1/* paths ignore options.num_ctx).
-    base_name = _strip_latest(model["name"])
-    # Append `::nothink` for the inline-reasoning forced-off pick. The
-    # router's parseReasoningOverride strips this suffix and treats
-    # the request as policy=off, injecting enable_thinking=false (or
-    # the equivalent per-backend disable shape). The user gets
-    # think-disabled output without the model's <think> blocks.
-    reasoning_suffix = ""
-    if model.get("_picker_mode") == "nothink":
-        reasoning_suffix = "::nothink"
-    if model["backend"] == "ollama":
-        # Ollama: KV is dynamic per request; only the reasoning suffix
-        # rides on the model name. No `@<ctx>` needed.
-        serving_name = f"{base_name}{reasoning_suffix}"
-    else:
-        # vLLM / SGLang: order is `<name>::<reasoning>@<ctx>` so the
-        # router's parseCtxOverride (which strips trailing @<int>)
-        # runs cleanly before parseReasoningOverride.
-        serving_name = f"{base_name}{reasoning_suffix}@{selected_context}"
+        decision = _resolve_agent(agent_filter, model)
+        if decision is None:
+            # Backed out of the info / agent modal. Re-enter the model list.
+            continue
+        agent_id, reasoning_mode = decision
 
-    cmd = _build(agent[0], serving_name, model["backend"])
-    _record_pick(base_name, agent[0], selected_context)
-    mode_note = " [no reasoning]" if reasoning_suffix else ""
-    print(
-        f"\n  {_BOLD}{agent[0]}{_RESET}"
-        f" → {base_name}{mode_note} @ {_context_label(selected_context)}"
-        f" via {_BACKENDS[model['backend']][0]}\n"
-    )
-    os.execvp(cmd[0], cmd)
+        selected_context = int(model.get("_picker_context") or _DEFAULT_CONTEXT)
+        os.environ["CONTEXT"] = str(selected_context)
+        base_name = _strip_latest(model["name"])
+        # `::nothink` rides on the model name only when the user explicitly
+        # chose reasoning OFF inside the info modal. The router's
+        # parseReasoningOverride strips it and treats the request as
+        # policy=off (enable_thinking=false / per-backend disable shape).
+        reasoning_suffix = "::nothink" if reasoning_mode == "nothink" else ""
+        if model["backend"] == "ollama":
+            # Ollama: KV is dynamic per request; only the reasoning
+            # suffix rides on the model name.
+            serving_name = f"{base_name}{reasoning_suffix}"
+        else:
+            # vLLM / SGLang: order is `<name>::<reasoning>@<ctx>` so the
+            # router's parseCtxOverride (strips trailing @<int>) runs
+            # cleanly before parseReasoningOverride.
+            serving_name = f"{base_name}{reasoning_suffix}@{selected_context}"
+
+        cmd = _build(agent_id, serving_name, model["backend"])
+        _record_pick(base_name, agent_id, selected_context)
+        mode_note = " [no reasoning]" if reasoning_suffix else ""
+        print(
+            f"\n  {_BOLD}{agent_id}{_RESET}"
+            f" → {base_name}{mode_note} @ {_context_label(selected_context)}"
+            f" via {_BACKENDS[model['backend']][0]}\n"
+        )
+        os.execvp(cmd[0], cmd)
 
 
 if __name__ == "__main__":
