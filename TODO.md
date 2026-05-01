@@ -1,24 +1,69 @@
 # TODO
 
+> Reconciled against `git log` on 2026-05-01 (covers commits afb7c59 → b77e42b).
+
 ## Completed
-- [x] Install Aider as local AI coding agent in JupyterLab
-- [x] Configure Claude Code and Codex CLIs to use local models via router
-- [x] Add JupyterLab launcher icons for Aider
-- [x] Add interactive agent picker for shell-cpu/shell-gpu targets
-- [x] Seed Codex config files via entrypoint
-- [x] Router refactor: multi-port architecture (Ollama :11434, vLLM :11435, SGLang :11436)
-- [x] GPU exclusion with graceful drain
+
+### Foundation
+- [x] Aider / Claude / Codex / Gemini agents in JupyterLab + shell launcher cards
+- [x] Multi-port router (Ollama :11434, vLLM :11435, SGLang :11436) with GPU exclusion + graceful drain
 - [x] Container liveness verification (detect externally stopped containers)
-- [x] SGLang backend support added
-- [x] models.yaml flat list with backend: [list] per model
-- [x] Go unit tests (19) + integration tests (19) — all passing
-- [x] Interactive model picker (fzf-based shell + Jupyter launcher cards)
-- [x] Dynamic GPU memory fraction (model size vs VRAM, backend-aware)
-- [x] Dynamic context length (128K default, auto-reduced for tight fits)
-- [x] Go unit tests expanded to 31 (parseSizeGB, memFraction, computeLaunchConfig)
+- [x] Interactive fzf model picker (shell + Jupyter launcher cards)
+- [x] Dynamic GPU memory fraction + context length per model size
+
+### Probe & catalog pipeline
+- [x] Upstream-driven catalog (`make catalog-regen` → `deploy/models.yaml`)
+- [x] Per-tier probe schema v3, digest-keyed cache (Ollama)
+- [x] 2-D probe matrix (VRAM × CONTEXT); `active-models.yaml` removed — cache IS the active set
+- [x] Disk-driven picker; rows hidden until `fully_on_gpu` / `fits`
+- [x] Implied-spill propagation: smaller-ctx spill short-circuits larger ctx
+- [x] gguf source kind: FROM + RENDERER + PARSER Modelfile, `ollama create`-driven
+- [x] Per-session num_ctx via Modelfile-derived tags (Ollama, agent-agnostic)
+- [x] Probe-truth picker: probe-measured `actual_vram_gb` used directly when `fits=true`
+- [x] Cell-matrix selector: `(family, backend, ctx)` cells; quality rank by params then quant precision
+- [x] Probe clamp removal: tiers beyond model's nominal max_context now run a real probe
+- [x] `gpt-oss` family added with verified vLLM + SGLang parsers
+- [x] Catalog `hf_weight_bytes` reads `safetensors.index.json` first; excludes `original/`, `metal/`, `consolidated/` mirror dirs
+
+### Reasoning & tool parsing
+- [x] Runtime reasoning probe; capability-aware policy
+- [x] Ollama native `think:` field; vLLM/SGLang `enable_thinking` + `reasoning_effort` / `separate_reasoning`
+- [x] Per-request reasoning override via `<name>::<token>` suffix (e.g. `::nothink`)
+- [x] `maybeStripTools` drops `tools`/`tool_choice` for unverified-tool-parser HF models
+- [x] `none` capability bucket distinguishes correct-by-design non-reasoning from broken parser pairings
+
+### vLLM / SGLang parity
+- [x] Probe runners (`probe-vllm-reasoning.py`, `probe-sglang-reasoning.py`) on shared `_probe_hf_common`
+- [x] Schema-v2 caches (repo+sha-keyed, per-cell `fits` + evidence)
+- [x] vLLM / SGLang start as `sleep infinity` placeholders; router recreates on demand
+- [x] `<name>@<ctx>` per-session context binding for HF backends
+- [x] HF rows synthesized into router from probe caches; `tool_parser` plumbed through launchConfig
+- [x] CI flag-drift guard: `deploy/backend-flags.yaml` + `make verify-backend-flags`
+- [x] SGLang validated — NVFP4 broken upstream in `v0.5.10.post1-cu130` at `modelopt_quant.py:1482`; picker auto-hides via `kind=infra`
+
+### Standalone launcher
+- [x] `bin/devai-agent` (renamed from devai-shell): Python launcher, persisted prefs in `~/.devai/preferences.yaml`
+- [x] `make install` symlinks launcher + all 3 probe caches + picker source under `~/.devai/`
+- [x] Mounts `$PWD` (not `last_work_dir`) as work dir; back-channel `.last-pick.json` round-trip
+
+### Logging & infra
+- [x] `devai-logger` sidecar streams every `devai-*` container's stdout to `/var/cache/devai/logs/`
+- [x] `make setup-logs` creates a 100 GB thin LV at `/var/cache/devai/logs`
+- [x] `make logs SERVICE=<name> [LINES=N]` tails persisted logs
+
+### Tests
+- [x] Go unit tests (31+) covering parseSizeGB, memFraction, computeLaunchConfig, parseReasoningOverride, maybeStripTools, synthesizeHFFromCache
+- [x] Live integration per backend (`test-router-{vllm,sglang}.sh`)
+- [x] Exhaustive matrix: every probed digest × wire × scenario (`test-model-matrix.sh`)
+- [x] E2E picker → agent → live router round-trip (`test-e2e-picker.sh`)
+- [x] Probe smoke tests + Ollama-prober byte-identical regression check
+
+### Docs
+- [x] README / CLAUDE.md / AGENTS.md / `docs/backends.md` reflect steady state (matrix-mode pull, `::nothink`, devai-agent, picker columns)
 
 ## Open Items
-- [ ] README.md — full rewrite of remaining legacy sections (appendices, detailed GPU docs)
-- [ ] SGLang validation — test NVFP4 models on SGLang, benchmark vs vLLM
-- [ ] Makefile model scripts — update ollama-list.py, vllm-list.py for new models.yaml format
-- [ ] devai.sh / ollama.sh — rewrite standalone scripts for production use
+
+- [ ] Wire `deepseek_string` vLLM tool-parser plugin — parser written + smoke-tested in `scripts/vllm_plugins/`. Needs probe-driver bind-mount, router flag injection, image-build COPY, family-entry restoration for `deepseek-r1-distill`. See `scripts/vllm_plugins/TODO.md` for the full checklist.
+- [ ] Family-level `engine_flags` field (e.g. `--enforce-eager`) so OOM-prone NVFP4 MoE variants like `Nemotron-3-Nano-30B-A3B-NVFP4` can free the CUDA-graph budget and re-enter `hf_repos`.
+- [ ] Re-evaluate SGLang NVFP4 once upstream fixes `modelopt_quant.py:1482 fp4_quantize`.
+- [ ] End-to-end pull + probe pass for the new `gpt-oss` family on this host (`make model-pull FAMILY=gpt-oss` then `make probe-vllm` / `make probe-sglang`).

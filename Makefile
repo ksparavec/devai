@@ -25,7 +25,14 @@ OLLAMA_EXEC = $(CONTAINER_RUNTIME) exec $(OLLAMA_CONTAINER) ollama
 DEVAI_NETWORK = devai-net
 CACHE_DIR = /var/cache/devai
 GPU_MEMORY_GB ?= 24
-MAX_CONTEXT_LEN ?= 131072
+MAX_CONTEXT_LEN ?= 262144
+# Export so recipe shells — and compose interpolation in particular —
+# see these values without requiring the user to maintain a .env file.
+# Shell-level env wins over compose's `${VAR:-default}` fallback, so the
+# devai-router container receives the Makefile values verbatim. Anything
+# the user already exported in their shell still wins (?= keeps the
+# external value), and `make MAX_CONTEXT_LEN=X cache-up` overrides both.
+export GPU_MEMORY_GB MAX_CONTEXT_LEN
 CACHE_COMPOSE = deploy/docker-compose.yaml
 INFERENCE_CONFIG = deploy/models.yaml
 HF_CLI = hf
@@ -552,14 +559,16 @@ cache-up: ## Start all infrastructure (caches + Ollama + router + Open WebUI; vL
 cache-down: ## Stop and remove ALL infrastructure services (running, stopped, orphaned)
 	@# -t 0 kills immediately; --remove-orphans catches containers no longer in compose.
 	-$(COMPOSE) -f $(CACHE_COMPOSE) down --remove-orphans -t 0
-	@# Force-remove any leftovers from the compose project (e.g. a previous cache-up
-	@# that errored mid-create and left containers behind). Target the compose
-	@# project label so we never touch lab/shell containers the user is running.
-	@ids=$$($(CONTAINER_RUNTIME) ps -aq --filter "label=com.docker.compose.project=deploy" 2>/dev/null); \
-	if [ -n "$$ids" ]; then \
-		echo "Removing stragglers: $$ids"; \
-		$(CONTAINER_RUNTIME) rm -f $$ids; \
-	fi
+	@# Force-remove devai-vllm and devai-sglang explicitly. Compose launches
+	@# both as `sleep infinity` placeholders, but the router (gpu-arbiter)
+	@# replaces them via libpod when a request arrives — the recreated
+	@# container drifts from compose's tracked spec (different entrypoint,
+	@# args, no compose labels), so `compose down` may leave it behind as
+	@# a zombie that blocks the next `cache-up` with "container name
+	@# already in use". Remove by name, ignoring missing-container errors.
+	@for name in devai-vllm devai-sglang; do \
+		$(CONTAINER_RUNTIME) rm -f $$name >/dev/null 2>&1 || true; \
+	done
 
 setup-logs: ## One-time: create dedicated 100G LV at /var/cache/devai/logs (requires sudo).
 	@# Stops cache so nothing holds the old logs path open, then runs the

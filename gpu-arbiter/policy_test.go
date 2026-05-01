@@ -299,9 +299,9 @@ func newTestArbiterHF() *arbiter {
 			// Qwen3-14B-NVFP4 has structured but disable not verified.
 		},
 		// Qwen3.5-9B-NVFP4 has a probe-verified tool parser (used by the
-		// strip-tools test); Qwen3-14B-NVFP4 doesn't.
-		modelToolParser: map[string]string{
-			"Qwen3.5-9B-NVFP4": "hermes",
+		// strip-tools test); Qwen3-14B-NVFP4 doesn't. Keyed by backend.
+		modelToolParser: map[string]map[string]string{
+			"vllm": {"Qwen3.5-9B-NVFP4": "hermes"},
 		},
 		defaultPolicy: "auto",
 	}
@@ -674,5 +674,47 @@ func TestMaybeStripTools_NoToolsNoop(t *testing.T) {
 	out := a.maybeStripTools("vllm", "Qwen3-14B-NVFP4", in)
 	if string(out) != string(in) {
 		t.Fatalf("body without tools must passthrough byte-for-byte, got %s", out)
+	}
+}
+
+// Regression: openai/gpt-oss-20b is registered on both vLLM and SGLang with
+// completely different parser names (vLLM: openai_gptoss/openai;
+// SGLang: gpt-oss/gpt-oss). With a flat map[string]string the
+// second-loaded backend's value would overwrite the first's, so launching
+// vLLM would receive SGLang's "gpt-oss" tool parser and crash with
+// `KeyError: invalid tool call parser: gpt-oss`. This test pins the
+// backend-keyed lookup behavior.
+func TestMaybeStripTools_BackendIsolation_NoCrossBackendOverwrite(t *testing.T) {
+	a := &arbiter{
+		modelToolParser: map[string]map[string]string{
+			"vllm":   {"gpt-oss-20b": "openai"},
+			"sglang": {"gpt-oss-20b": "gpt-oss"},
+		},
+	}
+	body := []byte(`{"model":"gpt-oss-20b","messages":[],"tools":[{"type":"function"}],"tool_choice":"auto"}`)
+
+	if out := a.maybeStripTools("vllm", "gpt-oss-20b", body); string(out) != string(body) {
+		t.Fatalf("vllm: parser is verified for this backend, tools must survive; got %s", out)
+	}
+	if out := a.maybeStripTools("sglang", "gpt-oss-20b", body); string(out) != string(body) {
+		t.Fatalf("sglang: parser is verified for this backend, tools must survive; got %s", out)
+	}
+
+	// Conversely: a model verified on vLLM only must have its tools
+	// stripped when the request hits SGLang (otherwise the engine
+	// rejects it because it was launched without --tool-call-parser).
+	a2 := &arbiter{
+		modelToolParser: map[string]map[string]string{
+			"vllm": {"vllm-only-model": "hermes"},
+		},
+	}
+	body2 := []byte(`{"model":"vllm-only-model","messages":[],"tools":[{"type":"function"}]}`)
+	out := a2.maybeStripTools("sglang", "vllm-only-model", body2)
+	var doc map[string]any
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatalf("rewritten body invalid JSON: %v body=%s", err, out)
+	}
+	if _, ok := doc["tools"]; ok {
+		t.Errorf("sglang request must NOT inherit vLLM's parser; tools should be stripped; body=%s", out)
 	}
 }

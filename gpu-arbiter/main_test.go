@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -21,6 +22,9 @@ func testBackend(name string, server *httptest.Server) *backendState {
 			HealthPath: "/health",
 		},
 		proxy: newProxy(u),
+		// recreateCond is bound to the arbiter's mutex in production code
+		// (see backend construction in main()). testArbiter rebinds it
+		// once the arbiter is constructed.
 	}
 }
 
@@ -35,6 +39,7 @@ func testArbiter(backends ...*backendState) *arbiter {
 		maxContextLen: 131072,
 	}
 	for _, bs := range backends {
+		bs.recreateCond = sync.NewCond(&a.mu)
 		a.backends[bs.config.Name] = bs
 	}
 	return a
@@ -523,6 +528,148 @@ func TestEnsureBackendRunning_RequiresModelForNonOllama(t *testing.T) {
 	}
 }
 
+// --- TestEnsureBackendRunning_RecreateCoalescing ---
+//
+// Regression for the Claude Code split-model issue. Without
+// recreate-coalescing, when two requests for the same model arrive
+// while a recreate is in flight (lock released for the 50–60s
+// `waitForHealthy` window), both observed `bs.running=false` and fired
+// duplicate `podman rm` + `podman create` cycles — the second tearing
+// down the first's half-built container. Verified by running this test
+// against the pre-fix code: both goroutines proceeded into
+// containerRecreate, podman errors leaked back through both, and
+// `bs.running` was clobbered.
+
+func TestEnsureBackendRunning_CoalescesConcurrentSameModelRecreates(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer server.Close()
+
+	bs := testBackend("vllm", server)
+	a := testArbiter(bs)
+
+	// Simulate an in-flight recreate held open by an external goroutine.
+	// (In production this state is set by the goroutine that won the
+	// recreate race; here we set it directly so the orchestration is
+	// deterministic.)
+	a.mu.Lock()
+	bs.recreating = true
+	bs.pendingModel = "test-model"
+	bs.pendingContext = 32768
+	a.mu.Unlock()
+
+	// Two concurrent requests for the same (model, ctx) the in-flight
+	// recreate is targeting. Both must park on bs.recreateCond.
+	var wg sync.WaitGroup
+	var errA, errB error
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		a.mu.Lock()
+		errA = a.ensureBackendRunning(bs, "test-model", 32768)
+		a.mu.Unlock()
+	}()
+	go func() {
+		defer wg.Done()
+		a.mu.Lock()
+		errB = a.ensureBackendRunning(bs, "test-model", 32768)
+		a.mu.Unlock()
+	}()
+
+	// Give both goroutines time to enter the cond.Wait().
+	time.Sleep(50 * time.Millisecond)
+
+	// Simulate the in-flight recreate completing successfully — exactly
+	// the state the winning goroutine would commit before broadcasting.
+	a.mu.Lock()
+	bs.recreating = false
+	bs.pendingModel = ""
+	bs.pendingContext = 0
+	bs.running = true
+	bs.currentModel = "test-model"
+	bs.currentContext = 32768
+	bs.recreateCond.Broadcast()
+	a.mu.Unlock()
+
+	wg.Wait()
+
+	if errA != nil {
+		t.Errorf("goroutine A: unexpected error %v", errA)
+	}
+	if errB != nil {
+		t.Errorf("goroutine B: unexpected error %v", errB)
+	}
+	// Critically, neither A nor B should have fired its own recreate —
+	// they should have observed the in-flight recreate's result and
+	// returned cleanly. State must match what the "completer" set.
+	if !bs.running {
+		t.Error("expected bs.running=true post-wakeup")
+	}
+	if bs.currentModel != "test-model" {
+		t.Errorf("bs.currentModel=%q want test-model", bs.currentModel)
+	}
+	if bs.currentContext != 32768 {
+		t.Errorf("bs.currentContext=%d want 32768", bs.currentContext)
+	}
+	if bs.recreating {
+		t.Error("bs.recreating should be false after broadcast")
+	}
+}
+
+// Two requests, recreate completes with FAILURE (e.g. health timeout).
+// Waiters must wake up, see recreating=false + running=false, and be
+// free to re-evaluate. This pins the defer-broadcast on error paths.
+func TestEnsureBackendRunning_WaitersUnblockOnRecreateFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer server.Close()
+
+	bs := testBackend("vllm", server)
+	a := testArbiter(bs)
+
+	a.mu.Lock()
+	bs.recreating = true
+	bs.pendingModel = "test-model"
+	bs.pendingContext = 32768
+	a.mu.Unlock()
+
+	parked := make(chan struct{})
+	done := make(chan struct{})
+
+	go func() {
+		a.mu.Lock()
+		// Signal that we're about to enter the wait loop. (Locked here
+		// so the test can't broadcast before this goroutine parks —
+		// the orchestrator must contend with us for the lock.)
+		close(parked)
+		// We pass an empty model name here so that, post-wakeup, the
+		// "model name required" check fires immediately and
+		// ensureBackendRunning returns without calling the real
+		// containerRecreate (which would touch podman).
+		_ = a.ensureBackendRunning(bs, "", 0)
+		a.mu.Unlock()
+		close(done)
+	}()
+
+	<-parked
+	time.Sleep(50 * time.Millisecond) // ensure cond.Wait() has actually parked
+
+	// Simulate the in-flight recreate FAILING — the winning goroutine's
+	// defer would clear recreating + broadcast even on error, leaving
+	// running=false.
+	a.mu.Lock()
+	bs.recreating = false
+	bs.pendingModel = ""
+	bs.pendingContext = 0
+	bs.recreateCond.Broadcast()
+	a.mu.Unlock()
+
+	select {
+	case <-done:
+		// Waiter unblocked — fix is working.
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiter never unblocked after recreate failure broadcast")
+	}
+}
+
 // --- TestDrainBackend ---
 
 func TestDrainBackend_ReturnsImmediatelyWhenNoActiveRequests(t *testing.T) {
@@ -827,6 +974,48 @@ func TestComputeLaunchConfig_SGLangReservesMoreMemory(t *testing.T) {
 	if sglang.MaxContext >= vllm.MaxContext {
 		t.Errorf("sglang should have lower max context due to RadixAttention overhead: vllm=%d sglang=%d",
 			vllm.MaxContext, sglang.MaxContext)
+	}
+}
+
+// --- TestApplyProbeCeiling ---
+//
+// Regression tests for the gpt-oss-20b incident: fittableContext's
+// heuristic table assigns 256 KB/token to 12–20 GB models, which
+// collapses gpt-oss-20b's probe-verified 256K ceiling (22.30 GB measured
+// at host_vram=24) to ~36K. The probe is the source of truth — the
+// router must trust it.
+
+func TestApplyProbeCeiling_TrustsProbeOverHeuristic(t *testing.T) {
+	// gpt-oss-20b @ 24G: heuristic says 36864, probe says 262144 fits.
+	// Request 256K → router must launch with 256K, not 36K.
+	got := applyProbeCeiling(36864, 262144, 262144)
+	if got != 262144 {
+		t.Fatalf("probe-verified 256K must override heuristic 36K, got %d", got)
+	}
+}
+
+func TestApplyProbeCeiling_RequestBelowProbeMax_UsesRequest(t *testing.T) {
+	// User picks 64K even though probe verified 256K — honour the request.
+	got := applyProbeCeiling(36864, 65536, 262144)
+	if got != 65536 {
+		t.Fatalf("requestedCtx 64K must win when ≤ probedMax, got %d", got)
+	}
+}
+
+func TestApplyProbeCeiling_RequestAboveProbeMax_ClampsToProbe(t *testing.T) {
+	// User picks 256K but probe only verified 128K — clamp to probe ceiling.
+	got := applyProbeCeiling(36864, 262144, 131072)
+	if got != 131072 {
+		t.Fatalf("requestedCtx 256K must clamp to probedMax 128K, got %d", got)
+	}
+}
+
+func TestApplyProbeCeiling_NoProbeData_FallsBackToHeuristic(t *testing.T) {
+	// Pre-probe / YAML-only models keep the heuristic — there's no
+	// authoritative ceiling to trust.
+	got := applyProbeCeiling(36864, 262144, 0)
+	if got != 36864 {
+		t.Fatalf("probedMax=0 must keep heuristic, got %d", got)
 	}
 }
 

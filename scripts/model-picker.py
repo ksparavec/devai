@@ -108,6 +108,21 @@ _BACKENDS: dict[str, tuple[str, str, int]] = {
     "sglang": ("SGLang", "NVFP4 tensor cores — RadixAttention, multi-turn optimized", 11436),
 }
 
+# Backends actually surfaced as picker rows. SGLang stays in _BACKENDS,
+# in the router, in `make probe-sglang`, and in select-models.py because
+# the infrastructure still works and may be useful for chat-only direct
+# access — but its OpenAI-compat surface is too thin for current agent
+# flows: gpt-oss community parsers mangle harmony tool/reasoning channels
+# (vLLM uses OpenAI's official `openai_gptoss`/`openai` parsers instead),
+# Codex 0.124+ /v1/responses tools schema only accepts hosted-tool types
+# (rejects `function`), Claude Code's split-model orchestration races on
+# the long cold-start path. Re-enable by adding "sglang" back here when
+# upstream parser/Responses-API support catches up.
+_PICKER_BACKENDS: tuple[str, ...] = ("ollama", "vllm")
+_PICKER_HF_BACKENDS: tuple[str, ...] = tuple(
+    b for b in _PICKER_BACKENDS if b != "ollama"
+)
+
 #                  id             display name          description
 _AGENTS: list[tuple[str, str, str]] = [
     ("claude",      "Claude Code",       "AI coding assistant with agentic terminal"),
@@ -585,14 +600,30 @@ def _discover_models() -> list[dict]:
     # `model-picker --show` style listings.
     vllm_probes = _load_hf_probe_records(_VLLM_PROBE_CACHE_PATHS)
     sglang_probes = _load_hf_probe_records(_SGLANG_PROBE_CACHE_PATHS)
-    fallback_backend = _HF_BACKEND if _HF_BACKEND in ("vllm", "sglang") else "vllm"
+    # Placeholder rows for files with no probe data anywhere are tagged
+    # with DEVAI_HF_BACKEND when it is one of the picker-exposed HF
+    # backends; otherwise we fall back to the first picker-exposed HF
+    # backend (typically "vllm"). Without this gate, setting
+    # DEVAI_HF_BACKEND=sglang would still surface placeholder rows
+    # tagged sglang even though sglang is filtered out of the picker.
+    fallback_backend = (
+        _HF_BACKEND if _HF_BACKEND in _PICKER_HF_BACKENDS
+        else (_PICKER_HF_BACKENDS[0] if _PICKER_HF_BACKENDS else "vllm")
+    )
 
     def _hf_probes_for(name: str) -> list[tuple[dict, str]]:
         """Return one (probe_entry, backend) pair per backend with a
         non-error probe for this model. Empty list when neither backend
         has a usable entry — the caller emits a single placeholder."""
         out_pairs: list[tuple[dict, str]] = []
-        for backend, store in (("vllm", vllm_probes), ("sglang", sglang_probes)):
+        # Iterate only picker-exposed HF backends. The sglang probe
+        # cache is still loaded (above) and used by the router; it
+        # just doesn't generate menu rows while sglang is filtered out.
+        store_by_backend = {"vllm": vllm_probes, "sglang": sglang_probes}
+        for backend in _PICKER_HF_BACKENDS:
+            store = store_by_backend.get(backend)
+            if store is None:
+                continue
             entry = store.get(name)
             if not entry:
                 continue
@@ -1177,7 +1208,7 @@ def _build_menu(models: list[dict]) -> tuple[list[str], list[bool], list[dict | 
         f"{'PARSER':>14s}  "
         f"{'VRAM (GB)':>10s}"
     )
-    for backend in ("ollama", "vllm", "sglang"):
+    for backend in _PICKER_BACKENDS:
         if backend not in grouped:
             continue
         if not first_section:
@@ -1271,6 +1302,19 @@ def _build(agent_id: str, model_name: str, backend: str) -> list[str]:
         # backend ignores auth: claude refuses to dispatch otherwise.
         os.environ["ANTHROPIC_BASE_URL"] = base
         os.environ.setdefault("ANTHROPIC_AUTH_TOKEN", "local")
+        # Claude Code's split-model design uses a smaller/cheaper model for
+        # background calls (summarization, prompt rewriting, sub-agent
+        # dispatch, file-content compaction). In cloud that's Claude Haiku
+        # alongside Sonnet — sensible cost/latency tradeoff. Locally we
+        # have one model loaded; switching is a 50-60s cold-start, not a
+        # cheap call. Without these overrides Claude Code emits its
+        # hardcoded haiku id (e.g. "claude-haiku-4-5-20251001"), the
+        # router has no row for it, phantom-launches a vLLM container
+        # that never serves, and the foreground turn starves on the 10-
+        # minute health timeout. Pin both slots to the picker-chosen
+        # model so all calls hit the already-loaded backend.
+        os.environ["ANTHROPIC_SMALL_FAST_MODEL"] = name
+        os.environ["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = name
         return ["claude", "--model", name]
 
     if agent_id == "aider":

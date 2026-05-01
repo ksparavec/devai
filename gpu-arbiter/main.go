@@ -30,7 +30,7 @@
 //	CONFIG_FILE       path to models.yaml (default /etc/devai/models.yaml)
 //	NETWORK           Podman network name (default devai-net)
 //	GPU_MEMORY_GB     total GPU VRAM in GB for memory fraction calc (default 24)
-//	MAX_CONTEXT_LEN   default max context length in tokens (default 131072 = 128K)
+//	MAX_CONTEXT_LEN   default max context length in tokens (default 262144 = 256K)
 //	DEVAI_REASONING   reasoning policy: auto|off|low|medium|high (default auto)
 package main
 
@@ -110,6 +110,13 @@ type configModel struct {
 	Reasoning       *configReasoning `yaml:"reasoning,omitempty"`
 	ToolParser      string           `yaml:"tool_parser,omitempty"`      // populated from HF probe cache
 	ReasoningParser string           `yaml:"reasoning_parser,omitempty"` // populated from HF probe cache
+	// ProbedMaxCtx is the highest context length the probe verified fits at
+	// the host's VRAM band — i.e. the largest `fits=true` (HF) or
+	// `fully_on_gpu=true` (Ollama) cell at hostKey in the cache. The router
+	// trusts this over fittableContext's heuristic at launch time, so
+	// MoE/GQA models like gpt-oss-20b aren't artificially clamped to 36K
+	// when the probe verified 256K loads cleanly.
+	ProbedMaxCtx int `yaml:"-"`
 }
 
 // configReasoning records what the runtime probe observed for this model.
@@ -221,12 +228,13 @@ func synthesizeFromCache(
 			aliases = append([]string(nil), entry.Aliases[1:]...)
 		}
 		out = append(out, configModel{
-			Name:    canonical,
-			Aliases: aliases,
-			Digest:  entry.Digest,
-			Backend: []string{"ollama"},
-			Size:    fmt.Sprintf("%.2f GB", bestProbe.ActualTotalGB),
-			Context: effCtx,
+			Name:         canonical,
+			Aliases:      aliases,
+			Digest:       entry.Digest,
+			Backend:      []string{"ollama"},
+			Size:         fmt.Sprintf("%.2f GB", bestProbe.ActualTotalGB),
+			Context:      effCtx,
+			ProbedMaxCtx: bestCtx,
 			Reasoning: &configReasoning{
 				Capability:      cap,
 				DisableVerified: entry.DisableVerified,
@@ -374,6 +382,7 @@ func synthesizeHFFromCache(
 			Repo:            entry.Repo,
 			Size:            fmt.Sprintf("%.2f GB", sizeGB),
 			Context:         effCtx,
+			ProbedMaxCtx:    bestCtx,
 			ToolParser:      toolParser,
 			ReasoningParser: reasoningParser,
 			Reasoning: &configReasoning{
@@ -437,25 +446,48 @@ type backendState struct {
 	currentContext int // baked --max-model-len / --context-length for vLLM/SGLang; 0 for Ollama
 	lastRequest    time.Time
 	activeReqs     int64
+	// Recreate coalescing — without this, a second request that arrives
+	// during the 50–60s cold-start `waitForHealthy` window sees
+	// running=false, decides it needs its own recreate, and tears down
+	// the in-flight one with a duplicate `podman rm` + `podman create`.
+	// `recreating` is true while a recreate is in flight, `pendingModel`
+	// and `pendingContext` describe its target, and `recreateCond` is the
+	// sync.Cond (over arbiter.mu) that waiters block on until the
+	// in-flight recreate either completes or fails.
+	recreating     bool
+	pendingModel   string
+	pendingContext int
+	recreateCond   *sync.Cond
 }
 
 type arbiter struct {
-	backends             map[string]*backendState
-	mu                   sync.Mutex
-	ollamaURL            *url.URL
-	podmanClient         *http.Client
-	idleTimeout          time.Duration
-	drainTimeout         time.Duration
-	healthTimeout        time.Duration      // configurable per HEALTH_TIMEOUT_SECONDS env (default 600s — vLLM/SGLang cold-start with NVFP4 weights + CUDA graph compilation can exceed 5 min on consumer GPUs)
-	modelSizes           map[string]float64 // model name → weight size in GB
-	modelContexts        map[string]int     // model name → declared max context (from models.yaml)
-	modelCapability      map[string]string  // model name → reasoning.capability
-	modelDisableOK       map[string]bool    // model name → disable_verified (only when present)
-	modelToolParser      map[string]string  // model name → backend --tool-call-parser (empty omits the flag)
-	modelReasoningParser map[string]string  // model name → backend --reasoning-parser (empty omits the flag)
-	defaultPolicy        string             // DEVAI_REASONING env value: auto|off|low|medium|high
-	totalVRAMGB          float64
-	maxContextLen        int // global default from MAX_CONTEXT_LEN env (default 131072)
+	backends        map[string]*backendState
+	mu              sync.Mutex
+	ollamaURL       *url.URL
+	podmanClient    *http.Client
+	idleTimeout     time.Duration
+	drainTimeout    time.Duration
+	healthTimeout   time.Duration      // configurable per HEALTH_TIMEOUT_SECONDS env (default 600s — vLLM/SGLang cold-start with NVFP4 weights + CUDA graph compilation can exceed 5 min on consumer GPUs)
+	modelSizes      map[string]float64 // model name → weight size in GB
+	modelContexts   map[string]int     // model name → declared max context (from models.yaml)
+	modelCapability map[string]string  // model name → reasoning.capability
+	modelDisableOK  map[string]bool    // model name → disable_verified (only when present)
+	// Parser names are backend-specific: a model that runs on both vLLM and
+	// SGLang (e.g. openai/gpt-oss-20b) typically uses different parser
+	// names on each engine (vLLM: openai_gptoss/openai; SGLang: gpt-oss/
+	// gpt-oss). Keying by (backend, modelName) prevents the second-loaded
+	// backend from overwriting the first's flags and producing a startup
+	// `KeyError: invalid tool call parser` on the wrong engine.
+	modelToolParser      map[string]map[string]string // backend → model name → --tool-call-parser
+	modelReasoningParser map[string]map[string]string // backend → model name → --reasoning-parser
+	// modelProbedMaxCtx is the highest probe-verified context length per
+	// (backend, model) at the host VRAM band. fittableContext's heuristic
+	// is conservative for MoE/GQA models — when we have a fits=true cell
+	// at hostKey, we trust it over the heuristic at launch time.
+	modelProbedMaxCtx map[string]map[string]int // backend → model name → highest fits=true ctx
+	defaultPolicy     string                    // DEVAI_REASONING env value: auto|off|low|medium|high
+	totalVRAMGB       float64
+	maxContextLen     int // global default from MAX_CONTEXT_LEN env (default 262144)
 }
 
 // --- Proxy factories ---
@@ -599,6 +631,31 @@ func fittableContext(availableKVGB, modelSizeGB float64) int {
 	return tokens
 }
 
+// applyProbeCeiling reconciles fittableContext's heuristic against the
+// probe-verified ceiling at the host VRAM band.
+//
+// fittableContext is conservative — it assumes a fixed KV-bytes-per-token
+// from a coarse model-size lookup table, which underestimates the
+// achievable context for MoE/GQA models (e.g. gpt-oss-20b: heuristic
+// 36K vs probe-verified 256K at 22.30 GB on a 24 GB host).
+//
+// When `probedMax > 0` we have an authoritative measurement from the
+// probe runner: the engine actually loaded and served at that context
+// at the host's VRAM band. The router uses min(requestedCtx, probedMax)
+// in that case and ignores `heuristicCtx` entirely. When `probedMax == 0`
+// (no probe data — legacy YAML rows or pre-probe entries) the heuristic
+// stays as the only source of truth.
+func applyProbeCeiling(heuristicCtx, requestedCtx, probedMax int) int {
+	if probedMax <= 0 {
+		return heuristicCtx
+	}
+	ctx := requestedCtx
+	if ctx > probedMax {
+		ctx = probedMax
+	}
+	return ctx
+}
+
 // computeLaunchConfig builds a launchConfig for the given model and backend.
 // desiredContext is the target context length (from models.yaml or
 // MAX_CONTEXT_LEN env); the actual value is reduced when KV cache memory
@@ -615,7 +672,7 @@ func computeLaunchConfig(modelSizeGB, totalVRAMGB float64, backend string, desir
 	fits := fittableContext(availKV, modelSizeGB)
 	ctx := desiredContext
 	if ctx <= 0 {
-		ctx = 131072
+		ctx = 262144
 	}
 	if fits < ctx {
 		ctx = fits
@@ -702,7 +759,7 @@ func main() {
 	var cfg configFile
 	cachePath := env("PROBE_CACHE", "/etc/devai/.ollama-reasoning-cache.json")
 	hostVRAMGB := envInt("GPU_MEMORY_GB", 24)
-	operatorMaxCtx := envInt("MAX_CONTEXT_LEN", 131072)
+	operatorMaxCtx := envInt("MAX_CONTEXT_LEN", 262144)
 	if data, err := os.ReadFile(cachePath); err == nil {
 		var cache map[string]*cacheEntry
 		if jerr := json.Unmarshal(data, &cache); jerr == nil {
@@ -777,8 +834,9 @@ func main() {
 	modelContexts := make(map[string]int)
 	modelCapability := make(map[string]string)
 	modelDisableOK := make(map[string]bool)
-	modelToolParser := make(map[string]string)      // backend startup flag, populated from probe cache
-	modelReasoningParser := make(map[string]string) // backend startup flag, populated from probe cache
+	modelToolParser := make(map[string]map[string]string)      // backend → model → --tool-call-parser
+	modelReasoningParser := make(map[string]map[string]string) // backend → model → --reasoning-parser
+	modelProbedMaxCtx := make(map[string]map[string]int)       // backend → model → highest fits=true ctx
 	capCounts := make(map[string]int)
 	for _, m := range cfg.Models {
 		names := append([]string{m.Name}, m.Aliases...)
@@ -804,11 +862,28 @@ func main() {
 			if disableOK {
 				modelDisableOK[name] = true
 			}
-			if m.ToolParser != "" {
-				modelToolParser[name] = m.ToolParser
-			}
-			if m.ReasoningParser != "" {
-				modelReasoningParser[name] = m.ReasoningParser
+			// Parser maps and the probe-verified ctx ceiling are keyed by
+			// backend so the same model name can carry different values on
+			// vLLM vs SGLang without one backend overwriting the other.
+			for _, backend := range m.Backend {
+				if m.ToolParser != "" {
+					if modelToolParser[backend] == nil {
+						modelToolParser[backend] = make(map[string]string)
+					}
+					modelToolParser[backend][name] = m.ToolParser
+				}
+				if m.ReasoningParser != "" {
+					if modelReasoningParser[backend] == nil {
+						modelReasoningParser[backend] = make(map[string]string)
+					}
+					modelReasoningParser[backend][name] = m.ReasoningParser
+				}
+				if m.ProbedMaxCtx > 0 {
+					if modelProbedMaxCtx[backend] == nil {
+						modelProbedMaxCtx[backend] = make(map[string]int)
+					}
+					modelProbedMaxCtx[backend][name] = m.ProbedMaxCtx
+				}
 			}
 		}
 		// Count capability once per canonical row, not once per alias —
@@ -822,7 +897,7 @@ func main() {
 	}
 	log.Printf("reasoning policy: %s; capability counts: %v", policy, capCounts)
 	totalVRAMGB := envFloat("GPU_MEMORY_GB", 24.0)
-	maxCtx := envInt("MAX_CONTEXT_LEN", 131072)
+	maxCtx := envInt("MAX_CONTEXT_LEN", 262144)
 
 	a := &arbiter{
 		backends:             make(map[string]*backendState),
@@ -837,6 +912,7 @@ func main() {
 		modelDisableOK:       modelDisableOK,
 		modelToolParser:      modelToolParser,
 		modelReasoningParser: modelReasoningParser,
+		modelProbedMaxCtx:    modelProbedMaxCtx,
 		defaultPolicy:        policy,
 		totalVRAMGB:          totalVRAMGB,
 		maxContextLen:        maxCtx,
@@ -850,9 +926,10 @@ func main() {
 			proxy = newSmartProxy(bc.BackendURL)
 		}
 		a.backends[bc.Name] = &backendState{
-			config:     bc,
-			proxy:      proxy,
-			modelNames: modelsForBackend(cfg.Models, bc.Name),
+			config:       bc,
+			proxy:        proxy,
+			modelNames:   modelsForBackend(cfg.Models, bc.Name),
+			recreateCond: sync.NewCond(&a.mu),
 		}
 	}
 
@@ -981,10 +1058,14 @@ func (a *arbiter) containerRecreate(bs *backendState, modelName string, desiredC
 		}
 	}
 	lc := computeLaunchConfig(modelSizeGB, a.totalVRAMGB, cfg.Name, requestedCtx)
-	if parser := a.modelToolParser[modelName]; parser != "" {
+	lc.MaxContext = applyProbeCeiling(
+		lc.MaxContext, requestedCtx,
+		a.modelProbedMaxCtx[cfg.Name][modelName],
+	)
+	if parser := a.modelToolParser[cfg.Name][modelName]; parser != "" {
 		lc.ToolParser = parser
 	}
-	if parser := a.modelReasoningParser[modelName]; parser != "" {
+	if parser := a.modelReasoningParser[cfg.Name][modelName]; parser != "" {
 		lc.ReasoningParser = parser
 	}
 	log.Printf("  %s launch: model=%.1f GB, gpu=%.1f GB → fraction=%.2f, context=%dk, reasoning=%q tool=%q",
@@ -1140,6 +1221,17 @@ func (a *arbiter) ensureBackendRunning(bs *backendState, modelName string, desir
 		return nil
 	}
 
+	// Recreate coalescing. If a recreate is already in flight on this
+	// backend we MUST NOT fire our own — the second `podman rm` would
+	// kill the half-built container from the first. Wait on the cond
+	// until the in-flight recreate finishes (success or failure), then
+	// re-evaluate from the top: maybe it produced exactly what we want
+	// (same modelName + ctx) and we can return clean, or maybe it
+	// targeted a different model and we now need to fire our own.
+	for bs.recreating {
+		bs.recreateCond.Wait()
+	}
+
 	// Verify the backend is actually serving. Two reasons a previously-
 	// recreated workload may no longer be reachable:
 	//   1. The container was stopped externally (operator, crash, etc.).
@@ -1181,11 +1273,30 @@ func (a *arbiter) ensureBackendRunning(bs *backendState, modelName string, desir
 			bs.config.Name, modelName, bs.currentContext, desiredCtx)
 	}
 	log.Printf("starting %s with model %s (ctx=%d)...", bs.config.Name, modelName, desiredCtx)
+
+	// Mark the recreate in flight BEFORE releasing the lock. Concurrent
+	// callers landing in the wait loop above will block on recreateCond
+	// instead of duplicating the work. `defer` ensures the flag and
+	// broadcast happen on every exit path (recreate failure, health
+	// timeout, panic) — without that, a failure would leave waiters
+	// stuck forever.
+	bs.recreating = true
+	bs.pendingModel = modelName
+	bs.pendingContext = desiredCtx
+	defer func() {
+		bs.recreating = false
+		bs.pendingModel = ""
+		bs.pendingContext = 0
+		bs.recreateCond.Broadcast()
+	}()
+
 	if err := a.containerRecreate(bs, modelName, desiredCtx); err != nil {
 		return fmt.Errorf("failed to start %s: %w", bs.config.Name, err)
 	}
 
-	// Release lock during health wait
+	// Release lock during health wait so concurrent /v1/* requests can
+	// queue / waiters can park on the cond. The recreating flag prevents
+	// them from kicking off duplicate recreates.
 	a.mu.Unlock()
 	err := a.waitForHealthy(bs, a.healthTimeout)
 	a.mu.Lock()
@@ -1347,7 +1458,7 @@ func (a *arbiter) maybeStripTools(backendName, modelName string, body []byte) []
 	if backendName != "vllm" && backendName != "sglang" {
 		return body
 	}
-	if a.modelToolParser[modelName] != "" {
+	if a.modelToolParser[backendName][modelName] != "" {
 		return body
 	}
 	var doc map[string]any
