@@ -195,26 +195,25 @@ families:
     arch_ref: NVFP4/Qwen3-Coder-30B-A3B-Instruct-FP4
     thinking: false
 
-  - name: qwen3-thinking
-    # Reasoning refresh of Qwen3-30B-A3B published as the `2507`
-    # series. Thinking-only mode (always emits <think></think>),
-    # 256K native context. Same MoE shape as base Qwen3-30B-A3B
-    # (30.5B / 3.3B active). Reasoning parser names diverge across
-    # backends: vLLM uses `deepseek_r1` (underscore), SGLang uses
-    # `deepseek-r1` (hyphen) — keep both verbatim. Tool calls emit
-    # standard Hermes-style <tool_call> tags inherited from the
-    # Qwen3 chat template.
-    hf_repos:
-      - NVFP4/Qwen3-30B-A3B-Thinking-2507-FP4
-    parsers:
-      vllm:
-        reasoning: deepseek_r1
-        tool: hermes
-      sglang:
-        reasoning: deepseek-r1
-        tool: qwen
-    arch_ref: NVFP4/Qwen3-30B-A3B-Thinking-2507-FP4
-    thinking: true
+  # NOTE: NVFP4/Qwen3-30B-A3B-Thinking-2507-FP4 was added 2026-05-02
+  # and removed the same day. The checkpoint OOMs at vLLM model-load
+  # time on 24G consumer GPUs — verified on RTX 4000 Pro Blackwell
+  # with the full mitigation matrix (--enforce-eager,
+  # --kv-cache-dtype fp8, --max-num-seqs 4, --gpu-memory-utilization
+  # 0.95). PyTorch reaches 22.74 GiB allocated and fails on a 768 MiB
+  # final tensor before reaching the memory-profiling stage where any
+  # of those flags would have effect, so no engine_flags knob can
+  # rescue it. Root cause: this checkpoint's config.json carries
+  # intermediate_size=6144 vs Coder/base Qwen3-30B-A3B's 5472, which
+  # inflates vLLM's load-time scratch buffers by ~700 MiB beyond the
+  # 24G ceiling. Re-add when:
+  #   * vLLM loader stops sizing scratch buffers to intermediate_size
+  #     for MoE-only models (issue worth filing upstream), OR
+  #   * NVIDIA / RedHatAI publishes a Thinking-2507 NVFP4 quant with
+  #     a slimmer load-time profile (e.g. the Coder/Instruct line),
+  #     OR
+  #   * SGLang fixes its NVFP4 path (bug noted at the top of this
+  #     file) so we can fall back to SGLang's loader.
 
   - name: llama3.2
     # Ollama-only — NVIDIA hasn't published an NVFP4 quant for the
@@ -271,12 +270,28 @@ families:
     hf_repos:
       # NOTE: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4 was previously
       # listed here. Removed 2026-05-01 — the 30B-A3B NVFP4 weights
-      # (~19 GB) plus vLLM startup overhead + 32K KV cache + CUDA graph
-      # capture exceed 24 GB and OOM on consumer hardware. Re-add when
-      # we have a knob (e.g. --enforce-eager via family `engine_flags`)
-      # to free the ~2 GB CUDA graph budget. The Omni variant below is
-      # the same MoE compute envelope but routed via a different repo
-      # (and OOMd similarly in the last probe — re-evaluate together).
+      # (~19 GB) plus vLLM startup overhead + 32K KV cache exceed 24 GB
+      # and OOM on consumer hardware. The original removal note proposed
+      # `--enforce-eager` (via a family `engine_flags`) as a likely fix.
+      # That hypothesis was tested directly 2026-05-02 and FALSIFIED: the
+      # OOM trips at gpu_model_runner.py:4818 during model load — before
+      # CUDA graph capture happens — so `--enforce-eager` cannot apply.
+      # PyTorch reaches 23.37 GiB on a 23.42 GiB-usable card and fails
+      # on a 316 MiB allocation, with 4.25 GiB reserved-but-unallocated
+      # (heavy fragmentation). The directly-tested flag combination on
+      # this checkpoint was --enforce-eager + --gpu-memory-utilization
+      # 0.90; the same load-time line (4818) failure was also observed
+      # for the structurally-similar Qwen3-Thinking-2507-FP4 against
+      # the full mitigation matrix (--enforce-eager + --kv-cache-dtype
+      # fp8 + --max-num-seqs 4 + --gpu-memory-utilization 0.95), which
+      # confirms that no post-load flag rescues a load-time OOM.
+      # Re-add only when (a) a slimmer NVFP4 quant ships (RedHatAI /
+      # community), or (b) vLLM upstream reduces NemotronH load-time
+      # scratch buffers, or (c) the SGLang NVFP4 path (broken upstream,
+      # see file header) becomes usable as an alternative loader.
+      # The Omni variant below is the same MoE compute envelope but
+      # routed via a different repo (and OOMd similarly in the last
+      # probe — re-evaluate together).
       #
       # Multimodal reasoning variant of the same MoE — omni I/O.
       - nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4
