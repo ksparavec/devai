@@ -501,8 +501,18 @@ agentic use" badge.
 7. **Add inspect_ai's vLLM `/metrics` snapshot** -- captures
    `vllm:gpu_cache_usage_perc` and `vllm:num_preemptions_total` per
    run. Real-time KV pressure indicators.
-8. **Run `bench-sglang`** -- only one fitting model (`gpt-oss-20b`),
-   single-row delta to the leaderboard. Quick.
+8. **Run `bench-sglang`** -- **on-hold.** Two models actually fit on
+   the SGLang side per the current probe cache (`gpt-oss-20b` and
+   `DeepSeek-R1-Distill-Qwen-7B`); a first attempt revealed that the
+   bench cache schema collided HF rows from different backends under
+   the same `<repo>@<sha>` key, so a no-op SGLang run silently
+   overwrote the vLLM rows' `backend` field and zeroed their
+   `peak_vram_gb`. The harness was hardened (cache key now suffixed
+   with `::<backend>`, idempotent migration on load) but the
+   re-bench itself is paused per project decision. Reactivate by
+   simply running `make bench-sglang` once SGLang is back in scope;
+   the harness will create new `::sglang` rows alongside the
+   existing `::vllm` ones.
 9. **Run `bench-ollama`** -- 28 models, ~4 hours wall time. Parallel
    to vLLM since Ollama models are smaller and the bench framework
    is the same.

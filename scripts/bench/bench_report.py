@@ -17,7 +17,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from _probe_core import load_cache  # noqa: E402
-from bench._bench_core import DEFAULT_CACHE_PATH  # noqa: E402
+from bench._bench_core import DEFAULT_CACHE_PATH, migrate_bench_cache_keys  # noqa: E402
 
 # Host VRAM cap. Defaults to 24 GB to match the project's reference card
 # (RTX 4000 PRO Blackwell). Override with GPU_MEMORY_GB at run-time when
@@ -140,6 +140,9 @@ def main() -> None:
     )
     args = ap.parse_args()
     cache = load_cache(args.cache)
+    # In-memory only -- bench_report is read-only against the on-disk cache.
+    # The runner is the writer; it persists the migrated form on next save.
+    migrate_bench_cache_keys(cache)
     if not cache:
         print(
             f"# Bench leaderboard\n\n"

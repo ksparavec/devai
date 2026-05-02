@@ -41,6 +41,7 @@ from bench import bench_latency_leak  # noqa: E402
 from bench._bench_core import (  # noqa: E402
     DEFAULT_CACHE_PATH,
     cache_key_for_entry,
+    migrate_bench_cache_keys,
     router_url_for,
     serving_alias,
     serving_alias_with_ctx,
@@ -497,6 +498,13 @@ def main() -> None:
     )
 
     cache = load_cache(args.cache)
+    n_migrated = migrate_bench_cache_keys(cache)
+    if n_migrated:
+        print(
+            f"bench: migrated {n_migrated} pre-2026-05-02 cache keys to "
+            f"<repo>@<sha>::<backend> form",
+            file=sys.stderr,
+        )
     for tgt in targets:
         run_for_target(
             tgt,

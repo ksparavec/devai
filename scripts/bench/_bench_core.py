@@ -289,22 +289,70 @@ def router_url_for(backend: str) -> str:
 # ── Catalog helpers ─────────────────────────────────────────────────────────
 
 def cache_key_for_entry(entry: dict, backend: str) -> str | None:
-    """Resolve the top-level key used by the probe caches.
+    """Resolve the top-level key for the **bench** cache.
 
-    Ollama caches are keyed by ``digest``. HF caches (vLLM/SGLang) are
-    keyed by ``<repo>@<sha>``. Returns None when neither field is
-    present (malformed entry).
+    The same model can be served by more than one backend (the only
+    overlap on this hardware is ``gpt-oss-20b`` and
+    ``DeepSeek-R1-Distill-Qwen-7B``, which both fit on vLLM and
+    SGLang). Bench scores, cold-start times, peak VRAM and TPS all
+    depend on the backend, so each (model, backend) pair gets its
+    own row. The key shape is:
+
+    - HF backends: ``<repo>@<sha>::<backend>`` (e.g.
+      ``openai/gpt-oss-20b@6cee5e81ee83::vllm``).
+    - Ollama: ``<digest>::ollama``.
+
+    Returns None when the underlying probe cache entry is malformed
+    (no digest for Ollama, no repo+sha for HF).
+
+    Note: the **probe** caches are still keyed by the bare identifier
+    (digest, or ``<repo>@<sha>``); only the bench cache uses the
+    composite form. ``run_for_target`` joins by reading the probe-
+    cache entry first, then minting the bench-cache key from it.
     """
+    base: str | None = None
     if backend == "ollama":
         digest = entry.get("digest")
         if isinstance(digest, str) and digest:
-            return digest
+            base = digest
+    else:
+        repo = entry.get("repo")
+        sha = entry.get("sha")
+        if isinstance(repo, str) and isinstance(sha, str) and repo and sha:
+            base = f"{repo}@{sha}"
+    if base is None:
         return None
-    repo = entry.get("repo")
-    sha = entry.get("sha")
-    if isinstance(repo, str) and isinstance(sha, str) and repo and sha:
-        return f"{repo}@{sha}"
-    return None
+    return f"{base}::{backend}"
+
+
+def migrate_bench_cache_keys(cache: dict) -> int:
+    """Idempotent migration from pre-2026-05-02 cache keys (no
+    ``::<backend>`` suffix) to the composite form. Walks the cache
+    once and renames in place. Returns the number of keys renamed.
+
+    Old rows always carry a ``backend`` field, so we use that to
+    decide the suffix. Calling this on an already-migrated cache is
+    a no-op.
+    """
+    renames: list[tuple[str, str]] = []
+    for k in list(cache.keys()):
+        v = cache.get(k)
+        if not isinstance(v, dict):
+            continue
+        if "::" in k:
+            continue
+        backend = v.get("backend")
+        if not isinstance(backend, str) or not backend:
+            continue
+        renames.append((k, f"{k}::{backend}"))
+    for old, new in renames:
+        if new in cache:
+            # Defensive: if a composite-key row already exists, leave
+            # the old one alone rather than overwriting. Caller should
+            # investigate manually.
+            continue
+        cache[new] = cache.pop(old)
+    return len(renames)
 
 
 def serving_alias(entry: dict) -> str | None:
