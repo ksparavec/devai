@@ -114,6 +114,11 @@ services:
       # an actionable error rather than silently launching wrong.
       - VLLM_PLUGINS_REGISTRY=/etc/devai/vllm-plugins.json
       - VLLM_PLUGINS_HOST_DIR=${VLLM_PLUGINS_HOST_DIR:-}
+      # Per-model recovery flags + env (deploy/recovery-flags.json).
+      # Same JSON read by the vLLM/SGLang probers so probe and serve-time
+      # launches stay in sync. Missing file → no per-model overrides;
+      # behaviour identical to pre-registry builds.
+      - RECOVERY_FLAGS_REGISTRY=/etc/devai/recovery-flags.json
     volumes:
       - ${XDG_RUNTIME_DIR:-/run/user/1000}/podman/podman.sock:/run/podman/podman.sock
       # Probe caches (schema v3 for Ollama digest-keyed; schema v1 for
@@ -129,6 +134,9 @@ services:
       # the router only needs the host path string (passed via env) to
       # forward to libpod when recreating the vLLM container.
       - ./vllm-plugins.json:/etc/devai/vllm-plugins.json:ro
+      # Per-model recovery flags + env. See header comment in the JSON
+      # file for schema; loaded by gpu-arbiter/recovery_flags.go.
+      - ./recovery-flags.json:/etc/devai/recovery-flags.json:ro
     depends_on:
       - ollama
     restart: unless-stopped

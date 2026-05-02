@@ -113,6 +113,51 @@ MEM_BUDGET_SLACK = 1.05
 MUTEX_CONTAINERS = ("devai-router", "devai-vllm", "devai-sglang")
 
 
+# ── Recovery flags registry ──────────────────────────────────────────────────
+# Per-model launch flags + env overrides shared with the router. Same file
+# the router reads via gpu-arbiter/recovery_flags.go. Loaded once at module
+# import; lookup is a single dict access per probe.
+RECOVERY_FLAGS_PATH = Path(
+    os.environ.get("RECOVERY_FLAGS_REGISTRY", str(REPO_ROOT / "deploy" / "recovery-flags.json"))
+)
+
+
+def _load_recovery_registry(path: Path) -> dict[str, dict]:
+    """Read deploy/recovery-flags.json and return {model_name: entry}.
+
+    Missing file or parse error → empty dict (every model launches without
+    extra flags, matching pre-registry behaviour).
+    """
+    try:
+        data = json.loads(path.read_text())
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"[warn] recovery registry {path}: {exc}", file=sys.stderr)
+        return {}
+    models = data.get("models")
+    if not isinstance(models, dict):
+        return {}
+    return {name: entry for name, entry in models.items() if isinstance(entry, dict)}
+
+
+_RECOVERY_REGISTRY: dict[str, dict] = _load_recovery_registry(RECOVERY_FLAGS_PATH)
+
+
+def recovery_overrides(model_name: str) -> tuple[list[str], dict[str, str]]:
+    """Return (extra_flags, extra_env) for model_name. Empty when no entry."""
+    entry = _RECOVERY_REGISTRY.get(model_name)
+    if not entry:
+        return [], {}
+    flags = entry.get("engine_flags") or []
+    env = entry.get("engine_env") or {}
+    if not isinstance(flags, list):
+        flags = []
+    if not isinstance(env, dict):
+        env = {}
+    return list(flags), dict(env)
+
+
 # ── Backend spec ─────────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -747,6 +792,15 @@ def probe_one_cell(
     )
 
     env_vars = {"VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1"}
+    # Per-model recovery overrides (deploy/recovery-flags.json) — shared
+    # with the router so probe and serve-time launches see the same flags.
+    # Env entries override env_vars defaults on key collision; flags are
+    # appended after parser flags (mirrors gpu-arbiter/main.go).
+    extra_flags, extra_env = recovery_overrides(model_name)
+    if extra_flags:
+        cmd_args = list(cmd_args) + extra_flags
+    if extra_env:
+        env_vars = {**env_vars, **extra_env}
     extra_volumes: list[tuple[str, str, str]] = []
     if plugin_volume is not None:
         extra_volumes.append(plugin_volume)

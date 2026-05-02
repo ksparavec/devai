@@ -155,31 +155,13 @@ type launchConfig struct {
 	ReasoningParserPlugin string
 }
 
-// modelRecoveryConfig declares per-model recovery flags and environment
-// variables required to load specific checkpoints on the project's
-// reference 24G Blackwell card. Hand-maintained — kept here rather than
-// in the catalog because these are recovery policies (not probe-verified
-// data), they apply identically whether or not a cell was probed, and the
-// probe cache schema doesn't carry a flag-list field. Adding an entry =
-// rebuild the router image (`make build-router`).
-//
-// Add an entry when a model OOMs at vLLM model-load time
-// (gpu_model_runner.py:4818) on the reference 24G card and the listed
-// flags + env rescue it. Verify by direct `podman run` launch first;
-// see the conversation that introduced this map for the worked example
-// on Nemotron-3-Nano. Both fields are optional.
-//
-// The lookup key is the canonical model name (the basename used in
-// /var/cache/devai/ollama/models/vllm/<name>/), not the HF repo path.
-var modelRecoveryConfig = map[string]struct {
-	Flags []string
-	Env   map[string]string
-}{
-	"NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4": {
-		Flags: []string{"--enforce-eager"},
-		Env:   map[string]string{"PYTORCH_ALLOC_CONF": "expandable_segments:True"},
-	},
-}
+// recoveryFlags is the package-level handle to deploy/recovery-flags.json.
+// Initialised in main() before the entrypoint helpers fire and shared with
+// the probe driver via the same JSON file (scripts/_probe_hf_common.py
+// reads its own copy). See gpu-arbiter/recovery_flags.go for the loader,
+// and the registry comment block in deploy/recovery-flags.json for the
+// schema and update procedure.
+var recoveryFlags *recoveryRegistry
 
 type configFile struct {
 	Defaults map[string]string `yaml:"defaults"`
@@ -778,8 +760,8 @@ func vllmEntrypoint(modelName string, lc launchConfig) []string {
 		args = append(args, "--enable-auto-tool-choice", "--tool-call-parser", lc.ToolParser)
 	}
 	// Per-model recovery flags (e.g. --enforce-eager for checkpoints that
-	// OOM at vLLM model-load time on 24G). See modelRecoveryConfig.
-	if rec, ok := modelRecoveryConfig[modelName]; ok {
+	// OOM at vLLM model-load time on 24G). See deploy/recovery-flags.json.
+	if rec, ok := recoveryFlags.Lookup(modelName); ok {
 		args = append(args, rec.Flags...)
 	}
 	return args
@@ -809,7 +791,7 @@ func sglangEntrypoint(modelName string, lc launchConfig) []string {
 	// Per-model recovery flags (mirrors vllmEntrypoint). SGLang's NVFP4
 	// loader path is currently broken upstream so this branch rarely
 	// fires today, but the symmetry keeps the behaviour predictable.
-	if rec, ok := modelRecoveryConfig[modelName]; ok {
+	if rec, ok := recoveryFlags.Lookup(modelName); ok {
 		args = append(args, rec.Flags...)
 	}
 	return args
@@ -992,6 +974,9 @@ func main() {
 	pluginRegistry := loadVLLMPluginRegistry(
 		env("VLLM_PLUGINS_REGISTRY", "/etc/devai/vllm-plugins.json"),
 		env("VLLM_PLUGINS_HOST_DIR", ""),
+	)
+	recoveryFlags = loadRecoveryRegistry(
+		env("RECOVERY_FLAGS_REGISTRY", "/etc/devai/recovery-flags.json"),
 	)
 
 	a := &arbiter{
@@ -1265,7 +1250,7 @@ func (a *arbiter) containerRecreate(bs *backendState, modelName string, desiredC
 	for k, v := range cfg.EnvVars {
 		envMap[k] = v
 	}
-	if rec, ok := modelRecoveryConfig[modelName]; ok {
+	if rec, ok := recoveryFlags.Lookup(modelName); ok {
 		for k, v := range rec.Env {
 			envMap[k] = v
 		}

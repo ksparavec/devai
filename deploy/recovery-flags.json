@@ -1,0 +1,30 @@
+{
+  "_comment": [
+    "Per-model recovery flags and environment variables required to load",
+    "specific NVFP4/MXFP4 checkpoints on the project's reference 24G",
+    "Blackwell card. Single source of truth — read by both",
+    "  gpu-arbiter/main.go (router; via gpu-arbiter/recovery_flags.go)",
+    "  scripts/_probe_hf_common.py (vLLM/SGLang probers)",
+    "Schema:",
+    "  models.<name>.engine_flags  list of vLLM/SGLang CLI flags appended",
+    "                              after the parser flags during launch.",
+    "  models.<name>.engine_env    map of env vars merged into the",
+    "                              container env (overrides per-backend",
+    "                              defaults on key collision).",
+    "",
+    "Lookup key is the canonical model name (basename of the directory",
+    "under /var/cache/devai/ollama/models/vllm/ — NOT the HF repo path).",
+    "",
+    "Add an entry when a checkpoint OOMs at vLLM model-load time on the",
+    "reference 24G card and the listed flags + env rescue it. Verify by",
+    "direct podman launch first."
+  ],
+  "models": {
+    "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4": {
+      "engine_flags": ["--enforce-eager"],
+      "engine_env": {
+        "PYTORCH_ALLOC_CONF": "expandable_segments:True"
+      }
+    }
+  }
+}
