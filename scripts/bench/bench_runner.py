@@ -132,8 +132,16 @@ def _invoke_inspect_task(
     router_url: str,
     log_dir: Path,
     timeout_s: float,
+    fail_on_error: bool | None = None,
 ):
-    """Run an inspect_ai Task against the router. Returns the EvalLog."""
+    """Run an inspect_ai Task against the router. Returns the EvalLog.
+
+    ``fail_on_error=False`` lets a single failing sample (e.g. a router
+    400 against a forced-mode model on a multi-tool request) be recorded
+    as a failed sample rather than aborting the whole task. Default
+    None preserves inspect_ai's stricter built-in behaviour for tasks
+    where any error indicates a real bug.
+    """
     from inspect_ai import eval as inspect_eval
 
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -141,8 +149,7 @@ def _invoke_inspect_task(
     # via /v1. Auth doesn't matter — router is internal — but the SDK
     # complains if API key is empty, so set a placeholder.
     os.environ.setdefault("OPENAI_API_KEY", "devai-router-no-auth")
-    logs = inspect_eval(
-        task_obj,
+    eval_kwargs = dict(
         model=f"openai/{served_model}",
         model_base_url=router_url + "/v1",
         log_dir=str(log_dir),
@@ -155,6 +162,9 @@ def _invoke_inspect_task(
         # sample-level timeout fires AFTER the model is loaded.
         time_limit=int(timeout_s),
     )
+    if fail_on_error is not None:
+        eval_kwargs["fail_on_error"] = fail_on_error
+    logs = inspect_eval(task_obj, **eval_kwargs)
     return logs[0] if isinstance(logs, list) else logs
 
 
@@ -321,6 +331,12 @@ def run_for_target(
                     router_url=router_url,
                     log_dir=log_dir,
                     timeout_s=600.0,
+                    # Forced-mode models historically tripped the router's
+                    # tool_choice_pinning_required check on individual
+                    # samples; per-sample pinning fixes the request shape,
+                    # but keep fail_on_error=False as belt-and-suspenders
+                    # so a single anomalous sample doesn't void the run.
+                    fail_on_error=False,
                 )
                 score, n = _aggregate_score(eval_log)
                 by_sub = _by_subcase_breakdown(eval_log)

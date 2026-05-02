@@ -31,8 +31,14 @@ from pathlib import Path
 from inspect_ai import Task, task
 from inspect_ai.dataset import Sample, MemoryDataset
 from inspect_ai.scorer import Score, Target, accuracy, scorer, stderr
-from inspect_ai.solver import TaskState, generate, system_message, use_tools
-from inspect_ai.tool import tool
+from inspect_ai.solver import (
+    Generate,
+    TaskState,
+    solver,
+    system_message,
+    use_tools,
+)
+from inspect_ai.tool import ToolFunction, tool
 
 PROMPTS_PATH = Path(__file__).resolve().parent.parent / "data" / "tools_prompts.jsonl"
 
@@ -268,16 +274,90 @@ def tools_use_scorer():
     return score
 
 
+@solver
+def tool_loop_with_pin():
+    """Custom tool-call loop that pins ``tool_choice`` per-sample.
+
+    Replaces inspect_ai's default ``generate()`` solver chain for this
+    task. Why we can't just set ``state.tool_choice`` and reuse
+    ``generate()``:
+
+    - The router's ``tool_choice_pinning_required`` rule (see
+      ``gpu-arbiter/main.go::maybePromoteToolChoice``) returns HTTP 400
+      when a vLLM/SGLang ``tool_mode="forced"`` model (R1-Distill x2,
+      Llama-3.1-8B-Instruct-NVFP4) sees ``tool_choice="auto"`` against
+      multiple tools.
+    - inspect_ai's built-in tool loop (``inspect_ai/_eval/task/generate.py``)
+      reads ``state.tool_choice`` once, but **resets it to ``"auto"``
+      after a forced ``ToolFunction`` call** so the model can produce a
+      final answer. That second turn then trips the router.
+
+    The loop here:
+
+    1. Turn 1 sends ``tool_choice = ToolFunction(name=expect_tool)``.
+       Router accepts (a function-spec map is not ``"auto"``).
+    2. Tools execute via ``execute_tools``.
+    3. For ``result_followup`` only, a second model turn runs with
+       ``tool_choice="none"`` so the model produces the final text. The
+       router accepts ``"none"`` (it's a string that's neither empty
+       nor ``"auto"``). Other subcases stop after turn 1; the scorer
+       grades them on the tool call alone.
+
+    Tradeoff: ``multi_tool_pick`` no longer tests the model's tool-
+    routing decision (we hand it the answer). It now tests args
+    correctness given the right tool — narrower, but the only path that
+    works for forced-mode models on multi-tool prompts.
+    """
+
+    async def solve(state: TaskState, generate: Generate) -> TaskState:
+        from inspect_ai.model import get_model
+        from inspect_ai.model._call_tools import execute_tools
+
+        meta = state.metadata or {}
+        expect_tool = str(meta.get("expect_tool") or "")
+        subcase = str(meta.get("subcase") or "")
+
+        model = get_model()
+        first_choice = ToolFunction(name=expect_tool) if expect_tool else "auto"
+
+        state.output = await model.generate(
+            input=state.messages,
+            tools=state.tools,
+            tool_choice=first_choice,
+        )
+        state.messages.append(state.output.message)
+
+        if state.output.message.tool_calls:
+            tool_result = await execute_tools(state.messages, state.tools)
+            state.messages.extend(tool_result.messages)
+            if tool_result.output is not None:
+                state.output = tool_result.output
+
+            if subcase == "result_followup":
+                state.output = await model.generate(
+                    input=state.messages,
+                    tools=state.tools,
+                    tool_choice="none",
+                )
+                state.messages.append(state.output.message)
+
+        return state
+
+    return solve
+
+
 def _build_solver(samples: list[Sample]):
-    """Build a solver chain that exposes the right tool subset to each
-    sample. inspect_ai's ``use_tools`` solver applies to all samples
-    in a Task; to vary tools per subcase we union all tools and let
-    the model pick — that's the behaviour we want anyway, since
-    multi-subcase parity stops the model from getting trivial hints
-    about which subcase it's in.
+    """Build a solver chain that exposes the union of all tools to every
+    sample, then drives a per-sample tool-call loop via
+    ``tool_loop_with_pin``. See that solver for why we don't use
+    inspect_ai's stock ``generate()``.
     """
     all_tools = [task_list(), get_weather(), get_time()]
-    return [system_message(SYSTEM_PROMPT), use_tools(all_tools), generate()]
+    return [
+        system_message(SYSTEM_PROMPT),
+        use_tools(all_tools),
+        tool_loop_with_pin(),
+    ]
 
 
 @task

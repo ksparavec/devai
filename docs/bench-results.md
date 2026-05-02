@@ -45,23 +45,16 @@ The bench produces evidence-grade routing recommendations. On this
 | **Qwen3-14B-NVFP4@65536** | 0.97 | 0.92 | **1.00** | 1.0/1.0/1.0/1.0 | 0.000 | 49.8 | 45.8/48.0 | 62.0 | 22.32 GB | **0.96** |
 | **gpt-oss-20b@262144** | 0.97 | **0.98** | 0.90 | 0.8/1.0/0.8/1.0 | 0.000 | 56.0 | 51.0/54.0 | **136.4** | 22.36 GB | **0.95** |
 | **Qwen3.5-9B-NVFP4@131072** | 0.95 | 0.74 | 0.80 | 0.4/1.0/0.8/1.0 | 0.000 | 162.3 | 32.6/34.1 | 55.7 | 21.66 GB | 0.83 |
-| **Llama-3.1-8B-Instruct-NVFP4@131072** | 0.84 | 0.72 | 0.00^+^+ | -- | 0.000 | 41.6 | 22.9/24.9 | **95.9** | 22.65 GB | 0.52 |
-| **DeepSeek-R1-Distill-Qwen-7B@65536** | 0.88 | 0.26 | 0.00^+^+ | -- | 0.000 | 86.9 | 36.4/40.1 | 45.2 | 21.89 GB | 0.38 |
+| **Llama-3.1-8B-Instruct-NVFP4@131072** | 0.84 | 0.72 | 0.75 | 1.0/0.6/1.0/0.4 | 0.000 | 41.6 | 22.9/24.9 | **95.9** | 22.65 GB | 0.77 |
+| **DeepSeek-R1-Distill-Qwen-7B@65536** | 0.88 | 0.26 | 0.65 | 1.0/0.8/0.4/0.4 | 0.000 | 86.9 | 36.4/40.1 | 45.2 | 21.89 GB | 0.60 |
+| **DeepSeek-R1-Distill-Llama-8B@32768** | 0.57 | 0.00^+^+^+ | 0.60 | 1.0/0.4/0.4/0.6 | 0.000 | 85.2 | 37.6/53.1 | 42.5 | 21.69 GB | 0.39 |
 | **Nemotron-Nano-9B-v2-NVFP4@65536** | 0.84 | 0.00^+^+^+ | 0.00 | 0.0/0.0/0.0/0.0 | 0.075 (3x `</think>`) | 114.9 | 27.6/32.0 | 81.1 | 22.28 GB | 0.28 |
-| **DeepSeek-R1-Distill-Llama-8B@32768** | 0.57 | 0.00^+^+^+ | 0.00^+^+ | -- | 0.000 | 85.2 | 37.6/53.1 | 42.5 | 21.69 GB | 0.19 |
 
 Subcase legend: **E**mpty-schema . **S**ingle-arg . **M**ulti-tool-pick . **F**ollow-up.
 All TPS values are post-fix (see "TPS counting fix" below).
 
 Footnotes for caveats marked above:
 
-- ^+^+ **`tools_use=0.00` on forced-mode models** is an artefact of the
-  router's `tool_choice_pinning_required` rule firing against the
-- ^+^+ **`tools_use=0.00` on forced-mode models** is an artefact of the
-  router's `tool_choice_pinning_required` rule firing against the
-  bench's auto-choice request. The router is doing exactly what was
-  designed; the bench needs to pin `tool_choice` per-sample to test
-  these models. Tracked as a known-issue fix; rerun planned.
 - ^+^+^+ **HumanEval=0.00 for inline-reasoning models** (Nemotron-Nano,
   R1-Distill-Llama-8B) is a scorer-strictness issue: my
   `_clean_completion` only handles a fence enclosing the entire
@@ -69,6 +62,12 @@ Footnotes for caveats marked above:
   blocks before the code fence. Fix planned: search for the LAST
   fenced code block and ignore preamble. Plus, R1-Distill-Llama-8B
   has a *separate* tokenizer-decoding bug -- see the issues section.
+
+(The previous `^+^+` footnote about `tools_use=0.00` on forced-mode
+models is gone: the bench's `tools_use` task now pins `tool_choice`
+per-sample via a custom tool-call loop, so R1-Distill x2 and
+Llama-3.1-8B-Instruct-NVFP4 produce real scores. See "Issues surfaced
+> 2. Tool-loop interruption on forced-mode models" below.)
 
 ## Methodology
 
@@ -226,17 +225,36 @@ Qwen-7B distill (Qwen-2 tokenizer) does NOT show this bug.
 Llama-3 reasoning to OpenAI-compatible non-reasoning paths or use the
 Llama-3.1-Instruct-NVFP4 (no reasoning, 0.72 HumanEval).
 
-### 2. Tool-loop interruption on forced-mode models
+### 2. Tool-loop interruption on forced-mode models — **FIXED**
 The router's `tool_choice_pinning_required` HTTP 400 -- designed to
-prevent silent garbage from forced-mode agents -- fires inside the
-inspect_ai tool loop and gets converted to RuntimeError, killing the
+prevent silent garbage from forced-mode agents -- fired inside the
+inspect_ai tool loop and got converted to RuntimeError, killing the
 task. This is the router doing exactly what we built it to do; the
-bench needs to pin `tool_choice` per-sample to test forced-mode models.
+bench needed to pin `tool_choice` per-sample to test forced-mode models.
 
-**Action**: rewrite `tasks/tools_use.py` to set `state.tool_choice`
-based on `metadata.expect_tool` per-sample, plus
-`fail_on_error=False` on inspect_eval. Re-run with
-`make bench-vllm BENCH_TASKS=tools BENCH_FORCE=1`.
+**Why setting `state.tool_choice` alone wasn't enough**: inspect_ai's
+built-in tool loop (`_eval/task/generate.py::task_generate`) reads
+`state.tool_choice` once at the start, but **resets it to `"auto"`
+after a forced `ToolFunction` call** so the model can produce a final
+answer. That second turn then trips the router. There is no public
+API to disable that reset.
+
+**Resolution**: `tasks/tools_use.py` now ships a custom solver
+(`tool_loop_with_pin`) that drives the loop manually:
+turn 1 with `tool_choice=ToolFunction(name=expect_tool)`;
+`execute_tools` for any tool calls; for `result_followup` only, a
+second turn with `tool_choice="none"` so the model produces text
+without re-tripping the router. Other subcases stop after turn 1 --
+the scorer grades them on the tool call alone. `bench_runner.py` also
+passes `fail_on_error=False` to `inspect_eval` for the tools task as
+belt-and-suspenders. Verified end-to-end with `BENCH_TASKS=tools
+BENCH_FORCE=1`; all three forced-mode models now produce real scores
+(0.60--0.75) instead of 0.00.
+
+**Tradeoff**: `multi_tool_pick` no longer tests the model's tool-
+routing decision (we hand it the answer); it now tests args
+correctness given the right tool. That's the only path that works
+for forced-mode models on multi-tool prompts.
 
 ### 3. Nemotron-Nano-9B-v2 leaks `</think>` markers
 3 occurrences across 40 latency prompts. The model emits
@@ -343,28 +361,38 @@ agentic use" badge.
   parser also fixed (gpt-oss 38->136 tok/s, MoE leader confirmed).
   Makefile also fixed to single-quote `BENCH_REPO` / `BENCH_TASKS`
   so regex pipes don't get interpreted by the shell.
-1. **Fix `tools_use` task to pin `tool_choice` per-sample** -- recovers
+1. ~~**Fix `tools_use` task to pin `tool_choice` per-sample** -- recovers
    tools data for the 3 forced-mode models (R1-Distill x2 + Llama-3.1
-   NVFP4). ~30 min of code, requires `BENCH_FORCE=1` re-run.
-3. **Fix HumanEval scorer for inline-reasoning models** -- recovers
+   NVFP4).~~ **Done.** First attempt (set `state.tool_choice` and reuse
+   `generate()`) failed because inspect_ai's built-in tool loop resets
+   `tool_choice` to `"auto"` on the follow-up turn. Final fix replaces
+   `generate()` with a custom `tool_loop_with_pin` solver in
+   `scripts/bench/tasks/tools_use.py` that drives the loop manually:
+   turn 1 pinned to `ToolFunction(name=expect_tool)`, optional turn 2
+   for `result_followup` with `tool_choice="none"`. Validated on all 3
+   forced-mode models: Llama-3.1-8B-Instruct-NVFP4 (0.00 → 0.75),
+   DeepSeek-R1-Distill-Qwen-7B (0.00 → 0.65), DeepSeek-R1-Distill-Llama-8B
+   (0.00 → 0.60). See "Issues surfaced > 2" for details and the tradeoff
+   on `multi_tool_pick`.
+2. **Fix HumanEval scorer for inline-reasoning models** -- recovers
    Nemotron and R1-Distill-Llama-8B HumanEval data. ~30 min.
-4. **Investigate R1-Distill-Llama-8B BPE-decode bug** -- file vLLM
+3. **Investigate R1-Distill-Llama-8B BPE-decode bug** -- file vLLM
    issue with reproducer. Likely a vLLM x Llama-3 tokenizer x reasoning-
    parser interaction.
-5. **Add KV-pressure column to `make bench-report`** -- the data is
+4. **Add KV-pressure column to `make bench-report`** -- the data is
    already in the cache. ~10 min.
-6. **Add a long-context probe (one prompt at 80% of ctx)** -- detects
+5. **Add a long-context probe (one prompt at 80% of ctx)** -- detects
    KV paging cliffs that the current latency probe misses. v2 feature.
-7. **Add inspect_ai's vLLM `/metrics` snapshot** -- captures
+6. **Add inspect_ai's vLLM `/metrics` snapshot** -- captures
    `vllm:gpu_cache_usage_perc` and `vllm:num_preemptions_total` per
    run. Real-time KV pressure indicators.
-8. **Run `bench-sglang`** -- only one fitting model (`gpt-oss-20b`),
+7. **Run `bench-sglang`** -- only one fitting model (`gpt-oss-20b`),
    single-row delta to the leaderboard. Quick.
-9. **Run `bench-ollama`** -- 28 models, ~4 hours wall time. Parallel
+8. **Run `bench-ollama`** -- 28 models, ~4 hours wall time. Parallel
    to vLLM since Ollama models are smaller and the bench framework
    is the same.
-10. **Wire bench cache -> picker badge** -- tag PRODUCTION_AGENTIC rows
-    in the picker UI. v2 feature.
+9. **Wire bench cache -> picker badge** -- tag PRODUCTION_AGENTIC rows
+   in the picker UI. v2 feature.
 
 ## Cross-references
 
