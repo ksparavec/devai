@@ -4,22 +4,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is **Dev AI Lab** — a containerized development environment for AI experimentation featuring JupyterLab and multiple AI CLIs (Gemini, Claude, OpenAI, Ollama). Built on Debian Trixie with Python 3.13 (uv-managed), Node.js 22 LTS. Two-layer image build for fast iteration. Compatible with Podman and Docker. GPU/CUDA support.
+This is **Dev AI Lab** -- a containerized development environment for AI experimentation featuring JupyterLab and multiple AI CLIs (Gemini, Claude, OpenAI, Ollama). Built on Debian Trixie with Python 3.13 (uv-managed), Node.js 22 LTS. Two-layer image build for fast iteration. Compatible with Podman and Docker. GPU/CUDA support.
 
-**Backends:** all three are wired — Ollama (GGUF, port 11434), vLLM (NVFP4/safetensors, port 11435), SGLang (NVFP4/safetensors, port 11436). The router enforces GPU mutual exclusion: only one backend serves at a time. vLLM and SGLang start as `sleep infinity` placeholders and are recreated on demand by the router when a request arrives.
+**Backends:** all three are wired -- Ollama (GGUF, port 11434), vLLM (NVFP4/safetensors, port 11435), SGLang (NVFP4/safetensors, port 11436). The router enforces GPU mutual exclusion: only one backend serves at a time. vLLM and SGLang start as `sleep infinity` placeholders and are recreated on demand by the router when a request arrives.
 
 **Documentation:**
-- `docs/router.md` — router architecture, ports, lifecycle, request rewrite chain (override parsing → reasoning policy → tool_choice promotion → tool stripping → ctx injection), config, caches, failure modes. **Source of truth for the router.**
-- `docs/backends.md` — backend lifecycle, probing procedure, parser plugins, cache hygiene, failure-mode taxonomy.
-- `docs/nvfp4-coldstart.md` — NVFP4 cold-start phases (graphviz timeline) and per-component VRAM budget at 32K/64K/128K/256K. Reference model: **`nvidia/Qwen3-8B-NVFP4`**, anchored to `deploy/.bench-cache.json` measurements (peak/mean VRAM, cold + steady TTFT, sustained tok/s, GSM8K/HumanEval/tools/leak scores) on RTX PRO 4000 Blackwell (24 GB GDDR7). Per-phase wall times are not instrumented — the diagram shows phase order and bottleneck only. Anything beyond 24 GB or beyond 8B-class is paper extrapolation, not benchmark. Explains why `HEALTH_TIMEOUT_SECONDS=600`, why context-cap changes recreate the container, and why `peak_vram_gb` is not the strict minimum.
-- `docs/nvfp4-number-formats.md` — beginner's guide to FP32, FP16, BF16, FP8 (E4M3/E5M2), FP4, MXFP4, NVFP4. Covers how IEEE-754 numbers get encoded in fewer bits with worked examples, the role of per-block scales, why model weights and KV cache typically get *different* formats (NVFP4 weights + FP8 KV is the modern default), and how to read `quantization_config` in a checkpoint's `config.json`. Read this first if you're new to LLM number formats.
-- `docs/llm-tokens-and-speed.md` — beginner's guide to LLM tokens (BPE, why they're nothing like compiler tokens, why `"hello"` and `" hello"` are different) and to the *prefill vs decode* split that drives every inference benchmark. Derives the bandwidth-bound decode ceiling for Qwen3-8B-NVFP4 on RTX 4000 PRO Blackwell (640 GB/s ÷ 5.1 GB ≈ 125 tok/s peak; measured 98.3 tok/s ≈ 78 % utilisation) and proves it against the BF16 R1-Distill row (16 GB → 40 tok/s ceiling; measured 42 tok/s = at ceiling). Sourced from `bench-results.md`.
-- `docs/attention-and-the-transformer.md` — beginner's guide to the transformer architecture itself: embedding → 36 transformer blocks → lm_head. Walks through Q/K/V dot-product attention with worked example, GQA (why Qwen3-8B has 8 KV heads instead of 32 — and why this is *the* reason 128 K context fits on 24 GB), RoPE positional encoding (and how YaRN extends 40 K-trained contexts to 131 K), SwiGLU MLP, RMSNorm, and the full Qwen3-8B parameter inventory mapping each weight bucket to its NVFP4/BF16 storage class. The conceptual foundation that every other doc in this folder implicitly assumes.
-- `docs/reasoning-tool-calling-chat-templates.md` — beginner's guide to the three "agentic" mechanisms above the model architecture: chat templates and the `<|im_start|>` machinery; tool calling with parser plugins (`hermes`, `qwen3_xml`, `llama3_json`, `deepseek_string`, `openai`/harmony) and `tool_choice` modes; reasoning models with `<think>` blocks, `--reasoning-parser`, and the `structured/inline/unsupported` capability classification. Includes the TPS-counting bug from `bench-results.md` as a worked example of why understanding `reasoning_content` separation matters.
-- `docs/openai-api-and-streaming.md` — the wire format itself. Endpoint surface, request/response anatomy, every generation-control field, full SSE streaming including tool-call piecemeal arguments and reasoning-content streaming, the Anthropic `/v1/messages` variant, worked curl examples against the project's router. Practical companion to anyone reading vLLM/SGLang/router code or writing a custom agent.
-- `docs/sampling-strategies.md` — beginner's guide to how the next token is actually picked from the model's logit vector. Covers greedy, temperature, top-k, top-p (nucleus), min-p, repetition/frequency/presence penalties — each with a worked example on a tiny 5-token vocabulary distribution. Ends with sane defaults per task type (deterministic eval, code, chat, creative, reasoning, tool calling). Self-contained ~400-line read.
-- `docs/paged-attention-and-vllm-internals.md` — beginner's guide to the trick that makes the "elastic KV pool" referenced in `nvfp4-coldstart.md` actually work. Explains internal/external KV-cache fragmentation in the naïve approach, the OS-style page-table indirection vLLM uses (block_size 16, fixed pool, per-sequence block tables), the five wins (zero waste, prefix caching, continuous batching, dynamic admission, copy-on-write), the kernel-level cost, and SGLang's RadixAttention extension. Computes the actual block count for Qwen3-8B-NVFP4 on the project's hardware (~11 950 blocks ≈ 191 K tokens of pool capacity).
-- `docs/mixture-of-experts.md` — beginner's guide to MoE models, anchored in `gpt-oss-20b` (the project's coding specialist). Explains total vs active parameters (~21 B total / ~3.6 B active for gpt-oss-20b), why VRAM scales with total but FLOPs scale with active, the router/specialisation mechanism, why MoE is harder to serve (expert load imbalance, batching defeated, slower cold start), and how to spot an MoE model in `config.json`. Notes the open follow-up in `bench-results.md` to re-run gpt-oss-20b TPS post-fix.
+- `docs/router.md` -- router architecture, ports, lifecycle, request rewrite chain (override parsing -> reasoning policy -> tool_choice promotion -> tool stripping -> ctx injection), config, caches, failure modes. **Source of truth for the router.**
+- `docs/backends.md` -- backend lifecycle, probing procedure, parser plugins, cache hygiene, failure-mode taxonomy.
+- `docs/nvfp4-coldstart.md` -- NVFP4 cold-start phases (graphviz timeline) and per-component VRAM budget at 32K/64K/128K/256K. Reference model: **`nvidia/Qwen3-8B-NVFP4`**, anchored to `deploy/.bench-cache.json` measurements (peak/mean VRAM, cold + steady TTFT, sustained tok/s, GSM8K/HumanEval/tools/leak scores) on RTX PRO 4000 Blackwell (24 GB GDDR7). Per-phase wall times are not instrumented -- the diagram shows phase order and bottleneck only. Anything beyond 24 GB or beyond 8B-class is paper extrapolation, not benchmark. Explains why `HEALTH_TIMEOUT_SECONDS=600`, why context-cap changes recreate the container, and why `peak_vram_gb` is not the strict minimum.
+- `docs/nvfp4-number-formats.md` -- beginner's guide to FP32, FP16, BF16, FP8 (E4M3/E5M2), FP4, MXFP4, NVFP4. Covers how IEEE-754 numbers get encoded in fewer bits with worked examples, the role of per-block scales, why model weights and KV cache typically get *different* formats (NVFP4 weights + FP8 KV is the modern default), and how to read `quantization_config` in a checkpoint's `config.json`. Read this first if you're new to LLM number formats.
+- `docs/llm-tokens-and-speed.md` -- beginner's guide to LLM tokens (BPE, why they're nothing like compiler tokens, why `"hello"` and `" hello"` are different) and to the *prefill vs decode* split that drives every inference benchmark. Derives the bandwidth-bound decode ceiling for Qwen3-8B-NVFP4 on RTX 4000 PRO Blackwell (640 GB/s / 5.1 GB ~ 125 tok/s peak; measured 98.3 tok/s ~ 78 % utilisation) and proves it against the BF16 R1-Distill row (16 GB -> 40 tok/s ceiling; measured 42 tok/s = at ceiling). Sourced from `bench-results.md`.
+- `docs/attention-and-the-transformer.md` -- beginner's guide to the transformer architecture itself: embedding -> 36 transformer blocks -> lm_head. Walks through Q/K/V dot-product attention with worked example, GQA (why Qwen3-8B has 8 KV heads instead of 32 -- and why this is *the* reason 128 K context fits on 24 GB), RoPE positional encoding (and how YaRN extends 40 K-trained contexts to 131 K), SwiGLU MLP, RMSNorm, and the full Qwen3-8B parameter inventory mapping each weight bucket to its NVFP4/BF16 storage class. The conceptual foundation that every other doc in this folder implicitly assumes.
+- `docs/reasoning-tool-calling-chat-templates.md` -- beginner's guide to the three "agentic" mechanisms above the model architecture: chat templates and the `<|im_start|>` machinery; tool calling with parser plugins (`hermes`, `qwen3_xml`, `llama3_json`, `deepseek_string`, `openai`/harmony) and `tool_choice` modes; reasoning models with `<think>` blocks, `--reasoning-parser`, and the `structured/inline/unsupported` capability classification. Includes the TPS-counting bug from `bench-results.md` as a worked example of why understanding `reasoning_content` separation matters.
+- `docs/openai-api-and-streaming.md` -- the wire format itself. Endpoint surface, request/response anatomy, every generation-control field, full SSE streaming including tool-call piecemeal arguments and reasoning-content streaming, the Anthropic `/v1/messages` variant, worked curl examples against the project's router. Practical companion to anyone reading vLLM/SGLang/router code or writing a custom agent.
+- `docs/sampling-strategies.md` -- beginner's guide to how the next token is actually picked from the model's logit vector. Covers greedy, temperature, top-k, top-p (nucleus), min-p, repetition/frequency/presence penalties -- each with a worked example on a tiny 5-token vocabulary distribution. Ends with sane defaults per task type (deterministic eval, code, chat, creative, reasoning, tool calling). Self-contained ~400-line read.
+- `docs/paged-attention-and-vllm-internals.md` -- beginner's guide to the trick that makes the "elastic KV pool" referenced in `nvfp4-coldstart.md` actually work. Explains internal/external KV-cache fragmentation in the naive approach, the OS-style page-table indirection vLLM uses (block_size 16, fixed pool, per-sequence block tables), the five wins (zero waste, prefix caching, continuous batching, dynamic admission, copy-on-write), the kernel-level cost, and SGLang's RadixAttention extension. Computes the actual block count for Qwen3-8B-NVFP4 on the project's hardware (~11 950 blocks ~ 191 K tokens of pool capacity).
+- `docs/mixture-of-experts.md` -- beginner's guide to MoE models, anchored in `gpt-oss-20b` (the project's coding specialist). Explains total vs active parameters (~21 B total / ~3.6 B active for gpt-oss-20b), why VRAM scales with total but FLOPs scale with active, the router/specialisation mechanism, why MoE is harder to serve (expert load imbalance, batching defeated, slower cold start), and how to spot an MoE model in `config.json`. Notes the open follow-up in `bench-results.md` to re-run gpt-oss-20b TPS post-fix.
 
 ## Build and Run Commands
 
@@ -33,8 +33,8 @@ make build           # Build all (CPU + GPU + router)
 # Run
 make lab-gpu         # Run JupyterLab with GPU
 make lab-cpu         # Run JupyterLab CPU-only
-make shell-gpu       # Interactive shell (GPU) — cwd = repo root
-make shell-cpu       # Interactive shell (CPU) — cwd = repo root
+make shell-gpu       # Interactive shell (GPU) -- cwd = repo root
+make shell-cpu       # Interactive shell (CPU) -- cwd = repo root
 
 # Install standalone launcher (one-time; stages launcher + config under ~/.devai/)
 make install         # writes ~/.local/bin/devai-agent + ~/.devai/{model-picker.py,probe-cache symlink}
@@ -52,7 +52,7 @@ make cache-up        # Start all services. vLLM/SGLang start as `sleep` placehol
 make cache-down      # Stop all services
 make cache-status    # Show status, models, disk usage
 
-# Models — matrix-driven selection and probing
+# Models -- matrix-driven selection and probing
 make probe                      # Probe every (VRAM, ctx, backend) cell; Ollama only
 make probe-vllm                 # Probe every (VRAM, ctx) cell for vLLM; requires `make cache-down`
 make probe-sglang               # Probe every (VRAM, ctx) cell for SGLang; requires `make cache-down`
@@ -72,10 +72,10 @@ make setup-logs                 # One-time: 100G LV at /var/cache/devai/logs (su
 # Tests
 make test-router                # Go unit tests for arbiter
 make test-ollama                # Ollama integration tests
-make test-models                # Matrix: every probed digest × wire × scenario
+make test-models                # Matrix: every probed digest x wire x scenario
 make test-vllm                  # Live vLLM integration (chat, ctx switch, GPU exclusion)
 make test-sglang                # Live SGLang integration (skips when not loadable)
-make test-e2e                   # Picker → agent command → live router chat
+make test-e2e                   # Picker -> agent command -> live router chat
 make test-probe-vllm            # Probe smoke: cache schema assertion (requires cache-down)
 make test-probe-sglang          # Same for SGLang
 make test-probe-ollama-idempotent  # Byte-identical regression check on refactored Ollama prober
@@ -91,18 +91,18 @@ make help            # Show all targets
 
 Copy `.env.example` to `.env` before first use. Key settings:
 
-- `LAB_PORT` — JupyterLab port (default: 8888)
-- `WEBUI_PORT` — Open WebUI HTTPS port (default: 8443)
-- `CONTAINER_RUNTIME` — `podman` (default) or `docker`
-- `HOST_HOME_DIR` — Host home directory for .gitconfig/.ssh mounting
-- `HOME_VOLUME` — Persistent home directory path
-- `JUPYTER_TOKEN` — Fixed JupyterLab access token
-- `HTTP_PROXY`/`HTTPS_PROXY` — Proxy settings for corporate environments
+- `LAB_PORT` -- JupyterLab port (default: 8888)
+- `WEBUI_PORT` -- Open WebUI HTTPS port (default: 8443)
+- `CONTAINER_RUNTIME` -- `podman` (default) or `docker`
+- `HOST_HOME_DIR` -- Host home directory for .gitconfig/.ssh mounting
+- `HOME_VOLUME` -- Persistent home directory path
+- `JUPYTER_TOKEN` -- Fixed JupyterLab access token
+- `HTTP_PROXY`/`HTTPS_PROXY` -- Proxy settings for corporate environments
 
 Model catalog is in `deploy/models.yaml` (single source of truth for all models). GPU inference settings:
 
-- `GPU_MEMORY_GB` — Total GPU VRAM in GB (default: 24). Used by router to calculate memory fractions and context limits.
-- `MAX_CONTEXT_LEN` — Default max context length in tokens (default: 131072 = 128K). The router caps each model's per-name context at `min(model.max_context, MAX_CONTEXT_LEN)`. The probe cache (`deploy/.ollama-reasoning-cache.json`) is the source of truth — `deploy/active-models.yaml` no longer exists.
+- `GPU_MEMORY_GB` -- Total GPU VRAM in GB (default: 24). Used by router to calculate memory fractions and context limits.
+- `MAX_CONTEXT_LEN` -- Default max context length in tokens (default: 131072 = 128K). The router caps each model's per-name context at `min(model.max_context, MAX_CONTEXT_LEN)`. The probe cache (`deploy/.ollama-reasoning-cache.json`) is the source of truth -- `deploy/active-models.yaml` no longer exists.
 
 ## Architecture
 
@@ -110,31 +110,31 @@ Model catalog is in `deploy/models.yaml` (single source of truth for all models)
 
 Two-layer image build (base rarely changes, lab layer for fast iteration):
 
-**Layer 1: Dockerfile.base** — System packages, Python 3.13 (via uv), Node.js 22 LTS
-**Layer 2: Dockerfile.lab** — CLI binaries (Claude, Codex, Ollama, Gemini, code-server), PyTorch, Python packages, JupyterLab
+**Layer 1: Dockerfile.base** -- System packages, Python 3.13 (via uv), Node.js 22 LTS
+**Layer 2: Dockerfile.lab** -- CLI binaries (Claude, Codex, Ollama, Gemini, code-server), PyTorch, Python packages, JupyterLab
 
-Build cache: CLI binaries pre-downloaded to `/var/cache/devai/pip/bin/` via `make fetch-cli` (ETag-based updates). Mounted into build — no network downloads during rebuild.
+Build cache: CLI binaries pre-downloaded to `/var/cache/devai/pip/bin/` via `make fetch-cli` (ETag-based updates). Mounted into build -- no network downloads during rebuild.
 
 ### Inference stack (deploy/docker-compose.yaml)
 
 ```
-Agent → devai-router:11434 → devai-ollama:11434 (GGUF models)
-Agent → devai-router:11435 → devai-vllm:11434   (NVFP4 / safetensors via vLLM)
-Agent → devai-router:11436 → devai-sglang:11434 (NVFP4 / safetensors via SGLang)
+Agent -> devai-router:11434 -> devai-ollama:11434 (GGUF models)
+Agent -> devai-router:11435 -> devai-vllm:11434   (NVFP4 / safetensors via vLLM)
+Agent -> devai-router:11436 -> devai-sglang:11434 (NVFP4 / safetensors via SGLang)
 ```
 
-- **devai-router** — Multi-port GPU-aware reverse proxy. One port per backend. No message inspection — port determines backend. Manages GPU exclusion (only one backend uses GPU at a time), graceful drain on switch, idle timeout (`IDLE_TIMEOUT_SECONDS` env, default 300s), health check timeout (`HEALTH_TIMEOUT_SECONDS` env, default 600s for NVFP4 cold-start with CUDA graph compilation), dynamic GPU memory allocation (`--gpu-memory-utilization` for vLLM, `--mem-fraction-static` for SGLang). Per-request context cap comes from `<name>@<ctx>` override (picker-supplied) or the probe cache row's `min(model.max_context, MAX_CONTEXT_LEN)`. Both `currentModel` and `currentContext` are tracked per backend; either change triggers a recreate. **Reasoning policy** (`DEVAI_REASONING`): global policy is `auto|off|low|medium|high` (default auto); per-request suffix `::<reasoning>` overrides (e.g., `::nothink` → `enable_thinking=off` for inline-reasoning models). Ollama uses native `think:` field; vLLM/SGLang inject `extra_body.chat_template_kwargs.enable_thinking` plus `reasoning_effort` (vLLM) or `separate_reasoning` (SGLang). Capability=`inline` + policy=`off` now returns `reasoningDisable` (explicit user opt-out). **Tool stripping** (`maybeStripTools`): when vLLM/SGLang models have no probe-verified tool parser, the router drops `tools` and `tool_choice` from the request body to prevent "BadRequestError: auto tool choice requires --enable-auto-tool-choice and --tool-call-parser" rejections. Disable rewrite is gated on `disable_verified` (per-model probe outcome).
-- **devai-ollama** — Unmodified `ollama/ollama:latest`. GGUF models, GPU auto-detected. `OLLAMA_MAX_LOADED_MODELS=1` ensures clean model switching. `OLLAMA_CONTEXT_LENGTH` defaults to 262144 (compose env).
-- **devai-vllm** — `vllm/vllm-openai:latest-cu130-ubuntu2404` image. NVFP4 / safetensors models. Starts as a `sleep infinity` placeholder; the router recreates the container with the dynamic entrypoint on first request to port 11435. Entrypoint injects `--reasoning-parser` and `--enable-auto-tool-choice --tool-call-parser` when the v2 probe cache has confirmed values for the model (sourced from each family's curated `parsers:` block in `scripts/model-families.yaml`).
-- **devai-sglang** — `lmsysorg/sglang:v0.5.10.post1-cu130` image (pinned; bump via `deploy/backend-flags.yaml` + `make verify-backend-flags`). NVFP4 / safetensors with RadixAttention for multi-turn speedup. Same `sleep infinity` placeholder + on-demand recreate pattern as vLLM. Entrypoint injects `--reasoning-parser` / `--tool-call-parser` from the probe cache. SGLang has no `--enable-auto-tool-choice` analogue — `--tool-call-parser` alone enables tool parsing.
-- **devai-webui-proxy** — nginx TLS proxy for Open WebUI (mkcert certs or self-signed fallback).
-- **devai-open-webui** — Web chat interface, connects to router's ollama port (:11434).
-- **devai-logger** — Sidecar that streams `podman --remote logs --follow` for every devai-* container into `/var/cache/devai/logs/<service>.log`. Survives container restarts. Tail via `make logs SERVICE=<name> [LINES=N]`. Requires the `cache_logs` LV (one-time setup via `make setup-logs`).
+- **devai-router** -- Multi-port GPU-aware reverse proxy. One port per backend. No message inspection -- port determines backend. Manages GPU exclusion (only one backend uses GPU at a time), graceful drain on switch, idle timeout (`IDLE_TIMEOUT_SECONDS` env, default 300s), health check timeout (`HEALTH_TIMEOUT_SECONDS` env, default 600s for NVFP4 cold-start with CUDA graph compilation), dynamic GPU memory allocation (`--gpu-memory-utilization` for vLLM, `--mem-fraction-static` for SGLang). Per-request context cap comes from `<name>@<ctx>` override (picker-supplied) or the probe cache row's `min(model.max_context, MAX_CONTEXT_LEN)`. Both `currentModel` and `currentContext` are tracked per backend; either change triggers a recreate. **Reasoning policy** (`DEVAI_REASONING`): global policy is `auto|off|low|medium|high` (default auto); per-request suffix `::<reasoning>` overrides (e.g., `::nothink` -> `enable_thinking=off` for inline-reasoning models). Ollama uses native `think:` field; vLLM/SGLang inject `extra_body.chat_template_kwargs.enable_thinking` plus `reasoning_effort` (vLLM) or `separate_reasoning` (SGLang). Capability=`inline` + policy=`off` now returns `reasoningDisable` (explicit user opt-out). **Tool stripping** (`maybeStripTools`): when vLLM/SGLang models have no probe-verified tool parser, the router drops `tools` and `tool_choice` from the request body to prevent "BadRequestError: auto tool choice requires --enable-auto-tool-choice and --tool-call-parser" rejections. Disable rewrite is gated on `disable_verified` (per-model probe outcome).
+- **devai-ollama** -- Unmodified `ollama/ollama:latest`. GGUF models, GPU auto-detected. `OLLAMA_MAX_LOADED_MODELS=1` ensures clean model switching. `OLLAMA_CONTEXT_LENGTH` defaults to 262144 (compose env).
+- **devai-vllm** -- `vllm/vllm-openai:latest-cu130-ubuntu2404` image. NVFP4 / safetensors models. Starts as a `sleep infinity` placeholder; the router recreates the container with the dynamic entrypoint on first request to port 11435. Entrypoint injects `--reasoning-parser` and `--enable-auto-tool-choice --tool-call-parser` when the v2 probe cache has confirmed values for the model (sourced from each family's curated `parsers:` block in `scripts/model-families.yaml`).
+- **devai-sglang** -- `lmsysorg/sglang:v0.5.10.post1-cu130` image (pinned; bump via `deploy/backend-flags.yaml` + `make verify-backend-flags`). NVFP4 / safetensors with RadixAttention for multi-turn speedup. Same `sleep infinity` placeholder + on-demand recreate pattern as vLLM. Entrypoint injects `--reasoning-parser` / `--tool-call-parser` from the probe cache. SGLang has no `--enable-auto-tool-choice` analogue -- `--tool-call-parser` alone enables tool parsing.
+- **devai-webui-proxy** -- nginx TLS proxy for Open WebUI (mkcert certs or self-signed fallback).
+- **devai-open-webui** -- Web chat interface, connects to router's ollama port (:11434).
+- **devai-logger** -- Sidecar that streams `podman --remote logs --follow` for every devai-* container into `/var/cache/devai/logs/<service>.log`. Survives container restarts. Tail via `make logs SERVICE=<name> [LINES=N]`. Requires the `cache_logs` LV (one-time setup via `make setup-logs`).
 
 ### Supporting services
 
-- **apt-cacher-ng** — APT package cache (port 3142)
-- **Registry mirror** — Docker Hub pull-through cache (port 5000)
+- **apt-cacher-ng** -- APT package cache (port 3142)
+- **Registry mirror** -- Docker Hub pull-through cache (port 5000)
 
 All services share `devai-net` network. Model data stored under `/var/cache/devai/`.
 
@@ -146,21 +146,21 @@ All services share `devai-net` network. Model data stored under `/var/cache/deva
 
 ### Model picker (shell + Jupyter)
 
-Interactive model → agent selection via fzf. Used by `make shell-*` (via `agent-picker`), the standalone `devai-agent` launcher, and JupyterLab launcher cards.
+Interactive model -> agent selection via fzf. Used by `make shell-*` (via `agent-picker`), the standalone `devai-agent` launcher, and JupyterLab launcher cards.
 
-- `scripts/model-picker.py` — Python TUI, two-step fzf picker. Reads all three probe caches (Ollama digest-keyed v3; vLLM/SGLang repo+sha-keyed v2) for fit data. Falls back to `deploy/models.yaml` for catalog metadata only. Renders one row per `(model_dir, backend)` — HF repos probed by both vLLM and SGLang appear in both sections. New columns: `BACKEND` (ollama/vllm/sglang), `FORMAT` (derived from `quantization_config`, dir-name token like `NVFP4`, or torch_dtype), `PARSER` (probe-confirmed tool_parser or catalog hint or N/A). Inline-reasoning models produce two rows: default mode + "Reasoning off" variant with `::nothink` suffix. Ctrl-C / Esc exits cleanly. High-contrast colour scheme (bright cyan headers, yellow pointer, dark-grey bar, light-grey legend).
-- `scripts/agent-picker.sh` — Shell wrapper, execs model-picker.py.
-- `bin/devai-agent` — Host-side Python launcher. Reads/writes `~/.devai/preferences.yaml` (vram, context, last_model, last_agent, last_work_dir, agent_session_file). Bind-mounts `~/.devai/` to `/devai-host` (rw) so the picker can drop `.last-pick.json` for the launcher to consume on exit. Bind-mounts `~/.devai/model-picker.py` over `/usr/local/bin/model-picker` so picker edits don't require an image rebuild. Pre-flight checks for image + `devai-net`.
-- `packages/jupyter-ai-launchers/src/index.ts` — JupyterLab extension, each card runs `model-picker --agent <name>`.
+- `scripts/model-picker.py` -- Python TUI, two-step fzf picker. Reads all three probe caches (Ollama digest-keyed v3; vLLM/SGLang repo+sha-keyed v2) for fit data. Falls back to `deploy/models.yaml` for catalog metadata only. Renders one row per `(model_dir, backend)` -- HF repos probed by both vLLM and SGLang appear in both sections. New columns: `BACKEND` (ollama/vllm/sglang), `FORMAT` (derived from `quantization_config`, dir-name token like `NVFP4`, or torch_dtype), `PARSER` (probe-confirmed tool_parser or catalog hint or N/A). Inline-reasoning models produce two rows: default mode + "Reasoning off" variant with `::nothink` suffix. Ctrl-C / Esc exits cleanly. High-contrast colour scheme (bright cyan headers, yellow pointer, dark-grey bar, light-grey legend).
+- `scripts/agent-picker.sh` -- Shell wrapper, execs model-picker.py.
+- `bin/devai-agent` -- Host-side Python launcher. Reads/writes `~/.devai/preferences.yaml` (vram, context, last_model, last_agent, last_work_dir, agent_session_file). Bind-mounts `~/.devai/` to `/devai-host` (rw) so the picker can drop `.last-pick.json` for the launcher to consume on exit. Bind-mounts `~/.devai/model-picker.py` over `/usr/local/bin/model-picker` so picker edits don't require an image rebuild. Pre-flight checks for image + `devai-net`.
+- `packages/jupyter-ai-launchers/src/index.ts` -- JupyterLab extension, each card runs `model-picker --agent <name>`.
 
-**Filter:** the picker shows one row per `(model, backend)` pair at the picker's VRAM band (env `VRAM` or `GPU_MEMORY_GB`). A model is eligible only when the relevant probe cache contains a `fits=true` (vLLM/SGLang) or `fully_on_gpu=true` (Ollama) cell at some context tier. There is no interpolation — gaps mean "re-run `make probe-vllm` / `make probe-sglang`". HF rows whose backend has no fitting probe entry stay hidden until probed. See `docs/backends.md`.
+**Filter:** the picker shows one row per `(model, backend)` pair at the picker's VRAM band (env `VRAM` or `GPU_MEMORY_GB`). A model is eligible only when the relevant probe cache contains a `fits=true` (vLLM/SGLang) or `fully_on_gpu=true` (Ollama) cell at some context tier. There is no interpolation -- gaps mean "re-run `make probe-vllm` / `make probe-sglang`". HF rows whose backend has no fitting probe entry stay hidden until probed. See `docs/backends.md`.
 
 **Per-session context binding & reasoning overrides.** Two paths:
 
-- **Ollama**: the picker emits just the parent name (or `<name>::nothink` for reasoning-off). KV cache is allocated *dynamically* per request from the loaded `context_length` ceiling (set globally via `OLLAMA_CONTEXT_LENGTH` env, default 256K). Clients hitting `/api/chat` / `/api/generate` get `options.num_ctx` injected by the router's `setNumCtx` (Ollama honours it on those paths). Clients hitting `/v1/chat/completions` or `/v1/messages` get the global `OLLAMA_CONTEXT_LENGTH` — Ollama upstream ignores `options.num_ctx` on those compat surfaces and we accept that. `::nothink` suffix forces `enable_thinking=false` even when the global `DEVAI_REASONING` policy isn't off.
-- **vLLM / SGLang**: the picker emits `<name>@<ctx>` (e.g. `Llama-3.1-8B-Instruct-NVFP4@32768`) or `<name>::<reasoning>@<ctx>` for reasoning overrides. The router's `parseReasoningOverride` and `parseCtxOverride` strip the suffixes (order: `@<ctx>` first, `::<reasoning>` second), propagate the ctx into `containerRecreate` which sets `--max-model-len` (vLLM) or `--context-length` (SGLang), and handle the reasoning override (e.g. `::<reasoning>` → `enable_thinking=off` even on models with inline capability). No client-side tag materialization needed — the router's tracking handles the rest.
+- **Ollama**: the picker emits just the parent name (or `<name>::nothink` for reasoning-off). KV cache is allocated *dynamically* per request from the loaded `context_length` ceiling (set globally via `OLLAMA_CONTEXT_LENGTH` env, default 256K). Clients hitting `/api/chat` / `/api/generate` get `options.num_ctx` injected by the router's `setNumCtx` (Ollama honours it on those paths). Clients hitting `/v1/chat/completions` or `/v1/messages` get the global `OLLAMA_CONTEXT_LENGTH` -- Ollama upstream ignores `options.num_ctx` on those compat surfaces and we accept that. `::nothink` suffix forces `enable_thinking=false` even when the global `DEVAI_REASONING` policy isn't off.
+- **vLLM / SGLang**: the picker emits `<name>@<ctx>` (e.g. `Llama-3.1-8B-Instruct-NVFP4@32768`) or `<name>::<reasoning>@<ctx>` for reasoning overrides. The router's `parseReasoningOverride` and `parseCtxOverride` strip the suffixes (order: `@<ctx>` first, `::<reasoning>` second), propagate the ctx into `containerRecreate` which sets `--max-model-len` (vLLM) or `--context-length` (SGLang), and handle the reasoning override (e.g. `::<reasoning>` -> `enable_thinking=off` even on models with inline capability). No client-side tag materialization needed -- the router's tracking handles the rest.
 
-**Do not add custom tags to cached models.** In particular, do not derive `<parent>:<tag>-ctx<N>` Modelfile siblings via `ollama create` to bake `num_ctx` (or any other PARAMETER) in. Per-session context is plumbed dynamically — via the router's `setNumCtx` injection on Ollama's `/api/chat` and via the `@<ctx>` suffix for vLLM/SGLang launch flags — so derived tags add nothing the runtime can use. They share digests with the parent (`make cache-status` then shows duplicate-looking rows), the picker filters them via `_ctx_tag` and the prober skips them via `_CTX_VARIANT_RE`, so they're inert leftovers from the pre-3a98ed0 design. The only sanctioned `ollama create` call is `select-models.py:pull_gguf` writing the canonical catalog tag from a downloaded GGUF blob; nothing else should mint Ollama tags.
+**Do not add custom tags to cached models.** In particular, do not derive `<parent>:<tag>-ctx<N>` Modelfile siblings via `ollama create` to bake `num_ctx` (or any other PARAMETER) in. Per-session context is plumbed dynamically -- via the router's `setNumCtx` injection on Ollama's `/api/chat` and via the `@<ctx>` suffix for vLLM/SGLang launch flags -- so derived tags add nothing the runtime can use. They share digests with the parent (`make cache-status` then shows duplicate-looking rows), the picker filters them via `_ctx_tag` and the prober skips them via `_CTX_VARIANT_RE`, so they're inert leftovers from the pre-3a98ed0 design. The only sanctioned `ollama create` call is `select-models.py:pull_gguf` writing the canonical catalog tag from a downloaded GGUF blob; nothing else should mint Ollama tags.
 
 ### Building the JupyterLab extension
 
@@ -178,31 +178,57 @@ Pre-built output lives in `packages/jupyter-ai-launchers/jupyter_ai_launchers/la
 ### Key files
 
 ```
-deploy/models.yaml            — Auto-generated catalog (every variant the upstream catalog declares); filters out :latest, bare-size aliases, routing variants, cloud placeholders; recognises quant markers
-deploy/.ollama-reasoning-cache.json — Ollama probe cache (schema v3, digest-keyed); per-cell: actual_total_gb, actual_vram_gb, fully_on_gpu, per-cell capability, timestamp; captures capabilities array
-deploy/.vllm-reasoning-cache.json   — vLLM probe cache (schema v2, repo+sha-keyed); top-level: reasoning_parser, tool_parser, disable_verified; per-cell: fits, evidence
-deploy/.sglang-reasoning-cache.json — SGLang probe cache (schema v2, repo+sha-keyed; same shape as vLLM)
-deploy/backend-flags.yaml     — Pinned launch-flag *names* per backend; `make verify-backend-flags` asserts presence after image bumps
-deploy/docker-compose.yaml    — Infrastructure services (vllm/sglang start as `sleep` placeholders; router recreates on demand)
-deploy/Dockerfile.base        — Base image
-deploy/Dockerfile.lab         — Lab image
-deploy/Dockerfile.router      — Router image (distroless)
-gpu-arbiter/main.go           — GPU arbiter source (multi-port proxy, ~1070 lines Go)
-scripts/generate-catalog.py   — Refresh deploy/models.yaml from upstream (HF + Ollama registry)
-scripts/_probe_core.py        — Backend-agnostic probe helpers (cache I/O, classifier, implied-spill propagation)
-scripts/_probe_hf_common.py   — Shared scaffold for vLLM/SGLang probers (BackendSpec, podman driver, single-launch + 3-chat probe, nvidia-smi)
-scripts/verify-backend-flags.py — Asserts `--help` of pinned vLLM/SGLang images exposes every flag in deploy/backend-flags.yaml
-scripts/probe-ollama-reasoning.py — Ollama prober (Make-orchestrated VRAM bands)
-scripts/probe-vllm-reasoning.py   — vLLM prober (BackendSpec wrapper)
-scripts/probe-sglang-reasoning.py — SGLang prober (BackendSpec wrapper)
-scripts/select-models.py      — Print fitting models / pull missing best-fit candidates (gguf path emits FROM + RENDERER + PARSER Modelfile, runs ollama create)
-scripts/model-picker.py       — Two-step interactive picker (model → agent); emits `<name>@<ctx>` for vLLM/SGLang (drives container-launch flag) and just `<name>` for Ollama (KV is dynamic; per-session ctx via setNumCtx on /api/chat only)
-deploy/setup-logs-volume.sh   — Idempotent LVM/XFS/fstab setup for /var/cache/devai/logs (called by `make setup-logs`)
-deploy/logging.sh             — Logger sidecar entrypoint (runs `podman --remote logs --follow` per devai-* container)
-tests/test-router.sh          — Ollama-side router integration tests
-tests/test-model-matrix.sh    — Exhaustive matrix: every probed digest × wire × scenario
-docs/backends.md              — Lifecycle, probing, cache hygiene, failure-mode taxonomy across all 3 backends
+deploy/models.yaml            -- Auto-generated catalog (every variant the upstream catalog declares); filters out :latest, bare-size aliases, routing variants, cloud placeholders; recognises quant markers
+deploy/.ollama-reasoning-cache.json -- Ollama probe cache (schema v3, digest-keyed); per-cell: actual_total_gb, actual_vram_gb, fully_on_gpu, per-cell capability, timestamp; captures capabilities array
+deploy/.vllm-reasoning-cache.json   -- vLLM probe cache (schema v2, repo+sha-keyed); top-level: reasoning_parser, tool_parser, disable_verified; per-cell: fits, evidence
+deploy/.sglang-reasoning-cache.json -- SGLang probe cache (schema v2, repo+sha-keyed; same shape as vLLM)
+deploy/backend-flags.yaml     -- Pinned launch-flag *names* per backend; `make verify-backend-flags` asserts presence after image bumps
+deploy/docker-compose.yaml    -- Infrastructure services (vllm/sglang start as `sleep` placeholders; router recreates on demand)
+deploy/Dockerfile.base        -- Base image
+deploy/Dockerfile.lab         -- Lab image
+deploy/Dockerfile.router      -- Router image (distroless)
+gpu-arbiter/main.go           -- GPU arbiter source (multi-port proxy, ~1070 lines Go)
+scripts/generate-catalog.py   -- Refresh deploy/models.yaml from upstream (HF + Ollama registry)
+scripts/_probe_core.py        -- Backend-agnostic probe helpers (cache I/O, classifier, implied-spill propagation)
+scripts/_probe_hf_common.py   -- Shared scaffold for vLLM/SGLang probers (BackendSpec, podman driver, single-launch + 3-chat probe, nvidia-smi)
+scripts/verify-backend-flags.py -- Asserts `--help` of pinned vLLM/SGLang images exposes every flag in deploy/backend-flags.yaml
+scripts/probe-ollama-reasoning.py -- Ollama prober (Make-orchestrated VRAM bands)
+scripts/probe-vllm-reasoning.py   -- vLLM prober (BackendSpec wrapper)
+scripts/probe-sglang-reasoning.py -- SGLang prober (BackendSpec wrapper)
+scripts/select-models.py      -- Print fitting models / pull missing best-fit candidates (gguf path emits FROM + RENDERER + PARSER Modelfile, runs ollama create)
+scripts/model-picker.py       -- Two-step interactive picker (model -> agent); emits `<name>@<ctx>` for vLLM/SGLang (drives container-launch flag) and just `<name>` for Ollama (KV is dynamic; per-session ctx via setNumCtx on /api/chat only)
+deploy/setup-logs-volume.sh   -- Idempotent LVM/XFS/fstab setup for /var/cache/devai/logs (called by `make setup-logs`)
+deploy/logging.sh             -- Logger sidecar entrypoint (runs `podman --remote logs --follow` per devai-* container)
+tests/test-router.sh          -- Ollama-side router integration tests
+tests/test-model-matrix.sh    -- Exhaustive matrix: every probed digest x wire x scenario
+docs/backends.md              -- Lifecycle, probing, cache hygiene, failure-mode taxonomy across all 3 backends
 ```
+
+## Documentation conventions
+
+**Markdown documents must use ASCII characters only.** Non-ASCII
+characters (anything above U+007F) do not always render properly
+across editors, terminal pagers, GitHub viewers, and downstream
+tooling -- some drop them, some mojibake, some treat them as zero-
+width. Use ASCII equivalents:
+
+- em-dash (U+2014)             -> `--` or ` -- ` (two hyphens)
+- en-dash (U+2013)             -> `-`
+- right-arrow (U+2192)         -> `->`
+- left-arrow (U+2190)          -> `<-`
+- bullet (U+2022)              -> `-`
+- multiplication sign (U+00D7) -> `x`
+- ellipsis (U+2026)            -> `...`
+- smart quotes ('' "")         -> straight quotes (`'`, `"`)
+- non-breaking space (U+00A0)  -> regular space
+
+This applies to `.md` files. Source code (`.py`, `.go`, `.sh`, etc.)
+is exempt: it is not affected by markdown renderers, and string
+literals can legitimately need any Unicode codepoint (e.g. test
+fixtures, byte-level BPE markers). Inside markdown, when discussing
+such codepoints, refer to them by hex name (`U+0120`) or by
+Python-style escape (`\u0120`) rather than pasting the glyph itself.
+
 # AK's CLAUDE.md
 
 Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-specific instructions as needed.
@@ -252,20 +278,20 @@ The test: Every changed line should trace directly to the user's request.
 **Define success criteria. Loop until verified.**
 
 Transform tasks into verifiable goals:
-- "Add validation" → "Write tests for invalid inputs, then make them pass"
-- "Fix the bug" → "Write a test that reproduces it, then make it pass"
-- "Refactor X" → "Ensure tests pass before and after"
+- "Add validation" -> "Write tests for invalid inputs, then make them pass"
+- "Fix the bug" -> "Write a test that reproduces it, then make it pass"
+- "Refactor X" -> "Ensure tests pass before and after"
 
 For multi-step tasks, state a brief plan:
 ```
-1. [Step] → verify: [check]
-2. [Step] → verify: [check]
-3. [Step] → verify: [check]
+1. [Step] -> verify: [check]
+2. [Step] -> verify: [check]
+3. [Step] -> verify: [check]
 ```
 
 Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
 
-## 5. Don't Assume — If You Don't Know, Say So
+## 5. Don't Assume -- If You Don't Know, Say So
 
 **Never claim something works, exists, or behaves a certain way unless you've verified it. If you haven't, say "I don't know" or "I haven't tested that".**
 
@@ -283,16 +309,16 @@ Required phrases when uncertain:
 - "This is unverified"
 
 Before reporting status, audit each claim:
-- Did I run it end-to-end? → can claim "works"
-- Did I only check it parses / imports / starts? → say "starts cleanly, full round-trip not tested"
-- Did I infer from documentation, help text, or another agent's behavior? → say "I'm assuming based on X, not verified"
+- Did I run it end-to-end? -> can claim "works"
+- Did I only check it parses / imports / starts? -> say "starts cleanly, full round-trip not tested"
+- Did I infer from documentation, help text, or another agent's behavior? -> say "I'm assuming based on X, not verified"
 
 A "PASS" in a test harness means PASS only for what the harness actually checked. If the harness checks "non-empty output", report that, not "works".
 
 When the user asks "does X work?", the only honest answers are:
-- "Yes — verified by [specific test/command/output]"
-- "No — fails at [specific point], log/error attached"
-- "I don't know — haven't tested"
+- "Yes -- verified by [specific test/command/output]"
+- "No -- fails at [specific point], log/error attached"
+- "I don't know -- haven't tested"
 
 ---
 

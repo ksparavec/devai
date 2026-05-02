@@ -78,7 +78,7 @@ Llama-3.1-8B-Instruct-NVFP4 produce real scores. See "Issues surfaced
 
 (The previous `^+^+^+` footnote about `HumanEval=0.00` for inline-
 reasoning models is replaced by the two notes above: the v2 scorer
-recovered Nemotron 0.00 → 0.06 -- modest because Nemotron is just
+recovered Nemotron 0.00 -> 0.06 -- modest because Nemotron is just
 genuinely weak at HumanEval, not because the scorer was hiding a
 strong score; R1-Distill-Llama-8B stayed 0.00 because of the BPE
 bug, which the scorer can't work around.)
@@ -239,7 +239,7 @@ Qwen-7B distill (Qwen-2 tokenizer) does NOT show this bug.
 Llama-3 reasoning to OpenAI-compatible non-reasoning paths or use the
 Llama-3.1-Instruct-NVFP4 (no reasoning, 0.72 HumanEval).
 
-### 2. Tool-loop interruption on forced-mode models — **FIXED**
+### 2. Tool-loop interruption on forced-mode models -- **FIXED**
 The router's `tool_choice_pinning_required` HTTP 400 -- designed to
 prevent silent garbage from forced-mode agents -- fired inside the
 inspect_ai tool loop and got converted to RuntimeError, killing the
@@ -295,7 +295,7 @@ existing comment in `model-families.yaml` claiming "no shipped
 parser matches" predates checking NVIDIA's docs and is wrong; it's
 flagged for correction as part of that followup.
 
-### 4. HumanEval scorer too strict for inline-reasoning models — **FIXED**
+### 4. HumanEval scorer too strict for inline-reasoning models -- **FIXED**
 `_clean_completion` v1 only matched a fence enclosing the **entire**
 completion (after `strip()`); inline-reasoning models that put a
 `<think>...</think>` preamble before the code fence, or surrounding
@@ -321,14 +321,14 @@ draft+final fences, entry_point-name-in-prose-then-real-def, unclosed
 **Validation rerun** (`BENCH_TASKS=humaneval BENCH_FORCE=1` over
 Nemotron + R1-Distill-Llama-8B):
 
-- Nemotron-Nano-9B-v2-NVFP4 pass@1: 0.00 → **0.06** (3/50). Modest
+- Nemotron-Nano-9B-v2-NVFP4 pass@1: 0.00 -> **0.06** (3/50). Modest
   improvement; the scorer was hiding ~3 truly-passing samples behind
   preamble. Most failures are genuine coding weakness, not scorer
-  strictness — the doc's earlier "0.00 likely much higher in reality"
+  strictness -- the doc's earlier "0.00 likely much higher in reality"
   speculation was over-optimistic.
-- R1-Distill-Llama-8B pass@1: 0.00 → **0.00**. Confirms the byte-level
+- R1-Distill-Llama-8B pass@1: 0.00 -> **0.00**. Confirms the byte-level
   BPE-decode bug (Issue #1) is the *dominant* failure mode here, not
-  scorer strictness — every completion is still invalid Python.
+  scorer strictness -- every completion is still invalid Python.
 
 The scorer fix is a no-op-or-improvement for already-passing models
 (strict whole-text fence still matches; surrounding-prose paths only
@@ -434,15 +434,15 @@ agentic use" badge.
    `scripts/bench/tasks/tools_use.py` that drives the loop manually:
    turn 1 pinned to `ToolFunction(name=expect_tool)`, optional turn 2
    for `result_followup` with `tool_choice="none"`. Validated on all 3
-   forced-mode models: Llama-3.1-8B-Instruct-NVFP4 (0.00 → 0.75),
-   DeepSeek-R1-Distill-Qwen-7B (0.00 → 0.65), DeepSeek-R1-Distill-Llama-8B
-   (0.00 → 0.60). See "Issues surfaced > 2" for details and the tradeoff
+   forced-mode models: Llama-3.1-8B-Instruct-NVFP4 (0.00 -> 0.75),
+   DeepSeek-R1-Distill-Qwen-7B (0.00 -> 0.65), DeepSeek-R1-Distill-Llama-8B
+   (0.00 -> 0.60). See "Issues surfaced > 2" for details and the tradeoff
    on `multi_tool_pick`.
 2. ~~**Fix HumanEval scorer for inline-reasoning models** -- recovers
    Nemotron and R1-Distill-Llama-8B HumanEval data.~~ **Done.**
    `scripts/bench/tasks/humaneval.py::_clean_completion` rewritten with
    `<think>` stripping + last-fence selection + `^def <entry_point>\(`
-   fallback. Validated: Nemotron 0.00 → 0.06 (modest -- mostly genuine
+   fallback. Validated: Nemotron 0.00 -> 0.06 (modest -- mostly genuine
    coding weakness, not scorer strictness); R1-Distill-Llama-8B stayed
    0.00 (BPE bug, see followup #3). See "Issues surfaced > 4" for
    details.
