@@ -526,9 +526,14 @@ agentic use" badge.
    simply running `make bench-sglang` once SGLang is back in scope;
    the harness will create new `::sglang` rows alongside the
    existing `::vllm` ones.
-9. **Run `bench-ollama`** -- 28 models, ~4 hours wall time. Parallel
-   to vLLM since Ollama models are smaller and the bench framework
-   is the same.
+9. **Run `bench-ollama`** -- **out of scope.** 28 Ollama models,
+   ~4 hours wall time. Skipped per project decision: at this stage
+   benchmarking the Ollama backend isn't useful for routing decisions
+   on this hardware (the agentic / coding-quality picture is already
+   resolved by the vLLM rows). The harness supports it (the bench
+   cache key now suffixes with `::ollama` and the `/metrics` snapshot
+   path explicitly no-ops for Ollama). Reactivate by running
+   `make bench-ollama` if Ollama-side comparisons become relevant.
 10. **Wire bench cache -> picker badge** -- tag PRODUCTION_AGENTIC rows
     in the picker UI. v2 feature.
 
