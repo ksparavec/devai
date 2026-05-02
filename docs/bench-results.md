@@ -498,9 +498,22 @@ agentic use" badge.
    points back to this doc.
 6. **Add a long-context probe (one prompt at 80% of ctx)** -- detects
    KV paging cliffs that the current latency probe misses. v2 feature.
-7. **Add inspect_ai's vLLM `/metrics` snapshot** -- captures
+7. ~~**Add vLLM `/metrics` snapshot** -- captures
    `vllm:gpu_cache_usage_perc` and `vllm:num_preemptions_total` per
-   run. Real-time KV pressure indicators.
+   run.~~ **Done.** End-of-run snapshot lands in the bench cache as
+   `vllm_kv_cache_usage_perc` and `vllm_num_preemptions_total`
+   alongside the existing VRAM/TTFT/TPS metrics. Note: the gauge in
+   the current vLLM image is `vllm:kv_cache_usage_perc`, not
+   `vllm:gpu_cache_usage_perc` -- the latter was an older name. The
+   parser is best-effort: if the backend's `/metrics` endpoint is
+   unreachable (Ollama, idle SGLang, network blip) the bench result
+   is still valid; the new fields just stay absent. SGLang has its
+   own metric names (`sglang:cache_hit_rate`, `sglang:num_running_reqs`,
+   `sglang:num_used_tokens`) -- the same code path picks them up
+   when SGLang benches resume (followup #8). Limitation: end-of-run
+   snapshot only, not max-during-run -- after the last sample drains
+   the queue, `kv_cache_usage_perc` falls. Capturing the max would
+   require a second sampler thread; left for a v2 polish.
 8. **Run `bench-sglang`** -- **on-hold.** Two models actually fit on
    the SGLang side per the current probe cache (`gpt-oss-20b` and
    `DeepSeek-R1-Distill-Qwen-7B`); a first attempt revealed that the

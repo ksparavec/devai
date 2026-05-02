@@ -31,6 +31,7 @@ import os
 import sys
 import time
 import urllib.error
+import urllib.request
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -60,6 +61,106 @@ DEFAULT_HOST_VRAM_GB = int(os.environ.get("GPU_MEMORY_GB", "24"))
 DEFAULT_INSPECT_LOG_DIR = Path(
     os.environ.get("BENCH_INSPECT_LOG_DIR", "/var/cache/devai/bench/inspect-logs")
 )
+
+# Backend Prometheus /metrics endpoints reachable from the bench
+# runner's network (devai-net). vLLM exposes a Prometheus exporter on
+# its internal serving port; SGLang too. Ollama does not expose
+# Prometheus metrics (None -> skip).
+BACKEND_METRICS_URL = {
+    "vllm": os.environ.get(
+        "BENCH_VLLM_METRICS_URL", "http://devai-vllm:11434/metrics"
+    ),
+    "sglang": os.environ.get(
+        "BENCH_SGLANG_METRICS_URL", "http://devai-sglang:11434/metrics"
+    ),
+    "ollama": None,
+}
+
+# vLLM Prometheus metrics we capture per run. The names are vLLM-side
+# canonical (prefix ``vllm:``); we strip the prefix and store under
+# ``vllm_<short>`` keys in the bench cache row's metrics block. SGLang's
+# Prometheus exporter uses different metric names; we also try a small
+# matching set there. Backends that don't expose either are skipped.
+_VLLM_METRIC_PATTERNS = (
+    # gauge in [0.0, 1.0]: KV-cache utilization. End-of-run value is
+    # not a peak -- after the last sample drains the queue, usage falls.
+    # We document the limitation in docs/bench-results.md and leave
+    # max-during-run for a follow-up. Note: the current vLLM image
+    # exposes this as ``vllm:kv_cache_usage_perc``; older docs sometimes
+    # call it ``gpu_cache_usage_perc`` (renamed upstream).
+    "vllm:kv_cache_usage_perc",
+    # counter: cumulative preemptions over the run. Container is
+    # recreated per (model, ctx) for HF backends, so this resets per
+    # row -- absolute end-of-run value is the run total.
+    "vllm:num_preemptions_total",
+)
+_SGLANG_METRIC_PATTERNS = (
+    # SGLang exposes radix-cache hit rate and request queue depth on
+    # similar metric names. Kept here so the same code path covers
+    # both backends; if the exporter is silent the metric just doesn't
+    # appear and the row's metrics block is unaffected.
+    "sglang:cache_hit_rate",
+    "sglang:num_running_reqs",
+    "sglang:num_used_tokens",
+)
+
+
+def _parse_prometheus_max(text: str, metric_name: str) -> float | None:
+    """Parse Prometheus text for the maximum value of ``metric_name``.
+
+    A metric can have several rows with different label sets, e.g.::
+
+        vllm:gpu_cache_usage_perc{model_name="..."} 0.42
+        vllm:gpu_cache_usage_perc{model_name="other"} 0.01
+
+    We take the max so a row with multiple label combinations doesn't
+    silently lose the meaningful value. Lines starting with ``#`` are
+    HELP / TYPE comments and are skipped.
+    """
+    best: float | None = None
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        if not line.startswith(metric_name):
+            continue
+        # The metric name must end here; a trailing brace or space.
+        nxt = line[len(metric_name) : len(metric_name) + 1]
+        if nxt not in ("{", " "):
+            continue
+        try:
+            v = float(line.rsplit(" ", 1)[-1])
+        except (ValueError, IndexError):
+            continue
+        if best is None or v > best:
+            best = v
+    return best
+
+
+def _fetch_backend_metrics(backend: str) -> dict[str, float]:
+    """End-of-run snapshot of the backend's Prometheus /metrics endpoint.
+
+    Returns a flat dict suitable for merging into a row's
+    ``metrics`` block. Best-effort: any transport, decode, or parse
+    failure returns an empty dict (the bench result is still valid
+    without these). Keys are flattened by replacing ``:`` with ``_``
+    so downstream JSON consumers don't trip on the colon.
+    """
+    url = BACKEND_METRICS_URL.get(backend)
+    if not url:
+        return {}
+    try:
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=3.0) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+    except (urllib.error.URLError, OSError):
+        return {}
+    patterns = _VLLM_METRIC_PATTERNS if backend == "vllm" else _SGLANG_METRIC_PATTERNS
+    out: dict[str, float] = {}
+    for full_name in patterns:
+        v = _parse_prometheus_max(text, full_name)
+        if v is not None:
+            out[full_name.replace(":", "_")] = v
+    return out
 
 
 # --- Model discovery ---
@@ -365,6 +466,21 @@ def run_for_target(
         "mean_vram_gb": vram["mean_vram_gb"],
         "vram_samples": vram["n_samples"],
     }
+    # Best-effort end-of-run /metrics snapshot from the model server.
+    # The container is still alive at this point (it stops on idle
+    # timeout, well after we finish here). Returns {} for backends
+    # without a Prometheus exporter, or on transport/parse failure.
+    backend_metrics = _fetch_backend_metrics(backend)
+    if backend_metrics:
+        metrics.update(backend_metrics)
+        # One-line summary so the operator sees the snapshot landed.
+        kv = backend_metrics.get("vllm_kv_cache_usage_perc")
+        preempt = backend_metrics.get("vllm_num_preemptions_total")
+        if kv is not None or preempt is not None:
+            print(
+                f"  /metrics: kv_cache={kv}  preemptions={preempt}",
+                file=sys.stderr,
+            )
     update_row(
         cache,
         key,
