@@ -448,7 +448,17 @@ agentic use" badge.
    details.
 3. **Investigate R1-Distill-Llama-8B BPE-decode bug** -- file vLLM
    issue with reproducer. Likely a vLLM x Llama-3 tokenizer x reasoning-
-   parser interaction.
+   parser interaction. **In progress**: reproducer at
+   `scripts/repro/r1_distill_llama_bpe.py` -- a one-shot Python script
+   that streams a chat completion to two models and counts U+0120
+   (Llama-3 BPE leading-space marker) and U+010A (newline marker) in
+   `delta.content`. End-to-end verified against this project's stack:
+   R1-Distill-Llama-8B leaks 9 U+0120 + 3 U+010A in a 33-char reply;
+   R1-Distill-Qwen-7B (same `--reasoning-parser deepseek_r1`, Qwen-2
+   tokenizer) returns clean UTF-8. Draft issue body at
+   `scripts/repro/r1_distill_llama_bpe.md`. **Remaining**: paste the
+   draft into a new bug at `vllm-project/vllm` once we settle the
+   precise vLLM image digest to cite.
 4. **Wire up Nemotron-Nano-9B-v2 per NVIDIA's official guidance.**
    The current `tools_use=0.00` and `leak_rate=0.075` plus the
    sub-optimal HumanEval are not architectural limits; they're a
