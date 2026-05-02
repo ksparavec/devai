@@ -1,0 +1,115 @@
+// Realistic VRAM budget for nvidia/Qwen3-8B-NVFP4 at four context
+// lengths. Reference model chosen because the project has measured
+// benchmark data for it in deploy/.bench-cache.json (peak VRAM, mean
+// VRAM, TTFT, throughput, quality scores) -- the diagram is anchored to
+// real measurements rather than to probe-cache aggregates alone.
+//
+// Source of truth:
+//   - measured: deploy/.bench-cache.json
+//       entry nvidia/Qwen3-8B-NVFP4@ccd10a893cbc
+//       peak_vram_gb=22.53, mean_vram_gb=21.98, ttft_ms_first=45563.3,
+//       ttft_ms_steady_p50=32.7, tps_sustained_p50=14.53
+//   - analytical: HF config.json for Qwen3-8B
+//       36 layers, 8 KV heads (GQA), head_dim 128, vocab 151936,
+//       hidden 4096, torch_dtype bf16,
+//       quantization_config.quant_algo=NVFP4 (group_size 16),
+//       kv_cache_scheme = FP8 (1 byte/elem)  <- halves KV vs FP16
+//       on-disk weights: 6.0 GB
+//
+// Each column is a vertical stack; cell HEIGHT is roughly proportional
+// to bytes within a column. The numbers shown are MIN required (what
+// the runtime would allocate without the elastic KV pool).
+//
+// PROBE PROVENANCE: the bench measurements come from an RTX PRO 4000
+// Blackwell (24 GB GDDR7, PCIe Gen5 x16) workstation card. There is no
+// data in this project from any other GPU.
+//
+// Render: dot -Tsvg nvfp4-vram-budget.dot -o nvfp4-vram-budget.svg
+
+digraph nvfp4_vram {
+  rankdir=LR;
+  fontname="Helvetica";
+  nodesep=0.6;
+  ranksep=0.4;
+  graph [fontsize=20, labelloc=t,
+         label=<<B>NVFP4 VRAM budget -- nvidia/Qwen3-8B-NVFP4</B><BR/><FONT POINT-SIZE="14">minimum required per component, by context length (KV cache stored in FP8)</FONT><BR/><FONT POINT-SIZE="11">measured peak VRAM 22.53 GB . mean 21.98 GB on RTX PRO 4000 Blackwell -- see deploy/.bench-cache.json</FONT>>];
+  node [shape=plaintext, fontname="Helvetica", fontsize=14];
+  edge [style=invis];
+
+  // Reference column: what each component is.
+  ref [label=<
+    <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="14">
+      <TR><TD BGCOLOR="#333333"><FONT COLOR="white" POINT-SIZE="16"><B>Component</B></FONT></TD></TR>
+      <TR><TD BGCOLOR="#FFFBEA" ALIGN="LEFT"><FONT POINT-SIZE="14">Free / KV elastic pool</FONT><BR/><FONT POINT-SIZE="11">vLLM/SGLang fill to --gpu-memory-utilization</FONT></TD></TR>
+      <TR><TD BGCOLOR="#E1F5E1" ALIGN="LEFT"><FONT POINT-SIZE="14">CUDA graphs</FONT><BR/><FONT POINT-SIZE="11">piecewise capture, batch 1...256</FONT></TD></TR>
+      <TR><TD BGCOLOR="#FFE0E0" ALIGN="LEFT"><FONT POINT-SIZE="14">Activations + workspace</FONT><BR/><FONT POINT-SIZE="11">cuBLAS/cuDNN, attention scratch</FONT></TD></TR>
+      <TR><TD BGCOLOR="#FFC4C4" ALIGN="LEFT"><FONT POINT-SIZE="14">Runtime overhead</FONT><BR/><FONT POINT-SIZE="11">CUDA ctx, NCCL, allocator slack</FONT></TD></TR>
+      <TR><TD BGCOLOR="#D6E4FF" ALIGN="LEFT"><FONT POINT-SIZE="14">KV cache (FP8, paged)</FONT><BR/><FONT POINT-SIZE="11">2*L*H_kv*d*1B per token = 72 KB/tok</FONT></TD></TR>
+      <TR><TD BGCOLOR="#BFD4FF" ALIGN="LEFT"><FONT POINT-SIZE="14">Embeddings + lm_head (BF16)</FONT><BR/><FONT POINT-SIZE="11">vocab 151 936 x 4 096 x 2 B (tied)</FONT></TD></TR>
+      <TR><TD BGCOLOR="#7FA8E8"><FONT COLOR="white" POINT-SIZE="14"><B>NVFP4 weights</B></FONT><BR/><FONT COLOR="white" POINT-SIZE="11">~6.95 B params x 0.5625 B/param</FONT></TD></TR>
+    </TABLE>
+  >];
+
+  // 32K context column.  KV ~ 2.36 GB.
+  c32k [label=<
+    <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="10">
+      <TR><TD BGCOLOR="#333333"><FONT COLOR="white" POINT-SIZE="16"><B>32 K ctx</B></FONT></TD></TR>
+      <TR><TD BGCOLOR="#FFFBEA" HEIGHT="28" ALIGN="RIGHT"><FONT POINT-SIZE="13">elastic ...</FONT></TD></TR>
+      <TR><TD BGCOLOR="#E1F5E1" HEIGHT="48" ALIGN="RIGHT"><FONT POINT-SIZE="14">2.0 GB</FONT></TD></TR>
+      <TR><TD BGCOLOR="#FFE0E0" HEIGHT="28" ALIGN="RIGHT"><FONT POINT-SIZE="14">1.0 GB</FONT></TD></TR>
+      <TR><TD BGCOLOR="#FFC4C4" HEIGHT="28" ALIGN="RIGHT"><FONT POINT-SIZE="14">1.0 GB</FONT></TD></TR>
+      <TR><TD BGCOLOR="#D6E4FF" HEIGHT="60" ALIGN="RIGHT"><FONT POINT-SIZE="14">2.4 GB</FONT></TD></TR>
+      <TR><TD BGCOLOR="#BFD4FF" HEIGHT="32" ALIGN="RIGHT"><FONT POINT-SIZE="14">1.2 GB</FONT></TD></TR>
+      <TR><TD BGCOLOR="#7FA8E8" HEIGHT="98" ALIGN="RIGHT"><FONT COLOR="white" POINT-SIZE="14"><B>3.9 GB</B></FONT></TD></TR>
+      <TR><TD BGCOLOR="#222222"><FONT COLOR="white" POINT-SIZE="15"><B>min ~ 11.5 GB</B></FONT></TD></TR>
+    </TABLE>
+  >];
+
+  // 64K context column.  KV ~ 4.72 GB.
+  c64k [label=<
+    <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="10">
+      <TR><TD BGCOLOR="#333333"><FONT COLOR="white" POINT-SIZE="16"><B>64 K ctx</B></FONT></TD></TR>
+      <TR><TD BGCOLOR="#FFFBEA" HEIGHT="28" ALIGN="RIGHT"><FONT POINT-SIZE="13">elastic ...</FONT></TD></TR>
+      <TR><TD BGCOLOR="#E1F5E1" HEIGHT="48" ALIGN="RIGHT"><FONT POINT-SIZE="14">2.2 GB</FONT></TD></TR>
+      <TR><TD BGCOLOR="#FFE0E0" HEIGHT="28" ALIGN="RIGHT"><FONT POINT-SIZE="14">1.0 GB</FONT></TD></TR>
+      <TR><TD BGCOLOR="#FFC4C4" HEIGHT="28" ALIGN="RIGHT"><FONT POINT-SIZE="14">1.0 GB</FONT></TD></TR>
+      <TR><TD BGCOLOR="#D6E4FF" HEIGHT="118" ALIGN="RIGHT"><FONT POINT-SIZE="14">4.7 GB</FONT></TD></TR>
+      <TR><TD BGCOLOR="#BFD4FF" HEIGHT="32" ALIGN="RIGHT"><FONT POINT-SIZE="14">1.2 GB</FONT></TD></TR>
+      <TR><TD BGCOLOR="#7FA8E8" HEIGHT="98" ALIGN="RIGHT"><FONT COLOR="white" POINT-SIZE="14"><B>3.9 GB</B></FONT></TD></TR>
+      <TR><TD BGCOLOR="#222222"><FONT COLOR="white" POINT-SIZE="15"><B>min ~ 14.0 GB</B></FONT></TD></TR>
+    </TABLE>
+  >];
+
+  // 128K context column.  KV ~ 9.44 GB.
+  c128k [label=<
+    <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="10">
+      <TR><TD BGCOLOR="#333333"><FONT COLOR="white" POINT-SIZE="16"><B>128 K ctx</B></FONT></TD></TR>
+      <TR><TD BGCOLOR="#FFFBEA" HEIGHT="28" ALIGN="RIGHT"><FONT POINT-SIZE="13">elastic ...</FONT></TD></TR>
+      <TR><TD BGCOLOR="#E1F5E1" HEIGHT="48" ALIGN="RIGHT"><FONT POINT-SIZE="14">2.4 GB</FONT></TD></TR>
+      <TR><TD BGCOLOR="#FFE0E0" HEIGHT="28" ALIGN="RIGHT"><FONT POINT-SIZE="14">1.2 GB</FONT></TD></TR>
+      <TR><TD BGCOLOR="#FFC4C4" HEIGHT="28" ALIGN="RIGHT"><FONT POINT-SIZE="14">1.0 GB</FONT></TD></TR>
+      <TR><TD BGCOLOR="#D6E4FF" HEIGHT="236" ALIGN="RIGHT"><FONT POINT-SIZE="14">9.4 GB</FONT></TD></TR>
+      <TR><TD BGCOLOR="#BFD4FF" HEIGHT="32" ALIGN="RIGHT"><FONT POINT-SIZE="14">1.2 GB</FONT></TD></TR>
+      <TR><TD BGCOLOR="#7FA8E8" HEIGHT="98" ALIGN="RIGHT"><FONT COLOR="white" POINT-SIZE="14"><B>3.9 GB</B></FONT></TD></TR>
+      <TR><TD BGCOLOR="#222222"><FONT COLOR="white" POINT-SIZE="15"><B>min ~ 18.7 GB</B></FONT></TD></TR>
+    </TABLE>
+  >];
+
+  // 256K context column.  KV ~ 18.87 GB -> strict min over the 24 GB
+  // physical card; probe at this context errors with OOM.
+  c256k [label=<
+    <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="10">
+      <TR><TD BGCOLOR="#333333"><FONT COLOR="white" POINT-SIZE="16"><B>256 K ctx</B></FONT></TD></TR>
+      <TR><TD BGCOLOR="#FFFBEA" HEIGHT="28" ALIGN="RIGHT"><FONT POINT-SIZE="13">elastic ...</FONT></TD></TR>
+      <TR><TD BGCOLOR="#E1F5E1" HEIGHT="48" ALIGN="RIGHT"><FONT POINT-SIZE="14">2.6 GB</FONT></TD></TR>
+      <TR><TD BGCOLOR="#FFE0E0" HEIGHT="28" ALIGN="RIGHT"><FONT POINT-SIZE="14">1.5 GB</FONT></TD></TR>
+      <TR><TD BGCOLOR="#FFC4C4" HEIGHT="28" ALIGN="RIGHT"><FONT POINT-SIZE="14">1.0 GB</FONT></TD></TR>
+      <TR><TD BGCOLOR="#D6E4FF" HEIGHT="472" ALIGN="RIGHT"><FONT POINT-SIZE="14">18.9 GB</FONT></TD></TR>
+      <TR><TD BGCOLOR="#BFD4FF" HEIGHT="32" ALIGN="RIGHT"><FONT POINT-SIZE="14">1.2 GB</FONT></TD></TR>
+      <TR><TD BGCOLOR="#7FA8E8" HEIGHT="98" ALIGN="RIGHT"><FONT COLOR="white" POINT-SIZE="14"><B>3.9 GB</B></FONT></TD></TR>
+      <TR><TD BGCOLOR="#222222"><FONT COLOR="white" POINT-SIZE="15"><B>min ~ 28.2 GB</B></FONT></TD></TR>
+    </TABLE>
+  >];
+
+  ref -> c32k -> c64k -> c128k -> c256k;
+}

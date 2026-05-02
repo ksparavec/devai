@@ -1,0 +1,84 @@
+// NVFP4 cold-start phase timeline for vLLM / SGLang on a Blackwell GPU.
+// Vertical (top-to-bottom) layout so the diagram fits a page width
+// without text shrinking below readable size.
+//
+// Each phase node names what is happening and which resource bottlenecks
+// it. Per-phase wall times are NOT shown -- this project does not have
+// per-phase instrumentation, so those numbers would be guesswork. The
+// measured aggregate cold-start (container launch -> first token) is
+// shown in the side annotation, sourced from deploy/.bench-cache.json
+// for nvidia/Qwen3-8B-NVFP4 on RTX PRO 4000 Blackwell (24 GB GDDR7).
+//
+// Render: dot -Tsvg nvfp4-coldstart-phases.dot -o nvfp4-coldstart-phases.svg
+
+digraph nvfp4_coldstart {
+  rankdir=TB;
+  fontname="Helvetica";
+  ranksep=0.45;
+  nodesep=0.4;
+  node [shape=box, style="rounded,filled", fontname="Helvetica",
+        fontsize=14, margin="0.30,0.18", penwidth=1.5];
+  edge [fontname="Helvetica", fontsize=12, color="#555555", penwidth=1.4];
+  graph [fontsize=18, labelloc=t,
+         label=<<B>NVFP4 cold-start phase timeline</B><BR/><FONT POINT-SIZE="13">nvidia/Qwen3-8B-NVFP4 . RTX PRO 4000 Blackwell (24 GB GDDR7)</FONT><BR/><FONT POINT-SIZE="11">phase order &amp; bottleneck shown; per-phase wall times are not instrumented in this project</FONT>>];
+
+  // Legend strip across the top.
+  subgraph cluster_legend {
+    label="Resource legend"; style=dashed; color="#999999"; fontsize=13;
+    rank=same;
+    L1 [label="CPU / disk / RAM",         fillcolor="#E8F1FF", color="#4A78C2"];
+    L2 [label="PCIe H2D transfer",        fillcolor="#FFF1D6", color="#C28A2A"];
+    L3 [label="VRAM allocation",          fillcolor="#FFE0E0", color="#C24A4A"];
+    L4 [label="GPU compute (kernel/JIT)", fillcolor="#E1F5E1", color="#3D8A3D"];
+    L1 -> L2 [style=invis];
+    L2 -> L3 [style=invis];
+    L3 -> L4 [style=invis];
+  }
+
+  // Phases, in temporal order, top-to-bottom. No fabricated wall times.
+  P0  [label="0. Router decision\nstop other backend, remove placeholder",
+       fillcolor="#E8F1FF", color="#4A78C2"];
+  P1  [label="1. Container start\nimage layers, cgroups, devices, entrypoint",
+       fillcolor="#E8F1FF", color="#4A78C2"];
+  P2  [label="2. Python + library import\nvllm / sglang, torch, flashinfer, flash-attn, cutlass",
+       fillcolor="#E8F1FF", color="#4A78C2"];
+  P3  [label="3. Config + tokenizer load\nparse config.json + quantization_config\n(NVFP4 group_size=16, FP8-E4M3 scales, FP8 KV)",
+       fillcolor="#E8F1FF", color="#4A78C2"];
+  P4  [label="4. CUDA context init\ndriver handshake, primary ctx, cuBLAS / cuDNN handles",
+       fillcolor="#FFE0E0", color="#C24A4A"];
+  P5  [label="5. Weight mmap + shard\nopen safetensors, build per-layer NVFP4 tensor views\n(6.0 GB on disk for Qwen3-8B-NVFP4)",
+       fillcolor="#E8F1FF", color="#4A78C2"];
+  P6  [label="6. Weight H2D copy\nNVFP4 packed tensors + FP8 scales + BF16 lm_head/embed\nover PCIe Gen5 x16 (~55 GB/s practical)",
+       fillcolor="#FFF1D6", color="#C28A2A"];
+  P7  [label="7. Weight registration\nbind cutlass NVFP4 GEMM operands, init per-block scale tensors",
+       fillcolor="#FFE0E0", color="#C24A4A"];
+  P8  [label="8. KV cache pool allocation\npaged blocks sized from --max-model-len &amp; --gpu-memory-utilization",
+       fillcolor="#FFE0E0", color="#C24A4A"];
+  P9  [label="9. CUDA graph capture\npiecewise capture across batch sizes 1, 2, 4, ..., 256\nNVFP4 cutlass JIT autotune per (SM, kernel, shape)",
+       fillcolor="#E1F5E1", color="#3D8A3D"];
+  P10 [label="10. Profiling warmup\ndummy decode pass, fill cuBLAS workspace, lazy module init",
+       fillcolor="#E1F5E1", color="#3D8A3D"];
+  P11 [label="11. /health -> 200\nrouter stops polling, proxies queued request",
+       fillcolor="#D6F5D6", color="#2F6F2F", penwidth=2];
+
+  P0 -> P1 -> P2 -> P3 -> P4 -> P5 -> P6 -> P7 -> P8 -> P9 -> P10 -> P11;
+
+  // Side annotations -- the only timing claim in this diagram is the
+  // measured aggregate. Source: deploy/.bench-cache.json.
+  N_recreate [shape=note, fillcolor="#FFFBEA", color="#B89B3A", fontsize=12,
+              label="Triggers a full recreate (phases 1-11):\n* model change\n* @ctx change -> --max-model-len\n* ::reasoning override change"];
+
+  N_measured [shape=note, fillcolor="#E8F5E8", color="#3D8A3D", fontsize=13,
+              label=<<B>Measured cold-start (Qwen3-8B-NVFP4)</B><BR ALIGN="LEFT"/>container launch to first token: <B>45.6 s</B><BR ALIGN="LEFT"/>(ttft_ms_first = 45 563 ms)<BR ALIGN="LEFT"/><BR ALIGN="LEFT"/><B>Steady state, post-warmup:</B><BR ALIGN="LEFT"/>TTFT p50 = 32.7 ms, p95 = 34.5 ms<BR ALIGN="LEFT"/>sustained decode = 14.53 tok/s (p50)<BR ALIGN="LEFT"/><BR ALIGN="LEFT"/><FONT POINT-SIZE="11">Source: deploy/.bench-cache.json</FONT><BR ALIGN="LEFT"/><FONT POINT-SIZE="11">40 latency samples, 1 269 VRAM samples</FONT><BR ALIGN="LEFT"/>>];
+
+  N_router [shape=note, fillcolor="#FFFBEA", color="#B89B3A", fontsize=12,
+            label="Router timeout:\nHEALTH_TIMEOUT_SECONDS=600\n(headroom for slower NVFP4 builds)"];
+
+  P0  -> N_recreate [style=dashed, arrowhead=none, constraint=false];
+  P9  -> N_measured [style=dashed, arrowhead=none, constraint=false];
+  P11 -> N_router   [style=dashed, arrowhead=none, constraint=false];
+
+  {rank=same; P0;  N_recreate;}
+  {rank=same; P9;  N_measured;}
+  {rank=same; P11; N_router;}
+}

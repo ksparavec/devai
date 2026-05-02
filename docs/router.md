@@ -29,6 +29,7 @@ caches consumed, and failure modes.
 - [Configuration (env vars)](#configuration-env-vars)
 - [Failure modes](#failure-modes)
 - [Operator tasks](#operator-tasks)
+- [Benchmark harness](#benchmark-harness)
 
 ---
 
@@ -39,23 +40,23 @@ It listens on three ports inside the `devai-net` network, one per
 backend, and proxies requests after rewriting them.
 
 ```
-┌──────────────┐                         ┌──────────────────────────────┐
-│   agents     │                         │        devai-router          │
-│ (Claude Code,│                         │                              │
-│  Aider,      │  POST /v1/...           │  port 11434  ──►  ollama     │
-│  Codex,      │ ──────────────────►     │  port 11435  ──►  vllm       │
-│  Open WebUI, │                         │  port 11436  ──►  sglang     │
-│  curl, ...)  │                         │                              │
-└──────────────┘                         │  GPU mutex • request rewrite │
-                                         │  container lifecycle         │
-                                         └──────────────────────────────┘
-                                                       │
-                                                       ▼
-                                         ┌──────────────────────────────┐
-                                         │  devai-ollama (always on)    │
-                                         │  devai-vllm   (sleep ▶ live) │
-                                         │  devai-sglang (sleep ▶ live) │
-                                         └──────────────────────────────┘
++--------------+                         +------------------------------+
+|   agents     |                         |        devai-router          |
+| (Claude Code,|                         |                              |
+|  Aider,      |  POST /v1/...           |  port 11434  -->  ollama     |
+|  Codex,      | ------------------>     |  port 11435  -->  vllm       |
+|  Open WebUI, |                         |  port 11436  -->  sglang     |
+|  curl, ...)  |                         |                              |
++--------------+                         |  GPU mutex * request rewrite |
+                                         |  container lifecycle         |
+                                         +------------------------------+
+                                                       |
+                                                       v
+                                         +------------------------------+
+                                         |  devai-ollama (always on)    |
+                                         |  devai-vllm   (sleep > live) |
+                                         |  devai-sglang (sleep > live) |
+                                         +------------------------------+
 ```
 
 The vLLM and SGLang containers start as `sleep infinity` placeholders
@@ -67,7 +68,7 @@ plugin mounts derived from the probe cache.
 ### What the router IS
 
 - A multi-port reverse proxy with **deterministic routing by port**
-  (no message inspection — port determines backend).
+  (no message inspection -- port determines backend).
 - A **GPU mutex**: only one backend uses the GPU at a time. Switching
   drains in-flight requests, stops the loser, recreates the winner.
 - A **container lifecycle manager** for vLLM/SGLang: stop, recreate,
@@ -119,24 +120,24 @@ host. Reach it from sibling containers (`devai-open-webui`,
 ### First request to vLLM/SGLang (cold start)
 
 ```
-agent ──► router (port 11435 or 11436)
-              │
-              ├─ parse `<model>@<ctx>` and `<model>::<reasoning>` overrides
-              ├─ identify other backends holding the GPU
-              │   ├─ drain their in-flight requests (DRAIN_TIMEOUT)
-              │   ├─ stop their containers (or unload Ollama models)
-              │   └─ release GPU
-              ├─ build launchConfig from probe cache + overrides
-              │   ├─ compute MemFraction for the host VRAM
-              │   ├─ resolve parser plugin paths (vllm-plugins.json)
-              │   └─ apply probe-verified ctx ceiling
-              ├─ stop + remove placeholder container
-              ├─ podman libpod create + start with full launch flags
-              ├─ poll /health (HEALTH_TIMEOUT_SECONDS, default 600s)
-              └─ proxy the original request through
+agent --> router (port 11435 or 11436)
+              |
+              +- parse `<model>@<ctx>` and `<model>::<reasoning>` overrides
+              +- identify other backends holding the GPU
+              |   +- drain their in-flight requests (DRAIN_TIMEOUT)
+              |   +- stop their containers (or unload Ollama models)
+              |   +- release GPU
+              +- build launchConfig from probe cache + overrides
+              |   +- compute MemFraction for the host VRAM
+              |   +- resolve parser plugin paths (vllm-plugins.json)
+              |   +- apply probe-verified ctx ceiling
+              +- stop + remove placeholder container
+              +- podman libpod create + start with full launch flags
+              +- poll /health (HEALTH_TIMEOUT_SECONDS, default 600s)
+              +- proxy the original request through
 ```
 
-Cold start typically takes 60–90s for BF16 weights, up to 300s for
+Cold start typically takes 60-90s for BF16 weights, up to 300s for
 NVFP4 with CUDA graph capture.
 
 ### Subsequent requests, same model
@@ -186,11 +187,11 @@ The model name in the request body may carry suffixes:
 | `<name>::<reasoning>@<ctx>` | both, in either order; `@<ctx>` strips first    | 1 then 2    |
 
 Examples:
-- `Qwen3-8B-NVFP4@65536` → recreate vLLM with `--max-model-len 65536`,
+- `Qwen3-8B-NVFP4@65536` -> recreate vLLM with `--max-model-len 65536`,
   request body's `model` rewritten to `Qwen3-8B-NVFP4`.
-- `qwen3.5:9b-q8_0::nothink` → set Ollama's `think:false` for this
+- `qwen3.5:9b-q8_0::nothink` -> set Ollama's `think:false` for this
   request only.
-- `gpt-oss-20b::low@131072` → vLLM gets `--max-model-len 131072`,
+- `gpt-oss-20b::low@131072` -> vLLM gets `--max-model-len 131072`,
   request gets `reasoning_effort: low`.
 
 ### 2. Reasoning policy
@@ -214,12 +215,12 @@ backend's protocol path:
 | Any                                 | none / unsupported  | noop |
 
 Models with `disable_verified=False` can't reliably suppress
-reasoning — the directive is sent, but the model may emit reasoning
+reasoning -- the directive is sent, but the model may emit reasoning
 anyway (R1-Distill family is the standing example).
 
 ### 3. Tool-choice promotion (vLLM/SGLang)
 
-Fires when the probe's `tool_mode == "forced"` — the model only
+Fires when the probe's `tool_mode == "forced"` -- the model only
 verified tool calls when `tool_choice` was pinned to a specific
 function, not under `auto`. Applies the rule:
 
@@ -262,7 +263,7 @@ fall through to step 4 (tool stripping).
 
 `auto` rows pass through the router unchanged. `forced` rows hit the
 single-tool promote / multi-tool reject rules above. See
-`docs/backends.md` "Operational notes — R1-Distill family" for the
+`docs/backends.md` "Operational notes -- R1-Distill family" for the
 behavioural difference between the two distill variants.
 
 ### 4. Tool stripping (vLLM/SGLang)
@@ -275,7 +276,7 @@ and --tool-call-parser`. The router strips `tools` and `tool_choice`
 so the request becomes a plain chat. Cost: tool-calling silently
 unavailable for that model. Benefit: chat works without backend errors.
 
-Ollama is unaffected — its protocol negotiates tool support per
+Ollama is unaffected -- its protocol negotiates tool support per
 request and tolerates `tools=[]` without launch flags.
 
 ### 5. Context injection (Ollama only)
@@ -287,7 +288,7 @@ clamped against the probe-verified ceiling. This makes per-session
 context binding work without minting Modelfile-derived tags.
 
 Ollama's `/v1/chat/completions` and `/v1/messages` compat paths
-ignore `options.num_ctx` — for those the global
+ignore `options.num_ctx` -- for those the global
 `OLLAMA_CONTEXT_LENGTH` is the only knob.
 
 vLLM/SGLang use `--max-model-len` / `--context-length` baked into the
@@ -319,7 +320,7 @@ matches an entry:
   `scripts/vllm_plugins`) into the recreated vLLM container at
   `container_dir`.
 - The launch args gain `--tool-parser-plugin <abs>` (or
-  `--reasoning-parser-plugin <abs>`) **before** the parser-name flag —
+  `--reasoning-parser-plugin <abs>`) **before** the parser-name flag -- 
   vLLM resolves parser names at flag-parse time.
 - An empty `VLLM_PLUGINS_HOST_DIR` for a plugin model fails the
   recreate with an actionable error.
@@ -338,7 +339,7 @@ adding-a-plugin recipe.
 
 ## Caches consumed
 
-The router reads only — never writes. Keep the writers single-source.
+The router reads only -- never writes. Keep the writers single-source.
 
 | File                                       | Schema | Writer                       | Keys              |
 |--------------------------------------------|--------|------------------------------|-------------------|
@@ -364,7 +365,7 @@ Top-level fields used by the router:
 **Top-level field derivation.** `capability` comes from the
 *smallest-tier* clean probe (most conservative classification).
 Parser fields and `tool_mode` come from the **most-recently-probed
-clean cell that has them populated** — `_latest_cell_with` in
+clean cell that has them populated** -- `_latest_cell_with` in
 `scripts/_probe_hf_common.py`. This split lets a partial `--force`
 re-probe of a single cell update the top-level row without requiring
 a full matrix re-probe; older cells with stale `None`s no longer
@@ -475,7 +476,7 @@ devai-vllm did not become ready within 600s
 Cause: NVFP4 weights with CUDA graph capture can take 5+ min on
 consumer GPUs; sometimes longer on first-ever load (kernel
 JIT-compilation cached afterwards). Fix: bump
-`HEALTH_TIMEOUT_SECONDS=900` and retry, or rerun the request — the
+`HEALTH_TIMEOUT_SECONDS=900` and retry, or rerun the request -- the
 second attempt usually hits warm caches.
 
 ### Recreate race on concurrent requests
@@ -506,7 +507,7 @@ make cache-up
 ```
 
 Compose mounts caches read-only and re-reads them on every router
-boot. No restart-on-write — the router holds its working set in
+boot. No restart-on-write -- the router holds its working set in
 memory.
 
 ### Inspect what the router is doing
@@ -520,7 +521,7 @@ Useful log lines:
 
 | Pattern                                        | Meaning                                  |
 |------------------------------------------------|------------------------------------------|
-| `probe cache: ... loaded (N entries → M serving rows)` | per-cache load summary           |
+| `probe cache: ... loaded (N entries -> M serving rows)` | per-cache load summary           |
 | `vllm plugin registry: ... loaded`             | plugin map consumed                       |
 | `vllm launch: model=X GB ... tool="Y" tool_plugin="Z"` | recreate spec                  |
 | `stopping <other-backend> (switching to <target>)` | GPU mutex switch                      |
@@ -544,7 +545,7 @@ podman run --rm --network devai-net curlimages/curl:latest \
 
 ### Test the tool-choice rules
 
-Single tool + auto (forced model) → should rewrite + extract:
+Single tool + auto (forced model) -> should rewrite + extract:
 
 ```bash
 podman run --rm --network devai-net curlimages/curl:latest \
@@ -559,5 +560,88 @@ podman run --rm --network devai-net curlimages/curl:latest \
   }'
 ```
 
-Multi-tool + auto (forced model) → should return HTTP 400 with
+Multi-tool + auto (forced model) -> should return HTTP 400 with
 `tool_choice_pinning_required` code.
+
+---
+
+## Benchmark harness
+
+Lives at `scripts/bench/`, runs in the lab container, talks to the
+router exactly the way Claude Code does. Built to answer "which model
+should I use for X?" with evidence rather than vibes.
+
+### What it measures
+
+Per (model, backend) pair, per run:
+
+| Axis | Metric | Source |
+|---|---|---|
+| Reasoning | GSM8K accuracy | inspect_ai task `gsm8k_subset_<n>` |
+| Coding | HumanEval pass@1 | inspect_ai task `humaneval_subset_<n>`, local subprocess sandbox |
+| Tool use | Score + per-subcase breakdown | inspect_ai task `tools_use_<n>` (empty-schema, single-arg, multi-tool pick, result follow-up) |
+| Output cleanliness | Leak rate + per-marker hits | regex sweep over response bodies via `bench_latency_leak.py` |
+| Cold start | `ttft_ms_first` | First request to a freshly-recreated backend (cold container + weight load + KV alloc + prefill + first token) |
+| Steady-state latency | `ttft_ms_steady_p50/p95` | Subsequent prompts in the same model session |
+| Throughput | `tps_sustained_p50` | Tokens-per-second during streamed body |
+| Memory | `peak_vram_gb`, `mean_vram_gb` | nvidia-smi sampler thread, 1Hz |
+
+### Cache file
+
+`deploy/.bench-cache.json`, schema-versioned and sorted-keys for
+diff-friendliness. Top-level key matches the probe caches -- 
+`<repo@sha>` for HF, `<digest>` for Ollama -- so a row joins to its
+source probe row by key. Schema is documented at the top of
+`scripts/bench/_bench_core.py::update_row`.
+
+Re-runs merge in (don't overwrite) so partial benches accumulate.
+`BENCH_FORCE=1` re-runs every task even if cached.
+
+### Make targets
+
+```
+make bench           # all backends
+make bench-vllm      # only vLLM models
+make bench-sglang    # only SGLang models
+make bench-ollama    # only Ollama models
+make bench-report    # Markdown leaderboard from .bench-cache.json
+make test-bench-smoke # 1-model tiny-subset sanity check
+```
+
+Knobs (env vars; same idiom as `PROBE_*`):
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `BENCH_TASKS` | `gsm8k,humaneval,tools,leak` | comma-separated subset |
+| `BENCH_REPO` | unset | regex filter on probe-cache top-level key |
+| `BENCH_FORCE` | unset | re-run tasks already cached |
+| `BENCH_N_GSM8K` | `100` | GSM8K subset size |
+| `BENCH_N_HUMANEVAL` | `50` | HumanEval subset size |
+| `BENCH_N_TOOLS` | `20` | tools_use prompts (5 per subcase x 4 subcases) |
+| `BENCH_N_LEAK_PROMPTS` | `40` | latency/leak sweep prompts |
+
+### Adding a leak marker
+
+Drop a Python regex line into
+`scripts/bench/data/leak_markers.txt`. Backslash-escape pipes inside
+`<|...|>` tokens so they're treated as literals (e.g.
+`<\|new_token\|>`). The sweeper recompiles on every run; no code
+changes needed.
+
+### Reading a result
+
+```bash
+make bench-report
+```
+
+prints a leaderboard sorted by aggregate correctness score. For a
+single model:
+
+```bash
+jq '.["meta-llama/Llama-3.1-8B@abc123"]' deploy/.bench-cache.json
+```
+
+Per-task `inspect_log_dir` paths point at `.eval` files under
+`/var/cache/devai/bench/inspect-logs/` -- load them in the inspect
+viewer (`inspect view start --log-dir <path>`) for full per-sample
+forensics.

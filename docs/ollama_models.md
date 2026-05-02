@@ -212,10 +212,10 @@ field is not equivalent to disabling reasoning.
 ### Step 4: Cache by Digest, Not Name
 
 The probe cache (`deploy/.ollama-reasoning-cache.json`, schema v3) is
-keyed by `digest` — one record per set of weights. Each record carries:
+keyed by `digest` -- one record per set of weights. Each record carries:
 
 - `aliases`: every name pointing at this digest (`ollama:latest`,
-  `ollama:9b`, `ollama:9b-q4_K_M` …)
+  `ollama:9b`, `ollama:9b-q4_K_M` ...)
 - `max_context`: the architecture's design ceiling from `/api/show`
 - `capability` and `disable_verified`: canonical, taken at the smallest
   fitting tier (most reliable signal)
@@ -227,7 +227,7 @@ keyed by `digest` — one record per set of weights. Each record carries:
 Probing is incremental and never destructive. A new (band, tier) cell
 only fills a gap; existing cells are immutable unless `--force-ctx`
 or `--force` is passed. Two aliases of the same digest probe at most
-once per cell — the probe driver dedups before issuing chat calls. If
+once per cell -- the probe driver dedups before issuing chat calls. If
 a tier is above `max_context`, it's silently capped: a 128K-only model
 with tiers `[32K, 64K, 128K, 256K]` records probes at `[32768, 65536,
 131072]` and is shown at higher tiers as "limited to 128K".

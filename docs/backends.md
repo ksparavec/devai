@@ -1,4 +1,4 @@
-# Inference backends — Ollama, vLLM, SGLang
+# Inference backends -- Ollama, vLLM, SGLang
 
 DevAI exposes three inference backends behind a single multi-port router
 (`gpu-arbiter`). Each backend serves a distinct port; the router enforces
@@ -14,7 +14,7 @@ when the probe cache has confirmed values for the model.
 | SGLang  | 11436 | `lmsysorg/sglang:v0.5.10.post1-cu130` | NVFP4, FP8, BF16/FP16 safetensors (RadixAttention multi-turn) |
 
 Backend launch-flag *names* are pinned in `deploy/backend-flags.yaml`.
-Run `make verify-backend-flags` after bumping either image — it dumps
+Run `make verify-backend-flags` after bumping either image -- it dumps
 `--help` from the pinned image and asserts every named flag is present.
 
 All three are reachable via the router from inside the `devai-net` Podman
@@ -36,7 +36,7 @@ the chosen model's backend.
 When the first request hits port 11435 (vLLM) or 11436 (SGLang), the
 router:
 
-1. Stops the other GPU-using backends — `devai-ollama` is unloaded via
+1. Stops the other GPU-using backends -- `devai-ollama` is unloaded via
    `/api/generate` with `keep_alive=0`; vLLM/SGLang containers are
    stopped via libpod.
 2. Removes the placeholder `devai-vllm` / `devai-sglang` container.
@@ -55,26 +55,26 @@ router:
 
 A second request that switches the **model**, **context cap**, or **reasoning
 override** triggers another recreate. The router tracks `currentModel`,
-`currentContext`, and `currentReasoningOverride` per backend; any change → recreate.
+`currentContext`, and `currentReasoningOverride` per backend; any change -> recreate.
 
-## Probing — building the cache
+## Probing -- building the cache
 
 Each backend has its own probe cache:
 
-- `deploy/.ollama-reasoning-cache.json` — schema v3, digest-keyed.
-- `deploy/.vllm-reasoning-cache.json` — schema v2, repo+sha-keyed.
-- `deploy/.sglang-reasoning-cache.json` — schema v2, repo+sha-keyed.
+- `deploy/.ollama-reasoning-cache.json` -- schema v3, digest-keyed.
+- `deploy/.vllm-reasoning-cache.json` -- schema v2, repo+sha-keyed.
+- `deploy/.sglang-reasoning-cache.json` -- schema v2, repo+sha-keyed.
 
 Schema v2 (vLLM/SGLang) added three top-level fields per entry:
 
-- `reasoning_parser` — backend startup flag value (e.g. `qwen3`) that
+- `reasoning_parser` -- backend startup flag value (e.g. `qwen3`) that
   produced a `structured` round-trip in Probe A. Null when the curated
   family hint did not pan out, when no hint was supplied, or when the
   model's capability is `inline`/`unsupported`.
-- `tool_parser` — backend startup flag value (e.g. `hermes`, `qwen25`)
+- `tool_parser` -- backend startup flag value (e.g. `hermes`, `qwen25`)
   that produced a parseable tool call in Probe B. Null when no curated
   hint, or when the round-trip failed.
-- `disable_verified` — true iff Probe C suppressed `reasoning_content`
+- `disable_verified` -- true iff Probe C suppressed `reasoning_content`
   on a structured-capable model. Mirrors Ollama's `disable_verified`;
   gates the router's "off" rewrite.
 
@@ -88,27 +88,27 @@ Without probes, models are invisible.
 # 1. Ollama probing (Make-orchestrated, runs live with Ollama container)
 #    Each PROBE_VRAMS band recreates devai-ollama with OLLAMA_GPU_OVERHEAD
 #    set so the daemon behaves as if it had only that VRAM available.
-make probe                                          # all bands × all contexts
+make probe                                          # all bands x all contexts
 make probe PROBE_VRAMS=24G PROBE_CONTEXTS=32K      # one band, one tier
 make probe PROBE_FORCE=1                           # re-probe everything
 
-# 2. HF probing (vLLM/SGLang) — requires exclusive GPU access
+# 2. HF probing (vLLM/SGLang) -- requires exclusive GPU access
 #    Stop the live router and ollama first.
 make cache-down
 
 # 3. For each HF backend, launch a probe container and run all cells.
 #    For each (model, vram_band, ctx_tier) cell:
-#      A) fit + reasoning      — classify capability, snapshot nvidia-smi
-#      B) tool-call            — only when parsers.<backend>.tool is set
-#      C) disable verification — only when Probe A produced `structured`;
+#      A) fit + reasoning      -- classify capability, snapshot nvidia-smi
+#      B) tool-call            -- only when parsers.<backend>.tool is set
+#      C) disable verification -- only when Probe A produced `structured`;
 #                                verifies suppression of `reasoning_content`
-#    Each cell takes 1–3 minutes; extra probes add a few seconds each.
+#    Each cell takes 1-3 minutes; extra probes add a few seconds each.
 make probe-vllm                                     # all vLLM models, all cells
 make probe-sglang                                   # all SGLang models, all cells
 make probe-vllm PROBE_REPO=Llama                   # filter to matching models
 make probe-sglang PROBE_CONTEXTS=128K              # single context tier
 
-# 4. Restart the stack — router reloads all three caches at boot.
+# 4. Restart the stack -- router reloads all three caches at boot.
 make cache-up
 ```
 
@@ -134,7 +134,7 @@ choices live in `scripts/model-families.yaml` under each family's
 in `deploy/models.yaml`. The probers read the row's block and pass
 `--reasoning-parser` / `--tool-call-parser` (vLLM also adds
 `--enable-auto-tool-choice`) to the launch. A field is only confirmed
-in the cache when the corresponding round-trip succeeds — a curated
+in the cache when the corresponding round-trip succeeds -- a curated
 hint that the model doesn't actually honour produces a null cache
 entry, and the router launches without the flag.
 
@@ -155,7 +155,7 @@ entry, and the router launches without the flag.
 Some models emit tool calls or reasoning in a format that no built-in
 vLLM parser handles. The DeepSeek R1 distills are the standing
 example: their chat template uses DeepSeek-V3 boundary markers
-(`<｜tool▁call▁begin｜>` etc.), but they inherit the Qwen2 / Llama-3
+(`<|tool_call_begin|>` etc.), but they inherit the Qwen2 / Llama-3
 tokenizer where those markers aren't atomic vocab entries. vLLM's
 built-in `deepseek_v3` / `_v31` / `_v32` parsers do
 `vocab.get(<token>)` at startup and crash with HTTP 500 on every
@@ -191,7 +191,7 @@ to a plugin entry they:
 - bind-mount `scripts/vllm_plugins/` into the launched vLLM container
   at the registry's `container_dir` (default `/etc/devai/vllm-plugins`);
 - emit `--tool-parser-plugin <abs>` (or `--reasoning-parser-plugin`)
-  *before* the matching `--tool-call-parser <name>` flag — vLLM
+  *before* the matching `--tool-call-parser <name>` flag -- vLLM
   resolves parser names at flag-parse time, so the plugin module has
   to be loaded by then.
 
@@ -211,7 +211,7 @@ SGLang has no equivalent: SGLang's plugin model is Python-import based
 based, so a separate plugin would be needed per model. SGLang traffic
 for plugin-only families runs without tool support until that lands.
 
-#### Operational notes — R1-Distill family
+#### Operational notes -- R1-Distill family
 
 Both R1 distills share the same chat template and the same plugin, but
 their tool-calling **behaviour** differs sharply because of base-model
@@ -220,12 +220,12 @@ training. Verified end-to-end through the router with `tool_choice:
 
 | Model | Base tokenizer | `tool_mode` | Completion tokens to call | Reasoning preamble |
 |---|---|---|---|---|
-| `DeepSeek-R1-Distill-Llama-8B` | Llama-3 | forced | **5** | none — calls immediately |
-| `DeepSeek-R1-Distill-Qwen-7B` | Qwen-2  | forced | ~525 | yes — long CoT before the call |
+| `DeepSeek-R1-Distill-Llama-8B` | Llama-3 | forced | **5** | none -- calls immediately |
+| `DeepSeek-R1-Distill-Qwen-7B` | Qwen-2  | forced | ~525 | yes -- long CoT before the call |
 
 Both ended up `tool_mode=forced` (the auto-choice probe didn't elicit
 a call), so the router's promote rule kicks in for either. The
-**Llama-8B distill is much more usable for tool-calling agents** —
+**Llama-8B distill is much more usable for tool-calling agents** -- 
 it's effectively non-reasoning when handed a single tool. Prefer it
 over the Qwen-7B distill when latency matters and the use case
 doesn't need reasoning depth. The Qwen-7B distill is better when you
@@ -239,7 +239,7 @@ Llama-3.1-8B-Instruct-NVFP4) that handles auto choice reliably.
 
 ## Cache hygiene
 
-### vLLM / SGLang — re-probe when sha changes
+### vLLM / SGLang -- re-probe when sha changes
 
 The HF probe cache is keyed on `<repo>@<sha>` where `sha` is the first
 12 chars of HuggingFace's commit SHA at generation time
@@ -250,9 +250,9 @@ The HF probe cache is keyed on `<repo>@<sha>` where `sha` is the first
 3. Run `make probe-vllm` / `make probe-sglang` to populate the new key.
 
 Old entries persist until manually pruned. The router synthesizes only
-from the latest catalog sha — old entries don't affect serving.
+from the latest catalog sha -- old entries don't affect serving.
 
-### Ollama — re-probe when digest changes
+### Ollama -- re-probe when digest changes
 
 Ollama models are identified by their manifest digest. Pulling a new
 quantization or alias changes the digest; the prober keys on digest
@@ -266,17 +266,17 @@ When a probe records `fits: false`, `evidence.kind` tells you why:
 |---|---|---|
 | `arch` | Model's architecture (`config.json`) is rejected by the backend's runtime. Custom-code archs (e.g. `auto_map`-only models) hit this. | Wait for upstream support, or pick a different model. The probe records `capability: "unsupported_arch"` and the picker hides the row permanently. |
 | `quant` | Quantization scheme (FP8/GPTQ/AWQ) not supported on this hardware. | Pick a different quant of the same model. |
-| `oom_startup` | Container failed during model load — weights + KV at requested ctx exceed the GPU memory budget. | Reduce `MAX_CONTEXT_LEN`, pick a smaller quant, or run on a larger GPU. |
-| `oom_chat` | Container started but failed on the first chat round-trip — typically CUDA-graph capture OOM. | Same as `oom_startup`; the budget is too tight for the model + ctx. |
-| `clamped_ctx` | Backend silently capped `actual_max_model_len` below the requested ctx — typically a model with a hard architectural ceiling lower than the operator-requested tier. | Lower the requested ctx tier or accept the cap. |
-| `infra` | Container failed for non-model reasons — image missing nvcc, network error, tokenizer download stall, podman issue. The log excerpt usually shows what. | Fix the environment; this is not a model-fitness signal. |
-| `implied_spill` | Larger ctx tier filled in by the prober without launching — set when a smaller ctx at the same VRAM band already failed. | Skip; smaller ctx fit is the actionable upper bound. |
+| `oom_startup` | Container failed during model load -- weights + KV at requested ctx exceed the GPU memory budget. | Reduce `MAX_CONTEXT_LEN`, pick a smaller quant, or run on a larger GPU. |
+| `oom_chat` | Container started but failed on the first chat round-trip -- typically CUDA-graph capture OOM. | Same as `oom_startup`; the budget is too tight for the model + ctx. |
+| `clamped_ctx` | Backend silently capped `actual_max_model_len` below the requested ctx -- typically a model with a hard architectural ceiling lower than the operator-requested tier. | Lower the requested ctx tier or accept the cap. |
+| `infra` | Container failed for non-model reasons -- image missing nvcc, network error, tokenizer download stall, podman issue. The log excerpt usually shows what. | Fix the environment; this is not a model-fitness signal. |
+| `implied_spill` | Larger ctx tier filled in by the prober without launching -- set when a smaller ctx at the same VRAM band already failed. | Skip; smaller ctx fit is the actionable upper bound. |
 
 The `evidence.matched_pattern` field (when present) names the substring
-that triggered the classification — useful for auditing why a particular
+that triggered the classification -- useful for auditing why a particular
 launch was tagged a particular way.
 
-## Coordination — only one backend at a time
+## Coordination -- only one backend at a time
 
 The router serializes GPU access via `stopOtherBackends`. A request for
 backend X drains and stops all other GPU-using backends before X starts.
@@ -295,4 +295,4 @@ When the picker selects a model + context tier (+ reasoning override), each back
 
 Valid reasoning suffixes: `::off`, `::auto`, `::low`, `::medium`, `::high`, `::nothink` (Ollama only; suppresses thinking).
 
-Both flows are transparent to the agent CLI — the picker emits the right serving name and the router handles parsing and lifecycle management.
+Both flows are transparent to the agent CLI -- the picker emits the right serving name and the router handles parsing and lifecycle management.
