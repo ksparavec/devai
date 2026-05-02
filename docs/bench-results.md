@@ -47,27 +47,41 @@ The bench produces evidence-grade routing recommendations. On this
 | **Qwen3.5-9B-NVFP4@131072** | 0.95 | 0.74 | 0.80 | 0.4/1.0/0.8/1.0 | 0.000 | 162.3 | 32.6/34.1 | 55.7 | 21.66 GB | 0.83 |
 | **Llama-3.1-8B-Instruct-NVFP4@131072** | 0.84 | 0.72 | 0.75 | 1.0/0.6/1.0/0.4 | 0.000 | 41.6 | 22.9/24.9 | **95.9** | 22.65 GB | 0.77 |
 | **DeepSeek-R1-Distill-Qwen-7B@65536** | 0.88 | 0.26 | 0.65 | 1.0/0.8/0.4/0.4 | 0.000 | 86.9 | 36.4/40.1 | 45.2 | 21.89 GB | 0.60 |
-| **DeepSeek-R1-Distill-Llama-8B@32768** | 0.57 | 0.00^+^+^+ | 0.60 | 1.0/0.4/0.4/0.6 | 0.000 | 85.2 | 37.6/53.1 | 42.5 | 21.69 GB | 0.39 |
-| **Nemotron-Nano-9B-v2-NVFP4@65536** | 0.84 | 0.00^+^+^+ | 0.00 | 0.0/0.0/0.0/0.0 | 0.075 (3x `</think>`) | 114.9 | 27.6/32.0 | 81.1 | 22.28 GB | 0.28 |
+| **DeepSeek-R1-Distill-Llama-8B@32768** | 0.57 | 0.00^* | 0.60 | 1.0/0.4/0.4/0.6 | 0.000 | 85.2 | 37.6/53.1 | 42.5 | 21.69 GB | 0.39 |
+| **Nemotron-Nano-9B-v2-NVFP4@65536** | 0.84 | 0.06 | 0.00^+ | 0.0/0.0/0.0/0.0 | 0.075 (3x `</think>`) | 114.9 | 27.6/32.0 | 81.1 | 22.29 GB | 0.30 |
 
 Subcase legend: **E**mpty-schema . **S**ingle-arg . **M**ulti-tool-pick . **F**ollow-up.
 All TPS values are post-fix (see "TPS counting fix" below).
 
 Footnotes for caveats marked above:
 
-- ^+^+^+ **HumanEval=0.00 for inline-reasoning models** (Nemotron-Nano,
-  R1-Distill-Llama-8B) is a scorer-strictness issue: my
-  `_clean_completion` only handles a fence enclosing the entire
-  completion, but inline-reasoning models emit `<think>...</think>`
-  blocks before the code fence. Fix planned: search for the LAST
-  fenced code block and ignore preamble. Plus, R1-Distill-Llama-8B
-  has a *separate* tokenizer-decoding bug -- see the issues section.
+- ^* **`HumanEval=0.00` for R1-Distill-Llama-8B** is the byte-level
+  BPE-decode bug (Issue #1 below): the model emits raw `G`-marker
+  (space) and `C`-marker (newline) tokens un-decoded, so every
+  completion is invalid Python regardless of the scorer. Confirmed
+  by re-running with the v2 scorer after the fence-handling fix --
+  pass@1 stayed at 0.00. Fixing this is followup #3 (file vLLM
+  issue with reproducer).
+- ^+ **`tools_use=0.00` for Nemotron-Nano-9B-v2-NVFP4** is because the
+  router's `maybeStripTools` drops `tools` and `tool_choice` from the
+  request entirely when no tool parser is probed, and Nemotron has
+  no `parsers:` block in `model-families.yaml`. NVIDIA does ship a
+  parser plugin (`nemotron_toolcall_parser_no_streaming.py`) for
+  vLLM's `--tool-parser-plugin` mechanism; wiring it up is a
+  separate followup (see followup work below).
 
 (The previous `^+^+` footnote about `tools_use=0.00` on forced-mode
 models is gone: the bench's `tools_use` task now pins `tool_choice`
 per-sample via a custom tool-call loop, so R1-Distill x2 and
 Llama-3.1-8B-Instruct-NVFP4 produce real scores. See "Issues surfaced
 > 2. Tool-loop interruption on forced-mode models" below.)
+
+(The previous `^+^+^+` footnote about `HumanEval=0.00` for inline-
+reasoning models is replaced by the two notes above: the v2 scorer
+recovered Nemotron 0.00 → 0.06 -- modest because Nemotron is just
+genuinely weak at HumanEval, not because the scorer was hiding a
+strong score; R1-Distill-Llama-8B stayed 0.00 because of the BPE
+bug, which the scorer can't work around.)
 
 ## Methodology
 
@@ -260,17 +274,67 @@ for forced-mode models on multi-tool prompts.
 3 occurrences across 40 latency prompts. The model emits
 `<think>...</think>` inline (it's `cap=inline`, not structured), and
 Nemotron has no `parsers:` block in `model-families.yaml`, so vLLM
-launches without `--reasoning-parser`. The parser would catch the
-markers if curated. **Action**: research Nemotron's reasoning parser
-support; if available in vLLM, add to family yaml.
+launches without `--reasoning-parser`.
 
-### 4. HumanEval scorer too strict for inline-reasoning models
-`_clean_completion` only handles a fence enclosing the entire output.
-Inline-reasoning models put `<think>...</think>` before the code
-fence. Affects Nemotron-Nano (0.00 likely much higher in reality) and
-R1-Distill-Llama-8B (compounded by issue #1). **Action**: in v2, find
-the LAST fenced code block; if no fence, find the function definition
-matching `entry_point`.
+**What NVIDIA actually prescribes** (from the HF model card,
+checked 2026-05-02): reasoning is controlled via `/think` (default)
+or `/no_think` keywords in the system message or per-turn user
+message; the model emits `<think>...</think>` tags around the trace.
+Tool calling uses NVIDIA's custom `<TOOLCALL>` / `<AVAILABLE_TOOLS>`
+/ `<TOOL_RESPONSE>` format, with a parser plugin
+(`nemotron_toolcall_parser_no_streaming.py`) that ships in the HF
+repo for vLLM's `--tool-parser-plugin` mechanism. The full launch
+spec is `vllm serve nvidia/NVIDIA-Nemotron-Nano-9B-v2
+--trust-remote-code --mamba_ssm_cache_dtype float32
+--enable-auto-tool-choice --tool-parser-plugin <vendored-script>
+--tool-call-parser nemotron_json`. None of that is wired up in this
+repo today.
+
+**Action**: see followup #4 below for the concrete steps. The
+existing comment in `model-families.yaml` claiming "no shipped
+parser matches" predates checking NVIDIA's docs and is wrong; it's
+flagged for correction as part of that followup.
+
+### 4. HumanEval scorer too strict for inline-reasoning models — **FIXED**
+`_clean_completion` v1 only matched a fence enclosing the **entire**
+completion (after `strip()`); inline-reasoning models that put a
+`<think>...</think>` preamble before the code fence, or surrounding
+prose around the fence, fell through to "return raw text" and the
+subprocess saw `<think>` / `Here's the code:` lines as syntax errors.
+
+**Resolution**: rewrote `_clean_completion` in
+`scripts/bench/tasks/humaneval.py` with three layered strategies:
+
+1. Strip any `<think>...</think>` blocks (re.DOTALL, case-insensitive).
+2. If one or more fenced blocks remain, return the body of the
+   **last** one (empirically the model's final answer when it drafts
+   then revises).
+3. If no fence and an `entry_point` is known, anchor on
+   `^def <entry_point>\(` and slice from there.
+4. Else return the think-stripped text as-is.
+
+Smoke-tested against 9 representative inputs (whole-text fence, fence
+with surrounding prose, `<think>` + fence, `<think>` + naked def,
+draft+final fences, entry_point-name-in-prose-then-real-def, unclosed
+`<think>`, empty input). All passed.
+
+**Validation rerun** (`BENCH_TASKS=humaneval BENCH_FORCE=1` over
+Nemotron + R1-Distill-Llama-8B):
+
+- Nemotron-Nano-9B-v2-NVFP4 pass@1: 0.00 → **0.06** (3/50). Modest
+  improvement; the scorer was hiding ~3 truly-passing samples behind
+  preamble. Most failures are genuine coding weakness, not scorer
+  strictness — the doc's earlier "0.00 likely much higher in reality"
+  speculation was over-optimistic.
+- R1-Distill-Llama-8B pass@1: 0.00 → **0.00**. Confirms the byte-level
+  BPE-decode bug (Issue #1) is the *dominant* failure mode here, not
+  scorer strictness — every completion is still invalid Python.
+
+The scorer fix is a no-op-or-improvement for already-passing models
+(strict whole-text fence still matches; surrounding-prose paths only
+fire when the strict path would have returned the unmodified text).
+No re-run of auto-mode models was performed; their cached scores are
+still meaningful.
 
 ### 5. TPS undercounted for Qwen3 reasoning parser
 vLLM with `--reasoning-parser qwen3` doesn't include `reasoning_content`
@@ -374,25 +438,58 @@ agentic use" badge.
    DeepSeek-R1-Distill-Qwen-7B (0.00 → 0.65), DeepSeek-R1-Distill-Llama-8B
    (0.00 → 0.60). See "Issues surfaced > 2" for details and the tradeoff
    on `multi_tool_pick`.
-2. **Fix HumanEval scorer for inline-reasoning models** -- recovers
-   Nemotron and R1-Distill-Llama-8B HumanEval data. ~30 min.
+2. ~~**Fix HumanEval scorer for inline-reasoning models** -- recovers
+   Nemotron and R1-Distill-Llama-8B HumanEval data.~~ **Done.**
+   `scripts/bench/tasks/humaneval.py::_clean_completion` rewritten with
+   `<think>` stripping + last-fence selection + `^def <entry_point>\(`
+   fallback. Validated: Nemotron 0.00 → 0.06 (modest -- mostly genuine
+   coding weakness, not scorer strictness); R1-Distill-Llama-8B stayed
+   0.00 (BPE bug, see followup #3). See "Issues surfaced > 4" for
+   details.
 3. **Investigate R1-Distill-Llama-8B BPE-decode bug** -- file vLLM
    issue with reproducer. Likely a vLLM x Llama-3 tokenizer x reasoning-
    parser interaction.
-4. **Add KV-pressure column to `make bench-report`** -- the data is
+4. **Wire up Nemotron-Nano-9B-v2 per NVIDIA's official guidance.**
+   The current `tools_use=0.00` and `leak_rate=0.075` plus the
+   sub-optimal HumanEval are not architectural limits; they're a
+   missing-config problem. NVIDIA's HF model card prescribes a
+   specific parser plugin and launch flags that we don't ship. Steps:
+     a. Vendor `NVIDIA-Nemotron-Nano-9B-v2/nemotron_toolcall_parser_no_streaming.py`
+        from the HF repo into `scripts/parsers/` (or download at
+        probe-time) and reference it via `--tool-parser-plugin`.
+     b. Add a `parsers:` block under the `nemotron-nano-v2` family in
+        `scripts/model-families.yaml`: `tool_parser: nemotron_json`,
+        plus the launch flags `--enable-auto-tool-choice
+        --trust-remote-code --mamba_ssm_cache_dtype float32`. Update
+        the comment block above the family (currently asserts "no
+        shipped parser matches" -- that's wrong, NVIDIA does ship one).
+     c. For HumanEval / pure-code prompts: the bench's system prompt
+        currently fights the model's default `/think` -- adding
+        `/no_think` to the system message would skip reasoning and
+        likely raise pass@1 noticeably. Either patch the bench's
+        SYSTEM_PROMPT for Nemotron specifically or rely on a future
+        per-model prompt override knob.
+     d. Re-run `make probe-vllm` (just for this family); the per-cell
+        cache should flip `tool_parser: nemotron_json`,
+        `tool_mode: auto`, `disable_verified: True`. If the probe
+        rejects the parser, the launch flags are wrong.
+     e. Re-run `make bench-vllm BENCH_REPO=Nemotron-Nano BENCH_FORCE=1`
+        and update the table + "Avoid (broken)" tier accordingly.
+     Reference: https://huggingface.co/nvidia/NVIDIA-Nemotron-Nano-9B-v2
+5. **Add KV-pressure column to `make bench-report`** -- the data is
    already in the cache. ~10 min.
-5. **Add a long-context probe (one prompt at 80% of ctx)** -- detects
+6. **Add a long-context probe (one prompt at 80% of ctx)** -- detects
    KV paging cliffs that the current latency probe misses. v2 feature.
-6. **Add inspect_ai's vLLM `/metrics` snapshot** -- captures
+7. **Add inspect_ai's vLLM `/metrics` snapshot** -- captures
    `vllm:gpu_cache_usage_perc` and `vllm:num_preemptions_total` per
    run. Real-time KV pressure indicators.
-7. **Run `bench-sglang`** -- only one fitting model (`gpt-oss-20b`),
+8. **Run `bench-sglang`** -- only one fitting model (`gpt-oss-20b`),
    single-row delta to the leaderboard. Quick.
-8. **Run `bench-ollama`** -- 28 models, ~4 hours wall time. Parallel
+9. **Run `bench-ollama`** -- 28 models, ~4 hours wall time. Parallel
    to vLLM since Ollama models are smaller and the bench framework
    is the same.
-9. **Wire bench cache -> picker badge** -- tag PRODUCTION_AGENTIC rows
-   in the picker UI. v2 feature.
+10. **Wire bench cache -> picker badge** -- tag PRODUCTION_AGENTIC rows
+    in the picker UI. v2 feature.
 
 ## Cross-references
 

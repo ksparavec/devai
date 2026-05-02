@@ -47,19 +47,62 @@ _RUN_TIMEOUT_S = 10.0
 # test needs; protects the host if the model writes a runaway list.
 _MEM_LIMIT_MB = 256
 
-# Strip markdown fences and any "Here is the implementation:" preamble
-# that smaller models like to add despite the system prompt.
-_FENCE_RX = re.compile(r"^```(?:python)?\s*\n(.*?)\n```\s*$", re.DOTALL)
+# Match any fenced code block (with optional ``python|py`` info-string)
+# anywhere in the text. Non-greedy body so multiple fences round-trip
+# correctly via ``findall`` (caller takes the last match).
+_FENCE_BLOCK_RX = re.compile(r"```(?:python|py)?\s*\n?(.*?)```", re.DOTALL)
+# Strip ``<think>...</think>`` reasoning preambles that inline-reasoning
+# models (Nemotron-Nano, R1-Distill-Llama-8B) emit before the actual
+# code. Models with a probe-verified reasoning parser (Qwen3, deepseek_r1
+# applied to Qwen tokenizer, harmony) split ``reasoning_content`` off
+# server-side, so this regex is a no-op for them; it only fires for the
+# inline-reasoning case.
+_THINK_RX = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
 
-def _clean_completion(text: str) -> str:
-    """Strip markdown fences from a completion. Keep the rest as-is."""
+def _clean_completion(text: str, entry_point: str = "") -> str:
+    """Extract executable Python from a model completion.
+
+    Strategy (in order):
+
+    1. Strip any ``<think>...</think>`` reasoning blocks. Inline-reasoning
+       models stuff CoT prose, sometimes pseudocode, into these blocks
+       before the real answer. Leaving them in causes the subprocess
+       to choke on ``<`` as a syntax error.
+    2. If one or more fenced code blocks are present, return the body
+       of the **last** one. The last fence is empirically the model's
+       final answer — earlier fences are often draft attempts the model
+       then revised.
+    3. If no fence is present and an ``entry_point`` is known, find the
+       first line that starts with ``def <entry_point>(`` and slice from
+       there to the end. Catches models that emit raw code after a
+       ``<think>`` block without wrapping it.
+    4. Otherwise return the think-stripped text as-is. Same fall-through
+       behaviour as the original strict fence-only cleaner for non-
+       reasoning models with clean output.
+
+    The strict v1 cleaner only matched a fence enclosing the entire
+    completion (after ``strip()``) and otherwise returned the raw text.
+    That returned ``<think>...</think>\\n```python\\n...\\n``` `` verbatim
+    to the subprocess, which failed every Nemotron-Nano and R1-Distill-
+    Llama-8B sample with a parse error -- not because the code was bad
+    but because the wrapper text wasn't valid Python.
+    """
     if not text:
         return ""
-    m = _FENCE_RX.search(text.strip())
-    if m:
-        return m.group(1)
-    return text
+    cleaned = _THINK_RX.sub("", text).strip()
+    fences = _FENCE_BLOCK_RX.findall(cleaned)
+    if fences:
+        return fences[-1].rstrip("\n")
+    if entry_point:
+        m = re.search(
+            rf"^def\s+{re.escape(entry_point)}\s*\(",
+            cleaned,
+            flags=re.MULTILINE,
+        )
+        if m:
+            return cleaned[m.start() :]
+    return cleaned
 
 
 def _record_to_sample(record: dict) -> Sample:
@@ -132,7 +175,9 @@ def humaneval_pass_at_1():
         if not test or not entry_point:
             return Score(value=0.0, answer="", explanation="missing test or entry_point")
 
-        completion = _clean_completion(state.output.completion or "")
+        completion = _clean_completion(
+            state.output.completion or "", entry_point=entry_point
+        )
         # The HumanEval convention: program = prompt + completion + test +
         # `check(<entry>)` invocation. The test module defines `check(fn)`.
         program = (
