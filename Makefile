@@ -132,6 +132,7 @@ endif
 .PHONY: clean clean-cpu clean-gpu clean-router prune
 .PHONY: fetch-cli pull-images install install-systemd uninstall test test-router test-ollama test-agents test-models test-probe-vllm test-probe-sglang test-probe-ollama-idempotent test-vllm test-sglang test-e2e test-full help
 .PHONY: catalog-regen catalog-suggest probe probe-vllm probe-sglang model-fit model-pull vram-fit verify-backend-flags ollama-cleanup-ctx-variants
+.PHONY: bench bench-vllm bench-sglang bench-ollama bench-report test-bench-smoke
 
 all: help
 
@@ -981,3 +982,96 @@ install-systemd: ## Install and enable systemd service for infrastructure
 	systemctl --user enable --now devai-infra.service
 	loginctl enable-linger $(USER)
 	@echo "Installed to $(HOME)/.config/devai/ and enabled devai-infra.service"
+
+
+# =============================================================================
+# Bench harness — see scripts/bench/ and docs/router.md "Benchmark harness".
+# =============================================================================
+
+# Cache mounts mirror what the router uses so the runner reads the same
+# probe data the live stack does.
+BENCH_CACHE_MOUNTS = \
+	-v $(CURDIR)/scripts:/scripts:ro \
+	-v $(CURDIR)/deploy:/deploy \
+	-v $(CACHE_DIR)/bench:$(CACHE_DIR)/bench
+
+# n-knobs surface to the runner as both env (for inspect_ai's task
+# constructors that read defaults) and CLI flags (the runner reads them
+# either way; CLI takes precedence).
+BENCH_RUN_FLAGS = \
+	$(if $(BENCH_TASKS),--tasks '$(BENCH_TASKS)',) \
+	$(if $(BENCH_REPO),--repo '$(BENCH_REPO)',) \
+	$(if $(BENCH_FORCE),--force,) \
+	$(if $(BENCH_N_GSM8K),--n-gsm8k $(BENCH_N_GSM8K),) \
+	$(if $(BENCH_N_HUMANEVAL),--n-humaneval $(BENCH_N_HUMANEVAL),) \
+	$(if $(BENCH_N_TOOLS),--n-tools $(BENCH_N_TOOLS),) \
+	$(if $(BENCH_N_LEAK_PROMPTS),--n-leak-prompts $(BENCH_N_LEAK_PROMPTS),)
+
+bench: bench-vllm bench-sglang bench-ollama ## Bench every probed model on every backend
+	@echo
+	@echo ">>> bench complete; run 'make bench-report' for the leaderboard"
+
+bench-vllm: ## Bench every loaded vLLM/HF model via devai-router:11435
+	@# Pre-condition: devai-router + devai-vllm reachable on devai-net
+	@# (run 'make cache-up'). nvidia-smi must be on PATH inside the
+	@# lab image so the VRAM sampler reads memory.used.
+	@mkdir -p $(CACHE_DIR)/bench/inspect-logs
+	$(CONTAINER_RUNTIME) run --rm \
+		--network $(DEVAI_NETWORK) \
+		$(BENCH_CACHE_MOUNTS) \
+		$(GPU_FLAGS) \
+		-e GPU_MEMORY_GB=$(GPU_MEMORY_GB) \
+		--entrypoint python3 \
+		$(IMAGE_NAME_GPU) \
+		/scripts/bench/bench_runner.py --backend vllm \
+			$(BENCH_RUN_FLAGS)
+
+bench-sglang: ## Bench every loaded SGLang model via devai-router:11436
+	@mkdir -p $(CACHE_DIR)/bench/inspect-logs
+	$(CONTAINER_RUNTIME) run --rm \
+		--network $(DEVAI_NETWORK) \
+		$(BENCH_CACHE_MOUNTS) \
+		$(GPU_FLAGS) \
+		-e GPU_MEMORY_GB=$(GPU_MEMORY_GB) \
+		--entrypoint python3 \
+		$(IMAGE_NAME_GPU) \
+		/scripts/bench/bench_runner.py --backend sglang \
+			$(BENCH_RUN_FLAGS)
+
+bench-ollama: ## Bench every loaded Ollama model via devai-router:11434
+	@mkdir -p $(CACHE_DIR)/bench/inspect-logs
+	$(CONTAINER_RUNTIME) run --rm \
+		--network $(DEVAI_NETWORK) \
+		$(BENCH_CACHE_MOUNTS) \
+		$(GPU_FLAGS) \
+		-e GPU_MEMORY_GB=$(GPU_MEMORY_GB) \
+		--entrypoint python3 \
+		$(IMAGE_NAME_GPU) \
+		/scripts/bench/bench_runner.py --backend ollama \
+			$(BENCH_RUN_FLAGS)
+
+bench-report: ## Print a Markdown leaderboard from .bench-cache.json
+	@$(CONTAINER_RUNTIME) run --rm \
+		-v $(CURDIR)/scripts:/scripts:ro \
+		-v $(CURDIR)/deploy:/deploy:ro \
+		--entrypoint python3 \
+		$(IMAGE_NAME) \
+		/scripts/bench/bench_report.py \
+			--cache /deploy/.bench-cache.json
+
+test-bench-smoke: ## 1-model tiny-subset smoke test (CI / sanity)
+	@# Picks the smallest fitting vLLM model and runs n=5 on every
+	@# task type plus n=10 on the latency probe. Should finish in
+	@# under 5 minutes on a 24G GPU once the model is warm.
+	@mkdir -p $(CACHE_DIR)/bench/inspect-logs
+	$(CONTAINER_RUNTIME) run --rm \
+		--network $(DEVAI_NETWORK) \
+		$(BENCH_CACHE_MOUNTS) \
+		$(GPU_FLAGS) \
+		-e GPU_MEMORY_GB=$(GPU_MEMORY_GB) \
+		--entrypoint python3 \
+		$(IMAGE_NAME_GPU) \
+		/scripts/bench/bench_runner.py --backend vllm \
+			--repo "Qwen3-8B-NVFP4" \
+			--n-gsm8k 5 --n-humaneval 5 --n-tools 4 --n-leak-prompts 10 \
+			--force

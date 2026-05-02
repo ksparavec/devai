@@ -1,0 +1,20 @@
+{"id": "empty-1", "subcase": "empty_schema", "prompt": "List the active tasks.", "expect_tool": "task_list", "expect_args": {}}
+{"id": "empty-2", "subcase": "empty_schema", "prompt": "What's on the task list?", "expect_tool": "task_list", "expect_args": {}}
+{"id": "empty-3", "subcase": "empty_schema", "prompt": "Show me my todos.", "expect_tool": "task_list", "expect_args": {}}
+{"id": "empty-4", "subcase": "empty_schema", "prompt": "Use task_list to enumerate active items.", "expect_tool": "task_list", "expect_args": {}}
+{"id": "empty-5", "subcase": "empty_schema", "prompt": "Call task_list now and report what comes back.", "expect_tool": "task_list", "expect_args": {}}
+{"id": "single-1", "subcase": "single_arg", "prompt": "What's the weather in Paris?", "expect_tool": "get_weather", "expect_args": {"city": "Paris"}}
+{"id": "single-2", "subcase": "single_arg", "prompt": "Get me the weather for Tokyo.", "expect_tool": "get_weather", "expect_args": {"city": "Tokyo"}}
+{"id": "single-3", "subcase": "single_arg", "prompt": "How is the weather in Berlin today?", "expect_tool": "get_weather", "expect_args": {"city": "Berlin"}}
+{"id": "single-4", "subcase": "single_arg", "prompt": "Look up the weather for the city of San Francisco.", "expect_tool": "get_weather", "expect_args": {"city": "San Francisco"}}
+{"id": "single-5", "subcase": "single_arg", "prompt": "Tell me the weather in Mumbai.", "expect_tool": "get_weather", "expect_args": {"city": "Mumbai"}}
+{"id": "multi-1", "subcase": "multi_tool_pick", "prompt": "What time is it in UTC?", "expect_tool": "get_time", "expect_args": {"tz": "UTC"}}
+{"id": "multi-2", "subcase": "multi_tool_pick", "prompt": "Show me the active tasks.", "expect_tool": "task_list", "expect_args": {}}
+{"id": "multi-3", "subcase": "multi_tool_pick", "prompt": "What's the weather in Oslo?", "expect_tool": "get_weather", "expect_args": {"city": "Oslo"}}
+{"id": "multi-4", "subcase": "multi_tool_pick", "prompt": "Tell me the current time in America/New_York.", "expect_tool": "get_time", "expect_args": {"tz": "America/New_York"}}
+{"id": "multi-5", "subcase": "multi_tool_pick", "prompt": "List my tasks please.", "expect_tool": "task_list", "expect_args": {}}
+{"id": "follow-1", "subcase": "result_followup", "prompt": "What's the weather in Madrid? After calling the tool, give me a one-line summary including the result.", "expect_tool": "get_weather", "expect_args": {"city": "Madrid"}, "expect_in_final": "Madrid"}
+{"id": "follow-2", "subcase": "result_followup", "prompt": "Check the weather in Rome and tell me what you got back.", "expect_tool": "get_weather", "expect_args": {"city": "Rome"}, "expect_in_final": "Rome"}
+{"id": "follow-3", "subcase": "result_followup", "prompt": "Use the weather tool for Lisbon and summarize the response.", "expect_tool": "get_weather", "expect_args": {"city": "Lisbon"}, "expect_in_final": "Lisbon"}
+{"id": "follow-4", "subcase": "result_followup", "prompt": "Get the weather in Vienna and report what the tool returned.", "expect_tool": "get_weather", "expect_args": {"city": "Vienna"}, "expect_in_final": "Vienna"}
+{"id": "follow-5", "subcase": "result_followup", "prompt": "Look up Athens weather and tell me the result in one short sentence.", "expect_tool": "get_weather", "expect_args": {"city": "Athens"}, "expect_in_final": "Athens"}

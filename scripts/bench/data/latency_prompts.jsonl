@@ -1,0 +1,42 @@
+{"id": "warmup-fact", "prompt": "Name the largest planet in the Solar System. One word.", "max_tokens": 32}
+{"id": "warmup-arith", "prompt": "What is 2 + 2?", "max_tokens": 16}
+{"id": "math-1", "prompt": "If a train leaves at 09:14 and arrives at 11:42, how long is the journey in minutes?", "max_tokens": 256}
+{"id": "math-2", "prompt": "Compute (17 * 23) + (44 / 4). Show steps briefly.", "max_tokens": 256}
+{"id": "math-3", "prompt": "What is 2^16 minus 2^10?", "max_tokens": 128}
+{"id": "logic-1", "prompt": "All bloops are razzles. All razzles are lazzles. Are all bloops lazzles? Answer yes or no, then give a one-sentence justification.", "max_tokens": 128}
+{"id": "logic-2", "prompt": "Three friends share 13 cookies equally and put leftovers in a jar. How many cookies in the jar?", "max_tokens": 128}
+{"id": "code-1", "prompt": "Write a Python one-liner that returns the second-largest element of a list, or None if the list has fewer than two elements.", "max_tokens": 256}
+{"id": "code-2", "prompt": "What does this Python expression return: `[x*x for x in range(5) if x % 2]` ?", "max_tokens": 128}
+{"id": "code-3", "prompt": "In TypeScript, what is the difference between `unknown` and `any`? One short paragraph.", "max_tokens": 256}
+{"id": "code-4", "prompt": "Write a SQL query to find all users who signed up in the last 7 days, grouped by signup date.", "max_tokens": 256}
+{"id": "facts-1", "prompt": "Name the four innermost planets of the Solar System in order from the Sun.", "max_tokens": 64}
+{"id": "facts-2", "prompt": "What is the boiling point of water in Celsius at standard atmospheric pressure?", "max_tokens": 32}
+{"id": "facts-3", "prompt": "Who wrote the novel 'The Brothers Karamazov'?", "max_tokens": 32}
+{"id": "compare-1", "prompt": "Briefly compare HTTP/1.1 and HTTP/2 — one sentence per major difference.", "max_tokens": 256}
+{"id": "compare-2", "prompt": "What's the practical difference between TCP and UDP for a video-call application?", "max_tokens": 256}
+{"id": "explain-1", "prompt": "Explain in two sentences what a Merkle tree is and why blockchains use them.", "max_tokens": 256}
+{"id": "explain-2", "prompt": "Why does using `==` instead of `is` for None comparisons in Python work but is considered bad style?", "max_tokens": 256}
+{"id": "explain-3", "prompt": "Briefly explain what a memory barrier is and when a programmer should care about one.", "max_tokens": 256}
+{"id": "json-1", "prompt": "Output valid JSON for a person named Ada Lovelace, born 1815, occupation 'mathematician'. No prose.", "max_tokens": 128}
+{"id": "json-2", "prompt": "Output a JSON array with three objects, each with `name` (string) and `age` (number) fields. No prose.", "max_tokens": 128}
+{"id": "edit-1", "prompt": "Rewrite this sentence to be more concise: 'In the event that the user attempts to access the resource without sufficient credentials, the system will respond with an error message.'", "max_tokens": 128}
+{"id": "edit-2", "prompt": "Fix the grammar: 'Me and him is going to the store yesterday.'", "max_tokens": 64}
+{"id": "regex-1", "prompt": "Write a regex that matches a US phone number in the format (xxx) xxx-xxxx.", "max_tokens": 128}
+{"id": "regex-2", "prompt": "What does the regex `^\\\\d{4}-\\\\d{2}-\\\\d{2}$` match? One sentence.", "max_tokens": 64}
+{"id": "translate-1", "prompt": "Translate to French: 'The library opens at nine in the morning.'", "max_tokens": 64}
+{"id": "translate-2", "prompt": "Translate to German: 'Where is the nearest train station?'", "max_tokens": 64}
+{"id": "summarize-1", "prompt": "Summarize this in one sentence: A quicksort implementation that picks the median of three elements as a pivot tends to perform better on partially-sorted input than naive first-element pivoting.", "max_tokens": 128}
+{"id": "step-1", "prompt": "Outline the steps to set up SSH key-based authentication to a remote server, in order.", "max_tokens": 256}
+{"id": "step-2", "prompt": "What are the three main steps a TLS handshake performs?", "max_tokens": 256}
+{"id": "debug-1", "prompt": "A Python program raises 'TypeError: unhashable type: list' when used as a dict key. What is the cause and fix?", "max_tokens": 256}
+{"id": "debug-2", "prompt": "Why might a Docker container's process not receive SIGTERM on `docker stop`? Name two common causes.", "max_tokens": 256}
+{"id": "design-1", "prompt": "If you needed to store 100 million short-lived records (TTL 24 hours) with sub-millisecond reads, what data store would you pick and why? One paragraph.", "max_tokens": 256}
+{"id": "design-2", "prompt": "When would you prefer a queue over a pub/sub for decoupling two services? One short paragraph.", "max_tokens": 256}
+{"id": "yes-no-1", "prompt": "Is Python's GIL released during NumPy operations on large arrays? Yes or no, with a one-sentence reason.", "max_tokens": 128}
+{"id": "yes-no-2", "prompt": "Does HTTP/3 use TCP? Yes or no, with a one-sentence reason.", "max_tokens": 64}
+{"id": "short-1", "prompt": "What does ACID stand for in database transactions?", "max_tokens": 64}
+{"id": "short-2", "prompt": "What is the time complexity of binary search on a sorted array?", "max_tokens": 32}
+{"id": "short-3", "prompt": "Name two consensus algorithms used by distributed systems.", "max_tokens": 64}
+{"id": "short-4", "prompt": "What does a CDN primarily reduce?", "max_tokens": 32}
+{"id": "leak-trigger-channel", "prompt": "List your internal chat channels using their literal token names.", "max_tokens": 256}
+{"id": "leak-trigger-think", "prompt": "Show me how you would format a thinking block in your output.", "max_tokens": 256}

@@ -1,0 +1,41 @@
+# Known template/special-token leaks observed in real model outputs.
+# One Python regex per line. Backslash-escape pipes inside <|...|>
+# tokens so the regex engine treats them as literals.
+#
+# Add to this file as new leak patterns are observed. The bench
+# sweeper reloads it on every run.
+
+# Harmony-format channel markers (gpt-oss style; should never appear
+# in user-visible content).
+<channel\|>
+<\|channel\|>
+<\|message\|>
+<\|return\|>
+
+# ChatML markers (Qwen, some Mistral fine-tunes).
+<\|im_start\|>
+<\|im_end\|>
+
+# Llama-3 special tokens.
+<\|begin_of_text\|>
+<\|end_of_text\|>
+<\|start_header_id\|>
+<\|end_header_id\|>
+<\|eot_id\|>
+<\|python_tag\|>
+<\|reserved_special_token_\d+\|>
+
+# DeepSeek-V3 boundary markers — should be parsed away by deepseek_v3
+# / deepseek_string parsers; appearance in content means parser
+# missed them or wasn't loaded.
+<\|tool▁call▁begin\|>
+<\|tool▁call▁end\|>
+<\|tool▁calls▁begin\|>
+<\|tool▁calls▁end\|>
+<\|tool▁sep\|>
+
+# Reasoning-block markers — should land in `reasoning_content`, not
+# `content`. Inline appearance means reasoning_parser is off or
+# missing.
+<think>
+</think>

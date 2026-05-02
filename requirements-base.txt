@@ -11,6 +11,18 @@ llm
 jupyter-server-proxy
 jupyter-vscode-proxy
 
+# Benchmark harness — used by scripts/bench/. inspect-ai pulls in its
+# own openai/anthropic providers transitively; keep it pinned so
+# scorer/solver API changes don't silently break the runner.
+inspect-ai
+# inspect_ai validates the Anthropic SDK version at provider init when
+# ANTHROPIC_BASE_URL is set (the lab image sets it for Claude Code).
+# Older anthropic (0.37.x, transitive) crashes inspect_ai with
+# `PrerequisiteError: Anthropic API requires at least version 0.75.0`.
+# Pin a recent anthropic so inspect_ai loads cleanly even when only
+# the OpenAI provider is exercised.
+anthropic>=0.75.0
+
 # Core ML/Data Science
 numpy
 pandas
