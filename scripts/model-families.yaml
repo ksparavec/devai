@@ -306,18 +306,32 @@ families:
       # delivered capability. Re-add only when the project explicitly
       # adds image/audio workflows.
     parsers:
-      # Reasoning parser: SGLang ships `nemotron_3`; vLLM ships
-      # `nemotron_v3`. Names DO NOT match across backends — keep both
-      # verbatim.
+      # Reasoning parser: SGLang ships `nemotron_3`; vLLM has a built-in
+      # `nemotron_v3` that the project initially used, but NVIDIA's HF
+      # model card for the 30B-A3B variant explicitly prescribes a
+      # *different* parser called `nano_v3`, registered via a plugin
+      # script (`nano_v3_reasoning_parser.py`) shipped in the model
+      # repo. The plugin inherits from `DeepSeekR1ReasoningParser` and
+      # adds the `enable_thinking=False` swap for reasoning-disabled
+      # turns. The built-in `nemotron_v3` is for the older 9B-v2 line
+      # and gives different boundaries on this model -- empirically
+      # observed 2026-05-03: under Anthropic-style chat templates
+      # (Claude Code) the boundary detection failed and raw
+      # `<function=...>` Qwen3-Coder tool tags leaked into `content`.
+      # We now vendor `nano_v3_reasoning_parser.py` under
+      # `scripts/vllm_plugins/` and resolve it via the plugin registry
+      # (`deploy/vllm-plugins.json`); the router auto-emits
+      # `--reasoning-parser-plugin <abs> --reasoning-parser nano_v3`.
+      # Names DO NOT match across backends -- keep both verbatim.
       # Tool parser: the prior comment claimed `hermes`. That was wrong
-      # — verified empirically 2026-05-02 against the text-only
+      # -- verified empirically 2026-05-02 against the text-only
       # NVFP4 variant: the model emits Qwen3-Coder-style
       # `<function=NAME><parameter=KEY>VALUE</parameter></function>`
       # tags (NOT JSON-in-`<tool_call>` like Hermes), and the hermes
       # parser JSONDecodeError'd on every call. `qwen3_coder` parsed
       # the round-trip cleanly into OpenAI-format tool_calls.
       vllm:
-        reasoning: nemotron_v3
+        reasoning: nano_v3
         tool: qwen3_coder
       sglang:
         reasoning: nemotron_3

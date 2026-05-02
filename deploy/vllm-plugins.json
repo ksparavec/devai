@@ -22,6 +22,10 @@
     "deepseek_string": {
       "kind": "tool",
       "file": "deepseek_string_tool_parser.py"
+    },
+    "nano_v3": {
+      "kind": "reasoning",
+      "file": "nano_v3_reasoning_parser.py"
     }
   }
 }

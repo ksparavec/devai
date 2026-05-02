@@ -21,9 +21,11 @@
   ],
   "models": {
     "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4": {
-      "engine_flags": ["--enforce-eager"],
+      "engine_flags": ["--enforce-eager", "--trust-remote-code"],
       "engine_env": {
-        "PYTORCH_ALLOC_CONF": "expandable_segments:True"
+        "PYTORCH_ALLOC_CONF": "expandable_segments:True",
+        "VLLM_USE_FLASHINFER_MOE_FP4": "1",
+        "VLLM_FLASHINFER_MOE_BACKEND": "throughput"
       }
     }
   }
