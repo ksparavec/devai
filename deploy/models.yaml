@@ -2,7 +2,7 @@
 #
 # Regenerate with: make catalog-regen
 # Source of truth:  scripts/model-families.yaml
-# Generated at:     2026-05-01T17:57:05+00:00
+# Generated at:     2026-05-02T20:45:34+00:00
 #
 # Every 'size' and 'arch' below was fetched live from the
 # upstream provider at generation time. Do not hand-edit.
@@ -941,6 +941,42 @@ models:
     arch: { layers: 40, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/Qwen3-14B-NVFP4/config.json"
     purpose: "qwen3 · 438.0 GB · 40L/8kv/128h"
+
+  - name: "Qwen3-Coder-30B-A3B-Instruct-FP4"
+    family: qwen3-coder
+    backend: [vllm, sglang]
+    repo: "NVFP4/Qwen3-Coder-30B-A3B-Instruct-FP4"
+    source: hf
+    sha: "3b554c28e968"
+    size: "16.85 GB"
+    arch: { layers: 48, kv_heads: 4, head_dim: 128, k_eq_v: false }
+    arch_source: "NVFP4/Qwen3-Coder-30B-A3B-Instruct-FP4/config.json"
+    purpose: "qwen3-coder · 16.9 GB · 48L/4kv/128h"
+    conversational: true
+    parsers:
+      vllm:
+        tool: qwen3_coder
+      sglang:
+        tool: qwen3_coder
+
+  - name: "Qwen3-30B-A3B-Thinking-2507-FP4"
+    family: qwen3-thinking
+    backend: [vllm, sglang]
+    repo: "NVFP4/Qwen3-30B-A3B-Thinking-2507-FP4"
+    source: hf
+    sha: "421e05c305ff"
+    size: "16.85 GB"
+    arch: { layers: 48, kv_heads: 4, head_dim: 128, k_eq_v: false }
+    arch_source: "NVFP4/Qwen3-30B-A3B-Thinking-2507-FP4/config.json"
+    purpose: "qwen3-thinking · 16.9 GB · 48L/4kv/128h"
+    conversational: true
+    parsers:
+      vllm:
+        reasoning: deepseek_r1
+        tool: hermes
+      sglang:
+        reasoning: deepseek-r1
+        tool: qwen
 
   - name: "llama3.2:1b-instruct-q2_K"
     family: llama3.2
@@ -2317,7 +2353,7 @@ models:
     backend: [vllm, sglang]
     repo: "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4"
     source: hf
-    sha: "b5a7a5e3da84"
+    sha: "5a9e7bf2ff9f"
     size: "20.87 GB"
     arch: { layers: 56, kv_heads: 8, head_dim: 128, k_eq_v: false }
     arch_source: "nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4/config.json"

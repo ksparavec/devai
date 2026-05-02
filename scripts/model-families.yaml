@@ -176,6 +176,46 @@ families:
     arch_ref: nvidia/Qwen3-14B-NVFP4
     thinking: true
 
+  - name: qwen3-coder
+    # Agentic-coding fine-tune of Qwen3-30B-A3B (30.5B total / 3.3B
+    # active MoE). Native 256K context, extends to 1M with YaRN.
+    # Non-thinking only — model card explicitly states it does not
+    # generate <think></think> blocks, so no reasoning parser is set.
+    # Tool calls follow the Qwen3-Coder format which both vLLM and
+    # SGLang register as `qwen3_coder` (same name on both, unlike the
+    # nemotron split). On-disk weights ~18 GB; same VRAM envelope as
+    # the base nvidia/Qwen3-30B-A3B-NVFP4 above.
+    hf_repos:
+      - NVFP4/Qwen3-Coder-30B-A3B-Instruct-FP4
+    parsers:
+      vllm:
+        tool: qwen3_coder
+      sglang:
+        tool: qwen3_coder
+    arch_ref: NVFP4/Qwen3-Coder-30B-A3B-Instruct-FP4
+    thinking: false
+
+  - name: qwen3-thinking
+    # Reasoning refresh of Qwen3-30B-A3B published as the `2507`
+    # series. Thinking-only mode (always emits <think></think>),
+    # 256K native context. Same MoE shape as base Qwen3-30B-A3B
+    # (30.5B / 3.3B active). Reasoning parser names diverge across
+    # backends: vLLM uses `deepseek_r1` (underscore), SGLang uses
+    # `deepseek-r1` (hyphen) — keep both verbatim. Tool calls emit
+    # standard Hermes-style <tool_call> tags inherited from the
+    # Qwen3 chat template.
+    hf_repos:
+      - NVFP4/Qwen3-30B-A3B-Thinking-2507-FP4
+    parsers:
+      vllm:
+        reasoning: deepseek_r1
+        tool: hermes
+      sglang:
+        reasoning: deepseek-r1
+        tool: qwen
+    arch_ref: NVFP4/Qwen3-30B-A3B-Thinking-2507-FP4
+    thinking: true
+
   - name: llama3.2
     # Ollama-only — NVIDIA hasn't published an NVFP4 quant for the
     # Llama-3.2 1B/3B line (too small for the Blackwell tensor-core
