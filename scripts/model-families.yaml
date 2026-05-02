@@ -268,59 +268,60 @@ families:
     ollama_repos:
       - nemotron-3-nano
     hf_repos:
-      # NOTE: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4 was previously
-      # listed here. Removed 2026-05-01 — the 30B-A3B NVFP4 weights
-      # (~19 GB) plus vLLM startup overhead + 32K KV cache exceed 24 GB
-      # and OOM on consumer hardware. The original removal note proposed
-      # `--enforce-eager` (via a family `engine_flags`) as a likely fix.
-      # That hypothesis was tested directly 2026-05-02 and FALSIFIED: the
-      # OOM trips at gpu_model_runner.py:4818 during model load — before
-      # CUDA graph capture happens — so `--enforce-eager` cannot apply.
-      # PyTorch reaches 23.37 GiB on a 23.42 GiB-usable card and fails
-      # on a 316 MiB allocation, with 4.25 GiB reserved-but-unallocated
-      # (heavy fragmentation). The directly-tested flag combination on
-      # this checkpoint was --enforce-eager + --gpu-memory-utilization
-      # 0.90; the same load-time line (4818) failure was also observed
-      # for the structurally-similar Qwen3-Thinking-2507-FP4 against
-      # the full mitigation matrix (--enforce-eager + --kv-cache-dtype
-      # fp8 + --max-num-seqs 4 + --gpu-memory-utilization 0.95), which
-      # confirms that no post-load flag rescues a load-time OOM.
-      # Re-add only when (a) a slimmer NVFP4 quant ships (RedHatAI /
-      # community), or (b) vLLM upstream reduces NemotronH load-time
-      # scratch buffers, or (c) the SGLang NVFP4 path (broken upstream,
-      # see file header) becomes usable as an alternative loader.
-      # The Omni variant below is the same MoE compute envelope but
-      # routed via a different repo (and OOMd similarly in the last
-      # probe — re-evaluate together).
+      # nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4 — text-only sibling
+      # of the Omni variant below.
       #
-      # Multimodal reasoning variant of the same MoE — omni I/O.
-      - nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4
-    gguf_repos:
-      # Nemotron-3-Nano-Omni-30B-A3B-Reasoning — MoE successor with
-      # multimodal (omni) reasoning. ~3B active params per token so
-      # the compute footprint is small even at 30B total.
-      - repo: unsloth/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-GGUF
-        tag_prefix: 30b-a3b-omni
-        include:
-          - UD-Q3_K_XL
-          - UD-IQ3_XXS
+      # History:
+      #   2026-05-01: removed after a probe at 24 GB returned
+      #     gpu_model_runner.py:4818 OOM during model load (PyTorch
+      #     reaches 23.37 GiB on a 23.42 GiB-usable card and fails on a
+      #     316 MiB allocation, with 4.25 GiB reserved-but-unallocated).
+      #   2026-05-02: tested the original --enforce-eager hypothesis;
+      #     FALSIFIED because the OOM trips before CUDA graph capture.
+      #   2026-05-02: vLLM's own error message hinted at the fix —
+      #     PYTORCH_ALLOC_CONF=expandable_segments:True. Combined with
+      #     --enforce-eager + --gpu-memory-utilization 0.92, the model
+      #     loads cleanly: VRAM peaks at 23.12/23.89 GiB (96.8 % of card,
+      #     ~1.3 GiB headroom at 32K) and round-trips both the reasoning
+      #     parser (nemotron_v3) and tool parser (qwen3_coder, NOT hermes
+      #     which JSON-decoder-errored on the model's <function=...>
+      #     <parameter=...> tool format).
+      # Re-added 2026-05-03 with the recovery flags wired into the
+      # router's per-model overrides — see modelRecoveryConfig in
+      # gpu-arbiter/main.go. The flag list lives there rather than in a
+      # catalog field because (a) it's recovery policy not probe-verified
+      # data, (b) it's the same on every (vram, ctx) cell, and (c) the
+      # probe-cache schema doesn't carry flag-list fields.
+      - nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4
+      #
+      # nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4 (and the
+      # matching unsloth GGUF mirror) was previously listed here.
+      # Removed 2026-05-03: project focus is coding + reasoning, the
+      # Omni variant only adds vision/audio I/O on top of the same
+      # reasoning brain, and on a 24G card it would consume both
+      # additional disk and the headroom that the text-only variant
+      # already sits within. The Ollama side never wired multimodal
+      # tokens through `/api/chat` either, so the GGUF mirror was
+      # text-only inference of the Omni weights — branding without
+      # delivered capability. Re-add only when the project explicitly
+      # adds image/audio workflows.
     parsers:
-      # Reasoning parser: SGLang ships `nemotron_3`; vLLM accepts the
-      # same name (its --reasoning-parser is free-form).
-      # Tool parser: the 30B-A3B-NVFP4 chat template emits standard
-      # Hermes-style `<tool_call>...</tool_call>` tags (verified via
-      # `jq -r .chat_template tokenizer_config.json`), so `hermes` is
-      # the right choice on both backends. The probe verifies the
-      # round-trip before the router uses it.
+      # Reasoning parser: SGLang ships `nemotron_3`; vLLM ships
+      # `nemotron_v3`. Names DO NOT match across backends — keep both
+      # verbatim.
+      # Tool parser: the prior comment claimed `hermes`. That was wrong
+      # — verified empirically 2026-05-02 against the text-only
+      # NVFP4 variant: the model emits Qwen3-Coder-style
+      # `<function=NAME><parameter=KEY>VALUE</parameter></function>`
+      # tags (NOT JSON-in-`<tool_call>` like Hermes), and the hermes
+      # parser JSONDecodeError'd on every call. `qwen3_coder` parsed
+      # the round-trip cleanly into OpenAI-format tool_calls.
       vllm:
-        # vLLM registers the parser as `nemotron_v3` in
-        # vllm/reasoning/__init__.py. SGLang registers it as `nemotron_3`.
-        # The names DO NOT match across backends — keep both verbatim.
         reasoning: nemotron_v3
-        tool: hermes
+        tool: qwen3_coder
       sglang:
         reasoning: nemotron_3
-        tool: hermes
+        tool: qwen3_coder
     arch_ref: nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4
     thinking: true        # hint upgraded after probe verified structured
 

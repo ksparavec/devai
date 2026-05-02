@@ -155,6 +155,32 @@ type launchConfig struct {
 	ReasoningParserPlugin string
 }
 
+// modelRecoveryConfig declares per-model recovery flags and environment
+// variables required to load specific checkpoints on the project's
+// reference 24G Blackwell card. Hand-maintained — kept here rather than
+// in the catalog because these are recovery policies (not probe-verified
+// data), they apply identically whether or not a cell was probed, and the
+// probe cache schema doesn't carry a flag-list field. Adding an entry =
+// rebuild the router image (`make build-router`).
+//
+// Add an entry when a model OOMs at vLLM model-load time
+// (gpu_model_runner.py:4818) on the reference 24G card and the listed
+// flags + env rescue it. Verify by direct `podman run` launch first;
+// see the conversation that introduced this map for the worked example
+// on Nemotron-3-Nano. Both fields are optional.
+//
+// The lookup key is the canonical model name (the basename used in
+// /var/cache/devai/ollama/models/vllm/<name>/), not the HF repo path.
+var modelRecoveryConfig = map[string]struct {
+	Flags []string
+	Env   map[string]string
+}{
+	"NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4": {
+		Flags: []string{"--enforce-eager"},
+		Env:   map[string]string{"PYTORCH_ALLOC_CONF": "expandable_segments:True"},
+	},
+}
+
 type configFile struct {
 	Defaults map[string]string `yaml:"defaults"`
 	Models   []configModel     `yaml:"models"`
@@ -751,6 +777,11 @@ func vllmEntrypoint(modelName string, lc launchConfig) []string {
 	if lc.ToolParser != "" {
 		args = append(args, "--enable-auto-tool-choice", "--tool-call-parser", lc.ToolParser)
 	}
+	// Per-model recovery flags (e.g. --enforce-eager for checkpoints that
+	// OOM at vLLM model-load time on 24G). See modelRecoveryConfig.
+	if rec, ok := modelRecoveryConfig[modelName]; ok {
+		args = append(args, rec.Flags...)
+	}
 	return args
 }
 
@@ -774,6 +805,12 @@ func sglangEntrypoint(modelName string, lc launchConfig) []string {
 	}
 	if lc.ToolParser != "" {
 		args = append(args, "--tool-call-parser", lc.ToolParser)
+	}
+	// Per-model recovery flags (mirrors vllmEntrypoint). SGLang's NVFP4
+	// loader path is currently broken upstream so this branch rarely
+	// fires today, but the symmetry keeps the behaviour predictable.
+	if rec, ok := modelRecoveryConfig[modelName]; ok {
+		args = append(args, rec.Flags...)
 	}
 	return args
 }
@@ -1220,8 +1257,21 @@ func (a *arbiter) containerRecreate(bs *backendState, modelName string, desiredC
 		"selinux_opts": []string{"disable"},
 		"hostname":     cfg.Name,
 	}
-	if len(cfg.EnvVars) > 0 {
-		spec["env"] = cfg.EnvVars
+	// Merge per-backend env (cfg.EnvVars) with per-model recovery env
+	// (modelRecoveryConfig). Per-model entries win on key collision —
+	// recovery env exists precisely to override defaults for borderline
+	// checkpoints.
+	envMap := make(map[string]string, len(cfg.EnvVars))
+	for k, v := range cfg.EnvVars {
+		envMap[k] = v
+	}
+	if rec, ok := modelRecoveryConfig[modelName]; ok {
+		for k, v := range rec.Env {
+			envMap[k] = v
+		}
+	}
+	if len(envMap) > 0 {
+		spec["env"] = envMap
 	}
 
 	body, _ := json.Marshal(spec)
