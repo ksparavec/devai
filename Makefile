@@ -1054,6 +1054,7 @@ bench-report: ## Print a Markdown leaderboard from .bench-cache.json
 	@$(CONTAINER_RUNTIME) run --rm \
 		-v $(CURDIR)/scripts:/scripts:ro \
 		-v $(CURDIR)/deploy:/deploy:ro \
+		-e GPU_MEMORY_GB=$(GPU_MEMORY_GB) \
 		--entrypoint python3 \
 		$(IMAGE_NAME) \
 		/scripts/bench/bench_report.py \

@@ -486,8 +486,16 @@ agentic use" badge.
      e. Re-run `make bench-vllm BENCH_REPO=Nemotron-Nano BENCH_FORCE=1`
         and update the table + "Avoid (broken)" tier accordingly.
      Reference: https://huggingface.co/nvidia/NVIDIA-Nemotron-Nano-9B-v2
-5. **Add KV-pressure column to `make bench-report`** -- the data is
-   already in the cache. ~10 min.
+5. ~~**Add KV-pressure column to `make bench-report`** -- the data is
+   already in the cache.~~ **Done.** New `KV %` column at the end of
+   the leaderboard renders `peak_vram_gb / GPU_MEMORY_GB` as a
+   percentage; defaults to a 24 GB host cap (matches RTX 4000 PRO
+   Blackwell), overridable via env (`GPU_MEMORY_GB=48 make bench-report`)
+   or CLI flag (`--host-vram-gb 48`). 95 % is the rule-of-thumb
+   threshold from "KV-pressure observations" above; current cache flags
+   `Qwen3.5-9B-NVFP4` at 95.7 % (the only row above the threshold).
+   Footer line in the report reminds readers of the threshold and
+   points back to this doc.
 6. **Add a long-context probe (one prompt at 80% of ctx)** -- detects
    KV paging cliffs that the current latency probe misses. v2 feature.
 7. **Add inspect_ai's vLLM `/metrics` snapshot** -- captures
