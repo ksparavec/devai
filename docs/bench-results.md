@@ -1,77 +1,98 @@
-# Bench results -- first vLLM sweep on RTX 4000 PRO Blackwell (24 GB)
+# Bench results -- vLLM leaderboard on RTX 4000 PRO Blackwell (24 GB)
 
-> Generated 2026-05-02 from `deploy/.bench-cache.json`. Hardware:
-> RTX 4000 PRO Blackwell, 24 GB VRAM, ~640 GB/s memory bandwidth.
-> Backend: vLLM `latest-cu130-ubuntu2404` via the gpu-arbiter router.
-> Bench harness: `scripts/bench/` -- see `docs/router.md` "Benchmark
-> harness" section. Per-task subset sizes: GSM8K n=100, HumanEval
-> n=50, tools_use n=20, latency/leak n=40 streamed prompts.
+> Last refreshed 2026-05-05 from `deploy/.bench-cache.json`
+> (host_env_id `ea4fd7e7b668`: kernel `6.12.85+deb13-amd64`, driver
+> `595.71.05`, GPU `NVIDIA RTX PRO 4000 Blackwell`, CUDA `13.2`).
+> Hardware: RTX 4000 PRO Blackwell, 24 GB VRAM, ~640 GB/s memory
+> bandwidth. Backend: vLLM `latest-cu130-ubuntu2404` via the
+> gpu-arbiter router. Bench harness: `scripts/bench/` -- see
+> `docs/router.md` "Benchmark harness" section. Per-task subset
+> sizes: GSM8K n=100, HumanEval n=50, tools_use n=20, latency/leak
+> n=40 streamed prompts.
 >
-> **2026-05-05 schema bump (v2):** the bench cache now carries a
-> top-level `_meta.host_env_history` block keyed by a 12-char id
-> derived from `(kernel, driver_version, gpu_name, gpu_memory_gb,
-> cuda_version)`, and every row stamps `host_env_id` so a re-bench
-> against a different driver/kernel is auditable. `make bench-vllm
-> BENCH_FORCE=1` resets row `tasks`/`metrics` before re-running so
-> stale fields don't linger; `first_benched_at` is preserved.
-> Numbers below are from the original 2026-05-02 sweep -- the
-> 2026-05-05 re-bench (driver `595.71.05`, kernel
-> `6.12.85+deb13-amd64`, host_env_id `ea4fd7e7b668`) is in the live
-> cache; refresh this doc with `make bench-report` when ready.
+> **Cache schema v2** (effective 2026-05-05): every row stamps
+> `host_env_id` so re-benches against a different driver/kernel are
+> auditable; the `_meta.host_env_history` block holds the
+> environment for each id. `make bench-vllm BENCH_FORCE=1` resets a
+> row's `tasks` / `metrics` before re-running so stale fields don't
+> linger; `first_benched_at` is preserved. Refresh this doc with
+> `make bench-report` after a new sweep.
 
 ## TL;DR
 
 The bench produces evidence-grade routing recommendations. On this
-24 GB Blackwell card:
+24 GB Blackwell card, the 2026-05-05 sweep yields a clear ordering
+across nine vLLM rows (subset of the picker; SGLang on hold):
 
-- **`gpt-oss-20b@262144`** is the **fastest** (136 tok/s, MoE+MXFP4)
-  AND **best coder** (HumanEval 0.98). Single best model overall for
-  agentic + coding work.
-- **`Qwen3-8B-NVFP4@131072`** has the **highest aggregate
-  correctness** (0.97) and ties gpt-oss on speed for an 8B (98 tok/s).
-  Best when you specifically want a Qwen-family reasoning model with
-  perfect tool calling.
-- **`Qwen3-14B-NVFP4@65536`** matches the small Qwen on quality but
-  caps at 64K context due to KV pressure. Use only when 128K isn't
-  needed.
-- **`NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4@131072`** scores 0.95
-  aggregate, ties gpt-oss-20b on overall correctness and ties Qwen3
-  on perfect tool fidelity, with 128K context. **And at
-  144.8 tok/s** -- restored after replacing `--enforce-eager` with
-  NVIDIA's prescribed `--max-num-seqs 8`, which shrinks the
-  CUDA-graph capture budget enough to fit on 24 GB without
-  disabling capture. Now the **fastest** structured-reasoning +
-  perfect-tools model on the leaderboard, edging gpt-oss-20b's
-  136 tok/s. Strong choice for any interactive agentic workload at
-  this hardware budget.
-- **`Llama-3.1-8B-Instruct-NVFP4@131072`** is the fastest non-
-  reasoning model (96 tok/s, no `<think>` preamble) -- good fallback
-  for latency-critical simple tasks.
-- **R1-Distill family (BF16)** are not as slow as the original bench
-  suggested (real TPS 42-45, not 13-17 -- counting bug fixed); they're
-  still slow in *wall time* because of long reasoning preambles.
+- **`NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4@131072`** is the new
+  **outright leader** -- aggregate **0.99** (gsm8k 0.99, HumanEval
+  0.98, tools_use 1.00 with all four subcases at 1.0), **143.8 tok/s**
+  steady-state decode, 22.45 GB peak. MoE in NVFP4 weights with
+  FP4 KV cache, 128K context. Only model that ties top-of-bench on
+  every quality task *and* sits in the top-2 by speed. Default pick
+  for any interactive agentic workload on this hardware.
+- **`Qwen3-14B-NVFP4@65536`** is a close second at aggregate **0.97**
+  and ties Nemotron-3-Nano on perfect tool fidelity (1.00). Slower
+  at 61.9 tok/s because dense weights are bigger; capped at 64K
+  context due to KV pressure (94 % VRAM at peak). Pick when 64K is
+  enough and you want the Qwen3 family.
+- **`gpt-oss-20b@262144`** and **`Qwen3-8B-NVFP4@131072`** tie at
+  aggregate **0.93**. Different strengths:
+  - **gpt-oss-20b**: fastest at the top tier (139.2 tok/s, MoE+MXFP4)
+    and HumanEval 0.98 -- but tools_use slipped to 0.85 (empty-schema
+    subcase down to 0.4), so it no longer qualifies for the
+    PRODUCTION_AGENTIC badge that requires tools >= 0.9.
+  - **Qwen3-8B-NVFP4**: 0.95 tools, 0.97 gsm8k, 102 tok/s, 128K
+    context. The smaller-model AGENTIC choice when you want
+    Nemotron-3's fidelity without the 30B-class container.
+- **`Qwen3.5-9B-NVFP4@131072`** scores aggregate **0.90** with strong
+  reasoning (gsm8k 0.98, tools 0.95) but weaker code (HumanEval
+  0.78). 55.3 tok/s steady, the longest cold-start of the sweep
+  (~160 s). Picks when reasoning depth + 128K matter more than
+  wall-time.
+- **`DeepSeek-R1-Distill-Qwen-7B@65536`** -- aggregate 0.80, with a
+  surprising HumanEval **0.94** (up from 0.26 in the 2026-05-02
+  sweep -- worth investigating; likely a sampling/scorer interaction
+  flagged in followup work). Tools score 0.60 keeps it out of the
+  AGENTIC tier.
+- **`Llama-3.1-8B-Instruct-NVFP4@131072`** is the fastest
+  non-reasoning model (95.4 tok/s, no `<think>` preamble) and the
+  fastest cold-start (~40 s). Aggregate 0.76; good fallback for
+  latency-critical simple tasks.
+- **`DeepSeek-R1-Distill-Llama-8B@32768`** still scores HumanEval
+  **0.00** -- the byte-level BPE-decode bug from 2026-05-02 hasn't
+  been fixed upstream. Aggregate 0.48; avoid.
+- **`Nemotron-Nano-9B-v2-NVFP4@65536`** is the only row with a
+  non-zero leak rate (**0.075** -- 3 of 40 prompts emit
+  `</think>` markers) *and* tools_use 0.00 (no probe-confirmed tool
+  parser, so the router strips `tools` from the request). Aggregate
+  0.27; do not deploy until both issues are resolved.
 
 | Tier | Models | Use for |
 |---|---|---|
-| **Production default** | `gpt-oss-20b@262144` | Claude Code, Aider, multi-tool agents -- fastest and most accurate combination |
-| **Reasoning + tools alternative** | `Qwen3-8B-NVFP4@131072`, `Qwen3-14B-NVFP4@65536`, `NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4@131072` | when you specifically want the Qwen3 family or perfect tool fidelity (1.00 tools_use); Nemotron-3 also qualifies and is now the fastest in this tier at 144.8 tok/s after the `--max-num-seqs 8` graph-capture rescue |
-| **Non-reasoning low-latency** | `Llama-3.1-8B-Instruct-NVFP4@131072` | simple prompts where you don't want CoT preamble |
+| **Production default** (PRODUCTION_AGENTIC badge) | `NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4@131072`, `Qwen3-14B-NVFP4@65536`, `Qwen3-8B-NVFP4@131072`, `Qwen3.5-9B-NVFP4@131072` | meet every threshold (gsm8k >= 0.9, HumanEval >= 0.7, tools >= 0.9, leak == 0.0, peak < 23 GB). Default agentic picks; Nemotron-3-Nano is fastest of the four |
+| **High-throughput coder (tools-light)** | `gpt-oss-20b@262144` | dropped out of AGENTIC because tools_use = 0.85 < 0.9; still the fastest 0.97/0.98 reasoning+code combo when tool fidelity isn't critical |
+| **Non-reasoning low-latency** | `Llama-3.1-8B-Instruct-NVFP4@131072` | simple prompts where you don't want CoT preamble; fastest cold-start of the sweep |
 | **Reasoning-only (high latency)** | `DeepSeek-R1-Distill-Qwen-7B@65536` | offline / batch / when reasoning depth matters more than wall time |
-| **Avoid (broken)** | `DeepSeek-R1-Distill-Llama-8B@32768` (BPE-decode bug, 0.0 HumanEval), `Nemotron-Nano-9B-v2-NVFP4@65536` (3 leak hits, no tool parser) | -- |
+| **Avoid (broken)** | `DeepSeek-R1-Distill-Llama-8B@32768` (BPE-decode bug, 0.0 HumanEval), `Nemotron-Nano-9B-v2-NVFP4@65536` (7.5 % leak rate, no tool parser) | -- |
 
 ## Full results table
 
+Sorted by aggregate (mean of GSM8K / HumanEval / tools_use). All
+rows from the 2026-05-05 sweep stamped with `host_env_id`
+`ea4fd7e7b668`.
+
 | Model | GSM8K | HumanEval | tools_use | by_subcase (E/S/M/F) | Leak | Cold (s) | Warm p50/p95 (ms) | TPS (tok/s) | Peak VRAM | Aggregate |
 |---|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|
-| **Qwen3-8B-NVFP4@131072** | 0.98 | 0.94 | **1.00** | 1.0/1.0/1.0/1.0 | 0.000 | 45.6 | 32.7/34.5 | **98.3** | 22.53 GB | **0.97** |
-| **Qwen3-14B-NVFP4@65536** | 0.97 | 0.92 | **1.00** | 1.0/1.0/1.0/1.0 | 0.000 | 49.8 | 45.8/48.0 | 62.0 | 22.32 GB | **0.96** |
-| **gpt-oss-20b@262144** | 0.97 | **0.98** | 0.90 | 0.8/1.0/0.8/1.0 | 0.000 | 56.0 | 51.0/54.0 | **136.4** | 22.36 GB | **0.95** |
-| **NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4@131072** | 0.98 | 0.86 | **1.00** | 1.0/1.0/1.0/1.0 | 0.000 | 65.6 | 51.0/54.0 | **144.8** | 22.43 GB | **0.95** |
-| **Qwen3.5-9B-NVFP4@131072** | 0.95 | 0.74 | 0.80 | 0.4/1.0/0.8/1.0 | 0.000 | 162.3 | 32.6/34.1 | 55.7 | 21.66 GB | 0.83 |
-| **Llama-3.1-8B-Instruct-NVFP4@131072** | 0.84 | 0.72 | 0.75 | 1.0/0.6/1.0/0.4 | 0.000 | 41.6 | 22.9/24.9 | **95.9** | 22.65 GB | 0.77 |
-| **DeepSeek-R1-Distill-Qwen-7B@65536** | 0.88 | 0.26 | 0.65 | 1.0/0.8/0.4/0.4 | 0.000 | 86.9 | 36.4/40.1 | 45.2 | 21.89 GB | 0.60 |
-| **DeepSeek-R1-Distill-Llama-8B@32768** | 0.57 | 0.00^* | 0.60 | 1.0/0.4/0.4/0.6 | 0.000 | 85.2 | 37.6/53.1 | 42.5 | 21.69 GB | 0.39 |
-| **Nemotron-Nano-9B-v2-NVFP4@65536** | 0.84 | 0.06 | 0.00^+ | 0.0/0.0/0.0/0.0 | 0.075 (3x `</think>`) | 114.9 | 27.6/32.0 | 81.1 | 22.29 GB | 0.30 |
+| **NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4@131072** | 0.99 | 0.98 | **1.00** | 1.0/1.0/1.0/1.0 | 0.000 | 60.6 | 46.9/52.7 | **143.8** | 22.45 GB | **0.99** |
+| **Qwen3-14B-NVFP4@65536** | 0.98 | 0.94 | **1.00** | 1.0/1.0/1.0/1.0 | 0.000 | 47.8 | 46.1/47.3 | 61.9 | 22.32 GB | **0.97** |
+| **Qwen3-8B-NVFP4@131072** | 0.97 | 0.88 | 0.95 | 1.0/1.0/1.0/0.8 | 0.000 | 43.5 | 32.3/34.4 | 102.1 | 22.53 GB | **0.93** |
+| **gpt-oss-20b@262144** | 0.97 | **0.98** | 0.85 | 0.4/1.0/1.0/1.0 | 0.000 | 53.9 | 50.3/54.0 | **139.2** | 22.37 GB | **0.93** |
+| **Qwen3.5-9B-NVFP4@131072** | 0.98 | 0.78 | 0.95 | 0.8/1.0/1.0/1.0 | 0.000 | 160.5 | 31.5/45.6 | 55.3 | 21.54 GB | **0.90** |
+| **DeepSeek-R1-Distill-Qwen-7B@65536** | 0.87 | 0.94^! | 0.60 | 1.0/0.4/0.6/0.4 | 0.000 | 84.8 | 36.2/49.4 | 44.5 | 21.90 GB | 0.80 |
+| **Llama-3.1-8B-Instruct-NVFP4@131072** | 0.78 | 0.80 | 0.70 | 1.0/0.4/1.0/0.4 | 0.000 | 39.5 | 23.3/24.0 | 95.4 | 22.65 GB | 0.76 |
+| **DeepSeek-R1-Distill-Llama-8B@32768** | 0.63 | 0.00^* | 0.80 | 1.0/0.6/1.0/0.6 | 0.000 | 0.1^# | 37.1/52.7 | 42.5 | 21.69 GB | 0.48 |
+| **Nemotron-Nano-9B-v2-NVFP4@65536** | 0.74 | 0.06 | 0.00^+ | 0.0/0.0/0.0/0.0 | 0.075 (3x `</think>`) | 112.7 | 26.9/30.9 | 80.4 | 22.28 GB | 0.27 |
 
 Subcase legend: **E**mpty-schema . **S**ingle-arg . **M**ulti-tool-pick . **F**ollow-up.
 All TPS values are post-fix (see "TPS counting fix" below).
@@ -81,27 +102,35 @@ Footnotes for caveats marked above:
 - ^* **`HumanEval=0.00` for R1-Distill-Llama-8B** is the byte-level
   BPE-decode bug (Issue #1 below): the model emits raw `G`-marker
   (space) and `C`-marker (newline) tokens un-decoded, so every
-  completion is invalid Python regardless of the scorer. Confirmed
-  by re-running with the v2 scorer after the fence-handling fix --
-  pass@1 stayed at 0.00. Fixing this is followup #3 (file vLLM
-  issue with reproducer).
+  completion is invalid Python regardless of the scorer. The 2026-
+  05-05 re-bench reproduced 0.00 cleanly; followup #3 (file vLLM
+  issue with reproducer) still pending.
 - ^+ **`tools_use=0.00` for Nemotron-Nano-9B-v2-NVFP4** is because the
   router's `maybeStripTools` drops `tools` and `tool_choice` from the
-  request entirely when no tool parser is probed, and Nemotron has
-  no `parsers:` block in `model-families.yaml`. NVIDIA does ship a
-  parser plugin (`nemotron_toolcall_parser_no_streaming.py`) for
-  vLLM's `--tool-parser-plugin` mechanism; wiring it up is a
+  request entirely when no tool parser is probed, and Nemotron-Nano-
+  9B-v2 has no `parsers:` block in `model-families.yaml`. NVIDIA does
+  ship a parser plugin (`nemotron_toolcall_parser_no_streaming.py`)
+  for vLLM's `--tool-parser-plugin` mechanism; wiring it up is a
   separate followup (see followup work below).
-  (Historical note: an earlier configuration of this row used
-  `--enforce-eager` for OOM rescue and reported TPS=43 tok/s and
-  Cold=30.6 s (probe-measured, since the bench saw a warmed
-  container at 78 ms). After replacing `--enforce-eager` with
-  `--max-num-seqs 8` (NVIDIA's prescribed value, which shrinks the
-  CUDA-graph capture budget rather than disabling capture
-  entirely), the model loads cleanly with graph capture on and TPS
-  triples to 144.8 tok/s. The 65.6 s cold-start figure now in the
-  table includes one-time CUDA-graph compilation; subsequent
-  recreates are faster.)
+- ^! **`HumanEval=0.94` for R1-Distill-Qwen-7B** is up from **0.26**
+  in the 2026-05-02 sweep -- a 0.68 jump that flagged on the diff.
+  Same model digest, same n=50 subset, same backend image. Most
+  likely cause: the 2026-05-02 run preceded the v2 scorer's fence-
+  handling fix and was charging fenced inline-reasoning answers as
+  failures; the re-bench under the v2 scorer with `--force` now
+  records the model's real performance. Worth a sanity re-run if
+  it ever drifts back. (See "Issues surfaced > 4. HumanEval scorer
+  too strict for inline-reasoning models -- FIXED" for the scorer
+  history.)
+- ^# **`Cold=0.1 s` for R1-Distill-Llama-8B** is a measurement
+  artifact: the bench operator hit the model with a warmup curl
+  before kicking off `make bench-vllm`, so the latency sidecar saw
+  a fully-warmed container on the first prompt. The genuine cold-
+  start for this row is in the 50-90 s range based on the 2026-05-
+  02 sweep (85.2 s). The TPS, p50/p95, and quality numbers are
+  unaffected; only `ttft_ms_first` was contaminated. Easy fix on
+  the next run: skip the warmup curl, or accept `ttft_ms_first` as
+  "warm-start latency" and add a separate cold-start probe.
 
 (The previous `^+^+` footnote about `tools_use=0.00` on forced-mode
 models is gone: the bench's `tools_use` task now pins `tool_choice`
@@ -109,12 +138,12 @@ per-sample via a custom tool-call loop, so R1-Distill x2 and
 Llama-3.1-8B-Instruct-NVFP4 produce real scores. See "Issues surfaced
 > 2. Tool-loop interruption on forced-mode models" below.)
 
-(The previous `^+^+^+` footnote about `HumanEval=0.00` for inline-
-reasoning models is replaced by the two notes above: the v2 scorer
-recovered Nemotron 0.00 -> 0.06 -- modest because Nemotron is just
-genuinely weak at HumanEval, not because the scorer was hiding a
-strong score; R1-Distill-Llama-8B stayed 0.00 because of the BPE
-bug, which the scorer can't work around.)
+(The previous note about Nemotron-3-Nano-30B-A3B's `--enforce-eager`
+-> `--max-num-seqs 8` rescue is now historical: that fix landed in
+b730985 before the 2026-05-02 sweep and the model has been stable
+since. The 2026-05-05 cold-start of 60.6 s includes the standard
+CUDA-graph compilation; the 143.8 tok/s steady-state matches the
+post-fix expectation.)
 
 ## Methodology
 
@@ -178,27 +207,30 @@ unchanged, and drift is within run-to-run noise (different prompt
 sampling). **Fix confirmed correct for both regressions and
 non-regressions.**
 
-The biggest single insight from the re-run: **`gpt-oss-20b` is the
-fastest model in the bench at 136 tok/s** -- not the slowest as the
-original numbers suggested. As an MoE with ~3.6B active parameters
-per token plus native MXFP4, its per-token weight transfer
-(~1.8 GB) is well below the dense 8B NVFP4 models (~5 GB) -- and on
-a 640 GB/s memory-bound card, that's a ~3x ceiling advantage. **MoE
-+ FP4 wins decisively** on this hardware class.
+The biggest single insight from the 2026-05-05 sweep: **MoE + FP4
+wins decisively on this card.** Both the new outright leader
+**`Nemotron-3-Nano-30B-A3B-NVFP4`** at 143.8 tok/s and the runner-up
+**`gpt-oss-20b`** at 139.2 tok/s are MoE + FP4-class checkpoints
+(~3 B and ~3.6 B active params respectively); their per-token
+weight transfer (~1.5-1.8 GB) is well below the dense 8 B NVFP4
+models (~5 GB), giving a ~3x ceiling advantage on the 640 GB/s
+memory-bound card.
 
 ## Architectural finding: FP4 quantization + MoE on Blackwell
 
-After the TPS counting fix, the picture is cleaner: this
+After the TPS counting fix and the 2026-05-05 re-bench, this
 Blackwell card delivers a **~3x decode-rate spread** across the
-quantization x architecture matrix, with MoE+MXFP4 winning decisively:
+quantization x architecture matrix, with MoE + FP4 sweeping the
+top:
 
 | Architecture x Quantization | Models | TPS p50 | Why |
 |---|---|---:|---|
-| **MoE + MXFP4** (native Blackwell, only ~3.6B active) | gpt-oss-20b | **136 tok/s** | smallest per-token weight transfer (~1.8 GB) |
-| **Dense + NVFP4** (small) | Qwen3-8B, Llama-3.1-8B-Instruct | 96-98 tok/s | ~5 GB/token; FP4 tensor cores hit |
-| **Dense + NVFP4** (medium reasoning) | Nemotron-Nano-9B-v2 | 81 tok/s | similar to small NVFP4 + reasoning template overhead |
+| **MoE + NVFP4** (~3 B active, FP4 KV cache) | NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4 | **143.8 tok/s** | smallest per-token weight transfer (~1.5 GB); FP4 KV cache cuts attention reads too |
+| **MoE + MXFP4** (~3.6 B active) | gpt-oss-20b | **139.2 tok/s** | per-token weight transfer ~1.8 GB; OCP MXFP4 vs vendor NVFP4 is a wash on raw decode |
+| **Dense + NVFP4** (small) | Qwen3-8B-NVFP4, Llama-3.1-8B-Instruct-NVFP4 | 95-102 tok/s | ~5 GB/token; FP4 tensor cores hit |
+| **Dense + NVFP4** (medium reasoning) | Nemotron-Nano-9B-v2-NVFP4 | 80 tok/s | similar to small NVFP4 + reasoning template overhead |
 | **Dense + NVFP4** (large) | Qwen3-14B-NVFP4 | 62 tok/s | ~7 GB/token; bandwidth scales linearly with weight size |
-| **Hybrid Mamba + NVFP4** (community quant) | Qwen3.5-9B (`ykarout/`) | 56 tok/s | linear-attention layers decode well, but Mamba state arithmetic adds overhead vs pure Transformer |
+| **Hybrid Mamba + NVFP4** (community quant) | Qwen3.5-9B-NVFP4 (`ykarout/`) | 55 tok/s | linear-attention layers decode well, but Mamba state arithmetic adds overhead vs pure Transformer |
 | **Dense + BF16** | DeepSeek-R1-Distill-{Qwen-7B, Llama-8B} | 42-45 tok/s | 16 GB/token weight transfer at 640 GB/s ~ 40 tok/s ceiling |
 
 **Practical wall-time matters more than raw TPS** because reasoning
@@ -207,9 +239,10 @@ End-to-end wall time for an agent waiting on a 200-token reply:
 
 | Model | TPS | Pre-answer reasoning | Total wall time |
 |---|---:|---:|---:|
-| `gpt-oss-20b` (harmony channels, structured) | 136 | ~300 tokens | **3.7 s** |
-| `Qwen3-8B-NVFP4` (Qwen3 thinking) | 98 | ~500 tokens | **7.1 s** |
-| `Llama-3.1-8B-Instruct-NVFP4` (no reasoning) | 96 | 0 | **2.1 s** |
+| `Nemotron-3-Nano-30B-A3B-NVFP4` (nano_v3 reasoning) | 144 | ~300 tokens | **3.5 s** |
+| `gpt-oss-20b` (harmony channels, structured) | 139 | ~300 tokens | **3.6 s** |
+| `Qwen3-8B-NVFP4` (Qwen3 thinking) | 102 | ~500 tokens | **6.9 s** |
+| `Llama-3.1-8B-Instruct-NVFP4` (no reasoning) | 95 | 0 | **2.1 s** |
 | `Qwen3-14B-NVFP4` | 62 | ~600 tokens | **12.9 s** |
 | `DeepSeek-R1-Distill-Qwen-7B` (BF16, R1-style) | 45 | ~1500 tokens | **37.8 s** |
 
@@ -229,11 +262,14 @@ For BF16 8B models, the theoretical ceiling is ~40 tok/s
 streaming overhead.
 
 **Routing implication**: prefer NVFP4 quantizations of any reasoning-
-capable model. The Qwen3 NVFP4 family (8B, 14B) and gpt-oss-20b are
-the practical agentic workhorses on this hardware. The R1-Distill
-BF16 family stays in the catalog as a curiosity (their reasoning
-quality is real -- Qwen-7B distill scored 0.88 on GSM8K) but should
-not be the default for any latency-sensitive workflow.
+capable model, and prefer MoE when context budget allows. The
+**Nemotron-3-Nano-30B-A3B-NVFP4** + **Qwen3 NVFP4 family (8B, 14B)**
++ **gpt-oss-20b** are the practical agentic workhorses on this
+hardware. The R1-Distill BF16 family stays in the catalog as a
+curiosity (their reasoning quality is real -- Qwen-7B distill scored
+0.87 on GSM8K and an unexpectedly high 0.94 on HumanEval in this
+sweep) but should not be the default for any latency-sensitive
+workflow.
 
 ## Cold-start signal
 
@@ -243,17 +279,18 @@ a freshly-routed model:
 
 | Model | Cold (s) | Notes |
 |---|---:|---|
-| Llama-3.1-8B-Instruct-NVFP4 | 41.6 | fastest cold start; small footprint, no reasoning preamble |
-| Qwen3-8B-NVFP4 | 45.6 | + reasoning template + Qwen3 chat template |
-| Qwen3-14B-NVFP4 | 49.8 | bigger weights |
-| gpt-oss-20b | 57.9 | 20 B MoE, harmony channels, longer graph compile |
-| DeepSeek-R1-Distill-Llama-8B | 85.2 | BF16, slower paged-in load |
-| DeepSeek-R1-Distill-Qwen-7B | 86.9 | same |
-| Nemotron-Nano-9B-v2-NVFP4 | 114.4 | NVFP4 + 9B + Nemotron-specific kernel compile |
-| **Qwen3.5-9B-NVFP4** | **162.3** | **first-time CUDA-graph capture for the Qwen3.5 generation; subsequent recreates much faster** |
+| Llama-3.1-8B-Instruct-NVFP4 | 39.5 | fastest cold start; small footprint, no reasoning preamble |
+| Qwen3-8B-NVFP4 | 43.5 | + reasoning template + Qwen3 chat template |
+| Qwen3-14B-NVFP4 | 47.8 | bigger weights |
+| gpt-oss-20b | 53.9 | 20 B MoE, harmony channels, longer graph compile |
+| Nemotron-3-Nano-30B-A3B-NVFP4 | 60.6 | 30 B MoE in NVFP4 + nano_v3 reasoning parser; CUDA-graph capture under `--max-num-seqs 8` |
+| DeepSeek-R1-Distill-Qwen-7B | 84.8 | BF16, slower paged-in load |
+| Nemotron-Nano-9B-v2-NVFP4 | 112.7 | NVFP4 + 9B + Nemotron-specific kernel compile |
+| **Qwen3.5-9B-NVFP4** | **160.5** | **first-time CUDA-graph capture for the Qwen3.5 generation; subsequent recreates much faster** |
+| _DeepSeek-R1-Distill-Llama-8B_ | _0.1_ | _2026-05-05 row contaminated by a pre-bench warmup curl; cf. footnote `^#` on the full results table. The genuine cold-start is ~85 s based on the 2026-05-02 sweep._ |
 
 Operational note: the `HEALTH_TIMEOUT_SECONDS=600` default in
-`gpu-arbiter` is justified -- Qwen3.5-9B's 162 s startup leaves
+`gpu-arbiter` is justified -- Qwen3.5-9B's 160 s startup leaves
 generous margin against the 600 s ceiling, and slower NVFP4 + CUDA-
 graph compiles on bigger MoEs can push 4-5 minutes in the wild.
 
@@ -384,14 +421,14 @@ Peak VRAM relative to the 24 GB cap:
 | Model | Peak / 24 GB | Pressure |
 |---|---:|---|
 | Llama-3.1-8B-Instruct-NVFP4 @131K | 22.65 / 24 = **94.4%** | tight; KV near limit at full ctx |
-| Nemotron-3-Nano-30B-A3B-NVFP4 @131K | 22.43 / 24 = **93.5%** | tight; runs with `--max-num-seqs 8` (NVIDIA's prescribed value) which shrinks CUDA-graph capture buffers enough to keep capture enabled |
 | Qwen3-8B-NVFP4 @131K | 22.53 / 24 = **93.9%** | tight |
+| Nemotron-3-Nano-30B-A3B-NVFP4 @131K | 22.45 / 24 = **93.5%** | tight; runs with `--max-num-seqs 8` (NVIDIA's prescribed value) which shrinks CUDA-graph capture buffers enough to keep capture enabled |
 | gpt-oss-20b @262K | 22.37 / 24 = 93.2% | tight |
 | Qwen3-14B-NVFP4 @65K | 22.32 / 24 = 93.0% | tight |
-| Nemotron-Nano-9B-v2-NVFP4 @65K | 22.29 / 24 = 92.9% | tight |
-| DeepSeek-R1-Distill-Qwen-7B @65K | 21.89 / 24 = 91.2% | comfortable |
-| Qwen3.5-9B-NVFP4 @131K | 21.66 / 24 = 90.3% | comfortable |
+| Nemotron-Nano-9B-v2-NVFP4 @65K | 22.28 / 24 = 92.8% | tight |
+| DeepSeek-R1-Distill-Qwen-7B @65K | 21.90 / 24 = 91.2% | comfortable |
 | DeepSeek-R1-Distill-Llama-8B @32K | 21.69 / 24 = 90.4% | comfortable |
+| Qwen3.5-9B-NVFP4 @131K | 21.54 / 24 = 89.8% | comfortable |
 
 All models cleared the probe filter (no KV preemption observed
 during the run). The 4 models above 93% are running at or near the
@@ -412,42 +449,59 @@ Encoded as filter expressions ready for the picker / docs:
 ```
 PRODUCTION_AGENTIC = (
     backend == "vllm"
-    AND quantization == "NVFP4"
+    AND quantization in {"NVFP4", "MXFP4"}
     AND tools_use_score >= 0.9
     AND humaneval >= 0.7
     AND gsm8k >= 0.9
     AND leak_rate == 0
     AND peak_vram_gb < 23
 )
-# matches: Qwen3-8B, Qwen3-14B, gpt-oss-20b, NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4
+# matches (2026-05-05): NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4,
+#   Qwen3-14B-NVFP4, Qwen3-8B-NVFP4, Qwen3.5-9B-NVFP4
+# notable change vs 2026-05-02: gpt-oss-20b dropped out -- tools_use
+#   slipped from 0.90 to 0.85 (empty_schema subcase down to 0.4),
+#   so it no longer clears the >= 0.9 threshold.
 
 CODING_SPECIALIST = max(humaneval) where PRODUCTION_AGENTIC
-# matches: gpt-oss-20b
+# matches: NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4 (HumanEval 0.98)
+# tied: gpt-oss-20b would also be 0.98 but is no longer AGENTIC.
 
 LATENCY_SENSITIVE = (
     PRODUCTION_AGENTIC
-    AND tps_sustained_p50 >= 50  # using corrected TPS once the bug fix lands
+    AND tps_sustained_p50 >= 50
 )
-# matches: gpt-oss-20b (38 measured but real ~50-80)
+# matches all four AGENTIC models -- 55 < tps < 144.
+
+THROUGHPUT_KING = max(tps_sustained_p50)
+# matches: NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4 at 143.8 tok/s,
+#   edging gpt-oss-20b at 139.2.
 
 REASONING_ONLY = (
     backend == "vllm"
     AND gsm8k >= 0.85
-    AND tps_sustained_p50 < 30  # genuinely slow on this card
+    AND tps_sustained_p50 < 30
 )
-# matches: DeepSeek-R1-Distill-Qwen-7B (latency too high for default agent)
+# matches (2026-05-05): no models -- the slowest qualifying model
+#   in the sweep, DeepSeek-R1-Distill-Qwen-7B, decodes at 44.5 tok/s
+#   (still slow in wall time once you account for the long <think>
+#   preamble, but its raw decode rate is well above the 30 tok/s
+#   cutoff).
 
 AVOID = (
     leak_rate > 0
     OR has_known_decode_bug   # R1-Distill-Llama-8B
     OR (humaneval < 0.3 AND not REASONING_ONLY)
 )
-# matches: R1-Distill-Llama-8B (BPE bug), Nemotron-Nano-9B-v2 (leaks)
+# matches: R1-Distill-Llama-8B (BPE bug; HumanEval 0.00),
+#   Nemotron-Nano-9B-v2 (7.5 % leak rate, tools_use 0.00).
 ```
 
-These are derived from the cache, not hand-curated. The picker can
-read `deploy/.bench-cache.json` directly and surface a "verified for
-agentic use" badge.
+These are derived from the cache, not hand-curated. The picker
+reads `deploy/.bench-cache.json` directly and surfaces the
+PRODUCTION_AGENTIC verdict via `_is_production_agentic` (formerly a
+TIER badge; the per-row score columns now make the verdict implicit
+-- a row that's `Yes` in TOOLS, has `>= 0.9` in TOTAL%, and shows
+`0.0` in LEAK% is by definition AGENTIC).
 
 ## Followup work (ordered by impact)
 
