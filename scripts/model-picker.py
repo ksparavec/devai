@@ -56,6 +56,11 @@ _SGLANG_PROBE_CACHE_PATHS = [
     str(Path(__file__).resolve().parent.parent / "deploy" / ".sglang-reasoning-cache.json"),
 ]
 
+_BENCH_CACHE_PATHS = [
+    "/etc/devai/.bench-cache.json",
+    str(Path(__file__).resolve().parent.parent / "deploy" / ".bench-cache.json"),
+]
+
 _ROUTER = os.environ.get("DEVAI_ROUTER_HOST", "devai-router")
 _VLLM_DIR = os.environ.get("VLLM_MODELS_DIR", "/var/cache/devai/ollama/models/vllm")
 _OLLAMA_MANIFESTS = os.environ.get(
@@ -140,7 +145,8 @@ _AGENTS: list[tuple[str, str, str]] = [
 # which most terminals render too dim to read on black. Bold remains a
 # brightness/weight cue for headers and labels.
 _BOLD = "\033[1m"
-_DIM = "\033[38;5;245m"     # light-grey foreground (≈ #8a8a8a)
+_DIM = "\033[38;5;245m"     # light-grey foreground (~ #8a8a8a)
+_GREEN = "\033[38;5;48m"    # bright green for the PRODUCTION_AGENTIC badge
 _RESET = "\033[0m"
 
 
@@ -237,6 +243,116 @@ def _load_hf_probe_records(paths: list[str]) -> dict[str, dict]:
                 records[alias] = entry
         return records
     return {}
+
+
+def _load_bench_records(paths: list[str]) -> dict[tuple[str, str], dict]:
+    """Lookup of ``(model_name, backend) -> bench cache row``.
+
+    The bench cache (``deploy/.bench-cache.json``) is keyed at top
+    level by ``<repo>@<sha>::<backend>`` (HF) or
+    ``<digest>::<backend>`` (Ollama). For UI rendering we only need
+    the per-row data; index it by the alias the picker already
+    carries (the row's ``model`` field) plus its ``backend``.
+
+    Returns ``{}`` when no readable cache exists -- non-fatal: rows
+    just won't render badges. The picker is fully usable without
+    bench data.
+    """
+    out: dict[tuple[str, str], dict] = {}
+    for path in paths:
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                raw = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(raw, dict):
+            continue
+        for entry in raw.values():
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("model")
+            backend = entry.get("backend")
+            if isinstance(name, str) and isinstance(backend, str):
+                out[(name, backend)] = entry
+        return out
+    return {}
+
+
+# Thresholds for the PRODUCTION_AGENTIC badge -- mirrors the formula
+# documented in docs/bench-results.md > "Picker-tier recommendations".
+# Keep this single source of truth: any change here should also be
+# reflected in the doc.
+_PRODUCTION_AGENTIC_MIN_TOOLS = 0.9
+_PRODUCTION_AGENTIC_MIN_HUMANEVAL = 0.7
+_PRODUCTION_AGENTIC_MIN_GSM8K = 0.9
+_PRODUCTION_AGENTIC_MAX_LEAK = 0.0
+_PRODUCTION_AGENTIC_MAX_VRAM_GB = 23.0
+
+
+def _bench_score(tasks: dict, prefix: str, key: str) -> float | None:
+    """Latest matching bench score by prefix.
+
+    Tasks are stored as e.g. ``gsm8k_subset_100``, ``humaneval_subset_50``,
+    ``tools_use_20``; a model may have stale entries from prior runs at
+    different ``n``. We pick the row with the latest ``ran_at``, falling
+    back to the first match if timestamps are missing.
+    """
+    best: tuple[str, dict] | None = None
+    for tname, tdata in (tasks or {}).items():
+        if not (isinstance(tname, str) and tname.startswith(prefix)
+                and isinstance(tdata, dict)):
+            continue
+        if best is None:
+            best = (tname, tdata)
+            continue
+        # Prefer larger ran_at lexicographic (ISO-8601 -> chronological).
+        cur_ts = str(tdata.get("ran_at") or "")
+        best_ts = str(best[1].get("ran_at") or "")
+        if cur_ts > best_ts:
+            best = (tname, tdata)
+    if best is None:
+        return None
+    raw = best[1].get(key)
+    try:
+        return float(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_production_agentic(model: dict, bench_row: dict | None) -> bool:
+    """Return True when the (model, bench) pair satisfies every
+    PRODUCTION_AGENTIC threshold from docs/bench-results.md.
+
+    Missing bench data -> False (badge is never speculative). Backend
+    must be vLLM, weights NVFP4, all four correctness/leak gates
+    cleared, and peak VRAM strictly under
+    ``_PRODUCTION_AGENTIC_MAX_VRAM_GB``.
+    """
+    if bench_row is None:
+        return False
+    if (model.get("backend") or "") != "vllm":
+        return False
+    fmt = str(((model.get("details") or {}).get("quantization") or "")).upper()
+    if fmt != "NVFP4":
+        return False
+    tasks = bench_row.get("tasks") or {}
+    metrics = bench_row.get("metrics") or {}
+    tools = _bench_score(tasks, "tools_use", "score")
+    he = _bench_score(tasks, "humaneval_", "pass@1")
+    gsm = _bench_score(tasks, "gsm8k_", "score")
+    leak = (tasks.get("leak_probe") or {}).get("leak_rate")
+    peak = metrics.get("peak_vram_gb")
+    if None in (tools, he, gsm, leak, peak):
+        return False
+    return (
+        tools >= _PRODUCTION_AGENTIC_MIN_TOOLS
+        and he >= _PRODUCTION_AGENTIC_MIN_HUMANEVAL
+        and gsm >= _PRODUCTION_AGENTIC_MIN_GSM8K
+        and float(leak) <= _PRODUCTION_AGENTIC_MAX_LEAK
+        and float(peak) < _PRODUCTION_AGENTIC_MAX_VRAM_GB
+    )
 
 
 def _migrate_in_memory(raw: dict) -> dict:
@@ -1035,6 +1151,17 @@ def _format_model_row(m: dict) -> str:
     backend_col = str(m.get("backend") or "?")
     parser_col = str(m.get("tool_parser") or "N/A")
 
+    # PRODUCTION_AGENTIC badge -- bench cache certifies the row meets
+    # every threshold from "Picker-tier recommendations" in
+    # docs/bench-results.md. Renders bright green so it pops on the
+    # row without changing column widths. Dim placeholder for the
+    # rest of the rows so the column still aligns.
+    if m.get("_picker_agentic"):
+        # Manual padding so the ANSI escape doesn't count toward width.
+        tier_col = f"{_GREEN}{'agentic':>8s}{_RESET}"
+    else:
+        tier_col = f"{_DIM}{'-':>8s}{_RESET}"
+
     return (
         f"      {ctx_str:>4s}  "
         f"{glyph} {status_label:<16s}  "
@@ -1045,6 +1172,7 @@ def _format_model_row(m: dict) -> str:
         f"{tuning:>5s}  "
         f"{type_col:>5s}  "
         f"{parser_col:>14s}  "
+        f"{tier_col}  "
         f"{vram_num:>10s}"
     )
 
@@ -1275,7 +1403,10 @@ def _capability_summary_text(m: dict, reasoning_mode: str = "default") -> str:
     )
 
 
-def _build_menu(models: list[dict]) -> tuple[list[str], list[bool], list[dict | None]]:
+def _build_menu(
+    models: list[dict],
+    bench_records: dict[tuple[str, str], dict] | None = None,
+) -> tuple[list[str], list[bool], list[dict | None]]:
     """Build (display_lines, selectable_flags, model_per_line) for fzf.
 
     Flat list ordered by capability score (descending). One row per model:
@@ -1285,7 +1416,12 @@ def _build_menu(models: list[dict]) -> tuple[list[str], list[bool], list[dict | 
         tier that fits fully on GPU at the picker's VRAM band.
       - Inline-reasoning models appear once; the user toggles reasoning
         ON/OFF in the info modal after pressing Enter.
+      - When ``bench_records`` is supplied, rows are tagged with
+        ``_picker_agentic=True`` if they meet every PRODUCTION_AGENTIC
+        threshold from docs/bench-results.md; missing bench data
+        leaves the tag False.
     """
+    bench_records = bench_records or {}
     hidden = {
         "missing_capability": 0,
         "no_fitting_ctx": 0,
@@ -1309,6 +1445,10 @@ def _build_menu(models: list[dict]) -> tuple[list[str], list[bool], list[dict | 
         # Default reasoning mode; per-model toggle is offered in the info
         # modal for inline-reasoning rows. No `::nothink` row in the list.
         decorated["_picker_mode"] = "default"
+        bench_key = (str(decorated.get("name") or ""), str(decorated.get("backend") or ""))
+        decorated["_picker_agentic"] = _is_production_agentic(
+            decorated, bench_records.get(bench_key)
+        )
         candidates.append(decorated)
 
     # HF dedup — vLLM preferred over SGLang for the same name. Ollama
@@ -1331,6 +1471,7 @@ def _build_menu(models: list[dict]) -> tuple[list[str], list[bool], list[dict | 
         f"{'TUNE':>5s}  "
         f"{'TYPE':>5s}  "
         f"{'PARSER':>14s}  "
+        f"{'TIER':>8s}  "
         f"{'VRAM (GB)':>10s}"
     )
     lines.append(f"{_BOLD}{column_header}{_RESET}")
@@ -1522,7 +1663,8 @@ def main() -> None:
             "  Pull models first (e.g. `make ollama-pull`, `make vllm-pull`)."
         )
 
-    lines, selectable, item_models = _build_menu(models)
+    bench_records = _load_bench_records(_BENCH_CACHE_PATHS)
+    lines, selectable, item_models = _build_menu(models, bench_records)
     if not any(selectable):
         sys.exit(
             f"error: no usable model/context rows on disk for "

@@ -556,8 +556,22 @@ agentic use" badge.
    cache key now suffixes with `::ollama` and the `/metrics` snapshot
    path explicitly no-ops for Ollama). Reactivate by running
    `make bench-ollama` if Ollama-side comparisons become relevant.
-10. **Wire bench cache -> picker badge** -- tag PRODUCTION_AGENTIC rows
-    in the picker UI. v2 feature.
+10. ~~**Wire bench cache -> picker badge** -- tag PRODUCTION_AGENTIC rows
+    in the picker UI.~~ **Done.** `scripts/model-picker.py` now reads
+    `deploy/.bench-cache.json` (loader pattern mirrors the existing
+    HF probe-cache loader, falls back gracefully when the file is
+    missing) and tags each candidate row with `_picker_agentic`
+    based on the formula in "Picker-tier recommendations" above.
+    Qualifying rows render the literal `agentic` label in bright
+    green in a new `TIER` column right before `VRAM (GB)`;
+    non-qualifying rows get a dim `-` placeholder so the column
+    still aligns. Thresholds (`tools_use >= 0.9`, `humaneval >= 0.7`,
+    `gsm8k >= 0.9`, `leak_rate <= 0`, `peak_vram_gb < 23`,
+    backend=vllm, format=NVFP4) live as named constants
+    `_PRODUCTION_AGENTIC_*` so any change here is one place. Smoke-
+    tested against the real cache: 4 models qualify (Qwen3-8B,
+    Qwen3-14B, gpt-oss-20b, Nemotron-3-30B-A3B); the rest don't.
+    Missing bench data leaves the badge off (never speculative).
 11. ~~**Experiment: drop `--enforce-eager` on
     `NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4` by also passing
     `--max-num-seqs 8`**~~ **Done.** Hypothesis confirmed: the OOM
