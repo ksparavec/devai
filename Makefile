@@ -133,6 +133,7 @@ endif
 .PHONY: fetch-cli pull-images install install-systemd uninstall test test-router test-ollama test-agents test-models test-probe-vllm test-probe-sglang test-probe-ollama-idempotent test-vllm test-sglang test-e2e test-full help
 .PHONY: catalog-regen catalog-suggest probe probe-vllm probe-sglang model-fit model-pull vram-fit verify-backend-flags ollama-cleanup-ctx-variants
 .PHONY: bench bench-vllm bench-sglang bench-ollama bench-report test-bench-smoke
+.PHONY: bench-pearls bench-pearls-vllm bench-pearls-sglang bench-pearls-ollama bench-pearls-verify
 
 all: help
 
@@ -1078,3 +1079,65 @@ test-bench-smoke: ## 1-model tiny-subset smoke test (CI / sanity)
 			--repo "Qwen3-8B-NVFP4" \
 			--n-gsm8k 5 --n-humaneval 5 --n-tools 4 --n-leak-prompts 10 \
 			--force
+
+# =============================================================================
+# Pearls bench harness — see scripts/bench_pearls/ and that folder's README.
+# Runs only the Programming Pearls task; defaults to coding-tier model
+# families. Writes to a separate cache (.bench-pearls-cache.json) so v1
+# can be torn down without touching the main leaderboard.
+# =============================================================================
+
+# Same mounts as the main bench. The pearls runner imports sibling
+# helpers from /scripts/bench/, so /scripts must be the parent (not
+# just /scripts/bench_pearls).
+BENCH_PEARLS_RUN_FLAGS = \
+	$(if $(BENCH_PEARLS_REPO),--repo '$(BENCH_PEARLS_REPO)',) \
+	$(if $(BENCH_PEARLS_FORCE),--force,) \
+	$(if $(BENCH_PEARLS_N),--n-pearls $(BENCH_PEARLS_N),)
+
+bench-pearls: bench-pearls-vllm bench-pearls-sglang bench-pearls-ollama ## Run the pearls task on every coding-tier model on every backend
+	@echo
+	@echo ">>> bench-pearls complete; see deploy/.bench-pearls-cache.json"
+
+bench-pearls-vllm: ## Pearls task on every coding-tier vLLM model via devai-router:11435
+	@mkdir -p $(CACHE_DIR)/bench/inspect-logs
+	$(CONTAINER_RUNTIME) run --rm \
+		--network $(DEVAI_NETWORK) \
+		$(BENCH_CACHE_MOUNTS) \
+		$(GPU_FLAGS) \
+		-e GPU_MEMORY_GB=$(GPU_MEMORY_GB) \
+		--entrypoint python3 \
+		$(IMAGE_NAME_GPU) \
+		/scripts/bench_pearls/bench_runner.py --backend vllm \
+			$(BENCH_PEARLS_RUN_FLAGS)
+
+bench-pearls-sglang: ## Pearls task on every coding-tier SGLang model via devai-router:11436
+	@mkdir -p $(CACHE_DIR)/bench/inspect-logs
+	$(CONTAINER_RUNTIME) run --rm \
+		--network $(DEVAI_NETWORK) \
+		$(BENCH_CACHE_MOUNTS) \
+		$(GPU_FLAGS) \
+		-e GPU_MEMORY_GB=$(GPU_MEMORY_GB) \
+		--entrypoint python3 \
+		$(IMAGE_NAME_GPU) \
+		/scripts/bench_pearls/bench_runner.py --backend sglang \
+			$(BENCH_PEARLS_RUN_FLAGS)
+
+bench-pearls-ollama: ## Pearls task on every coding-tier Ollama model via devai-router:11434
+	@mkdir -p $(CACHE_DIR)/bench/inspect-logs
+	$(CONTAINER_RUNTIME) run --rm \
+		--network $(DEVAI_NETWORK) \
+		$(BENCH_CACHE_MOUNTS) \
+		$(GPU_FLAGS) \
+		-e GPU_MEMORY_GB=$(GPU_MEMORY_GB) \
+		--entrypoint python3 \
+		$(IMAGE_NAME_GPU) \
+		/scripts/bench_pearls/bench_runner.py --backend ollama \
+			$(BENCH_PEARLS_RUN_FLAGS)
+
+bench-pearls-verify: ## Sanity-check: run every problem's canonical solution through the bench sandbox
+	@$(CONTAINER_RUNTIME) run --rm \
+		-v $(CURDIR)/scripts:/scripts:ro \
+		--entrypoint python3 \
+		$(IMAGE_NAME) \
+		/scripts/bench_pearls/verify_problems.py
