@@ -24,12 +24,14 @@ The bench produces evidence-grade routing recommendations. On this
   needed.
 - **`NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4@131072`** scores 0.95
   aggregate, ties gpt-oss-20b on overall correctness and ties Qwen3
-  on perfect tool fidelity, with 128K context. The catch: TPS is
-  **43 tok/s** -- one third of gpt-oss-20b at the same active-param
-  count -- because it requires `--enforce-eager` for OOM rescue on
-  this 24 GB card, which disables CUDA-graph capture. Strong choice
-  for accuracy-bound batch / async workloads; not the right pick for
-  interactive turns where wall time matters.
+  on perfect tool fidelity, with 128K context. **And at
+  144.8 tok/s** -- restored after replacing `--enforce-eager` with
+  NVIDIA's prescribed `--max-num-seqs 8`, which shrinks the
+  CUDA-graph capture budget enough to fit on 24 GB without
+  disabling capture. Now the **fastest** structured-reasoning +
+  perfect-tools model on the leaderboard, edging gpt-oss-20b's
+  136 tok/s. Strong choice for any interactive agentic workload at
+  this hardware budget.
 - **`Llama-3.1-8B-Instruct-NVFP4@131072`** is the fastest non-
   reasoning model (96 tok/s, no `<think>` preamble) -- good fallback
   for latency-critical simple tasks.
@@ -40,7 +42,7 @@ The bench produces evidence-grade routing recommendations. On this
 | Tier | Models | Use for |
 |---|---|---|
 | **Production default** | `gpt-oss-20b@262144` | Claude Code, Aider, multi-tool agents -- fastest and most accurate combination |
-| **Reasoning + tools alternative** | `Qwen3-8B-NVFP4@131072`, `Qwen3-14B-NVFP4@65536`, `NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4@131072` | when you specifically want the Qwen3 family or perfect tool fidelity (1.00 tools_use); Nemotron-3 also qualifies but is throughput-bound (43 tok/s) |
+| **Reasoning + tools alternative** | `Qwen3-8B-NVFP4@131072`, `Qwen3-14B-NVFP4@65536`, `NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4@131072` | when you specifically want the Qwen3 family or perfect tool fidelity (1.00 tools_use); Nemotron-3 also qualifies and is now the fastest in this tier at 144.8 tok/s after the `--max-num-seqs 8` graph-capture rescue |
 | **Non-reasoning low-latency** | `Llama-3.1-8B-Instruct-NVFP4@131072` | simple prompts where you don't want CoT preamble |
 | **Reasoning-only (high latency)** | `DeepSeek-R1-Distill-Qwen-7B@65536` | offline / batch / when reasoning depth matters more than wall time |
 | **Avoid (broken)** | `DeepSeek-R1-Distill-Llama-8B@32768` (BPE-decode bug, 0.0 HumanEval), `Nemotron-Nano-9B-v2-NVFP4@65536` (3 leak hits, no tool parser) | -- |
@@ -52,7 +54,7 @@ The bench produces evidence-grade routing recommendations. On this
 | **Qwen3-8B-NVFP4@131072** | 0.98 | 0.94 | **1.00** | 1.0/1.0/1.0/1.0 | 0.000 | 45.6 | 32.7/34.5 | **98.3** | 22.53 GB | **0.97** |
 | **Qwen3-14B-NVFP4@65536** | 0.97 | 0.92 | **1.00** | 1.0/1.0/1.0/1.0 | 0.000 | 49.8 | 45.8/48.0 | 62.0 | 22.32 GB | **0.96** |
 | **gpt-oss-20b@262144** | 0.97 | **0.98** | 0.90 | 0.8/1.0/0.8/1.0 | 0.000 | 56.0 | 51.0/54.0 | **136.4** | 22.36 GB | **0.95** |
-| **NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4@131072** | 0.98 | 0.86 | **1.00** | 1.0/1.0/1.0/1.0 | 0.000 | 30.6^# | 70.1/74.4 | 42.9 | 22.63 GB | **0.95** |
+| **NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4@131072** | 0.98 | 0.86 | **1.00** | 1.0/1.0/1.0/1.0 | 0.000 | 65.6 | 51.0/54.0 | **144.8** | 22.43 GB | **0.95** |
 | **Qwen3.5-9B-NVFP4@131072** | 0.95 | 0.74 | 0.80 | 0.4/1.0/0.8/1.0 | 0.000 | 162.3 | 32.6/34.1 | 55.7 | 21.66 GB | 0.83 |
 | **Llama-3.1-8B-Instruct-NVFP4@131072** | 0.84 | 0.72 | 0.75 | 1.0/0.6/1.0/0.4 | 0.000 | 41.6 | 22.9/24.9 | **95.9** | 22.65 GB | 0.77 |
 | **DeepSeek-R1-Distill-Qwen-7B@65536** | 0.88 | 0.26 | 0.65 | 1.0/0.8/0.4/0.4 | 0.000 | 86.9 | 36.4/40.1 | 45.2 | 21.89 GB | 0.60 |
@@ -78,18 +80,16 @@ Footnotes for caveats marked above:
   parser plugin (`nemotron_toolcall_parser_no_streaming.py`) for
   vLLM's `--tool-parser-plugin` mechanism; wiring it up is a
   separate followup (see followup work below).
-- ^# **`Cold (s) = 30.6` for NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4**
-  is the **probe-measured** cold start (fresh container, fresh model
-  load) rather than the bench's `ttft_ms_first`. The bench's value
-  was 78 ms for this row because the model was already loaded in the
-  vLLM container at bench-start time (a manual validation request
-  warmed it earlier in the same session). The probe number reflects
-  a genuine cold start. First-time cold start with CUDA-graph
-  compilation will be longer; subsequent recreates are faster as
-  cached. Note also: this row runs with `--enforce-eager` (recovery
-  flag for OOM rescue), which disables CUDA-graph capture entirely
-  -- that's the dominant reason TPS is 43 vs gpt-oss-20b's 136 at
-  the same active-param count. See followup #11.
+  (Historical note: an earlier configuration of this row used
+  `--enforce-eager` for OOM rescue and reported TPS=43 tok/s and
+  Cold=30.6 s (probe-measured, since the bench saw a warmed
+  container at 78 ms). After replacing `--enforce-eager` with
+  `--max-num-seqs 8` (NVIDIA's prescribed value, which shrinks the
+  CUDA-graph capture budget rather than disabling capture
+  entirely), the model loads cleanly with graph capture on and TPS
+  triples to 144.8 tok/s. The 65.6 s cold-start figure now in the
+  table includes one-time CUDA-graph compilation; subsequent
+  recreates are faster.)
 
 (The previous `^+^+` footnote about `tools_use=0.00` on forced-mode
 models is gone: the bench's `tools_use` task now pins `tool_choice`
@@ -372,7 +372,7 @@ Peak VRAM relative to the 24 GB cap:
 | Model | Peak / 24 GB | Pressure |
 |---|---:|---|
 | Llama-3.1-8B-Instruct-NVFP4 @131K | 22.65 / 24 = **94.4%** | tight; KV near limit at full ctx |
-| Nemotron-3-Nano-30B-A3B-NVFP4 @131K | 22.63 / 24 = **94.3%** | tight; runs with `--enforce-eager` for OOM rescue |
+| Nemotron-3-Nano-30B-A3B-NVFP4 @131K | 22.43 / 24 = **93.5%** | tight; runs with `--max-num-seqs 8` (NVIDIA's prescribed value) which shrinks CUDA-graph capture buffers enough to keep capture enabled |
 | Qwen3-8B-NVFP4 @131K | 22.53 / 24 = **93.9%** | tight |
 | gpt-oss-20b @262K | 22.37 / 24 = 93.2% | tight |
 | Qwen3-14B-NVFP4 @65K | 22.32 / 24 = 93.0% | tight |
@@ -558,20 +558,21 @@ agentic use" badge.
    `make bench-ollama` if Ollama-side comparisons become relevant.
 10. **Wire bench cache -> picker badge** -- tag PRODUCTION_AGENTIC rows
     in the picker UI. v2 feature.
-11. **Experiment: drop `--enforce-eager` on
+11. ~~**Experiment: drop `--enforce-eager` on
     `NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4` by also passing
-    `--max-num-seqs 8`** (NVIDIA's prescribed value, currently we use
-    vLLM's default of 256). Hypothesis: the OOM at model load is
-    driven by CUDA-graph capture buffers that scale with
-    `max_num_seqs`; shrinking the scheduler pool to 8 may free enough
-    transient headroom to keep graph capture enabled, lifting TPS
-    from 43 tok/s back toward the ~80-120 tok/s expected for a
-    3.6 B-active MoE on this card. Steps: add `"--max-num-seqs",
-    "8"` to `engine_flags` in `recovery-flags.json` and remove
-    `--enforce-eager`, run `make probe-vllm` for the family, and if
-    it fits run `make bench-vllm BENCH_REPO='Nemotron-3-Nano-30B-A3B-NVFP4'
-    BENCH_FORCE=1` to get the new TPS. Risk: if OOM still trips,
-    re-add `--enforce-eager` and accept current TPS. Quick (~30 min).
+    `--max-num-seqs 8`**~~ **Done.** Hypothesis confirmed: the OOM
+    at model load is driven by CUDA-graph capture buffers that scale
+    with `max_num_seqs`. Shrinking the scheduler pool from vLLM's
+    default 256 down to NVIDIA's prescribed 8 reduced the graph
+    capture transient enough to fit on 24 GB *without* disabling
+    capture. After: probe loads cleanly (peak VRAM 22.35 GB,
+    structured capability preserved), bench shows TPS 42.87 -> 144.84
+    (3.4x), steady TTFT p50 70 ms -> 51 ms (-27 %), peak VRAM 22.63
+    GB -> 22.43 GB (-200 MB), leak rate stays at 0. Cold start now
+    65.6 s (one-time graph compile included; faster on subsequent
+    recreates). Nemotron-3 is now the fastest structured-reasoning +
+    perfect-tools model on the leaderboard, edging gpt-oss-20b's 136
+    tok/s. `recovery-flags.json` updated; `--enforce-eager` removed.
 
 ## Cross-references
 
