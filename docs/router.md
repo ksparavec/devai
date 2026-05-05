@@ -588,14 +588,32 @@ Per (model, backend) pair, per run:
 
 ### Cache file
 
-`deploy/.bench-cache.json`, schema-versioned and sorted-keys for
-diff-friendliness. Top-level key matches the probe caches -- 
-`<repo@sha>` for HF, `<digest>` for Ollama -- so a row joins to its
-source probe row by key. Schema is documented at the top of
-`scripts/bench/_bench_core.py::update_row`.
+`deploy/.bench-cache.json`, schema v2, sorted-keys for diff-
+friendliness. Top-level layout:
+
+- `_meta.host_env_history` -- map keyed by 12-char SHA-256 id of
+  `(kernel, driver_version, gpu_name, gpu_memory_gb, cuda_version)`,
+  values include `captured_at` (ISO-8601 UTC). Same hardware on
+  different days -> same id, so the table accumulates one entry per
+  distinct environment.
+- `_meta.current_host_env_id` -- pointer to the most-recent run's id.
+- Bench rows -- keys `<repo>@<sha>::<backend>` for HF
+  (vllm/sglang) or `<digest>::<backend>` for Ollama. Each row stamps
+  `host_env_id` so consumers can spot mixed-provenance leaderboards.
+  The `::<backend>` suffix is mandatory; legacy keys without it are
+  migrated in-memory by `migrate_bench_cache_keys` on every load.
+
+Iterate with `is_row_key(key)` from `_bench_core.py` so `_meta` (and
+any future top-level meta blocks) are skipped. Schema is documented
+at the top of `scripts/bench/_bench_core.py::update_row`.
 
 Re-runs merge in (don't overwrite) so partial benches accumulate.
-`BENCH_FORCE=1` re-runs every task even if cached.
+`BENCH_FORCE=1` re-runs every task and **also** resets the row's
+`tasks` and `metrics` blocks before the new run starts -- preserving
+`first_benched_at`, refreshing `last_benched_at`, and stamping the
+current `host_env_id`. Without `--force`, individual tasks are
+skipped only when an entry with that exact subset name (e.g.
+`gsm8k_subset_100`) already exists.
 
 ### Make targets
 
@@ -634,11 +652,16 @@ changes needed.
 make bench-report
 ```
 
-prints a leaderboard sorted by aggregate correctness score. For a
-single model:
+prints a leaderboard sorted by aggregate correctness score. The
+top of the report carries a `_Host env_` header with the active
+`host_env_id`, kernel, driver, GPU, CUDA version, and capture
+timestamp; the per-row `Env` column joins each row to its history
+entry so a re-bench after a driver upgrade shows clearly mixed
+provenance. For a single model:
 
 ```bash
-jq '.["meta-llama/Llama-3.1-8B@abc123"]' deploy/.bench-cache.json
+jq '.["nvidia/Qwen3-8B-NVFP4@ccd10a893cbc::vllm"]' deploy/.bench-cache.json
+jq '.["_meta"].host_env_history' deploy/.bench-cache.json
 ```
 
 Per-task `inspect_log_dir` paths point at `.eval` files under

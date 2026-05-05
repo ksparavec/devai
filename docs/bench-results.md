@@ -6,6 +6,18 @@
 > Bench harness: `scripts/bench/` -- see `docs/router.md` "Benchmark
 > harness" section. Per-task subset sizes: GSM8K n=100, HumanEval
 > n=50, tools_use n=20, latency/leak n=40 streamed prompts.
+>
+> **2026-05-05 schema bump (v2):** the bench cache now carries a
+> top-level `_meta.host_env_history` block keyed by a 12-char id
+> derived from `(kernel, driver_version, gpu_name, gpu_memory_gb,
+> cuda_version)`, and every row stamps `host_env_id` so a re-bench
+> against a different driver/kernel is auditable. `make bench-vllm
+> BENCH_FORCE=1` resets row `tasks`/`metrics` before re-running so
+> stale fields don't linger; `first_benched_at` is preserved.
+> Numbers below are from the original 2026-05-02 sweep -- the
+> 2026-05-05 re-bench (driver `595.71.05`, kernel
+> `6.12.85+deb13-amd64`, host_env_id `ea4fd7e7b668`) is in the live
+> cache; refresh this doc with `make bench-report` when ready.
 
 ## TL;DR
 
