@@ -518,8 +518,36 @@ agentic use" badge.
    `Qwen3.5-9B-NVFP4` at 95.7 % (the only row above the threshold).
    Footer line in the report reminds readers of the threshold and
    points back to this doc.
-6. **Add a long-context probe (one prompt at 80% of ctx)** -- detects
-   KV paging cliffs that the current latency probe misses. v2 feature.
+6. ~~**Add a long-context probe (one prompt at 80% of ctx)** -- detects
+   KV paging cliffs that the current latency probe misses.~~ **Done.**
+   New module `scripts/bench/bench_longctx.py` sends ONE chat
+   completion at `fraction * model.ctx` input tokens (default 0.8)
+   and captures: prefill TTFT, decode-phase TPS, output_tokens,
+   finish_reason, end-of-request `vllm:kv_cache_usage_perc`, and
+   `vllm:num_preemptions_total` delta. Wired into `bench_runner` as
+   an opt-in `longctx` task (not in the default `gsm8k,humaneval,
+   tools,leak` set; enable with `BENCH_TASKS=longctx,...`). Knobs
+   `--n-longctx-fraction` and `--n-longctx-max-tokens` (env
+   `BENCH_N_LONGCTX_FRACTION` / `BENCH_N_LONGCTX_MAX_TOKENS`).
+   Filler prompt is a public-domain prose chunk repeated to size
+   (~3.5 chars/token, conservative under-shoot to avoid
+   max_model_len rejection); the tail asks for a single-sentence
+   summary so the model produces a measurable decode segment.
+
+   Smoke-test against Nemotron-3-Nano-30B-A3B-NVFP4 at 80 % of
+   131 K (104 857 target tokens): `ttft=75.8s`, `decode TPS=144.1`,
+   `out=67`, `finish=length`, no preemptions, peak VRAM 22.54 GB.
+   Prefill cost confirmed as the dominant interactive-latency
+   penalty for near-max-ctx requests on this card.
+
+   Known limitation: the end-of-request `kv_cache_usage_perc`
+   reads 0.0 because the request has freed its KV blocks by the
+   time we sample /metrics. Capturing the peak DURING the request
+   would need a parallel polling thread (similar to the existing
+   `VramSampler`). Logged but not fixed -- the absence of
+   preemptions is sufficient signal that the KV pool was big
+   enough; we'll only need peak-during-run sampling when we hit a
+   model that DOES preempt under longctx load.
 7. ~~**Add vLLM `/metrics` snapshot** -- captures
    `vllm:gpu_cache_usage_perc` and `vllm:num_preemptions_total` per
    run.~~ **Done.** End-of-run snapshot lands in the bench cache as

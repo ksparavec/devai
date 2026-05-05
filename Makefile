@@ -1005,7 +1005,9 @@ BENCH_RUN_FLAGS = \
 	$(if $(BENCH_N_GSM8K),--n-gsm8k $(BENCH_N_GSM8K),) \
 	$(if $(BENCH_N_HUMANEVAL),--n-humaneval $(BENCH_N_HUMANEVAL),) \
 	$(if $(BENCH_N_TOOLS),--n-tools $(BENCH_N_TOOLS),) \
-	$(if $(BENCH_N_LEAK_PROMPTS),--n-leak-prompts $(BENCH_N_LEAK_PROMPTS),)
+	$(if $(BENCH_N_LEAK_PROMPTS),--n-leak-prompts $(BENCH_N_LEAK_PROMPTS),) \
+	$(if $(BENCH_N_LONGCTX_FRACTION),--n-longctx-fraction $(BENCH_N_LONGCTX_FRACTION),) \
+	$(if $(BENCH_N_LONGCTX_MAX_TOKENS),--n-longctx-max-tokens $(BENCH_N_LONGCTX_MAX_TOKENS),)
 
 bench: bench-vllm bench-sglang bench-ollama ## Bench every probed model on every backend
 	@echo

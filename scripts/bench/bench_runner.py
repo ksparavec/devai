@@ -336,6 +336,8 @@ def run_for_target(
     n_humaneval: int,
     n_tools: int,
     n_leak_prompts: int,
+    n_longctx_fraction: float,
+    n_longctx_max_tokens: int,
     log_dir: Path,
     cache: dict,
     cache_path: Path,
@@ -455,6 +457,40 @@ def run_for_target(
             except Exception as e:  # noqa: BLE001
                 print(f"    !! tools_use failed: {e}", file=sys.stderr)
 
+        if "longctx" in tasks and (force or "longctx_probe" not in existing_tasks):
+            from bench import bench_longctx
+            print(
+                f"  [longctx] one prompt at {n_longctx_fraction:g}x ctx="
+                f"{target['ctx']} ...",
+                file=sys.stderr,
+            )
+            try:
+                lc = bench_longctx.run(
+                    model=served,
+                    router_url=router_url,
+                    ctx_target=int(target["ctx"]),
+                    fraction=float(n_longctx_fraction),
+                    max_output_tokens=int(n_longctx_max_tokens),
+                    timeout_s=900.0,
+                    fetch_metrics=lambda: _fetch_backend_metrics(backend),
+                )
+                task_results["longctx_probe"] = {**lc, "ran_at": _now_iso()}
+                if lc.get("error"):
+                    print(f"    !! longctx errored: {lc['error']}", file=sys.stderr)
+                else:
+                    print(
+                        f"    target_in={lc['input_tokens_target']}  "
+                        f"ttft={lc['ttft_ms']}ms  "
+                        f"tps_decode={lc['tps_during_decode']}/s  "
+                        f"out={lc['output_tokens']}  "
+                        f"finish={lc['finish_reason']}  "
+                        f"kv={lc['peak_kv_cache_perc']}  "
+                        f"preempt={lc['preemptions']}",
+                        file=sys.stderr,
+                    )
+            except Exception as e:  # noqa: BLE001
+                print(f"    !! longctx failed: {e}", file=sys.stderr)
+
     finally:
         vram = sampler.stop()
         elapsed = time.time() - started
@@ -530,10 +566,10 @@ def _print_latency_summary(latency: dict) -> None:
 def _strip_subset(task_name: str) -> str:
     """Map cache task keys back to user-visible task names.
 
-    ``gsm8k_subset_100`` → ``gsm8k``; ``humaneval_subset_50`` →
-    ``humaneval``; ``tools_use_20`` → ``tools``; ``leak_probe`` →
-    ``leak``. Used to skip already-cached tasks without forcing the
-    same n.
+    ``gsm8k_subset_100`` -> ``gsm8k``; ``humaneval_subset_50`` ->
+    ``humaneval``; ``tools_use_20`` -> ``tools``; ``leak_probe`` ->
+    ``leak``; ``longctx_probe`` -> ``longctx``. Used to skip
+    already-cached tasks without forcing the same n.
     """
     if task_name.startswith("gsm8k_"):
         return "gsm8k"
@@ -543,6 +579,8 @@ def _strip_subset(task_name: str) -> str:
         return "tools"
     if task_name == "leak_probe":
         return "leak"
+    if task_name == "longctx_probe":
+        return "longctx"
     return task_name
 
 
@@ -582,12 +620,24 @@ def main() -> None:
     ap.add_argument("--n-tools", type=int, default=int(os.environ.get("BENCH_N_TOOLS", "20")))
     ap.add_argument("--n-leak-prompts", type=int,
                     default=int(os.environ.get("BENCH_N_LEAK_PROMPTS", "40")))
+    ap.add_argument(
+        "--n-longctx-fraction", type=float,
+        default=float(os.environ.get("BENCH_N_LONGCTX_FRACTION", "0.8")),
+        help="prompt size as a fraction of the model's max ctx (default 0.8)",
+    )
+    ap.add_argument(
+        "--n-longctx-max-tokens", type=int,
+        default=int(os.environ.get("BENCH_N_LONGCTX_MAX_TOKENS", "64")),
+        help="response token cap for the long-context probe; small by "
+             "design -- the probe measures prefill TTFT and steady-state "
+             "decode rate, not response length",
+    )
     ap.add_argument("--cache", type=Path, default=DEFAULT_CACHE_PATH)
     ap.add_argument("--log-dir", type=Path, default=DEFAULT_INSPECT_LOG_DIR)
     args = ap.parse_args()
 
     tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
-    invalid = [t for t in tasks if t not in {"gsm8k", "humaneval", "tools", "leak"}]
+    invalid = [t for t in tasks if t not in {"gsm8k", "humaneval", "tools", "leak", "longctx"}]
     if invalid:
         sys.exit(f"unknown task(s): {invalid}")
 
@@ -631,6 +681,8 @@ def main() -> None:
             n_humaneval=args.n_humaneval,
             n_tools=args.n_tools,
             n_leak_prompts=args.n_leak_prompts,
+            n_longctx_fraction=args.n_longctx_fraction,
+            n_longctx_max_tokens=args.n_longctx_max_tokens,
             log_dir=args.log_dir,
             cache=cache,
             cache_path=args.cache,
