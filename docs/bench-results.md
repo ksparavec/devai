@@ -574,6 +574,20 @@ agentic use" badge.
     perfect-tools model on the leaderboard, edging gpt-oss-20b's 136
     tok/s. `recovery-flags.json` updated; `--enforce-eager` removed.
 
+    Side-effect: this also closed the "doesn't investigate deep
+    enough" symptom the user reported when running Claude Code
+    against this model in a parallel session. The earlier
+    investigation suspected intrinsic 3.6 B-active-params capability,
+    sampling defaults, or system-prompt sparseness (knobs 1a/1b/1c
+    in the followup plan). 1a (`enable_thinking` reaches vLLM) was
+    verified working before this rerun. After 3.4x throughput the
+    symptom evaporated -- the model wasn't reasoning shallower, the
+    slow turns just made the same investigation depth feel
+    shallower per minute of patience. **Lesson: throughput
+    regressions can masquerade as quality regressions in
+    interactive agentic workloads.** Resolved without touching
+    sampling or system prompts.
+
 ## Cross-references
 
 - `docs/router.md` -- request rewrite chain, including the
