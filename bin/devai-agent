@@ -62,6 +62,13 @@ PROBE_CACHES = {
     "sglang": CONFIG_DIR / ".sglang-reasoning-cache.json",
 }
 
+# Bench cache feeds the picker's TPS/CODE/REAS/TOTAL columns. Mounted
+# at the same /etc/devai/ prefix as the probe caches so the picker's
+# _BENCH_CACHE_PATHS lookup finds it. Absent file is non-fatal — the
+# picker renders the four score columns as '-' and the sort modes
+# still work, just with all rows tied at no-data.
+BENCH_CACHE = CONFIG_DIR / ".bench-cache.json"
+
 DEFAULTS: dict = {
     "vram": 24,
     "context": 131072,
@@ -236,6 +243,12 @@ def build_run_cmd(
         if host_path.exists():
             cmd += ["-v",
                     f"{host_path}:/etc/devai/.{backend}-reasoning-cache.json:ro"]
+
+    # Bench cache — same /etc/devai/ prefix the picker scans. Without
+    # this mount the four bench-score columns show '-' even when the
+    # repo's deploy/.bench-cache.json is fully populated.
+    if BENCH_CACHE.exists():
+        cmd += ["-v", f"{BENCH_CACHE}:/etc/devai/.bench-cache.json:ro"]
 
     # Override the baked-in /usr/local/bin/model-picker with the host copy
     # so improvements made in the repo (and copied to ~/.devai/ by

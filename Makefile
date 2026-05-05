@@ -102,11 +102,14 @@ MODEL_CACHE_MOUNT = $(if $(wildcard $(CACHE_DIR)/ollama),-v $(CACHE_DIR)/ollama:
 # its name → context-cap map. All three caches must be exposed under
 # /etc/devai/.<backend>-reasoning-cache.json — model-picker.py looks
 # them up by that path. Without the vLLM/SGLang mounts the picker
-# falls back to "no HF probes" and shows Ollama rows only.
+# falls back to "no HF probes" and shows Ollama rows only. The
+# .bench-cache.json mount is what populates the picker's TPS/CODE/
+# REAS/TOTAL columns; absent → all four columns render as '-'.
 PROBE_CACHE_MOUNT = \
 	$(if $(wildcard deploy/.ollama-reasoning-cache.json),-v $(CURDIR)/deploy/.ollama-reasoning-cache.json:/etc/devai/.ollama-reasoning-cache.json:ro) \
 	$(if $(wildcard deploy/.vllm-reasoning-cache.json),-v $(CURDIR)/deploy/.vllm-reasoning-cache.json:/etc/devai/.vllm-reasoning-cache.json:ro) \
-	$(if $(wildcard deploy/.sglang-reasoning-cache.json),-v $(CURDIR)/deploy/.sglang-reasoning-cache.json:/etc/devai/.sglang-reasoning-cache.json:ro)
+	$(if $(wildcard deploy/.sglang-reasoning-cache.json),-v $(CURDIR)/deploy/.sglang-reasoning-cache.json:/etc/devai/.sglang-reasoning-cache.json:ro) \
+	$(if $(wildcard deploy/.bench-cache.json),-v $(CURDIR)/deploy/.bench-cache.json:/etc/devai/.bench-cache.json:ro)
 
 # User switching: only needed for docker (rootless podman root = host user)
 USER_ENV =
@@ -955,6 +958,17 @@ install: ## Install bin/devai-agent to $(INSTALL_PREFIX)/bin and stage config in
 			echo "  WARNING: $$src missing — run 'make probe' (or probe-$$cache) first"; \
 		fi; \
 	done
+	@# Bench cache feeds the picker's TPS/CODE/REAS/TOTAL columns. Absent
+	@# means those columns render as '-'; not fatal — just unhelpful for
+	@# the bench-aware sort modes.
+	@bench_src="$(CURDIR)/deploy/.bench-cache.json"; \
+	bench_dst="$(DEVAI_HOME)/.bench-cache.json"; \
+	if [ -f "$$bench_src" ]; then \
+		ln -sf "$$bench_src" "$$bench_dst"; \
+		echo "  linked: $$bench_dst"; \
+	else \
+		echo "  WARNING: $$bench_src missing — run 'make bench-vllm' to populate picker score columns"; \
+	fi
 	@echo "  linked: $(DEVAI_HOME)/model-picker.py"
 	@echo "  installed: $(INSTALL_PREFIX)/bin/devai-agent"
 	@echo
@@ -968,6 +982,7 @@ uninstall: ## Remove devai-agent launcher and the staged config dir
 	@rm -f $(DEVAI_HOME)/.ollama-reasoning-cache.json
 	@rm -f $(DEVAI_HOME)/.vllm-reasoning-cache.json
 	@rm -f $(DEVAI_HOME)/.sglang-reasoning-cache.json
+	@rm -f $(DEVAI_HOME)/.bench-cache.json
 	@rm -f $(DEVAI_HOME)/model-picker.py
 	@echo "Removed $(INSTALL_PREFIX)/bin/devai-agent and the symlinks under $(DEVAI_HOME)/."
 	@echo "preferences.yaml and sessions/ are kept; remove $(DEVAI_HOME)/ manually if you want a clean slate."

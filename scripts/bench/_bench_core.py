@@ -218,6 +218,21 @@ def sweep_for_leaks(
 
 # ── Cache row builder ───────────────────────────────────────────────────────
 
+# Top-level cache keys reserved for harness metadata (schema v2+). Anything
+# else at the top level is a bench row keyed by ``<repo>@<sha>::<backend>`` or
+# ``<digest>::<backend>``. Consumers iterating cache.items() must skip these.
+META_KEYS: frozenset[str] = frozenset({"_meta"})
+
+
+def is_row_key(key: str) -> bool:
+    """True when ``key`` names a bench row (not a meta block).
+
+    Centralised so report/picker/migration code stays in sync if more
+    meta keys are added later.
+    """
+    return not (key in META_KEYS or key.startswith("_"))
+
+
 def update_row(
     cache: dict,
     key: str,
@@ -227,6 +242,7 @@ def update_row(
     router_endpoint: str,
     task_results: dict[str, dict] | None = None,
     metrics: dict | None = None,
+    host_env_id: str | None = None,
 ) -> dict:
     """Merge a single bench result into the cache.
 
@@ -234,10 +250,16 @@ def update_row(
     leak` after a full bench, etc.) don't lose unrelated task data.
     Updates ``last_benched_at`` always; sets ``first_benched_at`` only
     when the row is fresh.
+
+    ``host_env_id`` (when supplied) is stamped on the row so the
+    leaderboard can join back to ``cache["_meta"]["host_env_history"]``
+    and prove which kernel + driver + GPU produced these numbers. Each
+    re-bench against a different host environment yields a distinct id
+    so consumers can spot mixed-provenance rows.
     """
     now = _now_iso()
     row = cache.get(key) or {
-        "schema_version": 1,
+        "schema_version": 2,
         "model": model,
         "backend": backend,
         "router_endpoint": router_endpoint,
@@ -250,14 +272,136 @@ def update_row(
     row["router_endpoint"] = router_endpoint
     row.setdefault("tasks", {})
     row.setdefault("metrics", {})
+    # Schema bump on touch so older rows acquire the field even if no
+    # other fields changed in this update.
+    row["schema_version"] = max(int(row.get("schema_version", 1)), 2)
     if task_results:
         for tname, tresult in task_results.items():
             row["tasks"][tname] = tresult
     if metrics:
         row["metrics"].update(metrics)
+    if host_env_id is not None:
+        row["host_env_id"] = host_env_id
     row["last_benched_at"] = now
     cache[key] = row
     return row
+
+
+def reset_row_for_force(cache: dict, key: str) -> None:
+    """Clear ``tasks`` and ``metrics`` for a force re-bench, preserving
+    provenance (``first_benched_at``, ``model``, ``backend``,
+    ``router_endpoint``). No-op when the row doesn't exist yet.
+
+    Without this, ``--force`` re-runs the tasks but leaves stale
+    metric fields (e.g. an old ``ttft_ms_first`` from a prior driver
+    version) sitting next to the new run -- and the leaderboard can't
+    tell which is which.
+    """
+    row = cache.get(key)
+    if not isinstance(row, dict):
+        return
+    row["tasks"] = {}
+    row["metrics"] = {}
+
+
+# ── Host environment capture ────────────────────────────────────────────────
+
+def capture_host_env() -> dict:
+    """Snapshot the running host's kernel, GPU driver, and GPU model.
+
+    Best-effort. Each piece is wrapped so a missing tool (no
+    ``nvidia-smi`` on a CPU-only host, ``uname`` unavailable on
+    Windows-via-WSL surfaces, etc.) leaves a sparse dict rather than
+    crashing the bench. The dict is fed to ``host_env_id`` for hashing
+    and to ``cache["_meta"]["host_env_history"]`` for human reading.
+    """
+    import datetime as dt
+    import platform
+    import subprocess
+
+    out: dict = {
+        "kernel": platform.release(),
+        "captured_at": dt.datetime.now(dt.timezone.utc)
+        .replace(microsecond=0)
+        .isoformat(),
+    }
+    try:
+        r = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=driver_version,name,memory.total",
+                "--format=csv,noheader",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            line = r.stdout.strip().splitlines()[0]
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) >= 3:
+                out["driver_version"] = parts[0]
+                out["gpu_name"] = parts[1]
+                # memory.total looks like "24576 MiB" -- parse the integer.
+                mt_raw = parts[2].split()[0] if parts[2] else ""
+                try:
+                    out["gpu_memory_gb"] = round(int(mt_raw) / 1024.0, 2)
+                except ValueError:
+                    pass
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+    # CUDA runtime: nvidia-smi prints "CUDA Version: 13.0" in the
+    # header summary. The --query surface doesn't expose it, so we
+    # parse the human-readable output as a fallback.
+    try:
+        r = subprocess.run(
+            ["nvidia-smi"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        for line in (r.stdout or "").splitlines():
+            if "CUDA Version" in line and ":" in line:
+                tail = line.split("CUDA Version", 1)[1]
+                _, _, val = tail.partition(":")
+                cuda_ver = val.split("|")[0].strip()
+                if cuda_ver:
+                    out["cuda_version"] = cuda_ver
+                break
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+    return out
+
+
+def host_env_id(host_env: dict) -> str:
+    """Stable 12-char hash of the env, ignoring ``captured_at``.
+
+    Same kernel + driver + GPU model on different days -> same id, so
+    ``cache["_meta"]["host_env_history"]`` accumulates one entry per
+    distinct environment instead of one per bench run.
+    """
+    import hashlib
+
+    sub = {k: v for k, v in host_env.items() if k != "captured_at"}
+    raw = json.dumps(sub, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(raw).hexdigest()[:12]
+
+
+def stamp_host_env(cache: dict, env: dict) -> str:
+    """Record ``env`` under ``cache["_meta"]["host_env_history"][<id>]``
+    and return the id. Idempotent for the same env contents.
+
+    The pointer ``cache["_meta"]["current_host_env_id"]`` is updated
+    on every call so consumers can answer "which env produced the
+    most recent bench in this cache?" without scanning rows.
+    """
+    env_id = host_env_id(env)
+    meta = cache.setdefault("_meta", {})
+    history = meta.setdefault("host_env_history", {})
+    if env_id not in history:
+        history[env_id] = env
+    meta["current_host_env_id"] = env_id
+    return env_id
 
 
 def _now_iso() -> str:
@@ -332,10 +476,13 @@ def migrate_bench_cache_keys(cache: dict) -> int:
 
     Old rows always carry a ``backend`` field, so we use that to
     decide the suffix. Calling this on an already-migrated cache is
-    a no-op.
+    a no-op. Top-level meta keys (``_meta`` etc.) are skipped via
+    ``is_row_key``.
     """
     renames: list[tuple[str, str]] = []
     for k in list(cache.keys()):
+        if not is_row_key(k):
+            continue
         v = cache.get(k)
         if not isinstance(v, dict):
             continue

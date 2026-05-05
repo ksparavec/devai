@@ -17,7 +17,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from _probe_core import load_cache  # noqa: E402
-from bench._bench_core import DEFAULT_CACHE_PATH, migrate_bench_cache_keys  # noqa: E402
+from bench._bench_core import (  # noqa: E402
+    DEFAULT_CACHE_PATH,
+    is_row_key,
+    migrate_bench_cache_keys,
+)
 
 # Host VRAM cap. Defaults to 24 GB to match the project's reference card
 # (RTX 4000 PRO Blackwell). Override with GPU_MEMORY_GB at run-time when
@@ -78,6 +82,10 @@ def _kv_pressure_pct(peak_vram_gb: float | None, host_vram_gb: float) -> float |
 def render(cache: dict, host_vram_gb: float = DEFAULT_HOST_VRAM_GB) -> str:
     rows: list[dict] = []
     for key, row in cache.items():
+        if not is_row_key(key):
+            # Meta blocks (_meta etc.) live alongside row keys at the top
+            # level; the leaderboard only renders bench rows.
+            continue
         if not isinstance(row, dict):
             continue
         agg = _aggregate(row)
@@ -90,13 +98,28 @@ def render(cache: dict, host_vram_gb: float = DEFAULT_HOST_VRAM_GB) -> str:
         })
     rows.sort(key=lambda r: (r["agg"] is None, -(r["agg"] or 0.0)))
 
+    meta = cache.get("_meta") or {}
+    history = meta.get("host_env_history") or {}
+    current_id = meta.get("current_host_env_id")
+
     lines: list[str] = []
+    if current_id and current_id in history:
+        env = history[current_id]
+        lines.append(
+            f"_Host env_ `{current_id}`: kernel `{env.get('kernel', '?')}`, "
+            f"driver `{env.get('driver_version', '?')}`, "
+            f"GPU `{env.get('gpu_name', '?')}` "
+            f"({env.get('gpu_memory_gb', '?')} GB), "
+            f"CUDA `{env.get('cuda_version', '?')}`, "
+            f"captured `{env.get('captured_at', '?')}`."
+        )
+        lines.append("")
     lines.append(
-        "| Model | Backend | Agg | GSM8K | HumanEval | Tools | Leak rate | "
+        "| Model | Backend | Env | Agg | GSM8K | HumanEval | Tools | Leak rate | "
         "TTFT first | TTFT p50 | TPS | Peak VRAM | KV % |"
     )
     lines.append(
-        "|---|---|---|---|---|---|---|---|---|---|---|---|"
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|"
     )
     for r in rows:
         row = r["row"]
@@ -113,8 +136,9 @@ def render(cache: dict, host_vram_gb: float = DEFAULT_HOST_VRAM_GB) -> str:
         kv_pct = _kv_pressure_pct(peak, host_vram_gb)
         # Round KV % to one decimal so the column stays narrow.
         kv_str = "-" if kv_pct is None else f"{kv_pct:.1f}%"
+        env_id = row.get("host_env_id") or "-"
         lines.append(
-            f"| {r['model']} | {r['backend']} | {_fmt(r['agg'])} | "
+            f"| {r['model']} | {r['backend']} | {env_id} | {_fmt(r['agg'])} | "
             f"{_fmt(gsm)} | {_fmt(he)} | {_fmt(tools)} | {_fmt(leak)} | "
             f"{_fmt(ttft_first, ' ms')} | {_fmt(ttft_p50, ' ms')} | "
             f"{_fmt(tps, ' tok/s')} | {_fmt(peak, ' GB')} | {kv_str} |"

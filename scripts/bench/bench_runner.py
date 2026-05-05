@@ -42,10 +42,13 @@ from bench import bench_latency_leak  # noqa: E402
 from bench._bench_core import (  # noqa: E402
     DEFAULT_CACHE_PATH,
     cache_key_for_entry,
+    capture_host_env,
     migrate_bench_cache_keys,
+    reset_row_for_force,
     router_url_for,
     serving_alias,
     serving_alias_with_ctx,
+    stamp_host_env,
     update_row,
 )
 from bench.bench_vram_snapshot import VramSampler  # noqa: E402
@@ -342,10 +345,15 @@ def run_for_target(
     cache: dict,
     cache_path: Path,
     force: bool,
+    host_env_id: str | None = None,
 ) -> None:
     """Run all requested tasks against one model and persist results."""
     served = serving_alias_with_ctx(target["alias"], target["ctx"], backend)
     key = target["key"]
+    if force:
+        # Wipe stale tasks/metrics so the new run's numbers stand alone.
+        # Provenance (first_benched_at) is preserved by reset_row_for_force.
+        reset_row_for_force(cache, key)
     existing = cache.get(key) or {}
     existing_tasks = (existing.get("tasks") or {})
 
@@ -376,7 +384,10 @@ def run_for_target(
                     "ran_at": _now_iso(),
                 }
                 # Latency metrics live under "metrics", not "tasks".
-                _latency_metrics_into_row(cache, key, latency, target, backend, router_url)
+                _latency_metrics_into_row(
+                    cache, key, latency, target, backend, router_url,
+                    host_env_id=host_env_id,
+                )
                 _print_latency_summary(latency)
             except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
                 print(f"    !! leak/latency failed: {e}", file=sys.stderr)
@@ -525,6 +536,7 @@ def run_for_target(
         router_endpoint=router_url,
         task_results=task_results,
         metrics=metrics,
+        host_env_id=host_env_id,
     )
     save_cache(cache_path, cache)
 
@@ -532,6 +544,7 @@ def run_for_target(
 def _latency_metrics_into_row(
     cache: dict, key: str, latency: dict,
     target: dict, backend: str, router_url: str,
+    host_env_id: str | None = None,
 ) -> None:
     """Latency metrics belong on row.metrics, not row.tasks. Pulled
     out so the leak-task branch can write both shapes from one
@@ -547,6 +560,7 @@ def _latency_metrics_into_row(
             "tps_sustained_p50": latency.get("tps_sustained_p50"),
             "n_latency_samples": latency.get("n_samples"),
         },
+        host_env_id=host_env_id,
     )
 
 
@@ -671,6 +685,18 @@ def main() -> None:
             f"<repo>@<sha>::<backend> form",
             file=sys.stderr,
         )
+    # Snapshot the host environment once per run. Stamped on every row
+    # touched below so a re-bench against a different driver/kernel
+    # doesn't silently mix numbers with the previous run.
+    env = capture_host_env()
+    env_id = stamp_host_env(cache, env)
+    print(
+        f"bench: host_env_id={env_id} "
+        f"kernel={env.get('kernel')!r} "
+        f"driver={env.get('driver_version')!r} "
+        f"gpu={env.get('gpu_name')!r}",
+        file=sys.stderr,
+    )
     for tgt in targets:
         run_for_target(
             tgt,
@@ -687,6 +713,7 @@ def main() -> None:
             cache=cache,
             cache_path=args.cache,
             force=args.force,
+            host_env_id=env_id,
         )
 
     print(f"\nbench: wrote {args.cache}", file=sys.stderr)

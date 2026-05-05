@@ -321,6 +321,49 @@ def _bench_score(tasks: dict, prefix: str, key: str) -> float | None:
         return None
 
 
+def _picker_scores(bench_row: dict | None) -> dict[str, float | None]:
+    """Extract the four picker-sort scores from a bench cache row.
+
+    Returns ``{"tps": float|None, "code": float|None, "reas": float|None,
+    "total": float|None}``. Each value is ``None`` when the underlying
+    bench task hasn't been recorded yet (so the picker can sort
+    unbenched rows to the bottom rather than treating them as zeros).
+
+    Definitions:
+      * ``tps``   = ``metrics.tps_sustained_p50``
+                    (steady-state decode tokens/sec)
+      * ``code``  = ``tasks.humaneval_subset_*.pass@1``
+      * ``reas``  = ``2/3 * tools_use_score + 1/3 * gsm8k_score``
+                    (weighted blend of agentic-tool correctness and
+                    multi-step math reasoning)
+      * ``total`` = ``mean(gsm8k, humaneval, tools_use)``
+                    (equal-weight quality average; latency-only rows
+                    have ``None``)
+    """
+    if bench_row is None:
+        return {"tps": None, "code": None, "reas": None, "total": None}
+    tasks = bench_row.get("tasks") or {}
+    metrics = bench_row.get("metrics") or {}
+    tps_raw = metrics.get("tps_sustained_p50")
+    try:
+        tps = float(tps_raw) if tps_raw is not None else None
+    except (TypeError, ValueError):
+        tps = None
+    code = _bench_score(tasks, "humaneval_", "pass@1")
+    gsm = _bench_score(tasks, "gsm8k_", "score")
+    tools = _bench_score(tasks, "tools_use", "score")
+    # Reasoning blend: tools-use dominates because agentic workflows
+    # care more about tool-call correctness than abstract math, but
+    # GSM8K stays in the mix as a multi-step-thinking signal.
+    if tools is not None and gsm is not None:
+        reas = (2.0 / 3.0) * tools + (1.0 / 3.0) * gsm
+    else:
+        reas = None
+    quality_parts = [v for v in (gsm, code, tools) if v is not None]
+    total = sum(quality_parts) / len(quality_parts) if quality_parts else None
+    return {"tps": tps, "code": code, "reas": reas, "total": total}
+
+
 def _is_production_agentic(model: dict, bench_row: dict | None) -> bool:
     """Return True when the (model, bench) pair satisfies every
     PRODUCTION_AGENTIC threshold from docs/bench-results.md.
@@ -353,6 +396,43 @@ def _is_production_agentic(model: dict, bench_row: dict | None) -> bool:
         and float(leak) <= _PRODUCTION_AGENTIC_MAX_LEAK
         and float(peak) < _PRODUCTION_AGENTIC_MAX_VRAM_GB
     )
+
+
+def _build_comparison_ctx(candidates: list[dict]) -> dict:
+    """Pre-compute per-metric ranks across the candidate list so the
+    preview pane can describe each model relative to its peers.
+
+    Uses competition ranking (1, 2, 2, 4) — ties share a rank, the
+    next position skips. Models without a TOTAL score are excluded
+    from the rankings entirely; their preview will show ``--`` and
+    skip the use-cases comparison line.
+
+    Returns ``{"n_benched": int, "n_total": int, "ranks": {metric:
+    {id(m): rank}}}``. Empty when no candidate has bench data.
+    """
+    benched: list[tuple[dict, dict]] = []
+    for m in candidates:
+        s = m.get("_picker_scores") or {}
+        if s.get("total") is not None:
+            benched.append((m, s))
+    ctx: dict = {"n_benched": len(benched), "n_total": len(candidates)}
+    if not benched:
+        return ctx
+    ranks: dict[str, dict[int, int]] = {}
+    for metric in ("tps", "code", "reas", "total"):
+        rmap: dict[int, int] = {}
+        for m, s in benched:
+            v = s.get(metric)
+            if v is None:
+                continue
+            higher = sum(
+                1 for _, ss in benched
+                if ss.get(metric) is not None and ss.get(metric) > v
+            )
+            rmap[id(m)] = higher + 1
+        ranks[metric] = rmap
+    ctx["ranks"] = ranks
+    return ctx
 
 
 def _migrate_in_memory(raw: dict) -> dict:
@@ -450,6 +530,22 @@ def _strip_latest(name: str) -> str:
     """
     suffix = ":latest"
     return name[: -len(suffix)] if name.endswith(suffix) else name
+
+
+def _display_tag(name: str) -> str:
+    """Display-only shortener for the picker's TAG column.
+
+    Strips the literal ``NVIDIA-`` prefix that NVIDIA bakes into its
+    HF model directories (e.g.
+    ``NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4`` -> ``Nemotron-...``) so
+    the row doesn't push every other column off-screen. The actual
+    ``m["name"]`` is unchanged — agent commands, bench-cache lookups,
+    pick-back-channel records, and the preview pane all keep using
+    the unabbreviated name.
+    """
+    base = _strip_latest(name)
+    prefix = "NVIDIA-"
+    return base[len(prefix):] if base.startswith(prefix) else base
 
 
 def _details_from_probe(probe: dict) -> dict:
@@ -835,7 +931,10 @@ def _check_cache_visible() -> None:
 def _fzf(lines: list[str], header: str,
          selectable: list[bool] | None = None,
          preview_cmd: str | None = None,
-         preview_window: str = "right:45%:wrap") -> int | None:
+         preview_window: str = "right:42%:wrap",
+         extra_bindings: list[str] | None = None,
+         input_text: str | None = None,
+         header_lines: int = 0) -> int | None:
     """Run fzf; return selected line index or None on cancel.
 
     `selectable[i]=False` marks line i as a non-selectable section header.
@@ -847,6 +946,19 @@ def _fzf(lines: list[str], header: str,
     keeps the tag out of the visible row but available for the preview
     substitution. Header rows produce a blank preview (their tag is
     `--` and the cmd is expected to fail silently for missing files).
+
+    `extra_bindings` adds custom fzf `--bind` clauses (one per list
+    entry, fzf syntax). Used for the bench-score sort cycle on ctrl-s.
+
+    `input_text` overrides the default tag-prefixed line stream (used
+    when a binding provides its own pre-built input file -- the caller
+    can hand fzf the same shape directly).
+
+    `header_lines` (>0) maps to fzf's `--header-lines=N` so the first
+    N input lines become a fixed header the cursor cannot navigate
+    onto. Used by the model picker so the column header / sort
+    indicator / formula note never receive focus -- the preview pane
+    always corresponds to a selectable model row.
     """
     if selectable is None:
         selectable = [True] * len(lines)
@@ -854,13 +966,21 @@ def _fzf(lines: list[str], header: str,
     for i, line in enumerate(lines):
         tag = str(i) if selectable[i] else "--"
         indexed.append(f"{tag}\t{line}")
+    fzf_input = input_text if input_text is not None else "\n".join(indexed)
     while True:
         try:
             args = [
                 "fzf", "--reverse", "--no-sort", "--ansi", "--no-info",
+                # --exact disables fzf's default fuzzy matching: a
+                # query like "nemo" must appear as a literal substring
+                # of the row text, not as scattered characters in
+                # order. Without it, "nemo" matched Qwen3-Coder rows
+                # via "qwe[n]3-Cod[e]r ... [Mo]E" -- correct fuzzy
+                # behaviour, wrong UX for a model picker.
+                "--exact",
                 "--delimiter", "\t", "--with-nth", "2..",
                 "--header", header,
-                "--pointer", "▶", "--prompt", "  ",
+                "--pointer", "▶", "--prompt", "Search: ",
                 "--margin", "1,2",
                 # Always draw a rounded border around every prompt so the
                 # window is clearly delimited on dark terminals. Bright
@@ -887,21 +1007,27 @@ def _fzf(lines: list[str], header: str,
                 "fg:15,fg+:15,bg+:236,pointer:11,header:14,"
                 "hl:11,hl+:11,prompt:14,info:8,gutter:-1,border:14",
             ]
+            if header_lines > 0:
+                args.extend(["--header-lines", str(header_lines)])
             if preview_cmd:
                 # Preview pane gets its own rounded frame so the split
                 # between list and details is visually obvious. Older
                 # fzf versions silently ignore the suffix; newer ones
-                # render it in the main `border:` colour.
+                # render it in the main `border:` colour. The "hidden"
+                # spec is left bare -- a hidden window has nothing to
+                # frame, and some fzf versions reject the combo.
                 pwindow = preview_window
-                if "border" not in pwindow:
+                if pwindow != "hidden" and "border" not in pwindow:
                     pwindow = f"{pwindow}:border-rounded"
                 args.extend([
                     "--preview", preview_cmd,
                     "--preview-window", pwindow,
                 ])
+            for binding in (extra_bindings or []):
+                args.extend(["--bind", binding])
             result = subprocess.run(
                 args,
-                input="\n".join(indexed),
+                input=fzf_input,
                 stdout=subprocess.PIPE,
                 text=True,
             )
@@ -1118,7 +1244,31 @@ def _tuning_label(m: dict) -> str:
     return ""
 
 
-def _format_model_row(m: dict) -> str:
+def _fmt_score_pct(v: float | None) -> str:
+    """0.876 -> '87.6'. None -> '-'. Three-char wide for picker columns."""
+    if v is None:
+        return "-"
+    return f"{v * 100:.1f}"
+
+
+def _fmt_tps(v: float | None) -> str:
+    if v is None:
+        return "-"
+    return f"{v:.1f}"
+
+
+def _fmt_leak_pct(m: dict) -> str:
+    """leak_rate * 100 as 1-decimal percent, or '-' when there is no
+    bench data on this row. Three-char value fits in a 5-char column.
+    """
+    bench_row = m.get("_picker_bench_row") or {}
+    leak_rate = ((bench_row.get("tasks") or {}).get("leak_probe") or {}).get("leak_rate")
+    if leak_rate is None:
+        return "-"
+    return f"{leak_rate * 100:.1f}"
+
+
+def _format_model_row(m: dict, idx: int = 0) -> str:
     info = m.get("_picker_vram") or {}
     vram_num = "?"
     if info:
@@ -1126,10 +1276,8 @@ def _format_model_row(m: dict) -> str:
         vram_num = f"{info['total_gb']:.2f}{suffix}"
 
     ctx_str = _context_label(int(m.get("_picker_context") or 0))
-    glyph = m.get("_picker_glyph", "?")
-    status_label = m.get("_picker_status_label", "Unknown")
 
-    # Params column: dense → "9B", MoE → "26B/A4B" (total/active).
+    # Params column: dense -> "9B", MoE -> "26B/A4B" (total/active).
     moe = m.get("moe") or {}
     details = m.get("details") or {}
     params_label = details.get("param_size") or "?"
@@ -1140,40 +1288,45 @@ def _format_model_row(m: dict) -> str:
                 active = tok.upper()
                 break
         params_col = f"{params_label}/{active}" if active else params_label
-        type_col = "MoE"
     else:
         params_col = params_label
-        type_col = "dense"
 
-    fmt = details.get("quantization") or "?"
-    tuning = _tuning_label(m)
-    display_name = _strip_latest(m["name"])
+    display_name = _display_tag(m["name"])
     backend_col = str(m.get("backend") or "?")
-    parser_col = str(m.get("tool_parser") or "N/A")
+    fmt_col = str(details.get("quantization") or "?")
+    type_col = "MoE" if _is_moe(m) else "Dense"
+    tools_col = "Yes" if _has_tools(m) else "No"
 
-    # PRODUCTION_AGENTIC badge -- bench cache certifies the row meets
-    # every threshold from "Picker-tier recommendations" in
-    # docs/bench-results.md. Renders bright green so it pops on the
-    # row without changing column widths. Dim placeholder for the
-    # rest of the rows so the column still aligns.
-    if m.get("_picker_agentic"):
-        # Manual padding so the ANSI escape doesn't count toward width.
-        tier_col = f"{_GREEN}{'agentic':>8s}{_RESET}"
-    else:
-        tier_col = f"{_DIM}{'-':>8s}{_RESET}"
+    # Bench scores -- four columns the user requested. Unbenched rows
+    # render '-' so they sort to the bottom but still appear (with all
+    # the format/parser/tier metadata visible in the preview pane).
+    scores = m.get("_picker_scores") or {}
+    tps_col = _fmt_tps(scores.get("tps"))
+    code_col = _fmt_score_pct(scores.get("code"))
+    reas_col = _fmt_score_pct(scores.get("reas"))
+    total_col = _fmt_score_pct(scores.get("total"))
+    leak_col = _fmt_leak_pct(m)
 
+    # Line number reflects position in the current sort order, so
+    # ctrl-s renumbers the list. Caller passes 1-based ``idx``;
+    # ``00.`` is a sentinel used only when the helper is invoked
+    # outside ``_build_menu`` (e.g. unit-style tests).
+    num_col = f"{idx:02d}."
     return (
-        f"      {ctx_str:>4s}  "
-        f"{glyph} {status_label:<16s}  "
-        f"{display_name:<32s}  "
-        f"{backend_col:<7s}  "
+        f"{num_col:>3s}  "
+        f"{ctx_str:>5s}  "
+        f"{display_name:<34s}  "
+        f"{backend_col:>7s}  "
         f"{params_col:>10s}  "
-        f"{fmt:>8s}  "
-        f"{tuning:>5s}  "
-        f"{type_col:>5s}  "
-        f"{parser_col:>14s}  "
-        f"{tier_col}  "
-        f"{vram_num:>10s}"
+        f"{type_col:>6s}  "
+        f"{fmt_col:>7s}  "
+        f"{tools_col:>5s}  "
+        f"{tps_col:>7s}  "
+        f"{code_col:>7s}  "
+        f"{reas_col:>7s}  "
+        f"{total_col:>7s}  "
+        f"{leak_col:>5s}  "
+        f"{vram_num:>6s}"
     )
 
 
@@ -1221,6 +1374,37 @@ def _has_tools(m: dict) -> bool:
         return True
     probe = m.get("probe") or {}
     return not bool(probe.get("disable_verified"))
+
+
+# Known MoE family substrings -- name-based fallback for cases where
+# neither the probe-cache `moe.experts_total` field nor the param_size
+# "/A<n>B" notation marks the model. Matched case-insensitively against
+# the model name. Extend when new MoE families land.
+_MOE_NAME_HINTS: tuple[str, ...] = ("gpt-oss",)
+
+
+def _is_moe(m: dict) -> bool:
+    """Mixture-of-experts detector. Three signals, any of which wins:
+
+    1. ``moe.experts_total`` truthy -- set by the Ollama prober for
+       confirmed MoE checkpoints.
+    2. ``details.param_size`` contains a slash (e.g. ``30B/A3B``) --
+       the convention used by the HF/NVFP4 catalog to encode total
+       and active param counts in one string. HF probes don't fill
+       ``moe.experts_total`` so this is the load-bearing signal for
+       the picker's vLLM rows.
+    3. Model name matches one of ``_MOE_NAME_HINTS`` -- catches MoE
+       families whose names (e.g. ``gpt-oss-20b``) hide the active
+       count and would otherwise read as dense.
+    """
+    moe = m.get("moe") or {}
+    if moe.get("experts_total"):
+        return True
+    psize = str((m.get("details") or {}).get("param_size") or "")
+    if "/" in psize:
+        return True
+    name_lc = str(m.get("name") or "").lower()
+    return any(hint in name_lc for hint in _MOE_NAME_HINTS)
 
 
 def _ctx_tier(ctx: int) -> int:
@@ -1299,6 +1483,120 @@ def _dedup_hf_by_name(models: list[dict]) -> list[dict]:
     return list(chosen.values())
 
 
+# ── Quant format notes (info modal copy) ────────────────────────────────────
+
+# Per-format one-paragraph explanation. Looked up uppercase. Unknown
+# formats render no note (the "Format:" line still shows the marker).
+_FORMAT_NOTES: dict[str, str] = {
+    "NVFP4": (
+        "NVIDIA FP4: 4-bit float (E2M1) with per-block FP8 scales. "
+        "About 5x smaller than BF16 and accelerated by Blackwell/Hopper "
+        "FP4 tensor cores; quality typically lands within 1-2% of BF16 "
+        "when prepared with nvidia/Modelopt."
+    ),
+    "FP4": (
+        "Generic 4-bit float (E2M1). About 4x smaller than BF16; "
+        "quality depends heavily on the calibration recipe and per-block "
+        "scaling."
+    ),
+    "MXFP4": (
+        "OCP Microscaling FP4: per-32-element block scales, open-standard "
+        "successor to vendor FP4 schemes. Runs on FP4-capable tensor "
+        "cores (Blackwell, MI350)."
+    ),
+    "FP8": (
+        "8-bit float (E4M3 or E5M2). Half the size of BF16 with marginal "
+        "quality loss; commonly paired as the KV-cache format alongside "
+        "NVFP4 weights."
+    ),
+    "BF16": (
+        "Brain float 16: full-precision inference reference. 2x the size "
+        "of FP8 / 4x of NVFP4; pick when you need the highest-fidelity "
+        "baseline and have the VRAM to spare."
+    ),
+    "FP16": (
+        "Half-precision float 16. Same size as BF16 but a narrower "
+        "exponent range; legacy choice from pre-Hopper hardware."
+    ),
+    "F16": (
+        "GGUF 16-bit float (BF16 or FP16, depending on the source "
+        "tensor). Full-precision GGUF tier; 2x the size of Q8 with "
+        "no measurable quality gain on most workloads."
+    ),
+    "Q8_0": (
+        "GGUF 8-bit integer quant. About 50% the size of BF16 with "
+        "quality essentially indistinguishable -- the safest GGUF tier "
+        "when VRAM allows."
+    ),
+    "Q6_K": (
+        "GGUF 6-bit k-quant. About 38% the size of BF16 with very small "
+        "quality loss; a solid middle ground when Q8 doesn't fit."
+    ),
+    "Q5_K_M": (
+        "GGUF 5-bit k-quant (medium variant). About 33% the size of "
+        "BF16; small quality cost vs Q8 and noticeably less VRAM."
+    ),
+    "Q5_K_S": (
+        "GGUF 5-bit k-quant (small variant). Slightly smaller than "
+        "Q5_K_M with marginally more quality loss."
+    ),
+    "Q4_K_M": (
+        "GGUF 4-bit k-quant (medium variant). About 25% the size of "
+        "BF16 -- the most popular size/quality balance for local "
+        "inference."
+    ),
+    "Q4_K_S": (
+        "GGUF 4-bit k-quant (small variant). Smaller than Q4_K_M with "
+        "a touch more quality loss."
+    ),
+    "Q3_K_L": (
+        "GGUF 3-bit k-quant (large variant). Aggressive size reduction "
+        "with noticeable quality drift on reasoning and code tasks."
+    ),
+    "Q3_K_M": (
+        "GGUF 3-bit k-quant (medium variant). Aggressive size reduction "
+        "with noticeable quality drift on reasoning and code tasks."
+    ),
+    "Q3_K_S": (
+        "GGUF 3-bit k-quant (small variant). Smaller still; measurable "
+        "quality loss on most workloads."
+    ),
+    "Q3_K_XL": (
+        "GGUF 3-bit k-quant (extra-large variant). Slightly larger than "
+        "Q3_K_L for a touch more quality at minor VRAM cost."
+    ),
+    "Q2_K": (
+        "GGUF 2-bit k-quant. The smallest GGUF tier; substantial quality "
+        "loss on most workloads -- only pick when nothing larger fits."
+    ),
+    "AWQ": (
+        "Activation-aware Weight Quantization: 4-bit weights with "
+        "importance-preserving scaling. Generally outperforms GPTQ at "
+        "the same bitwidth."
+    ),
+    "GPTQ": (
+        "GPTQ: post-training quantization, typically 4-bit. Older but "
+        "well-tested; AWQ usually edges it out on quality."
+    ),
+}
+
+
+def _format_quant_note(fmt: str, indent_cols: int = 11, wrap_cols: int = 50) -> str:
+    """Per-format explanation block, wrapped + indented to align under
+    the "Format:" line in the preview pane. Returns "" for unknown
+    formats so the preview just shows the marker without a note.
+    """
+    if not fmt or fmt == "?":
+        return ""
+    note = _FORMAT_NOTES.get(fmt.upper())
+    if not note:
+        return ""
+    import textwrap
+    pad = " " * indent_cols
+    wrapped = textwrap.wrap(note, width=wrap_cols)
+    return "\n".join(f"{pad}{ln}" for ln in wrapped)
+
+
 # ── Per-family use-case blurbs (info modal copy) ─────────────────────────────
 
 _FAMILY_USE_CASES: dict[str, str] = {
@@ -1363,8 +1661,22 @@ _FAMILY_USE_CASES: dict[str, str] = {
 }
 
 
-def _capability_summary_text(m: dict, reasoning_mode: str = "default") -> str:
-    """Body text for the info modal: capabilities + per-family use case."""
+def _capability_summary_text(
+    m: dict,
+    reasoning_mode: str = "default",
+    comparison: dict | None = None,
+) -> str:
+    """Body text for the info modal: capabilities + per-model bench
+    properties + per-family use case.
+
+    ``comparison`` is the dict returned by ``_build_comparison_ctx``;
+    when present and the model has bench scores, a "Model properties"
+    section is appended with TPS / CODE / REAS / TOTAL plus per-metric
+    rank against the rest of the picker list, peak VRAM headroom,
+    steady-state TTFT, and a non-zero leak warning. The "Use cases"
+    blurb gets one bench-derived sentence appended when the model is
+    a per-metric leader or carries a noteworthy caveat.
+    """
     name = _strip_latest(m.get("name") or "")
     backend = str(m.get("backend") or "?")
     info = m.get("_picker_vram") or {}
@@ -1374,8 +1686,7 @@ def _capability_summary_text(m: dict, reasoning_mode: str = "default") -> str:
     if cap == "inline" and reasoning_mode == "nothink":
         reason_label = f"{reason_label} (forced OFF for this launch)"
     tools_label = "Yes" if _has_tools(m) else "No"
-    moe = m.get("moe") or {}
-    type_label = "MoE" if moe.get("experts_total") else "Dense"
+    type_label = "MoE" if _is_moe(m) else "Dense"
     details = m.get("details") or {}
     fmt = details.get("quantization") or "?"
     params = str(details.get("param_size") or "")
@@ -1387,39 +1698,246 @@ def _capability_summary_text(m: dict, reasoning_mode: str = "default") -> str:
     vram_str = f"{vram:.2f} GB" if vram else "?"
     family = (m.get("family") or "").lower()
     blurb = _FAMILY_USE_CASES.get(family, _FAMILY_USE_CASES["__default__"])
-    return (
+
+    properties_section = _format_model_properties(m, comparison)
+    extra_use_case_lines = _extra_use_case_lines(m, comparison)
+
+    fmt_note = _format_quant_note(str(fmt))
+    fmt_block = f"Format:    {fmt}\n"
+    if fmt_note:
+        fmt_block += fmt_note + "\n"
+    head = (
         f"Model:     {name}\n"
         f"Backend:   {backend}\n"
-        f"Format:    {fmt}\n"
+        f"{fmt_block}"
         f"Params:    {params}    Type: {type_label}\n"
         f"Context:   {_context_label(ctx)} (max fit at {_VRAM_BUDGET:g} GB)\n"
         f"VRAM:      {vram_str}\n"
         f"\n"
         f"Reasoning: {reason_label}\n"
         f"Tools:     {tools_label}    (parser: {parser})\n"
-        f"\n"
-        f"Use cases:\n"
-        f"{blurb}"
     )
+    parts = [head]
+    if properties_section:
+        parts.append("\n" + properties_section)
+    use_cases_body = blurb
+    if extra_use_case_lines:
+        # Bench-derived sentences sit in their own paragraph: a blank
+        # line separates them from the family blurb above, and each
+        # one starts flush at column 1 (no leading indent) so the
+        # block reads as the next paragraph rather than a sub-bullet.
+        use_cases_body = (
+            blurb.rstrip()
+            + "\n\n"
+            + "\n".join(extra_use_case_lines)
+        )
+    parts.append(f"\nUse cases:\n{use_cases_body}")
+    return "".join(parts)
 
 
-def _build_menu(
+def _format_model_properties(m: dict, comparison: dict | None) -> str:
+    """Render the "Model properties" preview section, or an empty
+    string when there's no bench data to report.
+
+    Layout (one line each, indented by 2 spaces):
+        TPS:    143.8 tok/s    (rank 1/9)
+        CODE:   98.0%          (rank 1/9)
+        REAS:   99.7%          (rank 1/9)
+        TOTAL:  99.0%          (rank 1/9)
+        Peak:   22.54 GB       (1.46 GB headroom under 24 GB cap)
+        TTFT:   38 ms          (steady-state, post-warmup)
+        Leaks:  7.5%           (3 of 40 prompts emitted special tokens)
+    """
+    scores = m.get("_picker_scores") or {}
+    bench_row = m.get("_picker_bench_row") or {}
+    if scores.get("total") is None or not bench_row:
+        # No bench data for this row. Still emit the section header
+        # so the user knows it's *expected* to be there once the
+        # bench has run, rather than wondering why it's missing.
+        if comparison and comparison.get("n_benched", 0) > 0:
+            return (
+                "Model properties:\n"
+                "  (no bench data for this row -- run `make bench-vllm` "
+                "to populate)\n"
+            )
+        return ""
+
+    ranks = (comparison or {}).get("ranks") or {}
+    n = (comparison or {}).get("n_benched", 0)
+    rid = id(m)
+
+    def _rank_str(metric: str) -> str:
+        r = ranks.get(metric, {}).get(rid)
+        if not r or n <= 0:
+            return ""
+        return f"  (rank {r}/{n})"
+
+    lines: list[str] = ["Model properties:"]
+    tps = scores.get("tps")
+    if tps is not None:
+        lines.append(f"  TPS:    {tps:>6.1f} tok/s{_rank_str('tps')}")
+    code = scores.get("code")
+    if code is not None:
+        lines.append(f"  CODE:   {code * 100:>5.1f}%{_rank_str('code')}")
+    reas = scores.get("reas")
+    if reas is not None:
+        lines.append(f"  REAS:   {reas * 100:>5.1f}%{_rank_str('reas')}")
+    total = scores.get("total")
+    if total is not None:
+        lines.append(f"  TOTAL:  {total * 100:>5.1f}%{_rank_str('total')}")
+    metrics = bench_row.get("metrics") or {}
+    peak = metrics.get("peak_vram_gb")
+    if peak is not None:
+        headroom = float(_VRAM_BUDGET) - float(peak)
+        lines.append(
+            f"  Peak:   {peak:>5.2f} GB"
+            f"   ({headroom:.2f} GB headroom under {_VRAM_BUDGET:g} GB cap)"
+        )
+    ttft_p50 = metrics.get("ttft_ms_steady_p50")
+    if ttft_p50 is not None:
+        lines.append(f"  TTFT:   {ttft_p50:>5.0f} ms (steady-state, post-warmup)")
+    tasks = bench_row.get("tasks") or {}
+    leak_probe = tasks.get("leak_probe") or {}
+    leak_rate = leak_probe.get("leak_rate")
+    n_prompts = leak_probe.get("n_prompts")
+    if leak_rate is not None and leak_rate > 0:
+        leaked_n = (
+            int(round(leak_rate * n_prompts))
+            if isinstance(n_prompts, (int, float)) and n_prompts
+            else None
+        )
+        suffix = (
+            f"   ({leaked_n} of {n_prompts} prompts emitted special tokens)"
+            if leaked_n is not None
+            else ""
+        )
+        lines.append(f"  Leaks:  {leak_rate * 100:>5.1f}%{suffix}")
+    return "\n".join(lines) + "\n"
+
+
+def _extra_use_case_lines(m: dict, comparison: dict | None) -> list[str]:
+    """Return at most two bench-derived sentences to append to the
+    family use-cases blurb. Sentences are picked to highlight what's
+    *useful to a picker user*: the per-metric leader gets a callout,
+    leaks earn a caveat. Skipped silently when bench data is absent.
+    """
+    out: list[str] = []
+    if not comparison:
+        return out
+    scores = m.get("_picker_scores") or {}
+    if scores.get("total") is None:
+        return out
+    ranks = comparison.get("ranks") or {}
+    rid = id(m)
+    rt = ranks.get("total", {}).get(rid)
+    rtps = ranks.get("tps", {}).get(rid)
+    rcode = ranks.get("code", {}).get(rid)
+    rreas = ranks.get("reas", {}).get(rid)
+    n = comparison.get("n_benched", 0)
+
+    if rt == 1:
+        out.append(
+            f"Top-scoring model in this picker on the equally-weighted "
+            f"GSM8K + HumanEval + tools_use blend "
+            f"(TOTAL = {scores['total'] * 100:.1f}% across {n} benched models); "
+            f"safe default agentic pick on this hardware."
+        )
+    elif rcode == 1 and rtps == 1:
+        out.append(
+            "Highest HumanEval pass@1 *and* highest decode TPS in this "
+            "picker -- the strongest default for code-heavy workflows."
+        )
+    elif rtps == 1:
+        out.append(
+            f"Fastest decoder in this picker "
+            f"({scores['tps']:.1f} tok/s steady-state); pick when latency or "
+            f"throughput matters more than peak quality."
+        )
+    elif rcode == 1:
+        out.append(
+            f"Best HumanEval pass@1 in this picker "
+            f"({scores['code'] * 100:.1f}%) -- strong code-completion default."
+        )
+    elif rreas == 1:
+        out.append(
+            f"Strongest tools+reasoning blend in this picker "
+            f"(REAS = {scores['reas'] * 100:.1f}%); good fit for agentic flows "
+            f"that combine tool calls with multi-step thinking."
+        )
+
+    bench_row = m.get("_picker_bench_row") or {}
+    leak = ((bench_row.get("tasks") or {}).get("leak_probe") or {}).get("leak_rate")
+    if isinstance(leak, (int, float)) and leak > 0:
+        out.append(
+            f"Caveat: leaks chat-template special tokens at "
+            f"{leak * 100:.1f}% of prompts; sanitise output for downstream "
+            f"consumers or skip for production agentic deployment."
+        )
+    return out
+
+
+# Sort modes for the picker's score / context cycle. ctrl-s cycles in
+# this order; TOTAL is the default landing mode. CTX sorts by the
+# largest probe-confirmed context tier that fits at the picker's VRAM
+# band -- useful when the user cares about long-context capacity over
+# raw quality scores.
+_SORT_MODES: tuple[str, ...] = ("total", "tps", "code", "reas", "ctx")
+_SORT_LABELS: dict[str, str] = {
+    "total": "TOTAL",
+    "tps": "TPS",
+    "code": "CODE",
+    "reas": "REAS",
+    "ctx": "CTX",
+}
+
+
+_SORT_DIRS: tuple[str, ...] = ("desc", "asc")
+_SORT_ARROWS: dict[str, str] = {"desc": "▼", "asc": "▲"}
+
+
+def _sort_key_for_mode(mode: str, sort_dir: str = "desc"):
+    """Return a key fn that pushes models with no relevant data to the
+    bottom and otherwise sorts the chosen metric in ``sort_dir``.
+
+    Tuple shape: ``(missing_flag, +/- primary_value, -capability_score)``.
+    ``missing_flag`` is 1 when the primary value is absent so unbenched
+    rows always trail regardless of direction. ``sort_dir="desc"``
+    flips the sign so largest values come first; ``"asc"`` keeps the
+    natural sign so smallest come first. The capability score is the
+    tertiary tie-breaker.
+    """
+    sign = -1 if sort_dir == "desc" else 1
+
+    def key(m: dict):
+        if mode == "ctx":
+            ctx = int(m.get("_picker_context") or 0)
+            return (
+                0 if ctx > 0 else 1,
+                ctx * sign,
+                -_score(m),
+            )
+        scores = m.get("_picker_scores") or {}
+        v = scores.get(mode)
+        return (
+            0 if v is not None else 1,
+            (v if v is not None else 0.0) * sign,
+            -_score(m),
+        )
+    return key
+
+
+def _build_candidates(
     models: list[dict],
     bench_records: dict[tuple[str, str], dict] | None = None,
-) -> tuple[list[str], list[bool], list[dict | None]]:
-    """Build (display_lines, selectable_flags, model_per_line) for fzf.
+) -> tuple[list[dict], dict[str, int]]:
+    """Decorate every fitting model with picker metadata and return the
+    list once. Used by both ``_build_menu`` (sort/render) and the
+    main loop's pre-rendered sort-mode files so every mode shares
+    the same candidate dict identities (``id(m)`` is stable across
+    sort calls, which the tag mapping relies on).
 
-    Flat list ordered by capability score (descending). One row per model:
-
-      - HF rows are deduplicated by name with vLLM preferred over SGLang.
-      - Each model is stamped with its largest probe-confirmed context
-        tier that fits fully on GPU at the picker's VRAM band.
-      - Inline-reasoning models appear once; the user toggles reasoning
-        ON/OFF in the info modal after pressing Enter.
-      - When ``bench_records`` is supplied, rows are tagged with
-        ``_picker_agentic=True`` if they meet every PRODUCTION_AGENTIC
-        threshold from docs/bench-results.md; missing bench data
-        leaves the tag False.
+    Second return is the ``hidden`` counter dict so callers can show
+    a per-reason "hidden" footer.
     """
     bench_records = bench_records or {}
     hidden = {
@@ -1442,51 +1960,104 @@ def _build_menu(
         decorated["_picker_status"] = cap
         decorated["_picker_glyph"] = _CAP_GLYPH.get(cap, "?")
         decorated["_picker_status_label"] = _REASONING_LABEL.get(cap, "Unknown")
-        # Default reasoning mode; per-model toggle is offered in the info
-        # modal for inline-reasoning rows. No `::nothink` row in the list.
         decorated["_picker_mode"] = "default"
         bench_key = (str(decorated.get("name") or ""), str(decorated.get("backend") or ""))
-        decorated["_picker_agentic"] = _is_production_agentic(
-            decorated, bench_records.get(bench_key)
-        )
+        bench_row = bench_records.get(bench_key)
+        decorated["_picker_scores"] = _picker_scores(bench_row)
+        decorated["_picker_bench_row"] = bench_row
+        decorated["_picker_agentic"] = _is_production_agentic(decorated, bench_row)
         candidates.append(decorated)
-
-    # HF dedup — vLLM preferred over SGLang for the same name. Ollama
+    # HF dedup -- vLLM preferred over SGLang for the same name. Ollama
     # tag names never collide with HF directory names so Ollama rows
     # pass through unchanged.
     candidates = _dedup_hf_by_name(candidates)
-    candidates.sort(key=_score, reverse=True)
+    return candidates, hidden
+
+
+def _build_menu(
+    models: list[dict],
+    bench_records: dict[tuple[str, str], dict] | None = None,
+    sort_mode: str = "total",
+    sort_dir: str = "desc",
+    *,
+    _candidates: list[dict] | None = None,
+    _hidden: dict[str, int] | None = None,
+) -> tuple[list[str], list[bool], list[dict | None]]:
+    """Build (display_lines, selectable_flags, model_per_line) for fzf.
+
+    Flat list ordered by ``sort_mode`` (one of ``_SORT_MODES``) in
+    ``sort_dir`` direction (``"desc"`` or ``"asc"``). Models without a
+    bench row sort to the bottom in every direction. One row per
+    model.
+
+    Pass ``_candidates`` / ``_hidden`` from a single ``_build_candidates``
+    call when rendering multiple sort modes -- it preserves dict identity
+    across modes so tag-based fzf reload mapping stays correct.
+    """
+    if _candidates is None:
+        candidates, hidden = _build_candidates(models, bench_records)
+    else:
+        candidates = list(_candidates)
+        hidden = _hidden or {"missing_capability": 0, "no_fitting_ctx": 0}
+
+    if sort_mode not in _SORT_MODES:
+        sort_mode = "total"
+    if sort_dir not in _SORT_DIRS:
+        sort_dir = "desc"
+    candidates.sort(key=_sort_key_for_mode(sort_mode, sort_dir))
 
     lines: list[str] = []
     selectable: list[bool] = []
     item_models: list[dict | None] = []
 
+    sort_label = _SORT_LABELS.get(sort_mode, sort_mode.upper())
+    arrow = _SORT_ARROWS.get(sort_dir, "")
+
+    def _hdr(label: str, mode_key: str) -> str:
+        """Append the active-direction arrow to the matching column
+        header so the user sees at a glance which column drives the
+        current sort and in which direction."""
+        return f"{label}{arrow}" if mode_key == sort_mode else label
+
     column_header = (
-        f"      {'CTX':>4s}  "
-        f"{'REASONING':<18s}  "
-        f"{'TAG':<32s}  "
-        f"{'BACKEND':<7s}  "
+        f"{'##':>3s}  "
+        f"{_hdr('CTX', 'ctx'):>5s}  "
+        f"{'TAG':<34s}  "
+        f"{'BACKEND':>7s}  "
         f"{'PARAMS':>10s}  "
-        f"{'FORMAT':>8s}  "
-        f"{'TUNE':>5s}  "
-        f"{'TYPE':>5s}  "
-        f"{'PARSER':>14s}  "
-        f"{'TIER':>8s}  "
-        f"{'VRAM (GB)':>10s}"
+        f"{'TYPE':>6s}  "
+        f"{'FORMAT':>7s}  "
+        f"{'TOOLS':>5s}  "
+        f"{_hdr('TPS', 'tps'):>7s}  "
+        f"{_hdr('CODE%', 'code'):>7s}  "
+        f"{_hdr('REAS%', 'reas'):>7s}  "
+        f"{_hdr('TOTAL%', 'total'):>7s}  "
+        f"{'LEAK%':>5s}  "
+        f"{'VRAM':>6s}"
     )
     lines.append(f"{_BOLD}{column_header}{_RESET}")
     selectable.append(False)
     item_models.append(None)
+    cycle_hint = " > ".join(_SORT_LABELS[m] for m in _SORT_MODES)
+    sort_note = (
+        f"sort: {_BOLD}{sort_label} {arrow} {sort_dir}{_RESET}{_DIM}  "
+        f"(ctrl-s cycles {cycle_hint}; ctrl-r flips direction){_RESET}"
+    )
+    lines.append(f"  {sort_note}")
+    selectable.append(False)
+    item_models.append(None)
     note = (
-        "* = formula estimate (HF probes do not measure per-ctx VRAM; "
-        "Ollama cells without probe data fall back to formula)"
+        "* = VRAM formula estimate.  "
+        "CODE = HumanEval pass@1.  "
+        "REAS = 2/3*tools + 1/3*gsm8k.  "
+        "TOTAL = mean."
     )
     lines.append(f"  {_DIM}{note}{_RESET}")
     selectable.append(False)
     item_models.append(None)
 
-    for m in candidates:
-        lines.append(_format_model_row(m))
+    for idx, m in enumerate(candidates, start=1):
+        lines.append(_format_model_row(m, idx))
         selectable.append(True)
         item_models.append(m)
 
@@ -1664,7 +2235,19 @@ def main() -> None:
         )
 
     bench_records = _load_bench_records(_BENCH_CACHE_PATHS)
-    lines, selectable, item_models = _build_menu(models, bench_records)
+    # One candidate-decoration pass shared by every (mode, direction)
+    # so that ``id(m)`` matches across renders and the tag-to-model
+    # mapping for fzf reload stays consistent.
+    candidates, hidden = _build_candidates(models, bench_records)
+    menus: dict[tuple[str, str], tuple[list[str], list[bool], list[dict | None]]] = {}
+    for mode in _SORT_MODES:
+        for direction in _SORT_DIRS:
+            menus[(mode, direction)] = _build_menu(
+                models, bench_records,
+                sort_mode=mode, sort_dir=direction,
+                _candidates=candidates, _hidden=hidden,
+            )
+    lines, selectable, item_models = menus[("total", "desc")]
     if not any(selectable):
         sys.exit(
             f"error: no usable model/context rows on disk for "
@@ -1676,8 +2259,7 @@ def main() -> None:
 
     header = (
         f"DevAI  ▸  Pick a model  "
-        f"(≤ {_VRAM_BUDGET:g} GB · sorted by capability · "
-        f"details ▶)"
+        f"(≤ {_VRAM_BUDGET:g} GB · ctrl-s sort · ctrl-r dir · ? preview)"
     )
 
     # Materialise per-row info files for fzf's preview pane. Each
@@ -1686,17 +2268,115 @@ def main() -> None:
     # while the user is on a non-data row.
     preview_dir = tempfile.mkdtemp(prefix="devai-picker-")
     atexit.register(shutil.rmtree, preview_dir, ignore_errors=True)
+    # Comparison context is computed once over the full candidate list
+    # so the per-model preview can describe each row's rank against
+    # its peers (TPS / CODE / REAS / TOTAL).
+    comparison_ctx = _build_comparison_ctx(candidates)
+    # Preview content is keyed off the original (TOTAL-mode) item index,
+    # which equals the tag fzf carries for each line. All four sort
+    # modes share the same item_models list (only the row order changes
+    # within each pre-rendered file), so previews stay correct after
+    # ctrl-s reloads.
     for i, m in enumerate(item_models):
         if m is None:
             continue
-        Path(preview_dir, f"{i}.txt").write_text(_capability_summary_text(m))
+        Path(preview_dir, f"{i}.txt").write_text(
+            _capability_summary_text(m, comparison=comparison_ctx)
+        )
     preview_cmd = f"cat {preview_dir}/{{1}}.txt 2>/dev/null"
+
+    # Pre-render every (mode, dir) combination's tag-prefixed input
+    # stream. Each render references items via their *original*
+    # (TOTAL-desc) index so the preview cmd's {1} field still
+    # resolves to the right detail file after a reload.
+    base_models = list(item_models)
+    base_index: dict[int, int] = {id(m): i for i, m in enumerate(base_models) if m is not None}
+    sort_files: dict[tuple[str, str], Path] = {}
+    for mode in _SORT_MODES:
+        for direction in _SORT_DIRS:
+            m_lines, m_selectable, m_items = menus[(mode, direction)]
+            rendered: list[str] = []
+            for line, sel, m in zip(m_lines, m_selectable, m_items):
+                if not sel or m is None:
+                    tag = "--"
+                else:
+                    tag = str(base_index.get(id(m), 0))
+                rendered.append(f"{tag}\t{line}")
+            path = Path(preview_dir, f"sort-{mode}-{direction}.txt")
+            path.write_text("\n".join(rendered))
+            sort_files[(mode, direction)] = path
+
+    # Two state files split mode and direction so ctrl-s cycles modes
+    # while preserving direction, and ctrl-r flips direction while
+    # preserving mode. Initial: TOTAL desc.
+    state_mode_path = Path(preview_dir, "sort.mode")
+    state_dir_path = Path(preview_dir, "sort.dir")
+    state_mode_path.write_text("0")
+    state_dir_path.write_text("desc")
+    modes_array = " ".join(_SORT_MODES)
+
+    cycle_mode_path = Path(preview_dir, "cycle-sort.sh")
+    cycle_mode_path.write_text(
+        "#!/bin/bash\n"
+        "set -e\n"
+        f"state_mode={state_mode_path}\n"
+        f"state_dir={state_dir_path}\n"
+        f"files_dir={preview_dir}\n"
+        f"modes=({modes_array})\n"
+        "cur=$(cat \"$state_mode\" 2>/dev/null || echo 0)\n"
+        "next=$(( (cur + 1) % ${#modes[@]} ))\n"
+        "echo \"$next\" > \"$state_mode\"\n"
+        "dir=$(cat \"$state_dir\" 2>/dev/null || echo desc)\n"
+        "cat \"$files_dir/sort-${modes[$next]}-${dir}.txt\"\n"
+    )
+    cycle_mode_path.chmod(0o755)
+
+    cycle_dir_path = Path(preview_dir, "cycle-dir.sh")
+    cycle_dir_path.write_text(
+        "#!/bin/bash\n"
+        "set -e\n"
+        f"state_mode={state_mode_path}\n"
+        f"state_dir={state_dir_path}\n"
+        f"files_dir={preview_dir}\n"
+        f"modes=({modes_array})\n"
+        "cur=$(cat \"$state_mode\" 2>/dev/null || echo 0)\n"
+        "dir=$(cat \"$state_dir\" 2>/dev/null || echo desc)\n"
+        "if [ \"$dir\" = \"desc\" ]; then new=asc; else new=desc; fi\n"
+        "echo \"$new\" > \"$state_dir\"\n"
+        "cat \"$files_dir/sort-${modes[$cur]}-${new}.txt\"\n"
+    )
+    cycle_dir_path.chmod(0o755)
+
+    # Bindings:
+    #   ctrl-s   -- cycle bench-score sort mode (TOTAL > TPS > CODE >
+    #               REAS > CTX). Direction is preserved across cycles.
+    #   ctrl-r   -- flip sort direction (desc <-> asc). Mode is
+    #               preserved across flips.
+    #   ?        -- toggle preview pane on/off. Single-char fzf
+    #               action; reliable across terminals. Cost: '?' can
+    #               no longer be typed into the fuzzy-search query.
+    #   ctrl-p   -- alias for ?:toggle-preview.
+    # Non-selectable rows (column header / sort note / formula note)
+    # are made un-focusable via `--header-lines=3` below, so the
+    # preview is always meaningful when visible.
+    bindings = [
+        f"ctrl-s:reload({cycle_mode_path})",
+        f"ctrl-r:reload({cycle_dir_path})",
+        "?:toggle-preview",
+        "ctrl-p:toggle-preview",
+    ]
 
     while True:
         idx = _fzf(
             lines, header,
             selectable=selectable,
             preview_cmd=preview_cmd,
+            extra_bindings=bindings,
+            input_text=sort_files[("total", "desc")].read_text(),
+            # Column header + sort note + formula note. _build_menu
+            # always emits exactly these three at the top; if that
+            # ever changes, update this constant in lockstep.
+            header_lines=3,
         )
         if idx is None:
             # User cancelled the model list (Ctrl-C / Esc). Exit cleanly so
