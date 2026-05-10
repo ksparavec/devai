@@ -33,7 +33,7 @@ MAX_CONTEXT_LEN ?= 262144
 # the user already exported in their shell still wins (?= keeps the
 # external value), and `make MAX_CONTEXT_LEN=X cache-up` overrides both.
 export GPU_MEMORY_GB MAX_CONTEXT_LEN
-CACHE_COMPOSE = deploy/docker-compose.yaml
+CACHE_COMPOSE = $(CURDIR)/deploy/docker-compose.yaml
 INFERENCE_CONFIG = deploy/models.yaml
 HF_CLI = hf
 VLLM_MODELS_DIR = $(CACHE_DIR)/ollama/models/vllm
@@ -550,6 +550,15 @@ help: ## Show this help message
 # =============================================================================
 
 cache-up: ## Start all infrastructure (caches + Ollama + router + Open WebUI; vLLM/SGLang as `sleep` placeholders, recreated on demand)
+	@# nvidia_uvm and nvidia_uvm_tools are not pulled in by the display
+	@# stack at boot — only by the first CUDA process. The CDI spec
+	@# references /dev/nvidia-uvm and /dev/nvidia-uvm-tools, so without
+	@# them any GPU container fails with "cannot stat /dev/nvidia-uvm".
+	@# nvidia-modprobe is SUID root, idempotent, and a no-op once loaded.
+	@if [ -e /dev/nvidia0 ] && [ ! -e /dev/nvidia-uvm ] && command -v nvidia-modprobe >/dev/null 2>&1; then \
+		echo "Loading nvidia_uvm kernel module..."; \
+		nvidia-modprobe -u -c 0; \
+	fi
 	@if [ "$(CONTAINER_RUNTIME)" = "podman" ] && ! systemctl --user is-active --quiet podman.socket; then \
 		echo "Starting Podman API socket..."; \
 		systemctl --user enable --now podman.socket; \
