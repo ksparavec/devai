@@ -117,7 +117,7 @@ order the agent runs them.
 | C2 | Kernel IOMMU on cmdline | `intel_iommu=on` or `amd_iommu=on` in `/proc/cmdline` | H2 |
 | C3 | IOMMU initialized | `DMAR: IOMMU enabled` (Intel) or `AMD-Vi ... Initialized` in `dmesg` | H2 |
 | C4 | VFIO modules loaded | `vfio`, `vfio_iommu_type1`, `vfio_pci` all in `lsmod` | H3 |
-| C5 | No auto-claim of the NVIDIA GPU | `lspci -nnk -s ${DGPU_BDF}` reports `Kernel driver in use: nvidia` (not `vfio-pci`) | H4 |
+| C5 | No auto-claim of the NVIDIA GPU | `lspci -nnk -s ${DGPU_BDF}` reports `Kernel driver in use: nvidia` (not `vfio-pci`). If the GPU is on `vfio-pci` at idle and the binding is **not** permanent (no `options vfio-pci ids=...` in `/etc/modprobe.d/`), the agent self-heals with `virsh nodedev-reattach` in §1.3 before failing. | H4 |
 | C6 | libvirt installed and running | `virsh version` succeeds; `systemctl is-active libvirtd` returns `active` | H5 |
 | C7 | `virt-install` available | `virt-install --version` succeeds | H5 |
 | C8 | OVMF firmware available | `/usr/share/OVMF/OVMF_CODE.fd` or `OVMF_CODE_4M.fd` exists | H5 |
@@ -127,7 +127,8 @@ order the agent runs them.
 | C12 | GPU not currently in use | `nvidia-smi --query-compute-apps=pid` empty AND `lsof /dev/nvidia*` empty | H8 |
 | C13 | GPU IOMMU group is clean | the group containing `${DGPU_BDF}` contains only the GPU and its audio function | H9 |
 | C14 | Cloud-init seed-ISO tool | `cloud-localds` (preferred) or `genisoimage` available | H10 |
-| C15 | Operator has passwordless `sudo` on the host or the agent itself runs as root | `sudo -n true` succeeds | H11 |
+| C15 | The host user has passwordless `sudo` for the specific commands this procedure invokes (or the agent runs as root) | Per-command probe via `sudo -n -l <cmd>` for the call-surface listed in §1.3 C15 succeeds for every entry | H11 |
+| C16 | libvirt default pool dir is libvirt-group-writable with setgid, **and** the invoking host user is in the `libvirt` group | `stat` reports group `libvirt`, mode bits include `g+w` (020) and setgid (02000); `id -nG` lists `libvirt`. Required so §2.4 / §2.5 / §2.6 (`wget`, `cloud-localds`, `qemu-img create`) can write to `/var/lib/libvirt/images` as the unprivileged user and the resulting files are readable by libvirtd. | H12 |
 
 ### 1.3 Check commands
 
@@ -144,11 +145,27 @@ order the agent runs them.
             /NVIDIA/ && /(VGA|3D)/ { gsub(":", " "); print "0000:" $1 ":" $2; exit }
          ')
 [host] $ DGPU_AUDIO_BDF=$(lspci -nn | awk -v p="${DGPU_BDF#0000:}" '
-            BEGIN { split(p,a,":"); want=a[1]":"a[2] }
+            # p looks like "02:00.0"; strip the .function so "want"
+            # is "02:00", which substring-matches the audio function
+            # at "02:00.1" on the same bus:device.
+            BEGIN { sub(/\.[0-9]+$/, "", p); want=p }
             /NVIDIA/ && /Audio/ && $0 ~ want { gsub(":", " "); print "0000:" $1 ":" $2; exit }
          ')
 [host] [verify] $ test -n "${DGPU_BDF}" && test -n "${DGPU_AUDIO_BDF}"
 
+# C5 -- GPU must be on nvidia at idle. If a previous run (or any other
+# transient detach) left it on vfio-pci, self-heal by reattaching. Only
+# halt with H4 when a *permanent* vfio-pci binding exists.
+[host] $ current_drv=$(lspci -nnk -s "${DGPU_BDF}" \
+                        | awk -F': ' '/Kernel driver in use/ {print $2}')
+[host] $ if [ "${current_drv}" = vfio-pci ]; then
+            if grep -lE '^[[:space:]]*options[[:space:]]+vfio-pci[[:space:]]+ids' \
+                 /etc/modprobe.d/*.conf 2>/dev/null | grep -q .; then
+              echo "C5: permanent vfio-pci binding present -- see H4"; exit 1
+            fi
+            sudo virsh nodedev-reattach pci_$(echo "${DGPU_BDF}"       | tr ':.' '_')
+            sudo virsh nodedev-reattach pci_$(echo "${DGPU_AUDIO_BDF}" | tr ':.' '_')
+         fi
 [host] [verify] $ lspci -nnk -s "${DGPU_BDF}" \
                    | awk -F': ' '/Kernel driver in use/ {print $2}' \
                    | grep -qx nvidia                                          # C5
@@ -167,9 +184,11 @@ order the agent runs them.
                    | awk -F': +' '/Available/ {print $2}')
 [host] [verify] $ test "${avail_bytes}" -ge $((260 * 1024**3))
 
-# C12 — nobody holds the GPU
+# C12 -- nobody holds the GPU. The lsof target is the exact pair the
+# NOPASSWD whitelist in §1.4 H11 grants; nvidia-modeset/uvm/etc are
+# secondary nodes and a holder there would also hold nvidia0|nvidiactl.
 [host] [verify] $ test -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)"
-[host] [verify] $ test -z "$(sudo lsof /dev/nvidia* 2>/dev/null)"
+[host] [verify] $ test -z "$(sudo lsof /dev/nvidia0 /dev/nvidiactl 2>/dev/null)"
 
 # C13 — IOMMU group containment
 [host] [verify] $ group=$(basename "$(dirname "$(dirname \
@@ -181,7 +200,36 @@ order the agent runs them.
 [host] [verify] $ test -z "${extras}"
 
 [host] [verify] $ command -v cloud-localds >/dev/null || command -v genisoimage >/dev/null   # C14
-[host] [verify] $ sudo -n true                                                # C15
+
+# C15 -- per-command NOPASSWD probe. The procedure only invokes a
+# narrow whitelist of binaries under sudo; we require NOPASSWD only
+# for those. `sudo -n -l <cmd>` exits 0 iff <cmd> is permitted for the
+# invoking user without re-authentication. If the agent is already
+# running as root, the probe is moot.
+[host] [verify] $ if [ "$(id -u)" -ne 0 ]; then
+                    for cmd in \
+                        /usr/bin/virsh \
+                        /usr/bin/virt-install \
+                        '/usr/bin/systemctl is-active --quiet libvirtd' \
+                        '/usr/bin/lsof /dev/nvidia0 /dev/nvidiactl' ; do
+                      sudo -n -l ${cmd} >/dev/null 2>&1 || {
+                        echo "C15: NOPASSWD missing for: ${cmd}"; exit 1; }
+                    done
+                  fi                                                          # C15
+
+# C16 -- pool dir is libvirt-group-writable with setgid AND invoking
+# user is in the libvirt group. Needed for §2.4 wget, §2.5
+# cloud-localds, and §2.6 qemu-img create to run without sudo and
+# produce files libvirtd can read. The agent skips the user-membership
+# half when running as root.
+[host] $ POOL_PATH=$(virsh pool-dumpxml default \
+                       | awk -F'[<>]' '/<path>/ {print $3; exit}')
+[host] [verify] $ test -n "${POOL_PATH}"
+[host] [verify] $ test "$(stat -c '%G' "${POOL_PATH}")" = libvirt
+[host] [verify] $ perms=$(stat -c '%a' "${POOL_PATH}"); \
+                  test $(( 8#${perms} & 020   )) -eq $((020))   && \
+                  test $(( 8#${perms} & 02000 )) -eq $((02000))
+[host] [verify] $ test "$(id -u)" -eq 0 || id -nG | tr ' ' '\n' | grep -qx libvirt   # C16
 ```
 
 ### 1.4 Remediation hints (printed only on failure)
@@ -199,14 +247,14 @@ stops. The operator fixes the host, then re-runs the agent from §1.
   `docs/HOST_VFIO_SETUP.md` §5: drop `/etc/modules-load.d/vfio.conf`
   listing `vfio`, `vfio_iommu_type1`, `vfio_pci`, run
   `update-initramfs -u -k all` (or distro equivalent), reboot.
-- **H4 — GPU is bound to `vfio-pci` at idle, not `nvidia`.** Either
-  a previous (permanent) VFIO setup is still active or a stale VM
-  detached the GPU and never reattached. Check
-  `/etc/modprobe.d/vfio*.conf` for `options vfio-pci ids=...` and
-  remove it per `docs/HOST_VFIO_SETUP.md` §5.1, then reboot. If no
-  such file exists, run
-  `sudo virsh nodedev-reattach pci_$(echo ${DGPU_BDF} | tr :. _)`
-  for both the GPU and its audio function.
+- **H4 — GPU is bound to `vfio-pci` at idle via a *permanent* config.**
+  H4 fires only when §1.3 C5 found `options vfio-pci ids=...` in
+  `/etc/modprobe.d/*.conf` -- the transient case (stale VM that
+  detached and never reattached) is auto-healed by §1.3 calling
+  `virsh nodedev-reattach` and is not an operator-visible failure.
+  Remove the offending `vfio-pci ids=` line per
+  `docs/HOST_VFIO_SETUP.md` §5.1, run `update-initramfs -u -k all`
+  (or distro equivalent), then reboot.
 - **H5 — libvirt/virt-install/OVMF missing.** Install per
   `docs/HOST_VFIO_SETUP.md` §6 (`apt-get install -y --no-install-
   recommends qemu-system-x86 qemu-utils ovmf libvirt-daemon-system
@@ -233,9 +281,37 @@ stops. The operator fixes the host, then re-runs the agent from §1.
 - **H10 — No seed-ISO tool.** `apt-get install -y cloud-image-utils`
   (provides `cloud-localds`) on the host, or
   `apt-get install -y genisoimage` as a fallback.
-- **H11 — Operator has no passwordless sudo.** `usermod -aG sudo
-  ${INVOKING_USER}` then add a `NOPASSWD:` line to
-  `/etc/sudoers.d/devai-install`, or run the agent as root.
+- **H11 — Operator lacks NOPASSWD coverage for the procedure's
+  call-surface.** This procedure invokes only a narrow set of
+  binaries under sudo; rather than granting blanket NOPASSWD, drop
+  the following file (and only the following):
+
+  ```
+  # /etc/sudoers.d/devai-install   (mode 0440, validated with `visudo -cf`)
+  ${INVOKING_USER} ALL=(root) NOPASSWD: /usr/bin/virsh
+  ${INVOKING_USER} ALL=(root) NOPASSWD: /usr/bin/virt-install
+  ${INVOKING_USER} ALL=(root) NOPASSWD: /usr/bin/systemctl is-active --quiet libvirtd
+  ${INVOKING_USER} ALL=(root) NOPASSWD: /usr/bin/lsof /dev/nvidia0 /dev/nvidiactl
+  ```
+
+  Substitute `${INVOKING_USER}` with the actual host user. Validate
+  with `sudo visudo -cf /etc/sudoers.d/devai-install` before saving.
+  Alternatively, run the agent as root.
+- **H12 — libvirt pool dir not group-writable, or user not in
+  `libvirt` group.** Fix both halves:
+
+  ```
+  sudo chgrp libvirt /var/lib/libvirt/images
+  sudo chmod g+ws    /var/lib/libvirt/images   # group-write + setgid
+  sudo usermod -aG libvirt ${INVOKING_USER}
+  ```
+
+  The setgid bit (`g+s`) is mandatory -- without it, files created in
+  the pool dir inherit the user's primary group and libvirtd may
+  refuse to read them. `usermod -aG` does not take effect for the
+  current session; log out and back in (or run `newgrp libvirt` in a
+  fresh shell) before re-running the gate. If installing the agent's
+  systemd unit, ensure it inherits the `libvirt` supplementary group.
 
 ### 1.5 Exit criterion
 
@@ -383,7 +459,7 @@ EOF
 
 ```bash
 [host] $ VDA="${POOL_PATH}/devai-vm.qcow2"
-[host] # qemu-img create -f qcow2 -F qcow2 -b "${IMG}" "${VDA}" 250G
+[host] $ qemu-img create -f qcow2 -F qcow2 -b "${IMG}" "${VDA}" 250G
 ```
 
 `vda` is a 250 GiB copy-on-write overlay on the upstream cloud image
@@ -400,10 +476,11 @@ intervening seconds.
 
 ```bash
 [host] [verify] $ test -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)"
-[host] [verify] $ test -z "$(sudo lsof /dev/nvidia* 2>/dev/null)"
+[host] [verify] $ test -z "$(sudo lsof /dev/nvidia0 /dev/nvidiactl 2>/dev/null)"
 ```
 
-If non-empty, halt with hint H8.
+If non-empty, halt with hint H8. (`lsof` target matches the NOPASSWD
+whitelist defined in §1.4 H11; see §1.3 C12 for the rationale.)
 
 ### 2.8 Detach GPU from nvidia, bind to vfio-pci (D9)
 
