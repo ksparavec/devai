@@ -2213,6 +2213,36 @@ def _resolve_agent(agent_filter: str | None, model: dict) -> tuple[str, str] | N
 
 
 def main() -> None:
+    # Non-interactive entry point. When devai-agent passes --prompt, both the
+    # model and the agent are already chosen and there is no human at the
+    # picker UI. Bypass the fzf loop entirely and exec the agent with -p.
+    noninteractive_prompt = os.environ.get("DEVAI_NONINTERACTIVE_PROMPT")
+    if noninteractive_prompt:
+        pref_model = os.environ.get("DEVAI_PREF_MODEL")
+        pref_agent = os.environ.get("DEVAI_PREF_AGENT")
+        if not pref_model or not pref_agent:
+            sys.exit(
+                "error: DEVAI_NONINTERACTIVE_PROMPT is set but "
+                "DEVAI_PREF_MODEL and/or DEVAI_PREF_AGENT is missing. "
+                "Call devai-agent with --model and --agent."
+            )
+        if pref_agent != "claude":
+            sys.exit(
+                f"error: non-interactive --prompt currently supports "
+                f"--agent claude only, got {pref_agent!r}."
+            )
+        # Backend selection: a per-session context suffix (`@<ctx>`) is the
+        # vLLM/SGLang launcher contract; bare names are Ollama. SGLang is
+        # not probed in INSTALL.md, so the @<ctx> path always means vLLM
+        # in the supported configuration.
+        backend = "vllm" if "@" in pref_model else "ollama"
+        cmd = _build(pref_agent, pref_model, backend)
+        # _build returns ["claude", "--model", name]; splice in the
+        # one-shot prompt right after the executable so the rest of the
+        # claude CLI flags still parse cleanly.
+        cmd = [cmd[0], "-p", noninteractive_prompt, *cmd[1:]]
+        os.execvp(cmd[0], cmd)
+
     agent_filter: str | None = None
     if "--agent" in sys.argv:
         pos = sys.argv.index("--agent")

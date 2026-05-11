@@ -15,6 +15,9 @@ just `cd` to the project you want to work on first.
     devai-agent --cpu                     # use the CPU lab image
     devai-agent -C ~/other                # override work dir for this run
     devai-agent --model qwen3.5:9b-q8_0 --agent claude  # pre-set picks
+    devai-agent --model NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4@131072 \
+                --agent claude --prompt "summarize CLAUDE.md"
+                                          # one-shot non-interactive call
 
 Preferences (in ~/.devai/preferences.yaml):
     vram                int       advertised VRAM ceiling, GB
@@ -198,14 +201,20 @@ def build_run_cmd(
     *, runtime: str, image: str, cpu_only: bool,
     work_dir: Path, prefs: dict,
     pref_model: str | None, pref_agent: str | None,
+    prompt: str | None = None,
 ) -> list[str]:
     home_volume = Path(os.environ.get("HOME_VOLUME", str(Path.home() / "devai-home")))
     home_volume.mkdir(parents=True, exist_ok=True)
 
     pref_session = session_path_for(pref_agent, pref_model)
 
-    cmd: list[str] = [
-        runtime, "run", "-it", "--rm",
+    # Non-interactive runs (--prompt) drop the TTY: stdout must be captureable
+    # by the caller and there is no human at the other end of stdin.
+    cmd: list[str] = [runtime, "run", "--rm"]
+    if prompt is None:
+        cmd += ["-i", "-t"]
+
+    cmd += [
         *gpu_flags(runtime, cpu_only),
         "--network", DEVAI_NETWORK,
         "--add-host=host.containers.internal:host-gateway",
@@ -216,6 +225,12 @@ def build_run_cmd(
         "-e", f"VRAM={prefs['vram']}",
         "-e", f"CONTAINER_USER={CONTAINER_USER}",
     ]
+
+    if prompt is not None:
+        # The in-container picker (scripts/model-picker.py) reads this
+        # env var; when set together with DEVAI_PREF_MODEL/DEVAI_PREF_AGENT
+        # it bypasses the fzf UI and execs the agent in one-shot mode.
+        cmd += ["-e", f"DEVAI_NONINTERACTIVE_PROMPT={prompt}"]
 
     # Surface preferences to the picker so future versions can pre-select.
     # Today's picker doesn't read these but the env contract is forward-stable.
@@ -289,6 +304,12 @@ def make_parser() -> argparse.ArgumentParser:
     ap.add_argument("--show", action="store_true",
                     help="print the resolved preferences and the "
                          "container command, do not run")
+    ap.add_argument("--prompt",
+                    help="run the chosen agent non-interactively with "
+                         "this one-shot prompt and exit. Requires --model "
+                         "and --agent (currently --agent claude only). "
+                         "Stdin is not used; the prompt is delivered via "
+                         "DEVAI_NONINTERACTIVE_PROMPT inside the container.")
     return ap
 
 
@@ -299,6 +320,10 @@ def main() -> int:
         write_prefs(DEFAULTS)
         print(f"reset {PREFS_FILE} to defaults.")
         return 0
+
+    if args.prompt is not None and (not args.model or not args.agent):
+        sys.exit("error: --prompt requires both --model and --agent "
+                 "(non-interactive mode cannot consult the picker).")
 
     prefs = read_prefs()
 
@@ -323,6 +348,7 @@ def main() -> int:
         runtime=runtime, image=image, cpu_only=args.cpu,
         work_dir=work_dir, prefs=prefs,
         pref_model=pref_model, pref_agent=pref_agent,
+        prompt=args.prompt,
     )
 
     if args.show:

@@ -1,375 +1,577 @@
-# INSTALL.md — Bootstrap procedure for AI agents
+# INSTALL.md — VM-based bootstrap procedure for Dev AI Lab
 
-This document is the single, self-contained installation procedure for
-**Dev AI Lab** on **Linux**. It is written for an autonomous coding
-agent (Claude Code, OpenAI Codex, or equivalent tier-1 agent) to read
-and execute end-to-end on a fresh host with **no human interaction**
-beyond granting `sudo` once and (optionally) supplying API keys. A
-human operator can also follow it, but the phrasing, verification
-commands, and idempotency rules are tuned for an agent.
+This document is the **single, self-contained installation procedure
+for Dev AI Lab onto a QEMU/KVM virtual machine** on a Linux host with
+a dedicated NVIDIA GPU. It is written for an autonomous coding agent
+(Claude Code, OpenAI Codex, or equivalent tier-1 agent) to read and
+execute end-to-end with **no human interaction beyond preparing the
+host once** per [`docs/HOST_VFIO_SETUP.md`](docs/HOST_VFIO_SETUP.md)
+and granting `sudo` on the host so the agent can drive libvirt.
 
-The repository deliberately does NOT ship a monolithic Bash or Make
-scaffold for host bootstrap. Instead, the agent reads this file and
-issues one shell command at a time. Each command has a **purpose**, a
-**precondition**, an **idempotency rule**, and a **verification**
-command. If a verification fails, the agent must follow the per-section
-recovery rule rather than retrying blindly.
+The procedure has two parts:
 
----
+1. **§1 — Host readiness gate.** The agent verifies that the host has
+   already been prepared for PCI passthrough per
+   `docs/HOST_VFIO_SETUP.md`. If any precondition is missing, the
+   agent **stops** and prints the exact remediation hints. The host
+   must be configured by the operator; the agent does **not** mutate
+   firmware, kernel command line, initramfs, or VFIO module config.
+2. **§2 onwards — Autonomous VM provisioning.** Once the gate passes,
+   the agent creates a Debian 13 (Trixie) VM, hands it the passed-
+   through GPU, and runs the full install (storage, container
+   runtime, lab build, model probe, smoke test) inside the guest.
+   The operator is not consulted again until the final §14 smoke
+   test reports green.
 
-## Entry point — read this first
-
-**Every agent starts from this file regardless of platform.** Before
-executing any command in this document, run the following platform
-check:
-
-```bash
-[verify] $ uname -s
-```
-
-- If the result is **`Darwin`** (macOS), **stop reading this file**
-  and switch to [`INSTALL_macOS.md`](INSTALL_macOS.md). That document
-  is the complete macOS procedure: it covers Apple Silicon's unified
-  memory architecture, native Ollama via Metal, `podman machine`,
-  and the macOS-specific compose override. The Linux phases below do
-  not apply on macOS — applying them produces a working but slow
-  stack that wastes the project's GPU-arbitration plumbing.
-- If the result is **`Linux`**, continue with §0 below. The
-  remainder of this file covers Debian/Ubuntu, RHEL/Fedora/Rocky/
-  Alma, openSUSE/SLES, Arch/EndeavourOS, and (best-effort) Alpine.
-- Anything else (`FreeBSD`, `OpenBSD`, `SunOS`, …) is unsupported —
-  halt and surface to the operator.
-
-The redirect is one-way: `INSTALL_macOS.md` is self-contained and
-does not refer back here for installation steps.
+Bare-metal installation is out of scope. The guest is always Debian
+13 (Trixie) on x86_64 with the host's NVIDIA GPU passed through; no
+other guest OS, architecture, or storage layout is supported. For
+the runtime architecture the VM ends up running, see
+`docs/router.md`, `docs/backends.md`, the project `CLAUDE.md`, and
+the in-repo `README.md`.
 
 ---
 
-## 0. Contract
+## Decisions recorded in this procedure
 
-### 0.1 Goal
+The agent applies the following decisions **without asking**. They
+narrow the install to one supported configuration so the procedure
+can run autonomously. Anything the operator wants to override must
+be set in the environment or `.env` **before** the agent starts.
 
-Take a host that has only:
+| #   | Decision | Why locked here |
+|-----|----------|-----------------|
+| D1  | Hypervisor = libvirt + QEMU/KVM. No Hyper-V, VMware, VirtualBox, Proxmox CLI. | `HOST_VFIO_SETUP.md` documents only this stack. |
+| D2  | Guest OS = Debian 13 (Trixie) generic cloud image, x86_64. | Project reference platform; every `apt-get`, NVIDIA-driver path, and `docker-compose` step in §4 targets Trixie directly. |
+| D3  | Single VM disk: `vda` qcow2, 250 GiB. Cloud-init partitions it into `vda1` = 50 GiB root (ext4) and `vda2` = 200 GiB LVM PV for `vgais`. | Lab images live on `cache_registry` (§5.3) so the root never carries model or image bloat; 50 GiB is enough for the OS, system packages, and a working set. One disk simplifies provisioning and host snapshotting. |
+| D4  | VM resources: 4 vCPUs, 16 GiB RAM. | Minimum that completes `make build` + vLLM/SGLang cold-start without OOM on a 24 GiB-class GPU while leaving host headroom for the desktop / hypervisor. |
+| D5  | VM name = `devai-vm`. | Single canonical name. If a VM of that name already exists, the agent refuses to clobber it without an explicit `DEVAI_VM_RECREATE=1`. |
+| D6  | Network = libvirt `default` NAT. SSH to the VM uses the NAT lease. | Per `HOST_VFIO_SETUP.md` §7. No bridges, no macvtap. |
+| D7  | Cloud-init: agent generates a fresh ED25519 keypair on the host at `~/.ssh/devai-vm` and seeds it as `authorized_keys` for guest user `devai` with passwordless sudo. | Agent never logs in interactively; SSH key auth only. |
+| D8  | GPU BDFs are **discovered**, not hard-coded. | `lspci -nn` parse yields `${DGPU_BDF}` and `${DGPU_AUDIO_BDF}`. Reference values from `HOST_VFIO_SETUP.md` §1.3 (`0000:02:00.0` / `0000:02:00.1`) are illustrative only. |
+| D9  | GPU detach: `virsh nodedev-detach` of both functions immediately before `virsh start`; reattach automatically on `virsh destroy` (§16 tear-down). | Per `HOST_VFIO_SETUP.md` §8.2/§8.4. The agent does this once per provisioning run. |
+| D10 | Host GPU pre-flight: agent confirms `nvidia-smi --query-compute-apps` is empty, no `lsof /dev/nvidia*` holders, `nvidia-persistenced` stopped, no MPS daemon. If any holder remains, halt with the offending PID list. | Otherwise `nodedev-detach` blocks forever (§8.5 recovery). |
+| D11 | NVIDIA driver path **inside the VM** = CUDA repo `nvidia-open`. | Blackwell-class cards require the open kernel modules; Debian's `nvidia-driver` silently fails on Blackwell. `nvidia-open` works on Ampere/Ada too, so the agent picks it unconditionally. |
+| D12 | In-VM reboot count = exactly one, after NVIDIA driver install. Agent waits for SSH to come back via `until ssh ... true; do sleep 5; done`. | Host kernel IOMMU and VFIO-module reboots are the host operator's responsibility per `HOST_VFIO_SETUP.md`; inside the VM only the driver install needs a reboot. |
+| D13 | Compose provider = Go `docker-compose` v2 (downloaded into the VM during §4). | Debian Trixie's Python `podman-compose` 1.3.0 does not expand `${VAR:-default}` and breaks the router's on-demand vLLM/SGLang recreate. |
+| D14 | `JUPYTER_TOKEN` = random 32-char hex generated by the agent and written to `.env` before §10. Token is echoed once into the run log. | Removes an operator prompt; auto-start in §13 then works without a re-prompt. |
+| D15 | HuggingFace token is **not required** for the default procedure. The `NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4` repo (and the fallback `nvidia/Qwen3-8B-NVFP4`) are public on HF -- no licence click-through, anonymous downloads work. If the operator does keep a token at `${HOME}/.cache/huggingface/token` or `${HF_TOKEN}` on the host, the agent injects it into the VM via cloud-init `write_files` for higher anonymous rate limits and future-proofing; if not, the agent proceeds. | Verified against the live HF model pages: both targets show no gating banner. The token would only matter if the operator later swaps in a gated model. |
+| D16 | First Ollama model = `qwen3.5:9b-q8_0`. NVFP4 model for the mandatory vLLM probe and real end-to-end test = `NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4`. SGLang is **not probed** by this procedure (it stays as a sleeping placeholder in the compose stack for runtime use). | Ollama qwen3.5 covers the GGUF path; Nemotron-3-Nano-30B-A3B-NVFP4 (3 B active params over 30 B total) covers the NVFP4 + vLLM path within 24 GiB VRAM. Probing SGLang doubles wall time without adding coverage the vLLM probe doesn't already give. |
+| D17 | `devai-agent` is installed inside the VM (not on the host) and supports non-interactive model/agent selection plus one-shot prompts via `--model`, `--agent`, and `--prompt`. The §11.3 e2e test drives the launcher with these flags rather than `podman run` directly. | Host is a pure hypervisor for this procedure; the lab lives in the guest. Using the launcher in the e2e test exercises the same surface real users will hit, instead of a parallel test-only invocation path. |
+| D18 | Public exposure of VM services is the operator's job. Agent does not touch host firewall, iptables, nftables, or libvirt forward rules. | Exposing the lab or router beyond the host requires an operator-owned reverse-proxy + auth layer that this procedure does not provision. |
+| D19 | Tear-down (§16) destroys the VM, removes its disks, and runs `virsh nodedev-reattach` on the GPU functions. It does **not** revert the host VFIO setup — that is `HOST_VFIO_SETUP.md` §10. | Symmetric with provisioning: this doc owns the VM lifecycle, not the host. |
+| D20 | Cloud-init seed ISO built with `cloud-localds` (Debian package `cloud-image-utils`). If absent, fall back to `genisoimage`. | Both are in Debian main; one of them is always available on a host that already meets `HOST_VFIO_SETUP.md` §6. |
+| D21 | The agent runs on the host (the libvirt admin). All in-VM commands are executed via `ssh -i ~/.ssh/devai-vm devai@${VM_IP}`. | Single execution model; no remote-mode/local-mode branching. |
+| D22 | Single supported guest = Debian 13 x86_64 with GPU. The host is one of the distros supported by `HOST_VFIO_SETUP.md` §6. | One supported guest plus one supported set of host distros keeps the validated code paths small. |
 
-- One of the supported Linux distributions in §0.5, with rootless
-  container support.
-- Local administrative privileges (`sudo`).
-- Optionally an NVIDIA GPU (Blackwell, Ada, or Ampere class) on
-  `x86_64`, with the matching kernel driver already installed.
-- Network reachability to the package manager's repositories,
-  `docker.io`, `huggingface.co`, `registry.ollama.ai`, `github.com`,
-  `storage.googleapis.com`, `astral.sh`, `npmjs.org`, `nodejs.org`.
-
-…and produce a host that runs:
-
-- The `devai-router` plus `devai-ollama`, `devai-vllm` (placeholder),
-  `devai-sglang` (placeholder), `devai-open-webui`, `devai-webui-proxy`,
-  `devai-apt-cache`, `devai-registry-cache`, `devai-logger` services.
-- The `devai-lab-cpu` and (if GPU is present) `devai-lab-gpu` images
-  built and tagged locally.
-- A populated probe cache for at least one fitting model on at least
-  one backend.
-- A `devai-agent` launcher on the user's `PATH`.
-
-### 0.2 Constraints
-
-1. **No interactive prompts.** Every command runs non-interactively.
-   When a tool would prompt by default, pass the equivalent flag
-   (`-y`, `--non-interactive`, `--yes`, `<&-`).
-2. **Idempotent.** Re-running this procedure top to bottom on an
-   already-installed host must not destroy data, change UUIDs,
-   re-format filesystems, or evict running containers (except where the
-   step explicitly says it does).
-3. **Verify before mutating.** Each phase begins with a detection step
-   that decides whether work is needed.
-4. **Fail loudly, recover narrowly.** On any verification failure, do
-   the smallest scoped recovery that the section documents. Do not
-   silently retry the same command.
-5. **Preserve user data.** Never `rm -rf` or `lvremove` an existing LV
-   without an explicit instruction in this file or an explicit human
-   command.
-
-### 0.3 Conventions used below
-
-- Commands prefixed with `$` run as the invoking (non-root) user.
-- Commands prefixed with `#` run as `root` (use `sudo`).
-- Commands prefixed with `[verify]` are read-only checks.
-- `${INVOKING_USER}` resolves to `$(id -un)` of the user who
-  ultimately runs `devai-agent` and `make`. That same user must own
-  `/var/cache/devai/*` and the rootless podman state.
-- `${HOST_IP}` resolves to `$(hostname -I | awk '{print $1}')`.
-- `${REPO_DIR}` is the absolute path to the cloned `devai` repository.
-- `${HOME_DIR}` is `${INVOKING_USER}`'s home (`getent passwd
-  ${INVOKING_USER} | cut -d: -f6`).
-
-### 0.4 Phase order
-
-Phases are sequential. Do not start phase N+1 before phase N's exit
-verification passes.
-
-| # | Phase | Mutates host? | Network? | Verification |
-|---|---|---|---|---|
-| 1 | Detect environment | no | no | `[verify]` only |
-| 2 | Install host packages | yes (apt) | yes | `dpkg -l` |
-| 3 | Configure container runtime + GPU | yes (config files only) | no | CDI list (no podman runs — see §3 ordering note) |
-| 4 | Provision LVM cache volumes | yes (lvm/fs) | yes (first podman pull) | `findmnt`, `lsblk`, then deferred §3.4 podman probes |
-| 5 | Clone repo + write `.env` + registries.conf | yes (files) | yes | `test -f` |
-| 6 | Pre-pull base images and CLI binaries | yes (image store, cache) | yes | `podman images`, `ls` |
-| 7 | Build images (`make build`) | yes (images) | maybe | `podman images` |
-| 8 | Start infrastructure (`make cache-up`) | yes (containers) | yes (model image first time) | `podman ps`, HTTP probe of router |
-| 9 | Pull and probe initial model | yes (model store, caches) | yes | probe-cache file content |
-| 10 | Install `devai-agent` launcher | yes (`~/.local/bin`) | no | `command -v devai-agent` |
-| 11 | (optional) systemd auto-start | yes | no | `systemctl --user is-active` |
-| 12 | End-to-end smoke test | yes (one chat completion) | no | HTTP 200 + non-empty body |
-
-If the agent stops mid-procedure and is later resumed, it must
-re-execute the detection steps in §1 to determine which phases are
-already done; idempotency rules in each phase make re-execution safe.
-
-### 0.5 Platform support matrix
-
-| Platform | Lab + agents | Ollama (CPU) | Ollama (GPU) | vLLM / SGLang | Notes |
-|---|---|---|---|---|---|
-| Debian 12+ / Ubuntu 22.04+ x86_64 | yes | yes | yes (NVIDIA) | yes (NVIDIA, Blackwell+ for NVFP4) | reference platform; everything in this doc was developed against it |
-| Fedora 39+ / RHEL 9+ / Rocky 9+ / Alma 9+ x86_64 | yes | yes | yes (NVIDIA) | yes | needs SELinux exceptions or `--security-opt label=disable` (already in compose) |
-| openSUSE Leap 15.5+ / Tumbleweed x86_64 | yes | yes | yes (NVIDIA) | yes | zypper paths in §2 |
-| Arch / EndeavourOS x86_64 | yes | yes | yes (NVIDIA) | yes | rolling; pin nothing, accept upgrades |
-| Debian/Ubuntu/Fedora aarch64 (no NVIDIA) | yes | yes | no | no | CPU lab only; some images lack arm64 manifests — check `podman pull` results |
-| Alpine Linux | best-effort | yes | yes (with manual NVIDIA setup) | partial | musl + rootless podman work; NVIDIA Container Toolkit packaging is community-maintained — verify before relying on it |
-| macOS 13+ (Apple Silicon or Intel) | — | — | — | — | **Use [`INSTALL_macOS.md`](INSTALL_macOS.md), not this file.** Different architecture (host-native Ollama with Metal/UMA + lab in `podman machine`). |
-| Windows / WSL2 | not in scope here | — | — | — | technically possible (WSL2 + nvidia-cdi-hook); not part of this procedure |
-
-When the agent identifies a platform that is not in this matrix and
-not obviously close to one that is, it must halt and surface the OS,
-release, and architecture to the operator rather than improvising.
-
-The rest of this document uses **`${OS_FAMILY}`** to abbreviate the
-detected platform group:
-
-- `debian`   — Debian, Ubuntu, Pop!_OS, Mint Debian Edition
-- `rhel`     — RHEL, Fedora, CentOS Stream, Rocky, AlmaLinux, Amazon Linux 2023
-- `suse`     — openSUSE Leap, openSUSE Tumbleweed, SLES
-- `arch`     — Arch, EndeavourOS, Manjaro
-- `alpine`   — Alpine Linux 3.19+ (best-effort)
-
-(macOS is excluded from this list — it has its own document.)
-
-### 0.6 Execution context — local agent or remote agent
-
-This document describes work performed on a **target machine**. The
-agent executing the procedure may run in either of two execution
-contexts:
-
-- **Local** — the agent's shell **is** the target's shell. Every
-  `sudo apt-get install`, `lvcreate`, `podman build`, etc. operates
-  in-place. This is the natural mode for an operator setting up Dev
-  AI Lab on their own workstation.
-- **Remote** — the agent runs on a separate **control host** and
-  issues every install command against the target via SSH. The agent
-  does not log into an interactive session; each command is a single
-  `ssh user@target 'command'` invocation, return-coded, with stdout
-  and stderr captured back to the agent's transport. Reboots
-  disconnect SSH transiently; the agent waits for SSH to come back
-  and continues. The typical remote-mode target is a
-  freshly-provisioned libvirt VM with a dedicated GPU passed through
-  via VFIO — see [`docs/HOST_VFIO_SETUP.md`](docs/HOST_VFIO_SETUP.md)
-  for the host-side preparation.
-
-INSTALL.md is **identical in both modes** — the work to be done on
-the target is the same. Each command shown in this document is to be
-read as "execute this on the target." The agent translates that to
-either bare-shell (local) or SSH-prefixed (remote) before invocation.
-
-In **remote mode**, the agent must obey these conventions:
-
-- **Every** command from this document targets the remote machine.
-  The agent's `bash` tool, when used unprefixed, runs on the
-  control host — which is **not** what INSTALL.md is talking about.
-  Always prefix with `ssh -i <key> -o StrictHostKeyChecking=no
-  <user>@<target> 'command'`. The only legitimate uses of
-  unprefixed bash on the control host are reading this document,
-  scp/rsync of files into the target, polling SSH availability, and
-  inspecting harness state (transcripts, logs).
-- `sudo` runs as root **on the target** — the SSH user is in
-  passwordless sudoers.
-- Reboots: when a phase requires reboot (§2.1 NVIDIA driver, §3
-  kernel IOMMU on bare metal), the agent issues
-  `ssh ... 'sudo systemctl reboot'`, then loops `until ssh -o
-  ConnectTimeout=2 ... true; do sleep 5; done` before resuming. No
-  human waits between reboots.
-- This document does **not** cover host-side preparation for the
-  remote-mode target. Provisioning the VM, configuring GPU
-  passthrough on the control host, and dispatching the agent are
-  the operator's responsibility — see
-  [`docs/HOST_VFIO_SETUP.md`](docs/HOST_VFIO_SETUP.md). When the
-  agent enters this document in remote mode, the target is already
-  booted, SSH-reachable, and has the GPU attached via VFIO.
-
-When this document says "the agent decides" or "the operator
-confirms", that authority is the agent regardless of execution
-mode — only the *transport* of commands changes.
+These decisions are recorded inline so a future review can locate
+every place this document deliberately narrows behaviour for the
+sake of autonomous execution.
 
 ---
 
-## 1. Phase 1 — Detect environment
+## Conventions
 
-The agent must record these facts before mutating anything. They drive
-later decisions (CPU vs GPU build, which volumes already exist, whether
-a thin pool needs creating).
-
-### 1.1 Platform identification
-
-The entry-point check (top of file) already confirmed `uname -s` is
-`Linux`. Now identify the distribution:
-
-```bash
-[verify] $ uname -m              # x86_64 | aarch64
-[verify] $ uname -r
-[verify] $ . /etc/os-release && echo "${ID} ${ID_LIKE:-} ${VERSION_ID}"
-```
-
-Map `ID` (and `ID_LIKE` as a fallback) to `${OS_FAMILY}`:
-
-| `ID` / `ID_LIKE` contains | `${OS_FAMILY}` |
-|---|---|
-| `debian`, `ubuntu`, `linuxmint`, `pop` | `debian` |
-| `rhel`, `fedora`, `centos`, `rocky`, `almalinux`, `amzn` | `rhel` |
-| `opensuse`, `sles`, `suse` | `suse` |
-| `arch`, `manjaro`, `endeavouros` | `arch` |
-| `alpine` | `alpine` |
-| anything else | unsupported — halt |
-
-Cross-reference §0.5 to confirm the detected platform is supported.
-Best-effort platforms (Alpine, exotic distros) require the operator
-to opt in explicitly before the agent proceeds.
-
-### 1.2 GPU presence
-
-```bash
-[verify] $ test -e /dev/nvidia0 && echo gpu_present || echo gpu_absent
-[verify] $ command -v nvidia-smi >/dev/null && nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
-```
-
-Set `${HAS_GPU}=1` only if **all** of the following hold:
-
-- `uname -m` is `x86_64`.
-- `/dev/nvidia0` exists AND `nvidia-smi` runs.
-
-Otherwise `${HAS_GPU}=0`. On Linux aarch64, always `${HAS_GPU}=0` —
-the NVIDIA Container Toolkit and the vLLM/SGLang container images
-do not target that platform. The CPU-only path still produces a
-working JupyterLab; only GPU inference is skipped.
-
-If the kernel module is missing but the operator wants GPU, the
-agent must install the NVIDIA driver (Phase 2) and reboot before
-continuing. The agent must NOT silently reboot the host — it must
-surface a "reboot required" message to the operator and stop.
-
-### 1.3 Storage detection
-
-LVM2 thin-provisioned volumes under `/var/cache/devai/` are
-**mandatory**. Dev AI Lab does not run on plain directories on the
-root filesystem: a runaway model download must not be able to fill
-the host's `/`, and per-volume size accounting + isolation
-(`make cache-clean`, `make setup-logs`, model storage independent
-of build cache) all assume LVM thin pools.
-
-Record:
-
-```bash
-[verify] # lvm --version            # confirm LVM2 tooling is present
-[verify] # vgs --noheadings -o vg_name,vg_free | sort -u
-[verify] # lvs --noheadings -o lv_name,vg_name,segtype,pool_lv | grep -E 'thin-pool|thin' || true
-[verify] # findmnt -no SOURCE,TARGET,FSTYPE /var/cache/devai/{ollama,registry,pip,apt,npm,open-webui,logs} 2>/dev/null || true
-[verify] # lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT
-```
-
-- `${VG_NAME}` — the volume group with enough free space (≥ 600 GB
-  recommended) for the cache pool. Default if creating fresh: `vgais`.
-  If the host already has a VG with `cachepool` in it, **reuse it**.
-- `${POOL_NAME}` — `cachepool` is conventional; reuse if present.
-- `${EXISTING_VOLUMES}` — set of `cache_*` LVs already provisioned.
-  Do NOT recreate any of them.
-- `${EXISTING_MOUNTS}` — `/var/cache/devai/*` mountpoints already
-  active. Skip mount steps for these in Phase 4.
-
-If the host has **no LVM at all and no candidate disk/partition** for
-the cache pool (e.g. a small VPS with only a single boot partition,
-a workstation installed without LVM and no spare disk, Alpine on a
-single partition), the agent **must halt and surface to the
-operator**. The operator must either:
-
-- Attach a second physical or virtual disk (typical: 600 GB+ for the
-  thin pool's physical extent), then re-run from §1; or
-- Free a partition on the existing disk and provision LVM on it; or
-- Install Dev AI Lab on a different host that meets the prerequisite.
-
-INSTALL.md does not provide a non-LVM fallback path. The trade-offs
-of plain directories on root (no per-volume sizing, no `make
-setup-logs`, full root-fs at risk of model bloat) are not
-acceptable for a project that routinely manages 100+ GB of model
-weights and container caches.
-
-### 1.4 User and rootless podman
-
-```bash
-[verify] $ id
-[verify] $ subuid_count=$(grep "^${INVOKING_USER}:" /etc/subuid | head -n1 | awk -F: '{print $3}')
-[verify] $ subgid_count=$(grep "^${INVOKING_USER}:" /etc/subgid | head -n1 | awk -F: '{print $3}')
-[verify] $ echo "subuid=${subuid_count} subgid=${subgid_count}"
-```
-
-`subuid_count` and `subgid_count` must each be ≥ 65536. Most modern
-Linux installs satisfy this automatically when the user was created
-through the standard `adduser` / `useradd -m` path. If either is
-missing, Phase 2 will fix it via `usermod --add-subuids/--add-subgids`
-(or distro-specific equivalents — see §2).
-
-### 1.5 Repo presence
-
-```bash
-[verify] $ test -d "${REPO_DIR}/.git" && git -C "${REPO_DIR}" rev-parse --abbrev-ref HEAD
-```
-
-If `${REPO_DIR}` is missing, Phase 5 clones it. If present, verify the
-remote and branch but do not re-clone.
+- `$` runs on the **host** as the invoking (non-root) user.
+- `#` runs on the **host** as `root` (use `sudo`).
+- `[host]` is an explicit reminder that the command is host-side.
+- `[vm]` runs **inside the VM** via
+  `ssh -i ~/.ssh/devai-vm devai@${VM_IP} '...'`. The agent prefixes
+  every such command with that SSH transport; the snippet shows only
+  the inner command for readability.
+- `[verify]` is a read-only check whose failure halts the agent.
+- `${INVOKING_USER}` is the host user driving the agent (`$(id -un)`).
+- `${VM_IP}` is the VM's IPv4 on the libvirt `default` network,
+  resolved after first boot from `virsh net-dhcp-leases default`.
+- `${REPO_DIR}` is the absolute path of the cloned `devai` repository
+  **inside the VM** (default `/home/devai/devai`).
 
 ---
 
-## 2. Phase 2 — Install host packages
+## 1. Host environment readiness check
 
-This phase is platform-aware. Pick exactly one of §2.1.* matching
-`${OS_FAMILY}`, then run §2.2 (subuid/subgid, Linux only), §2.3
-(socket / `podman machine`), and §2.4 (verification) — those final
-three subsections are platform-aware in turn.
+The agent enters this section first. Every command in §1 is read-only
+and runs on the host. If any check fails, the agent **prints the
+remediation hint listed in §1.4 for that specific check and stops**.
+The operator then completes the missing piece of
+`docs/HOST_VFIO_SETUP.md` and re-runs the agent.
 
-### 2.0 Package responsibilities (cross-distro)
+### 1.1 Why this gate exists
 
-The same logical roles are needed on every platform. The per-platform
-sections below resolve each role to a concrete package name.
+`HOST_VFIO_SETUP.md` is the one-time host procedure: it mutates UEFI,
+the kernel command line, initramfs, and module-load configuration,
+and requires at least two reboots. None of it is reversible from
+inside a container or an unprivileged shell, and several steps need
+operator presence in the firmware setup screen. INSTALL.md therefore
+**must not** attempt to perform any of it. The agent's job here is
+purely to confirm the host is in the expected post-setup state.
 
-| Role | Provided by |
-|---|---|
-| Container engine | `podman` (preferred) or `docker` |
-| Compose provider (Go, **mandatory**) | `docker-compose` v2+ (Go binary), installed at `/usr/local/bin/docker-compose`. The Python `podman-compose` 1.3.0 shipped by Debian Trixie/Ubuntu **does not** expand `${VAR:-default}` substitutions used throughout `deploy/docker-compose.yaml` — the router then receives literal strings as image references and fails to recreate the on-demand vLLM/SGLang containers. `podman compose` (a wrapper) defers to `docker-compose` when present, so installing the Go binary fixes the substitution without changing the Makefile. |
-| GNU make | `make` |
-| Git | `git` |
-| Python ≥ 3.11 + YAML + venv | `python3`, `python3-yaml`, `python3-venv`/`python3-pip` (or distro equivalents) |
-| Curl + ca-certs + gnupg | `curl`, `ca-certificates`, `gnupg` |
-| Rootless container helpers (Linux) | `uidmap`/`shadow-utils-newxidmap`, `fuse-overlayfs`, `slirp4netns` (or `passt`) |
-| LVM2 + XFS tools (Linux storage) | `lvm2`, `xfsprogs` |
-| LVM thin tooling (**mandatory** on Linux) | `thin-provisioning-tools` (provides `/usr/sbin/thin_check`). Without it, LVM refuses to auto-activate thin LVs at boot — every `cache_*` mount fails silently (see §4.7's `nofail` requirement) and the stack starts with no `/var/cache/devai/*` storage. |
-| TLS for `devai-webui-proxy` | `openssl` on the host (alpine `nginx:alpine` ships no openssl binary, so the container's "self-signed fallback" is a no-op; certs must be pre-generated on the host — see §8.0). `mkcert` is optional for browser-trusted certs. |
-| (optional, GPU only) NVIDIA kernel driver | distro-specific (see §2.1.*) |
-| (optional, GPU only) NVIDIA Container Toolkit | `nvidia-container-toolkit` (every supported distro publishes a package) |
+### 1.2 Required host state
 
-### 2.1.a Debian / Ubuntu (`${OS_FAMILY}=debian`)
+All of the following must be true. The checks are listed in the
+order the agent runs them.
 
-Idempotent: `apt-get install -y` is a no-op when packages are present.
+| # | Check | Required value | If wrong, see §1.4 hint |
+|---|-------|----------------|-------------------------|
+| C1 | CPU virtualization extensions | `vmx` (Intel) or `svm` (AMD) in `/proc/cpuinfo` | H1 |
+| C2 | Kernel IOMMU on cmdline | `intel_iommu=on` or `amd_iommu=on` in `/proc/cmdline` | H2 |
+| C3 | IOMMU initialized | `DMAR: IOMMU enabled` (Intel) or `AMD-Vi ... Initialized` in `dmesg` | H2 |
+| C4 | VFIO modules loaded | `vfio`, `vfio_iommu_type1`, `vfio_pci` all in `lsmod` | H3 |
+| C5 | No auto-claim of the NVIDIA GPU | `lspci -nnk -s ${DGPU_BDF}` reports `Kernel driver in use: nvidia` (not `vfio-pci`) | H4 |
+| C6 | libvirt installed and running | `virsh version` succeeds; `systemctl is-active libvirtd` returns `active` | H5 |
+| C7 | `virt-install` available | `virt-install --version` succeeds | H5 |
+| C8 | OVMF firmware available | `/usr/share/OVMF/OVMF_CODE.fd` or `OVMF_CODE_4M.fd` exists | H5 |
+| C9 | libvirt `default` network active and autostart | `virsh net-info default` reports active + autostart | H6 |
+| C10 | libvirt `default` storage pool active and autostart | `virsh pool-info default` reports active + autostart | H6 |
+| C11 | Storage pool has ≥ 260 GiB free | `virsh pool-info default` `Available` ≥ 260 GiB | H7 |
+| C12 | GPU not currently in use | `nvidia-smi --query-compute-apps=pid` empty AND `lsof /dev/nvidia*` empty | H8 |
+| C13 | GPU IOMMU group is clean | the group containing `${DGPU_BDF}` contains only the GPU and its audio function | H9 |
+| C14 | Cloud-init seed-ISO tool | `cloud-localds` (preferred) or `genisoimage` available | H10 |
+| C15 | Operator has passwordless `sudo` on the host or the agent itself runs as root | `sudo -n true` succeeds | H11 |
+
+### 1.3 Check commands
 
 ```bash
-# apt-get update
-# apt-get install -y --no-install-recommends \
+[host] [verify] $ grep -Eqo '(vmx|svm)' /proc/cpuinfo                         # C1
+[host] [verify] $ grep -Eqo '(intel|amd)_iommu=on' /proc/cmdline              # C2
+[host] [verify] # dmesg | grep -Eq 'DMAR.*IOMMU enabled|AMD-Vi.*Initialized'  # C3
+[host] [verify] $ lsmod | awk '$1 ~ /^vfio(_iommu_type1|_pci)?$/ {print $1}' \
+                   | sort -u | tr '\n' ' '                                    # C4
+                  # must print: vfio vfio_iommu_type1 vfio_pci
+
+# Discover the dedicated NVIDIA GPU and its audio function (D8)
+[host] $ DGPU_BDF=$(lspci -nn | awk '
+            /NVIDIA/ && /(VGA|3D)/ { gsub(":", " "); print "0000:" $1 ":" $2; exit }
+         ')
+[host] $ DGPU_AUDIO_BDF=$(lspci -nn | awk -v p="${DGPU_BDF#0000:}" '
+            BEGIN { split(p,a,":"); want=a[1]":"a[2] }
+            /NVIDIA/ && /Audio/ && $0 ~ want { gsub(":", " "); print "0000:" $1 ":" $2; exit }
+         ')
+[host] [verify] $ test -n "${DGPU_BDF}" && test -n "${DGPU_AUDIO_BDF}"
+
+[host] [verify] $ lspci -nnk -s "${DGPU_BDF}" \
+                   | awk -F': ' '/Kernel driver in use/ {print $2}' \
+                   | grep -qx nvidia                                          # C5
+
+[host] [verify] $ virsh version                                               # C6
+[host] [verify] # systemctl is-active libvirtd
+[host] [verify] $ virt-install --version                                      # C7
+[host] [verify] $ ls /usr/share/OVMF/OVMF_CODE*.fd >/dev/null 2>&1            # C8
+[host] [verify] $ virsh net-info  default | grep -E 'Active:.*yes'            # C9
+[host] [verify] $ virsh net-info  default | grep -E 'Autostart:.*yes'
+[host] [verify] $ virsh pool-info default | grep -E 'State:.*running'         # C10
+[host] [verify] $ virsh pool-info default | grep -E 'Autostart:.*yes'
+
+# C11 — at least 260 GiB free in the default pool
+[host] [verify] $ avail_bytes=$(virsh pool-info default --bytes \
+                   | awk -F': +' '/Available/ {print $2}')
+[host] [verify] $ test "${avail_bytes}" -ge $((260 * 1024**3))
+
+# C12 — nobody holds the GPU
+[host] [verify] $ test -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)"
+[host] [verify] $ test -z "$(sudo lsof /dev/nvidia* 2>/dev/null)"
+
+# C13 — IOMMU group containment
+[host] [verify] $ group=$(basename "$(dirname "$(dirname \
+                   "$(ls /sys/kernel/iommu_groups/*/devices/${DGPU_BDF} 2>/dev/null)")")")
+[host] [verify] $ test -n "${group}"
+[host] [verify] $ allowed="${DGPU_BDF}\n${DGPU_AUDIO_BDF}"
+[host] [verify] $ extras=$(ls /sys/kernel/iommu_groups/${group}/devices/ \
+                   | grep -vxE "${DGPU_BDF}|${DGPU_AUDIO_BDF}" || true)
+[host] [verify] $ test -z "${extras}"
+
+[host] [verify] $ command -v cloud-localds >/dev/null || command -v genisoimage >/dev/null   # C14
+[host] [verify] $ sudo -n true                                                # C15
+```
+
+### 1.4 Remediation hints (printed only on failure)
+
+If a check fails, the agent emits the matching hint **verbatim** and
+stops. The operator fixes the host, then re-runs the agent from §1.
+
+- **H1 — CPU lacks virt extensions.** This host cannot run KVM VMs.
+  Replace the host. No software fix.
+- **H2 — IOMMU not on kernel command line.** Follow
+  `docs/HOST_VFIO_SETUP.md` §3: append `intel_iommu=on iommu=pt`
+  (Intel) or `amd_iommu=on iommu=pt` (AMD) to
+  `GRUB_CMDLINE_LINUX_DEFAULT`, run `update-grub`, reboot.
+- **H3 — VFIO modules not loaded.** Follow
+  `docs/HOST_VFIO_SETUP.md` §5: drop `/etc/modules-load.d/vfio.conf`
+  listing `vfio`, `vfio_iommu_type1`, `vfio_pci`, run
+  `update-initramfs -u -k all` (or distro equivalent), reboot.
+- **H4 — GPU is bound to `vfio-pci` at idle, not `nvidia`.** Either
+  a previous (permanent) VFIO setup is still active or a stale VM
+  detached the GPU and never reattached. Check
+  `/etc/modprobe.d/vfio*.conf` for `options vfio-pci ids=...` and
+  remove it per `docs/HOST_VFIO_SETUP.md` §5.1, then reboot. If no
+  such file exists, run
+  `sudo virsh nodedev-reattach pci_$(echo ${DGPU_BDF} | tr :. _)`
+  for both the GPU and its audio function.
+- **H5 — libvirt/virt-install/OVMF missing.** Install per
+  `docs/HOST_VFIO_SETUP.md` §6 (`apt-get install -y --no-install-
+  recommends qemu-system-x86 qemu-utils ovmf libvirt-daemon-system
+  libvirt-clients virtinst bridge-utils dnsmasq-base`), then
+  `systemctl enable --now libvirtd` and add `${INVOKING_USER}` to
+  group `libvirt`.
+- **H6 — libvirt `default` net or pool not active.** Run
+  `virsh net-start default; virsh net-autostart default;
+  virsh pool-start default; virsh pool-autostart default` per
+  `docs/HOST_VFIO_SETUP.md` §7.
+- **H7 — libvirt storage pool has < 260 GiB free.** Free space, or
+  point `default` at a larger directory via `virsh pool-define-as`.
+  The agent will not silently use a different pool.
+- **H8 — GPU is currently in use.** Stop the holders before
+  proceeding. Typical fixes (`docs/HOST_VFIO_SETUP.md` §8.1):
+  `make cache-down` if a host-native Dev AI Lab is running,
+  `sudo systemctl stop nvidia-persistenced`,
+  `sudo pkill -x nvidia-cuda-mps-control`. Re-run `lsof /dev/nvidia*`
+  until empty.
+- **H9 — IOMMU group is polluted.** Move the GPU to a different
+  PCIe slot whose root port has its own IOMMU group. See
+  `docs/HOST_VFIO_SETUP.md` §4. This is a hardware change, not a
+  software one.
+- **H10 — No seed-ISO tool.** `apt-get install -y cloud-image-utils`
+  (provides `cloud-localds`) on the host, or
+  `apt-get install -y genisoimage` as a fallback.
+- **H11 — Operator has no passwordless sudo.** `usermod -aG sudo
+  ${INVOKING_USER}` then add a `NOPASSWD:` line to
+  `/etc/sudoers.d/devai-install`, or run the agent as root.
+
+### 1.5 Exit criterion
+
+Every `[verify]` in §1.3 succeeded. The agent records `${DGPU_BDF}`,
+`${DGPU_AUDIO_BDF}`, and the libvirt pool path. It now proceeds to
+§2 without further operator interaction.
+
+---
+
+## 2. Provision the VM
+
+The agent creates `devai-vm`, attaches the GPU, and waits for SSH.
+Everything in §2 is host-side.
+
+### 2.1 VM specification (recorded, not negotiable here)
+
+| Property | Value | Source |
+|----------|-------|--------|
+| Name | `devai-vm` | D5 |
+| vCPUs | 4 | D4 |
+| Memory | 16 GiB | D4 |
+| Firmware | UEFI (OVMF) | `HOST_VFIO_SETUP.md` §6 |
+| Network | libvirt `default` (NAT) | D6 |
+| Disk (`vda`) | 250 GiB qcow2; cloud-init partitions into `vda1` = 50 GiB root + `vda2` = 200 GiB LVM PV | D3 |
+| Host devices | `${DGPU_BDF}`, `${DGPU_AUDIO_BDF}` | D8 / D9 |
+| Guest OS | Debian 13 generic cloud image, x86_64 | D2 |
+| Guest user | `devai`, passwordless sudo, ED25519 key auth | D7 |
+| Seed | cloud-init NoCloud ISO (`seed.iso`) | D20 |
+
+### 2.2 Idempotency: refuse to clobber an existing VM
+
+```bash
+[host] [verify] $ virsh dominfo devai-vm >/dev/null 2>&1 && \
+                    test "${DEVAI_VM_RECREATE:-0}" = 1 || \
+                    ! virsh dominfo devai-vm >/dev/null 2>&1
+```
+
+If a `devai-vm` already exists and `DEVAI_VM_RECREATE` is not `1`, the
+agent stops and asks the operator to either `export
+DEVAI_VM_RECREATE=1` (then re-run) or pick a different name by
+exporting `DEVAI_VM_NAME=...` (then re-run; the agent substitutes that
+name everywhere in §2). When `DEVAI_VM_RECREATE=1` is set, the agent
+runs the §16 tear-down flow before continuing.
+
+### 2.3 Generate SSH keypair (D7)
+
+```bash
+[host] $ KEY=${HOME}/.ssh/devai-vm
+[host] $ test -f "${KEY}" || ssh-keygen -t ed25519 -f "${KEY}" -N '' \
+                              -C "devai-vm $(date -u +%Y%m%d)"
+[host] $ PUBKEY=$(cat "${KEY}.pub")
+```
+
+### 2.4 Fetch the Debian 13 cloud image
+
+```bash
+[host] $ POOL_PATH=$(virsh pool-dumpxml default \
+                      | awk -F'[<>]' '/<path>/ {print $3; exit}')
+[host] $ IMG="${POOL_PATH}/debian-13-generic-amd64.qcow2"
+[host] $ test -f "${IMG}" || wget -O "${IMG}" \
+            https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-amd64.qcow2
+```
+
+The download is idempotent: a present file is reused.
+
+### 2.5 Build cloud-init seed ISO (D20)
+
+```bash
+[host] $ WORK=$(mktemp -d)
+[host] $ cat > "${WORK}/user-data" <<EOF
+#cloud-config
+hostname: devai-vm
+users:
+  - name: devai
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    lock_passwd: true
+    ssh_authorized_keys:
+      - ${PUBKEY}
+
+# D3: do not let cloud-init grow root to fill the whole 250 GiB disk.
+# We partition manually below so vda1 stays at 50 GiB and vda2 holds
+# the 200 GiB LVM PV for vgais.
+growpart:
+  mode: off
+resize_rootfs: false
+
+package_update: true
+packages:
+  - ca-certificates
+  - curl
+  - gnupg
+  - git
+  - make
+  - openssh-server
+  - parted
+  - e2fsprogs
+
+runcmd:
+  - [ systemctl, enable, --now, ssh ]
+  - |
+    set -e
+    test -e /var/lib/devai-partitioned && exit 0
+    ROOT_DEV=\$(findmnt -no SOURCE /)
+    DISK=/dev/\$(lsblk -no PKNAME "\$ROOT_DEV")
+    PART_NUM=\$(echo "\$ROOT_DEV" | grep -oE '[0-9]+$')
+    parted -s "\$DISK" resizepart "\$PART_NUM" 50GiB
+    partprobe "\$DISK" || true
+    resize2fs "\$ROOT_DEV"
+    parted -s "\$DISK" mkpart primary 50GiB 100%
+    partprobe "\$DISK" || true
+    touch /var/lib/devai-partitioned
+EOF
+[host] $ cat > "${WORK}/meta-data" <<EOF
+instance-id: devai-vm
+local-hostname: devai-vm
+EOF
+
+# D15 — inject an HF token only if the operator already keeps one on
+# the host. The default models in §11.2 are public, so a missing
+# token is not a failure; the VM proceeds with anonymous HF downloads.
+[host] $ if [ -s "${HOME}/.cache/huggingface/token" ] || [ -n "${HF_TOKEN:-}" ]; then
+            TOKEN=$(cat "${HOME}/.cache/huggingface/token" 2>/dev/null || printf '%s' "${HF_TOKEN}")
+            cat >> "${WORK}/user-data" <<EOF
+write_files:
+  - path: /home/devai/.cache/huggingface/token
+    owner: devai:devai
+    permissions: '0600'
+    content: |
+      ${TOKEN}
+EOF
+         fi
+
+[host] $ SEED="${POOL_PATH}/devai-vm-seed.iso"
+[host] $ if command -v cloud-localds >/dev/null; then
+            cloud-localds "${SEED}" "${WORK}/user-data" "${WORK}/meta-data"
+         else
+            genisoimage -output "${SEED}" -volid cidata -joliet -rock \
+                "${WORK}/user-data" "${WORK}/meta-data"
+         fi
+[host] $ rm -rf "${WORK}"
+```
+
+### 2.6 Allocate VM disk
+
+```bash
+[host] $ VDA="${POOL_PATH}/devai-vm.qcow2"
+[host] # qemu-img create -f qcow2 -F qcow2 -b "${IMG}" "${VDA}" 250G
+```
+
+`vda` is a 250 GiB copy-on-write overlay on the upstream cloud image
+so the base stays untouched and re-provisioning is cheap. Cloud-init
+(§2.5) repartitions the disk on first boot: `vda1` holds the 50 GiB
+root filesystem and `vda2` is a fresh 200 GiB partition that §6 turns
+into an LVM PV for `vgais`.
+
+### 2.7 Host GPU pre-flight (D10)
+
+Already verified in §1 (C12), but the agent re-checks immediately
+before detaching — anything could have started a CUDA process in the
+intervening seconds.
+
+```bash
+[host] [verify] $ test -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)"
+[host] [verify] $ test -z "$(sudo lsof /dev/nvidia* 2>/dev/null)"
+```
+
+If non-empty, halt with hint H8.
+
+### 2.8 Detach GPU from nvidia, bind to vfio-pci (D9)
+
+```bash
+[host] $ DGPU_NODE=pci_$(echo "${DGPU_BDF}"       | tr ':.' '_')
+[host] $ DGPU_AUDIO_NODE=pci_$(echo "${DGPU_AUDIO_BDF}" | tr ':.' '_')
+[host] # virsh nodedev-detach "${DGPU_NODE}"
+[host] # virsh nodedev-detach "${DGPU_AUDIO_NODE}"
+
+[host] [verify] $ lspci -nnk -s "${DGPU_BDF}"       | grep -q 'Kernel driver in use: vfio-pci'
+[host] [verify] $ lspci -nnk -s "${DGPU_AUDIO_BDF}" | grep -q 'Kernel driver in use: vfio-pci'
+```
+
+### 2.9 virt-install
+
+```bash
+[host] $ virt-install \
+            --name devai-vm \
+            --memory 16384 --vcpus 4 \
+            --cpu host-passthrough \
+            --osinfo name=debiantesting \
+            --boot uefi \
+            --disk path="${VDA}",format=qcow2,bus=virtio \
+            --disk path="${SEED}",device=cdrom \
+            --network network=default,model=virtio \
+            --hostdev "${DGPU_NODE}" \
+            --hostdev "${DGPU_AUDIO_NODE}" \
+            --graphics none --console pty,target_type=serial \
+            --import --noautoconsole
+```
+
+`--osinfo name=debiantesting` silences the `osinfo` warning on Trixie.
+`--hostdev pci_...` matches the syntax that Debian Trixie's
+`virt-install` accepts (per `HOST_VFIO_SETUP.md` §8 note); the GPU is
+already in `vfio-pci` from §2.8 so libvirt just claims it.
+
+### 2.10 Wait for SSH
+
+```bash
+[host] $ for _ in $(seq 1 60); do
+            VM_IP=$(virsh net-dhcp-leases default \
+                      | awk '/devai-vm/ {print $5}' | cut -d/ -f1)
+            test -n "${VM_IP}" && break
+            sleep 5
+         done
+[host] [verify] $ test -n "${VM_IP}"
+
+[host] $ for _ in $(seq 1 60); do
+            ssh -i ~/.ssh/devai-vm \
+                -o StrictHostKeyChecking=no \
+                -o UserKnownHostsFile=/dev/null \
+                -o ConnectTimeout=2 \
+                devai@${VM_IP} true && break
+            sleep 5
+         done
+[host] [verify] $ ssh -i ~/.ssh/devai-vm \
+                    -o StrictHostKeyChecking=no \
+                    -o UserKnownHostsFile=/dev/null \
+                    devai@${VM_IP} \
+                    'cloud-init status --wait'
+[host] [verify] $ ssh -i ~/.ssh/devai-vm \
+                    -o StrictHostKeyChecking=no \
+                    -o UserKnownHostsFile=/dev/null \
+                    devai@${VM_IP} \
+                    'lspci -nn | grep -i nvidia && lsblk /dev/vda'
+```
+
+`cloud-init status --wait` blocks until first-boot finishes, which
+guarantees the §2.5 partitioning runcmd has completed (vda1 = 50 GiB,
+vda2 = 200 GiB, unformatted) before the agent moves on.
+
+Expected: the VM's `lspci` lists the NVIDIA GPU and its audio
+function, and `lsblk` shows `vda1` (~50G ext4 mounted at `/`) plus
+`vda2` (~200G, no filesystem). From here on, the agent uses
+`ssh -i ~/.ssh/devai-vm devai@${VM_IP} '...'` for every `[vm]`
+command. The seed ISO can stay attached; cloud-init runs only on
+first boot.
+
+### 2.11 Verification (exit criterion for §2)
+
+```bash
+[host] [verify] $ virsh dominfo devai-vm | grep -E 'State: +running'
+[host] [verify] $ virsh dumpxml  devai-vm | grep -E 'hostdev|address.*type=.pci' | head
+[vm]   [verify] $ lspci -nnk | grep -A2 NVIDIA | grep -q 'Kernel driver in use'
+```
+
+The in-VM `Kernel driver in use:` line will be empty (no nvidia driver
+yet) at this point — that's expected; §3 installs the driver.
+
+---
+
+## 3. Detect environment inside the VM
+
+The agent SSHs in and records the facts that drive later phases.
+
+### 3.1 Platform identification
+
+```bash
+[vm] [verify] $ uname -m            # must be x86_64
+[vm] [verify] $ uname -r
+[vm] [verify] $ . /etc/os-release && test "${ID}" = debian && test "${VERSION_ID}" = 13
+```
+
+If any check fails, the cloud image is wrong; halt and surface to
+the operator. With the recorded D2 decision the only path here is
+Debian 13 (Trixie); other distros would mean the operator overrode
+the image and accepted responsibility for the deviation.
+
+### 3.2 GPU presence
+
+```bash
+[vm] [verify] $ lspci -nn | grep -iE 'NVIDIA.*(VGA|3D)' | head -1
+[vm] [verify] $ test -e /dev/kvm || true   # informational only; KVM nesting not required
+```
+
+`/dev/nvidia0` does **not** exist yet — the host kernel module is in
+the VM image only as `nouveau` (blacklisted on cloud images) or
+absent. §4.1 (D11) installs the open NVIDIA driver.
+
+### 3.3 Storage detection
+
+The cache LVs (see §6) will live on `/dev/vda2`, the 200 GiB
+partition that cloud-init carved out of `/dev/vda` in §2.5. The agent
+records the current state of vda:
+
+```bash
+[vm] [verify] $ lsblk -no NAME,SIZE,FSTYPE /dev/vda
+                # vda      250G
+                # |-vda1   50G    ext4   (root, mounted at /)
+                # |-vda14  ...                (BIOS boot, Debian cloud image)
+                # |-vda15  ...    vfat        (EFI System Partition)
+                # `-vda2   200G                (unformatted; vgais PV in §6)
+```
+
+If `/dev/vda2` is missing or already populated with LVM metadata,
+cloud-init's partitioning step did not produce the expected layout.
+Inspect `/var/log/cloud-init-output.log` inside the VM. The agent
+does **not** repartition vda after first boot.
+
+### 3.4 User and rootless podman pre-state
+
+```bash
+[vm] [verify] $ id
+[vm] [verify] $ grep "^devai:" /etc/subuid | awk -F: '{print $3}'   # >= 65536
+[vm] [verify] $ grep "^devai:" /etc/subgid | awk -F: '{print $3}'   # >= 65536
+```
+
+Cloud-init creates `devai` via `useradd`, which on Debian populates
+subuid/subgid automatically. If the counts are below 65536, §4 fixes
+it via `usermod --add-subuids/--add-subgids`.
+
+### 3.5 Repo presence
+
+```bash
+[vm] [verify] $ test -d ${REPO_DIR}/.git || echo "missing — phase 7 will clone"
+```
+
+---
+
+## 4. Install host packages inside the VM
+
+Single distro = Debian 13 (D22).
+
+### 4.1 Apt + base tooling
+
+```bash
+[vm] # apt-get update
+[vm] # apt-get install -y --no-install-recommends \
         ca-certificates curl gnupg git make \
         python3 python3-yaml python3-pip python3-venv \
         podman podman-compose \
@@ -379,1088 +581,822 @@ Idempotent: `apt-get install -y` is a no-op when packages are present.
         openssl mkcert
 ```
 
-Then install **`docker-compose` v2 (Go binary)** as the compose provider —
-without it `podman compose` falls through to the Python `podman-compose`
-1.3.0 in Debian, which does not expand `${VAR:-default}` and breaks the
-router's on-demand vLLM/SGLang recreation:
+Why these specific packages:
+
+- `passt` (binary `pasta`) is podman 5.x's default rootless network
+  backend on Debian Trixie. Without it `podman run` fails with
+  "could not find pasta".
+- `netavark` + `aardvark-dns` + `nftables` are required for
+  user-defined networks (the compose stack always uses one).
+  Debian's `podman` package only **recommends** them;
+  `--no-install-recommends` skips them.
+- `thin-provisioning-tools` is mandatory for LVM thin-pool
+  auto-activation at boot. Without it, the `cache_*` LVs come up
+  inactive and every `/var/cache/devai/*` mount fails silently
+  (see §6.7 `nofail` requirement).
+- `mkcert` is optional for browser-trusted certs; the agent only
+  uses it as a fallback if `openssl req` fails (it shouldn't, since
+  the package is present).
+
+### 4.2 Install Go-based `docker-compose` v2 (D13)
+
+The Python `podman-compose` 1.3.0 shipped by Trixie does not expand
+`${VAR:-default}` in `deploy/docker-compose.yaml`. The Go binary
+does. `podman compose` (no hyphen) auto-detects the Go binary and
+delegates to it when present.
 
 ```bash
-# DC_VER=v2.40.0   # any v2.x release
-# curl -fsSL "https://github.com/docker/compose/releases/download/${DC_VER}/docker-compose-linux-$(uname -m)" \
+[vm] # DC_VER=v2.40.0
+[vm] # curl -fsSL \
+        "https://github.com/docker/compose/releases/download/${DC_VER}/docker-compose-linux-$(uname -m)" \
         -o /usr/local/bin/docker-compose
-# chmod +x /usr/local/bin/docker-compose
-[verify] $ docker-compose version       # must print "Docker Compose version vX.Y.Z"
-[verify] $ podman compose version       # must print the SAME version (proves the wrapper picked it up)
+[vm] # chmod +x /usr/local/bin/docker-compose
+
+[vm] [verify] $ docker-compose version
+[vm] [verify] $ podman compose version    # same version as docker-compose
 ```
 
-Network-stack notes for podman 5.x rootless on Debian Trixie:
-
-- `passt` (binary `pasta`) is podman's default rootless network
-  backend; without it, `podman run` fails with `could not find pasta,
-  the network namespace can't be configured`. `slirp4netns` is the
-  fallback used on older kernels; installing both lets podman pick
-  the one its defaults prefer.
-- `netavark` + `aardvark-dns` + `nftables` are required when
-  containers join a user-defined network (as compose does — every
-  service joins the project's bridge). Without them, `podman start`
-  on those containers fails with `netavark: nftables error: unable to
-  execute nft` and `aardvark-dns binary not found`. Debian's `podman`
-  package only **recommends** these; `--no-install-recommends`
-  skips them.
-
-If `${HAS_GPU}=1`, the **driver source matters** for newer GPUs:
-
-- **Debian Trixie's `nvidia-driver`** (currently 550.163.01) supports
-  Ampere (RTX 30xx, A-series) and Ada (RTX 40xx, L-series). It
-  **does not support Blackwell** (RTX PRO 4000/5000/6000 Blackwell,
-  RTX 50xx) — the driver fails its probe with
-  `NVRM: ... not supported by the NVIDIA 550.163.01 driver release`
-  and `/dev/nvidia0` never appears.
-- **NVIDIA's CUDA APT repo** ships latest production drivers
-  (570+ at the time of writing) which support Ampere through
-  Blackwell. Use this path on Blackwell hosts; either path works
-  for older cards.
-
-Path A — Debian's `nvidia-driver` (Ampere/Ada only):
+### 4.3 NVIDIA driver — CUDA repo, `nvidia-open` (D11)
 
 ```bash
-# Enable contrib + non-free-firmware (Trixie cloud images ship main only)
-# sed -i 's|^Components: main$|Components: main contrib non-free-firmware non-free|' \
-       /etc/apt/sources.list.d/debian.sources
+[vm] # wget -qO /tmp/cuda-keyring.deb \
+        https://developer.download.nvidia.com/compute/cuda/repos/debian13/x86_64/cuda-keyring_1.1-1_all.deb
+[vm] # dpkg -i /tmp/cuda-keyring.deb && rm /tmp/cuda-keyring.deb
 
-# NVIDIA Container Toolkit repo
-# curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
-       | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
-# curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
-       | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#' \
-       > /etc/apt/sources.list.d/nvidia-container-toolkit.list
+[vm] # curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+        | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+[vm] # curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+        | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#' \
+        > /etc/apt/sources.list.d/nvidia-container-toolkit.list
 
-# apt-get update
-# apt-get install -y nvidia-driver nvidia-smi nvidia-container-toolkit \
-                     linux-headers-amd64
+[vm] # apt-get update
+[vm] # apt-get install -y nvidia-open nvidia-container-toolkit linux-headers-amd64
 ```
 
-Path B — NVIDIA's CUDA repo (Blackwell or any newer GPU):
+`nvidia-open` pulls in `nvidia-kernel-open-dkms`, which builds the
+open `nvidia.ko` against the running kernel using `linux-headers-
+amd64`. On Blackwell the closed kernel modules from `cuda-drivers`
+load but fail GPU init with `RmInitAdapter failed!`; on Ampere/Ada
+both work. The agent unconditionally picks open (D11) for forward
+compatibility.
+
+### 4.4 Reboot the VM (D12)
 
 ```bash
-# CUDA repo keyring
-# wget -qO /tmp/cuda-keyring.deb \
-       https://developer.download.nvidia.com/compute/cuda/repos/debian13/x86_64/cuda-keyring_1.1-1_all.deb
-# dpkg -i /tmp/cuda-keyring.deb && rm /tmp/cuda-keyring.deb
-
-# NVIDIA Container Toolkit repo (same as Path A)
-# curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
-       | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
-# curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
-       | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#' \
-       > /etc/apt/sources.list.d/nvidia-container-toolkit.list
-
-# apt-get update
-# apt-get install -y nvidia-open nvidia-container-toolkit linux-headers-amd64
+[vm] # systemctl reboot
+[host] $ until ssh -i ~/.ssh/devai-vm -o ConnectTimeout=2 devai@${VM_IP} true; do
+            sleep 5
+         done
+[vm] [verify] $ nvidia-smi -L          # must list the passed-through GPU
+[vm] [verify] $ test -e /dev/nvidia0
 ```
 
-**Use `nvidia-open`, not `cuda-drivers`, on Blackwell.** Blackwell
-GPUs (PCI ID `10de:2c34` and similar) require NVIDIA's **open
-kernel modules**; the closed-source modules pulled in by
-`cuda-drivers` will load but fail GPU init with
-`NVRM: GPU 0000:XX:00.0: RmInitAdapter failed!` and the dmesg
-hint `requires use of the NVIDIA open kernel modules`. The
-`nvidia-open` metapackage pulls in `nvidia-kernel-open-dkms`,
-which builds the open `nvidia.ko` against the running kernel.
+If `nvidia-smi` reports "couldn't communicate with the NVIDIA driver",
+the most common cause is a kernel/header mismatch — `linux-headers-
+amd64` lagged the running kernel. Run `apt-get install -y
+linux-headers-$(uname -r)`, then `dpkg-reconfigure
+nvidia-kernel-open-dkms`, and reboot once more.
 
-For Ampere/Ada, both `cuda-drivers` (closed) and `nvidia-open`
-(open) work; pick `nvidia-open` for forward-compatibility with
-future GPU generations.
+### 4.5 subuid/subgid
 
-Why both:
-
-- `linux-headers-amd64` is required for DKMS to build `nvidia.ko`
-  against the running kernel; without it the module is missing
-  post-reboot and `nvidia-smi` reports "couldn't communicate with
-  the NVIDIA driver".
-- `nvidia-smi` is its own package on Debian (not pulled in by
-  `nvidia-driver`) but is needed by §3.1 verification.
-
-For Ubuntu the same paths apply; only the Debian
-`sources.list.d/debian.sources` edit is unnecessary (Ubuntu's
-`restricted` and `multiverse` are typically already enabled).
-
-### 2.1.b RHEL / Fedora / Rocky / Alma / Amazon Linux 2023 (`${OS_FAMILY}=rhel`)
+Skip if §3.4 reported counts ≥ 65536. On a fresh cloud-init `devai`
+user, those counts are usually already correct.
 
 ```bash
-# dnf install -y \
-        ca-certificates curl gnupg2 git make \
-        python3 python3-pyyaml python3-pip \
-        podman podman-compose \
-        shadow-utils fuse-overlayfs slirp4netns \
-        lvm2 xfsprogs \
-        mkcert
+[vm] # usermod --add-subuids 100000-165535 devai
+[vm] # usermod --add-subgids 100000-165535 devai
+[vm] $ podman system migrate
 ```
 
-On RHEL/Rocky/Alma 9, `podman-compose` lives in EPEL —
-`dnf install -y epel-release` first if it is missing. Amazon Linux
-2023 ships podman without compose; install via PyPI:
+### 4.6 Activate the podman socket
 
 ```bash
-# pip3 install podman-compose
+[vm] $ systemctl --user enable --now podman.socket
+[vm] # loginctl enable-linger devai
 ```
 
-If `${HAS_GPU}=1`:
+`loginctl enable-linger` keeps `--user` services running after logout,
+which the eventual §13 systemd auto-start unit relies on.
+
+### 4.7 Verification
 
 ```bash
-# dnf config-manager --add-repo \
-       https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo
-# dnf install -y nvidia-driver nvidia-container-toolkit
-```
-
-The exact NVIDIA driver package name varies — Fedora uses
-`akmod-nvidia` (RPM Fusion), RHEL uses the CUDA repo's `nvidia-driver`
-or `kmod-nvidia-latest-dkms`. Defer to the operator if the
-straightforward `dnf install nvidia-driver` does not resolve.
-
-SELinux: the project's compose file already passes
-`--security-opt label=disable` to GPU containers because rootless
-podman + nvidia-container-toolkit + enforcing SELinux historically
-clashes. No additional SELinux work is required for the default
-path. If the operator runs in `Enforcing` mode and prefers labels,
-they must add the matching `container_t` rules manually.
-
-### 2.1.c openSUSE Leap / Tumbleweed / SLES (`${OS_FAMILY}=suse`)
-
-```bash
-# zypper install -y \
-        ca-certificates curl gpg2 git make \
-        python3 python3-PyYAML python3-pip \
-        podman podman-compose \
-        shadow fuse-overlayfs slirp4netns \
-        lvm2 xfsprogs \
-        mkcert
-```
-
-If `${HAS_GPU}=1`:
-
-```bash
-# zypper addrepo https://download.nvidia.com/opensuse/leap/15.5 NVIDIA
-# zypper --gpg-auto-import-keys refresh
-# zypper install -y nvidia-driver-G06 nvidia-container-toolkit
-```
-
-Adjust `15.5` to the actual Leap version; on Tumbleweed use the
-`tumbleweed` path. The NVIDIA Container Toolkit RPM repo
-(`https://nvidia.github.io/libnvidia-container/stable/rpm/`) also
-works on openSUSE.
-
-### 2.1.d Arch / EndeavourOS / Manjaro (`${OS_FAMILY}=arch`)
-
-```bash
-# pacman -Syu --noconfirm \
-        ca-certificates curl gnupg git make \
-        python python-yaml python-pip \
-        podman podman-compose \
-        shadow fuse-overlayfs slirp4netns \
-        lvm2 xfsprogs \
-        mkcert
-```
-
-Arch's package names are unversioned (always latest). If
-`${HAS_GPU}=1`:
-
-```bash
-# pacman -S --noconfirm nvidia nvidia-container-toolkit
-```
-
-Use `nvidia-dkms` instead of `nvidia` when running a non-stock kernel
-(e.g. `linux-zen`, `linux-lts`).
-
-### 2.1.e Alpine 3.19+ (`${OS_FAMILY}=alpine`, best-effort)
-
-```bash
-# apk add --no-cache \
-        ca-certificates curl gnupg git make \
-        python3 py3-yaml py3-pip \
-        podman podman-compose \
-        shadow-uidmap fuse-overlayfs slirp4netns \
-        lvm2 xfsprogs \
-        mkcert
-```
-
-The musl + busybox combination is **not** the project's reference
-platform. Known caveats:
-
-- The CUDA + NVIDIA Container Toolkit stack on Alpine relies on
-  community packaging that lags behind glibc distros; verify with
-  `nvidia-ctk --version` before continuing.
-- `make probe-vllm` may fail on Alpine if the upstream vLLM image
-  was compiled against glibc-only glibc-dependent CUDA bindings;
-  this is a vLLM-side limitation, not the project's.
-
-If the operator has not explicitly opted into Alpine, halt and
-surface the platform.
-
-### 2.2 subuid/subgid
-
-Skip if §1.4 reported counts ≥ 65536.
-
-```bash
-# usermod --add-subuids 100000-165535 ${INVOKING_USER}
-# usermod --add-subgids 100000-165535 ${INVOKING_USER}
-$ podman system migrate
-```
-
-On distros where `usermod` lacks `--add-subuids` (older util-linux),
-edit `/etc/subuid` and `/etc/subgid` directly:
-
-```bash
-# echo "${INVOKING_USER}:100000:65536" >> /etc/subuid
-# echo "${INVOKING_USER}:100000:65536" >> /etc/subgid
-$ podman system migrate
-```
-
-`podman system migrate` resets the rootless storage to pick up the new
-mappings. It is destructive of any existing rootless state, so the
-agent must only run it after detecting that the new ranges are
-genuinely needed.
-
-### 2.3 Container runtime activation
-
-The router invokes podman remotely to recreate vLLM/SGLang containers,
-so the user's podman socket must be active.
-
-```bash
-$ systemctl --user enable --now podman.socket
-$ loginctl enable-linger ${INVOKING_USER}
-```
-
-`loginctl enable-linger` keeps `--user` services running after logout —
-required for systemd-managed `devai-infra.service` (Phase 11).
-
-On Alpine and other non-systemd distros, the equivalent is to run
-`podman system service --time=0 unix:///run/user/$(id -u)/podman/podman.sock &`
-under a long-lived supervisor (OpenRC, runit, s6). The exact unit is
-distro-specific — document and surface to the operator if Alpine is
-the target.
-
-### 2.4 Verification
-
-```bash
-[verify] $ podman --version
-[verify] $ podman compose version
-[verify] $ python3 --version           # ≥ 3.11
-[verify] $ make --version
-[verify] $ test -S "/run/user/$(id -u)/podman/podman.sock"
+[vm] [verify] $ podman --version
+[vm] [verify] $ podman compose version
+[vm] [verify] $ python3 --version       # >= 3.11
+[vm] [verify] $ make --version
+[vm] [verify] $ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+[vm] [verify] $ test -S /run/user/$(id -u)/podman/podman.sock
 ```
 
 ---
 
-## 3. Phase 3 — Configure container runtime + GPU
+## 5. Configure container runtime + GPU in the VM
 
-> **Ordering note.** §3 only writes config files and (on GPU hosts)
-> generates the CDI spec; it deliberately defers every `podman run`
-> probe to §4.8 because §3.2.1's `graphroot = /var/cache/devai/registry`
-> requires that mount point to exist. Sequence: §3.1 → §3.2 → §3.2.1
-> → §3.3 → §4 → §3.4 (which is now a no-op pointer to §4.8).
-
-### 3.0 Subsection applicability
-
-| Subsection | Linux + GPU | Linux CPU-only |
-|---|---|---|
-| 3.1 NVIDIA CDI | required | skip |
-| 3.2 containers.conf | recommended | recommended |
-| 3.3 Registry mirror routing | optional | optional |
-| 3.4 Verification | required | partial |
-
-### 3.1 NVIDIA Container Device Interface (CDI)
-
-Skip if `${HAS_GPU}=0`.
-
-The repo's containers reference GPU via the CDI device name
-`nvidia.com/gpu=all` (see `deploy/docker-compose.yaml`). CDI must be
-generated and stored where rootless podman finds it:
+### 5.1 NVIDIA Container Device Interface (CDI)
 
 ```bash
-# nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
-[verify] # podman info --format '{{.Host.CgroupVersion}} {{.Host.Security.Rootless}}'
-[verify] $ podman run --rm --device nvidia.com/gpu=all \
-              docker.io/library/debian:trixie nvidia-smi -L
+[vm] # nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+[vm] [verify] $ podman info --format '{{.Host.CgroupVersion}} {{.Host.Security.Rootless}}'
+[vm] [verify] $ podman run --rm --device nvidia.com/gpu=all \
+                  docker.io/library/debian:trixie nvidia-smi -L
 ```
 
-The `nvidia-smi -L` output must list at least one GPU. If it fails
-with "no such device", regenerate CDI after confirming `nvidia-smi`
-works on the host directly.
+The CDI device name `nvidia.com/gpu=all` is what
+`deploy/docker-compose.yaml` references. `nvidia-smi -L` inside the
+container must list the same GPU as §4.4.
 
-### 3.2 Containers config
+### 5.2 containers.conf
 
-The repo expects rootless podman to use the user's runtime socket.
-Generate (or update) `~/.config/containers/containers.conf` ONLY if it
-is missing or lacks the runtime config; never overwrite a populated
-file:
+Write only if missing — never clobber a populated file:
 
 ```bash
-$ test -f ${HOME_DIR}/.config/containers/containers.conf || \
-    nvidia-ctk runtime configure --runtime=podman \
-        --config=${HOME_DIR}/.config/containers/containers.conf
+[vm] $ test -f ~/.config/containers/containers.conf || \
+         nvidia-ctk runtime configure --runtime=podman \
+           --config=~/.config/containers/containers.conf
 ```
 
-#### 3.2.1 Rootless podman storage relocation (mandatory)
+### 5.3 Rootless podman storage relocation (mandatory)
 
-Default rootless graphroot is `${HOME_DIR}/.local/share/containers/storage`,
-which lives on the **root filesystem**. The lab images (~30 GB total)
-plus pulled NVFP4 / GGUF backend images (~30 GB more) will quickly fill
-`/` on any host whose `${HOME_DIR}` is not on a large dedicated volume.
-Relocate the graphroot to the LVM-backed `cache_registry` LV **before
-running any `podman` command that touches storage** (`pull`, `run`,
-`build`, etc.). Once podman has initialised its sqlite state DB at the
-default path, switching graphroot requires either an in-place sqlite
-edit of `db.sql` (`UPDATE DBConfig SET StaticDir=…, GraphRoot=…,
-VolumeDir=…;` plus the same `REPLACE()` over `VolumeConfig.JSON`) or a
-destructive `podman system reset --force`. Configuring storage.conf
+Default graphroot is `~/.local/share/containers/storage`, which lives
+on `vda1` (the 50 GiB root). The lab images (~30 GiB) plus the pulled
+backend images (~30 GiB more) would fill it. Relocate **before any
+podman command that materializes storage** (`pull`, `run`, `build`).
+
+Once podman has written its sqlite state DB at the default path,
+switching graphroot requires either an in-place edit of `db.sql` or a
+destructive `podman system reset --force`. Setting `storage.conf`
 before the first podman call avoids both.
 
 ```bash
-$ mkdir -p ${HOME_DIR}/.config/containers
-$ cat > ${HOME_DIR}/.config/containers/storage.conf <<EOF
+[vm] $ mkdir -p ~/.config/containers
+[vm] $ cat > ~/.config/containers/storage.conf <<'EOF'
 [storage]
 driver = "overlay"
 graphroot = "/var/cache/devai/registry"
 EOF
-
-[verify] $ podman info --format '{{.Store.GraphRoot}}'
-# Expected: /var/cache/devai/registry
 ```
 
-The `cache_registry` LV is created in §4 with this exact path; the
-ordering here means storage.conf is in place before §3.4's
-`podman run` verification call. Using the same `graphroot` path that
-the host uses (the project's standard) keeps any future image transfers
-between hosts straightforward.
+Verification is deferred to §6.8 because `/var/cache/devai/registry`
+does not exist until §6 mounts it.
 
-### 3.3 Registry mirror routing
+### 5.4 Registry mirror routing (optional)
 
 The infra stack runs a `registry:2` pull-through cache on `:5000`.
-Routing rootless podman through it is optional but speeds up
-re-builds. Install the supplied config only if no `registries.conf`
-exists yet (do not clobber a customised one):
+Routing podman through it speeds up rebuilds.
 
 ```bash
-$ mkdir -p ${HOME_DIR}/.config/containers
-$ test -f ${HOME_DIR}/.config/containers/registries.conf || \
-      cp ${REPO_DIR}/deploy/registries.conf \
-         ${HOME_DIR}/.config/containers/registries.conf
+[vm] $ mkdir -p ~/.config/containers
+[vm] $ test -f ~/.config/containers/registries.conf || \
+         cp ${REPO_DIR}/deploy/registries.conf \
+            ~/.config/containers/registries.conf
 ```
 
-The shipped `registries.conf` adds `localhost:5000` as an insecure
-mirror for `docker.io`. It falls back to `docker.io` directly if the
-mirror is down, so installing it before §8 (when the mirror starts)
-is safe.
+The shipped file adds `localhost:5000` as an insecure mirror for
+`docker.io` and falls back to `docker.io` directly if the mirror is
+down. Safe to install before §10 (when the mirror starts).
 
-### 3.4 Verification
+### 5.5 Verification
 
-Deferred to §4.8 — see the ordering note at the top of §3. The probes
-that test `podman run` need `graphroot = /var/cache/devai/registry`
-to exist as a mounted directory, which §4 provides.
-
-The non-podman probe (CDI list) is safe to run here:
-
-```bash
-[verify] # nvidia-ctk cdi list 2>/dev/null | head        # GPU hosts only
-```
+The podman-storage probe is deferred to §6.8. The CDI probe (§5.1)
+already ran.
 
 ---
 
-## 4. Phase 4 — Provision storage for `/var/cache/devai/`
+## 6. Provision storage on `/dev/vda2`
 
-This phase creates seven LVM2 thin-provisioned volumes under
-`${VG_NAME}/cachepool`, formats them XFS, and mounts them at
-`/var/cache/devai/<name>`. **LVM is mandatory**; if §1.3 reported
-no usable VG, the agent has already halted and the operator has
-attached a disk or freed a partition before re-entering this phase.
+The 200 GiB `vda2` becomes `vgais`, holding one 200 GiB thin pool and
+seven thin LVs (§6.1).
 
-### 4.0 Why LVM thin pool
-
-> One physical extent backs many sparse LVs, so unused capacity is
-> shared but accounting is per-LV. Snapshots are cheap. A runaway
-> model download fills only its own LV, never the host's `/`. The
-> repo's `make cache-clean` and `make setup-logs` targets assume
-> this layout verbatim (see `deploy/setup-logs-volume.sh`).
-
-### 4.1 Target layout
+### 6.1 Target layout
 
 | LV name | Size (virtual) | Mountpoint | Filesystem | Owner |
 |---|---|---|---|---|
-| `cache_ollama` | 200G–500G | `/var/cache/devai/ollama` | xfs | `${INVOKING_USER}` |
-| `cache_registry` | 200G | `/var/cache/devai/registry` | xfs | `${INVOKING_USER}` |
-| `cache_pip` | 30G | `/var/cache/devai/pip` | xfs | `${INVOKING_USER}` |
-| `cache_apt` | 10G | `/var/cache/devai/apt` | xfs | `${INVOKING_USER}` |
-| `cache_npm` | 10G | `/var/cache/devai/npm` | xfs | `${INVOKING_USER}` |
-| `cache_open_webui` | 5G | `/var/cache/devai/open-webui` | xfs | `${INVOKING_USER}` |
-| `cache_logs` | 100G | `/var/cache/devai/logs` | xfs | `${INVOKING_USER}` |
+| `cache_ollama` | 200G | `/var/cache/devai/ollama` | xfs | `devai` |
+| `cache_registry` | 200G | `/var/cache/devai/registry` | xfs | `devai` |
+| `cache_pip` | 30G | `/var/cache/devai/pip` | xfs | `devai` |
+| `cache_apt` | 10G | `/var/cache/devai/apt` | xfs | `devai` |
+| `cache_npm` | 10G | `/var/cache/devai/npm` | xfs | `devai` |
+| `cache_open_webui` | 5G | `/var/cache/devai/open-webui` | xfs | `devai` |
+| `cache_logs` | 100G | `/var/cache/devai/logs` | xfs | `devai` |
 
-Sum of virtual sizes ≈ 855 GB; the underlying thin pool only needs to
-hold what is actually written. Recommended thin-pool physical size:
-≥ 600 GB (room for one or two large NVFP4 models plus mirror).
+Sum of virtual sizes ≈ 555 GiB. The thin pool is **exactly 200 GiB**,
+intentionally over-committed; thin provisioning charges only written
+extents.
 
-`cache_ollama` is the largest because it holds **all** model weights
-(Ollama GGUF blobs under `models/blobs/` AND vLLM/SGLang safetensors
-trees under `models/vllm/<repo>/`). A single 30B NVFP4 checkpoint can
-be 18–25 GB; plan accordingly.
-
-### 4.2 Decision tree
-
-The agent reads `${VG_NAME}`, `${POOL_NAME}`, and `${EXISTING_VOLUMES}`
-from §1.3.
-
-```
-if ${VG_NAME} unset (no usable VG):
-    → create VG on a free disk or partition (§4.3)
-    → create thin pool (§4.4)
-elif ${POOL_NAME} present in ${VG_NAME}:
-    → reuse the existing pool
-else:
-    → create thin pool inside ${VG_NAME} (§4.4)
-
-for lv in cache_ollama cache_registry cache_pip cache_apt cache_npm cache_open_webui cache_logs:
-    if lv in ${EXISTING_VOLUMES}:
-        skip (do not recreate, do not reformat)
-    else:
-        lvcreate (§4.5)
-        mkfs.xfs (§4.6)
-
-for mountpoint:
-    if already mounted from the matching device:
-        skip
-    else:
-        ensure /etc/fstab entry, mkdir, mount (§4.7)
-```
-
-### 4.3 Volume group (only when one does not already exist)
-
-Skip if `${VG_NAME}` is set.
-
-The agent must NOT pick a disk autonomously. If no VG exists, halt and
-surface this to the operator with a list of candidate block devices
-(`lsblk -dp -o NAME,SIZE,TYPE,MOUNTPOINTS`). Human approval of the
-target device is required.
-
-When the operator picks `${DEVICE}` (e.g. `/dev/nvme1n1` or
-`/dev/nvme0n1p4`):
+### 6.2 Volume group
 
 ```bash
-# pvcreate ${DEVICE}
-# vgcreate vgais ${DEVICE}
+[vm] # pvcreate /dev/vda2
+[vm] # vgcreate vgais /dev/vda2
+[vm] [verify] # vgs vgais --units g
 ```
 
-Set `${VG_NAME}=vgais`.
-
-### 4.4 Thin pool
-
-Skip if a `thin-pool` LV already exists in `${VG_NAME}`.
+### 6.3 Thin pool
 
 ```bash
-# lvcreate -L 600G -T ${VG_NAME}/cachepool
+[vm] # lvcreate -L 200G -T vgais/cachepool
+[vm] [verify] # lvs vgais/cachepool
 ```
 
-Set `${POOL_NAME}=cachepool`. The pool size is bounded by free space
-in `${VG_NAME}`; pick a value ≥ 1.5x the sum of intended LV virtual
-sizes that fit in `vgs --units g --noheadings -o vg_free ${VG_NAME}`.
-On a small disk, scale all LV sizes proportionally.
+The pool size is exactly 200 GiB; do not scale.
 
-### 4.5 Thin LVs
-
-Idempotency: each `lvcreate` is wrapped in an existence check so a
-re-run is a no-op.
+### 6.4 Thin LVs
 
 ```bash
-# for spec in \
-      "cache_ollama:200G" \
-      "cache_registry:200G" \
-      "cache_pip:30G" \
-      "cache_apt:10G" \
-      "cache_npm:10G" \
-      "cache_open_webui:5G" \
-      "cache_logs:100G"; do
-      lv="${spec%%:*}"; size="${spec##*:}"
-      if ! lvs "${VG_NAME}/${lv}" >/dev/null 2>&1; then
-          lvcreate --thin --virtualsize "${size}" --name "${lv}" \
-              "${VG_NAME}/${POOL_NAME}"
-      fi
-  done
+[vm] # for spec in \
+        "cache_ollama:200G" \
+        "cache_registry:200G" \
+        "cache_pip:30G" \
+        "cache_apt:10G" \
+        "cache_npm:10G" \
+        "cache_open_webui:5G" \
+        "cache_logs:100G"; do
+            lv="${spec%%:*}"; size="${spec##*:}"
+            if ! lvs "vgais/${lv}" >/dev/null 2>&1; then
+                lvcreate --thin --virtualsize "${size}" --name "${lv}" vgais/cachepool
+            fi
+        done
 ```
 
-### 4.6 Filesystem
-
-Format ONLY when the LV reports no signature:
+### 6.5 Filesystems
 
 ```bash
-# for lv in cache_ollama cache_registry cache_pip cache_apt cache_npm cache_open_webui cache_logs; do
-      dev="/dev/${VG_NAME}/${lv}"
-      if blkid -p "${dev}" >/dev/null 2>&1; then
-          continue
-      fi
-      mkfs.xfs -q "${dev}"
-  done
+[vm] # for lv in cache_ollama cache_registry cache_pip cache_apt cache_npm cache_open_webui cache_logs; do
+            dev="/dev/vgais/${lv}"
+            blkid -p "${dev}" >/dev/null 2>&1 && continue
+            mkfs.xfs -q "${dev}"
+        done
 ```
 
-### 4.7 Mountpoints, /etc/fstab, mount
+### 6.6 Mounts and fstab
 
 ```bash
-# mkdir -p /var/cache/devai/{ollama,registry,pip,apt,npm,open-webui,logs}
-
-# for lv in cache_ollama cache_registry cache_pip cache_apt cache_npm cache_open_webui cache_logs; do
-      dev="/dev/${VG_NAME}/${lv}"
-      uuid="$(blkid -s UUID -o value "${dev}")"
-      case "${lv}" in
-          cache_ollama)     mp="/var/cache/devai/ollama" ;;
-          cache_registry)   mp="/var/cache/devai/registry" ;;
-          cache_pip)        mp="/var/cache/devai/pip" ;;
-          cache_apt)        mp="/var/cache/devai/apt" ;;
-          cache_npm)        mp="/var/cache/devai/npm" ;;
-          cache_open_webui) mp="/var/cache/devai/open-webui" ;;
-          cache_logs)       mp="/var/cache/devai/logs" ;;
-      esac
-      # If the device is already mounted at the right place, skip
-      if findmnt -no SOURCE --mountpoint "${mp}" 2>/dev/null | grep -q "${dev}$"; then
-          continue
-      fi
-      # Replace any stale fstab line for this mountpoint or device
-      cp -f /etc/fstab "/etc/fstab.bak.$(date -u +%Y%m%dT%H%M%SZ)"
-      sed -i.tmp -e "\#\\s${mp}\\s#d" -e "\#${dev}\\s#d" \
-          -e "\#UUID=${uuid}\\s#d" /etc/fstab
-      rm -f /etc/fstab.tmp
-      echo "UUID=${uuid}  ${mp}  xfs  defaults,noatime,nofail  0  2" >> /etc/fstab
-      mount "${mp}"
-  done
-
-# chown -R ${INVOKING_USER}:${INVOKING_USER} /var/cache/devai
+[vm] # mkdir -p /var/cache/devai/{ollama,registry,pip,apt,npm,open-webui,logs}
+[vm] # for lv in cache_ollama cache_registry cache_pip cache_apt cache_npm cache_open_webui cache_logs; do
+            dev="/dev/vgais/${lv}"
+            uuid="$(blkid -s UUID -o value "${dev}")"
+            case "${lv}" in
+                cache_ollama)     mp="/var/cache/devai/ollama" ;;
+                cache_registry)   mp="/var/cache/devai/registry" ;;
+                cache_pip)        mp="/var/cache/devai/pip" ;;
+                cache_apt)        mp="/var/cache/devai/apt" ;;
+                cache_npm)        mp="/var/cache/devai/npm" ;;
+                cache_open_webui) mp="/var/cache/devai/open-webui" ;;
+                cache_logs)       mp="/var/cache/devai/logs" ;;
+            esac
+            findmnt -no SOURCE --mountpoint "${mp}" 2>/dev/null | grep -q "${dev}$" && continue
+            cp -f /etc/fstab "/etc/fstab.bak.$(date -u +%Y%m%dT%H%M%SZ)"
+            sed -i.tmp -e "\#\\s${mp}\\s#d" -e "\#${dev}\\s#d" \
+                -e "\#UUID=${uuid}\\s#d" /etc/fstab
+            rm -f /etc/fstab.tmp
+            echo "UUID=${uuid}  ${mp}  xfs  defaults,noatime,nofail  0  2" >> /etc/fstab
+            mount "${mp}"
+        done
+[vm] # chown -R devai:devai /var/cache/devai
 ```
 
-**`nofail` is mandatory.** Without it, a mount that fails at boot (e.g.
-LVM thin pool not yet activated because `thin-provisioning-tools` is
-missing — see §2.0) drops systemd into `emergency.target`. On a
-cloud-init image with the root account locked, the emergency console's
-`sulogin` then loops on "Press Enter" with no way to log in. With
-`nofail` the failed mount is skipped, the system boots, and the
-operator can ssh in to diagnose. This is the difference between a
-recoverable fault and an unrecoverable VM.
+`nofail` is mandatory: a thin-LV that fails to activate at boot would
+otherwise drop systemd into `emergency.target`, and on a cloud-init
+image with `root` locked the emergency console loops on
+"Press Enter". With `nofail` the host boots and the operator can SSH
+in to diagnose.
 
-The repo ships `deploy/setup-logs-volume.sh` which performs the
-`cache_logs` step exactly this way and is safe to use instead of the
-loop above for that one volume:
+### 6.7 Auto-activation across reboots
 
 ```bash
-$ cd ${REPO_DIR}
-$ make setup-logs        # idempotent, prompts only via sudo
+[vm] [verify] # vgchange -an vgais && vgchange -ay vgais
+[vm] [verify] # lvs vgais -o lv_name,attr | grep -E '^ *cache_' | grep -v 'a.tz' \
+                  && { echo FAIL; exit 1; } || echo OK
 ```
 
-`make setup-logs` cannot replace this whole phase because it only
-manages `cache_logs`; the other six volumes still need the loop.
+If any cache_* LV shows `Vwi---tz--` instead of `Vwi-aotz--`,
+`thin-provisioning-tools` is missing (§4.1) — install and re-test.
 
-### 4.8 Verification
-
-LVM + mounts:
+### 6.8 Deferred podman probes (from §5.3)
 
 ```bash
-[verify] # lvs ${VG_NAME} --noheadings -o lv_name,size,segtype,pool_lv | sort
-[verify] # findmnt /var/cache/devai/{ollama,registry,pip,apt,npm,open-webui,logs}
-[verify] $ stat -c '%U:%G %a %n' /var/cache/devai
+[vm] [verify] $ podman info --format '{{.Store.GraphRoot}}'    # /var/cache/devai/registry
+[vm] [verify] $ podman info --format '{{.Host.OCIRuntime.Name}}'
+[vm] [verify] $ podman run --rm docker.io/library/debian:trixie true
+[vm] [verify] $ podman run --rm --device nvidia.com/gpu=all \
+                  docker.io/library/debian:trixie \
+                  nvidia-smi --query-gpu=name --format=csv,noheader
 ```
 
-Expected: every mountpoint resolves to its `/dev/${VG_NAME}/cache_*`
-device, mounted xfs, owned by `${INVOKING_USER}`.
-
-**Auto-activation across reboots:** the LVs must come up active on
-their own at boot, not require `vgchange -ay`. Confirm:
-
-```bash
-[verify] # systemctl reboot       # or, less invasive, simulate:
-[verify] # vgchange -an ${VG_NAME} && vgchange -ay ${VG_NAME}
-[verify] # lvs ${VG_NAME} -o lv_name,attr | grep -E 'cache_' | grep -v 'a.tz' && \
-              echo "FAIL: at least one cache_* LV is not active" || \
-              echo "OK: all cache_* LVs are active"
-```
-
-If any cache_* LV shows `Vwi---tz--` (no `a` flag) instead of
-`Vwi-aotz--`, `thin-provisioning-tools` is missing — install it
-(see §2.0) and re-test.
-
-Now run the deferred §3.4 podman probes — `graphroot` from §3.2.1
-finally points at a real mount:
-
-```bash
-[verify] $ podman info --format '{{.Store.GraphRoot}}'
-# must equal /var/cache/devai/registry
-[verify] $ podman info --format '{{.Host.OCIRuntime.Name}}'
-[verify] $ podman run --rm docker.io/library/debian:trixie true
-[verify] $ ${HAS_GPU} -eq 0 || podman run --rm \
-              --device nvidia.com/gpu=all \
-              docker.io/library/debian:trixie nvidia-smi --query-gpu=name --format=csv,noheader
-```
-
-The `debian:trixie` pull lands inside `/var/cache/devai/registry`,
-proving graphroot relocation took effect before any image was
-materialised.
-
-### 4.9 Recovery
-
-| Symptom | Recovery |
-|---|---|
-| `lvcreate` fails with "Volume group has insufficient free space" | Reduce target sizes proportionally and re-run §4.5. Do NOT extend the VG without operator approval. |
-| `mkfs.xfs` reports "device contains a known filesystem" | The LV is already populated. Confirm it is one of ours via `blkid` and skip the format. Do NOT pass `-f`. |
-| `mount` fails with "wrong fs type" | The fstab line UUID is stale (LV was recreated). Fix by re-reading UUID with `blkid`. |
-| `chown` reports permission denied on a path containing already-running container subuid files | Run `podman unshare chown -R 0:0 /var/cache/devai/<path>` from `${INVOKING_USER}`'s shell instead. |
+The `debian:trixie` pull lands inside `/var/cache/devai/registry` —
+proof the graphroot relocation took effect before any image was
+materialized.
 
 ---
 
-## 5. Phase 5 — Repo, configuration, registry mirror
+## 7. Clone repo, write `.env`, registry routing
 
-### 5.1 Clone
-
-Skip if `${REPO_DIR}` exists and is the right repo.
+### 7.1 Clone
 
 ```bash
-$ git clone https://github.com/<owner>/devai.git ${REPO_DIR}
-$ cd ${REPO_DIR}
+[vm] $ git clone https://github.com/<owner>/devai.git ${REPO_DIR}
+[vm] $ cd ${REPO_DIR}
 ```
 
-The agent must be told the canonical clone URL by the operator if
-multiple forks exist. Do not assume a default.
+The canonical clone URL is a `${DEVAI_REPO_URL}` environment variable
+provided by the operator at agent start. The agent does not guess.
 
-### 5.2 `.env`
-
-The repo ships `.env.example`. Copy only if `.env` is absent
-(idempotency: never overwrite an existing `.env`):
+### 7.2 `.env`
 
 ```bash
-$ test -f ${REPO_DIR}/.env || cp ${REPO_DIR}/.env.example ${REPO_DIR}/.env
-```
+[vm] $ test -f ${REPO_DIR}/.env || cp ${REPO_DIR}/.env.example ${REPO_DIR}/.env
 
-**`.env` and `${VAR:-default}` compose substitution.** `deploy/docker-compose.yaml`
-references several values via `${KEY:-fallback}` syntax (notably
-`VLLM_IMAGE`, `SGLANG_IMAGE`, `DEVAI_REASONING`, `GPU_MEMORY_GB`,
-`MAX_CONTEXT_LEN`, `VLLM_PLUGINS_HOST_DIR`). The Go-based
-`docker-compose` v2 binary (installed in §2.1.a) expands these
-correctly and a sparse `.env` is enough. The Python `podman-compose`
-1.3.0 in Debian apt does **not** expand `${VAR:-default}` — those
-strings reach the router container as literal `${VLLM_IMAGE:-…}` text
-and the router fails to recreate vLLM/SGLang on demand. If for any
-reason `docker-compose` v2 is not available, set the values
-explicitly in `.env`:
+# D14 — generate JUPYTER_TOKEN if absent
+[vm] $ grep -q '^JUPYTER_TOKEN=' ${REPO_DIR}/.env || \
+         echo "JUPYTER_TOKEN=$(openssl rand -hex 16)" >> ${REPO_DIR}/.env
 
-```text
+# D13 — pin compose image versions explicitly, in case some future
+# `podman compose` path bypasses docker-compose v2
+[vm] $ cat >> ${REPO_DIR}/.env <<'EOF'
 VLLM_IMAGE=docker.io/vllm/vllm-openai:latest-cu130-ubuntu2404
 SGLANG_IMAGE=docker.io/lmsysorg/sglang:v0.5.10.post1-cu130
 DEVAI_REASONING=auto
 GPU_MEMORY_GB=24
 MAX_CONTEXT_LEN=131072
-VLLM_PLUGINS_HOST_DIR=
+EOF
 ```
 
-Tunable keys (see comments inside `.env.example`):
+If the host's GPU has more or less VRAM than 24 GiB, the operator
+overrides `GPU_MEMORY_GB` by setting it in the environment before
+running the agent (the agent picks that up and writes the override
+into `.env` before §10).
 
-- `LAB_PORT` — JupyterLab port (default 8888).
-- `WEBUI_PORT` — Open WebUI HTTPS port (default 8443).
-- `CONTAINER_RUNTIME` — `podman` (default) or `docker`.
-- `HOST_HOME_DIR` — host directory whose `.gitconfig` and `.ssh` are
-  copied into the lab container's home on first run.
-- `HOME_VOLUME` — persistent home directory for the lab user
-  (default `${HOME_DIR}/devai-home`).
-- `JUPYTER_TOKEN` — recommended; if unset, JupyterLab generates a
-  random token printed at startup. Set this for systemd auto-start.
-- `GPU_MEMORY_GB` — total VRAM the router should advertise (default
-  24). Match real card; the picker filters by this band.
-- `MAX_CONTEXT_LEN` — upper bound for per-request context (default
-  131072 = 128K). Routes are capped at `min(model_max_ctx,
-  MAX_CONTEXT_LEN)`.
-- `DEVAI_REASONING` — global reasoning policy
-  (`auto|off|low|medium|high`); per-request overrides are described in
-  the project README.
-- Proxy: `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `APT_PROXY` —
-  set if the host is behind a corporate proxy. The Makefile threads
-  them into both build args and runtime env.
-
-### 5.3 Permissions on cache (defensive)
-
-`make cache-up` creates files inside `/var/cache/devai/*` as the
-`${INVOKING_USER}` rootless mapping. If §4 was followed exactly, the
-top-level dirs are already owned correctly and no further action is
-needed. Verify:
+### 7.3 Cache ownership sanity
 
 ```bash
-[verify] $ stat -c '%U' /var/cache/devai
-```
-
-Must equal `${INVOKING_USER}`.
-
----
-
-## 6. Phase 6 — Pre-pull base images and CLI binaries
-
-This is split out from `make build` for two reasons:
-
-1. The base/runtime images and CLI tarballs are large; doing them
-   first lets the agent fail fast if a registry is unreachable.
-2. `fetch-cli` populates `/var/cache/devai/pip/bin/` which is bind-
-   mounted into the build, so the actual `make build` runs offline.
-
-### 6.1 Pull infrastructure images
-
-`make pull-images` pulls every image referenced by
-`deploy/docker-compose.yaml` plus the base images for the lab build.
-Idempotent — `podman pull` no-ops on a digest match.
-
-```bash
-$ cd ${REPO_DIR}
-$ make pull-images
-```
-
-Image set (current as of repo HEAD; consult `deploy/docker-compose.yaml`
-for the source of truth):
-
-- `debian:trixie` — base for CPU lab and router build stage.
-- `docker.io/nvidia/cuda:12.9.1-cudnn-runtime-ubuntu24.04` — base for
-  GPU lab.
-- `docker.io/library/golang:1.23-bookworm` — router build stage.
-- `gcr.io/distroless/static-debian12` — router runtime stage.
-- `sameersbn/apt-cacher-ng:latest` — apt cache.
-- `registry:2` — Docker Hub mirror.
-- `ollama/ollama:latest` — Ollama backend.
-- `docker.io/vllm/vllm-openai:latest-cu130-ubuntu2404` — vLLM
-  backend (placeholder + on-demand recreate).
-- `docker.io/lmsysorg/sglang:v0.5.10.post1-cu130` — SGLang backend.
-- `ghcr.io/open-webui/open-webui:main` — chat UI.
-- `docker.io/library/nginx:alpine` — TLS termination for the chat UI.
-- `quay.io/podman/stable` — logger sidecar (tails podman logs).
-
-If a pull fails for one image but succeeds for others, the agent must
-NOT proceed to §7 — `make build` will fail mid-way and leave a partial
-image. Recover by re-running `make pull-images` and checking network
-or auth on the failing registry.
-
-### 6.2 Fetch CLI binaries
-
-```bash
-$ make fetch-cli
-```
-
-This downloads (with ETag-based caching under
-`/var/cache/devai/pip/bin/.etags/`):
-
-- Anthropic Claude Code (release CDN)
-- OpenAI Codex (GitHub releases)
-- Ollama CLI (GitHub releases)
-- code-server (GitHub releases)
-- `uv` and `uvx` (GitHub releases)
-- Google Gemini CLI (npm registry tarball)
-- LATE (GitHub releases)
-
-Each tool is staged to `/var/cache/devai/pip/bin/<name>` and bind-
-mounted read-only into the lab image at build time. Re-running the
-target only re-downloads tools whose ETag changed.
-
-### 6.3 Verification
-
-```bash
-[verify] $ podman images --format '{{.Repository}}:{{.Tag}}' | grep -E '(debian|nvidia/cuda|golang|distroless|apt-cacher|registry|ollama|vllm|sglang|open-webui|nginx|podman/stable)' | sort -u
-[verify] $ ls -1 /var/cache/devai/pip/bin/ | grep -E '^(claude|codex|ollama|code-server|uv|uvx|gemini|late)$'
+[vm] [verify] $ stat -c '%U' /var/cache/devai      # devai
 ```
 
 ---
 
-## 7. Phase 7 — Build images
+## 8. Pre-pull images and CLI binaries
+
+### 8.1 Pull infrastructure images
 
 ```bash
-$ cd ${REPO_DIR}
-$ make build           # builds: base-cpu, lab-cpu, base-gpu, lab-gpu, router
+[vm] $ cd ${REPO_DIR}
+[vm] $ make pull-images
 ```
 
-Targets (all called by `make build`):
-
-| Target | Image | When to skip |
-|---|---|---|
-| `build-base-cpu` | `devai-base-cpu` | always required (router not affected; lab-cpu depends on it) |
-| `build-cpu` | `devai-lab-cpu` | always required |
-| `build-base-gpu` | `devai-base-gpu` | `${HAS_GPU}=0` |
-| `build-gpu` | `devai-lab-gpu` | `${HAS_GPU}=0` |
-| `build-router` | `localhost/devai-router` | always required |
-
-If `${HAS_GPU}=0`, run only the CPU builds:
-
-```bash
-$ make build-cpu build-router
-```
-
-On Linux aarch64, the CPU lab image works but the build must use
-arm64 base images. Most upstream images (`debian:trixie`,
-`ollama/ollama:latest`, `quay.io/podman/stable`,
+Targets (see `deploy/docker-compose.yaml` for the source of truth):
+`debian:trixie`, `docker.io/nvidia/cuda:12.9.1-cudnn-runtime-
+ubuntu24.04`, `docker.io/library/golang:1.23-bookworm`,
+`gcr.io/distroless/static-debian12`, `sameersbn/apt-cacher-ng:latest`,
+`registry:2`, `ollama/ollama:latest`,
+`docker.io/vllm/vllm-openai:latest-cu130-ubuntu2404`,
+`docker.io/lmsysorg/sglang:v0.5.10.post1-cu130`,
 `ghcr.io/open-webui/open-webui:main`,
-`docker.io/library/nginx:alpine`, `docker.io/library/golang:1.23-bookworm`,
-`gcr.io/distroless/static-debian12`, `registry:2`,
-`sameersbn/apt-cacher-ng:latest`) ship arm64 manifests.
-**`docker.io/vllm/vllm-openai:*` and `docker.io/lmsysorg/sglang:*` do
-not ship arm64 manifests** — `make cache-up` will leave their
-placeholders in `Created` state on aarch64 hosts. This is harmless
-because the router only recreates them on demand, and on aarch64
-nothing should be probing them. If a probe is attempted, it will
-fail with an architecture-mismatch error; do not retry.
+`docker.io/library/nginx:alpine`, `quay.io/podman/stable`.
 
-The repo's `Makefile` `fetch-cli` recipe also hardcodes the `uv`
-tarball filename to `uv-x86_64-unknown-linux-gnu.tar.gz`, which
-breaks on aarch64. Patch in place before running `make build-cpu`:
+If any pull fails, the agent halts. Re-running `make pull-images` is
+idempotent (digest match → no-op).
+
+### 8.2 Fetch CLI binaries
 
 ```bash
-$ test "$(uname -m)" != aarch64 || \
-      sed -i.bak 's|uv-x86_64-unknown-linux-gnu|uv-aarch64-unknown-linux-gnu|g' \
-          ${REPO_DIR}/Makefile
+[vm] $ make fetch-cli
 ```
 
-The Makefile bind-mounts `/var/cache/devai/pip` (uv cache),
-`/var/cache/devai/npm` (npm cache), and `/var/cache/devai/pip/bin`
-(CLI binaries) into each build, so the build is mostly offline after
-§6 succeeded.
+Downloads to `/var/cache/devai/pip/bin/` (ETag cached):
 
-### 7.1 Verification
+- Anthropic Claude Code
+- OpenAI Codex
+- Ollama CLI
+- code-server
+- `uv` / `uvx`
+- Google Gemini CLI
+- LATE
+
+These are bind-mounted read-only into the lab image at build time, so
+§9 is offline.
+
+### 8.3 Verification
 
 ```bash
-[verify] $ podman images --format '{{.Repository}}:{{.Tag}}' | grep -E '^(devai-(base-cpu|base-gpu|lab-cpu|lab-gpu)|localhost/devai-router):latest$' | sort
+[vm] [verify] $ podman images --format '{{.Repository}}:{{.Tag}}' \
+                | grep -E '(debian|nvidia/cuda|golang|distroless|apt-cacher|registry|ollama|vllm|sglang|open-webui|nginx|podman/stable)' \
+                | sort -u
+[vm] [verify] $ ls -1 /var/cache/devai/pip/bin/ \
+                | grep -E '^(claude|codex|ollama|code-server|uv|uvx|gemini|late)$'
 ```
 
-Expected (GPU host): five entries. CPU-only host: three (no
-`-gpu` suffix).
+---
 
-### 7.2 Recovery
+## 9. Build images
+
+```bash
+[vm] $ cd ${REPO_DIR}
+[vm] $ make build           # base-cpu, lab-cpu, base-gpu, lab-gpu, router
+```
+
+| Target | Image |
+|---|---|
+| `build-base-cpu` | `devai-base-cpu` |
+| `build-cpu`      | `devai-lab-cpu`  |
+| `build-base-gpu` | `devai-base-gpu` |
+| `build-gpu`      | `devai-lab-gpu`  |
+| `build-router`   | `localhost/devai-router` |
+
+The VM always has a GPU (D9), so the GPU variants always build. The
+Makefile bind-mounts `/var/cache/devai/pip`, `/var/cache/devai/npm`,
+and `/var/cache/devai/pip/bin` into each build, so the network is
+hit only if §8 missed something.
+
+### 9.1 Verification
+
+```bash
+[vm] [verify] $ podman images --format '{{.Repository}}:{{.Tag}}' \
+                | grep -E '^(devai-(base-cpu|base-gpu|lab-cpu|lab-gpu)|localhost/devai-router):latest$' \
+                | sort
+```
+
+Expected: five entries.
+
+### 9.2 Recovery
 
 | Symptom | Recovery |
 |---|---|
-| `fetch-cli` produced the binary but the build complains it is missing | Permissions: `/var/cache/devai/pip/bin/<name>` must be readable by the rootless build subuid. Run `chmod +rX -R /var/cache/devai/pip/bin`. |
-| Build fails on `pip install` step with network errors | Re-run `make pull-images` and verify the proxy env is exported into the build with `make build HTTP_PROXY=... HTTPS_PROXY=...`. |
-| GPU build OOMs the host during torch install | Reduce parallel build threads via `BUILDAH_FORMAT=docker BUILD_ARGS="--jobs 1" make build-gpu`. |
+| `fetch-cli` produced the binary but the build complains it is missing | Permissions: `chmod +rX -R /var/cache/devai/pip/bin`. |
+| Build OOMs the VM during torch install | Reduce parallel build jobs: `BUILDAH_FORMAT=docker BUILD_ARGS="--jobs 1" make build`. |
 
 ---
 
-## 8. Phase 8 — Start infrastructure
+## 10. Start infrastructure
 
-### 8.0 TLS certificates for `devai-webui-proxy` (mandatory)
+### 10.1 TLS certificates for `devai-webui-proxy`
 
-The `nginx:alpine` image used by `devai-webui-proxy` does **not** ship
-the `openssl` binary, so `deploy/webui-proxy/entrypoint.sh`'s
+`nginx:alpine` has no `openssl` binary, so the entrypoint's
 "self-signed fallback" silently fails (the `openssl req` call exits
-with `command not found`, swallowed by the entrypoint's
-`2>/dev/null`). nginx then loops on
-`cannot load certificate "/etc/nginx/ssl/cert.pem"` and the container
-restarts forever. Pre-generate certs **on the host** so the entrypoint
-takes the "found existing" branch:
+with "command not found", swallowed by `2>/dev/null`). nginx then
+loops on "cannot load certificate" and the container restarts
+forever. Pre-generate certs **on the VM filesystem** so the
+entrypoint takes the "found existing" branch:
 
 ```bash
-$ SSL_DIR=${HOME_DIR}/devai-home/.jupyter/ssl
-$ mkdir -p "$SSL_DIR"
-$ test -f "$SSL_DIR/cert.pem" || openssl req -x509 -nodes -days 365 \
-      -newkey rsa:2048 \
-      -keyout "$SSL_DIR/key.pem" -out "$SSL_DIR/cert.pem" \
-      -subj "/CN=devai-webui"
-$ chmod 600 "$SSL_DIR/key.pem"
-[verify] $ ls "$SSL_DIR"/cert.pem "$SSL_DIR"/key.pem
+[vm] $ SSL_DIR=${HOME}/devai-home/.jupyter/ssl
+[vm] $ mkdir -p "${SSL_DIR}"
+[vm] $ test -f "${SSL_DIR}/cert.pem" || openssl req -x509 -nodes -days 365 \
+            -newkey rsa:2048 \
+            -keyout "${SSL_DIR}/key.pem" -out "${SSL_DIR}/cert.pem" \
+            -subj "/CN=devai-webui"
+[vm] $ chmod 600 "${SSL_DIR}/key.pem"
+[vm] [verify] $ ls "${SSL_DIR}"/cert.pem "${SSL_DIR}"/key.pem
 ```
 
-(For browser-trusted certs use `mkcert <hostname>` instead of openssl
-and copy the resulting `<host>.pem` / `<host>-key.pem` into `$SSL_DIR`.)
-
-### 8.1 Bring the stack up
+### 10.2 Bring the stack up
 
 ```bash
-$ make cache-up
+[vm] $ make cache-up
 ```
-
-(The Makefile creates the `devai-net` external network if missing,
-then runs `podman compose -f deploy/docker-compose.yaml up -d` — which
-in turn dispatches to the `docker-compose` v2 binary installed in
-§2.1.a. If you bypass the Makefile and call compose directly, you
-must `podman network create devai-net` first.)
 
 This:
 
-- Ensures `${INVOKING_USER}`'s podman socket is enabled (idempotent).
+- Ensures `devai`'s podman socket is enabled (idempotent).
 - Creates the `devai-net` network if missing.
-- `podman compose -f deploy/docker-compose.yaml up -d` brings up:
-  `devai-apt-cache`, `devai-registry-cache`, `devai-ollama`,
-  `devai-vllm` (placeholder), `devai-sglang` (placeholder),
-  `devai-router`, `devai-open-webui`, `devai-webui-proxy`,
-  `devai-logger`.
+- Runs `podman compose -f deploy/docker-compose.yaml up -d` (via
+  `docker-compose` v2 — D13), starting `devai-apt-cache`,
+  `devai-registry-cache`, `devai-ollama`, `devai-vllm` (placeholder),
+  `devai-sglang` (placeholder), `devai-router`, `devai-open-webui`,
+  `devai-webui-proxy`, `devai-logger`.
 
-`devai-vllm` and `devai-sglang` are launched with
-`entrypoint: ["sleep", "infinity"]` and DO NOT serve traffic; the
-router replaces each container on demand when a request first arrives
-on its dedicated port (11435 / 11436). This is by design — see
-`docs/backends.md` and the project CLAUDE.md.
+`devai-vllm` and `devai-sglang` launch with `entrypoint: ["sleep",
+"infinity"]` and do not serve traffic; the router replaces each
+container on demand when a request first hits ports 11435/11436.
 
-### 8.2 Verification
+### 10.3 Verification
 
 ```bash
-[verify] $ podman ps --format '{{.Names}}\t{{.Status}}' | grep -E '^devai-' | sort
-[verify] $ curl -fsS http://localhost:11434/v1/models   # router → ollama
-[verify] $ curl -k -fsS https://localhost:8443/         # webui-proxy
+[vm] [verify] $ podman ps --format '{{.Names}}\t{{.Status}}' | grep -E '^devai-' | sort
+[vm] [verify] $ curl -fsS http://localhost:11434/v1/models
+[vm] [verify] $ curl -k -fsS https://localhost:8443/
 ```
 
-The first time `make cache-up` runs, the router probe-cache files
-(`deploy/.ollama-reasoning-cache.json`,
-`deploy/.vllm-reasoning-cache.json`,
-`deploy/.sglang-reasoning-cache.json`) may not yet exist on disk —
-that is fine. The router treats missing caches as "no models known
-yet" and the bind mounts in compose are conditional. Phase 9
-populates them.
+The probe-cache files in `deploy/.*-reasoning-cache.json` may not
+exist on first `cache-up` — that's fine, §11 populates them.
 
-### 8.3 Recovery
+### 10.4 Recovery
 
 | Symptom | Recovery |
 |---|---|
-| `Error: name <devai-X> already in use` | `make cache-down && make cache-up`. The router occasionally leaves drifted vllm/sglang containers behind; `cache-down` force-removes them. |
-| Router container exits immediately | `podman logs devai-router` — most common cause is a missing podman socket bind (`XDG_RUNTIME_DIR` unset in the user environment). Re-run `systemctl --user enable --now podman.socket`. |
-| `ollama` container repeatedly OOMs at startup | Set `OLLAMA_KEEP_ALIVE=10s` in the environment and `OLLAMA_MAX_LOADED_MODELS=1` (already in compose). If the GPU has < 8 GB free, no Ollama model is loadable; expect probes to fail. |
+| `Error: name <devai-X> already in use` | `make cache-down && make cache-up`. |
+| Router container exits immediately | `podman logs devai-router` — most common cause is missing podman socket; re-run `systemctl --user enable --now podman.socket`. |
+| `ollama` repeatedly OOMs at startup | Set `OLLAMA_KEEP_ALIVE=10s`; if the GPU has < 8 GiB free, expect probes to fail. |
 
 ---
 
-## 9. Phase 9 — Pull and probe initial model
+## 11. Pull and probe initial model
 
-The system is functional after §8 but has no models. The minimum to
-prove end-to-end behaviour is one Ollama GGUF model. NVFP4 / vLLM /
-SGLang are optional and only useful on Blackwell-class hardware.
-
-### 9.1 Default first model
+### 11.1 Default first model (D16)
 
 ```bash
-$ make model-pull FAMILY=qwen3.5
-$ make probe
+[vm] $ make model-pull FAMILY=qwen3.5
+[vm] $ make probe
 ```
 
 `make model-pull` reads `deploy/models.yaml` and pulls every fitting
-variant of the `qwen3.5` family for the host's `(VRAM, context)`
-matrix. On a 24 GB card, this typically pulls 1–3 quantised tags
-(e.g. `qwen3.5:9b-q8_0`).
+variant of `qwen3.5` for the host's `(VRAM, context)` matrix.
 
-`make probe` exercises every `(VRAM band, context tier, backend)` cell
-on each downloaded Ollama digest and writes the result to
-`deploy/.ollama-reasoning-cache.json`. The first run takes 5–15 min
-per model depending on context tier.
+`make probe` exercises every `(VRAM band, context tier, backend)`
+cell and writes the result to `deploy/.ollama-reasoning-cache.json`.
+First run takes 5–15 minutes per model.
 
-### 9.2 vLLM / SGLang (GPU only, optional)
+### 11.2 vLLM NVFP4 probe (mandatory)
 
-Skip on Linux aarch64 — no upstream image support (see §7).
-
-NVFP4 weights are in HuggingFace format; pulling them requires the
-`huggingface-hub` Python package on the host:
-
-```bash
-$ pip install --user 'huggingface-hub[cli]'
-$ huggingface-cli login        # only if the model is gated
-$ make model-pull FAMILY=Qwen3-8B-NVFP4    # example
-```
-
-Probing vLLM and SGLang requires **exclusive** GPU access, so the
-infra stack must be down first:
+The vLLM probe pulls and exercises
+`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4` end-to-end. The repo
+is public on HuggingFace (NVIDIA Nemotron Open Model License) -- no
+licence click-through, no HF token required. If §2.5 happened to
+inject one anyway, it's used to raise anonymous rate limits but
+isn't load-bearing.
 
 ```bash
-$ make cache-down
-$ make probe-vllm
-$ make probe-sglang
-$ make cache-up
+[vm] $ pip install --user 'huggingface-hub[cli]'
+[vm] $ make model-pull FAMILY=NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4
+[vm] $ make cache-down
+[vm] $ make probe-vllm
+[vm] $ make cache-up
 ```
 
-`make probe-vllm` and `make probe-sglang` write to
-`deploy/.vllm-reasoning-cache.json` and
-`deploy/.sglang-reasoning-cache.json` respectively. The router and
-picker pick up the new entries on the next request — no rebuild
-needed.
+`make probe-vllm` needs exclusive GPU access -- hence the
+`cache-down` first. It writes
+`deploy/.vllm-reasoning-cache.json` with the model's
+`(fits, reasoning_parser, tool_parser, disable_verified)` row at
+every fitting context tier; the router and picker pick the entries
+up on the next request, no rebuild.
 
-### 9.3 Verification
+SGLang is **not** probed by this procedure (D16). The
+`devai-sglang` placeholder stays in the compose stack for runtime
+use but is never exercised by INSTALL.md.
+
+### 11.3 Real end-to-end agent test
+
+Final correctness gate. The agent drives `devai-agent` itself with
+its non-interactive options (D17): `--model`, `--agent claude`,
+`--workdir ${REPO_DIR}` (mounted as `/home/devai/work` inside the
+container), and `--prompt "<question>"` for one-shot Q&A. Three
+questions about the repo are asked; each answer is grepped for an
+expected substring.
 
 ```bash
-[verify] $ test -s ${REPO_DIR}/deploy/.ollama-reasoning-cache.json
-[verify] $ podman exec devai-ollama ollama list | tail -n +2
+# Step 1 -- install the launcher and dummy Claude credentials so the
+# e2e test does not depend on §12 having run yet. Both steps are
+# idempotent; §12 re-runs them as no-ops.
+[vm] $ cd ${REPO_DIR}
+[vm] $ make install
+[vm] $ devai-agent --init
+[vm] $ TARGET=${HOME}/devai-home/.claude/.credentials.json
+[vm] $ mkdir -p "$(dirname "${TARGET}")"
+[vm] $ python3 - "${TARGET}" <<'PY'
+import json, pathlib, sys
+prefix = "sk-ant-DUMMY_LOCAL_DEVAI_NOT_VALID_FOR_REAL_API_USE_"
+dummy = {"claudeAiOauth": {
+    "accessToken":      prefix + "A" * 56,
+    "refreshToken":     prefix + "B" * 56,
+    "expiresAt":        4070908800000,
+    "scopes": ["user:file_upload","user:inference",
+               "user:mcp_servers","user:profile",
+               "user:sessions:claude_code"],
+    "subscriptionType": "max",
+    "rateLimitTier":    "default_claude_max_20x"}}
+target = pathlib.Path(sys.argv[1])
+target.write_text(json.dumps(dummy, indent=2))
+target.chmod(0o600)
+PY
+
+# Step 2 -- warm the vLLM container so the first claude -p call does
+# not race the 10-minute NVFP4 cold-start timeout. `devai-agent
+# --show` prints the constructed podman command without launching;
+# we still rely on direct curl to actually warm the backend because
+# --show is dry-run only.
+[vm] $ MODEL='NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4@131072'
+[vm] $ devai-agent --model "${MODEL}" --agent claude --show     # sanity-print
+[vm] $ curl -fsS http://localhost:11435/v1/chat/completions \
+            -H 'content-type: application/json' \
+            -d "{\"model\":\"${MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"stream\":false,\"max_tokens\":4}" \
+            > /dev/null
+
+# Step 3 -- three Q&A pairs. devai-agent runs claude inside the lab
+# container with the repo mounted at /home/devai/work, the router
+# pinned via ANTHROPIC_BASE_URL by the in-container picker, and the
+# answer printed to stdout. Each expected substring must appear in
+# the answer (case-insensitive grep).
+[vm] $ run_q () {
+            local q="$1" expected="$2"
+            local answer
+            answer=$(devai-agent \
+                --workdir "${REPO_DIR}" \
+                --model "${MODEL}" \
+                --agent claude \
+                --prompt "$q")
+            printf 'Q: %s\nA: %s\n' "$q" "$answer"
+            if printf '%s' "$answer" | grep -qiF -- "$expected"; then
+                printf 'PASS (saw "%s")\n\n' "$expected"
+            else
+                printf 'FAIL (missing "%s")\n' "$expected"
+                return 1
+            fi
+        }
+
+[vm] $ capture_q () {
+            # Same launcher invocation as run_q but returns the raw answer on
+            # stdout without doing a substring check; used for the Q4 summary
+            # whose validation needs the full text.
+            devai-agent \
+                --workdir "${REPO_DIR}" \
+                --model "${MODEL}" \
+                --agent claude \
+                --prompt "$1"
+        }
+
+[vm] [verify] $ run_q \
+        "Read CLAUDE.md and tell me the relative path of the Go source file that implements the GPU arbiter router daemon. Reply with only the path." \
+        "gpu-arbiter/main.go"
+
+[vm] [verify] $ run_q \
+        "Read CLAUDE.md and tell me which inference backend the router uses to serve NVFP4 safetensors weights. Reply with only the backend name in lowercase." \
+        "vllm"
+
+[vm] [verify] $ run_q \
+        "Read CLAUDE.md and tell me the host port the router exposes for the vLLM backend. Reply with only the port number." \
+        "11435"
+
+# Q4 -- complex: write a full repo summary, then verify all its claims.
+# The verification has two layers:
+#   (a) a keyword sweep on the script side -- any correct summary of this
+#       repo MUST mention these core terms; if it doesn't, the model is
+#       either generating filler or has hallucinated a different project;
+#   (b) an LLM-as-judge pass that re-reads the actual files and is told
+#       to emit a fixed verification token only if every claim grounds
+#       in those files. Anything else fails the grep.
+
+[vm] $ SUMMARY=$(capture_q "$(cat <<'PROMPT'
+You are operating inside a freshly cloned copy of the 'devai' (Dev AI
+Lab) repository, mounted at your current working directory. Use the
+Read tool to load CLAUDE.md, README.md (if present), the top-level
+Makefile, deploy/docker-compose.yaml, gpu-arbiter/main.go (just the
+first 80 lines), and scripts/model-picker.py (just the header).
+
+Then write a 250-400 word factual summary of the project covering:
+  1. What the project is and who runs it.
+  2. The three inference backends (Ollama, vLLM, SGLang), how they
+     are reached via the router's host ports, and the GPU mutual-
+     exclusion invariant the router enforces.
+  3. The lab images (devai-lab-cpu / devai-lab-gpu) and the two-
+     layer base+lab build pattern.
+  4. The on-disk cache layout under /var/cache/devai/ and the
+     thin-pool / LV scheme.
+  5. The role of model-picker.py and the devai-agent launcher.
+
+Constraints: stick to claims you can verify from the files you read.
+Do NOT speculate about missing details. Do NOT invent file paths,
+ports, or container names. Use plain prose, no bullet lists, no
+markdown headings, no code fences -- one continuous block of text.
+PROMPT
+)")
+[vm] $ printf '=== generated summary ===\n%s\n=========================\n' "${SUMMARY}"
+
+# Verification layer (a) -- required-content sweep.
+[vm] [verify] $ for kw in router ollama vllm sglang NVFP4 podman JupyterLab GPU \
+                          gpu-arbiter cachepool 11434 11435 11436 devai-net; do
+                    if ! printf '%s' "${SUMMARY}" | grep -qiF -- "${kw}"; then
+                        printf 'FAIL: summary missing required keyword "%s"\n' "${kw}"
+                        exit 1
+                    fi
+                done
+                printf 'PASS: summary covers all required keywords\n\n'
+
+# Verification layer (b) -- LLM-as-judge fact-check. Write the summary to
+# a file the verifier model can read with its Read tool; we don't try to
+# stuff multi-KB of text through shell quoting.
+[vm] $ SUMMARY_FILE="${REPO_DIR}/.devai-e2e-summary.tmp"
+[vm] $ printf '%s\n' "${SUMMARY}" > "${SUMMARY_FILE}"
+
+[vm] [verify] $ run_q "$(cat <<'PROMPT'
+Inside the current working directory there is a file named
+.devai-e2e-summary.tmp containing a summary of this repository
+written by an earlier model. Your job is to fact-check it.
+
+Step 1: Read .devai-e2e-summary.tmp.
+Step 2: Read CLAUDE.md, README.md (if it exists), the top-level
+        Makefile, deploy/docker-compose.yaml, gpu-arbiter/main.go,
+        and scripts/model-picker.py.
+Step 3: For every factual claim in the summary (project purpose,
+        backend names, host ports, container names, file paths,
+        cache layout, build flow, picker behaviour), check it
+        against the files you read.
+
+If and only if every claim is supported by those files, reply with
+exactly the single literal token ALL_CLAIMS_VERIFIED on its own line
+and nothing else. If any claim is wrong, unsupported, or invented,
+do NOT emit that token; instead list each problematic claim as a
+bulleted item with a short reason.
+PROMPT
+)" "ALL_CLAIMS_VERIFIED"
+
+[vm] $ rm -f "${SUMMARY_FILE}"
 ```
 
-For full end-to-end (sends a real prompt to the loaded model):
+Four `PASS` lines = `devai-agent`'s non-interactive surface, the
+lab image, the router, the vLLM backend, the NVFP4 weights, and
+the Claude Code agent are all wired up correctly against the real
+repo, and the model can both produce **and self-validate** a
+multi-claim summary against the on-disk files. Any `FAIL` halts
+the agent; the operator inspects `podman logs devai-router`,
+`podman logs devai-vllm`, the captured summary text, and the
+verifier's bulleted list of rejected claims to triage.
+
+### 11.4 Verification of the Ollama path
 
 ```bash
-[verify] $ curl -fsS http://localhost:11434/api/chat -H 'content-type: application/json' \
-              -d '{"model":"qwen3.5:9b-q8_0","messages":[{"role":"user","content":"reply with the single word PONG"}],"stream":false}' \
-              | python3 -c "import sys,json; print(json.load(sys.stdin)['message']['content'][:200])"
+[vm] [verify] $ test -s ${REPO_DIR}/deploy/.ollama-reasoning-cache.json
+[vm] [verify] $ test -s ${REPO_DIR}/deploy/.vllm-reasoning-cache.json
+[vm] [verify] $ podman exec devai-ollama ollama list | tail -n +2
+[vm] [verify] $ curl -fsS http://localhost:11434/api/chat \
+                  -H 'content-type: application/json' \
+                  -d '{"model":"qwen3.5:9b-q8_0","messages":[{"role":"user","content":"reply with the single word PONG"}],"stream":false}' \
+                  | python3 -c "import sys,json;print(json.load(sys.stdin)['message']['content'][:200])"
 ```
 
-Expected: `PONG` or a short response containing `PONG`. If the model
-name `qwen3.5:9b-q8_0` does not exist in the local Ollama cache, use
-the first row of `ollama list` instead.
+Expected: `PONG`. If the Ollama model tag differs, use the first
+row of `ollama list`.
 
-### 9.4 Recovery
+### 11.5 Recovery
 
 | Symptom | Recovery |
 |---|---|
-| `make model-pull` fails on HuggingFace 401 | Run `huggingface-cli login`; for gated models the operator must accept the licence on the HF web UI first. |
-| Probe writes `fits=false` for every cell | The host VRAM is genuinely too small for that model at any tier. Pick a smaller family (`qwen3.5`, `llama3.2`) or a higher-quant tag (q4 instead of q8). |
-| `make probe-vllm` aborts with "router/vllm/sglang container running" | Run `make cache-down` first. Probing needs exclusive GPU. |
+| `make model-pull` fails on HuggingFace 401 | Unexpected for the default public model. Either NVIDIA has changed the repo's gating, or the operator swapped in a gated alternative -- check the model's HF page in a browser, accept any licence shown, and (if needed) put a valid token at `~/.cache/huggingface/token` on the host before re-running. |
+| `make probe-vllm` writes `fits=false` for every cell | GPU VRAM is too small for the Nemotron-3-Nano MoE at any context tier on this host. This is a hardware constraint; the install target does not fit. |
+| `make probe-vllm` aborts with "router/vllm container running" | Run `make cache-down` first, then `make probe-vllm`, then `make cache-up`. |
+| §11.3 `claude -p` returns empty / hangs | The vLLM container is still cold-starting (5--10 min on Blackwell for the first request). Re-run the warm-up curl, then retry the failed `run_q` call. |
+| §11.3 PASS but answer text is rambling around the expected substring | Acceptable. The check is a substring grep, not equality. |
+| §11.3 Q4 keyword sweep fails on a term that's clearly in the repo | The model produced a thin / partial summary. Re-run `capture_q` once -- NVFP4 sampling is non-deterministic. If it repeats, the model isn't loading CLAUDE.md (check whether the work-dir mount succeeded inside the lab container: `podman exec ... ls /home/devai/work`). |
+| §11.3 Q4 judge pass lists hallucinated claims | Real failure mode: the summary contained a wrong fact and the judge correctly caught it. Inspect the judge's bulleted list -- if the listed claims are genuinely wrong, the model under test is misreading CLAUDE.md (could indicate a bad NVFP4 download). Re-run from §11.2 `make probe-vllm`. |
+| §11.3 Q4 judge emits `ALL_CLAIMS_VERIFIED` plus extra text | Treated as PASS by the grep, but worth eyeballing the extra text once. The instruction says "nothing else"; a model that adds prose anyway is otherwise functional but slightly off-instruction. |
 
 ---
 
-## 10. Phase 10 — Install `devai-agent` launcher
+## 12. Install `devai-agent` launcher
+
+§11.3 already ran `make install` and `devai-agent --init`. This
+phase re-runs them defensively (idempotent: re-running `make
+install` replaces the symlinks, `devai-agent --init` resets
+`~/.devai/preferences.yaml` to defaults) and adds the PATH export
+in case the operator's shell rc didn't pick up `~/.local/bin`.
 
 ```bash
-$ cd ${REPO_DIR}
-$ make install
-$ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ${HOME_DIR}/.bashrc   # only if missing
-$ devai-agent --init
+[vm] $ cd ${REPO_DIR}
+[vm] $ make install
+[vm] $ grep -q '\.local/bin' ~/.bashrc || \
+         echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+[vm] $ devai-agent --init
 ```
 
-`make install` (defined in the Makefile):
+`make install` symlinks `${REPO_DIR}/bin/devai-agent` to
+`~/.local/bin/devai-agent` and the picker + probe caches to `~/.devai/`.
 
-- Symlinks `${REPO_DIR}/bin/devai-agent` to
-  `${HOME_DIR}/.local/bin/devai-agent`.
-- Symlinks the picker and probe caches into `${HOME_DIR}/.devai/`
-  so the launcher can bind-mount them into the lab container without
-  rebuilding the image.
+The launcher supports both interactive and non-interactive use:
 
-`devai-agent --init` writes a default
-`${HOME_DIR}/.devai/preferences.yaml` with `vram=24`,
-`context=131072`, etc. Edit if the host's VRAM differs.
+- `devai-agent` (no args) -- fzf picker, then interactive shell.
+- `devai-agent --model <name> --agent <id>` -- skip the picker but
+  still start an interactive session.
+- `devai-agent --model <name> --agent claude --prompt "<text>"` --
+  one-shot: pipe the prompt to `claude -p`, print its stdout, exit
+  with the agent's return code. No TTY, no picker, no shell.
+- `devai-agent --show` -- dry-run the podman command without
+  launching.
 
-### 10.1 Verification
+The §11.3 e2e test uses the `--prompt` form (D17).
+`devai-agent --init` writes a default `~/.devai/preferences.yaml`.
+
+### 12.1 Verification
 
 ```bash
-[verify] $ command -v devai-agent
-[verify] $ devai-agent --show
+[vm] [verify] $ command -v devai-agent
+[vm] [verify] $ devai-agent --show
 ```
 
-The `--show` invocation must print the resolved preferences and the
-constructed `podman run` command without launching anything. If it
-errors with "image not found", re-run §7.
+`--show` must print the resolved preferences and the constructed
+`podman run` command without launching anything.
 
-### 10.2 Claude Code dummy credentials (mandatory if `--agent claude` is used)
-
-Claude Code (any version baked into the lab image) refuses to run
-without a credentials file at `${HOME_DIR}/.claude/.credentials.json`.
-On a real workstation that file is populated by `claude auth` against
-api.anthropic.com. In the local-router setup there is no Anthropic
-account to authenticate against — but if the file is **absent**,
-Claude fires a startup probe with its hardcoded model id
-`claude-haiku-4-5-20251001`. The router has no entry for that name,
-so it phantom-launches a vLLM container that never serves, the
-foreground turn starves on the 10-minute health timeout, and the
-session hangs. The picker's `ANTHROPIC_DEFAULT_HAIKU_MODEL` /
-`ANTHROPIC_SMALL_FAST_MODEL` env vars do **not** suppress this probe
-on the Claude Code versions currently in the lab image.
-
-Fix: drop a syntactically valid but locally inert credentials file
-at the path Claude reads inside the lab container (which is the
-host path `${HOME_DIR}/devai-home/.claude/.credentials.json`,
-bind-mounted by `devai-agent` to `/home/devai/.claude/...`).
+### 12.2 Claude Code dummy credentials (mandatory if `--agent claude`)
 
 ```bash
-$ TARGET=${HOME_DIR}/devai-home/.claude/.credentials.json
-$ mkdir -p "$(dirname "$TARGET")"
-$ python3 - "$TARGET" <<'PY'
-import json, os, pathlib, sys
-prefix = "sk-ant-DUMMY_LOCAL_DEVAI_NOT_VALID_FOR_REAL_API_USE_"   # 52 chars
+[vm] $ TARGET=${HOME}/devai-home/.claude/.credentials.json
+[vm] $ mkdir -p "$(dirname "${TARGET}")"
+[vm] $ python3 - "${TARGET}" <<'PY'
+import json, pathlib, sys
+prefix = "sk-ant-DUMMY_LOCAL_DEVAI_NOT_VALID_FOR_REAL_API_USE_"
 dummy = {
     "claudeAiOauth": {
-        "accessToken":      prefix + "A" * 56,           # 108 chars total
+        "accessToken":      prefix + "A" * 56,
         "refreshToken":     prefix + "B" * 56,
-        "expiresAt":        4070908800000,                # year 2099 (ms)
+        "expiresAt":        4070908800000,
         "scopes": [
             "user:file_upload", "user:inference",
             "user:mcp_servers", "user:profile",
@@ -1475,295 +1411,273 @@ target.write_text(json.dumps(dummy, indent=2))
 target.chmod(0o600)
 print("wrote", target, "mode 0600")
 PY
-
-[verify] $ test -f ${HOME_DIR}/devai-home/.claude/.credentials.json
-[verify] $ stat -c '%a' ${HOME_DIR}/devai-home/.claude/.credentials.json   # must be 600
+[vm] [verify] $ test -f ${HOME}/devai-home/.claude/.credentials.json
+[vm] [verify] $ stat -c '%a' ${HOME}/devai-home/.claude/.credentials.json     # 600
 ```
 
-The token strings are cryptographically invalid — they will be
-rejected immediately by api.anthropic.com if Claude ever falls back
-to it — but the picker pins `ANTHROPIC_BASE_URL` to the local router,
-so no cloud call is ever attempted. The file's *presence* alone is
-what suppresses the OAuth probe.
+The token strings are cryptographically invalid; the picker pins
+`ANTHROPIC_BASE_URL` to the local router so no cloud call is ever
+attempted. The file's **presence** suppresses Claude Code's
+hardcoded `claude-haiku-4-5-20251001` startup probe that would
+otherwise phantom-launch a vLLM container and hang the session for
+10 minutes.
 
-This file is **per-user, per-host, mode 0600**. Do not check it into
-the repo. Do not copy a real `.credentials.json` from a workstation
-into a shared host — that token would be valid for the workstation
-operator's account and would leak quota.
+This file is per-user, per-VM, mode 0600. Never copy a real
+credentials file into a shared VM.
 
 ---
 
-## 11. Phase 11 — (optional) auto-start at boot
-
-### 11.1 systemd (most distros)
-
-To bring the cache stack up on boot:
+## 13. Auto-start at boot (optional)
 
 ```bash
-$ make install-systemd
+[vm] $ make install-systemd
 ```
 
-This:
-
-- Copies `deploy/docker-compose.yaml` and
-  `deploy/registry-config.yaml` to `${HOME_DIR}/.config/devai/`.
-- Installs `deploy/systemd/devai-infra.service` as a `--user` unit.
-- Enables `podman.socket` and `devai-infra.service`.
-- Calls `loginctl enable-linger ${INVOKING_USER}` so the user services
-  keep running after logout.
-
-Idempotent: re-running overwrites the staged compose file (intentional
-— picks up upstream changes) but does not destroy any container state.
-
-Verification:
+This stages `deploy/docker-compose.yaml` and `deploy/registry-config.yaml`
+to `~/.config/devai/`, installs `deploy/systemd/devai-infra.service`
+as a `--user` unit, enables `podman.socket` and
+`devai-infra.service`, and calls `loginctl enable-linger devai` (a
+no-op if §4.6 already ran).
 
 ```bash
-[verify] $ systemctl --user is-enabled devai-infra.service
-[verify] $ systemctl --user is-active  devai-infra.service
+[vm] [verify] $ systemctl --user is-enabled devai-infra.service
+[vm] [verify] $ systemctl --user is-active  devai-infra.service
 ```
 
-### 11.2 Non-systemd distros (Alpine, etc.)
-
-Translate `devai-infra.service` to the host's service manager.
-For OpenRC, place an init script in `/etc/init.d/devai-infra`
-running `cd ${HOME_DIR}/.config/devai && podman compose up -d`,
-then `rc-update add devai-infra default`. The agent should not
-generate this file autonomously — surface the request to the
-operator with the equivalent `systemd` unit content as a starting
-point.
+The agent runs §13 unconditionally because the VM is dedicated to
+Dev AI Lab. If the operator overrides via `DEVAI_NO_SYSTEMD=1`, the
+agent skips this section.
 
 ---
 
-## 12. Phase 12 — End-to-end smoke test
+## 14. End-to-end smoke test
 
-A green smoke test means the agent has finished correctly.
-
-```bash
-$ make test-router    # Go unit tests; no GPU; ~1 min
-$ make test-ollama    # Live Ollama integration; needs §9 to have pulled at least one model
-```
-
-For a manual single-shot:
+The agent has already passed the real e2e gate in §11.3. This phase
+is a final sanity-check that the post-§12 / §13 system surfaces are
+all up.
 
 ```bash
-[verify] $ curl -fsS http://localhost:11434/api/chat -H 'content-type: application/json' \
-              -d '{"model":"qwen3.5:9b-q8_0","messages":[{"role":"user","content":"reply with the single word PONG"}],"stream":false}'
-[verify] $ curl -k -fsS https://localhost:8443/                | head -c 200
-[verify] $ curl -fsS http://localhost:8888/ -o /dev/null && echo lab_up || true
+[vm] $ make test-router
+[vm] $ make test-ollama
 ```
 
-The full `make test` suite (`test-router`, probe smokes, vLLM/SGLang
-live integration, matrix tests) takes 30–60 min and requires the
-infra to be cycled (`cache-down` for probe smokes, then `cache-up`).
-Run only when the operator wants exhaustive validation.
+```bash
+[vm] [verify] $ curl -fsS http://localhost:11434/api/chat \
+                  -H 'content-type: application/json' \
+                  -d '{"model":"qwen3.5:9b-q8_0","messages":[{"role":"user","content":"reply with the single word PONG"}],"stream":false}'
+[vm] [verify] $ curl -k -fsS https://localhost:8443/      | head -c 200
+[vm] [verify] $ curl -fsS http://localhost:8888/ -o /dev/null && echo lab_up
+```
+
+A green smoke test plus four §11.3 PASS lines (Q1, Q2, Q3, plus Q4's
+keyword sweep and judge pass each printing PASS) means the agent has
+finished correctly.
+
+For a manual external test from the host: `ssh -L
+8888:localhost:8888 -L 11434:localhost:11434 -L 8443:localhost:8443
+-i ~/.ssh/devai-vm devai@${VM_IP}` then hit
+`http://localhost:8888/` etc. from a browser on the host.
+
+The full `make test` suite (~30–60 minutes) runs `cache-down` for
+probe smokes and then `cache-up` again. Run only for exhaustive
+validation.
 
 ---
 
-## 13. State-of-the-world reference
+## 15. State-of-the-world reference
 
-For the agent reading this file later, here is what the *running*
-host looks like once Phases 1–11 succeed.
-
-### 13.1 Filesystem map
+### 15.1 Filesystem map inside the VM
 
 ```
-/var/cache/devai/
-├── apt/             ← LV cache_apt        (apt-cacher-ng)
-├── npm/             ← LV cache_npm        (npm cache for builds)
-├── pip/             ← LV cache_pip        (uv cache + CLI binaries in pip/bin/)
-├── registry/        ← LV cache_registry   (podman graphroot + registry:2 mirror)
-├── ollama/          ← LV cache_ollama     (Ollama blobs + vLLM/SGLang weight trees)
+/var/cache/devai/                       (all backed by vgais thin LVs)
+├── apt/             ← cache_apt
+├── npm/             ← cache_npm
+├── pip/             ← cache_pip (uv cache + CLI binaries in pip/bin/)
+├── registry/        ← cache_registry (podman graphroot + registry:2 mirror)
+├── ollama/          ← cache_ollama
 │   └── models/
 │       ├── blobs/         (Ollama GGUF + manifests)
 │       ├── manifests/
 │       └── vllm/          (HF safetensors per repo dir)
-├── open-webui/      ← LV cache_open_webui (chat UI app data)
-├── logs/            ← LV cache_logs       (per-container stdout, written by devai-logger)
-└── bench/                                  (optional bench run artefacts; created by make bench)
+├── open-webui/      ← cache_open_webui
+└── logs/            ← cache_logs
 
 ${REPO_DIR}/
-├── .env                                  (host config — never overwrite)
+├── .env
 ├── deploy/
-│   ├── .ollama-reasoning-cache.json      (probe cache, schema v3, digest-keyed)
-│   ├── .vllm-reasoning-cache.json        (probe cache, schema v2, repo+sha-keyed)
-│   ├── .sglang-reasoning-cache.json      (probe cache, schema v2)
-│   ├── .bench-cache.json                 (optional bench scores; populated by make bench)
-│   ├── docker-compose.yaml               (infra spec — source of truth)
-│   ├── models.yaml                       (catalog — auto-generated)
-│   ├── registries.conf                   (rootless podman registry routing)
-│   ├── registry-config.yaml              (registry:2 config)
-│   ├── recovery-flags.json               (per-model launch overrides)
-│   └── vllm-plugins.json                 (custom parser plugin registry)
-└── scripts/                              (probe drivers, pickers, bench harness)
+│   ├── .ollama-reasoning-cache.json
+│   ├── .vllm-reasoning-cache.json
+│   ├── .sglang-reasoning-cache.json
+│   ├── .bench-cache.json
+│   ├── docker-compose.yaml
+│   ├── models.yaml
+│   ├── registries.conf
+│   └── registry-config.yaml
+└── scripts/
 
-${HOME_DIR}/
-├── .config/containers/registries.conf    (mirror routing — only if installed in §3.3)
-├── .config/devai/                        (systemd-managed copies, only if §11)
-├── .config/systemd/user/devai-infra.service  (only if §11)
-├── .devai/                               (devai-agent state)
-│   ├── preferences.yaml
-│   ├── sessions/
-│   ├── model-picker.py                   (symlink → repo)
-│   ├── .ollama-reasoning-cache.json      (symlink → repo)
-│   ├── .vllm-reasoning-cache.json        (symlink → repo)
-│   ├── .sglang-reasoning-cache.json      (symlink → repo)
-│   └── .bench-cache.json                 (symlink → repo)
-├── .local/bin/devai-agent                (symlink → repo/bin/devai-agent)
-└── devai-home/                           (lab container's persistent home; bind-mounted)
+${HOME}/                                (= /home/devai)
+├── .config/containers/{registries.conf,storage.conf,containers.conf}
+├── .config/devai/                      (systemd-managed copies, §13)
+├── .config/systemd/user/devai-infra.service
+├── .devai/                             (devai-agent state + cache symlinks)
+├── .local/bin/devai-agent
+├── .cache/huggingface/token            (only if D15 fired)
+└── devai-home/                         (lab container's persistent home)
 ```
 
-### 13.2 Network
+### 15.2 Network
 
-All containers share the user-defined bridge `devai-net`. Inter-
-container traffic uses container names as DNS:
+The VM lives on `192.168.122.0/24` (libvirt `default` NAT) at
+`${VM_IP}`. All containers inside the VM share `devai-net`:
 
 ```
-clients (host port 11434) ─► devai-router:11434 ─► devai-ollama:11434
-clients (host port 11435) ─► devai-router:11435 ─► devai-vllm:11434
-clients (host port 11436) ─► devai-router:11436 ─► devai-sglang:11434
-browser (host port 8443)  ─► devai-webui-proxy:443 ─► devai-open-webui:8080 ─► devai-router:11434
-browser (host port 8888)  ─► devai-lab-{cpu,gpu}:8888                  (lab)
+host[clients] ── NAT ── vm[${VM_IP}]:11434 ─► devai-router:11434 ─► devai-ollama:11434
+                                       :11435 ─► devai-router:11435 ─► devai-vllm:11434
+                                       :11436 ─► devai-router:11436 ─► devai-sglang:11434
+                                       :8443  ─► devai-webui-proxy:443 ─► devai-open-webui:8080 ─► devai-router:11434
+                                       :8888  ─► devai-lab-gpu:8888
 ```
 
-Only the router's listening ports, the webui-proxy port, the apt
-cache port (3142), the registry mirror port (5000), and the lab port
-(8888) are exposed on the host. Backends are reachable only from
-inside the network.
+Only those VM ports are exposed; backends are reachable only from
+inside `devai-net`. Whether the host's IP exposes the VM ports to the
+LAN/internet is the operator's responsibility (D18).
 
-### 13.3 GPU mutual exclusion (router invariant)
+### 15.3 GPU mutual exclusion
 
 Only one of `devai-ollama`, `devai-vllm`, `devai-sglang` holds the
-GPU at a time. The router (`gpu-arbiter/main.go`) enforces this by
-draining the active backend before recreating another. Any deployment
-that bypasses the router (e.g. by talking to `devai-ollama:11434`
-directly) breaks the invariant — do not do this. Use only the
-router's host-exposed ports `11434/11435/11436`.
+passed-through GPU at a time. The router (`gpu-arbiter/main.go`)
+enforces this by draining the active backend before recreating
+another. Talking directly to any backend bypasses the invariant — use
+only the router ports (`11434/11435/11436`).
 
-### 13.4 Data classes and what is safe to delete
+### 15.4 Data classes and what is safe to delete
 
 | Path | Class | Safe to delete? |
 |---|---|---|
 | `/var/cache/devai/registry/docker/` | regenerable mirror cache | yes |
-| `/var/cache/devai/apt/` | regenerable apt cache | yes |
-| `/var/cache/devai/pip/` | regenerable build cache | yes (forces full rebuild) |
-| `/var/cache/devai/npm/` | regenerable build cache | yes |
-| `/var/cache/devai/ollama/models/blobs/` | downloaded models | costly; deleting forces re-pull (10–100 GB per model) |
-| `/var/cache/devai/ollama/models/vllm/` | downloaded NVFP4 weights | same caveat |
+| `/var/cache/devai/apt/` / `pip/` / `npm/` | regenerable build caches | yes (forces full rebuild) |
+| `/var/cache/devai/ollama/models/blobs/` | downloaded GGUFs | costly to re-pull |
+| `/var/cache/devai/ollama/models/vllm/` | downloaded NVFP4 weights | costly to re-pull |
 | `/var/cache/devai/open-webui/` | chat history & users | preserve unless intentional reset |
-| `/var/cache/devai/logs/` | container stdout logs | yes (rotated implicitly) |
+| `/var/cache/devai/logs/` | container stdout logs | yes |
 | `${REPO_DIR}/deploy/.*-reasoning-cache.json` | probe results | yes (next probe regenerates) |
-| `${REPO_DIR}/deploy/.bench-cache.json` | bench scores | yes (next bench run regenerates) |
+| `${REPO_DIR}/deploy/.bench-cache.json` | bench scores | yes |
 
-`${REPO_DIR}/deploy/registry/` (note: shared with podman graphroot)
-is **never** safe to wipe wholesale — see the `cache-clean` Makefile
-target for the correct selective approach via `podman unshare`.
-
----
-
-## 14. Tear-down
-
-If the agent is asked to fully remove Dev AI Lab from the host:
-
-```bash
-$ make cache-down               # stop and remove containers
-$ make clean                    # remove built images
-$ make uninstall                # remove devai-agent launcher + symlinks
-# systemctl --user disable --now devai-infra.service     (only if §11 ran)
-# rm -f ${HOME_DIR}/.config/systemd/user/devai-infra.service
-# rm -rf ${HOME_DIR}/.config/devai ${HOME_DIR}/.devai
-```
-
-To also reclaim the LVM volumes (DESTROYS DOWNLOADED MODELS):
-
-```bash
-# umount /var/cache/devai/{ollama,registry,pip,apt,npm,open-webui,logs}
-# sed -i.bak '/\/var\/cache\/devai\//d' /etc/fstab
-# for lv in cache_ollama cache_registry cache_pip cache_apt cache_npm cache_open_webui cache_logs; do
-      lvremove -f ${VG_NAME}/${lv}
-  done
-# lvremove -f ${VG_NAME}/${POOL_NAME}        # only if no other LVs depend on it
-```
-
-Do not perform the LVM step without explicit operator confirmation.
+`/var/cache/devai/registry/` is **never** safe to wipe wholesale
+(shared with podman graphroot — see `make cache-clean`).
 
 ---
 
-## 15. Decisions left to the operator
+## 16. Tear-down
 
-The agent must surface these to the operator and wait for an explicit
-answer rather than choosing autonomously:
+The agent's tear-down owns the VM lifecycle. It does **not** revert
+the host's VFIO setup — that lives in `HOST_VFIO_SETUP.md` §10.
 
-1. **Platform confirmation** when §0.5 lists the detected platform as
-   "best-effort" (Alpine), or when the platform is not in the matrix
-   at all.
-2. **Block device for the volume group** (§4.3) when no `vgais` (or
-   equivalent) exists.
-3. **Thin pool size** (§4.4) when free space in the VG is between
-   100 GB and 800 GB — anything above 600 GB is comfortable, anything
-   below requires shrinking the LV size table in §4.1.
-4. **Disk to back the LVM cache pool** (§1.3) when the host has no
-   existing VG and no spare disk/partition. INSTALL.md halts here
-   until the operator attaches a second disk (typical: ≥ 600 GB) or
-   frees a partition. There is no plain-directory fallback —
-   /var/cache/devai/* must live on dedicated LVs.
-5. **HuggingFace credentials** (§9.2) when downloading gated NVFP4
-   weights (any NVIDIA-* repo, Llama-3.x, etc.).
-6. **JUPYTER_TOKEN** value (§5.2) when auto-start is requested —
-   without a fixed token, every service restart invalidates browser
-   bookmarks.
-7. **Public exposure** — none of the host ports listed in §13.2
-   should be exposed to the public internet without an explicit
-   reverse-proxy + auth layer the operator owns. The agent must NOT
-   add a port-forward to a router or firewall rule unless asked.
-8. **Reboot to load NVIDIA driver** (§2.1.*) when the kernel module
-   is absent post-install. *GPU only.*
-9. **Auto-start on non-systemd distros** (§11.2) — requires a
-   manually authored OpenRC/runit/s6 service that the agent must
-   propose and the operator must approve before installing.
+### 16.1 Inside-VM cleanup (optional)
+
+If the operator wants to remove the in-VM state before destroying
+the domain (rare; usually the whole VM is just deleted):
+
+```bash
+[vm] $ make cache-down
+[vm] $ make clean
+[vm] $ make uninstall
+[vm] # systemctl --user disable --now devai-infra.service || true
+[vm] # rm -f ~/.config/systemd/user/devai-infra.service
+[vm] # rm -rf ~/.config/devai ~/.devai
+```
+
+### 16.2 Destroy the VM (D19)
+
+```bash
+[host] # virsh destroy   devai-vm 2>/dev/null || true
+[host] # virsh undefine  devai-vm --nvram --remove-all-storage
+```
+
+`--remove-all-storage` deletes the qcow2 disk and the seed ISO.
+The Debian base cloud image (`debian-13-generic-amd64.qcow2`) is
+preserved for re-provisioning.
+
+### 16.3 Reattach the GPU to nvidia (D9)
+
+```bash
+[host] # virsh nodedev-reattach "${DGPU_NODE}"
+[host] # virsh nodedev-reattach "${DGPU_AUDIO_NODE}"
+
+[host] [verify] $ lspci -nnk -s "${DGPU_BDF}" | grep -q 'Kernel driver in use: nvidia'
+[host] [verify] $ nvidia-smi -L
+```
+
+After this the host is back to its idle state per
+`HOST_VFIO_SETUP.md` §9.
+
+### 16.4 What is **not** torn down
+
+- The cached cloud image at `${POOL_PATH}/debian-13-generic-amd64.qcow2`.
+- The SSH keypair `~/.ssh/devai-vm{,.pub}`.
+- Anything in `HOST_VFIO_SETUP.md` §1–§7 (IOMMU, vfio modules,
+  libvirt, default net/pool).
+
+Re-running the agent re-creates a fresh `devai-vm` against the same
+cached base, in roughly the time it takes to run §3–§14.
+
+---
+
+## 17. Decisions left to the operator
+
+Almost everything is now pre-decided (see "Decisions recorded" at the
+top). The remaining operator inputs are:
+
+1. **Reboot of the host** when the §1 gate fails because IOMMU or
+   VFIO modules are missing. The agent prints the hint and stops.
+2. **Slot move** when §1 (C13) reports a polluted IOMMU group. This
+   is a physical change to the host.
+3. **HuggingFace token** (D15). Optional. The default §11.2 model
+   (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4`) is public and
+   downloads anonymously. The operator only needs to provide a
+   token if they swap §11.2 in for a gated model.
+4. **Override env vars** if the recorded defaults don't fit:
+   `DEVAI_VM_RECREATE`, `DEVAI_VM_NAME`, `DEVAI_REPO_URL`,
+   `GPU_MEMORY_GB`, `DEVAI_NO_SYSTEMD`.
+5. **Public exposure of VM services** (D18) — operator-owned reverse
+   proxy + auth layer, the agent does nothing here.
 
 For everything else, the agent decides per the procedure above.
 
 ---
 
-## 16. Validating this procedure
+## 18. Validating this procedure
 
-This document is "doc as test": if a tier-1 coding agent (Claude
-Code, Codex, etc.) reading INSTALL.md cannot produce a working
-stack, the doc is the bug.
+This document is "doc as test": if a tier-1 coding agent reading
+INSTALL.md cannot produce a working VM, the doc is the bug.
 
-The validation method is for the operator (or a separate driver
-agent) to run the procedure end-to-end against a fresh host and
-confirm the §12 smoke test passes. There is no in-repo automated
-harness — that abstraction was removed because the failure modes it
-hid (env-var substitution, dummy claude credentials, LVM
-auto-activation, fstab `nofail`, etc.) were exactly the gaps the
-doc itself needed to close. Each of those is now called out
-explicitly in the relevant phase.
-
-If you want to validate against an isolated VM rather than touch
-the production host, see [`docs/HOST_VFIO_SETUP.md`](docs/HOST_VFIO_SETUP.md)
-for the host-side preparation needed to temporarily hand the GPU
-to a libvirt VM via PCI passthrough. The VM provisioning + cloud-init
-+ agent dispatch is then driven by the operator with `virt-install`
-and an SSH session, not by a hidden bash harness.
+Validation method: an operator (or driver agent) runs the procedure
+end-to-end against a fresh, just-prepared host (per
+`HOST_VFIO_SETUP.md` §1–§7) and confirms both the §11.3 real e2e
+agent test and the §14 smoke test pass.
+There is no in-repo automated harness — that abstraction was removed
+because the failure modes it hid (env-var substitution, dummy claude
+credentials, LVM auto-activation, fstab `nofail`, etc.) were exactly
+the gaps this doc itself needed to close. Each of those is called
+out explicitly in the relevant phase.
 
 ---
 
-## 17. Versioning of this file
+## 19. Versioning of this file
 
 This document tracks the repository at the time of writing. When
 `deploy/docker-compose.yaml`, `deploy/Dockerfile.{base,lab,router}`,
 `Makefile`, or the `.env.example` shape changes, regenerate the
-relevant section here. Specifically:
+relevant section:
 
-- §6.1 image list — keep in sync with
-  `podman compose -f deploy/docker-compose.yaml config --images`.
-- §4.1 volume table — keep in sync with the storage section of
+- §8.1 image list — keep in sync with `podman compose -f
+  deploy/docker-compose.yaml config --images`.
+- §6.1 volume table — keep in sync with the storage section of
   `README.md` and `deploy/setup-logs-volume.sh`.
-- §5.2 `.env` keys — keep in sync with `.env.example` and
-  the `?=` defaults at the top of `Makefile`.
-- §9.x model-pull / probe targets — keep in sync with the
-  `MODELS` block in `make help`.
+- §7.2 `.env` keys — keep in sync with `.env.example` and the `?=`
+  defaults at the top of `Makefile`.
+- §11.x model-pull / probe targets — keep in sync with the `MODELS`
+  block in `make help`.
 
 The agent should treat this file as authoritative for **bootstrap**;
 for runtime architecture, defer to `docs/router.md`,
