@@ -43,7 +43,7 @@ be set in the environment or `.env` **before** the agent starts.
 |-----|----------|-----------------|
 | D1  | Hypervisor = libvirt + QEMU/KVM. No Hyper-V, VMware, VirtualBox, Proxmox CLI. | `HOST_VFIO_SETUP.md` documents only this stack. |
 | D2  | Guest OS = Debian 13 (Trixie) generic cloud image, x86_64. | Project reference platform; every `apt-get`, NVIDIA-driver path, and `docker-compose` step in §4 targets Trixie directly. |
-| D3  | Single VM disk: `vda` qcow2, 250 GiB. Cloud-init partitions it into `vda1` = 50 GiB root (ext4) and `vda2` = 200 GiB LVM PV for `vgais`. | Lab images live on `cache_registry` (§5.3) so the root never carries model or image bloat; 50 GiB is enough for the OS, system packages, and a working set. One disk simplifies provisioning and host snapshotting. |
+| D3  | Two VM disks: `vda` qcow2, 50 GiB (root, expanded in place from the Debian cloud image's ~3 GiB ext4 partition) and `vdb` qcow2, 200 GiB (raw block device used as the single `vgais` LVM PV — no partition table on `vdb`). | The cloud image is UEFI-first and trying to split a single 250 GiB `vda` into `vda1`=50G + `vda2`=200G has two failure modes that bit us during development: (a) Debian's `cloud-initramfs-growroot` runs from initramfs before cloud-init can honour `growpart.mode` and unconditionally extends the root partition to fill the disk; (b) any in-VM `runcmd` that tries to shrink the mounted ext4 back to 50 GiB fails because `resize2fs` cannot shrink a mounted live root. Splitting storage at the libvirt-disk boundary sidesteps both issues entirely. `vdb` carries the LVM thin pool (`cachepool` + the seven `cache_*` LVs from §6) and stays a separate qcow2 so the operator can re-create or snapshot the cache substrate independently of the root. |
 | D4  | VM resources: 4 vCPUs, 16 GiB RAM. | Minimum that completes `make build` + vLLM/SGLang cold-start without OOM on a 24 GiB-class GPU while leaving host headroom for the desktop / hypervisor. |
 | D5  | VM name = `devai-vm`. | Single canonical name. If a VM of that name already exists, the agent refuses to clobber it without an explicit `DEVAI_VM_RECREATE=1`. |
 | D6  | Network = libvirt `default` NAT. SSH to the VM uses the NAT lease. | Per `HOST_VFIO_SETUP.md` §7. No bridges, no macvtap. |
@@ -63,6 +63,7 @@ be set in the environment or `.env` **before** the agent starts.
 | D20 | Cloud-init seed ISO built with `cloud-localds` (Debian package `cloud-image-utils`). If absent, fall back to `genisoimage`. | Both are in Debian main; one of them is always available on a host that already meets `HOST_VFIO_SETUP.md` §6. |
 | D21 | The agent runs on the host (the libvirt admin). All in-VM commands are executed via `ssh -i ~/.ssh/devai-vm devai@${VM_IP}`. | Single execution model; no remote-mode/local-mode branching. |
 | D22 | Single supported guest = Debian 13 x86_64 with GPU. The host is one of the distros supported by `HOST_VFIO_SETUP.md` §6. | One supported guest plus one supported set of host distros keeps the validated code paths small. |
+| D23 | Guest firmware = **OVMF UEFI with Secure Boot OFF**. The agent uses `/usr/share/OVMF/OVMF_CODE_4M.fd` (the non-MS-signed code binary) paired with the `/usr/share/OVMF/OVMF_VARS_4M.ms.fd` template (which ships Microsoft-CA-enrolled keys so the existing Debian shim/grub/kernel chain still appears in `BootOrder`). | Debian's shim chain (shim → grub → kernel) is signed by Debian's CA via the MS-CA chain, so a Secure-Boot-enforcing firmware loads it fine — but the kernel then enters lockdown mode, which **rejects every DKMS-built module** with `Key was rejected by service`. Since the `nvidia-open` driver in §4.3 is DKMS-built and per-VM-signed by a MOK that we cannot reliably enroll non-interactively (shim 15.8's `MokManager` reads keystrokes from the EFI text-input protocol, not from the libvirt serial console, so an `expect`-driven enrollment over `virsh console` does not actually deliver keys to the MOK prompt during development testing), enforcing Secure Boot blocks the only Blackwell-compatible driver. The non-secboot OVMF code binary preserves the MS-keyed boot entries (so the disk still boots Debian via the same shim path) but does not enforce module signatures in the kernel, allowing `nvidia-open` to load. Classical BIOS (`<boot dev='hd'/>` with SeaBIOS) was investigated as an alternative and **did not boot the stock Debian 13 cloud image** in our testing — the image carries a `bios_grub` partition and `grub-pc-bin` but in-place `grub-install --target=i386-pc /dev/vda` produced a disk that neither SeaBIOS nor OVMF would boot, suggesting the cloud image is UEFI-first and converting it to BIOS-bootable requires more than a single `grub-install` invocation. |
 
 These decisions are recorded inline so a future review can locate
 every place this document deliberately narrows behaviour for the
@@ -392,12 +393,17 @@ users:
     ssh_authorized_keys:
       - ${PUBKEY}
 
-# D3: do not let cloud-init grow root to fill the whole 250 GiB disk.
-# We partition manually below so vda1 stays at 50 GiB and vda2 holds
-# the 200 GiB LVM PV for vgais.
+# D3: vda is a single 50 GiB qcow2 (no second partition on it). Let
+# cloud-init grow the cloud image's ~3 GiB root partition to fill the
+# whole 50 GiB vda. The 200 GiB LVM PV lives on a separate disk (vdb,
+# raw, no partition table) created in §2.6 — see §6 for vgais setup.
+#
+# NOTE: \`mode: 'off'\` MUST be quoted as a string. In YAML 1.1 (which
+# cloud-init parses) the bare word \`off\` parses as boolean false,
+# which cloud-init flags as deprecated and may eventually reject. The
+# string form is the documented spelling per cloud-init 23.x+.
 growpart:
-  mode: off
-resize_rootfs: false
+  mode: 'auto'
 
 package_update: true
 packages:
@@ -407,23 +413,9 @@ packages:
   - git
   - make
   - openssh-server
-  - parted
-  - e2fsprogs
 
 runcmd:
   - [ systemctl, enable, --now, ssh ]
-  - |
-    set -e
-    test -e /var/lib/devai-partitioned && exit 0
-    ROOT_DEV=\$(findmnt -no SOURCE /)
-    DISK=/dev/\$(lsblk -no PKNAME "\$ROOT_DEV")
-    PART_NUM=\$(echo "\$ROOT_DEV" | grep -oE '[0-9]+$')
-    parted -s "\$DISK" resizepart "\$PART_NUM" 50GiB
-    partprobe "\$DISK" || true
-    resize2fs "\$ROOT_DEV"
-    parted -s "\$DISK" mkpart primary 50GiB 100%
-    partprobe "\$DISK" || true
-    touch /var/lib/devai-partitioned
 EOF
 [host] $ cat > "${WORK}/meta-data" <<EOF
 instance-id: devai-vm
@@ -455,18 +447,36 @@ EOF
 [host] $ rm -rf "${WORK}"
 ```
 
-### 2.6 Allocate VM disk
+### 2.6 Allocate VM disks (D3 — two qcow2 files)
 
 ```bash
 [host] $ VDA="${POOL_PATH}/devai-vm.qcow2"
-[host] $ qemu-img create -f qcow2 -F qcow2 -b "${IMG}" "${VDA}" 250G
+[host] $ VDB="${POOL_PATH}/devai-vm-data.qcow2"
+[host] $ test -f "${VDA}" || qemu-img create -f qcow2 "${VDA}" 51G
+[host] $ test -f "${VDB}" || qemu-img create -f qcow2 "${VDB}" 200G
+
+[host] $ # vda is 51 GiB, not 50 GiB, because virt-resize needs ~130 MiB of
+[host] $ # headroom on top of the requested partition size to host the cloud
+[host] $ # image's bios_grub (3 MiB) + EFI (~124 MiB) partitions. Sized to 50
+[host] $ # exactly, virt-resize aborts with a "deficit of 129.3M" error.
+
+[host] $ # vda must be the upstream cloud image with the root partition pre-
+[host] $ # grown to 50 GiB. virt-resize handles the partition+ext4 expansion
+[host] $ # offline so cloud-initramfs-growroot has nothing to fight over.
+[host] $ virt-resize --resize /dev/sda1=50G "${IMG}" "${VDA}"
 ```
 
-`vda` is a 250 GiB copy-on-write overlay on the upstream cloud image
-so the base stays untouched and re-provisioning is cheap. Cloud-init
-(§2.5) repartitions the disk on first boot: `vda1` holds the 50 GiB
-root filesystem and `vda2` is a fresh 200 GiB partition that §6 turns
-into an LVM PV for `vgais`.
+`vda` is a self-contained 50 GiB qcow2 with the Debian root partition
+already grown to 50 GiB. There is **no second partition on `vda`** —
+the LVM PV lives on a separate disk (`vdb`), so neither the cloud
+image's initramfs-growroot hook nor any in-VM partition-shrink runcmd
+needs to participate. `vdb` is a raw 200 GiB qcow2 with no partition
+table; §6 calls `pvcreate /dev/vdb` directly on the whole-disk device.
+
+Idempotency: both `qemu-img create` calls and `virt-resize` are
+guarded with `test -f`. Re-running the procedure on a host that
+already has these qcow2 files reuses them — drop the files (or run
+§16 tear-down) to start fresh.
 
 ### 2.7 Host GPU pre-flight (D10)
 
@@ -494,7 +504,7 @@ whitelist defined in §1.4 H11; see §1.3 C12 for the rationale.)
 [host] [verify] $ lspci -nnk -s "${DGPU_AUDIO_BDF}" | grep -q 'Kernel driver in use: vfio-pci'
 ```
 
-### 2.9 virt-install
+### 2.9 virt-install (D3 + D23)
 
 ```bash
 [host] $ virt-install \
@@ -502,8 +512,9 @@ whitelist defined in §1.4 H11; see §1.3 C12 for the rationale.)
             --memory 16384 --vcpus 4 \
             --cpu host-passthrough \
             --osinfo name=debiantesting \
-            --boot uefi \
+            --boot loader=/usr/share/OVMF/OVMF_CODE_4M.fd,loader_ro=yes,loader_type=pflash,nvram_template=/usr/share/OVMF/OVMF_VARS_4M.ms.fd \
             --disk path="${VDA}",format=qcow2,bus=virtio \
+            --disk path="${VDB}",format=qcow2,bus=virtio \
             --disk path="${SEED}",device=cdrom \
             --network network=default,model=virtio \
             --hostdev "${DGPU_NODE}" \
@@ -511,6 +522,23 @@ whitelist defined in §1.4 H11; see §1.3 C12 for the rationale.)
             --graphics none --console pty,target_type=serial \
             --import --noautoconsole
 ```
+
+Two important deviations from the libvirt firmware-autodetection
+default (`--boot uefi`):
+
+1. **Two `--disk` flags** — `vda` (50 GiB root) and `vdb` (200 GiB
+   LVM PV-to-be), in that order. `vdb` has no partition table; §6
+   uses it as a whole-disk PV (`pvcreate /dev/vdb`).
+2. **Explicit `loader=` + `nvram_template=` paths (D23)** — points
+   OVMF at the non-secboot code binary (`OVMF_CODE_4M.fd`) while still
+   instantiating NVRAM from the Microsoft-keyed template
+   (`OVMF_VARS_4M.ms.fd`). The MS-keyed template carries the boot
+   entries that let shim/grub/kernel chain-load Debian's signed boot
+   path; the non-secboot code binary disables in-firmware signature
+   enforcement so the unsigned DKMS-built `nvidia-open` modules from
+   §4.3 still load. Using `--boot uefi` alone selects the secboot
+   variant and the procedure fails at §4.4 with
+   `modprobe: Key was rejected by service`.
 
 `--osinfo name=debiantesting` silences the `osinfo` warning on Trixie.
 `--hostdev pci_...` matches the syntax that Debian Trixie's
@@ -600,25 +628,28 @@ the image and accepted responsibility for the deviation.
 the VM image only as `nouveau` (blacklisted on cloud images) or
 absent. §4.1 (D11) installs the open NVIDIA driver.
 
-### 3.3 Storage detection
+### 3.3 Storage detection (D3 two-disk layout)
 
-The cache LVs (see §6) will live on `/dev/vda2`, the 200 GiB
-partition that cloud-init carved out of `/dev/vda` in §2.5. The agent
-records the current state of vda:
+The cache LVs (see §6) live on `/dev/vdb`, a separate raw 200 GiB
+qcow2 with no partition table. `vda` is the root disk (cloud image
+expanded to 50 GiB offline by §2.6's `virt-resize`). The agent
+records the current state of both disks:
 
 ```bash
 [vm] [verify] $ lsblk -no NAME,SIZE,FSTYPE /dev/vda
-                # vda      250G
-                # |-vda1   50G    ext4   (root, mounted at /)
-                # |-vda14  ...                (BIOS boot, Debian cloud image)
-                # |-vda15  ...    vfat        (EFI System Partition)
-                # `-vda2   200G                (unformatted; vgais PV in §6)
+                # vda       50G
+                # |-vda1    ~50G   ext4   (root, mounted at /)
+                # |-vda14   ~3M           (BIOS boot, Debian cloud image)
+                # `-vda15   ~124M  vfat   (EFI System Partition)
+[vm] [verify] $ lsblk -no NAME,SIZE,FSTYPE /dev/vdb
+                # vdb       200G          (no partition table; vgais PV in §6)
 ```
 
-If `/dev/vda2` is missing or already populated with LVM metadata,
-cloud-init's partitioning step did not produce the expected layout.
-Inspect `/var/log/cloud-init-output.log` inside the VM. The agent
-does **not** repartition vda after first boot.
+If `/dev/vdb` is missing the procedure was started without the second
+`--disk` in §2.9 — re-run §2.6/§2.9. If `/dev/vdb` already shows
+`fstype=LVM2_member`, a prior bootstrap created the PV; §6 detects
+this and skips re-`pvcreate`. The agent does **not** alter `vda`'s
+partition layout after first boot.
 
 ### 3.4 User and rootless podman pre-state
 
@@ -729,10 +760,38 @@ compatibility.
 ```
 
 If `nvidia-smi` reports "couldn't communicate with the NVIDIA driver",
-the most common cause is a kernel/header mismatch — `linux-headers-
-amd64` lagged the running kernel. Run `apt-get install -y
-linux-headers-$(uname -r)`, then `dpkg-reconfigure
-nvidia-kernel-open-dkms`, and reboot once more.
+the most common causes are:
+
+1. **Kernel/header mismatch.** `linux-headers-amd64` is the meta
+   package and may have lagged the running kernel during install.
+   Run `apt-get install -y linux-headers-$(uname -r)`, then
+   `dpkg-reconfigure nvidia-kernel-open-dkms`, and reboot once more.
+2. **`modprobe nvidia` exits with `Key was rejected by service`.**
+   This means the kernel is in EFI Secure Boot lockdown and is
+   refusing the unsigned DKMS-built modules. The §2.9 virt-install
+   line in this procedure should already use the non-secboot OVMF
+   code binary (D23) which prevents this — if you nonetheless see the
+   error, dump the domain XML with `virsh dumpxml devai-vm` and check
+   the `<loader>` element: it must point at
+   `/usr/share/OVMF/OVMF_CODE_4M.fd` (no `.ms` suffix) and the
+   `<os>` block must NOT contain `<feature enabled='yes'
+   name='secure-boot'/>`. If `libvirt`'s firmware autodetection
+   re-selected the secboot variant, recreate the domain with the
+   explicit `loader=/usr/share/OVMF/OVMF_CODE_4M.fd,
+   loader_ro=yes,loader_type=pflash,
+   nvram_template=/usr/share/OVMF/OVMF_VARS_4M.ms.fd` form from §2.9.
+   The "MS-keyed VARS template + non-MS code binary" combination
+   keeps the populated `BootOrder` (shim → grub → kernel still chain-
+   loads from `/EFI/debian/`) while disabling in-firmware module-
+   signature enforcement.
+
+Re-verifying after the firmware swap:
+
+```bash
+[vm] [verify] $ sudo mokutil --sb-state    # must print "This system doesn't support Secure Boot"
+[vm] [verify] $ sudo modprobe nvidia       # must exit 0
+[vm] [verify] $ lsmod | grep -E '^nvidia\b'
+```
 
 ### 4.5 subuid/subgid
 
@@ -840,10 +899,10 @@ already ran.
 
 ---
 
-## 6. Provision storage on `/dev/vda2`
+## 6. Provision storage on `/dev/vdb`
 
-The 200 GiB `vda2` becomes `vgais`, holding one 200 GiB thin pool and
-seven thin LVs (§6.1).
+The 200 GiB whole-disk `vdb` (no partition table — D3) becomes
+`vgais`, holding one ~200 GiB thin pool and seven thin LVs (§6.1).
 
 ### 6.1 Target layout
 
@@ -863,20 +922,35 @@ extents.
 
 ### 6.2 Volume group
 
+`pvcreate`/`vgcreate` are idempotent in this procedure — re-runs on a
+host that already has the PV/VG no-op. (LVM tools without the explicit
+`-ff` refuse to clobber existing metadata, which is the correct
+behaviour for this storage layout.)
+
 ```bash
-[vm] # pvcreate /dev/vda2
-[vm] # vgcreate vgais /dev/vda2
+[vm] # pvs /dev/vdb >/dev/null 2>&1 || pvcreate /dev/vdb
+[vm] # vgs vgais >/dev/null 2>&1 || vgcreate vgais /dev/vdb
 [vm] [verify] # vgs vgais --units g
+                # VG    #PV #LV #SN Attr   VSize    VFree
+                # vgais   1   0   0 wz--n- 199.87g  199.87g
 ```
 
 ### 6.3 Thin pool
 
+`vdb` is exactly 200 GiB but the VG reports ~199.87 GiB after the
+LVM superblock and metadata reservations. A literal `lvcreate -L 200G`
+fails with `insufficient free space`. Use `-l 99%FREE` so the pool
+takes the entire remaining VG minus the small reserve LVM holds back
+for thin-metadata.
+
 ```bash
-[vm] # lvcreate -L 200G -T vgais/cachepool
+[vm] # lvs vgais/cachepool >/dev/null 2>&1 || lvcreate -y -l 99%FREE -T vgais/cachepool
 [vm] [verify] # lvs vgais/cachepool
+                # LV        VG    Attr       LSize    Pool Origin Data%  Meta%
+                # cachepool vgais twi-a-tz-- <197.68g             0.00   10.43
 ```
 
-The pool size is exactly 200 GiB; do not scale.
+The pool is thin-provisioned and intentionally over-committed by §6.1.
 
 ### 6.4 Thin LVs
 
@@ -1671,9 +1745,20 @@ the domain (rare; usually the whole VM is just deleted):
 [host] # virsh undefine  devai-vm --nvram --remove-all-storage
 ```
 
-`--remove-all-storage` deletes the qcow2 disk and the seed ISO.
-The Debian base cloud image (`debian-13-generic-amd64.qcow2`) is
-preserved for re-provisioning.
+`--remove-all-storage` deletes **both** qcow2 disks (`devai-vm.qcow2`
+and `devai-vm-data.qcow2`) plus the seed ISO. The Debian base cloud
+image (`debian-13-generic-amd64.qcow2`) is preserved for
+re-provisioning.
+
+If `--remove-all-storage` complains that a disk is not managed by
+libvirt (can happen when the qcow2 files were created with
+`qemu-img create` outside a libvirt-managed pool), follow up with:
+
+```bash
+[host] # virsh vol-delete --pool default devai-vm.qcow2
+[host] # virsh vol-delete --pool default devai-vm-data.qcow2
+[host] # virsh vol-delete --pool default devai-vm-seed.iso
+```
 
 ### 16.3 Reattach the GPU to nvidia (D9)
 

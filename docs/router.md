@@ -294,6 +294,52 @@ ignore `options.num_ctx` -- for those the global
 vLLM/SGLang use `--max-model-len` / `--context-length` baked into the
 container at recreate time, not per-request injection.
 
+The vLLM entrypoint also always passes `--kv-cache-dtype fp8`. On the
+project's 24 GiB reference GPU this is what lets NVFP4 checkpoints
+(~18 GiB weights) cohabit with 128K-context KV. Default fp16 KV adds
+~7 GiB at 128K -- enough to push the total past 24 GiB. fp8 halves
+that to ~3.5 GiB, leaving room for activations and the engine's CUDA
+graph workspace. Blackwell exposes native fp8 so there is no
+throughput cost; older GPUs fall back to vLLM's fp8 emulation. The
+matching `--kv-cache-dtype fp8` is in `scripts/probe-vllm-reasoning.py`
+so probe-time fit data stays consistent with serve-time memory math.
+
+## Per-model recovery flags
+
+For checkpoints whose CUDA-graph workspace alone pushes them past 24
+GiB at high context (Nemotron-3-Nano-30B-A3B-NVFP4 at 128K is the
+canonical case), the router appends additional flags from
+`deploy/recovery-flags.json` after the parser block:
+
+```json
+{
+  "models": {
+    "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4": {
+      "engine_flags": ["--max-num-seqs", "8",
+                       "--trust-remote-code",
+                       "--enforce-eager"],
+      "engine_env": {
+        "PYTORCH_ALLOC_CONF": "expandable_segments:True",
+        "VLLM_USE_FLASHINFER_MOE_FP4": "1",
+        "VLLM_FLASHINFER_MOE_BACKEND": "throughput"
+      }
+    }
+  }
+}
+```
+
+`--enforce-eager` disables CUDA graph capture entirely, reclaiming the
+~4 GiB workspace vLLM otherwise pre-reserves. The model then loads
+with the fp8 KV cache fitting comfortably and 128K-context Q&A works
+end-to-end (probe records `fits=true, vram=22.79 GiB`). Cost is a
+~10-20% decode throughput hit from losing graph batching -- the going
+trade to reach 128K on a 24 GiB card.
+
+`scripts/_probe_hf_common.py` reads the same JSON so the vLLM/SGLang
+probers launch with the same flags. Without this symmetry the probe
+would record `fits=false` at 128K, the picker would hide the cell,
+and the router would never get a chance to use the recovery flags.
+
 ---
 
 ## vLLM plugin registry

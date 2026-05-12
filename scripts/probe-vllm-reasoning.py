@@ -66,6 +66,13 @@ def vllm_command_args(
         "--port", "11434",
         "--tensor-parallel-size", "1",
         "--max-model-len", str(max_ctx),
+        # FP8 KV cache halves KV memory vs the default fp16. On a 24 GiB
+        # GPU the difference is what makes 128K+ contexts on 18 GiB NVFP4
+        # weights fit (KV at 128K drops from ~7 GiB to ~3.5 GiB). Blackwell
+        # has native fp8; older GPUs use vLLM's fp8 emulation. Match the
+        # router's vllmEntrypoint in gpu-arbiter/main.go so probe-time and
+        # serve-time launches use identical memory math.
+        "--kv-cache-dtype", "fp8",
         "--gpu-memory-utilization", f"{host_frac:.4f}",
         "--enable-prefix-caching",
         "--trust-remote-code",

@@ -868,6 +868,7 @@ model-pull: ## Pull missing best-fit candidates from the catalog (catalog-driven
 	 VERBOSE=$${VERBOSE:-0} \
 		python3 scripts/select-models.py \
 			$(if $(FAMILY),--family $(FAMILY),) \
+			$(if $(NAME),--name $(NAME),) \
 			$(if $(VRAM),--vram $(VRAM),) \
 			$(if $(CONTEXT),--context $(CONTEXT),) \
 			$(if $(CONTEXTS),--contexts $(CONTEXTS),) \
@@ -997,15 +998,55 @@ uninstall: ## Remove devai-agent launcher and the staged config dir
 	@echo "preferences.yaml and sessions/ are kept; remove $(DEVAI_HOME)/ manually if you want a clean slate."
 
 install-systemd: ## Install and enable systemd service for infrastructure
+	@# Stage every path that deploy/docker-compose.yaml mounts via `./`,
+	@# so systemd's WorkingDirectory=$(HOME)/.config/devai resolves to the
+	@# same files the repo-side `make cache-up` uses. Mutable JSON caches
+	@# and shared scripts are SYMLINKED into the repo so probe/agent writes
+	@# in either checkout location stay in sync; static configs are COPIED.
 	@mkdir -p $(HOME)/.config/devai $(HOME)/.config/systemd/user
+	@# Pre-create the three reasoning-cache JSON files if absent — compose
+	@# would otherwise bind-mount a non-existent path and create it as a
+	@# DIRECTORY, which then crashes both the router and `make probe` with
+	@# `IsADirectoryError`. Idempotent.
+	@for f in deploy/.ollama-reasoning-cache.json \
+	          deploy/.vllm-reasoning-cache.json \
+	          deploy/.sglang-reasoning-cache.json ; do \
+	    test -e "$$f" || echo "{}" > "$$f" ; \
+	done
 	cp deploy/docker-compose.yaml $(HOME)/.config/devai/docker-compose.yaml
-	cp deploy/registry-config.yaml $(HOME)/.config/devai/registry-config.yaml
+	@# Symlink mutable / shared assets from the repo. ln -sfn updates a
+	@# pre-existing symlink in place and refuses to clobber a real file
+	@# (which the old recipe would leave behind on re-runs).
+	ln -sfn $(CURDIR)/deploy/registry-config.yaml          $(HOME)/.config/devai/registry-config.yaml
+	ln -sfn $(CURDIR)/deploy/logging.sh                    $(HOME)/.config/devai/logging.sh
+	ln -sfn $(CURDIR)/deploy/recovery-flags.json           $(HOME)/.config/devai/recovery-flags.json
+	ln -sfn $(CURDIR)/deploy/vllm-plugins.json             $(HOME)/.config/devai/vllm-plugins.json
+	ln -sfn $(CURDIR)/deploy/.ollama-reasoning-cache.json  $(HOME)/.config/devai/.ollama-reasoning-cache.json
+	ln -sfn $(CURDIR)/deploy/.vllm-reasoning-cache.json    $(HOME)/.config/devai/.vllm-reasoning-cache.json
+	ln -sfn $(CURDIR)/deploy/.sglang-reasoning-cache.json  $(HOME)/.config/devai/.sglang-reasoning-cache.json
+	ln -sfn $(CURDIR)/deploy/webui-proxy                   $(HOME)/.config/devai/webui-proxy
 	cp deploy/systemd/devai-infra.service $(HOME)/.config/systemd/user/
 	systemctl --user daemon-reload
 	systemctl --user enable --now podman.socket
 	systemctl --user enable --now devai-infra.service
 	loginctl enable-linger $(USER)
 	@echo "Installed to $(HOME)/.config/devai/ and enabled devai-infra.service"
+
+uninstall-systemd: ## Stop, disable and remove the systemd infrastructure unit
+	-systemctl --user disable --now devai-infra.service 2>/dev/null
+	rm -f $(HOME)/.config/systemd/user/devai-infra.service
+	rm -f $(HOME)/.config/devai/docker-compose.yaml
+	rm -f $(HOME)/.config/devai/registry-config.yaml
+	rm -f $(HOME)/.config/devai/logging.sh
+	rm -f $(HOME)/.config/devai/recovery-flags.json
+	rm -f $(HOME)/.config/devai/vllm-plugins.json
+	rm -f $(HOME)/.config/devai/.ollama-reasoning-cache.json
+	rm -f $(HOME)/.config/devai/.vllm-reasoning-cache.json
+	rm -f $(HOME)/.config/devai/.sglang-reasoning-cache.json
+	rm -f $(HOME)/.config/devai/webui-proxy
+	rmdir $(HOME)/.config/devai 2>/dev/null || true
+	systemctl --user daemon-reload
+	@echo "Removed devai-infra.service and $(HOME)/.config/devai/"
 
 
 # =============================================================================

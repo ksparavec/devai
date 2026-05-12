@@ -43,10 +43,16 @@ router:
 3. Recreates it via libpod with a dynamic entrypoint that bakes in the
    chosen model path, `--max-model-len` / `--context-length`, and
    `--gpu-memory-utilization` / `--mem-fraction-static` derived from the
-   probe cache and `MAX_CONTEXT_LEN`. If the model has probe-verified
-   `reasoning_parser` and/or `tool_parser`, the router injects
-   `--reasoning-parser <value>` (vLLM also adds `--enable-auto-tool-choice`)
-   and `--tool-call-parser <value>`.
+   probe cache and `MAX_CONTEXT_LEN`. For vLLM the entrypoint also
+   always passes `--kv-cache-dtype fp8` -- fp16 KV at 128K would push
+   NVFP4 checkpoints past 24 GiB on the reference card. If the model
+   has probe-verified `reasoning_parser` and/or `tool_parser`, the
+   router injects `--reasoning-parser <value>` (vLLM also adds
+   `--enable-auto-tool-choice`) and `--tool-call-parser <value>`.
+   Finally, any `engine_flags` / `engine_env` from
+   `deploy/recovery-flags.json` keyed by the canonical model name are
+   appended (e.g. `--enforce-eager` for Nemotron-3-Nano at 128K --
+   see docs/router.md "Per-model recovery flags").
 4. Polls `/health` until the container becomes ready (default 600s for
    NVFP4 cold-start with CUDA graph compilation, override via
    `HEALTH_TIMEOUT_SECONDS` env on the router).

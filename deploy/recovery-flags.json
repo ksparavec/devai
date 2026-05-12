@@ -21,7 +21,20 @@
   ],
   "models": {
     "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4": {
-      "engine_flags": ["--max-num-seqs", "8", "--trust-remote-code"],
+      "engine_flags": [
+        "--max-num-seqs", "8",
+        "--trust-remote-code",
+        "--enforce-eager"
+      ],
+      "_engine_flags_comment": [
+        "--enforce-eager disables CUDA graph capture, freeing the ~4 GiB",
+        "workspace vLLM otherwise pre-reserves for cudagraph buffers. The",
+        "model weights + fp8 KV cache fit comfortably in 24 GiB at 128K",
+        "context only with eager mode on; with graphs enabled, PyTorch",
+        "fails to allocate the last 316 MiB during model load. Cost: ~10-",
+        "20% throughput drop on decode (no graph batching). For 24 GiB",
+        "Blackwell that is the going trade to access 128K context."
+      ],
       "engine_env": {
         "PYTORCH_ALLOC_CONF": "expandable_segments:True",
         "VLLM_USE_FLASHINFER_MOE_FP4": "1",

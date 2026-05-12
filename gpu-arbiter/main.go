@@ -735,6 +735,12 @@ func vllmEntrypoint(modelName string, lc launchConfig) []string {
 		"--port", "11434",
 		"--tensor-parallel-size", "1",
 		"--max-model-len", fmt.Sprintf("%d", lc.MaxContext),
+		// FP8 KV cache halves KV memory vs the default fp16. On a 24 GiB
+		// GPU this is what makes 128K+ contexts on 18 GiB NVFP4 weights
+		// fit (KV at 128K drops from ~7 GiB to ~3.5 GiB). Must match
+		// vllm_command_args in scripts/probe-vllm-reasoning.py so probe-
+		// time fit data is consistent with serve-time launches.
+		"--kv-cache-dtype", "fp8",
 		"--gpu-memory-utilization", fmt.Sprintf("%.2f", lc.MemFraction),
 		"--enable-prefix-caching",
 		"--trust-remote-code",

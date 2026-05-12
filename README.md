@@ -93,6 +93,7 @@ make model-pull                               # download best-fit (family, backe
 make model-pull FAMILY=qwen3.5                # scope to one family; still iterates all contexts + backends
 make model-pull CONTEXT=32768                 # single context; disables matrix, picks one best per (family, backend)
 make model-pull CONTEXTS=32K,128K             # override the context tier list
+make model-pull NAME=NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4   # pull one specific catalog row by exact name, bypassing the fit matrix
 
 # Fit queries (probe-cache backed, no side effects)
 make model-fit                                # print fitting models at host VRAM × MAX_CONTEXT_LEN
@@ -410,10 +411,11 @@ This tells Podman to try `localhost:5000` (the registry mirror started by `make 
 ## Auto-Start at Boot
 
 ```bash
-make install-systemd
+make install-systemd            # stage compose + symlink caches into ~/.config/devai/, enable unit
+make uninstall-systemd          # reverse: disable unit + remove staged files
 ```
 
-Installs a systemd user service that starts all infrastructure containers on login. Uses `loginctl enable-linger` to keep services running after logout.
+`install-systemd` stages a systemd user service that brings the infrastructure containers up on login (`loginctl enable-linger` keeps them running after logout). It **copies** `docker-compose.yaml` into `~/.config/devai/` and **symlinks** the eight other paths the compose mounts (`registry-config.yaml`, `logging.sh`, `recovery-flags.json`, `vllm-plugins.json`, the three `.X-reasoning-cache.json` files, and the `webui-proxy/` directory) back into the repo's `deploy/`. The symlinks keep the systemd-managed stack reading the same probe caches that `make probe` writes — no duplication, no drift.
 
 ## Updating
 

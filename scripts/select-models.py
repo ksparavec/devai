@@ -1305,6 +1305,11 @@ def print_cell_matrix(
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--family", default="")
+    ap.add_argument("--name", default="",
+                    help="Pull a specific catalog row by its `name` field, "
+                         "bypassing the (VRAM, context) matrix entirely. "
+                         "Use to fetch a single HF model whose fit-data is "
+                         "not yet in the probe cache. Exits after pull.")
     ap.add_argument("--vram", type=float,
                     default=float(os.environ.get("GPU_MEMORY_GB", "24")))
     # --context: single-context override. When omitted, the selector
@@ -1354,6 +1359,24 @@ def main() -> None:
         sys.exit(f"error: {CATALOG} does not exist — run `make catalog-regen` first")
     cfg = yaml.safe_load(CATALOG.read_text()) or {}
     models = cfg.get("models", []) or []
+
+    # --name: short-circuit pull-by-exact-name. Skips the matrix entirely.
+    # Useful for HF-backed rows whose vLLM/SGLang fit-data is not yet in
+    # the probe cache and would therefore be skipped by the trial-candidate
+    # selector. Pulls the named row and exits.
+    if args.name:
+        match = [m for m in models if m.get("name") == args.name]
+        if not match:
+            sys.exit(f"error: no model named '{args.name}' in catalog")
+        if not args.download:
+            sys.exit("error: --name requires --download (the Makefile passes it)")
+        if not args.dry_run:
+            print(f"  → {args.name}  ({match[0].get('source', '?')})")
+            pull(match[0])
+        else:
+            print(f"  --dry-run: would pull {args.name}")
+        return
+
     if args.family:
         models = [m for m in models if m.get("family") == args.family]
     if not models:
