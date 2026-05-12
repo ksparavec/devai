@@ -1,0 +1,670 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Host VFIO setup — Dev AI Lab</title>
+<meta name="description" content="One-time host-side procedure to enable temporary GPU handoff from the host to QEMU/KVM VMs via VFIO/PCI passthrough, then automatically give the GPU back when the VM stops.">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism-tomorrow.min.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="site">
+  <main class="main">
+    <div class="content">
+
+      <header>
+        <span class="pill">Operations · host configuration</span>
+        <h1>Host VFIO setup — temporary GPU handoff to test VMs</h1>
+        <p class="lead">
+          One-time host-side procedure to prepare a Linux box so QEMU/KVM virtual
+          machines can <strong>temporarily borrow</strong> the NVIDIA GPU via PCI
+          passthrough (VFIO) for the duration of an <code>INSTALL.md</code>
+          validation run, and then <strong>automatically give it back</strong> to
+          the host's nvidia driver when the VM shuts down. Outside of test runs,
+          the host continues to use the GPU normally — Dev AI Lab on the bare
+          metal, CUDA workloads, anything else — exactly as before.
+        </p>
+      </header>
+
+      <div class="callout warn">
+        <div class="callout-icon">i</div>
+        <div>
+          <strong>Why a separate doc?</strong> This procedure mutates host-side
+          firmware settings, kernel command-line, initramfs, and module
+          configuration. Several steps require reboots. None of it is reversible
+          from inside a container or VM. It should be done <em>once per physical
+          host</em> and never re-run as part of an <code>INSTALL.md</code> run.
+        </div>
+      </div>
+
+      <p>
+        The procedure is written for an autonomous coding agent (Claude Code,
+        OpenAI Codex, or equivalent tier-1 agent) but the verification commands
+        and recovery rules are equally usable by a human operator. Each step
+        states its <strong>purpose</strong>, <strong>precondition</strong>,
+        <strong>idempotency rule</strong>, and <strong>verification</strong>.
+      </p>
+
+      <!-- §0 -->
+      <h2 id="contract">0. Contract</h2>
+
+      <h3 id="goal">0.1 Goal</h3>
+      <p>After successful completion:</p>
+      <ul>
+        <li>IOMMU is enabled in firmware and in the running kernel.</li>
+        <li>The <code>vfio</code>, <code>vfio_iommu_type1</code>, and <code>vfio_pci</code>
+          kernel modules are available (loadable on demand) but
+          <strong>do not auto-claim</strong> the dedicated NVIDIA GPU at boot.
+          The nvidia driver continues to bind it normally.</li>
+        <li><code>libvirt</code> + <code>qemu-system-x86_64</code> + <code>virt-install</code>
+          are installed.</li>
+        <li>libvirt's <code>&lt;hostdev managed='yes'&gt;</code> mechanism is operational.
+          Defining a VM with the GPU as a managed host device is sufficient:
+          libvirt detaches the GPU from its current driver (<code>nvidia</code>)
+          at VM start, binds it to <code>vfio-pci</code>, runs the VM, and on VM
+          shutdown unbinds <code>vfio-pci</code> and re-binds <code>nvidia</code>.
+          No manual bind/unbind scripts to maintain.</li>
+        <li>A single <code>virsh start &lt;vm-name&gt;</code> is enough to give a
+          VM the GPU, and <code>virsh destroy &lt;vm-name&gt;</code> (or
+          guest-initiated shutdown) returns it to the host.</li>
+      </ul>
+
+      <h3 id="not-changed">0.2 What is <em>not</em> changed</h3>
+      <ul>
+        <li>The host's nvidia driver continues to load at boot.</li>
+        <li><code>nvidia-smi</code> continues to work on the bare host.</li>
+        <li>Dev AI Lab installed natively on the host (the production stack)
+          continues to work between test runs.</li>
+        <li>The dedicated NVIDIA GPU does not lose its host-side identity — it is
+          still <code>Kernel driver in use: nvidia</code> after every reboot.
+          Only during an active test VM run does it briefly switch.</li>
+      </ul>
+
+      <h3 id="constraints">0.3 Constraints</h3>
+      <ol>
+        <li><strong>Stop GPU consumers before starting the test VM.</strong>
+          Anything on the host actively using the GPU (Dev AI Lab containers,
+          <code>nvidia-smi</code> background loops, CUDA processes, X server if
+          it uses the dGPU) blocks libvirt's driver detach. Production stack
+          must be <code>make cache-down</code> before <code>virsh start</code>.
+          The test harness automates this; the operator should be aware.</li>
+        <li><strong>Reboots required.</strong> At least two reboots: one after
+          enabling IOMMU (§3), one after configuring vfio-pci as a loadable
+          module (§5). The agent must surface "reboot required" and wait for
+          the operator rather than silently rebooting.</li>
+        <li><strong>Idempotent re-runs.</strong> Each phase begins with a
+          detection step that decides whether work is needed.</li>
+        <li><strong>Reversible.</strong> §10 documents how to undo every change
+          in this document. Reverting takes one config-file removal plus a
+          reboot.</li>
+      </ol>
+
+      <h3 id="conventions">0.4 Conventions</h3>
+      <ul>
+        <li><code>$</code> runs as the invoking user.</li>
+        <li><code>#</code> runs as <code>root</code> (use <code>sudo</code>).</li>
+        <li><code>[verify]</code> is a read-only check.</li>
+        <li><code>${INVOKING_USER}</code> = <code>$(id -un)</code> of the operator.</li>
+      </ul>
+
+      <h3 id="phase-order">0.5 Phase order</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>#</th><th>Phase</th><th>Mutates</th><th>Reboot?</th><th>Verification</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>1</td><td>Detect environment</td><td>no</td><td>no</td><td><code>[verify]</code> only</td></tr>
+            <tr><td>2</td><td>Confirm UEFI VT-d / VT-x</td><td>UEFI firmware</td><td>no (manual)</td><td><code>dmesg</code>, <code>/proc/cmdline</code></td></tr>
+            <tr><td>3</td><td>Enable kernel IOMMU</td><td><code>/etc/default/grub</code>, initramfs</td><td><strong>yes</strong></td><td><code>dmesg | grep DMAR</code></td></tr>
+            <tr><td>4</td><td>Identify IOMMU groups</td><td>no</td><td>no</td><td><code>find /sys/kernel/iommu_groups/</code></td></tr>
+            <tr><td>5</td><td>Make vfio-pci loadable (no auto-claim)</td><td><code>modules-load.d</code></td><td><strong>yes</strong></td><td><code>lsmod | grep vfio</code>, <code>lspci -nnk</code></td></tr>
+            <tr><td>6</td><td>Install libvirt + QEMU</td><td>apt, services</td><td>no</td><td><code>virsh version</code>, <code>virt-host-validate</code></td></tr>
+            <tr><td>7</td><td>Default network + storage pool</td><td>libvirt</td><td>no</td><td><code>virsh net-list</code>, <code>virsh pool-list</code></td></tr>
+            <tr><td>8</td><td>End-to-end smoke test of managed handoff</td><td>one-shot VM</td><td>no</td><td><code>nvidia-smi</code> round-trip pre/post</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- §1 -->
+      <h2 id="phase-1">1. Phase 1 — Detect environment</h2>
+
+      <h3 id="cpu-virt">1.1 CPU vendor and virtualisation features</h3>
+<pre data-lang="bash"><code class="language-bash">[verify] $ lscpu | grep -E '^(Vendor ID|Model name|Virtualization)'
+[verify] $ grep -Eqo '(vmx|svm)' /proc/cpuinfo && echo "virt-ext present" || echo "MISSING"</code></pre>
+      <p>
+        Stop here if <code>vmx</code> (Intel) or <code>svm</code> (AMD) is absent
+        — the CPU lacks hardware virtualisation extensions.
+      </p>
+
+      <h3 id="iommu-readiness">1.2 IOMMU readiness</h3>
+<pre data-lang="bash"><code class="language-bash">[verify] # dmesg | grep -E 'DMAR|IOMMU|AMD-Vi' | head -10
+[verify] $ cat /proc/cmdline</code></pre>
+      <p>
+        If <code>/proc/cmdline</code> does not include <code>intel_iommu=on</code>
+        (Intel) or <code>amd_iommu=on</code> (AMD), the kernel is not using
+        IOMMU even if the firmware exposes it. Phase 3 fixes this.
+      </p>
+
+      <h3 id="gpu-inventory">1.3 GPU inventory</h3>
+<pre data-lang="bash"><code class="language-bash">[verify] $ lspci -nn | grep -iE 'vga|display|3d controller|audio'</code></pre>
+      <p>Identify three things:</p>
+      <ul>
+        <li><strong><code>${IGPU_BDF}</code></strong> — bus-device-function of the
+          GPU the <strong>host</strong> uses for display (typically integrated,
+          e.g. <code>00:02.0</code> Intel <code>[8086:7d67]</code>).</li>
+        <li><strong><code>${DGPU_BDF}</code></strong> — bus-device-function of the
+          GPU dedicated to test VMs (typically discrete NVIDIA, e.g.
+          <code>02:00.0</code> <code>[10de:2c34]</code>).</li>
+        <li><strong><code>${DGPU_AUDIO_BDF}</code></strong> — the audio function
+          on the same physical card, must be passed through together (typically
+          <code>02:00.1</code> <code>[10de:22e9]</code> for NVIDIA cards).</li>
+      </ul>
+      <p>
+        For this repository's reference host (Intel Arrow Lake-S + NVIDIA RTX
+        PRO 4000 Blackwell), the values are:
+      </p>
+<pre data-lang="text"><code>IGPU_BDF=0000:00:02.0   IGPU_ID=8086:7d67
+DGPU_BDF=0000:02:00.0   DGPU_ID=10de:2c34
+DGPU_AUDIO_BDF=0000:02:00.1   DGPU_AUDIO_ID=10de:22e9</code></pre>
+      <p>
+        If the agent's host differs, replace these values throughout the
+        remainder of the document.
+      </p>
+
+      <h3 id="boot-loader">1.4 Boot loader</h3>
+<pre data-lang="bash"><code class="language-bash">[verify] $ test -d /sys/firmware/efi && echo "EFI" || echo "BIOS"
+[verify] $ test -f /etc/default/grub && echo "GRUB"
+[verify] $ test -d /boot/loader      && echo "systemd-boot"</code></pre>
+      <p>
+        The reference host is <strong>EFI + GRUB</strong>. If the host uses
+        systemd-boot, replace the GRUB-specific commands in §3 with edits to
+        <code>/boot/loader/entries/*.conf</code>.
+      </p>
+
+      <h3 id="bound-driver">1.5 Currently bound GPU driver</h3>
+<pre data-lang="bash"><code class="language-bash">[verify] $ lspci -nnk -s "${DGPU_BDF}" | sed -n 's/^[[:space:]]*Kernel driver in use:/&/p'
+[verify] $ lsmod | grep -E '^(nvidia|vfio)' || echo "neither nvidia nor vfio loaded"</code></pre>
+      <p>
+        Expected starting state on a host already running Dev AI Lab natively:
+        <code>Kernel driver in use: nvidia</code>. After this entire procedure
+        completes, the line still reads <code>nvidia</code> between test runs —
+        only during an active VM run does it temporarily change to
+        <code>vfio-pci</code>.
+      </p>
+
+      <!-- §2 -->
+      <h2 id="phase-2">2. Phase 2 — Confirm VT-d / VT-x in UEFI firmware</h2>
+      <div class="callout warn">
+        <div class="callout-icon">i</div>
+        <div>
+          This phase mutates <strong>firmware</strong>, not the OS, and the
+          agent must <strong>not</strong> automate it. The operator boots into
+          UEFI setup and confirms the settings below.
+        </div>
+      </div>
+      <ul>
+        <li><strong>Intel hosts</strong>: <code>Intel VT-d</code> (sometimes
+          labelled "VT for Directed I/O") is enabled. Distinct from
+          <code>Intel VT-x</code> (CPU virt extension), which must also be enabled.</li>
+        <li><strong>AMD hosts</strong>: <code>AMD-Vi</code> / <code>IOMMU</code>
+          is enabled. SVM (CPU virt) must also be enabled.</li>
+        <li>Recommended: <code>Resizable BAR</code> / <code>Above 4G Decoding</code>
+          enabled (modern NVIDIA cards benefit; required for some).</li>
+      </ul>
+      <p>Setting names vary by motherboard. After saving and rebooting:</p>
+<pre data-lang="bash"><code class="language-bash">[verify] # dmesg | grep -E 'DMAR.*IOMMU enabled|AMD-Vi.*Initialized'</code></pre>
+      <p>
+        A line like <code>DMAR: IOMMU enabled</code> (Intel) or AMD-Vi
+        initialisation (AMD) confirms the firmware exposes IOMMU to the kernel.
+      </p>
+
+      <!-- §3 -->
+      <h2 id="phase-3">3. Phase 3 — Enable kernel IOMMU support</h2>
+      <p>
+        UEFI exposing IOMMU is necessary but not sufficient — the kernel needs
+        <code>intel_iommu=on iommu=pt</code> (Intel) or
+        <code>amd_iommu=on iommu=pt</code> (AMD) on its command line.
+        <code>iommu=pt</code> ("passthrough") improves performance for
+        non-VFIO devices by letting them bypass the IOMMU.
+      </p>
+
+      <h3 id="edit-grub">3.1 Edit GRUB</h3>
+<pre data-lang="bash"><code class="language-bash"># cp /etc/default/grub /etc/default/grub.bak.$(date -u +%Y%m%dT%H%M%SZ)
+# vi /etc/default/grub</code></pre>
+      <p>
+        Find <code>GRUB_CMDLINE_LINUX_DEFAULT=</code> and <strong>append</strong>
+        <code>intel_iommu=on iommu=pt</code> (Intel) or
+        <code>amd_iommu=on iommu=pt</code> (AMD). Don't replace existing
+        parameters. For the reference host, the existing line is:
+      </p>
+<pre data-lang="text"><code>GRUB_CMDLINE_LINUX_DEFAULT="ipv6.disable=1 quiet"</code></pre>
+      <p>Edited:</p>
+<pre data-lang="text"><code>GRUB_CMDLINE_LINUX_DEFAULT="ipv6.disable=1 quiet intel_iommu=on iommu=pt"</code></pre>
+      <p>Regenerate the GRUB config:</p>
+<pre data-lang="bash"><code class="language-bash"># update-grub                              # Debian / Ubuntu
+# grub2-mkconfig -o /boot/grub2/grub.cfg   # Fedora / RHEL / openSUSE</code></pre>
+
+      <h3 id="reboot-3">3.2 Reboot</h3>
+<pre data-lang="bash"><code class="language-bash"># systemctl reboot</code></pre>
+      <div class="callout warn">
+        <div class="callout-icon">i</div>
+        <div>
+          The agent <strong>must not</strong> reboot autonomously. Surface
+          "reboot required to enable IOMMU" and wait for the operator.
+        </div>
+      </div>
+
+      <h3 id="verify-3">3.3 Verification</h3>
+      <p>After reboot:</p>
+<pre data-lang="bash"><code class="language-bash">[verify] $ cat /proc/cmdline | grep -oE '(intel|amd)_iommu=on'
+[verify] # dmesg | grep -E 'DMAR.*IOMMU enabled|AMD-Vi.*Initialized' | head -3</code></pre>
+      <p>Without these lines, the rest of the procedure cannot work.</p>
+
+      <h3 id="recovery-3">3.4 Recovery</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Symptom</th><th>Recovery</th></tr></thead>
+          <tbody>
+            <tr><td><code>update-grub</code> reports "command not found"</td><td>Non-GRUB loader; edit <code>/boot/loader/entries/*.conf</code> (systemd-boot).</td></tr>
+            <tr><td>Kernel param applied but <code>dmesg</code> still says no IOMMU</td><td>Phase 2 firmware setting was missed. Reboot into UEFI and recheck.</td></tr>
+            <tr><td>Host won't boot after GRUB regenerate</td><td>Press <code>e</code> at the GRUB menu and remove <code>iommu</code> params for one boot, then restore from <code>/etc/default/grub.bak.*</code>.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- §4 -->
+      <h2 id="phase-4">4. Phase 4 — Identify IOMMU groups for the dedicated GPU</h2>
+      <p>
+        The kernel exposes IOMMU groups under
+        <code>/sys/kernel/iommu_groups/</code>. Devices in the same group can
+        only be passed through together. A clean group for the GPU contains
+        only the GPU and its audio function; a polluted group contains
+        additional devices (USB, NIC, SATA) that would have to be given to the
+        VM as well — usually unacceptable.
+      </p>
+<pre data-lang="bash"><code class="language-bash">[verify] # for d in /sys/kernel/iommu_groups/*/devices/${DGPU_BDF}; do
+            grp=$(basename "$(dirname "$(dirname "$d")")")
+            echo "GPU is in IOMMU group $grp"
+            echo "Group $grp contents:"
+            ls -1 /sys/kernel/iommu_groups/$grp/devices/
+          done</code></pre>
+      <p>
+        Expected on the reference host: the group contains exactly two BDFs
+        (GPU <code>02:00.0</code> + audio <code>02:00.1</code>).
+      </p>
+      <p>If extra devices appear:</p>
+      <ol>
+        <li><strong>Move the card to a different PCIe slot.</strong> Many
+          motherboards group all devices behind a single root port together;
+          the GPU's slot may share a port with onboard NICs or USB controllers.
+          The motherboard manual typically labels which slot has its own IOMMU
+          group.</li>
+        <li><strong>ACS override patch.</strong> Some kernels (Proxmox,
+          hand-built) split groups artificially. Distro kernels do not include
+          this patch.</li>
+      </ol>
+      <p>For the reference host this group is clean — no further action.</p>
+
+      <!-- §5 -->
+      <h2 id="phase-5">5. Phase 5 — Make vfio-pci loadable, no auto-claim</h2>
+      <p>
+        Unlike a permanent-VFIO setup, this phase <strong>does not</strong> put
+        a <code>vfio-pci ids=…</code> directive in <code>/etc/modprobe.d/</code>.
+        We simply ensure the vfio modules are <em>available</em> so libvirt can
+        load and use them on demand, while leaving the nvidia driver as the
+        boot-time owner of the GPU.
+      </p>
+
+      <h3 id="mod-load">5.1 Module-load configuration</h3>
+<pre data-lang="bash"><code class="language-bash"># cat &gt; /etc/modules-load.d/vfio.conf &lt;&lt;'EOF'
+# Make the VFIO module stack available at boot. We deliberately do
+# NOT put `options vfio-pci ids=...` here — that would auto-claim
+# the GPU and prevent the nvidia driver from binding it during
+# normal operation. With these modules merely loaded (not bound to
+# any device), libvirt's `&lt;hostdev managed='yes'&gt;` can detach
+# nvidia and bind vfio-pci on demand at VM start, then reverse it
+# on VM shutdown.
+vfio
+vfio_iommu_type1
+vfio_pci
+EOF</code></pre>
+      <p>
+        If a previous attempt configured permanent VFIO on this host, remove
+        the offending files first:
+      </p>
+<pre data-lang="bash"><code class="language-bash"># rm -f /etc/modprobe.d/vfio.conf                         # ids= directive
+# rm -f /etc/modprobe.d/vfio-softdep.conf                 # softdep nvidia
+# rm -f /etc/modprobe.d/blacklist-nvidia-bare.conf        # nvidia blacklist</code></pre>
+
+      <h3 id="initramfs">5.2 Update the initramfs</h3>
+<pre data-lang="bash"><code class="language-bash"># update-initramfs -u -k all                # Debian / Ubuntu
+# dracut --regenerate-all --force           # Fedora / RHEL / openSUSE</code></pre>
+
+      <h3 id="reboot-5">5.3 Reboot</h3>
+<pre data-lang="bash"><code class="language-bash"># systemctl reboot</code></pre>
+
+      <h3 id="verify-5">5.4 Verification</h3>
+      <p>After reboot:</p>
+<pre data-lang="bash"><code class="language-bash">[verify] $ lsmod | grep -E '^vfio' | sort</code></pre>
+      <p>
+        Expected: <code>vfio</code>, <code>vfio_iommu_type1</code>,
+        <code>vfio_pci</code> all present.
+      </p>
+<pre data-lang="bash"><code class="language-bash">[verify] $ lspci -nnk -s ${DGPU_BDF}</code></pre>
+      <p>
+        Expected: <code>Kernel driver in use: nvidia</code>. The GPU is still in
+        nvidia's hands at idle — exactly what we want.
+      </p>
+<pre data-lang="bash"><code class="language-bash">[verify] $ nvidia-smi -L</code></pre>
+      <p>
+        Expected: lists the dedicated GPU and reports its name
+        (<code>RTX PRO 4000 Blackwell</code>). The bare-host nvidia stack still
+        works.
+      </p>
+
+      <!-- §6 -->
+      <h2 id="phase-6">6. Phase 6 — Install libvirt + QEMU stack</h2>
+<pre data-lang="bash"><code class="language-bash"># Debian / Ubuntu
+# apt-get update
+# apt-get install -y --no-install-recommends \
+        qemu-system-x86 qemu-utils ovmf \
+        libvirt-daemon-system libvirt-clients virtinst \
+        bridge-utils dnsmasq-base
+
+# Fedora / RHEL
+# dnf install -y \
+        @virtualization \
+        qemu-kvm qemu-img edk2-ovmf \
+        libvirt libvirt-client virt-install
+
+# openSUSE
+# zypper install -y \
+        qemu qemu-x86 qemu-tools qemu-ovmf-x86_64 \
+        libvirt libvirt-client virt-install
+
+# Arch
+# pacman -S --noconfirm \
+        qemu-full edk2-ovmf \
+        libvirt virt-install dnsmasq</code></pre>
+      <p>
+        <code>ovmf</code> / <code>edk2-ovmf</code> provides the UEFI firmware
+        images needed for OVMF-based VMs. UEFI is strongly preferred over legacy
+        BIOS for GPU passthrough; modern NVIDIA cards typically refuse to
+        function in legacy mode.
+      </p>
+      <p>Enable + start libvirt and add the operator to the <code>libvirt</code> group:</p>
+<pre data-lang="bash"><code class="language-bash"># systemctl enable --now libvirtd
+# usermod -aG libvirt ${INVOKING_USER}
+$ newgrp libvirt              # or log out / in to pick up the group</code></pre>
+
+      <h3 id="verify-6">6.1 Verification</h3>
+<pre data-lang="bash"><code class="language-bash">[verify] $ virsh version
+[verify] $ qemu-system-x86_64 --version
+[verify] $ ls /usr/share/OVMF/        # Debian / Ubuntu
+[verify] $ ls /usr/share/edk2-ovmf/   # Fedora / RHEL / Arch
+[verify] $ virt-host-validate</code></pre>
+      <p>
+        <code>virt-host-validate</code> should report PASS on hardware
+        virtualisation, KVM presence, IOMMU, and IOMMU groups. cgroup-related
+        WARNs are typically benign on cgroup-v2 hosts.
+      </p>
+
+      <!-- §7 -->
+      <h2 id="phase-7">7. Phase 7 — Default libvirt network and storage pool</h2>
+<pre data-lang="bash"><code class="language-bash"># virsh net-start  default      2>/dev/null || true
+# virsh net-autostart default
+# virsh pool-start  default     2>/dev/null || true
+# virsh pool-autostart default</code></pre>
+      <p>
+        Default storage pool at <code>/var/lib/libvirt/images/</code> is fine.
+        If <code>/var/lib/libvirt/</code> lives on the host's main partition and
+        you want test VM images on a dedicated LV instead, point libvirt at a
+        different path with
+        <code>virsh pool-define-as test-images dir --target /path/to/dir; virsh pool-build test-images; virsh pool-start test-images; virsh pool-autostart test-images</code>.
+      </p>
+
+      <h3 id="verify-7">7.1 Verification</h3>
+<pre data-lang="bash"><code class="language-bash">[verify] $ virsh net-list --all
+[verify] $ virsh pool-list --all</code></pre>
+      <p>
+        Expected: <code>default</code> network and <code>default</code> pool
+        both <code>active</code> + <code>autostart yes</code>.
+      </p>
+
+      <!-- §8 -->
+      <h2 id="phase-8">8. Phase 8 — End-to-end smoke test of GPU handoff</h2>
+      <p>
+        Confirm that the bind/unbind dance actually works: the GPU goes from
+        <code>nvidia</code> -&gt; <code>vfio-pci</code> before VM start, and back
+        to <code>nvidia</code> after VM stop.
+      </p>
+      <div class="callout">
+        <div class="callout-icon">i</div>
+        <div>
+          <strong>Note on syntax.</strong> Debian Trixie ships libvirt 11.x with
+          a <code>virt-install</code> whose <code>--hostdev</code> does not
+          accept the <code>managed=yes</code> or <code>driver.name=vfio</code>
+          sub-options that newer libvirt versions introduced. We therefore do
+          the detach/reattach <strong>manually</strong> with
+          <code>virsh nodedev-detach</code> / <code>virsh nodedev-reattach</code>
+          before and after the VM run, and pass the device to
+          <code>virt-install</code> as a plain
+          <code>--hostdev pci_0000_XX_XX_X</code>. Functionally identical to
+          <code>managed='yes'</code>; the test harness in
+          <code>tests/test-install-vm.sh</code> uses the same explicit pair so
+          production stack lifecycle (stop before, restart after) is obvious.
+        </div>
+      </div>
+
+      <h3 id="pre-flight">8.1 Pre-flight: free the GPU</h3>
+<pre data-lang="bash"><code class="language-bash">[verify] $ nvidia-smi --query-compute-apps=pid --format=csv,noheader</code></pre>
+      <p>
+        Output must be empty. Anything actively using the GPU (Dev AI Lab
+        containers, CUDA processes, etc.) blocks the detach with "device is in
+        use".
+      </p>
+      <p>Common GPU-holders to stop:</p>
+<pre data-lang="bash"><code class="language-bash"># 1. Production devai stack (if running natively on the host)
+$ cd /path/to/devai && make cache-down
+
+# 2. NVIDIA CUDA MPS daemon (sometimes auto-started by HPC tooling)
+$ sudo lsof /dev/nvidia* 2>/dev/null
+# If nvidia-cuda-mps-control appears, kill it:
+$ sudo pkill -x nvidia-cuda-mps-control || sudo kill &lt;pid&gt;
+
+# 3. nvidia-persistenced (kept-warm GPU initialiser)
+$ sudo systemctl stop nvidia-persistenced 2>/dev/null || true
+
+# 4. Anything else holding /dev/nvidia*
+$ sudo lsof /dev/nvidia* 2>/dev/null   # should be empty after the above</code></pre>
+      <p>If the host runs Dev AI Lab natively, take it down first:</p>
+<pre data-lang="bash"><code class="language-bash">$ cd /path/to/devai && make cache-down</code></pre>
+
+      <h3 id="detach">8.2 Detach the GPU from <code>nvidia</code> and bind it to <code>vfio-pci</code></h3>
+<pre data-lang="bash"><code class="language-bash">$ sudo virsh nodedev-detach pci_0000_02_00_0
+$ sudo virsh nodedev-detach pci_0000_02_00_1
+
+# Confirm both functions flipped
+[verify] $ lspci -nnk -s 02:00.0 | grep 'Kernel driver in use'   # vfio-pci
+[verify] $ lspci -nnk -s 02:00.1 | grep 'Kernel driver in use'   # vfio-pci</code></pre>
+      <p>
+        If either <code>nodedev-detach</code> hangs, return to §8.1: something
+        on the host is still holding the GPU. The kernel unbind blocks until
+        every holder closes its file descriptor.
+      </p>
+
+      <h3 id="define-vm">8.3 Define a minimal smoke VM with the GPU attached</h3>
+<pre data-lang="bash"><code class="language-bash">$ wget -O /var/lib/libvirt/images/debian-13-generic-amd64.qcow2 \
+       https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-amd64.qcow2
+
+$ virt-install \
+      --name vfio-smoke \
+      --memory 2048 --vcpus 2 \
+      --osinfo name=debiantesting \
+      --boot uefi \
+      --disk path=/var/lib/libvirt/images/debian-13-generic-amd64.qcow2,format=qcow2,bus=virtio \
+      --network default \
+      --hostdev pci_0000_02_00_0 \
+      --hostdev pci_0000_02_00_1 \
+      --import --noautoconsole</code></pre>
+      <p>
+        The plain <code>--hostdev pci_0000_XX_XX_X</code> (no sub-options) is
+        what Debian Trixie's <code>virt-install</code> accepts. The device is
+        already in <code>vfio-pci</code> from §8.2, so libvirt just claims it.
+      </p>
+
+      <h3 id="teardown">8.4 Verify and tear down</h3>
+<pre data-lang="bash"><code class="language-bash">[verify] $ virsh list --all                                  # vfio-smoke   running
+[verify] $ virsh dumpxml vfio-smoke | grep -E 'hostdev|address.*type=.pci' | head
+
+$ sleep 15
+$ virsh destroy vfio-smoke
+$ virsh undefine vfio-smoke --nvram                          # keep disk image
+
+# Reattach: rebind GPU + audio function back to `nvidia`
+$ sudo virsh nodedev-reattach pci_0000_02_00_0
+$ sudo virsh nodedev-reattach pci_0000_02_00_1
+
+[verify] $ lspci -nnk -s 02:00.0 | grep 'Kernel driver in use'   # nvidia
+[verify] $ nvidia-smi -L                                          # GPU listed normally</code></pre>
+      <p>
+        That's the smoke passing: nodedev-detach flipped
+        <code>nvidia -&gt; vfio-pci</code>, the VM ran with the GPU,
+        <code>virsh destroy</code> released it, <code>nodedev-reattach</code>
+        flipped it back, and <code>nvidia-smi -L</code> works again.
+      </p>
+
+      <h3 id="recovery-8">8.5 Recovery</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Symptom</th><th>Recovery</th></tr></thead>
+          <tbody>
+            <tr><td><code>virsh start</code> fails with "device in use"</td><td>A process on the host still uses the GPU. Check <code>nvidia-smi --query-compute-apps</code>, <code>lsof /dev/nvidia*</code>, or stop Dev AI Lab.</td></tr>
+            <tr><td><code>virsh start</code> fails with "vfio: device assignment requires CONFIG_VFIO"</td><td>vfio modules not loaded. Run <code>modprobe vfio_pci</code> and re-check <code>lsmod</code>.</td></tr>
+            <tr><td>GPU stuck in vfio-pci after VM destroy (nvidia-smi reports "no devices")</td><td>Some cards don't reset cleanly. Run <code>virsh nodedev-reattach pci_0000_${DGPU_BDF//[:.]/_}</code> manually. If still stuck, reboot. Modern Ampere/Ada/Blackwell cards generally handle this gracefully; older cards are worse.</td></tr>
+            <tr><td><code>Kernel driver in use:</code> shows neither nvidia nor vfio-pci</td><td>The driver chain failed mid-rebind. <code>modprobe -r nvidia_uvm nvidia_drm nvidia_modeset nvidia</code> (in that order) then <code>modprobe nvidia</code>.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- §9 -->
+      <h2 id="state-reference">9. State-of-the-world reference</h2>
+      <p>After §1–§7 succeed, <strong>at idle</strong> (no test VM running):</p>
+<pre data-lang="text"><code>Host (bare metal)
+├── /etc/default/grub                    GRUB_CMDLINE_LINUX_DEFAULT includes
+│                                        intel_iommu=on iommu=pt
+├── /etc/modules-load.d/vfio.conf        vfio, vfio_iommu_type1, vfio_pci loaded
+├── (no /etc/modprobe.d/vfio*.conf —     so vfio-pci does NOT auto-claim any device)
+│   no ids=, no softdep, no blacklist)
+├── /sys/kernel/iommu_groups/&lt;N&gt;/devices/
+│   ├── 0000:02:00.0  (GPU,   driver: nvidia)
+│   └── 0000:02:00.1  (audio, driver: snd_hda_intel)
+│
+├── nvidia driver                        loaded, bound to 02:00.* (host display
+│                                        unaffected — host uses iGPU)
+├── vfio_pci module                      loaded, bound to nothing
+│
+├── libvirtd.service                     active, autostart
+└── default libvirt net + pool           active, autostart</code></pre>
+      <p>
+        <strong>During a test VM run</strong>, libvirt automatically detaches
+        the GPU from nvidia and binds it to vfio-pci. After VM shutdown,
+        libvirt reverses everything and the GPU is back under nvidia. No
+        host-side action required for the switching.
+      </p>
+
+      <!-- §10 -->
+      <h2 id="teardown">10. Tear-down — remove all VFIO setup</h2>
+      <div class="callout danger">
+        <div class="callout-icon">i</div>
+        <div>
+          Tear-down reverts the host to plain bare-metal (no VFIO infrastructure
+          at all). Step 5 requires a reboot. Do not partially apply: removing
+          <code>vfio.conf</code> without rebooting leaves modules loaded for the
+          current session only.
+        </div>
+      </div>
+<pre data-lang="bash"><code class="language-bash"># 1. Remove vfio module-load config
+# rm -f /etc/modules-load.d/vfio.conf
+
+# 2. Remove the IOMMU kernel cmdline params (optional; harmless to keep)
+#    Edit /etc/default/grub, remove `intel_iommu=on iommu=pt`
+#    from GRUB_CMDLINE_LINUX_DEFAULT, then update-grub.
+
+# 3. Regenerate initramfs
+# update-initramfs -u -k all       # Debian / Ubuntu
+# dracut --regenerate-all --force  # Fedora / RHEL / openSUSE
+
+# 4. Remove libvirt + QEMU (optional — they're not actively claiming
+#    the GPU and don't need to be removed unless disk space matters)
+# apt-get remove --purge libvirt-daemon-system libvirt-clients virtinst \
+#                        qemu-system-x86 qemu-utils ovmf
+# (or distro equivalent)
+
+# 5. Reboot
+# systemctl reboot</code></pre>
+      <p>After reboot:</p>
+<pre data-lang="bash"><code class="language-bash">[verify] $ lsmod | grep vfio          # should be empty
+[verify] $ lspci -nnk -s 0000:02:00.0 # Kernel driver in use: nvidia
+[verify] $ nvidia-smi -L              # GPU listed as before</code></pre>
+
+      <!-- §11 -->
+      <h2 id="operator-decisions">11. Decisions left to the operator</h2>
+      <p>
+        The agent must surface these to the operator and wait for an explicit
+        answer rather than choosing autonomously:
+      </p>
+      <ol>
+        <li><strong>Reboot timing.</strong> Phases 3 and 5 require reboots; the
+          agent waits, does not initiate.</li>
+        <li><strong>Storage pool location</strong> (§7). Default is libvirt's
+          <code>/var/lib/libvirt/images/</code>. On a host with the LVM cache
+          pool from <code>INSTALL.md</code> present, the operator may prefer a
+          dedicated LV.</li>
+        <li><strong>Resizable BAR / Above 4G Decoding</strong> in UEFI (§2).
+          Strongly recommended for modern GPUs; some boards lock these behind
+          <code>CSM disabled</code>.</li>
+        <li><strong>Pre-flight stop of Dev AI Lab</strong> (§8.1, before each
+          test VM run). The test harness automates this, but if the operator
+          runs <code>virsh start</code> manually, the production stack must be
+          down first.</li>
+      </ol>
+      <p>For everything else, the agent decides per the procedure above.</p>
+
+      <!-- §12 -->
+      <h2 id="versioning">12. Versioning of this file</h2>
+      <p>When the upstream packages or kernel APIs change, regenerate the relevant section:</p>
+      <ul>
+        <li>§6 package lists — keep in sync with <code>apt-cache search libvirt</code>,
+          <code>dnf search libvirt</code>, etc.</li>
+        <li>§8 <code>virt-install</code> flag set — libvirt occasionally renames
+          <code>--hostdev</code> sub-options across major versions.</li>
+        <li>§10 sysfs paths and module names — stable across kernels.</li>
+      </ul>
+      <p>
+        For the actual <code>INSTALL.md</code> test harness that consumes the
+        host configured here, see <code>tests/test-install-vm.sh</code> (to be
+        written in a separate change after this host setup is in place).
+      </p>
+
+    </div>
+
+    <aside class="toc-floating">
+      <h4>On this page</h4>
+      <ul></ul>
+    </aside>
+  </main>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-core.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/plugins/autoloader/prism-autoloader.min.js"></script>
+<script src="assets/nav.js"></script>
+<script src="assets/widgets.js"></script>
+<script src="assets/site.js"></script>
+</body>
+</html>

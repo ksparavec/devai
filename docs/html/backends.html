@@ -1,0 +1,587 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Inference backends — Dev AI Lab</title>
+<meta name="description" content="Ollama, vLLM, and SGLang behind the gpu-arbiter router. Lifecycle, probe caches, parser plugins, failure-mode taxonomy, and per-session context binding.">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism-tomorrow.min.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="site">
+  <main class="main">
+    <div class="content">
+
+      <header>
+        <span class="pill">Operations · runtime</span>
+        <h1>Inference backends — Ollama, vLLM, SGLang</h1>
+        <p class="lead">
+          DevAI exposes three inference backends behind a single multi-port router
+          (<code>gpu-arbiter</code>). Each backend serves a distinct port; the router
+          enforces GPU mutual exclusion (only one backend uses the GPU at a time),
+          manages the per-request context cap, applies the reasoning policy, and
+          emits the correct backend startup flags (<code>--reasoning-parser</code>,
+          <code>--tool-call-parser</code>) when the probe cache has confirmed values
+          for the model.
+        </p>
+      </header>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Backend</th><th>Port</th><th>Image</th><th>Models</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Ollama</td><td>11434</td><td><code>ollama/ollama:latest</code></td><td>GGUF (Q3/Q4/Q5/Q8/etc.)</td></tr>
+            <tr><td>vLLM</td><td>11435</td><td><code>vllm/vllm-openai:latest-cu130-ubuntu2404</code></td><td>NVFP4, FP8, BF16/FP16 safetensors</td></tr>
+            <tr><td>SGLang</td><td>11436</td><td><code>lmsysorg/sglang:v0.5.10.post1-cu130</code></td><td>NVFP4, FP8, BF16/FP16 safetensors (RadixAttention multi-turn)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout">
+        <div class="callout-icon">i</div>
+        <div>
+          Backend launch-flag <em>names</em> are pinned in <code>deploy/backend-flags.yaml</code>.
+          Run <code>make verify-backend-flags</code> after bumping either image — it dumps
+          <code>--help</code> from the pinned image and asserts every named flag is present.
+        </div>
+      </div>
+
+      <p>
+        All three are reachable via the router from inside the <code>devai-net</code> Podman
+        network. Agents (Claude Code, Aider, Codex, LATE, Open WebUI) talk to the router
+        on the appropriate port; the picker emits the right port based on the chosen
+        model's backend.
+      </p>
+
+      <!-- §1 -->
+      <h2 id="lifecycle">1. Lifecycle</h2>
+
+      <p><code>make cache-up</code> brings up:</p>
+      <ul>
+        <li><strong>Always running</strong>: <code>devai-ollama</code>, <code>devai-router</code>, <code>devai-open-webui</code>, <code>devai-webui-proxy</code>, <code>devai-apt-cache</code>, <code>devai-registry-cache</code>, <code>devai-logger</code>.</li>
+        <li><strong>Idle placeholders</strong>: <code>devai-vllm</code> and <code>devai-sglang</code> start with <code>entrypoint: ["sleep", "infinity"]</code>. They hold the service definition (image, mounts, GPU device, network) but consume no GPU resources.</li>
+      </ul>
+
+      <p>
+        When the first request hits port 11435 (vLLM) or 11436 (SGLang), the router:
+      </p>
+      <ol>
+        <li><strong>Stops the other GPU-using backends</strong> — <code>devai-ollama</code> is unloaded via <code>/api/generate</code> with <code>keep_alive=0</code>; vLLM/SGLang containers are stopped via libpod.</li>
+        <li><strong>Removes the placeholder</strong> <code>devai-vllm</code> / <code>devai-sglang</code> container.</li>
+        <li>
+          <strong>Recreates it via libpod</strong> with a dynamic entrypoint that bakes in the chosen model path,
+          <code>--max-model-len</code> / <code>--context-length</code>, and
+          <code>--gpu-memory-utilization</code> / <code>--mem-fraction-static</code> derived from the probe cache
+          and <code>MAX_CONTEXT_LEN</code>. For vLLM the entrypoint also always passes
+          <code>--kv-cache-dtype fp8</code> — fp16 KV at 128K would push NVFP4 checkpoints past 24 GiB on the
+          reference card. If the model has probe-verified <code>reasoning_parser</code> and/or
+          <code>tool_parser</code>, the router injects <code>--reasoning-parser &lt;value&gt;</code>
+          (vLLM also adds <code>--enable-auto-tool-choice</code>) and
+          <code>--tool-call-parser &lt;value&gt;</code>. Finally, any <code>engine_flags</code> /
+          <code>engine_env</code> from <code>deploy/recovery-flags.json</code> keyed by the canonical model name
+          are appended (e.g. <code>--enforce-eager</code> for Nemotron-3-Nano at 128K — see
+          <a href="router.html">router.md "Per-model recovery flags"</a>).
+        </li>
+        <li><strong>Polls <code>/health</code></strong> until the container becomes ready (default 600s for NVFP4 cold-start with CUDA graph compilation, override via <code>HEALTH_TIMEOUT_SECONDS</code> env on the router).</li>
+        <li><strong>Applies the reasoning policy and tool-stripping rules</strong> to the request.</li>
+        <li><strong>Proxies the original request through.</strong></li>
+      </ol>
+
+      <p>
+        A second request that switches the <strong>model</strong>, <strong>context cap</strong>, or <strong>reasoning override</strong> triggers another recreate. The router tracks <code>currentModel</code>, <code>currentContext</code>, and <code>currentReasoningOverride</code> per backend; any change → recreate.
+      </p>
+
+      <figure>
+        <svg viewBox="0 0 940 460" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Backend container state machine">
+          <defs>
+            <marker id="bArr" markerWidth="10" markerHeight="8" refX="10" refY="4" orient="auto">
+              <path d="M0,0 L10,4 L0,8 Z" fill="var(--accent)"/>
+            </marker>
+            <marker id="bArrW" markerWidth="10" markerHeight="8" refX="10" refY="4" orient="auto">
+              <path d="M0,0 L10,4 L0,8 Z" fill="var(--warn)"/>
+            </marker>
+            <marker id="bArrG" markerWidth="10" markerHeight="8" refX="10" refY="4" orient="auto">
+              <path d="M0,0 L10,4 L0,8 Z" fill="var(--good)"/>
+            </marker>
+          </defs>
+
+          <text x="470" y="22" text-anchor="middle" fill="var(--text)" font-size="14" font-weight="700">
+            On-demand container lifecycle (vLLM / SGLang)
+          </text>
+
+          <!-- State 1: placeholder -->
+          <g>
+            <rect x="30" y="60" width="200" height="80" rx="10" fill="var(--bg-elev)" stroke="var(--border-strong)" stroke-width="2"/>
+            <text x="130" y="88" text-anchor="middle" fill="var(--text)" font-size="13" font-weight="700">Placeholder</text>
+            <text x="130" y="108" text-anchor="middle" fill="var(--text-muted)" font-family="JetBrains Mono" font-size="10">entrypoint: sleep infinity</text>
+            <text x="130" y="125" text-anchor="middle" fill="var(--text-muted)" font-size="11">no GPU, no health</text>
+          </g>
+
+          <!-- Arrow: request arrives -->
+          <path d="M 230 100 h 60" stroke="var(--accent)" stroke-width="2" fill="none" marker-end="url(#bArr)"/>
+          <text x="260" y="92" text-anchor="middle" fill="var(--accent)" font-size="11" font-weight="600">request</text>
+
+          <!-- State 2: arbitrate -->
+          <g>
+            <rect x="290" y="60" width="200" height="80" rx="10" fill="rgba(240,180,41,0.12)" stroke="var(--warn)" stroke-width="2"/>
+            <text x="390" y="88" text-anchor="middle" fill="var(--warn)" font-size="13" font-weight="700">Stop other backends</text>
+            <text x="390" y="108" text-anchor="middle" fill="var(--text-muted)" font-size="11">Ollama: keep_alive=0</text>
+            <text x="390" y="125" text-anchor="middle" fill="var(--text-muted)" font-size="11">vLLM/SGLang: libpod stop</text>
+          </g>
+
+          <!-- Arrow: drain -->
+          <path d="M 490 100 h 60" stroke="var(--warn)" stroke-width="2" fill="none" marker-end="url(#bArrW)"/>
+
+          <!-- State 3: recreate -->
+          <g>
+            <rect x="550" y="60" width="220" height="80" rx="10" fill="rgba(91,141,239,0.15)" stroke="var(--accent)" stroke-width="2"/>
+            <text x="660" y="84" text-anchor="middle" fill="var(--accent)" font-size="13" font-weight="700">Recreate</text>
+            <text x="660" y="102" text-anchor="middle" fill="var(--text-muted)" font-family="JetBrains Mono" font-size="10">--max-model-len</text>
+            <text x="660" y="116" text-anchor="middle" fill="var(--text-muted)" font-family="JetBrains Mono" font-size="10">--gpu-memory-utilization</text>
+            <text x="660" y="130" text-anchor="middle" fill="var(--text-muted)" font-family="JetBrains Mono" font-size="10">--reasoning-parser, --tool-call-parser</text>
+          </g>
+
+          <!-- Arrow down: poll health -->
+          <path d="M 660 140 v 40" stroke="var(--accent)" stroke-width="2" fill="none" marker-end="url(#bArr)"/>
+          <text x="700" y="165" fill="var(--accent)" font-size="11" font-weight="600">poll /health</text>
+
+          <!-- State 4: ready -->
+          <g>
+            <rect x="550" y="180" width="220" height="80" rx="10" fill="rgba(126,231,135,0.15)" stroke="var(--good)" stroke-width="2"/>
+            <text x="660" y="208" text-anchor="middle" fill="var(--good)" font-size="13" font-weight="700">Ready · serving</text>
+            <text x="660" y="226" text-anchor="middle" fill="var(--text-muted)" font-size="11">currentModel</text>
+            <text x="660" y="241" text-anchor="middle" fill="var(--text-muted)" font-size="11">currentContext · currentReasoningOverride</text>
+          </g>
+
+          <!-- Arrow back: same backend / same model -->
+          <path d="M 550 220 h -60 v -90 h -10" stroke="var(--good)" stroke-width="1.5" fill="none" marker-end="url(#bArrG)" stroke-dasharray="4 3"/>
+          <text x="450" y="135" text-anchor="middle" fill="var(--good)" font-size="10" font-style="italic">proxy through (no change)</text>
+
+          <!-- Arrow: model/ctx/reasoning change -->
+          <path d="M 550 240 h -200 v -100" stroke="var(--warn)" stroke-width="2" fill="none" marker-end="url(#bArrW)"/>
+          <text x="425" y="200" text-anchor="middle" fill="var(--warn)" font-size="11" font-weight="600">model/ctx/reasoning change</text>
+          <text x="425" y="215" text-anchor="middle" fill="var(--warn)" font-size="10" font-style="italic">→ recreate</text>
+
+          <!-- Arrow down: idle timeout -->
+          <path d="M 660 260 v 60" stroke="var(--text-muted)" stroke-width="2" fill="none" marker-end="url(#bArr)" stroke-dasharray="4 3"/>
+          <text x="720" y="295" fill="var(--text-muted)" font-size="11">IDLE_TIMEOUT_SECONDS</text>
+
+          <!-- State 5: stopped / back to placeholder -->
+          <g>
+            <rect x="550" y="320" width="220" height="80" rx="10" fill="var(--bg-elev)" stroke="var(--border-strong)" stroke-width="2"/>
+            <text x="660" y="348" text-anchor="middle" fill="var(--text)" font-size="13" font-weight="700">Stopped → Placeholder</text>
+            <text x="660" y="368" text-anchor="middle" fill="var(--text-muted)" font-size="11">libpod removes container</text>
+            <text x="660" y="384" text-anchor="middle" fill="var(--text-muted)" font-size="11">re-armed sleep infinity</text>
+          </g>
+
+          <!-- Loop back from stopped to placeholder -->
+          <path d="M 550 360 h -300 v -260 h -20" stroke="var(--text-muted)" stroke-width="1.5" fill="none" marker-end="url(#bArr)" stroke-dasharray="3 3"/>
+          <text x="290" y="240" text-anchor="middle" fill="var(--text-muted)" font-size="10" font-style="italic">next request restarts the cycle</text>
+
+          <!-- Footer note -->
+          <text x="470" y="435" text-anchor="middle" fill="var(--text-muted)" font-size="11" font-style="italic">
+            Ollama always runs and unloads its own model via keep_alive=0; only vLLM/SGLang containers cycle in and out of "placeholder" state.
+          </text>
+        </svg>
+        <figcaption>vLLM and SGLang are recreated on-demand: placeholder → arbitrate → recreate → ready → idle → stopped → placeholder again.</figcaption>
+      </figure>
+
+      <!-- §2 -->
+      <h2 id="probing">2. Probing — building the cache</h2>
+
+      <p>Each backend has its own probe cache:</p>
+      <ul>
+        <li><code>deploy/.ollama-reasoning-cache.json</code> — schema v3, digest-keyed.</li>
+        <li><code>deploy/.vllm-reasoning-cache.json</code> — schema v2, repo+sha-keyed.</li>
+        <li><code>deploy/.sglang-reasoning-cache.json</code> — schema v2, repo+sha-keyed.</li>
+      </ul>
+
+      <p>Schema v2 (vLLM/SGLang) added three top-level fields per entry:</p>
+      <ul>
+        <li><code>reasoning_parser</code> — backend startup flag value (e.g. <code>qwen3</code>) that produced a <code>structured</code> round-trip in Probe A. Null when the curated family hint did not pan out, when no hint was supplied, or when the model's capability is <code>inline</code>/<code>unsupported</code>.</li>
+        <li><code>tool_parser</code> — backend startup flag value (e.g. <code>hermes</code>, <code>qwen25</code>) that produced a parseable tool call in Probe B. Null when no curated hint, or when the round-trip failed.</li>
+        <li><code>disable_verified</code> — true iff Probe C suppressed <code>reasoning_content</code> on a structured-capable model. Mirrors Ollama's <code>disable_verified</code>; gates the router's "off" rewrite.</li>
+      </ul>
+
+      <div class="callout warn">
+        <div class="callout-icon">i</div>
+        <div>
+          The picker hides any model that lacks a <code>fits=true</code> probe at the host
+          VRAM band. The router synthesizes <code>/v1/models</code> rows from these caches.
+          Without probes, models are invisible.
+        </div>
+      </div>
+
+      <h3 id="procedure">2.1 Procedure</h3>
+
+      <pre data-lang="bash"><code class="language-bash"># 1. Ollama probing (Make-orchestrated, runs live with Ollama container)
+#    Each PROBE_VRAMS band recreates devai-ollama with OLLAMA_GPU_OVERHEAD
+#    set so the daemon behaves as if it had only that VRAM available.
+make probe                                          # all bands x all contexts
+make probe PROBE_VRAMS=24G PROBE_CONTEXTS=32K      # one band, one tier
+make probe PROBE_FORCE=1                           # re-probe everything
+
+# 2. HF probing (vLLM/SGLang) -- requires exclusive GPU access
+#    Stop the live router and ollama first.
+make cache-down
+
+# 3. For each HF backend, launch a probe container and run all cells.
+#    For each (model, vram_band, ctx_tier) cell:
+#      A) fit + reasoning      -- classify capability, snapshot nvidia-smi
+#      B) tool-call            -- only when parsers.&lt;backend&gt;.tool is set
+#      C) disable verification -- only when Probe A produced `structured`;
+#                                verifies suppression of `reasoning_content`
+#    Each cell takes 1-3 minutes; extra probes add a few seconds each.
+make probe-vllm                                     # all vLLM models, all cells
+make probe-sglang                                   # all SGLang models, all cells
+make probe-vllm PROBE_REPO=Llama                   # filter to matching models
+make probe-sglang PROBE_CONTEXTS=128K              # single context tier
+
+# 4. Restart the stack -- router reloads all three caches at boot.
+make cache-up</code></pre>
+
+      <h3 id="curating-parser-hints">2.2 Curating parser hints</h3>
+
+      <p>
+        Reasoning and tool-call parsers are per-architecture. The curated choices live
+        in <code>scripts/model-families.yaml</code> under each family's <code>parsers:</code>
+        block:
+      </p>
+
+      <pre data-lang="yaml"><code class="language-yaml">- name: qwen3.5
+  ...
+  parsers:
+    vllm:
+      reasoning: qwen3
+      tool: hermes
+    sglang:
+      reasoning: qwen3
+      tool: qwen25</code></pre>
+
+      <p>
+        <code>make catalog-regen</code> propagates these into per-row <code>parsers:</code>
+        blocks in <code>deploy/models.yaml</code>. The probers read the row's block and
+        pass <code>--reasoning-parser</code> / <code>--tool-call-parser</code> (vLLM also
+        adds <code>--enable-auto-tool-choice</code>) to the launch. A field is only
+        confirmed in the cache when the corresponding round-trip succeeds — a curated
+        hint that the model doesn't actually honour produces a null cache entry, and
+        the router launches without the flag.
+      </p>
+
+      <h3 id="probe-knobs">2.3 Probe knobs</h3>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Env / Make var</th><th>Effect</th></tr></thead>
+          <tbody>
+            <tr><td><code>PROBE_VRAMS=16G,24G</code></td><td>Ollama target bands</td></tr>
+            <tr><td><code>PROBE_VRAMS_VLLM=24G</code></td><td>vLLM target bands</td></tr>
+            <tr><td><code>PROBE_VRAMS_SGLANG=24G</code></td><td>SGLang target bands</td></tr>
+            <tr><td><code>PROBE_CONTEXTS=32K,64K,128K,256K</code></td><td>Context tiers (all backends)</td></tr>
+            <tr><td><code>PROBE_REPO=Llama-3.1-8B</code></td><td>Regex filter on catalog rows (HF probers only)</td></tr>
+            <tr><td><code>PROBE_FORCE=1</code></td><td>Re-probe every cell even if cached</td></tr>
+            <tr><td><code>PROBE_FORCE_ARCH=1</code></td><td>Re-probe top-level capability/arch fields</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 id="vllm-plugins">2.4 Custom vLLM parser plugins</h3>
+
+      <p>
+        Some models emit tool calls or reasoning in a format that no built-in vLLM
+        parser handles. The DeepSeek R1 distills are the standing example: their
+        chat template uses DeepSeek-V3 boundary markers (<code>&lt;|tool_call_begin|&gt;</code>
+        etc.), but they inherit the Qwen2 / Llama-3 tokenizer where those markers
+        aren't atomic vocab entries. vLLM's built-in <code>deepseek_v3</code> /
+        <code>_v31</code> / <code>_v32</code> parsers do <code>vocab.get(&lt;token&gt;)</code>
+        at startup and crash with HTTP 500 on every tool-using request.
+      </p>
+
+      <p>
+        The fix is a parser plugin: a Python file that registers a parser with vLLM's
+        <code>ToolParserManager</code>, loaded via the
+        <code>--tool-parser-plugin &lt;abs-path&gt;</code> flag. DevAI handles the wiring
+        so adding a new plugin is a two-step change:
+      </p>
+
+      <ol>
+        <li>Drop the parser file in <code>scripts/vllm_plugins/</code>.</li>
+        <li>
+          Add one entry in <code>deploy/vllm-plugins.json</code>:
+          <pre data-lang="json"><code class="language-json">{
+  "plugins": {
+    "&lt;parser_name&gt;": {
+      "kind": "tool",
+      "file": "&lt;basename&gt;.py"
+    }
+  }
+}</code></pre>
+        </li>
+        <li>Reference <code>&lt;parser_name&gt;</code> from a family's <code>parsers.vllm.tool</code> (or <code>parsers.vllm.reasoning</code>) in <code>scripts/model-families.yaml</code>, then <code>make catalog-regen</code> and re-probe.</li>
+      </ol>
+
+      <p>
+        Both the prober (<code>scripts/_probe_hf_common.py</code>) and the router
+        (<code>gpu-arbiter/main.go</code>) read the registry. When a parser name
+        resolves to a plugin entry they:
+      </p>
+      <ul>
+        <li>bind-mount <code>scripts/vllm_plugins/</code> into the launched vLLM container at the registry's <code>container_dir</code> (default <code>/etc/devai/vllm-plugins</code>);</li>
+        <li>emit <code>--tool-parser-plugin &lt;abs&gt;</code> (or <code>--reasoning-parser-plugin</code>) <em>before</em> the matching <code>--tool-call-parser &lt;name&gt;</code> flag — vLLM resolves parser names at flag-parse time, so the plugin module has to be loaded by then.</li>
+      </ul>
+
+      <p>
+        Names absent from the registry pass through as built-in vLLM parsers (no
+        plugin flag, no bind-mount). The behaviour for built-ins is identical to
+        pre-plugin builds.
+      </p>
+
+      <div class="callout danger">
+        <div class="callout-icon">i</div>
+        <div>
+          The router learns the host path of the plugin directory via
+          <code>VLLM_PLUGINS_HOST_DIR</code> (set by the Makefile to
+          <code>$(abspath scripts/vllm_plugins)</code> and exported into compose). When
+          that env is empty and a model still resolves to a plugin, the router fails
+          the recreate with an actionable error rather than launching without the
+          plugin file accessible.
+        </div>
+      </div>
+
+      <p>
+        SGLang has no equivalent: SGLang's plugin model is Python-import based
+        (register a class via SGLang's detector framework), not file-path based, so
+        a separate plugin would be needed per model. SGLang traffic for plugin-only
+        families runs without tool support until that lands.
+      </p>
+
+      <h3 id="r1-distill-notes">2.5 Operational notes — R1-Distill family</h3>
+
+      <p>
+        Both R1 distills share the same chat template and the same plugin, but their
+        tool-calling <strong>behaviour</strong> differs sharply because of base-model
+        training. Verified end-to-end through the router with
+        <code>tool_choice: "auto"</code> and one tool:
+      </p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Model</th><th>Base tokenizer</th><th><code>tool_mode</code></th><th>Completion tokens to call</th><th>Reasoning preamble</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>DeepSeek-R1-Distill-Llama-8B</code></td><td>Llama-3</td><td>forced</td><td><strong>5</strong></td><td>none — calls immediately</td></tr>
+            <tr><td><code>DeepSeek-R1-Distill-Qwen-7B</code></td><td>Qwen-2</td><td>forced</td><td>~525</td><td>yes — long CoT before the call</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout good">
+        <div class="callout-icon">i</div>
+        <div>
+          Both ended up <code>tool_mode=forced</code> (the auto-choice probe didn't elicit
+          a call), so the router's promote rule kicks in for either. The
+          <strong>Llama-8B distill is much more usable for tool-calling agents</strong> —
+          it's effectively non-reasoning when handed a single tool. Prefer it over the
+          Qwen-7B distill when latency matters and the use case doesn't need reasoning
+          depth. The Qwen-7B distill is better when you want explicit chain-of-thought,
+          but agents must budget for ~500-token preamble per tool call.
+        </div>
+      </div>
+
+      <p>
+        For multi-tool use cases on either distill, the router rejects with HTTP 400
+        (<code>tool_choice_pinning_required</code>). Pin client-side or route to a
+        <code>tool_mode=auto</code> model (<code>Qwen3.5-9B-Q8</code>,
+        <code>Qwen3-8B-NVFP4</code>, <code>Llama-3.1-8B-Instruct-NVFP4</code>) that
+        handles auto choice reliably.
+      </p>
+
+      <!-- §3 -->
+      <h2 id="cache-hygiene">3. Cache hygiene</h2>
+
+      <h3 id="hf-resha">3.1 vLLM / SGLang — re-probe when sha changes</h3>
+
+      <p>
+        The HF probe cache is keyed on <code>&lt;repo&gt;@&lt;sha&gt;</code> where
+        <code>sha</code> is the first 12 chars of HuggingFace's commit SHA at generation
+        time (<code>make catalog-regen</code>). When upstream rebases the repo:
+      </p>
+      <ol>
+        <li><code>make catalog-regen</code> produces a new sha.</li>
+        <li>The old cache entry is now an orphan (different key) and ignored.</li>
+        <li>Run <code>make probe-vllm</code> / <code>make probe-sglang</code> to populate the new key.</li>
+      </ol>
+
+      <p>
+        Old entries persist until manually pruned. The router synthesizes only from
+        the latest catalog sha — old entries don't affect serving.
+      </p>
+
+      <h3 id="ollama-redigest">3.2 Ollama — re-probe when digest changes</h3>
+
+      <p>
+        Ollama models are identified by their manifest digest. Pulling a new
+        quantization or alias changes the digest; the prober keys on digest directly,
+        so re-running <code>make probe</code> populates new entries.
+      </p>
+
+      <!-- §4 -->
+      <h2 id="failure-taxonomy">4. Failure-mode taxonomy</h2>
+
+      <p>When a probe records <code>fits: false</code>, <code>evidence.kind</code> tells you why:</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th><code>kind</code></th><th>Meaning</th><th>Action</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>arch</code></td>
+              <td>Model's architecture (<code>config.json</code>) is rejected by the backend's runtime. Custom-code archs (e.g. <code>auto_map</code>-only models) hit this.</td>
+              <td>Wait for upstream support, or pick a different model. The probe records <code>capability: "unsupported_arch"</code> and the picker hides the row permanently.</td>
+            </tr>
+            <tr>
+              <td><code>quant</code></td>
+              <td>Quantization scheme (FP8/GPTQ/AWQ) not supported on this hardware.</td>
+              <td>Pick a different quant of the same model.</td>
+            </tr>
+            <tr>
+              <td><code>oom_startup</code></td>
+              <td>Container failed during model load — weights + KV at requested ctx exceed the GPU memory budget.</td>
+              <td>Reduce <code>MAX_CONTEXT_LEN</code>, pick a smaller quant, or run on a larger GPU.</td>
+            </tr>
+            <tr>
+              <td><code>oom_chat</code></td>
+              <td>Container started but failed on the first chat round-trip — typically CUDA-graph capture OOM.</td>
+              <td>Same as <code>oom_startup</code>; the budget is too tight for the model + ctx.</td>
+            </tr>
+            <tr>
+              <td><code>clamped_ctx</code></td>
+              <td>Backend silently capped <code>actual_max_model_len</code> below the requested ctx — typically a model with a hard architectural ceiling lower than the operator-requested tier.</td>
+              <td>Lower the requested ctx tier or accept the cap.</td>
+            </tr>
+            <tr>
+              <td><code>infra</code></td>
+              <td>Container failed for non-model reasons — image missing nvcc, network error, tokenizer download stall, podman issue. The log excerpt usually shows what.</td>
+              <td>Fix the environment; this is not a model-fitness signal.</td>
+            </tr>
+            <tr>
+              <td><code>implied_spill</code></td>
+              <td>Larger ctx tier filled in by the prober without launching — set when a smaller ctx at the same VRAM band already failed.</td>
+              <td>Skip; smaller ctx fit is the actionable upper bound.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>
+        The <code>evidence.matched_pattern</code> field (when present) names the
+        substring that triggered the classification — useful for auditing why a
+        particular launch was tagged a particular way.
+      </p>
+
+      <!-- §5 -->
+      <h2 id="coordination">5. Coordination — only one backend at a time</h2>
+
+      <p>
+        The router serializes GPU access via <code>stopOtherBackends</code>. A request
+        for backend X drains and stops all other GPU-using backends before X starts.
+        Concurrent vLLM + SGLang on the same GPU is not supported.
+      </p>
+
+      <div class="callout warn">
+        <div class="callout-icon">i</div>
+        <div>
+          For probing, this constraint is enforced by the prober itself: each probe
+          driver refuses to run if <code>devai-router</code>, <code>devai-vllm</code>, or
+          <code>devai-sglang</code> is up. Always <code>make cache-down</code> before
+          probing.
+        </div>
+      </div>
+
+      <!-- §6 -->
+      <h2 id="per-session">6. Per-session context binding &amp; reasoning overrides</h2>
+
+      <p>
+        When the picker selects a model + context tier (+ reasoning override), each
+        backend handles the binding differently:
+      </p>
+
+      <div class="card-grid">
+        <div class="card">
+          <h4>Ollama</h4>
+          <p>
+            The picker emits the parent name (e.g., <code>qwen3.5:9b-q8_0</code>), or
+            with a reasoning override suffix (e.g., <code>qwen3.5:9b-q8_0::nothink</code>
+            to suppress thinking even if the model supports it). KV cache is allocated
+            dynamically per request from the <code>OLLAMA_CONTEXT_LENGTH</code> global
+            ceiling (default 256K). The <code>/api/chat</code> and
+            <code>/api/generate</code> endpoints honour <code>options.num_ctx</code>
+            injected by the router; the OpenAI- and Anthropic-compat layers ignore it
+            and use the global ceiling.
+          </p>
+        </div>
+        <div class="card">
+          <h4>vLLM / SGLang</h4>
+          <p>
+            The picker emits <code>&lt;name&gt;@&lt;ctx&gt;</code> (e.g.,
+            <code>Llama-3.1-8B-Instruct-NVFP4@32768</code>), or with a reasoning
+            override prefix (e.g.,
+            <code>Llama-3.1-8B-Instruct-NVFP4::low@32768</code> to set reasoning
+            effort to <code>low</code>). The router's <code>parseCtxOverride</code>
+            strips <code>@&lt;ctx&gt;</code> first, then
+            <code>parseReasoningOverride</code> strips <code>::&lt;reasoning&gt;</code>,
+            rewrites the body's <code>model</code> field to the clean name, applies
+            the reasoning policy, and triggers a recreate when
+            <code>currentContext</code> or <code>currentReasoningOverride</code>
+            differs. No client-side tag materialization needed.
+          </p>
+        </div>
+      </div>
+
+      <p>
+        Valid reasoning suffixes: <code>::off</code>, <code>::auto</code>,
+        <code>::low</code>, <code>::medium</code>, <code>::high</code>,
+        <code>::nothink</code> (Ollama only; suppresses thinking).
+      </p>
+
+      <div class="callout good">
+        <div class="callout-icon">i</div>
+        <div>
+          Both flows are transparent to the agent CLI — the picker emits the right
+          serving name and the router handles parsing and lifecycle management.
+        </div>
+      </div>
+
+      <!-- §7 -->
+      <h2 id="related">7. Related documents</h2>
+      <ul>
+        <li><a href="router.html">router</a> — full request rewrite chain (override parsing → reasoning policy → tool_choice promotion → tool stripping → ctx injection), GPU exclusion, idle timeout, per-model recovery flags.</li>
+        <li><a href="nvfp4-coldstart.html">nvfp4-coldstart</a> — why <code>HEALTH_TIMEOUT_SECONDS=600</code>, what happens during the 600s health probe window.</li>
+        <li><a href="bench-results.html">bench-results</a> — measured TPS / TTFT / VRAM per (model, backend, ctx) cell, sourced from the probe + bench caches described above.</li>
+      </ul>
+
+    </div>
+
+    <aside class="toc-floating">
+      <h4>On this page</h4>
+      <ul></ul>
+    </aside>
+  </main>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-core.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/plugins/autoloader/prism-autoloader.min.js"></script>
+<script src="assets/nav.js"></script>
+<script src="assets/widgets.js"></script>
+<script src="assets/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,788 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PagedAttention and vLLM internals — Dev AI Lab</title>
+<meta name="description" content="Why vLLM and SGLang use an OS-style page-table for KV cache. Internal and external fragmentation, fixed-size blocks, prefix caching, continuous batching, RadixAttention.">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism-tomorrow.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="site">
+  <main class="main">
+    <div class="content">
+
+      <header>
+        <span class="pill">Beginner's guide · runtime internals</span>
+        <h1>PagedAttention and vLLM internals</h1>
+        <p class="lead">
+          The trick that makes vLLM (and SGLang, and every other modern inference engine
+          that copied them) actually faster and more memory-efficient than the naive
+          approach &mdash; and the reason this project's docs can talk about an
+          <em>"elastic KV pool"</em> that fills the remaining VRAM after weights and
+          overhead.
+        </p>
+      </header>
+
+      <div class="callout">
+        <div class="callout-icon">i</div>
+        <div>
+          <strong>Prerequisites:</strong> if you have read
+          <a href="attention-and-the-transformer.html">attention-and-the-transformer</a>
+          §6 (KV cache mechanics) and
+          <a href="nvfp4-coldstart.html">nvfp4-coldstart</a> §2 (VRAM budget), you
+          already know <em>what</em> the KV cache is and <em>that</em> the elastic pool
+          fills remaining VRAM. This doc explains <em>why</em> that pool can be "elastic"
+          at all, and what magic vLLM does to make it work.
+        </div>
+      </div>
+
+      <!-- §1 -->
+      <h2 id="problem">1. The problem PagedAttention solves</h2>
+      <p>
+        Recall from
+        <a href="attention-and-the-transformer.html#kv-cache">attention-and-the-transformer §6</a>
+        that during decode, every layer of the model maintains a per-sequence KV
+        cache: one (K, V) pair per token in the sequence so far.
+      </p>
+      <p>The <strong>naive approach</strong> to storing this in VRAM:</p>
+      <pre data-lang="text"><code>for each running sequence s:
+    allocate two contiguous tensors of shape
+    [num_layers, num_kv_heads, max_seq_len, head_dim]
+    -- one for K, one for V</code></pre>
+
+      <p>
+        For Qwen3-8B with FP8 KV at 128 K context, that is
+        <code>36 x 8 x 131072 x 128 x 1 B = 4.5 GB</code> for K plus another 4.5 GB for
+        V &mdash; <strong>9 GB contiguous per sequence</strong>. The runtime has no idea
+        how long the sequence will actually become at the time it allocates.
+      </p>
+
+      <p>This is the source of two real problems:</p>
+
+      <h3 id="internal-frag">1.1 Internal fragmentation</h3>
+      <p>
+        You allocate 9 GB but generate only 1000 tokens. Then 8.93 GB of that
+        allocation sits unused for the entire lifetime of the request. On a 24 GB card,
+        you can host <em>one</em> sequence with up to ~14 GB headroom total &mdash;
+        meaning <em>zero</em> concurrent sequences if you reserve the worst case.
+      </p>
+
+      <h3 id="external-frag">1.2 External fragmentation</h3>
+      <p>
+        Sequence A allocates 9 GB, runs, finishes, freed. Sequence B allocates 9 GB. So
+        far so good. But if A and B don't fit back-to-back in the freed slot, you
+        fragment the heap and lose serving capacity even with bytes still nominally
+        available.
+      </p>
+
+      <p>
+        The original 2023 vLLM paper (Kwon <em>et al.</em>, <em>Efficient Memory
+        Management for Large Language Model Serving with PagedAttention</em>, SOSP 2023,
+        <a href="https://arxiv.org/abs/2309.06180">arXiv:2309.06180</a>) benchmarked
+        this and found <strong>60-80 % of allocated KV memory was wasted</strong> in
+        production serving with the naive scheme.
+      </p>
+
+      <figure>
+        <svg viewBox="0 0 800 500" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Naive vs paged KV allocation">
+          <defs>
+            <marker id="arrPA" markerWidth="10" markerHeight="8" refX="10" refY="4" orient="auto">
+              <path d="M0,0 L10,4 L0,8 Z" fill="var(--accent)"/>
+            </marker>
+            <pattern id="hatchWaste" patternUnits="userSpaceOnUse" width="6" height="6" patternTransform="rotate(45)">
+              <line x1="0" y1="0" x2="0" y2="6" stroke="var(--danger)" stroke-width="2"/>
+            </pattern>
+          </defs>
+
+          <!-- Panel A: Naive contiguous allocation -->
+          <g>
+            <text x="20" y="22" fill="var(--text)" font-size="14" font-weight="700">A. Naive contiguous allocation</text>
+            <text x="20" y="40" fill="var(--text-muted)" font-size="11" font-style="italic">Each sequence reserves worst-case contiguous range up front.</text>
+
+            <!-- VRAM strip -->
+            <text x="20" y="65" fill="var(--text-muted)" font-family="JetBrains Mono" font-size="11">VRAM (KV region)</text>
+
+            <!-- Seq A: 9 GB reserved, only ~3 GB used -->
+            <g>
+              <rect x="20" y="75" width="220" height="40" fill="var(--good)" stroke="var(--border-strong)"/>
+              <rect x="100" y="75" width="140" height="40" fill="url(#hatchWaste)" stroke="var(--border-strong)"/>
+              <text x="60" y="100" text-anchor="middle" fill="#0a0f15" font-size="11" font-weight="700">Seq A used</text>
+              <text x="170" y="100" text-anchor="middle" fill="var(--danger)" font-size="11" font-weight="700">wasted (internal frag)</text>
+            </g>
+
+            <!-- Seq B: 9 GB reserved, only ~2 GB used -->
+            <g>
+              <rect x="240" y="75" width="220" height="40" fill="var(--good)" stroke="var(--border-strong)"/>
+              <rect x="305" y="75" width="155" height="40" fill="url(#hatchWaste)" stroke="var(--border-strong)"/>
+              <text x="272" y="100" text-anchor="middle" fill="#0a0f15" font-size="11" font-weight="700">B used</text>
+              <text x="382" y="100" text-anchor="middle" fill="var(--danger)" font-size="11" font-weight="700">wasted</text>
+            </g>
+
+            <!-- Seq C: would need 9 GB but only ~6 GB free -->
+            <g>
+              <rect x="460" y="75" width="200" height="40" fill="var(--bg-code)" stroke="var(--border-strong)"/>
+              <text x="560" y="100" text-anchor="middle" fill="var(--text-muted)" font-size="11" font-weight="600">free (220 px) -- 6 GB</text>
+            </g>
+
+            <!-- Seq C waiting -->
+            <rect x="670" y="75" width="110" height="40" fill="rgba(240,180,41,0.18)" stroke="var(--warn)" stroke-dasharray="4 3"/>
+            <text x="725" y="100" text-anchor="middle" fill="var(--warn)" font-size="11" font-weight="700">Seq C rejected</text>
+
+            <!-- Annotation: external frag -->
+            <path d="M 560 120 v 18" stroke="var(--danger)" stroke-width="1.5" fill="none" marker-end="url(#arrPA)"/>
+            <text x="560" y="155" text-anchor="middle" fill="var(--danger)" font-size="11" font-weight="700">external frag:</text>
+            <text x="560" y="170" text-anchor="middle" fill="var(--danger)" font-size="11">6 GB free but C needs 9 GB contiguous</text>
+
+            <text x="40" y="200" fill="var(--text-muted)" font-size="11">
+              Result: ~60-80 % of KV memory wasted (Kwon et al. 2023).
+            </text>
+          </g>
+
+          <!-- Divider -->
+          <line x1="20" y1="225" x2="780" y2="225" stroke="var(--border-strong)" stroke-width="1" stroke-dasharray="4 3"/>
+
+          <!-- Panel B: Paged allocation -->
+          <g transform="translate(0, 240)">
+            <text x="20" y="22" fill="var(--text)" font-size="14" font-weight="700">B. Paged allocation (vLLM)</text>
+            <text x="20" y="40" fill="var(--text-muted)" font-size="11" font-style="italic">Single pool of fixed-size blocks; each sequence holds a block table of indices.</text>
+
+            <!-- Block pool: 32 blocks of 20px each -->
+            <text x="20" y="65" fill="var(--text-muted)" font-family="JetBrains Mono" font-size="11">Block pool (block_size = 16 tokens)</text>
+            <g font-family="JetBrains Mono" font-size="9">
+              <!-- 32 blocks -->
+              <g id="blocks">
+                <!-- Row 1: indices 0..15 -->
+              </g>
+            </g>
+
+            <!-- Draw 32 blocks manually with colored fills -->
+            <g>
+              <!-- We'll show two sequences: Seq A uses blocks 2, 7, 11, 19; Seq B uses 0, 4, 14, 22, 28 -->
+              <!-- block index | x position | fill -->
+              <!-- 0 -->
+              <rect x="20"  y="75" width="22" height="22" fill="var(--accent)" stroke="var(--border-strong)"/>
+              <text x="31"  y="91" text-anchor="middle" fill="#0a0f15" font-weight="700">0</text>
+              <rect x="44"  y="75" width="22" height="22" fill="var(--bg-code)" stroke="var(--border-strong)"/>
+              <text x="55"  y="91" text-anchor="middle" fill="var(--text-muted)">1</text>
+              <rect x="68"  y="75" width="22" height="22" fill="var(--good)" stroke="var(--border-strong)"/>
+              <text x="79"  y="91" text-anchor="middle" fill="#0a0f15" font-weight="700">2</text>
+              <rect x="92"  y="75" width="22" height="22" fill="var(--bg-code)" stroke="var(--border-strong)"/>
+              <text x="103" y="91" text-anchor="middle" fill="var(--text-muted)">3</text>
+              <rect x="116" y="75" width="22" height="22" fill="var(--accent)" stroke="var(--border-strong)"/>
+              <text x="127" y="91" text-anchor="middle" fill="#0a0f15" font-weight="700">4</text>
+              <rect x="140" y="75" width="22" height="22" fill="var(--bg-code)" stroke="var(--border-strong)"/>
+              <text x="151" y="91" text-anchor="middle" fill="var(--text-muted)">5</text>
+              <rect x="164" y="75" width="22" height="22" fill="var(--bg-code)" stroke="var(--border-strong)"/>
+              <text x="175" y="91" text-anchor="middle" fill="var(--text-muted)">6</text>
+              <rect x="188" y="75" width="22" height="22" fill="var(--good)" stroke="var(--border-strong)"/>
+              <text x="199" y="91" text-anchor="middle" fill="#0a0f15" font-weight="700">7</text>
+              <rect x="212" y="75" width="22" height="22" fill="var(--bg-code)" stroke="var(--border-strong)"/>
+              <text x="223" y="91" text-anchor="middle" fill="var(--text-muted)">8</text>
+              <rect x="236" y="75" width="22" height="22" fill="var(--bg-code)" stroke="var(--border-strong)"/>
+              <text x="247" y="91" text-anchor="middle" fill="var(--text-muted)">9</text>
+              <rect x="260" y="75" width="22" height="22" fill="var(--bg-code)" stroke="var(--border-strong)"/>
+              <text x="271" y="91" text-anchor="middle" fill="var(--text-muted)">10</text>
+              <rect x="284" y="75" width="22" height="22" fill="var(--good)" stroke="var(--border-strong)"/>
+              <text x="295" y="91" text-anchor="middle" fill="#0a0f15" font-weight="700">11</text>
+              <rect x="308" y="75" width="22" height="22" fill="var(--bg-code)" stroke="var(--border-strong)"/>
+              <text x="319" y="91" text-anchor="middle" fill="var(--text-muted)">12</text>
+              <rect x="332" y="75" width="22" height="22" fill="var(--bg-code)" stroke="var(--border-strong)"/>
+              <text x="343" y="91" text-anchor="middle" fill="var(--text-muted)">13</text>
+              <rect x="356" y="75" width="22" height="22" fill="var(--accent)" stroke="var(--border-strong)"/>
+              <text x="367" y="91" text-anchor="middle" fill="#0a0f15" font-weight="700">14</text>
+              <rect x="380" y="75" width="22" height="22" fill="var(--bg-code)" stroke="var(--border-strong)"/>
+              <text x="391" y="91" text-anchor="middle" fill="var(--text-muted)">15</text>
+              <rect x="404" y="75" width="22" height="22" fill="var(--bg-code)" stroke="var(--border-strong)"/>
+              <text x="415" y="91" text-anchor="middle" fill="var(--text-muted)">16</text>
+              <rect x="428" y="75" width="22" height="22" fill="var(--bg-code)" stroke="var(--border-strong)"/>
+              <text x="439" y="91" text-anchor="middle" fill="var(--text-muted)">17</text>
+              <rect x="452" y="75" width="22" height="22" fill="var(--bg-code)" stroke="var(--border-strong)"/>
+              <text x="463" y="91" text-anchor="middle" fill="var(--text-muted)">18</text>
+              <rect x="476" y="75" width="22" height="22" fill="var(--good)" stroke="var(--border-strong)"/>
+              <text x="487" y="91" text-anchor="middle" fill="#0a0f15" font-weight="700">19</text>
+              <rect x="500" y="75" width="22" height="22" fill="var(--bg-code)" stroke="var(--border-strong)"/>
+              <text x="511" y="91" text-anchor="middle" fill="var(--text-muted)">20</text>
+              <rect x="524" y="75" width="22" height="22" fill="var(--bg-code)" stroke="var(--border-strong)"/>
+              <text x="535" y="91" text-anchor="middle" fill="var(--text-muted)">21</text>
+              <rect x="548" y="75" width="22" height="22" fill="var(--accent)" stroke="var(--border-strong)"/>
+              <text x="559" y="91" text-anchor="middle" fill="#0a0f15" font-weight="700">22</text>
+              <rect x="572" y="75" width="22" height="22" fill="var(--bg-code)" stroke="var(--border-strong)"/>
+              <text x="583" y="91" text-anchor="middle" fill="var(--text-muted)">23</text>
+              <rect x="596" y="75" width="22" height="22" fill="var(--bg-code)" stroke="var(--border-strong)"/>
+              <text x="607" y="91" text-anchor="middle" fill="var(--text-muted)">24</text>
+              <rect x="620" y="75" width="22" height="22" fill="var(--bg-code)" stroke="var(--border-strong)"/>
+              <text x="631" y="91" text-anchor="middle" fill="var(--text-muted)">25</text>
+              <rect x="644" y="75" width="22" height="22" fill="var(--bg-code)" stroke="var(--border-strong)"/>
+              <text x="655" y="91" text-anchor="middle" fill="var(--text-muted)">26</text>
+              <rect x="668" y="75" width="22" height="22" fill="var(--bg-code)" stroke="var(--border-strong)"/>
+              <text x="679" y="91" text-anchor="middle" fill="var(--text-muted)">27</text>
+              <rect x="692" y="75" width="22" height="22" fill="var(--accent)" stroke="var(--border-strong)"/>
+              <text x="703" y="91" text-anchor="middle" fill="#0a0f15" font-weight="700">28</text>
+              <rect x="716" y="75" width="22" height="22" fill="var(--bg-code)" stroke="var(--border-strong)"/>
+              <text x="727" y="91" text-anchor="middle" fill="var(--text-muted)">29</text>
+              <rect x="740" y="75" width="22" height="22" fill="var(--bg-code)" stroke="var(--border-strong)"/>
+              <text x="751" y="91" text-anchor="middle" fill="var(--text-muted)">30</text>
+              <rect x="764" y="75" width="16" height="22" fill="var(--bg-code)" stroke="var(--border-strong)"/>
+            </g>
+
+            <!-- Seq A block table -->
+            <g transform="translate(20, 115)">
+              <rect width="170" height="60" rx="6" fill="rgba(126,231,135,0.12)" stroke="var(--good)" stroke-width="2"/>
+              <text x="10" y="18" fill="var(--good)" font-family="JetBrains Mono" font-size="11" font-weight="700">Seq A block table</text>
+              <text x="10" y="38" fill="var(--text)" font-family="JetBrains Mono" font-size="11">[2, 7, 11, 19]</text>
+              <text x="10" y="53" fill="var(--text-muted)" font-family="JetBrains Mono" font-size="10">-- 64 tokens, 4 blocks</text>
+            </g>
+
+            <!-- Arrows from Seq A table to blocks 2,7,11,19 -->
+            <path d="M 79 115 v -8 v -10" stroke="var(--good)" stroke-width="1.2" fill="none" marker-end="url(#arrPA)" opacity="0.7"/>
+            <path d="M 199 115 q -10 -10 0 -18" stroke="var(--good)" stroke-width="1.2" fill="none" opacity="0.7"/>
+            <path d="M 80 130 q 100 -30 220 -33" stroke="var(--good)" stroke-width="1.2" fill="none" marker-end="url(#arrPA)" opacity="0.6"/>
+            <path d="M 90 130 q 200 -40 400 -33" stroke="var(--good)" stroke-width="1.2" fill="none" marker-end="url(#arrPA)" opacity="0.6"/>
+
+            <!-- Seq B block table -->
+            <g transform="translate(210, 115)">
+              <rect width="200" height="60" rx="6" fill="rgba(91,141,239,0.12)" stroke="var(--accent)" stroke-width="2"/>
+              <text x="10" y="18" fill="var(--accent)" font-family="JetBrains Mono" font-size="11" font-weight="700">Seq B block table</text>
+              <text x="10" y="38" fill="var(--text)" font-family="JetBrains Mono" font-size="11">[0, 4, 14, 22, 28]</text>
+              <text x="10" y="53" fill="var(--text-muted)" font-family="JetBrains Mono" font-size="10">-- 80 tokens, 5 blocks</text>
+            </g>
+
+            <!-- Arrows from Seq B table -->
+            <path d="M 250 130 q -110 -25 -220 -33" stroke="var(--accent)" stroke-width="1.2" fill="none" marker-end="url(#arrPA)" opacity="0.6"/>
+            <path d="M 260 130 q -50 -25 -130 -33" stroke="var(--accent)" stroke-width="1.2" fill="none" marker-end="url(#arrPA)" opacity="0.6"/>
+            <path d="M 310 130 q 25 -25 57 -33" stroke="var(--accent)" stroke-width="1.2" fill="none" marker-end="url(#arrPA)" opacity="0.6"/>
+            <path d="M 340 130 q 100 -25 219 -33" stroke="var(--accent)" stroke-width="1.2" fill="none" marker-end="url(#arrPA)" opacity="0.6"/>
+            <path d="M 380 130 q 170 -25 323 -33" stroke="var(--accent)" stroke-width="1.2" fill="none" marker-end="url(#arrPA)" opacity="0.6"/>
+
+            <!-- Legend -->
+            <g transform="translate(440, 115)">
+              <rect width="320" height="60" rx="6" fill="var(--bg-elev)" stroke="var(--border)"/>
+              <rect x="10" y="12" width="16" height="14" fill="var(--good)"/>
+              <text x="32" y="24" fill="var(--text)" font-size="11">used by Seq A</text>
+              <rect x="130" y="12" width="16" height="14" fill="var(--accent)"/>
+              <text x="152" y="24" fill="var(--text)" font-size="11">used by Seq B</text>
+              <rect x="240" y="12" width="16" height="14" fill="var(--bg-code)" stroke="var(--border-strong)"/>
+              <text x="262" y="24" fill="var(--text)" font-size="11">free block</text>
+              <text x="10" y="48" fill="var(--text-muted)" font-size="11">All blocks same size; no contiguity required.</text>
+            </g>
+
+            <text x="20" y="205" fill="var(--good)" font-size="12" font-weight="700">
+              Internal frag &le; block_size - 1 tokens. External frag = 0. Seq C admits cleanly from the same pool.
+            </text>
+          </g>
+        </svg>
+        <figcaption>
+          Panel A: naive contiguous allocation leaves large unused tails (internal
+          fragmentation) and rejects requests that cannot find one contiguous range
+          (external fragmentation). Panel B: a single fixed-size block pool with
+          per-sequence block tables (indices into the pool). Blocks can be scattered;
+          allocation = pop one block off the free list.
+        </figcaption>
+      </figure>
+
+      <!-- §2 -->
+      <h2 id="insight">2. The insight &mdash; borrow from operating systems</h2>
+      <p>
+        This is exactly the problem virtual memory solved for operating systems in the
+        1960s. The OS doesn't allocate contiguous physical RAM for each process; it
+        allocates a <strong>page table</strong> that maps each process's virtual
+        addresses to scattered physical pages of fixed size (typically 4 KB).
+      </p>
+
+      <p>PagedAttention does the same for KV cache:</p>
+
+      <ul>
+        <li>
+          <strong>Physical KV pool</strong>: VRAM is partitioned at startup into
+          fixed-size <strong>blocks</strong>, each holding <code>block_size</code>
+          tokens' worth of K and V values for all layers and heads. (Default
+          <code>block_size = 16</code> in vLLM.) The number of blocks is determined by
+          total VRAM minus weights minus overhead.
+        </li>
+        <li>
+          <strong>Per-sequence block table</strong>: each running sequence holds a small
+          list of block indices it owns, in logical order. The K and V for tokens 0-15
+          live in block #41, for tokens 16-31 live in block #87, etc.
+        </li>
+        <li>
+          <strong>Allocation grows on demand</strong>: when a sequence's last block
+          fills up (16 more tokens generated), the runtime grabs one more free block
+          from the pool and appends its index to the sequence's block table.
+        </li>
+      </ul>
+
+      <!-- §3 -->
+      <h2 id="wins">3. What this changes &mdash; five wins, one cost</h2>
+
+      <div class="card-grid">
+        <div class="card" style="border-left: 3px solid var(--good)">
+          <h4 style="color: var(--good)">1. Near-zero internal fragmentation</h4>
+          <p>
+            A sequence that generates 1000 tokens uses <code>ceil(1000 / 16) = 63</code>
+            blocks. The 64th block (started but only 8/16 tokens used) is the
+            <em>only</em> over-allocation. Total waste:
+            &le; <code>block_size - 1</code> tokens per sequence ~ 0.0001 % of a
+            long-context request.
+          </p>
+        </div>
+        <div class="card" style="border-left: 3px solid var(--good)">
+          <h4 style="color: var(--good)">2. Zero external fragmentation</h4>
+          <p>
+            Blocks are all the same size, drawn from a single free pool. Free becomes
+            "return block index to pool"; allocate becomes "pop one off the pool". No
+            coalescing needed; no neighbour-merging; no failure under fragmentation.
+          </p>
+        </div>
+        <div class="card" style="border-left: 3px solid var(--accent)">
+          <h4 style="color: var(--accent)">3. Prefix sharing</h4>
+          <p>
+            Two sequences that begin with the same prompt (very common &mdash; every
+            agent has the same system prompt) can share early KV blocks <strong>by
+            reference</strong>. Same physical block, two logical block tables pointing
+            at it. Each sequence gets its own writable copy only when content diverges
+            (copy-on-write). vLLM exposes this as <code>--enable-prefix-caching</code>
+            (on by default).
+          </p>
+        </div>
+        <div class="card" style="border-left: 3px solid var(--accent)">
+          <h4 style="color: var(--accent)">4. Continuous batching</h4>
+          <p>
+            Older engines used "static batching": wait for N requests, batch, run all to
+            completion, return. Slow requests blocked fast ones. PagedAttention lets the
+            scheduler add a new request to a partially-running batch every step (KV
+            blocks are independent), and finished requests free their blocks mid-batch
+            (no contiguous allocation to preserve). GPU stays maximally busy.
+          </p>
+        </div>
+        <div class="card" style="border-left: 3px solid var(--accent)">
+          <h4 style="color: var(--accent)">5. Dynamic admission control</h4>
+          <p>
+            Because the runtime knows exactly how many free blocks remain at any moment,
+            it can decide <em>not</em> to admit a new request that wouldn't fit, or to
+            <strong>preempt</strong> an existing low-priority request by swapping its
+            blocks out to host RAM (or just dropping them &mdash; the request can
+            re-prefill). vLLM exposes <code>vllm:num_preemptions_total</code> in
+            Prometheus metrics.
+          </p>
+        </div>
+        <div class="card" style="border-left: 3px solid var(--warn)">
+          <h4 style="color: var(--warn)">Cost: kernel-level overhead</h4>
+          <p>
+            The attention kernel must dereference the block table for each token instead
+            of reading from a contiguous tensor. vLLM ships custom CUDA kernels
+            (<code>paged_attention_v1</code>, <code>paged_attention_v2</code>) that
+            handle this gather pattern with minimal slowdown &mdash; single-digit-percent
+            vs the contiguous version. Worth it.
+          </p>
+        </div>
+      </div>
+
+      <h3 id="prefix-sharing-figure">3.1 Prefix sharing &mdash; visualised</h3>
+      <p>
+        Two requests share the system-prompt blocks; each gets its own blocks after
+        the prompts diverge. The shared block is physically present once in VRAM but
+        appears in both block tables.
+      </p>
+
+      <figure>
+        <svg viewBox="0 0 760 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Prefix caching diagram">
+          <defs>
+            <marker id="arrPB" markerWidth="10" markerHeight="8" refX="10" refY="4" orient="auto">
+              <path d="M0,0 L10,4 L0,8 Z" fill="var(--accent)"/>
+            </marker>
+          </defs>
+
+          <text x="20" y="22" fill="var(--text)" font-size="14" font-weight="700">Prefix caching via shared block references</text>
+
+          <!-- Block pool -->
+          <text x="20" y="55" fill="var(--text-muted)" font-family="JetBrains Mono" font-size="11">Block pool</text>
+          <g>
+            <!-- shared system-prompt blocks: 0,1,2 (purple = shared) -->
+            <rect x="20"  y="65" width="40" height="40" fill="#9b7bef" stroke="var(--border-strong)"/>
+            <text x="40"  y="89" text-anchor="middle" fill="#0a0f15" font-size="11" font-weight="700">0</text>
+            <text x="40"  y="120" text-anchor="middle" fill="#9b7bef" font-size="9" font-weight="700">SHARED</text>
+            <rect x="64"  y="65" width="40" height="40" fill="#9b7bef" stroke="var(--border-strong)"/>
+            <text x="84"  y="89" text-anchor="middle" fill="#0a0f15" font-size="11" font-weight="700">1</text>
+            <text x="84"  y="120" text-anchor="middle" fill="#9b7bef" font-size="9" font-weight="700">SHARED</text>
+            <rect x="108" y="65" width="40" height="40" fill="#9b7bef" stroke="var(--border-strong)"/>
+            <text x="128" y="89" text-anchor="middle" fill="#0a0f15" font-size="11" font-weight="700">2</text>
+            <text x="128" y="120" text-anchor="middle" fill="#9b7bef" font-size="9" font-weight="700">SHARED</text>
+            <!-- divider -->
+            <line x1="160" y1="60" x2="160" y2="115" stroke="var(--border)" stroke-dasharray="3 3"/>
+            <!-- A-only -->
+            <rect x="170" y="65" width="40" height="40" fill="var(--good)" stroke="var(--border-strong)"/>
+            <text x="190" y="89" text-anchor="middle" fill="#0a0f15" font-size="11" font-weight="700">3</text>
+            <text x="190" y="120" text-anchor="middle" fill="var(--good)" font-size="9" font-weight="700">A</text>
+            <rect x="214" y="65" width="40" height="40" fill="var(--good)" stroke="var(--border-strong)"/>
+            <text x="234" y="89" text-anchor="middle" fill="#0a0f15" font-size="11" font-weight="700">4</text>
+            <text x="234" y="120" text-anchor="middle" fill="var(--good)" font-size="9" font-weight="700">A</text>
+            <!-- B-only -->
+            <rect x="258" y="65" width="40" height="40" fill="var(--accent)" stroke="var(--border-strong)"/>
+            <text x="278" y="89" text-anchor="middle" fill="#0a0f15" font-size="11" font-weight="700">5</text>
+            <text x="278" y="120" text-anchor="middle" fill="var(--accent)" font-size="9" font-weight="700">B</text>
+            <rect x="302" y="65" width="40" height="40" fill="var(--accent)" stroke="var(--border-strong)"/>
+            <text x="322" y="89" text-anchor="middle" fill="#0a0f15" font-size="11" font-weight="700">6</text>
+            <text x="322" y="120" text-anchor="middle" fill="var(--accent)" font-size="9" font-weight="700">B</text>
+            <rect x="346" y="65" width="40" height="40" fill="var(--accent)" stroke="var(--border-strong)"/>
+            <text x="366" y="89" text-anchor="middle" fill="#0a0f15" font-size="11" font-weight="700">7</text>
+            <text x="366" y="120" text-anchor="middle" fill="var(--accent)" font-size="9" font-weight="700">B</text>
+            <!-- free -->
+            <rect x="400" y="65" width="40" height="40" fill="var(--bg-code)" stroke="var(--border-strong)"/>
+            <text x="420" y="89" text-anchor="middle" fill="var(--text-muted)" font-size="11">8</text>
+            <rect x="444" y="65" width="40" height="40" fill="var(--bg-code)" stroke="var(--border-strong)"/>
+            <text x="464" y="89" text-anchor="middle" fill="var(--text-muted)" font-size="11">9</text>
+            <rect x="488" y="65" width="40" height="40" fill="var(--bg-code)" stroke="var(--border-strong)"/>
+            <text x="508" y="89" text-anchor="middle" fill="var(--text-muted)" font-size="11">10</text>
+          </g>
+
+          <!-- Seq A block table -->
+          <g transform="translate(50, 175)">
+            <rect width="260" height="60" rx="6" fill="rgba(126,231,135,0.12)" stroke="var(--good)" stroke-width="2"/>
+            <text x="10" y="20" fill="var(--good)" font-family="JetBrains Mono" font-size="11" font-weight="700">Req A block table</text>
+            <text x="10" y="40" fill="var(--text)" font-family="JetBrains Mono" font-size="11">[0, 1, 2, 3, 4]</text>
+            <text x="10" y="54" fill="var(--text-muted)" font-family="JetBrains Mono" font-size="10">prefix: 0,1,2  own: 3,4</text>
+          </g>
+
+          <!-- Seq B block table -->
+          <g transform="translate(420, 175)">
+            <rect width="290" height="60" rx="6" fill="rgba(91,141,239,0.12)" stroke="var(--accent)" stroke-width="2"/>
+            <text x="10" y="20" fill="var(--accent)" font-family="JetBrains Mono" font-size="11" font-weight="700">Req B block table</text>
+            <text x="10" y="40" fill="var(--text)" font-family="JetBrains Mono" font-size="11">[0, 1, 2, 5, 6, 7]</text>
+            <text x="10" y="54" fill="var(--text-muted)" font-family="JetBrains Mono" font-size="10">prefix: 0,1,2 (shared)  own: 5,6,7</text>
+          </g>
+
+          <!-- Pointers from both tables to shared blocks 0,1,2 -->
+          <path d="M 70 175 q -25 -40 -25 -65" stroke="#9b7bef" stroke-width="1.4" fill="none" marker-end="url(#arrPB)" opacity="0.75"/>
+          <path d="M 100 175 q -10 -40 -10 -65" stroke="#9b7bef" stroke-width="1.4" fill="none" marker-end="url(#arrPB)" opacity="0.75"/>
+          <path d="M 130 175 q 0 -40 0 -65" stroke="#9b7bef" stroke-width="1.4" fill="none" marker-end="url(#arrPB)" opacity="0.75"/>
+
+          <path d="M 460 175 q -340 -40 -415 -65" stroke="#9b7bef" stroke-width="1.4" fill="none" marker-end="url(#arrPB)" opacity="0.55"/>
+          <path d="M 500 175 q -350 -40 -415 -65" stroke="#9b7bef" stroke-width="1.4" fill="none" marker-end="url(#arrPB)" opacity="0.55"/>
+          <path d="M 540 175 q -350 -40 -410 -65" stroke="#9b7bef" stroke-width="1.4" fill="none" marker-end="url(#arrPB)" opacity="0.55"/>
+
+          <!-- A's own blocks -->
+          <path d="M 200 175 q 0 -40 -10 -65" stroke="var(--good)" stroke-width="1.4" fill="none" marker-end="url(#arrPB)" opacity="0.7"/>
+          <path d="M 240 175 q 0 -40 -5 -65" stroke="var(--good)" stroke-width="1.4" fill="none" marker-end="url(#arrPB)" opacity="0.7"/>
+
+          <!-- B's own blocks -->
+          <path d="M 580 175 q -290 -40 -300 -65" stroke="var(--accent)" stroke-width="1.4" fill="none" marker-end="url(#arrPB)" opacity="0.7"/>
+          <path d="M 620 175 q -290 -40 -298 -65" stroke="var(--accent)" stroke-width="1.4" fill="none" marker-end="url(#arrPB)" opacity="0.7"/>
+          <path d="M 660 175 q -290 -40 -293 -65" stroke="var(--accent)" stroke-width="1.4" fill="none" marker-end="url(#arrPB)" opacity="0.7"/>
+
+          <text x="380" y="275" text-anchor="middle" fill="var(--text-muted)" font-size="11" font-style="italic">
+            Blocks 0-2 hold the system-prompt KV. Both requests reference them. On a warm cache, prefill skips blocks 0-2 entirely.
+          </text>
+          <text x="380" y="295" text-anchor="middle" fill="#9b7bef" font-size="11" font-weight="700">
+            TTFT for a long system prompt drops from "compute N tokens" to "look up 3 block ids".
+          </text>
+        </svg>
+        <figcaption>
+          Prefix caching: shared blocks are referenced from multiple block tables. On
+          divergence, the runtime allocates new private blocks (copy-on-write
+          semantics).
+        </figcaption>
+      </figure>
+
+      <p>For an agent with a 5 KB system prompt, this means:</p>
+      <ul>
+        <li><strong>First request:</strong> prefill computes ~1.2 K KV blocks and writes them.</li>
+        <li>
+          <strong>Every subsequent request with the same system prompt:</strong> prefill
+          <em>skips</em> those blocks entirely, reusing them by reference. TTFT on a
+          long-prompt-warm-cache becomes near-instant.
+        </li>
+      </ul>
+
+      <!-- §4 -->
+      <h2 id="elastic-pool">4. How this maps to the project's "elastic pool" language</h2>
+      <p>
+        <a href="nvfp4-coldstart.html">nvfp4-coldstart</a> §2 calls the top of the VRAM
+        stack the <em>"Free / KV elastic pool"</em> and notes that
+        <em>"vLLM and SGLang both grow the paged-KV pool until total VRAM hits
+        <code>--gpu-memory-utilization</code>"</em>. Here is what that means precisely:
+      </p>
+
+      <ul>
+        <li>
+          At container start, the runtime computes
+          <code>free_vram = (gpu_memory_utilization x physical_VRAM) - weights -
+          cuda_graphs - workspace - overhead</code>.
+        </li>
+        <li>
+          It then divides <code>free_vram</code> by the per-block size
+          (<code>block_size x num_layers x num_kv_heads x head_dim x dtype_bytes x 2</code>
+          for K+V) and rounds down. That is the <strong>fixed number of paged-KV blocks</strong>
+          the runtime has to play with for the entire lifetime of the container.
+        </li>
+        <li>
+          "Elastic" refers to how those blocks are <em>distributed across running
+          sequences</em>. The pool itself is fixed-size; the per-sequence allocation is
+          what stretches and shrinks.
+        </li>
+      </ul>
+
+      <p>
+        For Qwen3-8B-NVFP4 on the 24 GB RTX PRO 4000 Blackwell, using the project's
+        defaults:
+      </p>
+
+      <pre data-lang="text"><code>physical_VRAM      = 24 GB
+gpu_memory_util    = 0.94
+budget             = ~22.6 GB
+weights (NVFP4 + BF16 embed)        = ~5.1 GB
+cuda graphs + workspace + overhead  = ~4.0 GB
+-> free_vram        = ~13.5 GB
+
+block_size         = 16 tokens
+per-block KV bytes = 16 x 36 x 8 x 128 x 1 x 2  = 1 179 648 B  ~ 1.13 MB
+-> number of blocks ~ 13.5 GB / 1.13 MB  ~ 11 950
+
+capacity at one sequence: 11 950 blocks x 16 tokens  ~ 191 K tokens
+                          (more than the 131 K context cap)
+capacity at 8 concurrent 16K-context sequences:
+                          8 x 1 024 = 8 192 blocks needed -> fits</code></pre>
+
+      <div class="callout good">
+        <div class="callout-icon">i</div>
+        <div>
+          That is the math the bench harness's <code>peak_vram_gb = 22.53</code>
+          indirectly confirms &mdash; the runtime grew the paged pool until VRAM hit the
+          budget cap, then stopped.
+        </div>
+      </div>
+
+      <!-- §5 -->
+      <h2 id="kernel">5. The PagedAttention kernel &mdash; what it actually does on the GPU</h2>
+      <p>
+        The standard attention kernel (FlashAttention, the cuDNN MHA, etc.) expects K
+        and V to be contiguous in memory. PagedAttention's kernel takes an additional
+        input &mdash; the <strong>block table</strong> &mdash; and gathers K, V fragments
+        from scattered physical blocks.
+      </p>
+
+      <p>Pseudocode for one decode step:</p>
+
+      <pre data-lang="text"><code>inputs:
+  q:           [num_heads, head_dim]               # query for the new token
+  block_table: [num_blocks_for_this_seq]           # logical -> physical mapping
+  k_cache, v_cache: [total_blocks, num_kv_heads, block_size, head_dim]
+
+output: [num_heads, head_dim]   # attention output for the new token
+
+loop over each logical block in this sequence:
+    physical_idx = block_table[logical_idx]
+    k_block = k_cache[physical_idx]   # gather
+    v_block = v_cache[physical_idx]
+    scores  = q @ k_block.transpose() / sqrt(head_dim)
+    scores  = causal_mask(scores, position_offset_of_this_block)
+    weights = softmax_partial(scores)         # online softmax
+    output += weights @ v_block
+normalise output by accumulated softmax denominator</code></pre>
+
+      <p>The tricks that make this fast:</p>
+      <ul>
+        <li>
+          <strong>Online softmax</strong> &mdash; accumulate the weighted sum and the
+          softmax denominator together in a streaming fashion, never materialising the
+          full attention matrix.
+        </li>
+        <li>
+          <strong>Block-level parallelism</strong> &mdash; multiple GPU threads handle
+          different logical blocks in parallel and their partial results combine via the
+          online softmax.
+        </li>
+        <li>
+          <strong>Vectorised gather</strong> &mdash; physical block indices are loaded
+          as vector loads to amortise the indirection cost.
+        </li>
+      </ul>
+
+      <p>
+        The implementation lives in vLLM's <code>csrc/attention/</code> directory; the
+        algorithmic essence comes from FlashAttention 2 (Dao 2023,
+        <a href="https://arxiv.org/abs/2307.08691">arXiv:2307.08691</a>) extended with
+        the block-table indirection.
+      </p>
+
+      <!-- §6 -->
+      <h2 id="sglang">6. SGLang's twist &mdash; RadixAttention</h2>
+      <p>
+        SGLang (the project's port-11436 backend) builds on PagedAttention but adds
+        <strong>RadixAttention</strong> (Zheng <em>et al.</em> 2024, <em>SGLang:
+        Efficient Execution of Structured Language Model Programs</em>,
+        <a href="https://arxiv.org/abs/2312.07104">arXiv:2312.07104</a>).
+      </p>
+
+      <p>
+        The key idea: prefix sharing in vLLM is per-block (16 tokens at a time).
+        RadixAttention organises the cached prefixes in a <strong>radix tree</strong>
+        indexed by token sequence. Two requests can share a common prefix
+        <strong>even if its length is not block-aligned</strong> &mdash; the tree matches
+        at the longest common token-level prefix, and the per-block representation is
+        reused below that.
+      </p>
+
+      <div class="callout">
+        <div class="callout-icon">i</div>
+        <div>
+          <strong>Practical effect:</strong> in workloads with many sub-string-overlapping
+          prompts (say, an agent that hits the same template with slightly different
+          parameters), SGLang's KV cache hit rate is materially higher than vLLM's,
+          translating to faster TTFT for repetitive patterns. For the project's typical
+          workload (single user, varied prompts), the two engines perform comparably.
+        </div>
+      </div>
+
+      <!-- §7 -->
+      <h2 id="practical">7. Practical implications</h2>
+      <ul>
+        <li>
+          <strong>The "elastic pool" in this project's docs is a fixed pool of
+          fixed-size blocks.</strong> "Elastic" = dynamic allocation across sequences,
+          not dynamic resizing of the pool.
+        </li>
+        <li>
+          <strong>Number of blocks = derived from VRAM budget at container start.</strong>
+          Changing <code>--gpu-memory-utilization</code> or <code>--max-model-len</code>
+          changes the block count, which is one reason the router has to recreate
+          containers when those change (see
+          <a href="nvfp4-coldstart.html">nvfp4-coldstart</a> §1).
+        </li>
+        <li>
+          <strong>Prefix caching is huge for agents.</strong> If your agent reuses a big
+          system prompt, vLLM's <code>--enable-prefix-caching</code> (default on) saves
+          the prefill cost on every reuse. The router doesn't need to do anything
+          special &mdash; it just forwards requests and the engine deduplicates
+          underneath.
+        </li>
+        <li>
+          <strong>Continuous batching makes single-stream and multi-stream performance
+          look quite similar at low concurrency.</strong> The benefit shows up under
+          load &mdash; the GPU stays at high utilisation regardless of mid-batch
+          arrivals or completions.
+        </li>
+        <li>
+          <strong>Preemption is rare in practice on this project's setup.</strong> The
+          router enforces GPU mutual exclusion (one backend at a time), so vLLM only
+          sees the requests routed to it; with batch sizes well below the block budget,
+          preemption doesn't trigger.
+        </li>
+        <li>
+          <strong>Increasing <code>block_size</code> reduces metadata overhead but
+          increases minimum-allocation waste.</strong> Default 16 is a good balance.
+          Don't change unless you know why.
+        </li>
+      </ul>
+
+      <!-- §8 -->
+      <h2 id="diagnosing">8. Diagnosing PagedAttention behaviour</h2>
+      <p>vLLM exposes Prometheus metrics for the paged pool. Useful ones:</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Metric</th><th>Meaning</th><th>Healthy value</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>vllm:gpu_cache_usage_perc</code></td>
+              <td>Fraction of paged blocks currently in use.</td>
+              <td>&lt; 100 %. At 100 % under load you are bandwidth-bound on KV reads and admission control starts preempting.</td>
+            </tr>
+            <tr>
+              <td><code>vllm:num_preemptions_total</code></td>
+              <td>Cumulative number of preempted requests.</td>
+              <td>0 under normal load.</td>
+            </tr>
+            <tr>
+              <td><code>vllm:prompt_tokens_total</code></td>
+              <td>Cumulative prompt tokens processed.</td>
+              <td>Monotonic. Useful for sanity-checking the bench TPS counts.</td>
+            </tr>
+            <tr>
+              <td><code>vllm:generation_tokens_total</code></td>
+              <td>Cumulative generated tokens.</td>
+              <td>Monotonic. Same use as above.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>
+        Scrape these from <code>http://devai-router:11435/metrics</code> (or the
+        upstream vLLM container's <code>/metrics</code> if you bypass the router).
+        <a href="bench-results.html">bench-results</a>'s "Followup work" item #7 proposes
+        folding these into the bench cache so KV pressure is visible per-model.
+      </p>
+
+      <!-- §9 -->
+      <h2 id="references">9. References</h2>
+
+      <h3>Foundational papers</h3>
+      <ul>
+        <li>
+          Kwon, W. <em>et al.</em> (2023). <em>Efficient Memory Management for Large
+          Language Model Serving with PagedAttention.</em> SOSP 2023.
+          <a href="https://arxiv.org/abs/2309.06180">arXiv:2309.06180</a>. The vLLM
+          paper.
+        </li>
+        <li>
+          Dao, T. (2023). <em>FlashAttention-2: Faster Attention with Better
+          Parallelism and Work Partitioning.</em>
+          <a href="https://arxiv.org/abs/2307.08691">arXiv:2307.08691</a>. The attention
+          kernel PagedAttention extends.
+        </li>
+        <li>
+          Dao, T. <em>et al.</em> (2022). <em>FlashAttention: Fast and Memory-Efficient
+          Exact Attention with IO-Awareness.</em>
+          <a href="https://arxiv.org/abs/2205.14135">arXiv:2205.14135</a>. Original
+          online-softmax-on-GPU paper.
+        </li>
+        <li>
+          Zheng, L. <em>et al.</em> (2024). <em>SGLang: Efficient Execution of Structured
+          Language Model Programs.</em>
+          <a href="https://arxiv.org/abs/2312.07104">arXiv:2312.07104</a>.
+          RadixAttention.
+        </li>
+      </ul>
+
+      <h3>Engine documentation</h3>
+      <ul>
+        <li>vLLM PagedAttention design doc: <a href="https://docs.vllm.ai/en/latest/design/v1/prefix_caching.html">docs.vllm.ai/en/latest/design/v1/prefix_caching.html</a>.</li>
+        <li>vLLM scheduler &amp; continuous batching docs: <a href="https://docs.vllm.ai/en/latest/design/v1/torch_compile.html">docs.vllm.ai/en/latest/design/v1/torch_compile.html</a>.</li>
+        <li>SGLang RadixAttention overview: <a href="https://docs.sglang.ai/backend/native_api.html">docs.sglang.ai/backend/native_api.html</a>.</li>
+      </ul>
+
+      <h3>Project-internal cross-links</h3>
+      <ul>
+        <li><a href="attention-and-the-transformer.html">attention-and-the-transformer</a> §6 &mdash; what the KV cache is and why decode reads it every step.</li>
+        <li><a href="nvfp4-coldstart.html">nvfp4-coldstart</a> §2 &mdash; the elastic-KV-pool entry in the VRAM stack.</li>
+        <li><a href="backends.html">backends</a> &mdash; vLLM vs SGLang container lifecycle.</li>
+        <li><a href="router.html">router</a> &mdash; how <code>--gpu-memory-utilization</code> and <code>--max-model-len</code> get computed and passed to vLLM.</li>
+        <li><a href="bench-results.html">bench-results</a> &mdash; peak/mean VRAM that reflects the paged pool's saturation.</li>
+      </ul>
+
+    </div>
+
+    <aside class="toc-floating">
+      <h4>On this page</h4>
+      <ul></ul>
+    </aside>
+  </main>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-core.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/plugins/autoloader/prism-autoloader.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+<script src="assets/nav.js"></script>
+<script src="assets/widgets.js"></script>
+<script src="assets/site.js"></script>
+</body>
+</html>

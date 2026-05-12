@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NVFP4 cold start — Dev AI Lab</title>
+<meta name="description" content="Phase-by-phase cold-start timeline and steady-state VRAM budget for NVFP4 inference, anchored in Qwen3-8B-NVFP4 measurements on RTX PRO 4000 Blackwell.">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism-tomorrow.min.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="site">
+  <main class="main">
+    <div class="content">
+
+      <header>
+        <span class="pill">Operations &middot; measured</span>
+        <h1>NVFP4 cold start</h1>
+        <p class="lead">
+          Phase-by-phase timeline from <code>vllm serve</code> launch to first token,
+          plus the steady-state VRAM budget broken into the components that actually
+          consume bytes. Anchored in <strong>nvidia/Qwen3-8B-NVFP4</strong> measurements on
+          an RTX PRO 4000 Blackwell.
+        </p>
+      </header>
+
+      <div class="callout">
+        <div class="callout-icon">i</div>
+        <div>
+          <strong>New to NVFP4, FP8, BF16 and friends?</strong> Read
+          <a href="nvfp4-number-formats.html">nvfp4-number-formats</a> first — it
+          explains how a regular floating-point number gets stored in 4 / 8 / 16 bits,
+          why model weights and the KV cache use <em>different</em> formats. New to
+          tokens and prefill vs decode? See
+          <a href="llm-tokens-and-speed.html">llm-tokens-and-speed</a>.
+        </div>
+      </div>
+
+      <div class="callout warn">
+        <div class="callout-icon">!</div>
+        <div>
+          <strong>Why a dedicated page.</strong> "It uses 22 GB" is what <code>nvidia-smi</code>
+          reports after vLLM has filled the elastic KV pool. That number does
+          <strong>not</strong> tell you how much the model strictly needs, why a longer
+          context can OOM at 24 GB while a shorter one fits, or how cold-start time
+          relates to steady-state TTFT. The diagrams below answer all three.
+        </div>
+      </div>
+
+      <h2 id="hardware">Hardware and data sources — read this before quoting numbers</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Number type</th><th>Source</th><th>Hardware</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Cold-start time, steady TTFT, sustained tok/s, mean/peak VRAM</td>
+              <td><code>deploy/.bench-cache.json</code>, key <code>nvidia/Qwen3-8B-NVFP4@ccd10a893cbc</code></td>
+              <td><strong>RTX PRO 4000 Blackwell, 24 GB GDDR7, PCIe Gen5 x16</strong></td>
+            </tr>
+            <tr>
+              <td>Quality scores (GSM8K, HumanEval, tools, leak)</td>
+              <td>same bench cache row + per-sample logs at <code>/var/cache/devai/bench/inspect-logs/</code></td>
+              <td>RTX PRO 4000 Blackwell</td>
+            </tr>
+            <tr>
+              <td>Per-component byte breakdown (§2)</td>
+              <td>NVFP4 spec + Qwen3-8B <code>config.json</code></td>
+              <td>hardware-independent arithmetic</td>
+            </tr>
+            <tr>
+              <td>Per-phase wall times (§1)</td>
+              <td><strong>not instrumented in this project</strong> — diagram shows order and bottleneck only</td>
+              <td>—</td>
+            </tr>
+            <tr>
+              <td>§3 Blackwell GPU reference table</td>
+              <td>NVIDIA public datasheets — <strong>not measured here</strong></td>
+              <td>extrapolation</td>
+            </tr>
+            <tr>
+              <td>§4 32B / 70B scaling rows</td>
+              <td>analytical from public configs, <strong>not run</strong></td>
+              <td>extrapolation; does not fit a single 24 GB card</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p>There is no enterprise B100/B200/GB200 anywhere in this project's data path. Treat anything outside the 24 GB row as a paper extrapolation.</p>
+
+      <h2 id="phases">1. Phase timeline</h2>
+      <figure>
+        <img src="nvfp4-coldstart-phases.svg" alt="NVFP4 cold-start phase timeline" style="max-width:100%; background:white; padding:8px; border-radius:6px;">
+        <figcaption>NVFP4 cold-start phases. Source: <code>nvfp4-coldstart-phases.dot</code>. Phase 9 (CUDA graph capture + cutlass JIT autotune) is the dominant cost.</figcaption>
+      </figure>
+
+      <h3 id="cold-start-measured">Measured cold-start aggregate</h3>
+      <p>The bench harness measures wall time from <code>vllm serve</code> launch to the first emitted token (<code>ttft_ms_first</code>). For Qwen3-8B-NVFP4:</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Metric</th><th>Value</th><th>Where</th></tr></thead>
+          <tbody>
+            <tr><td>Cold-start TTFT (container launch → first token)</td><td><strong>45 563 ms ≈ 45.6 s</strong></td><td><code>metrics.ttft_ms_first</code></td></tr>
+            <tr><td>Steady-state TTFT, p50</td><td><strong>32.7 ms</strong></td><td><code>metrics.ttft_ms_steady_p50</code></td></tr>
+            <tr><td>Steady-state TTFT, p95</td><td><strong>34.5 ms</strong></td><td><code>metrics.ttft_ms_steady_p95</code></td></tr>
+            <tr><td>Sustained decode throughput, p50</td><td><strong>14.53 tok/s</strong></td><td><code>metrics.tps_sustained_p50</code></td></tr>
+            <tr><td>Latency samples used</td><td>40</td><td><code>metrics.n_latency_samples</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        The cold-start figure rolls up phases 1–11 from the diagram. <strong>There is no
+        per-phase instrumentation in this project</strong>, so the diagram shows
+        ordering and which resource each phase touches but does not put a number on
+        individual phases.
+      </p>
+
+      <h3 id="phases-detail">What each phase is doing</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>#</th><th>Phase</th><th>Bottleneck</th></tr></thead>
+          <tbody>
+            <tr><td>0</td><td>Router decision — stop other backend, remove the <code>sleep infinity</code> placeholder</td><td>libpod RPC</td></tr>
+            <tr><td>1</td><td>Container start — image layer mount, cgroups, devices, entrypoint</td><td>container runtime</td></tr>
+            <tr><td>2</td><td>Python + library import — <code>vllm</code> / <code>sglang</code>, <code>torch</code>, <code>flashinfer</code>, <code>flash-attn</code>, cutlass NVFP4 kernels</td><td>disk + Python startup</td></tr>
+            <tr><td>3</td><td>Config + tokenizer load</td><td>RAM, single-threaded</td></tr>
+            <tr><td>4</td><td>CUDA context init — driver handshake, primary context, cuBLAS/cuDNN handles</td><td>GPU driver</td></tr>
+            <tr><td>5</td><td>Weight <code>mmap</code> + shard view construction (6.0 GB on disk)</td><td>page cache</td></tr>
+            <tr><td>6</td><td>Weight H2D copy — packed NVFP4 tensors + FP8 scales + BF16 lm_head/embed</td><td>PCIe Gen5 x16 (~55 GB/s practical)</td></tr>
+            <tr><td>7</td><td>Weight registration — bind cutlass NVFP4 GEMM operands, materialise per-block scale tensors</td><td>GPU memory ops</td></tr>
+            <tr><td>8</td><td>KV cache pool allocation — paged blocks sized from <code>--max-model-len</code> and <code>--gpu-memory-utilization</code></td><td>GPU malloc</td></tr>
+            <tr style="background: var(--accent-soft)"><td><strong>9</strong></td><td><strong>CUDA graph capture</strong> — piecewise capture across batch sizes 1, 2, 4, …, 256; cutlass NVFP4 JIT autotune</td><td>GPU compile</td></tr>
+            <tr><td>10</td><td>Profiling warmup — dummy decode pass, fill cuBLAS workspace, trigger lazy module init</td><td>GPU compute</td></tr>
+            <tr><td>11</td><td><code>/health</code> → 200 — router stops polling and proxies the queued request</td><td>—</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout warn">
+        <div class="callout-icon">!</div>
+        <div>
+          <strong>Why phase 9 is the longest pole.</strong> NVFP4 GEMMs run via specialised
+          cutlass kernels that are JIT-compiled and autotuned the first time the runtime
+          encounters a given <code>(GPU SM, kernel, shape)</code> triple. vLLM and SGLang
+          cache the resulting binaries in
+          <code>~/.cache/{vllm,sglang}/torch_compile/</code>; the first cold start on a
+          freshly built image pays the full JIT cost. The 45.6 s above already benefits
+          from a warm torch_compile cache.
+        </div>
+      </div>
+
+      <p>
+        <strong>This is why <code>HEALTH_TIMEOUT_SECONDS</code> defaults to 600 s.</strong>
+        The measured 45.6 s is well under that ceiling, but a fresh image, a slower
+        model (<code>ykarout/Qwen3.5-9B-NVFP4</code> showed <code>startup_seconds=147</code>
+        on the same card), or a different Blackwell SM target pushes this much higher.
+      </p>
+
+      <h3 id="full-coldstart-triggers">What triggers a full cold start</h3>
+      <p>
+        The router tracks <code>currentModel</code>, <code>currentContext</code>, and
+        <code>currentReasoningOverride</code> per backend. <strong>Any</strong> of these
+        changing recreates the container and walks phases 1–11 again:
+      </p>
+      <ul>
+        <li>Switching model (e.g. <code>Qwen3-8B-NVFP4</code> → <code>Qwen3-14B-NVFP4</code>).</li>
+        <li>Changing context cap via the <code>@&lt;ctx&gt;</code> suffix (e.g. <code>…-NVFP4@32768</code> → <code>…-NVFP4@131072</code>).</li>
+        <li>Changing reasoning override (<code>::nothink</code>, <code>::high</code>, etc.).</li>
+      </ul>
+      <p>A request matching the currently loaded model on all three axes skips phases 1–10 and goes straight to inference.</p>
+
+      <h2 id="vram-budget">2. VRAM budget at realistic proportions</h2>
+      <figure>
+        <img src="nvfp4-vram-budget.svg" alt="NVFP4 VRAM budget across context lengths" style="max-width:100%; background:white; padding:8px; border-radius:6px;">
+        <figcaption>VRAM budget breakdown for Qwen3-8B-NVFP4 at 32 K, 64 K, 128 K, 256 K context.</figcaption>
+      </figure>
+
+      <h3 id="component-sizing">How each component is sized</h3>
+
+      <h4 id="weights-39">NVFP4 weights — ~3.9 GB</h4>
+      <p>NVFP4 stores each weight as:</p>
+      <ul>
+        <li><strong>4-bit value</strong> in E2M1 layout (1 sign, 2 exponent, 1 mantissa).</li>
+        <li><strong>8-bit FP8 (E4M3) scale</strong> shared across each contiguous block of 16 weights (0.5 effective bits per value for the per-block scale).</li>
+        <li><strong>32-bit FP32 per-tensor scale</strong> — negligible.</li>
+      </ul>
+      <p>
+        Effective storage: <strong>4.5 bits per parameter ≈ 0.5625 bytes/param</strong>.
+        Qwen3-8B has ~8.2 B total parameters; with <code>lm_head</code> excluded and tied embeddings,
+        ~6.95 B transformer parameters get NVFP4 → <strong>~3.9 GB</strong> on device. The on-disk
+        safetensors total is 6.0 GB; the difference is BF16 embeddings + per-block FP8 scales + safetensors metadata.
+      </p>
+
+      <h4 id="embed-12">Embeddings + lm_head (BF16) — ~1.2 GB</h4>
+      <p>
+        Quantising the embedding table and output projection to NVFP4 hurts output quality enough that
+        <code>nvidia/*-NVFP4</code> checkpoints leave them in BF16. Qwen3-8B uses tied embeddings:
+      </p>
+      <ul>
+        <li>Embedding table: 151 936 × 4 096 × 2 B = <strong>1.24 GB</strong></li>
+        <li><code>lm_head</code>: tied with embeddings → no extra cost.</li>
+      </ul>
+
+      <h4 id="kv-linear">KV cache (FP8, paged) — <em>scales linearly with context</em></h4>
+      <p>Per token, the KV cache holds K and V activations for every layer:</p>
+      <pre data-lang="text"><code>bytes_per_token = 2 (K + V) × num_layers × num_kv_heads × head_dim × dtype_bytes</code></pre>
+      <p>
+        Qwen3-8B-NVFP4 declares <code>quantization_config.kv_cache_scheme = {num_bits: 8, type: float}</code> —
+        KV is stored as <strong>FP8 (1 byte per element)</strong>, halving the per-token cost vs the FP16 KV
+        older NVFP4 checkpoints used.
+      </p>
+      <p>For Qwen3-8B (36 layers, 8 KV heads via GQA, head_dim 128, FP8):</p>
+      <pre data-lang="text"><code>bytes_per_token = 2 × 36 × 8 × 128 × 1 = 73 728 B = 72 KB / token</code></pre>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Context</th><th>KV bytes</th></tr></thead>
+          <tbody>
+            <tr><td>32 K</td><td>2.36 GB</td></tr>
+            <tr><td>64 K</td><td>4.72 GB</td></tr>
+            <tr style="background: var(--accent-soft)"><td>128 K</td><td>9.44 GB</td></tr>
+            <tr><td>256 K</td><td>18.87 GB</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>This is the dominant scaling cost. <strong>Doubling the context doubles the KV cache; everything else is roughly constant.</strong></p>
+
+      <div class="callout good">
+        <div class="callout-icon">i</div>
+        <div>
+          <strong>Sanity check on FP8 KV.</strong> This means an NVFP4 checkpoint with FP8 KV roughly
+          <em>doubles</em> the maximum context that fits in a given VRAM budget compared to an
+          otherwise identical model with FP16 KV.
+        </div>
+      </div>
+
+      <h4 id="cuda-graphs">CUDA graphs — ~2.0–2.6 GB</h4>
+      <p>
+        vLLM piecewise-captures graphs for each decode batch size in
+        <code>{1, 2, 4, 8, 16, 32, 64, 128, 256}</code> by default. Each graph holds fused kernels,
+        I/O handles, and intermediate tensors for that shape. NVFP4 GEMMs add their cutlass workspace.
+        Disable with <code>--enforce-eager</code> to reclaim ~2 GB at the cost of 10–25% decode throughput.
+      </p>
+
+      <h4 id="activations">Activations + workspace — ~1.0–1.5 GB</h4>
+      <p>
+        cuBLAS/cuDNN scratch space, attention output buffers, paged-attention metadata tables,
+        prefix-cache index tables. Grows mildly with batch size and context.
+      </p>
+
+      <h4 id="runtime-overhead">Runtime overhead — ~1.0 GB</h4>
+      <p>
+        CUDA primary context (300–600 MB), NCCL communicator (small on a single GPU),
+        PyTorch caching allocator slack, misc small allocations from the runtime.
+      </p>
+
+      <h4 id="elastic-pool">Free / KV elastic pool — fills the rest</h4>
+      <p>
+        This is the one cell that is <strong>not</strong> a fixed footprint. vLLM and SGLang grow
+        the paged-KV pool until total VRAM hits <code>--gpu-memory-utilization</code> (router default ≈ 0.94).
+        On the reference 24 GB card with strict-minimum ~11.5 GB at 32 K context, the runtime adds ~10.5 GB
+        of extra paged blocks → bench harness recorded <code>peak_vram_gb=22.53</code> across 1 269 samples.
+      </p>
+
+      <h3 id="bench-results">Measured bench results — Qwen3-8B-NVFP4</h3>
+      <h4>Resource &amp; latency</h4>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Metric</th><th>Value</th><th>Field</th></tr></thead>
+          <tbody>
+            <tr><td>Peak VRAM observed</td><td><strong>22.53 GB</strong></td><td><code>metrics.peak_vram_gb</code></td></tr>
+            <tr><td>Mean VRAM (1 269 samples)</td><td><strong>21.98 GB</strong></td><td><code>metrics.mean_vram_gb</code></td></tr>
+            <tr><td>Cold-start TTFT</td><td><strong>45 563 ms</strong></td><td><code>metrics.ttft_ms_first</code></td></tr>
+            <tr><td>Steady TTFT, p50</td><td><strong>32.7 ms</strong></td><td><code>metrics.ttft_ms_steady_p50</code></td></tr>
+            <tr><td>Steady TTFT, p95</td><td><strong>34.5 ms</strong></td><td><code>metrics.ttft_ms_steady_p95</code></td></tr>
+            <tr><td>Sustained decode, p50</td><td><strong>14.53 tok/s</strong></td><td><code>metrics.tps_sustained_p50</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout">
+        <div class="callout-icon">i</div>
+        <div>
+          <strong>Reading the VRAM numbers.</strong> Peak (22.53 GB) and mean (21.98 GB) are within ~0.5 GB —
+          the elastic KV pool fills early and stays full. The strict minimum from the diagram (~11.5 GB at
+          the bench context) is roughly half; the difference is the elastic pool. Do <strong>not</strong>
+          read the 22.53 GB peak as a footprint floor.
+        </div>
+      </div>
+
+      <h4>Quality scores</h4>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Task</th><th>Result</th><th>n</th><th>Field</th></tr></thead>
+          <tbody>
+            <tr><td>GSM8K subset</td><td><strong>score 0.98</strong></td><td>100</td><td><code>tasks.gsm8k_subset_100.score</code></td></tr>
+            <tr><td>HumanEval subset</td><td><strong>pass@1 0.94</strong></td><td>50</td><td><code>tasks.humaneval_subset_50."pass@1"</code></td></tr>
+            <tr><td>Tools-use suite</td><td><strong>score 1.0</strong> (single_arg, multi_tool_pick, empty_schema, result_followup all 1.0)</td><td>20</td><td><code>tasks.tools_use_20</code></td></tr>
+            <tr><td>Leak probe (special-token leakage)</td><td><strong>0/40 prompts leaked</strong> any of 20 tracked markers, 0 errors</td><td>40</td><td><code>tasks.leak_probe</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Per-sample logs (<code>inspect_ai</code> .eval zip-of-JSON files) are at <code>/var/cache/devai/bench/inspect-logs/</code>:</p>
+      <pre data-lang="python"><code class="language-python">from inspect_ai.log import read_eval_log
+log = read_eval_log("/var/cache/devai/bench/inspect-logs/&lt;task&gt;.eval")
+for s in log.samples:
+    print(s.id, s.input[:60], "->", s.output.completion[:80],
+          "score:", list(s.scores.values())[0].value)</code></pre>
+      <p>…or <code>inspect view start --log-dir /var/cache/devai/bench/inspect-logs</code> for the bundled viewer.</p>
+
+      <h2 id="blackwell-ref">3. Blackwell GPU reference (paper extrapolation)</h2>
+      <div class="callout warn">
+        <div class="callout-icon">!</div>
+        <div>
+          <strong>Not measured here.</strong> Only the RTX PRO 4000 Blackwell row reflects bench data
+          from this project. Other rows are from NVIDIA datasheets, used purely to project how the
+          budget would map to other Blackwell parts.
+        </div>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Part</th><th>VRAM</th><th>Memory</th><th>Class</th><th>Used here?</th></tr></thead>
+          <tbody>
+            <tr style="background: var(--accent-soft)"><td><strong>RTX PRO 4000 Blackwell</strong></td><td><strong>24 GB</strong></td><td><strong>GDDR7</strong></td><td>Workstation</td><td><strong>yes — all bench rows</strong></td></tr>
+            <tr><td>RTX 5090 (GB202)</td><td>32 GB</td><td>GDDR7</td><td>Consumer</td><td>no</td></tr>
+            <tr><td>RTX PRO 6000 Blackwell</td><td>96 GB</td><td>GDDR7</td><td>Workstation</td><td>no</td></tr>
+            <tr><td>B100 (PCIe / SXM)</td><td>192 GB</td><td>HBM3e</td><td>Datacenter</td><td>no</td></tr>
+            <tr><td>B200 (SXM)</td><td>192 GB</td><td>HBM3e</td><td>Datacenter</td><td>no</td></tr>
+            <tr><td>GB200 (superchip, 2× B200)</td><td>384 GB</td><td>HBM3e</td><td>Datacenter</td><td>no</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Projecting the Qwen3-8B-NVFP4 strict-minimum budget onto each part (NVFP4 weights + BF16 embed + FP8 KV @ ctx + ~4 GB fixed overhead — analytical):</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>GPU VRAM</th><th>Max context that fits (strict min)</th><th>Headroom above strict min</th></tr></thead>
+          <tbody>
+            <tr><td>24 GB</td><td>128 K (~18.7 GB strict; 256 K crosses 24 GB and probe-OOMed)</td><td>~5 GB at 128 K → modest elastic pool</td></tr>
+            <tr><td>32 GB</td><td>256 K (~28 GB strict) just fits, marginal headroom</td><td>~4 GB at 256 K</td></tr>
+            <tr><td>96 GB</td><td>any context + comfortable headroom</td><td>enough for high batched throughput</td></tr>
+            <tr><td>192 GB</td><td>trivially fits any context</td><td>enough to co-host a 70B-class NVFP4</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2 id="scaling">4. Scaling to other model sizes (paper extrapolation)</h2>
+      <div class="callout warn">
+        <div class="callout-icon">!</div>
+        <div>
+          <strong>Not run.</strong> Arithmetic from public <code>config.json</code> data and the
+          NVFP4 byte-per-param figure. The 24 GB workstation card this project uses cannot fit either
+          the 32B or 70B totals. KV columns assume FP8 KV; an FP16-KV checkpoint doubles those bytes.
+        </div>
+      </div>
+      <p>Only weights and KV cache change with model size; CUDA graphs and runtime overhead stay roughly flat (within ±50%).</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Class</th><th>NVFP4 weights</th><th>BF16 embed</th><th>KV / token (FP8)</th><th>KV @ 32 K</th><th>KV @ 128 K</th></tr></thead>
+          <tbody>
+            <tr style="background: var(--accent-soft)"><td>8B (Qwen3-8B, reference)</td><td>~3.9 GB</td><td>~1.2 GB</td><td>72 KB</td><td>2.4 GB</td><td>9.4 GB</td></tr>
+            <tr><td>32B (Qwen3-32B class)</td><td>~18.0 GB</td><td>~1.5 GB</td><td>128 KB</td><td>4.0 GB</td><td>16.0 GB</td></tr>
+            <tr><td>70B (Llama-3.1 class)</td><td>~39.4 GB</td><td>~2.1 GB</td><td>160 KB</td><td>5.0 GB</td><td>20.0 GB</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Strict minimums (weights + embed + KV + ~4 GB fixed overhead):</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Class</th><th>32 K min</th><th>128 K min</th></tr></thead>
+          <tbody>
+            <tr><td>8B</td><td>~11.5 GB</td><td>~18.7 GB</td></tr>
+            <tr><td>32B</td><td>~27.5 GB</td><td>~39.5 GB</td></tr>
+            <tr><td>70B</td><td>~50.5 GB</td><td>~65.5 GB</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2 id="implications">5. Operational implications</h2>
+      <ul>
+        <li><strong><code>HEALTH_TIMEOUT_SECONDS=600</code></strong> sits well above the measured cold-start (45.6 s) but leaves headroom for fresh-image cold JIT, larger NVFP4 builds, and SM-cache invalidation on a different Blackwell GPU.</li>
+        <li><strong>Context-cap changes are not free.</strong> Each <code>@&lt;ctx&gt;</code> change re-walks phases 1–11. The router intentionally exposes the suffix at picker time.</li>
+        <li><strong>The bench cache is the truth source for VRAM and TTFT.</strong> <code>peak_vram_gb</code> is what the runtime allocated under the elastic policy, not the strict minimum.</li>
+        <li><strong><code>--enforce-eager</code> reclaims ~2 GB.</strong> Useful as a stop-gap; pay for it in throughput (10–25% slower decode).</li>
+        <li><strong>Quality scores are bench-cache rollups.</strong> If a number looks too good or too bad, open the per-sample log before attributing it to the model.</li>
+      </ul>
+
+      <h2 id="references">References</h2>
+      <ul>
+        <li>NVIDIA NVFP4 format reference — block-scaled FP4 (E2M1) with FP8-E4M3 per-block scales, group_size 16. See the <a href="https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/api/common.html">Transformer Engine NVFP4 docs</a> and the <a href="https://huggingface.co/nvidia/Qwen3-8B-NVFP4">NVIDIA Qwen3-8B-NVFP4 model card</a>.</li>
+        <li>vLLM CUDA graph capture: <code>vllm.config.CompilationConfig</code>, <code>--enforce-eager</code>, <code>--cuda-graph-sizes</code>.</li>
+        <li>SGLang RadixAttention + cuda graph capture: SGLang server args <code>--disable-cuda-graph</code>, <code>--cuda-graph-bs</code>.</li>
+        <li>Project-internal: <a href="router.html">router</a> for the request rewrite chain; <a href="backends.html">backends</a> for the lifecycle state machine and probing procedure. Bench tooling at <code>scripts/bench/</code> with cache at <code>deploy/.bench-cache.json</code>.</li>
+      </ul>
+
+    </div>
+
+    <aside class="toc-floating">
+      <h4>On this page</h4>
+      <ul></ul>
+    </aside>
+  </main>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-core.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/plugins/autoloader/prism-autoloader.min.js"></script>
+<script src="assets/nav.js"></script>
+<script src="assets/site.js"></script>
+</body>
+</html>

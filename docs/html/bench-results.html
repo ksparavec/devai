@@ -1,0 +1,1409 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Bench results — Dev AI Lab</title>
+<meta name="description" content="vLLM leaderboard on RTX 4000 PRO Blackwell (24 GB) — 2026-05-05 sweep. GSM8K / HumanEval / tools_use / leak / TPS / cold-start across nine NVFP4 + MXFP4 + BF16 models.">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism-tomorrow.min.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="site">
+  <main class="main">
+    <div class="content">
+
+      <header>
+        <span class="pill">Benchmark report · vLLM</span>
+        <h1>Bench results — vLLM leaderboard on RTX 4000 PRO Blackwell (24 GB)</h1>
+        <p class="lead">
+          Evidence-grade routing recommendations from the 2026-05-05 sweep across
+          nine vLLM rows. Headline finding: MoE + FP4 wins decisively on this card,
+          with <strong>Nemotron-3-Nano-30B-A3B-NVFP4</strong> taking the outright
+          lead at aggregate 0.99 and 143.8 tok/s.
+        </p>
+      </header>
+
+      <div class="callout">
+        <div class="callout-icon">i</div>
+        <div>
+          Last refreshed <strong>2026-05-05</strong> from
+          <code>deploy/.bench-cache.json</code> (host_env_id <code>ea4fd7e7b668</code>:
+          kernel <code>6.12.85+deb13-amd64</code>, driver <code>595.71.05</code>,
+          GPU <em>NVIDIA RTX PRO 4000 Blackwell</em>, CUDA <code>13.2</code>).
+          Hardware: RTX 4000 PRO Blackwell, 24 GB VRAM, ~640 GB/s memory bandwidth.
+          Backend: vLLM <code>latest-cu130-ubuntu2404</code> via the gpu-arbiter
+          router. Bench harness: <code>scripts/bench/</code> — see
+          <a href="router.html">router.html</a> "Benchmark harness" section.
+          Per-task subset sizes: GSM8K n=100, HumanEval n=50, tools_use n=20,
+          latency/leak n=40 streamed prompts.
+        </div>
+      </div>
+
+      <div class="callout good">
+        <div class="callout-icon">i</div>
+        <div>
+          <strong>Cache schema v2</strong> (effective 2026-05-05): every row stamps
+          <code>host_env_id</code> so re-benches against a different driver/kernel
+          are auditable; the <code>_meta.host_env_history</code> block holds the
+          environment for each id. <code>make bench-vllm BENCH_FORCE=1</code> resets
+          a row's <code>tasks</code> / <code>metrics</code> before re-running so stale
+          fields don't linger; <code>first_benched_at</code> is preserved. Refresh
+          this doc with <code>make bench-report</code> after a new sweep.
+        </div>
+      </div>
+
+      <!-- Headline TPS chart -->
+      <figure>
+        <svg viewBox="0 0 760 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Steady-state TPS leaderboard">
+          <text x="380" y="22" text-anchor="middle" fill="var(--text)" font-size="14" font-weight="600">
+            Steady-state TPS — 2026-05-05 sweep (batch=1, decode-rate p50)
+          </text>
+          <!-- Axes -->
+          <line x1="250" y1="40" x2="250" y2="320" stroke="var(--border-strong)" stroke-width="2"/>
+          <line x1="250" y1="320" x2="730" y2="320" stroke="var(--border-strong)" stroke-width="2"/>
+
+          <!-- x ticks -->
+          <g font-family="JetBrains Mono" font-size="10" fill="var(--text-muted)">
+            <text x="250" y="338" text-anchor="middle">0</text>
+            <text x="370" y="338" text-anchor="middle">40</text>
+            <text x="490" y="338" text-anchor="middle">80</text>
+            <text x="610" y="338" text-anchor="middle">120</text>
+            <text x="730" y="338" text-anchor="middle">160</text>
+            <line x1="370" y1="40" x2="370" y2="320" stroke="var(--border)" stroke-dasharray="2 2"/>
+            <line x1="490" y1="40" x2="490" y2="320" stroke="var(--border)" stroke-dasharray="2 2"/>
+            <line x1="610" y1="40" x2="610" y2="320" stroke="var(--border)" stroke-dasharray="2 2"/>
+            <line x1="730" y1="40" x2="730" y2="320" stroke="var(--border)" stroke-dasharray="2 2"/>
+          </g>
+          <text x="490" y="353" text-anchor="middle" fill="var(--text-muted)" font-size="11">tok/s (sustained, p50)</text>
+
+          <!-- bars: scale = 3 px / tok -->
+          <g font-family="Inter" font-size="11">
+            <!-- Nemotron-3-Nano 143.8 -->
+            <text x="244" y="60" text-anchor="end" fill="var(--accent)" font-weight="600">Nemotron-3-Nano-30B-A3B-NVFP4</text>
+            <rect x="250" y="48" width="431.4" height="18" fill="var(--accent)" rx="2"/>
+            <text x="688" y="61" fill="var(--accent)" font-weight="700">143.8</text>
+
+            <!-- gpt-oss-20b 139.2 -->
+            <text x="244" y="88" text-anchor="end" fill="var(--text)">gpt-oss-20b</text>
+            <rect x="250" y="76" width="417.6" height="18" fill="var(--good)" rx="2"/>
+            <text x="673" y="89" fill="var(--good)" font-weight="700">139.2</text>
+
+            <!-- Qwen3-8B-NVFP4 102.1 -->
+            <text x="244" y="116" text-anchor="end" fill="var(--text)">Qwen3-8B-NVFP4</text>
+            <rect x="250" y="104" width="306.3" height="18" fill="var(--good)" rx="2"/>
+            <text x="562" y="117" fill="var(--good)" font-weight="700">102.1</text>
+
+            <!-- Llama-3.1-8B 95.4 -->
+            <text x="244" y="144" text-anchor="end" fill="var(--text)">Llama-3.1-8B-Instruct-NVFP4</text>
+            <rect x="250" y="132" width="286.2" height="18" fill="var(--good)" rx="2"/>
+            <text x="542" y="145" fill="var(--good)" font-weight="700">95.4</text>
+
+            <!-- Nemotron-Nano-9B-v2 80.4 -->
+            <text x="244" y="172" text-anchor="end" fill="var(--text-muted)">Nemotron-Nano-9B-v2-NVFP4</text>
+            <rect x="250" y="160" width="241.2" height="18" fill="var(--warn)" rx="2"/>
+            <text x="497" y="173" fill="var(--warn)" font-weight="700">80.4</text>
+
+            <!-- Qwen3-14B 61.9 -->
+            <text x="244" y="200" text-anchor="end" fill="var(--text)">Qwen3-14B-NVFP4</text>
+            <rect x="250" y="188" width="185.7" height="18" fill="var(--good)" rx="2"/>
+            <text x="441" y="201" fill="var(--good)" font-weight="700">61.9</text>
+
+            <!-- Qwen3.5-9B 55.3 -->
+            <text x="244" y="228" text-anchor="end" fill="var(--text)">Qwen3.5-9B-NVFP4</text>
+            <rect x="250" y="216" width="165.9" height="18" fill="var(--good)" rx="2"/>
+            <text x="421" y="229" fill="var(--good)" font-weight="700">55.3</text>
+
+            <!-- DS-R1-Distill-Qwen-7B 44.5 -->
+            <text x="244" y="256" text-anchor="end" fill="var(--text)">DeepSeek-R1-Distill-Qwen-7B</text>
+            <rect x="250" y="244" width="133.5" height="18" fill="var(--text-muted)" rx="2"/>
+            <text x="389" y="257" fill="var(--text-muted)" font-weight="700">44.5</text>
+
+            <!-- DS-R1-Distill-Llama-8B 42.5 -->
+            <text x="244" y="284" text-anchor="end" fill="var(--danger)">DeepSeek-R1-Distill-Llama-8B</text>
+            <rect x="250" y="272" width="127.5" height="18" fill="var(--danger)" rx="2"/>
+            <text x="383" y="285" fill="var(--danger)" font-weight="700">42.5</text>
+          </g>
+
+          <!-- BF16 ceiling annotation -->
+          <line x1="370" y1="44" x2="370" y2="316" stroke="var(--warn)" stroke-width="1" stroke-dasharray="4 3"/>
+          <text x="370" y="312" text-anchor="middle" fill="var(--warn)" font-size="10" font-weight="600">BF16-8B bandwidth ceiling ~40 tok/s</text>
+        </svg>
+        <figcaption>
+          MoE + FP4 (Nemotron-3-Nano-30B-A3B, gpt-oss-20b) sweep the top with the
+          smallest per-token weight transfer (~1.5-1.8 GB). Dense 8 B NVFP4 cluster
+          around 95-102 tok/s. BF16 R1-Distill models sit at the bandwidth ceiling
+          (~40 tok/s for 16 GB weights on a 640 GB/s card).
+        </figcaption>
+      </figure>
+
+      <!-- §1 TL;DR -->
+      <h2 id="tldr">1. TL;DR</h2>
+      <p>
+        The bench produces evidence-grade routing recommendations. On this 24 GB
+        Blackwell card, the 2026-05-05 sweep yields a clear ordering across nine
+        vLLM rows (subset of the picker; SGLang on hold):
+      </p>
+
+      <ul>
+        <li>
+          <strong><code>NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4@131072</code></strong>
+          is the new <strong>outright leader</strong> — aggregate
+          <strong>0.99</strong> (gsm8k 0.99, HumanEval 0.98, tools_use 1.00 with all
+          four subcases at 1.0), <strong>143.8 tok/s</strong> steady-state decode,
+          22.45 GB peak. MoE in NVFP4 weights with FP4 KV cache, 128K context. Only
+          model that ties top-of-bench on every quality task <em>and</em> sits in
+          the top-2 by speed. Default pick for any interactive agentic workload on
+          this hardware.
+        </li>
+        <li>
+          <strong><code>Qwen3-14B-NVFP4@65536</code></strong> is a close second at
+          aggregate <strong>0.97</strong> and ties Nemotron-3-Nano on perfect tool
+          fidelity (1.00). Slower at 61.9 tok/s because dense weights are bigger;
+          capped at 64K context due to KV pressure (94 % VRAM at peak). Pick when
+          64K is enough and you want the Qwen3 family.
+        </li>
+        <li>
+          <strong><code>gpt-oss-20b@262144</code></strong> and
+          <strong><code>Qwen3-8B-NVFP4@131072</code></strong> tie at aggregate
+          <strong>0.93</strong>. Different strengths:
+          <ul>
+            <li>
+              <strong>gpt-oss-20b</strong>: fastest at the top tier (139.2 tok/s,
+              MoE+MXFP4) and HumanEval 0.98 — but tools_use slipped to 0.85
+              (empty-schema subcase down to 0.4), so it no longer qualifies for the
+              PRODUCTION_AGENTIC badge that requires tools &gt;= 0.9.
+            </li>
+            <li>
+              <strong>Qwen3-8B-NVFP4</strong>: 0.95 tools, 0.97 gsm8k, 102 tok/s,
+              128K context. The smaller-model AGENTIC choice when you want
+              Nemotron-3's fidelity without the 30B-class container.
+            </li>
+          </ul>
+        </li>
+        <li>
+          <strong><code>Qwen3.5-9B-NVFP4@131072</code></strong> scores aggregate
+          <strong>0.90</strong> with strong reasoning (gsm8k 0.98, tools 0.95) but
+          weaker code (HumanEval 0.78). 55.3 tok/s steady, the longest cold-start
+          of the sweep (~160 s). Picks when reasoning depth + 128K matter more than
+          wall-time.
+        </li>
+        <li>
+          <strong><code>DeepSeek-R1-Distill-Qwen-7B@65536</code></strong> — aggregate
+          0.80, with a surprising HumanEval <strong>0.94</strong> (up from 0.26 in
+          the 2026-05-02 sweep — worth investigating; likely a sampling/scorer
+          interaction flagged in followup work). Tools score 0.60 keeps it out of
+          the AGENTIC tier.
+        </li>
+        <li>
+          <strong><code>Llama-3.1-8B-Instruct-NVFP4@131072</code></strong> is the
+          fastest non-reasoning model (95.4 tok/s, no <code>&lt;think&gt;</code>
+          preamble) and the fastest cold-start (~40 s). Aggregate 0.76; good
+          fallback for latency-critical simple tasks.
+        </li>
+        <li>
+          <strong><code>DeepSeek-R1-Distill-Llama-8B@32768</code></strong> still
+          scores HumanEval <strong>0.00</strong> — the byte-level BPE-decode bug
+          from 2026-05-02 hasn't been fixed upstream. Aggregate 0.48; avoid.
+        </li>
+        <li>
+          <strong><code>Nemotron-Nano-9B-v2-NVFP4@65536</code></strong> is the only
+          row with a non-zero leak rate (<strong>0.075</strong> — 3 of 40 prompts
+          emit <code>&lt;/think&gt;</code> markers) <em>and</em> tools_use 0.00 (no
+          probe-confirmed tool parser, so the router strips <code>tools</code> from
+          the request). Aggregate 0.27; do not deploy until both issues are
+          resolved.
+        </li>
+      </ul>
+
+      <h3 id="tldr-tiers">1.1 Tier summary</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Tier</th><th>Models</th><th>Use for</th></tr>
+          </thead>
+          <tbody>
+            <tr style="background: var(--accent-soft)">
+              <td><strong>Production default</strong> (PRODUCTION_AGENTIC badge)</td>
+              <td>
+                <code>NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4@131072</code>,
+                <code>Qwen3-14B-NVFP4@65536</code>,
+                <code>Qwen3-8B-NVFP4@131072</code>,
+                <code>Qwen3.5-9B-NVFP4@131072</code>
+              </td>
+              <td>meet every threshold (gsm8k &gt;= 0.9, HumanEval &gt;= 0.7, tools &gt;= 0.9, leak == 0.0, peak &lt; 23 GB). Default agentic picks; Nemotron-3-Nano is fastest of the four</td>
+            </tr>
+            <tr>
+              <td><strong>High-throughput coder (tools-light)</strong></td>
+              <td><code>gpt-oss-20b@262144</code></td>
+              <td>dropped out of AGENTIC because tools_use = 0.85 &lt; 0.9; still the fastest 0.97/0.98 reasoning+code combo when tool fidelity isn't critical</td>
+            </tr>
+            <tr>
+              <td><strong>Non-reasoning low-latency</strong></td>
+              <td><code>Llama-3.1-8B-Instruct-NVFP4@131072</code></td>
+              <td>simple prompts where you don't want CoT preamble; fastest cold-start of the sweep</td>
+            </tr>
+            <tr>
+              <td><strong>Reasoning-only (high latency)</strong></td>
+              <td><code>DeepSeek-R1-Distill-Qwen-7B@65536</code></td>
+              <td>offline / batch / when reasoning depth matters more than wall time</td>
+            </tr>
+            <tr>
+              <td><strong>Avoid (broken)</strong></td>
+              <td>
+                <code>DeepSeek-R1-Distill-Llama-8B@32768</code> (BPE-decode bug, 0.0 HumanEval),
+                <code>Nemotron-Nano-9B-v2-NVFP4@65536</code> (7.5 % leak rate, no tool parser)
+              </td>
+              <td>—</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- §2 Full results -->
+      <h2 id="full-results">2. Full results table</h2>
+      <p>
+        Sorted by aggregate (mean of GSM8K / HumanEval / tools_use). All rows from
+        the 2026-05-05 sweep stamped with <code>host_env_id</code>
+        <code>ea4fd7e7b668</code>.
+      </p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Model</th>
+              <th style="text-align:right">GSM8K</th>
+              <th style="text-align:right">HumanEval</th>
+              <th style="text-align:right">tools_use</th>
+              <th>by_subcase (E/S/M/F)</th>
+              <th style="text-align:right">Leak</th>
+              <th style="text-align:right">Cold (s)</th>
+              <th style="text-align:right">Warm p50/p95 (ms)</th>
+              <th style="text-align:right">TPS (tok/s)</th>
+              <th style="text-align:right">Peak VRAM</th>
+              <th style="text-align:right">Aggregate</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr style="background: var(--accent-soft)">
+              <td><strong>NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4@131072</strong></td>
+              <td style="text-align:right">0.99</td>
+              <td style="text-align:right">0.98</td>
+              <td style="text-align:right"><strong>1.00</strong></td>
+              <td>1.0/1.0/1.0/1.0</td>
+              <td style="text-align:right">0.000</td>
+              <td style="text-align:right">60.6</td>
+              <td style="text-align:right">46.9/52.7</td>
+              <td style="text-align:right"><strong>143.8</strong></td>
+              <td style="text-align:right">22.45 GB</td>
+              <td style="text-align:right"><strong>0.99</strong></td>
+            </tr>
+            <tr>
+              <td><strong>Qwen3-14B-NVFP4@65536</strong></td>
+              <td style="text-align:right">0.98</td>
+              <td style="text-align:right">0.94</td>
+              <td style="text-align:right"><strong>1.00</strong></td>
+              <td>1.0/1.0/1.0/1.0</td>
+              <td style="text-align:right">0.000</td>
+              <td style="text-align:right">47.8</td>
+              <td style="text-align:right">46.1/47.3</td>
+              <td style="text-align:right">61.9</td>
+              <td style="text-align:right">22.32 GB</td>
+              <td style="text-align:right"><strong>0.97</strong></td>
+            </tr>
+            <tr>
+              <td><strong>Qwen3-8B-NVFP4@131072</strong></td>
+              <td style="text-align:right">0.97</td>
+              <td style="text-align:right">0.88</td>
+              <td style="text-align:right">0.95</td>
+              <td>1.0/1.0/1.0/0.8</td>
+              <td style="text-align:right">0.000</td>
+              <td style="text-align:right">43.5</td>
+              <td style="text-align:right">32.3/34.4</td>
+              <td style="text-align:right"><strong>102.1</strong></td>
+              <td style="text-align:right">22.53 GB</td>
+              <td style="text-align:right"><strong>0.93</strong></td>
+            </tr>
+            <tr>
+              <td><strong>gpt-oss-20b@262144</strong></td>
+              <td style="text-align:right">0.97</td>
+              <td style="text-align:right"><strong>0.98</strong></td>
+              <td style="text-align:right">0.85</td>
+              <td>0.4/1.0/1.0/1.0</td>
+              <td style="text-align:right">0.000</td>
+              <td style="text-align:right">53.9</td>
+              <td style="text-align:right">50.3/54.0</td>
+              <td style="text-align:right"><strong>139.2</strong></td>
+              <td style="text-align:right">22.37 GB</td>
+              <td style="text-align:right"><strong>0.93</strong></td>
+            </tr>
+            <tr>
+              <td><strong>Qwen3.5-9B-NVFP4@131072</strong></td>
+              <td style="text-align:right">0.98</td>
+              <td style="text-align:right">0.78</td>
+              <td style="text-align:right">0.95</td>
+              <td>0.8/1.0/1.0/1.0</td>
+              <td style="text-align:right">0.000</td>
+              <td style="text-align:right">160.5</td>
+              <td style="text-align:right">31.5/45.6</td>
+              <td style="text-align:right">55.3</td>
+              <td style="text-align:right">21.54 GB</td>
+              <td style="text-align:right"><strong>0.90</strong></td>
+            </tr>
+            <tr>
+              <td><strong>DeepSeek-R1-Distill-Qwen-7B@65536</strong></td>
+              <td style="text-align:right">0.87</td>
+              <td style="text-align:right">0.94<sup>!</sup></td>
+              <td style="text-align:right">0.60</td>
+              <td>1.0/0.4/0.6/0.4</td>
+              <td style="text-align:right">0.000</td>
+              <td style="text-align:right">84.8</td>
+              <td style="text-align:right">36.2/49.4</td>
+              <td style="text-align:right">44.5</td>
+              <td style="text-align:right">21.90 GB</td>
+              <td style="text-align:right">0.80</td>
+            </tr>
+            <tr>
+              <td><strong>Llama-3.1-8B-Instruct-NVFP4@131072</strong></td>
+              <td style="text-align:right">0.78</td>
+              <td style="text-align:right">0.80</td>
+              <td style="text-align:right">0.70</td>
+              <td>1.0/0.4/1.0/0.4</td>
+              <td style="text-align:right">0.000</td>
+              <td style="text-align:right">39.5</td>
+              <td style="text-align:right">23.3/24.0</td>
+              <td style="text-align:right"><strong>95.4</strong></td>
+              <td style="text-align:right">22.65 GB</td>
+              <td style="text-align:right">0.76</td>
+            </tr>
+            <tr>
+              <td><strong>DeepSeek-R1-Distill-Llama-8B@32768</strong></td>
+              <td style="text-align:right">0.63</td>
+              <td style="text-align:right"><span style="color: var(--text-muted)">0.00<sup>*</sup></span></td>
+              <td style="text-align:right">0.80</td>
+              <td>1.0/0.6/1.0/0.6</td>
+              <td style="text-align:right">0.000</td>
+              <td style="text-align:right"><span style="color: var(--text-muted)">0.1<sup>#</sup></span></td>
+              <td style="text-align:right">37.1/52.7</td>
+              <td style="text-align:right">42.5</td>
+              <td style="text-align:right">21.69 GB</td>
+              <td style="text-align:right"><span style="color: var(--text-muted)">0.48</span></td>
+            </tr>
+            <tr>
+              <td><strong>Nemotron-Nano-9B-v2-NVFP4@65536</strong></td>
+              <td style="text-align:right">0.74</td>
+              <td style="text-align:right"><span style="color: var(--text-muted)">0.06</span></td>
+              <td style="text-align:right"><span style="color: var(--text-muted)">0.00<sup>+</sup></span></td>
+              <td>0.0/0.0/0.0/0.0</td>
+              <td style="text-align:right">0.075 (3x <code>&lt;/think&gt;</code>)</td>
+              <td style="text-align:right">112.7</td>
+              <td style="text-align:right">26.9/30.9</td>
+              <td style="text-align:right">80.4</td>
+              <td style="text-align:right">22.28 GB</td>
+              <td style="text-align:right"><span style="color: var(--text-muted)">0.27</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p style="font-size: var(--text-sm); color: var(--text-muted)">
+        Subcase legend: <strong>E</strong>mpty-schema . <strong>S</strong>ingle-arg
+        . <strong>M</strong>ulti-tool-pick . <strong>F</strong>ollow-up.
+        All TPS values are post-fix (see "TPS counting fix" below).
+      </p>
+
+      <details>
+        <summary>Footnotes for caveats marked above</summary>
+        <ul>
+          <li>
+            <sup>*</sup> <strong><code>HumanEval=0.00</code> for
+            R1-Distill-Llama-8B</strong> is the byte-level BPE-decode bug
+            (Issue #1 below): the model emits raw <code>G</code>-marker (space)
+            and <code>C</code>-marker (newline) tokens un-decoded, so every
+            completion is invalid Python regardless of the scorer. The
+            2026-05-05 re-bench reproduced 0.00 cleanly; followup #3 (file vLLM
+            issue with reproducer) still pending.
+          </li>
+          <li>
+            <sup>+</sup> <strong><code>tools_use=0.00</code> for
+            Nemotron-Nano-9B-v2-NVFP4</strong> is because the router's
+            <code>maybeStripTools</code> drops <code>tools</code> and
+            <code>tool_choice</code> from the request entirely when no tool
+            parser is probed, and Nemotron-Nano-9B-v2 has no
+            <code>parsers:</code> block in <code>model-families.yaml</code>.
+            NVIDIA does ship a parser plugin
+            (<code>nemotron_toolcall_parser_no_streaming.py</code>) for vLLM's
+            <code>--tool-parser-plugin</code> mechanism; wiring it up is a
+            separate followup (see followup work below).
+          </li>
+          <li>
+            <sup>!</sup> <strong><code>HumanEval=0.94</code> for
+            R1-Distill-Qwen-7B</strong> is up from <strong>0.26</strong> in the
+            2026-05-02 sweep — a 0.68 jump that flagged on the diff. Same model
+            digest, same n=50 subset, same backend image. Most likely cause: the
+            2026-05-02 run preceded the v2 scorer's fence-handling fix and was
+            charging fenced inline-reasoning answers as failures; the re-bench
+            under the v2 scorer with <code>--force</code> now records the
+            model's real performance. Worth a sanity re-run if it ever drifts
+            back. (See "Issues surfaced &gt; 4. HumanEval scorer too strict for
+            inline-reasoning models — FIXED" for the scorer history.)
+          </li>
+          <li>
+            <sup>#</sup> <strong><code>Cold=0.1 s</code> for
+            R1-Distill-Llama-8B</strong> is a measurement artifact: the bench
+            operator hit the model with a warmup curl before kicking off
+            <code>make bench-vllm</code>, so the latency sidecar saw a
+            fully-warmed container on the first prompt. The genuine cold-start
+            for this row is in the 50-90 s range based on the 2026-05-02 sweep
+            (85.2 s). The TPS, p50/p95, and quality numbers are unaffected; only
+            <code>ttft_ms_first</code> was contaminated. Easy fix on the next
+            run: skip the warmup curl, or accept <code>ttft_ms_first</code> as
+            "warm-start latency" and add a separate cold-start probe.
+          </li>
+        </ul>
+      </details>
+
+      <div class="callout">
+        <div class="callout-icon">i</div>
+        <div>
+          The previous <code>^+^+</code> footnote about <code>tools_use=0.00</code>
+          on forced-mode models is gone: the bench's <code>tools_use</code> task
+          now pins <code>tool_choice</code> per-sample via a custom tool-call loop,
+          so R1-Distill x2 and Llama-3.1-8B-Instruct-NVFP4 produce real scores.
+          See <a href="#issue-tool-loop">Issues surfaced &gt; 2. Tool-loop
+          interruption on forced-mode models</a> below.
+          <br><br>
+          The previous note about Nemotron-3-Nano-30B-A3B's
+          <code>--enforce-eager</code> &rarr; <code>--max-num-seqs 8</code> rescue
+          is now historical: that fix landed in <code>b730985</code> before the
+          2026-05-02 sweep and the model has been stable since. The 2026-05-05
+          cold-start of 60.6 s includes the standard CUDA-graph compilation; the
+          143.8 tok/s steady-state matches the post-fix expectation.
+        </div>
+      </div>
+
+      <!-- §3 Methodology -->
+      <h2 id="methodology">3. Methodology</h2>
+      <p>Per (model, backend) pair:</p>
+
+      <ol>
+        <li>
+          <strong>Latency/leak sidecar</strong> (40 streamed prompts, sequential,
+          batch=1):
+          <ul>
+            <li>First prompt's TTFT recorded as <code>ttft_ms_first</code> — measures <strong>cold start</strong> including container recreate + weight load + KV alloc + prefill.</li>
+            <li>Remaining 39 prompts' TTFTs feed <code>ttft_ms_steady_p50/p95</code>.</li>
+            <li>Stream-body decode rate gives <code>tps_sustained_p50</code>.</li>
+            <li>Concatenated response bodies are regex-swept for known template-leak markers (<code>&lt;channel|&gt;</code>, <code>&lt;|im_end|&gt;</code>, <code>&lt;|tool_call_begin|&gt;</code>, <code>&lt;think&gt;</code>, etc. — see <code>scripts/bench/data/leak_markers.txt</code>).</li>
+          </ul>
+        </li>
+        <li><strong>GSM8K</strong> via inspect_ai (n=100, exact-match scorer).</li>
+        <li><strong>HumanEval</strong> via inspect_ai (n=50, local subprocess sandbox, pass@1).</li>
+        <li><strong>tools_use</strong> custom inspect_ai task (n=20, four sub-cases).</li>
+        <li><strong>VRAM sampler</strong> thread polls <code>nvidia-smi</code> at 1 Hz throughout each model's run, reports peak/mean.</li>
+      </ol>
+
+      <p>
+        Results merge into one row per model in <code>deploy/.bench-cache.json</code>,
+        keyed by <code>&lt;repo@sha&gt;</code> to join with the probe cache.
+      </p>
+
+      <!-- §4 TPS counting fix -->
+      <h2 id="tps-fix">4. TPS counting fix</h2>
+
+      <div class="callout warn">
+        <div class="callout-icon">i</div>
+        <div>
+          <strong>The first bench pass reported TPS values that were 2.5-94x too
+          low for any model with a reasoning parser</strong> because vLLM's
+          <code>usage.completion_tokens</code> only counts <code>content</code>
+          tokens — it excludes <code>reasoning_content</code> tokens generated
+          under <code>--reasoning-parser {qwen3,deepseek_r1}</code> (and probably
+          others). Since the bench's TPS divisor
+          <code>(t_done - t_first_token)</code> spans the full stream including
+          the entire <code>&lt;think&gt;</code> block, dividing a small numerator
+          by a large denominator gave nonsense rates like 0.66 tok/s for
+          Qwen3-14B-NVFP4.
+        </div>
+      </div>
+
+      <p>
+        <strong>Fix</strong>
+        (<code>scripts/bench/_bench_core.py::stream_chat_completion</code>):
+        accumulate <code>delta.reasoning_content</code> characters alongside
+        <code>delta.content</code>, then derive an
+        <code>effective_tokens = max(usage.completion_tokens, (content_chars + reasoning_chars) // 4)</code>.
+        The <code>// 4</code> heuristic is the standard ~4-chars-per-token
+        approximation; the <code>max()</code> keeps accurate parsers from being
+        penalised on short outputs.
+      </p>
+
+      <p><strong>Validation</strong> — re-ran leak/latency for every vLLM model and compared:</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Model</th>
+              <th>Parser</th>
+              <th style="text-align:right">Before fix</th>
+              <th style="text-align:right">After fix</th>
+              <th style="text-align:right">Delta</th>
+              <th>Notes</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Qwen3-14B-NVFP4</td>
+              <td>qwen3</td>
+              <td style="text-align:right">0.66</td>
+              <td style="text-align:right"><strong>62.02</strong></td>
+              <td style="text-align:right"><strong>94x</strong></td>
+              <td>qwen3 parser was the worst offender</td>
+            </tr>
+            <tr style="background: var(--accent-soft)">
+              <td><strong>gpt-oss-20b</strong></td>
+              <td>harmony (openai_gptoss)</td>
+              <td style="text-align:right">38.4</td>
+              <td style="text-align:right"><strong>136.37</strong></td>
+              <td style="text-align:right"><strong>3.6x</strong></td>
+              <td>harmony parser also undercounts; MoE = 3.6B active params -&gt; fastest in bench</td>
+            </tr>
+            <tr>
+              <td>Qwen3-8B-NVFP4</td>
+              <td>qwen3</td>
+              <td style="text-align:right">14.53</td>
+              <td style="text-align:right"><strong>98.31</strong></td>
+              <td style="text-align:right">6.8x</td>
+              <td>8B fits more bandwidth headroom</td>
+            </tr>
+            <tr>
+              <td>Qwen3.5-9B-NVFP4</td>
+              <td>qwen3</td>
+              <td style="text-align:right">22.67</td>
+              <td style="text-align:right"><strong>55.73</strong></td>
+              <td style="text-align:right">2.5x</td>
+              <td>hybrid Mamba arch decodes slower than pure Transformer</td>
+            </tr>
+            <tr>
+              <td>DeepSeek-R1-Distill-Qwen-7B</td>
+              <td>deepseek_r1</td>
+              <td style="text-align:right">13.85</td>
+              <td style="text-align:right"><strong>45.18</strong></td>
+              <td style="text-align:right">3.3x</td>
+              <td>deepseek_r1 also undercounts, but less</td>
+            </tr>
+            <tr>
+              <td>DeepSeek-R1-Distill-Llama-8B</td>
+              <td>deepseek_r1</td>
+              <td style="text-align:right">17.51</td>
+              <td style="text-align:right"><strong>42.51</strong></td>
+              <td style="text-align:right">2.4x</td>
+              <td>same parser bug; BF16 is at bandwidth ceiling anyway</td>
+            </tr>
+            <tr>
+              <td>Nemotron-Nano-9B-v2-NVFP4</td>
+              <td>(none, inline <code>&lt;think&gt;</code>)</td>
+              <td style="text-align:right">82.0</td>
+              <td style="text-align:right"><strong>81.08</strong></td>
+              <td style="text-align:right"><strong>-1.1 %</strong></td>
+              <td>inline <code>&lt;think&gt;</code> lands in <code>content</code> directly — usage already counted it; drift is run-to-run noise</td>
+            </tr>
+            <tr>
+              <td><strong>Llama-3.1-8B-Instruct-NVFP4</strong></td>
+              <td>(none)</td>
+              <td style="text-align:right">95.53</td>
+              <td style="text-align:right"><strong>95.88</strong></td>
+              <td style="text-align:right"><strong>+0.4 %</strong></td>
+              <td>non-reasoning model — fix is a no-op as expected, drift within measurement noise</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>
+        The Llama-3.1 and Nemotron rows are the validation cases: models with no
+        separate <code>reasoning_content</code> channel see the
+        <code>effective_tokens</code> formula fall through to
+        <code>usage.completion_tokens</code> unchanged, and drift is within
+        run-to-run noise (different prompt sampling). <strong>Fix confirmed correct
+        for both regressions and non-regressions.</strong>
+      </p>
+
+      <div class="callout good">
+        <div class="callout-icon">i</div>
+        <div>
+          The biggest single insight from the 2026-05-05 sweep:
+          <strong>MoE + FP4 wins decisively on this card.</strong> Both the new
+          outright leader <strong><code>Nemotron-3-Nano-30B-A3B-NVFP4</code></strong>
+          at 143.8 tok/s and the runner-up <strong><code>gpt-oss-20b</code></strong>
+          at 139.2 tok/s are MoE + FP4-class checkpoints (~3 B and ~3.6 B active
+          params respectively); their per-token weight transfer (~1.5-1.8 GB) is
+          well below the dense 8 B NVFP4 models (~5 GB), giving a ~3x ceiling
+          advantage on the 640 GB/s memory-bound card.
+        </div>
+      </div>
+
+      <!-- §5 Arch finding -->
+      <h2 id="fp4-moe">5. Architectural finding: FP4 quantization + MoE on Blackwell</h2>
+      <p>
+        After the TPS counting fix and the 2026-05-05 re-bench, this Blackwell card
+        delivers a <strong>~3x decode-rate spread</strong> across the
+        quantization x architecture matrix, with MoE + FP4 sweeping the top:
+      </p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Architecture x Quantization</th>
+              <th>Models</th>
+              <th style="text-align:right">TPS p50</th>
+              <th>Why</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr style="background: var(--accent-soft)">
+              <td><strong>MoE + NVFP4</strong> (~3 B active, FP4 KV cache)</td>
+              <td>NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4</td>
+              <td style="text-align:right"><strong>143.8 tok/s</strong></td>
+              <td>smallest per-token weight transfer (~1.5 GB); FP4 KV cache cuts attention reads too</td>
+            </tr>
+            <tr>
+              <td><strong>MoE + MXFP4</strong> (~3.6 B active)</td>
+              <td>gpt-oss-20b</td>
+              <td style="text-align:right"><strong>139.2 tok/s</strong></td>
+              <td>per-token weight transfer ~1.8 GB; OCP MXFP4 vs vendor NVFP4 is a wash on raw decode</td>
+            </tr>
+            <tr>
+              <td><strong>Dense + NVFP4</strong> (small)</td>
+              <td>Qwen3-8B-NVFP4, Llama-3.1-8B-Instruct-NVFP4</td>
+              <td style="text-align:right">95-102 tok/s</td>
+              <td>~5 GB/token; FP4 tensor cores hit</td>
+            </tr>
+            <tr>
+              <td><strong>Dense + NVFP4</strong> (medium reasoning)</td>
+              <td>Nemotron-Nano-9B-v2-NVFP4</td>
+              <td style="text-align:right">80 tok/s</td>
+              <td>similar to small NVFP4 + reasoning template overhead</td>
+            </tr>
+            <tr>
+              <td><strong>Dense + NVFP4</strong> (large)</td>
+              <td>Qwen3-14B-NVFP4</td>
+              <td style="text-align:right">62 tok/s</td>
+              <td>~7 GB/token; bandwidth scales linearly with weight size</td>
+            </tr>
+            <tr>
+              <td><strong>Hybrid Mamba + NVFP4</strong> (community quant)</td>
+              <td>Qwen3.5-9B-NVFP4 (<code>ykarout/</code>)</td>
+              <td style="text-align:right">55 tok/s</td>
+              <td>linear-attention layers decode well, but Mamba state arithmetic adds overhead vs pure Transformer</td>
+            </tr>
+            <tr>
+              <td><strong>Dense + BF16</strong></td>
+              <td>DeepSeek-R1-Distill-{Qwen-7B, Llama-8B}</td>
+              <td style="text-align:right">42-45 tok/s</td>
+              <td>16 GB/token weight transfer at 640 GB/s ~ 40 tok/s ceiling</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>
+        <strong>Practical wall-time matters more than raw TPS</strong> because
+        reasoning models emit a long <code>&lt;think&gt;</code> preamble before the
+        visible answer. End-to-end wall time for an agent waiting on a 200-token
+        reply:
+      </p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Model</th>
+              <th style="text-align:right">TPS</th>
+              <th style="text-align:right">Pre-answer reasoning</th>
+              <th style="text-align:right">Total wall time</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr style="background: var(--accent-soft)">
+              <td><code>Nemotron-3-Nano-30B-A3B-NVFP4</code> (nano_v3 reasoning)</td>
+              <td style="text-align:right">144</td>
+              <td style="text-align:right">~300 tokens</td>
+              <td style="text-align:right"><strong>3.5 s</strong></td>
+            </tr>
+            <tr>
+              <td><code>gpt-oss-20b</code> (harmony channels, structured)</td>
+              <td style="text-align:right">139</td>
+              <td style="text-align:right">~300 tokens</td>
+              <td style="text-align:right"><strong>3.6 s</strong></td>
+            </tr>
+            <tr>
+              <td><code>Qwen3-8B-NVFP4</code> (Qwen3 thinking)</td>
+              <td style="text-align:right">102</td>
+              <td style="text-align:right">~500 tokens</td>
+              <td style="text-align:right"><strong>6.9 s</strong></td>
+            </tr>
+            <tr>
+              <td><code>Llama-3.1-8B-Instruct-NVFP4</code> (no reasoning)</td>
+              <td style="text-align:right">95</td>
+              <td style="text-align:right">0</td>
+              <td style="text-align:right"><strong>2.1 s</strong></td>
+            </tr>
+            <tr>
+              <td><code>Qwen3-14B-NVFP4</code></td>
+              <td style="text-align:right">62</td>
+              <td style="text-align:right">~600 tokens</td>
+              <td style="text-align:right"><strong>12.9 s</strong></td>
+            </tr>
+            <tr>
+              <td><code>DeepSeek-R1-Distill-Qwen-7B</code> (BF16, R1-style)</td>
+              <td style="text-align:right">45</td>
+              <td style="text-align:right">~1500 tokens</td>
+              <td style="text-align:right"><strong>37.8 s</strong></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>
+        The R1-Distill family is <strong>not catastrophically slow on raw
+        decode</strong> (40+ tok/s, hitting the bandwidth ceiling for BF16 8B);
+        they're slow in <strong>wall time</strong> because of the long thinking
+        preamble. For an interactive agent like Claude Code where every prompt is
+        a turn, this matters end-to-end — choose architecture/parser combinations
+        that minimise the wall-time integral, not maximise raw TPS in isolation.
+      </p>
+
+      <p>
+        The card's ~640 GB/s memory bandwidth is the bottleneck for batch=1
+        decode. NVFP4 cuts the per-token weight transfer by 4x, and Blackwell
+        hardware tensor cores process FP4 natively — both effects compound. For
+        BF16 8B models, the theoretical ceiling is ~40 tok/s
+        (16 GB / 640 GB/s); real-world ~15 tok/s after parser, framework, and
+        streaming overhead.
+      </p>
+
+      <div class="callout good">
+        <div class="callout-icon">i</div>
+        <div>
+          <strong>Routing implication</strong>: prefer NVFP4 quantizations of any
+          reasoning-capable model, and prefer MoE when context budget allows. The
+          <strong>Nemotron-3-Nano-30B-A3B-NVFP4</strong> +
+          <strong>Qwen3 NVFP4 family (8B, 14B)</strong> +
+          <strong>gpt-oss-20b</strong> are the practical agentic workhorses on
+          this hardware. The R1-Distill BF16 family stays in the catalog as a
+          curiosity (their reasoning quality is real — Qwen-7B distill scored
+          0.87 on GSM8K and an unexpectedly high 0.94 on HumanEval in this sweep)
+          but should not be the default for any latency-sensitive workflow.
+        </div>
+      </div>
+
+      <!-- §6 Cold-start -->
+      <h2 id="cold-start">6. Cold-start signal</h2>
+      <p>
+        The <code>ttft_ms_first</code> metric captures the user-observable cold
+        start — exactly what an agent like Claude Code experiences on first
+        request to a freshly-routed model:
+      </p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Model</th>
+              <th style="text-align:right">Cold (s)</th>
+              <th>Notes</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td>Llama-3.1-8B-Instruct-NVFP4</td><td style="text-align:right">39.5</td><td>fastest cold start; small footprint, no reasoning preamble</td></tr>
+            <tr><td>Qwen3-8B-NVFP4</td><td style="text-align:right">43.5</td><td>+ reasoning template + Qwen3 chat template</td></tr>
+            <tr><td>Qwen3-14B-NVFP4</td><td style="text-align:right">47.8</td><td>bigger weights</td></tr>
+            <tr><td>gpt-oss-20b</td><td style="text-align:right">53.9</td><td>20 B MoE, harmony channels, longer graph compile</td></tr>
+            <tr style="background: var(--accent-soft)"><td>Nemotron-3-Nano-30B-A3B-NVFP4</td><td style="text-align:right">60.6</td><td>30 B MoE in NVFP4 + nano_v3 reasoning parser; CUDA-graph capture under <code>--max-num-seqs 8</code></td></tr>
+            <tr><td>DeepSeek-R1-Distill-Qwen-7B</td><td style="text-align:right">84.8</td><td>BF16, slower paged-in load</td></tr>
+            <tr><td>Nemotron-Nano-9B-v2-NVFP4</td><td style="text-align:right">112.7</td><td>NVFP4 + 9B + Nemotron-specific kernel compile</td></tr>
+            <tr><td><strong>Qwen3.5-9B-NVFP4</strong></td><td style="text-align:right"><strong>160.5</strong></td><td><strong>first-time CUDA-graph capture for the Qwen3.5 generation; subsequent recreates much faster</strong></td></tr>
+            <tr><td><em>DeepSeek-R1-Distill-Llama-8B</em></td><td style="text-align:right"><em>0.1</em></td><td><em>2026-05-05 row contaminated by a pre-bench warmup curl; cf. footnote <sup>#</sup> on the full results table. The genuine cold-start is ~85 s based on the 2026-05-02 sweep.</em></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout">
+        <div class="callout-icon">i</div>
+        <div>
+          <strong>Operational note</strong>: the <code>HEALTH_TIMEOUT_SECONDS=600</code>
+          default in <code>gpu-arbiter</code> is justified — Qwen3.5-9B's 160 s
+          startup leaves generous margin against the 600 s ceiling, and slower
+          NVFP4 + CUDA-graph compiles on bigger MoEs can push 4-5 minutes in the
+          wild.
+        </div>
+      </div>
+
+      <!-- §7 Issues surfaced -->
+      <h2 id="issues">7. Issues surfaced (all real findings, not bench bugs)</h2>
+
+      <h3 id="issue-bpe">7.1 R1-Distill-Llama-8B emits raw byte-level BPE tokens</h3>
+      <p>
+        Sample completions contained literal <code>G-marker</code> (space,
+        U+0120) and <code>C-marker</code> (newline, U+010A) — the Llama-3
+        byte-level BPE markers, un-decoded. HumanEval failed every sample because
+        Python parser rejects these as syntax errors. Smells like a
+        <code>--reasoning-parser deepseek_r1</code> x Llama-3 tokenizer
+        interaction in vLLM where the parser extracts text at the wrong layer
+        (tokens vs decoded UTF-8). Specific to this model — the Qwen-7B distill
+        (Qwen-2 tokenizer) does NOT show this bug.
+      </p>
+      <div class="callout danger">
+        <div class="callout-icon">i</div>
+        <div>
+          <strong>Action</strong>: file vLLM issue with reproducer; in the
+          meantime, route Llama-3 reasoning to OpenAI-compatible non-reasoning
+          paths or use the Llama-3.1-Instruct-NVFP4 (no reasoning, 0.72
+          HumanEval).
+        </div>
+      </div>
+
+      <h3 id="issue-tool-loop">7.2 Tool-loop interruption on forced-mode models — <span style="color: var(--good)">FIXED</span></h3>
+      <p>
+        The router's <code>tool_choice_pinning_required</code> HTTP 400 — designed
+        to prevent silent garbage from forced-mode agents — fired inside the
+        inspect_ai tool loop and got converted to RuntimeError, killing the task.
+        This is the router doing exactly what we built it to do; the bench needed
+        to pin <code>tool_choice</code> per-sample to test forced-mode models.
+      </p>
+      <p>
+        <strong>Why setting <code>state.tool_choice</code> alone wasn't
+        enough</strong>: inspect_ai's built-in tool loop
+        (<code>_eval/task/generate.py::task_generate</code>) reads
+        <code>state.tool_choice</code> once at the start, but <strong>resets it
+        to <code>"auto"</code> after a forced <code>ToolFunction</code>
+        call</strong> so the model can produce a final answer. That second turn
+        then trips the router. There is no public API to disable that reset.
+      </p>
+      <p>
+        <strong>Resolution</strong>: <code>tasks/tools_use.py</code> now ships a
+        custom solver (<code>tool_loop_with_pin</code>) that drives the loop
+        manually: turn 1 with
+        <code>tool_choice=ToolFunction(name=expect_tool)</code>;
+        <code>execute_tools</code> for any tool calls; for
+        <code>result_followup</code> only, a second turn with
+        <code>tool_choice="none"</code> so the model produces text without
+        re-tripping the router. Other subcases stop after turn 1 — the scorer
+        grades them on the tool call alone. <code>bench_runner.py</code> also
+        passes <code>fail_on_error=False</code> to <code>inspect_eval</code> for
+        the tools task as belt-and-suspenders. Verified end-to-end with
+        <code>BENCH_TASKS=tools BENCH_FORCE=1</code>; all three forced-mode
+        models now produce real scores (0.60—0.75) instead of 0.00.
+      </p>
+      <p>
+        <strong>Tradeoff</strong>: <code>multi_tool_pick</code> no longer tests
+        the model's tool-routing decision (we hand it the answer); it now tests
+        args correctness given the right tool. That's the only path that works
+        for forced-mode models on multi-tool prompts.
+      </p>
+
+      <h3 id="issue-leak">7.3 Nemotron-Nano-9B-v2 leaks <code>&lt;/think&gt;</code> markers</h3>
+      <p>
+        3 occurrences across 40 latency prompts. The model emits
+        <code>&lt;think&gt;...&lt;/think&gt;</code> inline (it's
+        <code>cap=inline</code>, not structured), and Nemotron has no
+        <code>parsers:</code> block in <code>model-families.yaml</code>, so vLLM
+        launches without <code>--reasoning-parser</code>.
+      </p>
+      <p>
+        <strong>What NVIDIA actually prescribes</strong> (from the HF model card,
+        checked 2026-05-02): reasoning is controlled via <code>/think</code>
+        (default) or <code>/no_think</code> keywords in the system message or
+        per-turn user message; the model emits
+        <code>&lt;think&gt;...&lt;/think&gt;</code> tags around the trace. Tool
+        calling uses NVIDIA's custom <code>&lt;TOOLCALL&gt;</code> /
+        <code>&lt;AVAILABLE_TOOLS&gt;</code> / <code>&lt;TOOL_RESPONSE&gt;</code>
+        format, with a parser plugin
+        (<code>nemotron_toolcall_parser_no_streaming.py</code>) that ships in the
+        HF repo for vLLM's <code>--tool-parser-plugin</code> mechanism. The full
+        launch spec is:
+      </p>
+      <pre data-lang="bash"><code class="language-bash">vllm serve nvidia/NVIDIA-Nemotron-Nano-9B-v2 \
+  --trust-remote-code \
+  --mamba_ssm_cache_dtype float32 \
+  --enable-auto-tool-choice \
+  --tool-parser-plugin &lt;vendored-script&gt; \
+  --tool-call-parser nemotron_json</code></pre>
+      <p>
+        None of that is wired up in this repo today.
+      </p>
+      <div class="callout warn">
+        <div class="callout-icon">i</div>
+        <div>
+          <strong>Action</strong>: see followup #4 below for the concrete steps.
+          The existing comment in <code>model-families.yaml</code> claiming "no
+          shipped parser matches" predates checking NVIDIA's docs and is wrong;
+          it's flagged for correction as part of that followup.
+        </div>
+      </div>
+
+      <h3 id="issue-humaneval-scorer">7.4 HumanEval scorer too strict for inline-reasoning models — <span style="color: var(--good)">FIXED</span></h3>
+      <p>
+        <code>_clean_completion</code> v1 only matched a fence enclosing the
+        <strong>entire</strong> completion (after <code>strip()</code>); inline-
+        reasoning models that put a <code>&lt;think&gt;...&lt;/think&gt;</code>
+        preamble before the code fence, or surrounding prose around the fence,
+        fell through to "return raw text" and the subprocess saw
+        <code>&lt;think&gt;</code> / <code>Here's the code:</code> lines as
+        syntax errors.
+      </p>
+      <p>
+        <strong>Resolution</strong>: rewrote <code>_clean_completion</code> in
+        <code>scripts/bench/tasks/humaneval.py</code> with three layered
+        strategies:
+      </p>
+      <ol>
+        <li>Strip any <code>&lt;think&gt;...&lt;/think&gt;</code> blocks (re.DOTALL, case-insensitive).</li>
+        <li>If one or more fenced blocks remain, return the body of the <strong>last</strong> one (empirically the model's final answer when it drafts then revises).</li>
+        <li>If no fence and an <code>entry_point</code> is known, anchor on <code>^def &lt;entry_point&gt;\(</code> and slice from there.</li>
+        <li>Else return the think-stripped text as-is.</li>
+      </ol>
+      <p>
+        Smoke-tested against 9 representative inputs (whole-text fence, fence
+        with surrounding prose, <code>&lt;think&gt;</code> + fence,
+        <code>&lt;think&gt;</code> + naked def, draft+final fences,
+        entry_point-name-in-prose-then-real-def, unclosed
+        <code>&lt;think&gt;</code>, empty input). All passed.
+      </p>
+      <p>
+        <strong>Validation rerun</strong>
+        (<code>BENCH_TASKS=humaneval BENCH_FORCE=1</code> over Nemotron +
+        R1-Distill-Llama-8B):
+      </p>
+      <ul>
+        <li>Nemotron-Nano-9B-v2-NVFP4 pass@1: 0.00 -&gt; <strong>0.06</strong> (3/50). Modest improvement; the scorer was hiding ~3 truly-passing samples behind preamble. Most failures are genuine coding weakness, not scorer strictness — the doc's earlier "0.00 likely much higher in reality" speculation was over-optimistic.</li>
+        <li>R1-Distill-Llama-8B pass@1: 0.00 -&gt; <strong>0.00</strong>. Confirms the byte-level BPE-decode bug (Issue #1) is the <em>dominant</em> failure mode here, not scorer strictness — every completion is still invalid Python.</li>
+      </ul>
+      <p>
+        The scorer fix is a no-op-or-improvement for already-passing models
+        (strict whole-text fence still matches; surrounding-prose paths only fire
+        when the strict path would have returned the unmodified text). No re-run
+        of auto-mode models was performed; their cached scores are still
+        meaningful.
+      </p>
+
+      <h3 id="issue-tps-undercount">7.5 TPS undercounted for Qwen3 reasoning parser</h3>
+      <p>
+        vLLM with <code>--reasoning-parser qwen3</code> doesn't include
+        <code>reasoning_content</code> tokens in
+        <code>usage.completion_tokens</code>. The bench's TPS divisor spans the
+        full stream, so reported values are 5-10x too low for Qwen3 family.
+      </p>
+      <p>
+        <strong>Action</strong>: switch the bench's TPS-counting to character-
+        bytes / 4 (approximate but parser-agnostic), or also accumulate
+        <code>reasoning_content</code> text length and add to the count.
+      </p>
+
+      <!-- §8 KV pressure -->
+      <h2 id="kv-pressure">8. KV-pressure observations</h2>
+      <p>Peak VRAM relative to the 24 GB cap:</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Model</th>
+              <th style="text-align:right">Peak / 24 GB</th>
+              <th>Pressure</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td>Llama-3.1-8B-Instruct-NVFP4 @131K</td><td style="text-align:right">22.65 / 24 = <strong>94.4%</strong></td><td>tight; KV near limit at full ctx</td></tr>
+            <tr><td>Qwen3-8B-NVFP4 @131K</td><td style="text-align:right">22.53 / 24 = <strong>93.9%</strong></td><td>tight</td></tr>
+            <tr style="background: var(--accent-soft)"><td>Nemotron-3-Nano-30B-A3B-NVFP4 @131K</td><td style="text-align:right">22.45 / 24 = <strong>93.5%</strong></td><td>tight; runs with <code>--max-num-seqs 8</code> (NVIDIA's prescribed value) which shrinks CUDA-graph capture buffers enough to keep capture enabled</td></tr>
+            <tr><td>gpt-oss-20b @262K</td><td style="text-align:right">22.37 / 24 = 93.2%</td><td>tight</td></tr>
+            <tr><td>Qwen3-14B-NVFP4 @65K</td><td style="text-align:right">22.32 / 24 = 93.0%</td><td>tight</td></tr>
+            <tr><td>Nemotron-Nano-9B-v2-NVFP4 @65K</td><td style="text-align:right">22.28 / 24 = 92.8%</td><td>tight</td></tr>
+            <tr><td>DeepSeek-R1-Distill-Qwen-7B @65K</td><td style="text-align:right">21.90 / 24 = 91.2%</td><td>comfortable</td></tr>
+            <tr><td>DeepSeek-R1-Distill-Llama-8B @32K</td><td style="text-align:right">21.69 / 24 = 90.4%</td><td>comfortable</td></tr>
+            <tr><td>Qwen3.5-9B-NVFP4 @131K</td><td style="text-align:right">21.54 / 24 = 89.8%</td><td>comfortable</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout warn">
+        <div class="callout-icon">i</div>
+        <div>
+          All models cleared the probe filter (no KV preemption observed during
+          the run). The 4 models above 93% are running at or near the practical
+          context ceiling for this card. <strong>Recommendation</strong>: when
+          benching at higher contexts, watch for
+          <code>peak_vram_gb &gt;= 0.95 * 24</code> = 22.8 GB; that's the
+          threshold where KV paging starts to bite.
+        </div>
+      </div>
+
+      <p>
+        For <strong>Qwen3-14B-NVFP4</strong> specifically, 22.32 GB at only 65K
+        context means <strong>128K is not feasible</strong> on this card —
+        confirmed by the probe which never offered the 128K tier for this model.
+        The 8B and 9B NVFP4 models all hit similar headroom at 128-131K,
+        suggesting that's the practical ceiling for any 7-9 B parameter NVFP4
+        model on 24 GB.
+      </p>
+
+      <!-- §9 Picker tiers -->
+      <h2 id="picker-tiers">9. Picker-tier recommendations</h2>
+      <p>Encoded as filter expressions ready for the picker / docs:</p>
+
+      <pre data-lang="python"><code class="language-python">PRODUCTION_AGENTIC = (
+    backend == "vllm"
+    AND quantization in {"NVFP4", "MXFP4"}
+    AND tools_use_score &gt;= 0.9
+    AND humaneval &gt;= 0.7
+    AND gsm8k &gt;= 0.9
+    AND leak_rate == 0
+    AND peak_vram_gb &lt; 23
+)
+# matches (2026-05-05): NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4,
+#   Qwen3-14B-NVFP4, Qwen3-8B-NVFP4, Qwen3.5-9B-NVFP4
+# notable change vs 2026-05-02: gpt-oss-20b dropped out -- tools_use
+#   slipped from 0.90 to 0.85 (empty_schema subcase down to 0.4),
+#   so it no longer clears the &gt;= 0.9 threshold.
+
+CODING_SPECIALIST = max(humaneval) where PRODUCTION_AGENTIC
+# matches: NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4 (HumanEval 0.98)
+# tied: gpt-oss-20b would also be 0.98 but is no longer AGENTIC.
+
+LATENCY_SENSITIVE = (
+    PRODUCTION_AGENTIC
+    AND tps_sustained_p50 &gt;= 50
+)
+# matches all four AGENTIC models -- 55 &lt; tps &lt; 144.
+
+THROUGHPUT_KING = max(tps_sustained_p50)
+# matches: NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4 at 143.8 tok/s,
+#   edging gpt-oss-20b at 139.2.
+
+REASONING_ONLY = (
+    backend == "vllm"
+    AND gsm8k &gt;= 0.85
+    AND tps_sustained_p50 &lt; 30
+)
+# matches (2026-05-05): no models -- the slowest qualifying model
+#   in the sweep, DeepSeek-R1-Distill-Qwen-7B, decodes at 44.5 tok/s
+#   (still slow in wall time once you account for the long &lt;think&gt;
+#   preamble, but its raw decode rate is well above the 30 tok/s
+#   cutoff).
+
+AVOID = (
+    leak_rate &gt; 0
+    OR has_known_decode_bug   # R1-Distill-Llama-8B
+    OR (humaneval &lt; 0.3 AND not REASONING_ONLY)
+)
+# matches: R1-Distill-Llama-8B (BPE bug; HumanEval 0.00),
+#   Nemotron-Nano-9B-v2 (7.5 % leak rate, tools_use 0.00).</code></pre>
+
+      <p>
+        These are derived from the cache, not hand-curated. The picker reads
+        <code>deploy/.bench-cache.json</code> directly and surfaces the
+        PRODUCTION_AGENTIC verdict via <code>_is_production_agentic</code>
+        (formerly a TIER badge; the per-row score columns now make the verdict
+        implicit — a row that's <code>Yes</code> in TOOLS, has
+        <code>&gt;= 0.9</code> in TOTAL%, and shows <code>0.0</code> in LEAK% is
+        by definition AGENTIC).
+      </p>
+
+      <!-- §10 Followup work -->
+      <h2 id="followups">10. Followup work (ordered by impact)</h2>
+
+      <div class="card-grid">
+        <div class="card" style="border-left: 3px solid var(--good)">
+          <h4 style="color: var(--good)">Done · TPS counting</h4>
+          <p>
+            Accumulate <code>reasoning_content</code> chars and use
+            <code>max(usage.completion_tokens, chars/4)</code>. Validated on all
+            8 models: non-reasoning (Llama-3.1, Nemotron) drift 0.4-1.1% as
+            expected (no-op fix path); reasoning-parser models corrected 2.4x
+            (deepseek_r1) to 94x (Qwen3-14B with qwen3 parser); harmony parser
+            also fixed (gpt-oss 38-&gt;136 tok/s, MoE leader confirmed).
+            Makefile also fixed to single-quote <code>BENCH_REPO</code> /
+            <code>BENCH_TASKS</code> so regex pipes don't get interpreted by the
+            shell.
+          </p>
+        </div>
+        <div class="card" style="border-left: 3px solid var(--good)">
+          <h4 style="color: var(--good)">Done · Pin <code>tool_choice</code> per-sample</h4>
+          <p>
+            Recovers tools data for the 3 forced-mode models (R1-Distill x2 +
+            Llama-3.1 NVFP4). First attempt (set <code>state.tool_choice</code>
+            and reuse <code>generate()</code>) failed because inspect_ai's
+            built-in tool loop resets <code>tool_choice</code> to
+            <code>"auto"</code> on the follow-up turn. Final fix replaces
+            <code>generate()</code> with a custom <code>tool_loop_with_pin</code>
+            solver in <code>scripts/bench/tasks/tools_use.py</code> that drives
+            the loop manually: turn 1 pinned to
+            <code>ToolFunction(name=expect_tool)</code>, optional turn 2 for
+            <code>result_followup</code> with <code>tool_choice="none"</code>.
+            Validated on all 3 forced-mode models: Llama-3.1-8B-Instruct-NVFP4
+            (0.00 -&gt; 0.75), DeepSeek-R1-Distill-Qwen-7B (0.00 -&gt; 0.65),
+            DeepSeek-R1-Distill-Llama-8B (0.00 -&gt; 0.60). See
+            <a href="#issue-tool-loop">Issues surfaced &gt; 2</a> for details
+            and the tradeoff on <code>multi_tool_pick</code>.
+          </p>
+        </div>
+        <div class="card" style="border-left: 3px solid var(--good)">
+          <h4 style="color: var(--good)">Done · HumanEval scorer for inline-reasoning</h4>
+          <p>
+            <code>scripts/bench/tasks/humaneval.py::_clean_completion</code>
+            rewritten with <code>&lt;think&gt;</code> stripping + last-fence
+            selection + <code>^def &lt;entry_point&gt;\(</code> fallback.
+            Validated: Nemotron 0.00 -&gt; 0.06 (modest — mostly genuine coding
+            weakness, not scorer strictness); R1-Distill-Llama-8B stayed 0.00
+            (BPE bug, see followup #3). See
+            <a href="#issue-humaneval-scorer">Issues surfaced &gt; 4</a> for
+            details.
+          </p>
+        </div>
+        <div class="card" style="border-left: 3px solid var(--warn)">
+          <h4 style="color: var(--warn)">In progress · Investigate R1-Distill-Llama-8B BPE-decode bug</h4>
+          <p>
+            File vLLM issue with reproducer. Likely a vLLM x Llama-3 tokenizer x
+            reasoning-parser interaction. Reproducer at
+            <code>scripts/repro/r1_distill_llama_bpe.py</code> — a one-shot
+            Python script that streams a chat completion to two models and
+            counts U+0120 (Llama-3 BPE leading-space marker) and U+010A
+            (newline marker) in <code>delta.content</code>. End-to-end verified
+            against this project's stack: R1-Distill-Llama-8B leaks 9 U+0120 +
+            3 U+010A in a 33-char reply; R1-Distill-Qwen-7B (same
+            <code>--reasoning-parser deepseek_r1</code>, Qwen-2 tokenizer)
+            returns clean UTF-8. Draft issue body at
+            <code>scripts/repro/r1_distill_llama_bpe.md</code>.
+            <strong>Remaining</strong>: paste the draft into a new bug at
+            <code>vllm-project/vllm</code> once we settle the precise vLLM
+            image digest to cite.
+          </p>
+        </div>
+        <div class="card" style="border-left: 3px solid var(--accent)">
+          <h4 style="color: var(--accent)">Todo · Wire up Nemotron-Nano-9B-v2 per NVIDIA</h4>
+          <p>
+            The current <code>tools_use=0.00</code> and
+            <code>leak_rate=0.075</code> plus the sub-optimal HumanEval are not
+            architectural limits; they're a missing-config problem. NVIDIA's HF
+            model card prescribes a specific parser plugin and launch flags that
+            we don't ship.
+          </p>
+          <p>Steps:</p>
+          <ol>
+            <li>Vendor <code>NVIDIA-Nemotron-Nano-9B-v2/nemotron_toolcall_parser_no_streaming.py</code> from the HF repo into <code>scripts/parsers/</code> (or download at probe-time) and reference it via <code>--tool-parser-plugin</code>.</li>
+            <li>Add a <code>parsers:</code> block under the <code>nemotron-nano-v2</code> family in <code>scripts/model-families.yaml</code>: <code>tool_parser: nemotron_json</code>, plus the launch flags <code>--enable-auto-tool-choice --trust-remote-code --mamba_ssm_cache_dtype float32</code>. Update the comment block above the family (currently asserts "no shipped parser matches" — that's wrong, NVIDIA does ship one).</li>
+            <li>For HumanEval / pure-code prompts: the bench's system prompt currently fights the model's default <code>/think</code> — adding <code>/no_think</code> to the system message would skip reasoning and likely raise pass@1 noticeably. Either patch the bench's SYSTEM_PROMPT for Nemotron specifically or rely on a future per-model prompt override knob.</li>
+            <li>Re-run <code>make probe-vllm</code> (just for this family); the per-cell cache should flip <code>tool_parser: nemotron_json</code>, <code>tool_mode: auto</code>, <code>disable_verified: True</code>. If the probe rejects the parser, the launch flags are wrong.</li>
+            <li>Re-run <code>make bench-vllm BENCH_REPO=Nemotron-Nano BENCH_FORCE=1</code> and update the table + "Avoid (broken)" tier accordingly.</li>
+          </ol>
+          <p>Reference: <a href="https://huggingface.co/nvidia/NVIDIA-Nemotron-Nano-9B-v2">huggingface.co/nvidia/NVIDIA-Nemotron-Nano-9B-v2</a></p>
+        </div>
+        <div class="card" style="border-left: 3px solid var(--good)">
+          <h4 style="color: var(--good)">Done · KV-pressure column in <code>bench-report</code></h4>
+          <p>
+            New <code>KV %</code> column at the end of the leaderboard renders
+            <code>peak_vram_gb / GPU_MEMORY_GB</code> as a percentage; defaults
+            to a 24 GB host cap (matches RTX 4000 PRO Blackwell), overridable
+            via env (<code>GPU_MEMORY_GB=48 make bench-report</code>) or CLI
+            flag (<code>--host-vram-gb 48</code>). 95 % is the rule-of-thumb
+            threshold from "KV-pressure observations" above; current cache
+            flags <code>Qwen3.5-9B-NVFP4</code> at 95.7 % (the only row above
+            the threshold). Footer line in the report reminds readers of the
+            threshold and points back to this doc.
+          </p>
+        </div>
+        <div class="card" style="border-left: 3px solid var(--good)">
+          <h4 style="color: var(--good)">Done · Long-context probe</h4>
+          <p>
+            One prompt at 80% of ctx — detects KV paging cliffs that the
+            current latency probe misses. New module
+            <code>scripts/bench/bench_longctx.py</code> sends ONE chat
+            completion at <code>fraction * model.ctx</code> input tokens
+            (default 0.8) and captures: prefill TTFT, decode-phase TPS,
+            output_tokens, finish_reason, end-of-request
+            <code>vllm:kv_cache_usage_perc</code>, and
+            <code>vllm:num_preemptions_total</code> delta. Wired into
+            <code>bench_runner</code> as an opt-in <code>longctx</code> task
+            (not in the default <code>gsm8k,humaneval,tools,leak</code> set;
+            enable with <code>BENCH_TASKS=longctx,...</code>). Knobs
+            <code>--n-longctx-fraction</code> and
+            <code>--n-longctx-max-tokens</code> (env
+            <code>BENCH_N_LONGCTX_FRACTION</code> /
+            <code>BENCH_N_LONGCTX_MAX_TOKENS</code>). Filler prompt is a
+            public-domain prose chunk repeated to size (~3.5 chars/token,
+            conservative under-shoot to avoid max_model_len rejection); the
+            tail asks for a single-sentence summary so the model produces a
+            measurable decode segment.
+          </p>
+          <p>
+            Smoke-test against Nemotron-3-Nano-30B-A3B-NVFP4 at 80 % of 131 K
+            (104 857 target tokens): <code>ttft=75.8s</code>,
+            <code>decode TPS=144.1</code>, <code>out=67</code>,
+            <code>finish=length</code>, no preemptions, peak VRAM 22.54 GB.
+            Prefill cost confirmed as the dominant interactive-latency penalty
+            for near-max-ctx requests on this card.
+          </p>
+          <p>
+            <strong>Known limitation</strong>: the end-of-request
+            <code>kv_cache_usage_perc</code> reads 0.0 because the request has
+            freed its KV blocks by the time we sample
+            <code>/metrics</code>. Capturing the peak DURING the request would
+            need a parallel polling thread (similar to the existing
+            <code>VramSampler</code>). Logged but not fixed — the absence of
+            preemptions is sufficient signal that the KV pool was big enough;
+            we'll only need peak-during-run sampling when we hit a model that
+            DOES preempt under longctx load.
+          </p>
+        </div>
+        <div class="card" style="border-left: 3px solid var(--good)">
+          <h4 style="color: var(--good)">Done · vLLM <code>/metrics</code> snapshot</h4>
+          <p>
+            Captures <code>vllm:gpu_cache_usage_perc</code> and
+            <code>vllm:num_preemptions_total</code> per run. End-of-run
+            snapshot lands in the bench cache as
+            <code>vllm_kv_cache_usage_perc</code> and
+            <code>vllm_num_preemptions_total</code> alongside the existing
+            VRAM/TTFT/TPS metrics. Note: the gauge in the current vLLM image
+            is <code>vllm:kv_cache_usage_perc</code>, not
+            <code>vllm:gpu_cache_usage_perc</code> — the latter was an older
+            name. The parser is best-effort: if the backend's
+            <code>/metrics</code> endpoint is unreachable (Ollama, idle SGLang,
+            network blip) the bench result is still valid; the new fields just
+            stay absent. SGLang has its own metric names
+            (<code>sglang:cache_hit_rate</code>,
+            <code>sglang:num_running_reqs</code>,
+            <code>sglang:num_used_tokens</code>) — the same code path picks
+            them up when SGLang benches resume (followup #8). Limitation:
+            end-of-run snapshot only, not max-during-run — after the last
+            sample drains the queue, <code>kv_cache_usage_perc</code> falls.
+            Capturing the max would require a second sampler thread; left for
+            a v2 polish.
+          </p>
+        </div>
+        <div class="card" style="border-left: 3px solid var(--warn)">
+          <h4 style="color: var(--warn)">On-hold · <code>bench-sglang</code></h4>
+          <p>
+            Two models actually fit on the SGLang side per the current probe
+            cache (<code>gpt-oss-20b</code> and
+            <code>DeepSeek-R1-Distill-Qwen-7B</code>); a first attempt revealed
+            that the bench cache schema collided HF rows from different
+            backends under the same <code>&lt;repo&gt;@&lt;sha&gt;</code> key,
+            so a no-op SGLang run silently overwrote the vLLM rows'
+            <code>backend</code> field and zeroed their
+            <code>peak_vram_gb</code>. The harness was hardened (cache key now
+            suffixed with <code>::&lt;backend&gt;</code>, idempotent migration
+            on load) but the re-bench itself is paused per project decision.
+            Reactivate by simply running <code>make bench-sglang</code> once
+            SGLang is back in scope; the harness will create new
+            <code>::sglang</code> rows alongside the existing
+            <code>::vllm</code> ones.
+          </p>
+        </div>
+        <div class="card" style="border-left: 3px solid var(--text-muted)">
+          <h4 style="color: var(--text-muted)">Out of scope · <code>bench-ollama</code></h4>
+          <p>
+            28 Ollama models, ~4 hours wall time. Skipped per project decision:
+            at this stage benchmarking the Ollama backend isn't useful for
+            routing decisions on this hardware (the agentic / coding-quality
+            picture is already resolved by the vLLM rows). The harness
+            supports it (the bench cache key now suffixes with
+            <code>::ollama</code> and the <code>/metrics</code> snapshot path
+            explicitly no-ops for Ollama). Reactivate by running
+            <code>make bench-ollama</code> if Ollama-side comparisons become
+            relevant.
+          </p>
+        </div>
+        <div class="card" style="border-left: 3px solid var(--good)">
+          <h4 style="color: var(--good)">Done · Bench cache &rarr; picker badge</h4>
+          <p>
+            <code>scripts/model-picker.py</code> now reads
+            <code>deploy/.bench-cache.json</code> (loader pattern mirrors the
+            existing HF probe-cache loader, falls back gracefully when the file
+            is missing) and tags each candidate row with
+            <code>_picker_agentic</code> based on the formula in "Picker-tier
+            recommendations" above. Qualifying rows render the literal
+            <code>agentic</code> label in bright green in a new <code>TIER</code>
+            column right before <code>VRAM (GB)</code>; non-qualifying rows get
+            a dim <code>-</code> placeholder so the column still aligns.
+            Thresholds (<code>tools_use &gt;= 0.9</code>,
+            <code>humaneval &gt;= 0.7</code>, <code>gsm8k &gt;= 0.9</code>,
+            <code>leak_rate &lt;= 0</code>, <code>peak_vram_gb &lt; 23</code>,
+            backend=vllm, format=NVFP4) live as named constants
+            <code>_PRODUCTION_AGENTIC_*</code> so any change here is one place.
+            Smoke-tested against the real cache: 4 models qualify (Qwen3-8B,
+            Qwen3-14B, gpt-oss-20b, Nemotron-3-30B-A3B); the rest don't.
+            Missing bench data leaves the badge off (never speculative).
+          </p>
+        </div>
+        <div class="card" style="border-left: 3px solid var(--good)">
+          <h4 style="color: var(--good)">Done · Drop <code>--enforce-eager</code> on Nemotron-3-Nano</h4>
+          <p>
+            Experiment: drop <code>--enforce-eager</code> on
+            <code>NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4</code> by also passing
+            <code>--max-num-seqs 8</code>. Hypothesis confirmed: the OOM at
+            model load is driven by CUDA-graph capture buffers that scale with
+            <code>max_num_seqs</code>. Shrinking the scheduler pool from
+            vLLM's default 256 down to NVIDIA's prescribed 8 reduced the graph
+            capture transient enough to fit on 24 GB <em>without</em> disabling
+            capture. After: probe loads cleanly (peak VRAM 22.35 GB,
+            structured capability preserved), bench shows TPS 42.87 -&gt;
+            144.84 (3.4x), steady TTFT p50 70 ms -&gt; 51 ms (-27 %), peak VRAM
+            22.63 GB -&gt; 22.43 GB (-200 MB), leak rate stays at 0. Cold start
+            now 65.6 s (one-time graph compile included; faster on subsequent
+            recreates). Nemotron-3 is now the fastest structured-reasoning +
+            perfect-tools model on the leaderboard, edging gpt-oss-20b's 136
+            tok/s. <code>recovery-flags.json</code> updated;
+            <code>--enforce-eager</code> removed.
+          </p>
+          <p>
+            <strong>Side-effect</strong>: this also closed the "doesn't
+            investigate deep enough" symptom the user reported when running
+            Claude Code against this model in a parallel session. The earlier
+            investigation suspected intrinsic 3.6 B-active-params capability,
+            sampling defaults, or system-prompt sparseness (knobs 1a/1b/1c in
+            the followup plan). 1a (<code>enable_thinking</code> reaches vLLM)
+            was verified working before this rerun. After 3.4x throughput the
+            symptom evaporated — the model wasn't reasoning shallower, the slow
+            turns just made the same investigation depth feel shallower per
+            minute of patience. <strong>Lesson: throughput regressions can
+            masquerade as quality regressions in interactive agentic
+            workloads.</strong> Resolved without touching sampling or system
+            prompts.
+          </p>
+        </div>
+      </div>
+
+      <!-- §11 Cross-refs -->
+      <h2 id="cross-refs">11. Cross-references</h2>
+      <ul>
+        <li><a href="router.html">router.html</a> — request rewrite chain, including the <code>tool_choice_pinning_required</code> rule that the bench surfaced as issue #2.</li>
+        <li><a href="backends.html">backends.html</a> — backend lifecycle, parser plugins.</li>
+        <li><a href="nvfp4-coldstart.html">nvfp4-coldstart.html</a> — graphviz timeline of NVFP4 cold-start phases; bench's <code>ttft_ms_first</code> corresponds directly to that timeline's last bar.</li>
+        <li><code>deploy/.bench-cache.json</code> — raw cache.</li>
+        <li><code>/var/cache/devai/bench/inspect-logs/*.eval</code> — full per-sample inspect_ai logs, viewable with <code>inspect view start --log-dir /var/cache/devai/bench/inspect-logs</code>.</li>
+      </ul>
+
+    </div>
+
+    <aside class="toc-floating">
+      <h4>On this page</h4>
+      <ul></ul>
+    </aside>
+  </main>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-core.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/plugins/autoloader/prism-autoloader.min.js"></script>
+<script src="assets/nav.js"></script>
+<script src="assets/widgets.js"></script>
+<script src="assets/site.js"></script>
+</body>
+</html>

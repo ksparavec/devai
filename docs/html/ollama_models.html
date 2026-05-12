@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ollama reasoning semantics — Dev AI Lab</title>
+<meta name="description" content="Proposed semantics for identifying and controlling reasoning, thinking, and chain-of-thought style behaviour for models served by the Ollama backend.">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism-tomorrow.min.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="site">
+  <main class="main">
+    <div class="content">
+
+      <header>
+        <span class="pill">Design doc · Ollama backend</span>
+        <h1>Ollama reasoning semantics</h1>
+        <p class="lead">
+          Proposed semantics for identifying and controlling reasoning,
+          thinking, and chain-of-thought style behaviour for models served by
+          the Ollama backend. This document intentionally covers only Ollama
+          for now. vLLM and SGLang should not reuse these rules until their
+          behaviour is tested separately.
+        </p>
+      </header>
+
+      <!-- Goals -->
+      <h2 id="goals">1. Goals</h2>
+      <ul>
+        <li>Distinguish model capability from activation mechanics.</li>
+        <li>Treat the local Ollama runtime as the source of truth for downloaded models.</li>
+        <li>Avoid relying on model names, families, README text, or upstream
+          claims as final proof of reasoning support.</li>
+        <li>Give every agent the same reasoning policy, even when agents use
+          different API protocols.</li>
+        <li>Make reasoning control explicit, reproducible, and testable.</li>
+      </ul>
+
+      <!-- Core concepts -->
+      <h2 id="core-concepts">2. Core concepts</h2>
+      <p>Use three separate concepts.</p>
+
+      <h3 id="capability">2.1 Capability</h3>
+      <p>
+        Capability describes what a specific local model can do when served by
+        the current Ollama runtime.
+      </p>
+      <p>Examples:</p>
+<pre data-lang="yaml"><code class="language-yaml">reasoning:
+  capability: structured</code></pre>
+      <p>Valid values:</p>
+      <ul>
+        <li><code>structured</code>: the model emits a separate reasoning trace field.</li>
+        <li><code>inline</code>: the model emits reasoning text inline, for example
+          in <code>&lt;think&gt;</code> blocks, but not in a separate structured
+          response field.</li>
+        <li><code>unsupported</code>: no reasoning behaviour was observed or the
+          runtime cannot control it.</li>
+        <li><code>unknown</code>: the model has not been probed yet.</li>
+        <li><code>error</code>: probing failed.</li>
+      </ul>
+      <div class="callout warn">
+        <div class="callout-icon">i</div>
+        <div>
+          Only <code>structured</code> should be considered first-class
+          reasoning support. <code>inline</code> can be displayed or filtered,
+          but it should not be treated as clean agent-compatible reasoning
+          because it can contaminate normal answer text.
+        </div>
+      </div>
+
+      <h3 id="protocol-control">2.2 Protocol control</h3>
+      <p>
+        Protocol control describes how a request to a specific API protocol
+        enables or disables reasoning.
+      </p>
+      <p>For Ollama native APIs, use this global protocol recipe:</p>
+<pre data-lang="yaml"><code class="language-yaml">reasoning:
+  native_api:
+    on_request: { think: true }
+    off_request: { think: false }
+    trace_field: message.thinking</code></pre>
+      <p>Meaning:</p>
+      <ul>
+        <li><code>on_request</code> is the JSON field the router injects when
+          policy says reasoning should be enabled.</li>
+        <li><code>off_request</code> is the JSON field the router injects when
+          policy says reasoning should be disabled.</li>
+        <li><code>trace_field</code> is the response location where structured
+          reasoning is expected.</li>
+      </ul>
+      <p>
+        These fields are protocol facts, not model facts. Do not repeat them
+        for every model unless a model requires a confirmed exception.
+      </p>
+
+      <h3 id="agent-transport">2.3 Agent transport</h3>
+      <p>
+        Agent transport describes which API protocol an agent uses to reach
+        Ollama.
+      </p>
+      <p>Examples:</p>
+      <ul>
+        <li>Open Interpreter may use Ollama native or OpenAI-compatible
+          requests, depending on invocation.</li>
+        <li>Aider usually uses OpenAI-compatible chat completions for non-native setups.</li>
+        <li>Codex uses OpenAI-compatible chat or responses semantics depending
+          on its configured provider.</li>
+        <li>Claude Code uses Ollama's Anthropic-compatible messages endpoint.</li>
+      </ul>
+      <p>
+        Agents should not own model-specific reasoning activation logic. The
+        router should normalise requests according to model capability,
+        protocol, and global reasoning policy.
+      </p>
+
+      <!-- Data model -->
+      <h2 id="data-model">3. Recommended data model</h2>
+      <p>Store protocol recipes globally:</p>
+<pre data-lang="yaml"><code class="language-yaml">reasoning_protocols:
+  ollama_native:
+    on_request: { think: true }
+    off_request: { think: false }
+    trace_field: message.thinking
+
+  openai_chat:
+    on_request: { reasoning_effort: medium }
+    off_request: { reasoning_effort: none }
+    trace_field: choices[].message.reasoning
+
+  anthropic_messages:
+    on_request:
+      thinking:
+        type: enabled
+        budget_tokens: 2048
+    off_request: {}
+    trace_field: content[type=thinking]</code></pre>
+
+      <p>Store per-model facts separately:</p>
+<pre data-lang="yaml"><code class="language-yaml">models:
+  - name: "qwen3.5:9b"
+    backend: [ollama]
+    source: ollama
+    reasoning:
+      capability: structured
+      detected_by: ollama_probe
+      probed_at: "2026-04-26T00:00:00Z"
+      model_digest: "sha256:..."
+      native_api:
+        supported: true
+        enable_verified: true
+        disable_verified: true
+        trace_observed: true</code></pre>
+
+      <p>Do not store this per model:</p>
+<pre data-lang="yaml"><code class="language-yaml">reasoning:
+  native_api:
+    on_request: { think: true }
+    off_request: { think: false }</code></pre>
+      <p>
+        That duplicates global protocol behaviour and makes the catalog harder
+        to maintain.
+      </p>
+
+      <!-- Detection -->
+      <h2 id="detection">4. Detection algorithm</h2>
+      <p>Detection must be performed against local downloaded models.</p>
+
+      <h3 id="discover">4.1 Step 1: Discover local Ollama models</h3>
+      <p>Use Ollama as the source of truth:</p>
+      <ul>
+        <li><code>/api/tags</code> for local model names and digests when available.</li>
+        <li><code>/api/show</code> for model metadata, details, capabilities,
+          parameters, template, and <code>model_info</code>.</li>
+      </ul>
+      <p>Catalog data may enrich display output, but it must not decide capability.</p>
+
+      <h3 id="positive-probe">4.2 Step 2: Native positive probe</h3>
+      <p>For each downloaded model, call <code>/api/chat</code> with:</p>
+<pre data-lang="json"><code class="language-json">{
+  "model": "&lt;model&gt;",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Answer with only the final number: What is 17 + 25?"
+    }
+  ],
+  "think": true,
+  "stream": false,
+  "options": {
+    "temperature": 0,
+    "num_predict": 128
+  }
+}</code></pre>
+      <p>Classify:</p>
+      <ul>
+        <li>If <code>message.thinking</code> is present and non-empty, capability is <code>structured</code>.</li>
+        <li>If <code>message.content</code> contains visible reasoning markers such as <code>&lt;think&gt;</code>, capability is <code>inline</code>.</li>
+        <li>If neither appears, capability is <code>unsupported</code>.</li>
+        <li>If the request fails or times out, capability is <code>error</code>.</li>
+      </ul>
+
+      <h3 id="negative-probe">4.3 Step 3: Native negative probe</h3>
+      <p>
+        For models classified as <code>structured</code>, call
+        <code>/api/chat</code> with the same prompt and:
+      </p>
+<pre data-lang="json"><code class="language-json">{
+  "think": false,
+  "stream": false
+}</code></pre>
+      <p>Classify disable support:</p>
+      <ul>
+        <li><code>disable_verified: true</code> if <code>message.thinking</code> is absent or empty.</li>
+        <li><code>disable_verified: false</code> if reasoning still appears.</li>
+        <li><code>disable_verified: unknown</code> if the request fails.</li>
+      </ul>
+      <p>
+        This matters because some models default reasoning on. Omitting the
+        control field is not equivalent to disabling reasoning.
+      </p>
+
+      <h3 id="cache-by-digest">4.4 Step 4: Cache by digest, not name</h3>
+      <p>
+        The probe cache (<code>deploy/.ollama-reasoning-cache.json</code>,
+        schema v3) is keyed by <code>digest</code> -- one record per set of
+        weights. Each record carries:
+      </p>
+      <ul>
+        <li><code>aliases</code>: every name pointing at this digest
+          (<code>ollama:latest</code>, <code>ollama:9b</code>,
+          <code>ollama:9b-q4_K_M</code> ...)</li>
+        <li><code>max_context</code>: the architecture's design ceiling from
+          <code>/api/show</code></li>
+        <li><code>capability</code> and <code>disable_verified</code>: canonical,
+          taken at the smallest fitting tier (most reliable signal)</li>
+        <li><code>probes</code>: a 2-D map nested by VRAM band then context
+          tier, e.g. <code>probes["16"]["32768"]</code> and
+          <code>probes["24"]["131072"]</code>. Each cell is a measurement
+          record with <code>vram_gb</code>, <code>ctx</code>,
+          <code>actual_total_gb</code>, <code>actual_vram_gb</code>,
+          <code>fully_on_gpu</code>, per-cell capability, and timestamp.</li>
+      </ul>
+      <p>
+        Probing is incremental and never destructive. A new (band, tier) cell
+        only fills a gap; existing cells are immutable unless
+        <code>--force-ctx</code> or <code>--force</code> is passed. Two aliases
+        of the same digest probe at most once per cell -- the probe driver
+        dedups before issuing chat calls. If a tier is above
+        <code>max_context</code>, it's silently capped: a 128K-only model with
+        tiers <code>[32K, 64K, 128K, 256K]</code> records probes at
+        <code>[32768, 65536, 131072]</code> and is shown at higher tiers as
+        "limited to 128K".
+      </p>
+      <p>
+        The orchestrator (<code>make probe</code>) loops over VRAM bands.
+        Before each pass it recreates devai-ollama with
+        <code>OLLAMA_GPU_OVERHEAD</code> set to
+        <code>(host_vram - target_vram) * 1024^3</code> bytes, so the daemon
+        behaves as if it had only the target VRAM. This lets a 24G host
+        produce cache cells valid for 16G targets without needing physical
+        hardware swaps.
+      </p>
+      <p>
+        When the digest disappears from <code>/api/tags</code> (model deleted),
+        the entry is dropped on the next probe run. When an alias disappears
+        (retag), it's removed from <code>aliases</code> but the digest entry
+        stays.
+      </p>
+
+      <!-- Runtime policy -->
+      <h2 id="runtime-policy">5. Runtime policy</h2>
+      <p>Expose one global policy:</p>
+<pre data-lang="bash"><code class="language-bash">DEVAI_REASONING=auto|off|low|medium|high</code></pre>
+      <p>Semantics:</p>
+      <ul>
+        <li><code>auto</code>: enable reasoning for <code>structured</code>
+          models, leave unsupported models alone.</li>
+        <li><code>off</code>: inject each protocol's <code>off_request</code>
+          when disable support is known.</li>
+        <li><code>low</code>: enable reasoning with a small budget or low
+          effort where the protocol supports levels.</li>
+        <li><code>medium</code>: default explicit reasoning mode for coding agents.</li>
+        <li><code>high</code>: explicit high-effort reasoning mode.</li>
+      </ul>
+      <p>
+        For Ollama native APIs, <code>low</code>, <code>medium</code>, and
+        <code>high</code> all map to:
+      </p>
+<pre data-lang="yaml"><code class="language-yaml">on_request: { think: true }</code></pre>
+      <p>
+        Ollama native boolean <code>think</code> does not express effort
+        levels. Effort levels are only meaningful for protocols that support
+        them.
+      </p>
+
+      <!-- Router responsibilities -->
+      <h2 id="router-responsibilities">6. Router responsibilities</h2>
+      <p>
+        The router should apply reasoning control before forwarding requests
+        to Ollama.
+      </p>
+
+      <h3 id="ollama-native">6.1 Ollama native <code>/api/chat</code> and <code>/api/generate</code></h3>
+      <ul>
+        <li>If policy enables reasoning and model capability is
+          <code>structured</code>, inject <code>think: true</code>.</li>
+        <li>If policy disables reasoning and disable support is verified,
+          inject <code>think: false</code>.</li>
+        <li>If model capability is <code>unsupported</code>, do not inject
+          reasoning fields unless explicitly requested.</li>
+        <li>If the client already sent an explicit <code>think</code> field,
+          client input should win unless an administrative override is
+          configured.</li>
+      </ul>
+
+      <h3 id="openai-compat">6.2 OpenAI-compatible <code>/v1/chat/completions</code></h3>
+      <ul>
+        <li>Map enabled reasoning to the configured OpenAI-compatible request
+          field.</li>
+        <li>Map disabled reasoning to the configured OpenAI-compatible off field.</li>
+        <li>Prefer protocol fields over prompt text tricks.</li>
+      </ul>
+
+      <h3 id="anthropic-compat">6.3 Anthropic-compatible <code>/v1/messages</code></h3>
+      <ul>
+        <li>Map enabled reasoning to the configured Anthropic-compatible
+          <code>thinking</code> request field.</li>
+        <li>Do not use prompt injection as the primary activation mechanism.</li>
+      </ul>
+
+      <!-- Agent responsibilities -->
+      <h2 id="agent-responsibilities">7. Agent responsibilities</h2>
+      <p>Agents should not hard-code per-model reasoning activation.</p>
+      <p>Agents should only provide:</p>
+      <ul>
+        <li>selected model</li>
+        <li>selected backend</li>
+        <li>optional user policy override</li>
+      </ul>
+      <p>The router should handle protocol-specific activation.</p>
+
+      <!-- Picker behaviour -->
+      <h2 id="picker-behaviour">8. Picker behaviour</h2>
+      <p>The picker should not hide all non-reasoning models by default.</p>
+      <p>Recommended display:</p>
+<pre data-lang="text"><code>qwen3.5:9b        Native reasoning   policy: auto
+deepseek-r1:8b    Native reasoning   policy: auto
+gemma4:e4b        No reasoning       standard chat
+qwen3.5:27b       CPU offload        slow / not preferred</code></pre>
+      <p>Filtering should be explicit:</p>
+      <ul>
+        <li>show all measured labels by default</li>
+        <li>optional filter: reasoning-capable only</li>
+        <li>optional filter: Native reasoning only</li>
+        <li>optional filter: probe errors</li>
+      </ul>
+
+      <!-- Anti-patterns -->
+      <h2 id="anti-patterns">9. Avoid these patterns</h2>
+      <p>Do not infer capability only from:</p>
+      <ul>
+        <li>model name</li>
+        <li>family name</li>
+        <li>Ollama library tags such as "thinking"</li>
+        <li>upstream README text</li>
+        <li>HuggingFace tokenizer metadata</li>
+        <li>hard-coded <code>/think</code> or <code>&lt;|think|&gt;</code> prompt prefixes</li>
+      </ul>
+      <p>These sources are useful hints, but local runtime behaviour must win.</p>
+      <div class="callout warn">
+        <div class="callout-icon">i</div>
+        <div>
+          Do not activate reasoning primarily by prompt text when a protocol
+          field exists. Prompt text activation is brittle across templates,
+          agents, and model versions.
+        </div>
+      </div>
+      <p>Do not store duplicate YAML keys such as:</p>
+<pre data-lang="yaml"><code class="language-yaml">thinking: false
+thinking: true</code></pre>
+      <p>Use one structured object instead:</p>
+<pre data-lang="yaml"><code class="language-yaml">reasoning:
+  capability: structured</code></pre>
+
+      <!-- Migration -->
+      <h2 id="migration">10. Migration plan</h2>
+      <ol>
+        <li>Add global <code>reasoning_protocols</code> metadata.</li>
+        <li>Add an Ollama probe command that writes per-model
+          <code>reasoning</code> facts for downloaded Ollama models.</li>
+        <li>Change the picker to read <code>reasoning.capability</code>
+          instead of <code>thinking</code>.</li>
+        <li>Change the router to inject protocol request fields based on policy.</li>
+        <li>Remove duplicate and manually assigned <code>thinking</code> keys
+          from active catalogs.</li>
+        <li>Keep family-level hints only as pre-probe hints, not final capability.</li>
+      </ol>
+
+      <!-- Minimal first impl -->
+      <h2 id="minimal-impl">11. Minimal first implementation</h2>
+      <p>The smallest useful implementation is:</p>
+      <ul>
+        <li>probe only <code>/api/chat</code></li>
+        <li>support only <code>structured</code>, <code>unsupported</code>, and <code>error</code></li>
+        <li>store only <code>capability</code>, <code>model_digest</code>,
+          <code>probed_at</code>, and native verification</li>
+        <li>support only <code>DEVAI_REASONING=auto|off</code></li>
+        <li>inject only native <code>{ think: true }</code> and <code>{ think: false }</code></li>
+      </ul>
+      <p>
+        After that works, add OpenAI-compatible and Anthropic-compatible
+        request rewriting for the agents that need them.
+      </p>
+
+    </div>
+
+    <aside class="toc-floating">
+      <h4>On this page</h4>
+      <ul></ul>
+    </aside>
+  </main>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-core.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/plugins/autoloader/prism-autoloader.min.js"></script>
+<script src="assets/nav.js"></script>
+<script src="assets/widgets.js"></script>
+<script src="assets/site.js"></script>
+</body>
+</html>

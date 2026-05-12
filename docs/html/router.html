@@ -1,0 +1,1110 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DevAI Router (gpu-arbiter) &mdash; Dev AI Lab</title>
+<meta name="description" content="Architecture, ports, lifecycle, request rewrite chain, configuration, caches, and failure modes for the DevAI router (gpu-arbiter).">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism-tomorrow.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="site">
+  <main class="main">
+    <div class="content">
+
+      <header>
+        <span class="pill">Reference &middot; infrastructure</span>
+        <h1>DevAI Router (<code>gpu-arbiter</code>)</h1>
+        <p class="lead">
+          The router is the central component of the DevAI stack. Every model
+          request from agents (Claude Code, Aider, Codex, Open WebUI, raw curl)
+          goes through it. The router is responsible for: which backend serves
+          a model, which model is currently loaded in that backend, what
+          context length and parser flags the backend was launched with, and
+          how every incoming request is rewritten on the way through.
+        </p>
+      </header>
+
+      <div class="callout">
+        <div class="callout-icon">i</div>
+        <div>
+          <strong>Source of truth.</strong> This document groups behaviour by
+          concern: ports, lifecycle, request rewrites, configuration, caches
+          consumed, and failure modes. For backend-side detail (probing, cache
+          hygiene, failure taxonomy across all three engines) see
+          <a href="backends.html">backends</a>.
+        </div>
+      </div>
+
+      <!-- Architecture -->
+      <h2 id="architecture">1. Architecture</h2>
+      <p>
+        The router is a Go reverse proxy in front of three inference backends.
+        It listens on three ports inside the <code>devai-net</code> network,
+        one per backend, and proxies requests after rewriting them.
+      </p>
+
+      <figure>
+        <svg viewBox="0 0 820 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Router architecture">
+          <defs>
+            <marker id="rArr" markerWidth="10" markerHeight="8" refX="10" refY="4" orient="auto">
+              <path d="M0,0 L10,4 L0,8 Z" fill="var(--accent)"/>
+            </marker>
+            <marker id="rArrM" markerWidth="10" markerHeight="8" refX="10" refY="4" orient="auto">
+              <path d="M0,0 L10,4 L0,8 Z" fill="var(--text-muted)"/>
+            </marker>
+          </defs>
+
+          <!-- Agents box -->
+          <rect x="20" y="60" width="200" height="180" rx="8" fill="var(--bg-elev)" stroke="var(--border-strong)"/>
+          <text x="120" y="85" text-anchor="middle" fill="var(--text)" font-size="13" font-weight="700">agents</text>
+          <g font-family="JetBrains Mono" font-size="11" fill="var(--text-muted)">
+            <text x="120" y="110" text-anchor="middle">Claude Code</text>
+            <text x="120" y="128" text-anchor="middle">Aider</text>
+            <text x="120" y="146" text-anchor="middle">Codex</text>
+            <text x="120" y="164" text-anchor="middle">Open WebUI</text>
+            <text x="120" y="182" text-anchor="middle">curl, ...</text>
+          </g>
+          <text x="120" y="215" text-anchor="middle" fill="var(--text-dim)" font-size="11" font-style="italic">POST /v1/...</text>
+
+          <!-- Arrow agents -> router -->
+          <path d="M 225 150 h 75" stroke="var(--accent)" stroke-width="2" fill="none" marker-end="url(#rArr)"/>
+
+          <!-- Router box -->
+          <rect x="305" y="40" width="320" height="220" rx="10" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="2"/>
+          <text x="465" y="65" text-anchor="middle" fill="var(--accent)" font-size="14" font-weight="700">devai-router</text>
+          <g font-family="JetBrains Mono" font-size="12">
+            <text x="325" y="100" fill="var(--text)">port 11434</text>
+            <text x="445" y="100" fill="var(--text-muted)">--&gt;</text>
+            <text x="490" y="100" fill="var(--accent)">ollama</text>
+            <text x="325" y="125" fill="var(--text)">port 11435</text>
+            <text x="445" y="125" fill="var(--text-muted)">--&gt;</text>
+            <text x="490" y="125" fill="var(--accent)">vllm</text>
+            <text x="325" y="150" fill="var(--text)">port 11436</text>
+            <text x="445" y="150" fill="var(--text-muted)">--&gt;</text>
+            <text x="490" y="150" fill="var(--accent)">sglang</text>
+          </g>
+          <line x1="325" y1="170" x2="605" y2="170" stroke="var(--border-strong)" stroke-dasharray="3 3"/>
+          <g font-size="11" fill="var(--text-muted)">
+            <text x="325" y="192">GPU mutex &middot; request rewrite</text>
+            <text x="325" y="212">container lifecycle</text>
+            <text x="325" y="232">probe-cache reader</text>
+          </g>
+
+          <!-- Arrow router -> backends -->
+          <path d="M 465 265 v 25" stroke="var(--accent)" stroke-width="2" fill="none" marker-end="url(#rArr)"/>
+
+          <!-- Backends box -->
+          <rect x="305" y="290" width="320" height="40" rx="8" fill="var(--bg-elev-2)" stroke="var(--border-strong)"/>
+          <g font-family="JetBrains Mono" font-size="11">
+            <text x="320" y="315" fill="var(--good)">devai-ollama</text>
+            <text x="410" y="315" fill="var(--warn)">devai-vllm</text>
+            <text x="500" y="315" fill="var(--warn)">devai-sglang</text>
+          </g>
+
+          <text x="465" y="20" text-anchor="middle" fill="var(--text-muted)" font-size="11" font-style="italic">
+            no message inspection &mdash; port determines backend
+          </text>
+
+          <!-- Lifecycle note -->
+          <text x="700" y="307" fill="var(--text-muted)" font-size="10">always-on</text>
+          <text x="700" y="320" fill="var(--text-muted)" font-size="10">vs sleep/live</text>
+        </svg>
+        <figcaption>Three ports, one router. Port determines backend; the router never inspects message content to route.</figcaption>
+      </figure>
+
+      <p>
+        The vLLM and SGLang containers start as <code>sleep infinity</code>
+        placeholders (see <code>deploy/docker-compose.yaml</code>). The router
+        replaces them with a live engine on the first request to their port
+        via the Podman libpod API, with the right <code>--model</code>,
+        <code>--max-model-len</code>, parser flags, and plugin mounts derived
+        from the probe cache.
+      </p>
+
+      <h3 id="what-it-is">1.1 What the router IS</h3>
+      <ul>
+        <li>A multi-port reverse proxy with <strong>deterministic routing by port</strong> (no message inspection &mdash; port determines backend).</li>
+        <li>A <strong>GPU mutex</strong>: only one backend uses the GPU at a time. Switching drains in-flight requests, stops the loser, recreates the winner.</li>
+        <li>A <strong>container lifecycle manager</strong> for vLLM/SGLang: stop, recreate, health-poll, idle-timeout.</li>
+        <li>A <strong>request rewriter</strong>: parses suffix overrides, applies reasoning policy, promotes/strips <code>tool_choice</code>, injects <code>num_ctx</code> for Ollama.</li>
+        <li>A <strong>probe-cache reader</strong>: synthesises serving rows from three caches on boot and feeds the same lookup maps as the legacy <code>active-models.yaml</code> did.</li>
+      </ul>
+
+      <h3 id="what-it-is-not">1.2 What the router is NOT</h3>
+      <ul>
+        <li>Not a model server. It owns no inference state.</li>
+        <li>Not aware of message content. It does not parse prompts.</li>
+        <li>Not a load balancer. There's exactly one of each backend.</li>
+      </ul>
+
+      <!-- Port layout -->
+      <h2 id="port-layout">2. Port layout</h2>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Port</th><th>Backend</th><th>Listener</th><th>Models</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>11434</code></td><td>Ollama</td><td>always live</td><td>GGUF only</td></tr>
+            <tr><td><code>11435</code></td><td>vLLM</td><td>recreated on demand</td><td>NVFP4, FP8, AWQ, BF16 safetensors</td></tr>
+            <tr><td><code>11436</code></td><td>SGLang</td><td>recreated on demand</td><td>NVFP4 (broken), BF16 safetensors</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout warn">
+        <div class="callout-icon">!</div>
+        <div>
+          The router is internal to <code>devai-net</code>. It is <strong>not</strong>
+          published to the host. Reach it from sibling containers
+          (<code>devai-open-webui</code>, <code>devai-lab-*</code>) or from
+          your own container with <code>--network devai-net</code>.
+        </div>
+      </div>
+
+      <!-- Backend lifecycle -->
+      <h2 id="backend-lifecycle">3. Backend lifecycle</h2>
+
+      <h3 id="boot">3.1 Boot</h3>
+      <ol>
+        <li>Read three probe caches:
+          <ul>
+            <li><code>/etc/devai/.ollama-reasoning-cache.json</code> (digest-keyed v3)</li>
+            <li><code>/etc/devai/.vllm-reasoning-cache.json</code> (repo+sha-keyed v2)</li>
+            <li><code>/etc/devai/.sglang-reasoning-cache.json</code> (repo+sha-keyed v2)</li>
+          </ul>
+        </li>
+        <li>Read <code>/etc/devai/vllm-plugins.json</code> (parser plugin registry).</li>
+        <li>Synthesise one <code>configModel</code> per cache entry whose host-VRAM band has a <code>fits=true</code> (HF) / <code>fully_on_gpu=true</code> (Ollama) cell.</li>
+        <li>Build per-backend lookup maps: model size, declared context, probed max ctx, tool parser, reasoning parser, tool mode, capability, <code>disable_verified</code>.</li>
+        <li>Start one HTTP listener per backend.</li>
+      </ol>
+
+      <h3 id="cold-start">3.2 First request to vLLM/SGLang (cold start)</h3>
+
+      <figure>
+        <svg viewBox="0 0 860 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Cold-start flow">
+          <defs>
+            <marker id="csArr" markerWidth="10" markerHeight="8" refX="10" refY="4" orient="auto">
+              <path d="M0,0 L10,4 L0,8 Z" fill="var(--accent)"/>
+            </marker>
+          </defs>
+
+          <!-- Agent -->
+          <rect x="20" y="40" width="140" height="40" rx="6" fill="var(--bg-elev-2)" stroke="var(--border-strong)"/>
+          <text x="90" y="65" text-anchor="middle" fill="var(--text)" font-size="13" font-weight="600">agent</text>
+
+          <!-- Router box -->
+          <path d="M 165 60 h 50" stroke="var(--accent)" stroke-width="2" fill="none" marker-end="url(#csArr)"/>
+          <rect x="225" y="20" width="600" height="380" rx="10" fill="var(--bg-elev)" stroke="var(--accent)" stroke-width="2"/>
+          <text x="525" y="45" text-anchor="middle" fill="var(--accent)" font-size="13" font-weight="700">router (port 11435 or 11436)</text>
+
+          <g font-family="Inter" font-size="12" fill="var(--text)">
+            <!-- Step 1 -->
+            <rect x="250" y="65" width="555" height="38" rx="6" fill="var(--bg-elev-2)" stroke="var(--border)"/>
+            <text x="265" y="89" font-weight="600" fill="var(--accent)">1.</text>
+            <text x="285" y="89">parse <tspan font-family="JetBrains Mono" font-size="11">&lt;model&gt;@&lt;ctx&gt;</tspan> and <tspan font-family="JetBrains Mono" font-size="11">&lt;model&gt;::&lt;reasoning&gt;</tspan> overrides</text>
+
+            <!-- Step 2 -->
+            <rect x="250" y="113" width="555" height="58" rx="6" fill="var(--bg-elev-2)" stroke="var(--border)"/>
+            <text x="265" y="137" font-weight="600" fill="var(--accent)">2.</text>
+            <text x="285" y="137">identify other backends holding the GPU</text>
+            <text x="305" y="156" fill="var(--text-muted)" font-size="11">&middot; drain in-flight (DRAIN_TIMEOUT) &middot; stop containers / unload Ollama</text>
+            <text x="305" y="170" fill="var(--text-muted)" font-size="11">&middot; release GPU</text>
+
+            <!-- Step 3 -->
+            <rect x="250" y="181" width="555" height="68" rx="6" fill="var(--bg-elev-2)" stroke="var(--border)"/>
+            <text x="265" y="205" font-weight="600" fill="var(--accent)">3.</text>
+            <text x="285" y="205">build launchConfig from probe cache + overrides</text>
+            <text x="305" y="224" fill="var(--text-muted)" font-size="11">&middot; compute MemFraction for host VRAM</text>
+            <text x="305" y="238" fill="var(--text-muted)" font-size="11">&middot; resolve parser plugin paths (vllm-plugins.json)</text>
+
+            <!-- Step 4 -->
+            <rect x="250" y="259" width="555" height="38" rx="6" fill="var(--bg-elev-2)" stroke="var(--border)"/>
+            <text x="265" y="283" font-weight="600" fill="var(--accent)">4.</text>
+            <text x="285" y="283">stop + remove placeholder &mdash; podman libpod create + start</text>
+
+            <!-- Step 5 -->
+            <rect x="250" y="307" width="555" height="38" rx="6" fill="var(--bg-elev-2)" stroke="var(--border)"/>
+            <text x="265" y="331" font-weight="600" fill="var(--accent)">5.</text>
+            <text x="285" y="331">poll <tspan font-family="JetBrains Mono" font-size="11">/health</tspan> (HEALTH_TIMEOUT_SECONDS, default 600s)</text>
+
+            <!-- Step 6 -->
+            <rect x="250" y="355" width="555" height="34" rx="6" fill="rgba(126,231,135,0.12)" stroke="var(--good)"/>
+            <text x="265" y="377" font-weight="600" fill="var(--good)">6.</text>
+            <text x="285" y="377" fill="var(--good)">proxy the original request through</text>
+          </g>
+        </svg>
+        <figcaption>The router's cold-start sequence on the first request to a sleeping vLLM or SGLang port.</figcaption>
+      </figure>
+
+      <p>
+        Cold start typically takes 60-90s for BF16 weights, up to 300s for
+        NVFP4 with CUDA graph capture.
+      </p>
+
+      <h3 id="warm-requests">3.3 Subsequent requests, same model</h3>
+      <p>Direct proxy. No recreate.</p>
+
+      <h3 id="model-switch">3.4 Request for a different model on the same backend</h3>
+      <p>
+        <code>currentModel</code> and <code>currentContext</code> are tracked
+        per backend. If either differs from the request, the router stops and
+        recreates. Concurrent requests for the same target model coalesce on
+        <code>recreateCond</code> so only one container start happens.
+      </p>
+
+      <h3 id="idle">3.5 Idle</h3>
+      <p>
+        <code>idleWatcher</code> polls every 30s. A backend whose
+        <code>lastRequest</code> is older than <code>IDLE_TIMEOUT</code>
+        (default 300s) gets stopped and replaced with the
+        <code>sleep infinity</code> placeholder. The next request triggers a
+        cold start.
+      </p>
+
+      <h3 id="gpu-exclusion">3.6 Backend switch (GPU exclusion)</h3>
+      <p>When a request hits a different backend than the one currently on the GPU:</p>
+      <ol>
+        <li>Wait for the active backend's in-flight requests to drain (<code>DRAIN_TIMEOUT</code>, default 30s).</li>
+        <li>Ollama: send <code>keep_alive=0</code> to all loaded models so it releases VRAM. Other backends: stop their container.</li>
+        <li>Recreate the target backend with the new model.</li>
+      </ol>
+
+      <figure>
+        <svg viewBox="0 0 760 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="GPU mutex state machine">
+          <defs>
+            <marker id="smArr" markerWidth="10" markerHeight="8" refX="10" refY="4" orient="auto">
+              <path d="M0,0 L10,4 L0,8 Z" fill="var(--accent)"/>
+            </marker>
+          </defs>
+
+          <text x="380" y="22" text-anchor="middle" fill="var(--text)" font-size="13" font-weight="600">GPU mutex state machine</text>
+
+          <!-- Three states -->
+          <g>
+            <rect x="40" y="60" width="180" height="80" rx="10" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="2"/>
+            <text x="130" y="90" text-anchor="middle" fill="var(--accent)" font-size="13" font-weight="700">Ollama on GPU</text>
+            <text x="130" y="112" text-anchor="middle" fill="var(--text-muted)" font-size="11">port 11434 live</text>
+            <text x="130" y="128" text-anchor="middle" fill="var(--text-muted)" font-size="11">vllm/sglang sleeping</text>
+
+            <rect x="290" y="60" width="180" height="80" rx="10" fill="rgba(240,180,41,0.15)" stroke="var(--warn)" stroke-width="2"/>
+            <text x="380" y="90" text-anchor="middle" fill="var(--warn)" font-size="13" font-weight="700">vLLM on GPU</text>
+            <text x="380" y="112" text-anchor="middle" fill="var(--text-muted)" font-size="11">port 11435 live</text>
+            <text x="380" y="128" text-anchor="middle" fill="var(--text-muted)" font-size="11">others released</text>
+
+            <rect x="540" y="60" width="180" height="80" rx="10" fill="rgba(126,231,135,0.15)" stroke="var(--good)" stroke-width="2"/>
+            <text x="630" y="90" text-anchor="middle" fill="var(--good)" font-size="13" font-weight="700">SGLang on GPU</text>
+            <text x="630" y="112" text-anchor="middle" fill="var(--text-muted)" font-size="11">port 11436 live</text>
+            <text x="630" y="128" text-anchor="middle" fill="var(--text-muted)" font-size="11">others released</text>
+          </g>
+
+          <!-- Arrows -->
+          <path d="M 222 92 q 35 -30 66 0" stroke="var(--accent)" stroke-width="1.5" fill="none" marker-end="url(#smArr)"/>
+          <path d="M 472 92 q 35 -30 66 0" stroke="var(--accent)" stroke-width="1.5" fill="none" marker-end="url(#smArr)"/>
+          <path d="M 538 112 q -35 30 -66 0" stroke="var(--accent)" stroke-width="1.5" fill="none" marker-end="url(#smArr)"/>
+          <path d="M 288 112 q -35 30 -66 0" stroke="var(--accent)" stroke-width="1.5" fill="none" marker-end="url(#smArr)"/>
+
+          <text x="380" y="175" text-anchor="middle" fill="var(--text-muted)" font-size="11" font-style="italic">drain &rarr; stop / unload &rarr; recreate target</text>
+          <text x="380" y="195" text-anchor="middle" fill="var(--text-muted)" font-size="11">only one backend holds the GPU at any time</text>
+          <text x="380" y="220" text-anchor="middle" fill="var(--accent)" font-size="11" font-weight="600">idle &gt; IDLE_TIMEOUT &rarr; back to placeholder (sleep infinity)</text>
+        </svg>
+      </figure>
+
+      <!-- Request rewrite chain -->
+      <h2 id="rewrite-chain">4. Request rewrite chain</h2>
+      <p>
+        Every non-trivial request goes through this chain in order. Each step
+        inspects and may mutate the JSON body. Steps are skipped when not
+        applicable.
+      </p>
+
+      <figure>
+        <svg viewBox="0 0 820 200" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Request rewrite chain">
+          <defs>
+            <marker id="rcArr" markerWidth="10" markerHeight="8" refX="10" refY="4" orient="auto">
+              <path d="M0,0 L10,4 L0,8 Z" fill="var(--accent)"/>
+            </marker>
+          </defs>
+
+          <!-- Request in -->
+          <rect x="10" y="80" width="100" height="50" rx="6" fill="var(--bg-elev-2)" stroke="var(--border-strong)"/>
+          <text x="60" y="100" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">request</text>
+          <text x="60" y="116" text-anchor="middle" fill="var(--text-muted)" font-size="11">(JSON body)</text>
+
+          <path d="M 112 105 h 25" stroke="var(--accent)" stroke-width="2" fill="none" marker-end="url(#rcArr)"/>
+
+          <!-- 5 steps -->
+          <g font-family="Inter" font-size="11">
+            <rect x="140" y="60" width="115" height="90" rx="6" fill="var(--accent-soft)" stroke="var(--accent)"/>
+            <text x="197" y="80" text-anchor="middle" fill="var(--accent)" font-weight="700">1.</text>
+            <text x="197" y="98" text-anchor="middle" fill="var(--text)">override</text>
+            <text x="197" y="113" text-anchor="middle" fill="var(--text)">parsing</text>
+            <text x="197" y="135" text-anchor="middle" fill="var(--text-muted)" font-size="10">@ctx, ::reason</text>
+
+            <path d="M 257 105 h 13" stroke="var(--accent)" stroke-width="2" fill="none" marker-end="url(#rcArr)"/>
+
+            <rect x="270" y="60" width="115" height="90" rx="6" fill="var(--accent-soft)" stroke="var(--accent)"/>
+            <text x="327" y="80" text-anchor="middle" fill="var(--accent)" font-weight="700">2.</text>
+            <text x="327" y="98" text-anchor="middle" fill="var(--text)">reasoning</text>
+            <text x="327" y="113" text-anchor="middle" fill="var(--text)">policy</text>
+            <text x="327" y="135" text-anchor="middle" fill="var(--text-muted)" font-size="10">think / effort</text>
+
+            <path d="M 387 105 h 13" stroke="var(--accent)" stroke-width="2" fill="none" marker-end="url(#rcArr)"/>
+
+            <rect x="400" y="60" width="115" height="90" rx="6" fill="var(--accent-soft)" stroke="var(--accent)"/>
+            <text x="457" y="80" text-anchor="middle" fill="var(--accent)" font-weight="700">3.</text>
+            <text x="457" y="98" text-anchor="middle" fill="var(--text)">tool_choice</text>
+            <text x="457" y="113" text-anchor="middle" fill="var(--text)">promotion</text>
+            <text x="457" y="135" text-anchor="middle" fill="var(--text-muted)" font-size="10">forced models</text>
+
+            <path d="M 517 105 h 13" stroke="var(--accent)" stroke-width="2" fill="none" marker-end="url(#rcArr)"/>
+
+            <rect x="530" y="60" width="115" height="90" rx="6" fill="var(--accent-soft)" stroke="var(--accent)"/>
+            <text x="587" y="80" text-anchor="middle" fill="var(--accent)" font-weight="700">4.</text>
+            <text x="587" y="98" text-anchor="middle" fill="var(--text)">tool</text>
+            <text x="587" y="113" text-anchor="middle" fill="var(--text)">stripping</text>
+            <text x="587" y="135" text-anchor="middle" fill="var(--text-muted)" font-size="10">no parser</text>
+
+            <path d="M 647 105 h 13" stroke="var(--accent)" stroke-width="2" fill="none" marker-end="url(#rcArr)"/>
+
+            <rect x="660" y="60" width="115" height="90" rx="6" fill="var(--accent-soft)" stroke="var(--accent)"/>
+            <text x="717" y="80" text-anchor="middle" fill="var(--accent)" font-weight="700">5.</text>
+            <text x="717" y="98" text-anchor="middle" fill="var(--text)">context</text>
+            <text x="717" y="113" text-anchor="middle" fill="var(--text)">injection</text>
+            <text x="717" y="135" text-anchor="middle" fill="var(--text-muted)" font-size="10">Ollama only</text>
+          </g>
+
+          <text x="410" y="35" text-anchor="middle" fill="var(--text-muted)" font-size="11" font-style="italic">
+            Five ordered stages. Each step may mutate the body or short-circuit with HTTP 400.
+          </text>
+          <text x="410" y="185" text-anchor="middle" fill="var(--text-muted)" font-size="11">
+            &rarr; proxy to backend
+          </text>
+        </svg>
+      </figure>
+
+      <h3 id="override-parsing">4.1 Override parsing (<code>&lt;name&gt;@&lt;ctx&gt;</code> / <code>&lt;name&gt;::&lt;reasoning&gt;</code>)</h3>
+      <p>The model name in the request body may carry suffixes:</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Suffix form</th><th>Meaning</th><th>Strip order</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>&lt;name&gt;@&lt;ctx&gt;</code></td><td>per-session <code>--max-model-len</code> for vLLM/SGLang</td><td>1 (first)</td></tr>
+            <tr><td><code>&lt;name&gt;::&lt;reasoning&gt;</code></td><td>per-request reasoning policy override</td><td>2</td></tr>
+            <tr><td><code>&lt;name&gt;::nothink</code></td><td>shortcut for <code>enable_thinking=false</code></td><td>2</td></tr>
+            <tr><td><code>&lt;name&gt;::&lt;reasoning&gt;@&lt;ctx&gt;</code></td><td>both, in either order; <code>@&lt;ctx&gt;</code> strips first</td><td>1 then 2</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Examples:</p>
+      <ul>
+        <li><code>Qwen3-8B-NVFP4@65536</code> &rarr; recreate vLLM with <code>--max-model-len 65536</code>, request body's <code>model</code> rewritten to <code>Qwen3-8B-NVFP4</code>.</li>
+        <li><code>qwen3.5:9b-q8_0::nothink</code> &rarr; set Ollama's <code>think:false</code> for this request only.</li>
+        <li><code>gpt-oss-20b::low@131072</code> &rarr; vLLM gets <code>--max-model-len 131072</code>, request gets <code>reasoning_effort: low</code>.</li>
+      </ul>
+
+      <h3 id="reasoning-policy">4.2 Reasoning policy</h3>
+      <p>
+        Driven by the <code>DEVAI_REASONING</code> env (default <code>auto</code>)
+        plus the <code>X-DevAI-Reasoning</code> header plus the
+        <code>::&lt;reasoning&gt;</code> suffix override (suffix wins over header
+        wins over env). Values: <code>auto | off | low | medium | high</code>.
+      </p>
+      <p>The action depends on the model's capability (from the probe) and the backend's protocol path:</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Backend / Path</th><th>Capability</th><th>Action</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Ollama <code>/api/chat</code>, <code>/api/generate</code></td><td>structured</td><td>inject <code>think: &lt;true|false&gt;</code></td></tr>
+            <tr><td>Ollama <code>/v1/chat/completions</code></td><td>structured</td><td>inject <code>reasoning: {enabled: ...}</code></td></tr>
+            <tr><td>Ollama <code>/v1/messages</code></td><td>structured</td><td>inject <code>thinking.type</code></td></tr>
+            <tr><td>vLLM <code>/v1/chat/completions</code></td><td>structured</td><td>inject <code>extra_body.chat_template_kwargs.enable_thinking</code> + <code>reasoning_effort</code></td></tr>
+            <tr><td>SGLang <code>/v1/chat/completions</code></td><td>structured</td><td>inject <code>extra_body.chat_template_kwargs.enable_thinking</code> + <code>separate_reasoning</code></td></tr>
+            <tr><td>Any</td><td>inline + policy=off</td><td>log <code>reasoningDisable</code> (explicit user opt-out)</td></tr>
+            <tr><td>Any</td><td>none / unsupported</td><td>noop</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout warn">
+        <div class="callout-icon">!</div>
+        <div>
+          Models with <code>disable_verified=False</code> can't reliably
+          suppress reasoning &mdash; the directive is sent, but the model may
+          emit reasoning anyway (R1-Distill family is the standing example).
+        </div>
+      </div>
+
+      <h3 id="tool-choice-promotion">4.3 Tool-choice promotion (vLLM/SGLang)</h3>
+      <p>
+        Fires when the probe's <code>tool_mode == "forced"</code> &mdash; the model
+        only verified tool calls when <code>tool_choice</code> was pinned to a
+        specific function, not under <code>auto</code>. Applies the rule:
+      </p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th><code>tool_choice</code> in request</th><th><code>len(tools)</code></th><th>Router action</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>absent or <code>"auto"</code></td><td>1</td><td>rewrite to <code>{"type":"function","function":{"name":tools[0].function.name}}</code></td></tr>
+            <tr><td>absent or <code>"auto"</code></td><td>&gt;1</td><td>reject with HTTP 400, structured error (see below)</td></tr>
+            <tr><td><code>"required"</code></td><td>any</td><td>pass through (agent took ownership)</td></tr>
+            <tr><td><code>{type:function,...}</code></td><td>any</td><td>pass through (already pinned)</td></tr>
+            <tr><td><code>"none"</code></td><td>any</td><td>pass through (agent disabled tools)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>
+        Models with <code>tool_mode == "auto"</code> (probe verified
+        spontaneous calls work) skip this step entirely. Models without a
+        verified <code>tool_parser</code> fall through to step 4 (tool
+        stripping).
+      </p>
+
+      <p><strong>Multi-tool reject payload:</strong></p>
+
+      <pre data-lang="json"><code class="language-json">{
+  "error": {
+    "type": "invalid_request_error",
+    "code": "tool_choice_pinning_required",
+    "message": "Model \"DeepSeek-R1-Distill-Qwen-7B\" requires tool_choice to be pinned to a specific function when called with multiple tools. Set tool_choice to {\"type\":\"function\",\"function\":{\"name\":\"&lt;one of: get_time, search&gt;\"}}, or route this request to a non-reasoning model (e.g. Qwen3.5-9B-Q8, Llama-3.1-8B-Instruct) that handles auto tool_choice reliably.",
+    "param": "tool_choice"
+  }
+}</code></pre>
+
+      <p><strong>Verified tool modes (vLLM, 24G host):</strong></p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Model</th><th>Tool parser</th><th><code>tool_mode</code></th><th>Use case</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>Qwen3-8B-NVFP4</code></td><td><code>hermes</code></td><td><code>auto</code></td><td>best general-purpose tool caller (auto works)</td></tr>
+            <tr><td><code>Qwen3-14B-NVFP4</code></td><td><code>hermes</code></td><td><code>auto</code></td><td>larger Qwen3 with same auto behaviour</td></tr>
+            <tr><td><code>Qwen3.5-9B-NVFP4</code></td><td><code>qwen3_xml</code></td><td><code>auto</code></td><td>Qwen3.5 with XML-style tool format</td></tr>
+            <tr><td><code>gpt-oss-20b</code></td><td><code>openai</code></td><td><code>auto</code></td><td>harmony format; auto works</td></tr>
+            <tr><td><code>Llama-3.1-8B-Instruct-NVFP4</code></td><td><code>llama3_json</code></td><td><code>forced</code></td><td>non-reasoning, cap=none; forced single-tool works</td></tr>
+            <tr><td><code>DeepSeek-R1-Distill-Llama-8B</code></td><td><code>deepseek_string</code></td><td><code>forced</code></td><td>reasoning, but <strong>5 tokens</strong> to call when forced</td></tr>
+            <tr><td><code>DeepSeek-R1-Distill-Qwen-7B</code></td><td><code>deepseek_string</code></td><td><code>forced</code></td><td>reasoning; 500+ tokens of CoT before the call</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>
+        <code>auto</code> rows pass through the router unchanged.
+        <code>forced</code> rows hit the single-tool promote / multi-tool
+        reject rules above. See
+        <a href="backends.html">backends</a> &mdash; "Operational notes &mdash;
+        R1-Distill family" for the behavioural difference between the two
+        distill variants.
+      </p>
+
+      <h3 id="tool-stripping">4.4 Tool stripping (vLLM/SGLang)</h3>
+      <p>
+        Fires when the model has <strong>no</strong> verified
+        <code>tool_parser</code> in the cache. Without an engine-level
+        <code>--tool-call-parser</code> flag, vLLM rejects every request that
+        carries <code>tool_choice</code> other than <code>"none"</code> with
+        <code>BadRequestError: "auto" tool choice requires
+        --enable-auto-tool-choice and --tool-call-parser</code>. The router
+        strips <code>tools</code> and <code>tool_choice</code> so the request
+        becomes a plain chat. Cost: tool-calling silently unavailable for that
+        model. Benefit: chat works without backend errors.
+      </p>
+
+      <div class="callout good">
+        <div class="callout-icon">i</div>
+        <div>
+          Ollama is unaffected &mdash; its protocol negotiates tool support per
+          request and tolerates <code>tools=[]</code> without launch flags.
+        </div>
+      </div>
+
+      <h3 id="ctx-injection">4.5 Context injection (Ollama only)</h3>
+      <p>
+        For Ollama's native <code>/api/chat</code> and <code>/api/generate</code>
+        paths, the router injects <code>options.num_ctx = &lt;effective ctx&gt;</code>
+        into the body. The effective context is
+        <code>min(model.declared_context, MAX_CONTEXT_LEN)</code> clamped
+        against the probe-verified ceiling. This makes per-session context
+        binding work without minting Modelfile-derived tags.
+      </p>
+      <p>
+        Ollama's <code>/v1/chat/completions</code> and <code>/v1/messages</code>
+        compat paths ignore <code>options.num_ctx</code> &mdash; for those the
+        global <code>OLLAMA_CONTEXT_LENGTH</code> is the only knob.
+      </p>
+      <p>
+        vLLM/SGLang use <code>--max-model-len</code> /
+        <code>--context-length</code> baked into the container at recreate
+        time, not per-request injection.
+      </p>
+
+      <p>
+        The vLLM entrypoint also always passes <code>--kv-cache-dtype fp8</code>.
+        On the project's 24 GiB reference GPU this is what lets NVFP4
+        checkpoints (~18 GiB weights) cohabit with 128K-context KV. Default
+        fp16 KV adds ~7 GiB at 128K &mdash; enough to push the total past
+        24 GiB. fp8 halves that to ~3.5 GiB, leaving room for activations and
+        the engine's CUDA graph workspace. Blackwell exposes native fp8 so
+        there is no throughput cost; older GPUs fall back to vLLM's fp8
+        emulation. The matching <code>--kv-cache-dtype fp8</code> is in
+        <code>scripts/probe-vllm-reasoning.py</code> so probe-time fit data
+        stays consistent with serve-time memory math.
+      </p>
+
+      <!-- Per-model recovery flags -->
+      <h2 id="recovery-flags">5. Per-model recovery flags</h2>
+      <p>
+        For checkpoints whose CUDA-graph workspace alone pushes them past 24
+        GiB at high context (Nemotron-3-Nano-30B-A3B-NVFP4 at 128K is the
+        canonical case), the router appends additional flags from
+        <code>deploy/recovery-flags.json</code> after the parser block:
+      </p>
+
+      <pre data-lang="json"><code class="language-json">{
+  "models": {
+    "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4": {
+      "engine_flags": ["--max-num-seqs", "8",
+                       "--trust-remote-code",
+                       "--enforce-eager"],
+      "engine_env": {
+        "PYTORCH_ALLOC_CONF": "expandable_segments:True",
+        "VLLM_USE_FLASHINFER_MOE_FP4": "1",
+        "VLLM_FLASHINFER_MOE_BACKEND": "throughput"
+      }
+    }
+  }
+}</code></pre>
+
+      <p>
+        <code>--enforce-eager</code> disables CUDA graph capture entirely,
+        reclaiming the ~4 GiB workspace vLLM otherwise pre-reserves. The model
+        then loads with the fp8 KV cache fitting comfortably and 128K-context
+        Q&amp;A works end-to-end (probe records
+        <code>fits=true, vram=22.79 GiB</code>). Cost is a ~10-20% decode
+        throughput hit from losing graph batching &mdash; the going trade to
+        reach 128K on a 24 GiB card.
+      </p>
+
+      <div class="callout">
+        <div class="callout-icon">i</div>
+        <div>
+          <code>scripts/_probe_hf_common.py</code> reads the same JSON so the
+          vLLM/SGLang probers launch with the same flags. Without this
+          symmetry the probe would record <code>fits=false</code> at 128K, the
+          picker would hide the cell, and the router would never get a chance
+          to use the recovery flags.
+        </div>
+      </div>
+
+      <!-- vLLM plugin registry -->
+      <h2 id="plugin-registry">6. vLLM plugin registry</h2>
+      <p>
+        <code>deploy/vllm-plugins.json</code> is the single source of truth
+        for custom parsers. Format:
+      </p>
+
+      <pre data-lang="json"><code class="language-json">{
+  "container_dir": "/etc/devai/vllm-plugins",
+  "plugins": {
+    "deepseek_string": {
+      "kind": "tool",
+      "file": "deepseek_string_tool_parser.py"
+    }
+  }
+}</code></pre>
+
+      <p>Both the prober and the router consult this map. When a parser name matches an entry:</p>
+      <ul>
+        <li>The router bind-mounts <code>VLLM_PLUGINS_HOST_DIR</code> (default <code>scripts/vllm_plugins</code>) into the recreated vLLM container at <code>container_dir</code>.</li>
+        <li>The launch args gain <code>--tool-parser-plugin &lt;abs&gt;</code> (or <code>--reasoning-parser-plugin &lt;abs&gt;</code>) <strong>before</strong> the parser-name flag &mdash; vLLM resolves parser names at flag-parse time.</li>
+        <li>An empty <code>VLLM_PLUGINS_HOST_DIR</code> for a plugin model fails the recreate with an actionable error.</li>
+      </ul>
+
+      <p>Names absent from the registry pass through as built-in vLLM parsers.</p>
+
+      <div class="callout">
+        <div class="callout-icon">i</div>
+        <div>
+          <strong>Adding a new plugin:</strong> drop the file in
+          <code>scripts/vllm_plugins/</code>, add one entry to
+          <code>deploy/vllm-plugins.json</code>, reference the parser name
+          from a family's <code>parsers.vllm.tool</code> (or
+          <code>.reasoning</code>) in <code>scripts/model-families.yaml</code>.
+          No router code change. See
+          <a href="backends.html">backends</a> &mdash; "Custom vLLM parser
+          plugins" for the full adding-a-plugin recipe.
+        </div>
+      </div>
+
+      <!-- Caches consumed -->
+      <h2 id="caches">7. Caches consumed</h2>
+      <p>The router reads only &mdash; never writes. Keep the writers single-source.</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>File</th><th>Schema</th><th>Writer</th><th>Keys</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>deploy/.ollama-reasoning-cache.json</code></td><td>v3</td><td><code>probe-ollama-reasoning.py</code></td><td>digest</td></tr>
+            <tr><td><code>deploy/.vllm-reasoning-cache.json</code></td><td>v2</td><td><code>probe-vllm-reasoning.py</code></td><td><code>&lt;repo&gt;@&lt;sha&gt;</code></td></tr>
+            <tr><td><code>deploy/.sglang-reasoning-cache.json</code></td><td>v2</td><td><code>probe-sglang-reasoning.py</code></td><td><code>&lt;repo&gt;@&lt;sha&gt;</code></td></tr>
+            <tr><td><code>deploy/vllm-plugins.json</code></td><td>v1</td><td>hand-edited</td><td>parser name</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Top-level fields used by the router:</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Field</th><th>From</th><th>Used by</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>aliases</code></td><td>catalog row name + ollama tags</td><td>model name lookup</td></tr>
+            <tr><td><code>size_gb</code></td><td>catalog row</td><td><code>memFraction</code> math</td></tr>
+            <tr><td><code>max_context</code></td><td>largest clean probe <code>actual_context</code></td><td>declared context cap</td></tr>
+            <tr><td><code>capability</code></td><td>smallest clean probe</td><td>reasoning policy</td></tr>
+            <tr><td><code>tool_parser</code></td><td>latest cell with <code>tool_parser</code> set</td><td>engine launch flag, strip-tools gate</td></tr>
+            <tr><td><code>reasoning_parser</code></td><td>latest cell with <code>reasoning_parser</code> set</td><td>engine launch flag</td></tr>
+            <tr><td><code>disable_verified</code></td><td>latest cell with <code>disable_verified</code></td><td>reasoning-disable gate</td></tr>
+            <tr><td><code>tool_mode</code></td><td>same cell as <code>tool_parser</code> (<code>evidence.tool.mode</code>)</td><td>tool-choice promotion</td></tr>
+            <tr><td><code>probes[vram][ctx].fits</code></td><td>per-cell verdict</td><td>row eligibility, <code>ProbedMaxCtx</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>
+        <strong>Top-level field derivation.</strong> <code>capability</code>
+        comes from the <em>smallest-tier</em> clean probe (most conservative
+        classification). Parser fields and <code>tool_mode</code> come from the
+        <strong>most-recently-probed clean cell that has them populated</strong>
+        &mdash; <code>_latest_cell_with</code> in
+        <code>scripts/_probe_hf_common.py</code>. This split lets a partial
+        <code>--force</code> re-probe of a single cell update the top-level row
+        without requiring a full matrix re-probe; older cells with stale
+        <code>None</code>s no longer shadow new evidence (e.g. when a curated
+        parser hint is added to a family that already had probed cells).
+      </p>
+
+      <div class="callout">
+        <div class="callout-icon">i</div>
+        <div>
+          A missing probe cache is non-fatal: the corresponding backend
+          exposes zero models. Run <code>make probe</code> (Ollama) or
+          <code>make probe-vllm</code> / <code>make probe-sglang</code> (HF) to
+          populate.
+        </div>
+      </div>
+
+      <!-- Configuration -->
+      <h2 id="configuration">8. Configuration (env vars)</h2>
+      <p>
+        Set in <code>deploy/docker-compose.yaml</code> under the
+        <code>router</code> service or on the shell when invoking compose.
+      </p>
+
+      <h3 id="env-backend">8.1 Backend wiring</h3>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Variable</th><th>Default</th><th>Purpose</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>OLLAMA_URL</code></td><td><code>http://devai-ollama:11434</code></td><td>upstream</td></tr>
+            <tr><td><code>OLLAMA_PORT</code></td><td><code>11434</code></td><td>router listen</td></tr>
+            <tr><td><code>VLLM_URL</code></td><td><code>http://devai-vllm:11434</code></td><td>upstream</td></tr>
+            <tr><td><code>VLLM_PORT</code></td><td><code>11435</code></td><td>router listen</td></tr>
+            <tr><td><code>VLLM_CONTAINER</code></td><td><code>devai-vllm</code></td><td>name to recreate</td></tr>
+            <tr><td><code>VLLM_IMAGE</code></td><td><code>docker.io/vllm/vllm-openai:latest-cu130-ubuntu2404</code></td><td>image to launch</td></tr>
+            <tr><td><code>VLLM_MODELS_DIR</code></td><td><code>/var/cache/devai/ollama/models/vllm</code></td><td>host path bound to <code>/models</code></td></tr>
+            <tr><td><code>SGLANG_URL</code></td><td><code>http://devai-sglang:11434</code></td><td>upstream</td></tr>
+            <tr><td><code>SGLANG_PORT</code></td><td><code>11436</code></td><td>router listen</td></tr>
+            <tr><td><code>SGLANG_CONTAINER</code></td><td><code>devai-sglang</code></td><td>name to recreate</td></tr>
+            <tr><td><code>SGLANG_IMAGE</code></td><td><code>docker.io/lmsysorg/sglang:v0.5.10.post1-cu130</code></td><td>image to launch</td></tr>
+            <tr><td><code>SGLANG_MODELS_DIR</code></td><td><code>/var/cache/devai/ollama/models/vllm</code></td><td>host path bound to <code>/models</code></td></tr>
+            <tr><td><code>NETWORK</code></td><td><code>devai-net</code></td><td>podman network name</td></tr>
+            <tr><td><code>PODMAN_SOCKET</code></td><td><code>/run/podman/podman.sock</code></td><td>libpod socket inside router</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 id="env-lifecycle">8.2 Lifecycle</h3>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Variable</th><th>Default</th><th>Purpose</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>IDLE_TIMEOUT</code></td><td><code>300</code></td><td>seconds before idle backend is replaced with placeholder</td></tr>
+            <tr><td><code>DRAIN_TIMEOUT</code></td><td><code>30</code></td><td>seconds to wait for in-flight requests when switching backends</td></tr>
+            <tr><td><code>HEALTH_TIMEOUT_SECONDS</code></td><td><code>600</code></td><td>cold-start health-poll deadline (NVFP4 + CUDA graph can need 5min)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 id="env-memory">8.3 Memory and context</h3>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Variable</th><th>Default</th><th>Purpose</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>GPU_MEMORY_GB</code></td><td><code>24</code></td><td>total GPU VRAM; drives memory fraction calc</td></tr>
+            <tr><td><code>MAX_CONTEXT_LEN</code></td><td><code>262144</code></td><td>global ceiling clamping any model's per-name context</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 id="env-reasoning">8.4 Reasoning</h3>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Variable</th><th>Default</th><th>Purpose</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>DEVAI_REASONING</code></td>
+              <td><code>auto</code></td>
+              <td>
+                global policy: <code>auto|off|low|medium|high</code>.
+                Per-request override via <code>::&lt;token&gt;</code> suffix or
+                <code>X-DevAI-Reasoning</code> header.
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 id="env-caches">8.5 Probe caches</h3>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Variable</th><th>Default</th><th>Purpose</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>PROBE_CACHE</code></td><td><code>/etc/devai/.ollama-reasoning-cache.json</code></td><td>Ollama cache</td></tr>
+            <tr><td><code>VLLM_PROBE_CACHE</code></td><td><code>/etc/devai/.vllm-reasoning-cache.json</code></td><td>vLLM cache</td></tr>
+            <tr><td><code>SGLANG_PROBE_CACHE</code></td><td><code>/etc/devai/.sglang-reasoning-cache.json</code></td><td>SGLang cache</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 id="env-plugin">8.6 Plugin registry</h3>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Variable</th><th>Default</th><th>Purpose</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>VLLM_PLUGINS_REGISTRY</code></td><td><code>/etc/devai/vllm-plugins.json</code></td><td>path the router reads inside its own container</td></tr>
+            <tr><td><code>VLLM_PLUGINS_HOST_DIR</code></td><td><code>""</code> (set by Makefile)</td><td>host path to bind-mount into recreated vLLM containers</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>
+        The Makefile sets
+        <code>VLLM_PLUGINS_HOST_DIR = $(abspath scripts/vllm_plugins)</code>
+        and exports it for compose interpolation.
+      </p>
+
+      <!-- Failure modes -->
+      <h2 id="failure-modes">9. Failure modes</h2>
+
+      <h3 id="fm-plugin">9.1 Plugin required but <code>VLLM_PLUGINS_HOST_DIR</code> empty</h3>
+
+      <pre data-lang="text"><code>podman create devai-vllm: vllm plugin required (tool="deepseek_string" reasoning="") but VLLM_PLUGINS_HOST_DIR is empty</code></pre>
+
+      <div class="callout danger">
+        <div class="callout-icon">!</div>
+        <div>
+          <strong>Cause:</strong> a model's verified <code>tool_parser</code>
+          is in the plugin registry but the router doesn't know the host path
+          to mount. <strong>Fix:</strong> ensure compose runs through
+          <code>make cache-up</code> (which sets the env via Makefile export),
+          or set <code>VLLM_PLUGINS_HOST_DIR</code> manually.
+        </div>
+      </div>
+
+      <h3 id="fm-multi-tool">9.2 Multi-tool reject (HTTP 400)</h3>
+
+      <pre data-lang="json"><code class="language-json">{"error":{"type":"invalid_request_error","code":"tool_choice_pinning_required",...}}</code></pre>
+
+      <div class="callout warn">
+        <div class="callout-icon">!</div>
+        <div>
+          <strong>Cause:</strong> model has <code>tool_mode=forced</code>,
+          request has <code>tool_choice="auto"</code> or absent, and
+          <code>len(tools) &gt; 1</code>. The router can't pick a tool for the
+          agent. <strong>Fix:</strong> pin <code>tool_choice</code> client-side
+          to a specific function, or route to a non-reasoning model with
+          <code>tool_mode=auto</code> (Qwen3.5, Llama-3.1).
+        </div>
+      </div>
+
+      <h3 id="fm-coldstart">9.3 Backend cold-start timeout</h3>
+
+      <pre data-lang="text"><code>devai-vllm did not become ready within 600s</code></pre>
+
+      <div class="callout warn">
+        <div class="callout-icon">!</div>
+        <div>
+          <strong>Cause:</strong> NVFP4 weights with CUDA graph capture can
+          take 5+ min on consumer GPUs; sometimes longer on first-ever load
+          (kernel JIT-compilation cached afterwards). <strong>Fix:</strong>
+          bump <code>HEALTH_TIMEOUT_SECONDS=900</code> and retry, or rerun the
+          request &mdash; the second attempt usually hits warm caches.
+        </div>
+      </div>
+
+      <h3 id="fm-race">9.4 Recreate race on concurrent requests</h3>
+      <p>
+        The first concurrent request observes <code>running=false</code> and
+        starts a recreate; subsequent requests for the same target wait on
+        <code>recreateCond</code> rather than launching a duplicate. If the
+        lead recreate fails, all waiters wake and propagate the same error.
+        No duplicate <code>podman create</code> calls.
+      </p>
+
+      <h3 id="fm-stuck-ollama">9.5 Stuck Ollama models holding GPU</h3>
+      <p>
+        Ollama's <code>keep_alive=0</code> directive normally releases VRAM.
+        If a model gets stuck loaded (rare; usually the daemon is wedged),
+        the router's <code>unloadOllama</code> loops over <code>/api/ps</code>
+        and unloads each. Worst case: restart <code>devai-ollama</code>.
+      </p>
+
+      <!-- Operator tasks -->
+      <h2 id="operator-tasks">10. Operator tasks</h2>
+
+      <h3 id="op-reload">10.1 Reload the router after a code or cache change</h3>
+
+      <pre data-lang="bash"><code class="language-bash">make build-router      # if Go code changed
+make cache-down
+make cache-up</code></pre>
+
+      <p>
+        Compose mounts caches read-only and re-reads them on every router
+        boot. No restart-on-write &mdash; the router holds its working set in
+        memory.
+      </p>
+
+      <h3 id="op-inspect">10.2 Inspect what the router is doing</h3>
+
+      <pre data-lang="bash"><code class="language-bash">make logs SERVICE=devai-router LINES=80
+make logs SERVICE=devai-vllm LINES=120     # backend that's currently active</code></pre>
+
+      <p>Useful log lines:</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Pattern</th><th>Meaning</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>probe cache: ... loaded (N entries -&gt; M serving rows)</code></td><td>per-cache load summary</td></tr>
+            <tr><td><code>vllm plugin registry: ... loaded</code></td><td>plugin map consumed</td></tr>
+            <tr><td><code>vllm launch: model=X GB ... tool="Y" tool_plugin="Z"</code></td><td>recreate spec</td></tr>
+            <tr><td><code>stopping &lt;other-backend&gt; (switching to &lt;target&gt;)</code></td><td>GPU mutex switch</td></tr>
+            <tr><td><code>draining &lt;backend&gt; (N active requests)</code></td><td>drain-on-switch</td></tr>
+            <tr><td><code>&lt;backend&gt; idle, stopping</code></td><td>idle timeout fired</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 id="op-verify">10.3 Verify a single request end-to-end</h3>
+      <p>From a sibling container on <code>devai-net</code>:</p>
+
+      <pre data-lang="bash"><code class="language-bash">podman run --rm --network devai-net curlimages/curl:latest \
+  -X POST http://devai-router:11435/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-8B-NVFP4@32768",
+    "messages": [{"role":"user","content":"hi"}],
+    "max_tokens": 64
+  }'</code></pre>
+
+      <h3 id="op-tools">10.4 Test the tool-choice rules</h3>
+      <p>Single tool + auto (forced model) &rarr; should rewrite + extract:</p>
+
+      <pre data-lang="bash"><code class="language-bash">podman run --rm --network devai-net curlimages/curl:latest \
+  -X POST http://devai-router:11435/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "DeepSeek-R1-Distill-Qwen-7B@32768",
+    "messages": [{"role":"user","content":"What time is it?"}],
+    "tools": [{"type":"function","function":{"name":"get_time","parameters":{"type":"object","properties":{}}}}],
+    "tool_choice": "auto",
+    "max_tokens": 4096
+  }'</code></pre>
+
+      <p>
+        Multi-tool + auto (forced model) &rarr; should return HTTP 400 with
+        <code>tool_choice_pinning_required</code> code.
+      </p>
+
+      <!-- Benchmark harness -->
+      <h2 id="benchmark-harness">11. Benchmark harness</h2>
+      <p>
+        Lives at <code>scripts/bench/</code>, runs in the lab container, talks
+        to the router exactly the way Claude Code does. Built to answer
+        "which model should I use for X?" with evidence rather than vibes.
+      </p>
+
+      <h3 id="bench-what">11.1 What it measures</h3>
+      <p>Per (model, backend) pair, per run:</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Axis</th><th>Metric</th><th>Source</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Reasoning</td><td>GSM8K accuracy</td><td><code>inspect_ai</code> task <code>gsm8k_subset_&lt;n&gt;</code></td></tr>
+            <tr><td>Coding</td><td>HumanEval pass@1</td><td><code>inspect_ai</code> task <code>humaneval_subset_&lt;n&gt;</code>, local subprocess sandbox</td></tr>
+            <tr><td>Tool use</td><td>Score + per-subcase breakdown</td><td><code>inspect_ai</code> task <code>tools_use_&lt;n&gt;</code> (empty-schema, single-arg, multi-tool pick, result follow-up)</td></tr>
+            <tr><td>Output cleanliness</td><td>Leak rate + per-marker hits</td><td>regex sweep over response bodies via <code>bench_latency_leak.py</code></td></tr>
+            <tr><td>Cold start</td><td><code>ttft_ms_first</code></td><td>First request to a freshly-recreated backend (cold container + weight load + KV alloc + prefill + first token)</td></tr>
+            <tr><td>Steady-state latency</td><td><code>ttft_ms_steady_p50/p95</code></td><td>Subsequent prompts in the same model session</td></tr>
+            <tr><td>Throughput</td><td><code>tps_sustained_p50</code></td><td>Tokens-per-second during streamed body</td></tr>
+            <tr><td>Memory</td><td><code>peak_vram_gb</code>, <code>mean_vram_gb</code></td><td><code>nvidia-smi</code> sampler thread, 1Hz</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 id="bench-cache">11.2 Cache file</h3>
+      <p>
+        <code>deploy/.bench-cache.json</code>, schema v2, sorted-keys for
+        diff-friendliness. Top-level layout:
+      </p>
+      <ul>
+        <li><code>_meta.host_env_history</code> &mdash; map keyed by 12-char SHA-256 id of <code>(kernel, driver_version, gpu_name, gpu_memory_gb, cuda_version)</code>, values include <code>captured_at</code> (ISO-8601 UTC). Same hardware on different days &rarr; same id, so the table accumulates one entry per distinct environment.</li>
+        <li><code>_meta.current_host_env_id</code> &mdash; pointer to the most-recent run's id.</li>
+        <li>Bench rows &mdash; keys <code>&lt;repo&gt;@&lt;sha&gt;::&lt;backend&gt;</code> for HF (vllm/sglang) or <code>&lt;digest&gt;::&lt;backend&gt;</code> for Ollama. Each row stamps <code>host_env_id</code> so consumers can spot mixed-provenance leaderboards. The <code>::&lt;backend&gt;</code> suffix is mandatory; legacy keys without it are migrated in-memory by <code>migrate_bench_cache_keys</code> on every load.</li>
+      </ul>
+
+      <p>
+        Iterate with <code>is_row_key(key)</code> from
+        <code>_bench_core.py</code> so <code>_meta</code> (and any future
+        top-level meta blocks) are skipped. Schema is documented at the top
+        of <code>scripts/bench/_bench_core.py::update_row</code>.
+      </p>
+
+      <p>
+        Re-runs merge in (don't overwrite) so partial benches accumulate.
+        <code>BENCH_FORCE=1</code> re-runs every task and <strong>also</strong>
+        resets the row's <code>tasks</code> and <code>metrics</code> blocks
+        before the new run starts &mdash; preserving
+        <code>first_benched_at</code>, refreshing <code>last_benched_at</code>,
+        and stamping the current <code>host_env_id</code>. Without
+        <code>--force</code>, individual tasks are skipped only when an entry
+        with that exact subset name (e.g. <code>gsm8k_subset_100</code>)
+        already exists.
+      </p>
+
+      <h3 id="bench-make">11.3 Make targets</h3>
+
+      <pre data-lang="bash"><code class="language-bash">make bench           # all backends
+make bench-vllm      # only vLLM models
+make bench-sglang    # only SGLang models
+make bench-ollama    # only Ollama models
+make bench-report    # Markdown leaderboard from .bench-cache.json
+make test-bench-smoke # 1-model tiny-subset sanity check</code></pre>
+
+      <p>Knobs (env vars; same idiom as <code>PROBE_*</code>):</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Variable</th><th>Default</th><th>Purpose</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>BENCH_TASKS</code></td><td><code>gsm8k,humaneval,tools,leak</code></td><td>comma-separated subset</td></tr>
+            <tr><td><code>BENCH_REPO</code></td><td>unset</td><td>regex filter on probe-cache top-level key</td></tr>
+            <tr><td><code>BENCH_FORCE</code></td><td>unset</td><td>re-run tasks already cached</td></tr>
+            <tr><td><code>BENCH_N_GSM8K</code></td><td><code>100</code></td><td>GSM8K subset size</td></tr>
+            <tr><td><code>BENCH_N_HUMANEVAL</code></td><td><code>50</code></td><td>HumanEval subset size</td></tr>
+            <tr><td><code>BENCH_N_TOOLS</code></td><td><code>20</code></td><td>tools_use prompts (5 per subcase x 4 subcases)</td></tr>
+            <tr><td><code>BENCH_N_LEAK_PROMPTS</code></td><td><code>40</code></td><td>latency/leak sweep prompts</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 id="bench-leak">11.4 Adding a leak marker</h3>
+      <p>
+        Drop a Python regex line into
+        <code>scripts/bench/data/leak_markers.txt</code>. Backslash-escape
+        pipes inside <code>&lt;|...|&gt;</code> tokens so they're treated as
+        literals (e.g. <code>&lt;\|new_token\|&gt;</code>). The sweeper
+        recompiles on every run; no code changes needed.
+      </p>
+
+      <h3 id="bench-read">11.5 Reading a result</h3>
+
+      <pre data-lang="bash"><code class="language-bash">make bench-report</code></pre>
+
+      <p>
+        prints a leaderboard sorted by aggregate correctness score. The top
+        of the report carries a <code>_Host env_</code> header with the
+        active <code>host_env_id</code>, kernel, driver, GPU, CUDA version,
+        and capture timestamp; the per-row <code>Env</code> column joins each
+        row to its history entry so a re-bench after a driver upgrade shows
+        clearly mixed provenance. For a single model:
+      </p>
+
+      <pre data-lang="bash"><code class="language-bash">jq '.["nvidia/Qwen3-8B-NVFP4@ccd10a893cbc::vllm"]' deploy/.bench-cache.json
+jq '.["_meta"].host_env_history' deploy/.bench-cache.json</code></pre>
+
+      <p>
+        Per-task <code>inspect_log_dir</code> paths point at <code>.eval</code>
+        files under <code>/var/cache/devai/bench/inspect-logs/</code> &mdash;
+        load them in the inspect viewer
+        (<code>inspect view start --log-dir &lt;path&gt;</code>) for full
+        per-sample forensics.
+      </p>
+
+    </div>
+
+    <aside class="toc-floating">
+      <h4>On this page</h4>
+      <ul></ul>
+    </aside>
+  </main>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-core.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/plugins/autoloader/prism-autoloader.min.js"></script>
+<script src="assets/nav.js"></script>
+<script src="assets/widgets.js"></script>
+<script src="assets/site.js"></script>
+</body>
+</html>

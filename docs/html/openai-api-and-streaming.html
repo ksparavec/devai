@@ -1,0 +1,725 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The OpenAI-compatible API and SSE streaming — Dev AI Lab</title>
+<meta name="description" content="What is actually on the wire when an agent talks to vLLM, SGLang, Ollama, or any OpenAI-compatible server. Request and response anatomy, SSE streaming, tool-call piecemeal arguments, reasoning-content separation, and the Anthropic /v1/messages variant.">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism-tomorrow.min.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="site">
+  <main class="main">
+    <div class="content">
+
+      <header>
+        <span class="pill">Beginner's guide · protocol</span>
+        <h1>The OpenAI-compatible API and SSE streaming</h1>
+        <p class="lead">
+          What is <em>actually on the wire</em> when an agent talks to vLLM, SGLang,
+          Ollama, or any other server claiming OpenAI compatibility. Everything in
+          this project's router code, bench harness, agent integrations (Claude Code,
+          Aider, Codex, Open WebUI), and probe drivers ultimately speaks this protocol.
+        </p>
+      </header>
+
+      <div class="callout">
+        <div class="callout-icon">i</div>
+        <div>
+          <strong>Prerequisites:</strong> if you can read JSON and you have ever sent
+          an HTTP POST, you have the prerequisites. If you have read
+          <a href="reasoning-tool-calling-chat-templates.html">reasoning-tool-calling-chat-templates</a>,
+          the structured-output fields below will already feel familiar.
+        </div>
+      </div>
+
+      <!-- §1 -->
+      <h2 id="endpoint-surface">1. The endpoint surface</h2>
+      <p>
+        The OpenAI-compatible servers in this project expose a small set of HTTP
+        endpoints. The vast majority of traffic hits exactly one:
+      </p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Endpoint</th><th>What it does</th><th>Used by</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>POST /v1/chat/completions</code></td><td>take a list of role-tagged messages, return an assistant message (or stream it)</td><td>every chat agent</td></tr>
+            <tr><td><code>POST /v1/completions</code></td><td>legacy raw-text completion (no chat structure)</td><td>rarely used; some autocomplete tools</td></tr>
+            <tr><td><code>POST /v1/embeddings</code></td><td>turn text into a vector for similarity search</td><td>RAG pipelines</td></tr>
+            <tr><td><code>GET  /v1/models</code></td><td>list models the server is currently serving</td><td>picker, healthchecks, agents on startup</td></tr>
+            <tr><td><code>GET  /health</code></td><td>"am I alive and ready?"</td><td>the router's polling loop after a container recreate</td></tr>
+            <tr><td><code>POST /v1/messages</code></td><td>Anthropic's variant of <code>/v1/chat/completions</code></td><td>Claude SDK, Claude Code</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Ports in this project:</p>
+      <ul>
+        <li><code>11434</code> — Ollama (and the router's Ollama-compat proxy)</li>
+        <li><code>11435</code> — vLLM (via router)</li>
+        <li><code>11436</code> — SGLang (via router)</li>
+      </ul>
+
+      <p>
+        All three speak the OpenAI surface plus health endpoints. Ollama also speaks
+        its native <code>/api/chat</code> and <code>/api/generate</code>;
+        Anthropic-compatible <code>/v1/messages</code> is wired through the router.
+      </p>
+
+      <!-- §2 -->
+      <h2 id="request-anatomy">2. Anatomy of a chat completion request</h2>
+      <p>A minimal request:</p>
+
+      <pre data-lang="http"><code class="language-http">POST /v1/chat/completions
+Content-Type: application/json
+
+{
+  "model": "Qwen3-8B-NVFP4@131072",
+  "messages": [
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user",   "content": "What is 2 + 2?"}
+  ]
+}</code></pre>
+
+      <p>
+        That is it. Every other field has a sensible default. The complete field
+        reference for the request body:
+      </p>
+
+      <h3 id="routing-fields">2.1 Routing fields</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Field</th><th>Type</th><th>Purpose</th></tr></thead>
+          <tbody>
+            <tr><td><code>model</code></td><td>string</td><td>required. Names the model. The picker's <code>&lt;name&gt;::&lt;reasoning&gt;@&lt;ctx&gt;</code> syntax is parsed by the router (this project's extension); raw OpenAI servers see only the prefix before the first <code>::</code> or <code>@</code>.</td></tr>
+            <tr><td><code>stream</code></td><td>bool</td><td><code>false</code> (default) → return one big response. <code>true</code> → return a Server-Sent Events stream. See <a href="#streaming">§4</a>.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 id="generation-control">2.2 Generation control</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Purpose</th></tr></thead>
+          <tbody>
+            <tr><td><code>temperature</code></td><td>float &gt;= 0</td><td>1.0</td><td>sampling temperature; 0 = greedy, higher = more random. See <a href="sampling-strategies.html">sampling-strategies</a>.</td></tr>
+            <tr><td><code>top_p</code></td><td>float (0,1]</td><td>1.0</td><td>nucleus sampling cutoff.</td></tr>
+            <tr><td><code>top_k</code></td><td>int</td><td>-1</td><td>(vLLM/SGLang extension) keep top-k logits. -1 = no cutoff.</td></tr>
+            <tr><td><code>min_p</code></td><td>float</td><td>0.0</td><td>(vLLM extension) minimum probability filter.</td></tr>
+            <tr><td><code>max_tokens</code></td><td>int</td><td>server default (often 16 or model max)</td><td>hard cap on generated tokens.</td></tr>
+            <tr><td><code>max_completion_tokens</code></td><td>int</td><td>—</td><td>OpenAI's newer name for the same thing; servers accept either.</td></tr>
+            <tr><td><code>stop</code></td><td>string | string[]</td><td>none</td><td>stop generation when one of these strings appears.</td></tr>
+            <tr><td><code>frequency_penalty</code></td><td>float</td><td>0</td><td>discourage repeated tokens proportional to past count.</td></tr>
+            <tr><td><code>presence_penalty</code></td><td>float</td><td>0</td><td>discourage tokens that have appeared at all.</td></tr>
+            <tr><td><code>seed</code></td><td>int</td><td>none</td><td>for repeatability under sampling — same seed + same model → same output.</td></tr>
+            <tr><td><code>logprobs</code></td><td>bool</td><td>false</td><td>return per-token log-probabilities in the response.</td></tr>
+            <tr><td><code>top_logprobs</code></td><td>int</td><td>0</td><td>how many alternatives per position.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 id="tool-calling">2.3 Tool calling</h3>
+      <p>
+        See also <a href="reasoning-tool-calling-chat-templates.html">reasoning-tool-calling-chat-templates</a> §2.
+      </p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Field</th><th>Type</th><th>Purpose</th></tr></thead>
+          <tbody>
+            <tr><td><code>tools</code></td><td>array</td><td>declared functions, each with <code>name</code>, <code>description</code>, JSON-schema <code>parameters</code>.</td></tr>
+            <tr><td><code>tool_choice</code></td><td>string | object</td><td><code>"auto"</code> / <code>"none"</code> / <code>"required"</code> / <code>{type: "function", function: {name: "X"}}</code>.</td></tr>
+            <tr><td><code>parallel_tool_calls</code></td><td>bool</td><td>allow the model to emit multiple tool calls in one assistant turn.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 id="reasoning-fields">2.4 Reasoning (vLLM/SGLang extensions for thinking models)</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Field</th><th>Type</th><th>Purpose</th></tr></thead>
+          <tbody>
+            <tr><td><code>reasoning_effort</code></td><td>enum</td><td><code>"low"</code> / <code>"medium"</code> / <code>"high"</code>. Hints the model to spend more or fewer tokens reasoning.</td></tr>
+            <tr><td><code>extra_body.chat_template_kwargs.enable_thinking</code></td><td>bool</td><td>per-request override of the chat template's <code>enable_thinking</code> slot. The router uses this to implement <code>::nothink</code>.</td></tr>
+            <tr><td><code>extra_body.chat_template_kwargs.separate_reasoning</code></td><td>bool</td><td>(SGLang) split reasoning vs final into separate channels.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 id="response-shaping">2.5 Response shaping</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Field</th><th>Type</th><th>Purpose</th></tr></thead>
+          <tbody>
+            <tr><td><code>response_format</code></td><td>object</td><td>force structured output. <code>{"type": "json_object"}</code> (any JSON), <code>{"type": "json_schema", "json_schema": {...}}</code> (specific schema).</td></tr>
+            <tr><td><code>n</code></td><td>int</td><td>how many independent completions to generate. Almost always 1 in practice.</td></tr>
+            <tr><td><code>user</code></td><td>string</td><td>client-supplied user identifier (logged for abuse tracking on hosted providers; no-op on local servers).</td></tr>
+            <tr><td><code>stream_options.include_usage</code></td><td>bool</td><td>when streaming, include the final <code>usage</code> block in the last event. <strong>Critical</strong> for accurate metering — bench harness uses this.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- §3 -->
+      <h2 id="response-anatomy">3. Anatomy of a non-streaming response</h2>
+      <p>For <code>stream: false</code> (or omitted), you get one JSON document:</p>
+
+      <pre data-lang="json"><code class="language-json">{
+  "id": "chatcmpl-abc123",
+  "object": "chat.completion",
+  "created": 1735000000,
+  "model": "Qwen3-8B-NVFP4",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "4",
+        "reasoning_content": "The user asked what 2+2 is..."
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 24,
+    "completion_tokens": 1,
+    "total_tokens": 25
+  }
+}</code></pre>
+
+      <h3 id="choices-array">3.1 The <code>choices</code> array</h3>
+      <p>Always length-1 unless you set <code>n &gt; 1</code>. The interesting fields:</p>
+      <ul>
+        <li><code>message.role</code> — always <code>"assistant"</code> for non-tool responses.</li>
+        <li><code>message.content</code> — the text content. May be <code>null</code> if the model emitted only tool calls.</li>
+        <li><code>message.reasoning_content</code> — the <code>&lt;think&gt;</code> content extracted by the reasoning parser, if any.</li>
+        <li><code>message.tool_calls</code> — array of structured tool-call objects, if the model decided to call tools.</li>
+        <li><code>finish_reason</code> — why generation stopped:
+          <ul>
+            <li><code>"stop"</code> — the model emitted its end-of-turn token (e.g. <code>&lt;|im_end|&gt;</code>) or hit a <code>stop</code> string.</li>
+            <li><code>"length"</code> — hit <code>max_tokens</code>.</li>
+            <li><code>"tool_calls"</code> — finished with tool calls; agent should execute and continue.</li>
+            <li><code>"content_filter"</code> — refused by safety filter.</li>
+          </ul>
+        </li>
+      </ul>
+
+      <h3 id="usage-block">3.2 The <code>usage</code> block</h3>
+      <p>Token accounting from the model's perspective:</p>
+      <ul>
+        <li><code>prompt_tokens</code> — input length after chat-template rendering and tokenisation. <strong>Includes</strong> the system prompt, all prior turns, and the chat template scaffolding tokens.</li>
+        <li><code>completion_tokens</code> — output length. <strong>Subject to the gotcha documented in <a href="reasoning-tool-calling-chat-templates.html">reasoning-tool-calling-chat-templates</a> §3.4</strong> — vLLM's qwen3 reasoning parser excludes <code>reasoning_content</code> tokens from this count. The bench harness's TPS fix works around this.</li>
+        <li><code>total_tokens</code> — sum of the above. What hosted providers bill on.</li>
+      </ul>
+
+      <!-- §4 -->
+      <h2 id="streaming">4. Streaming with Server-Sent Events (SSE)</h2>
+      <p>
+        When <code>stream: true</code>, the server replies with
+        <code>Content-Type: text/event-stream</code> and emits a series of events as
+        it generates. Each event is a single line of the form:
+      </p>
+
+      <pre data-lang="text"><code>data: &lt;json&gt;
+
+</code></pre>
+
+      <p>(with a literal blank line after each event — the SSE framing). The final event is the literal:</p>
+
+      <pre data-lang="text"><code>data: [DONE]
+
+</code></pre>
+
+      <p>A typical decode of "What is 2 + 2?" → "4" looks like:</p>
+
+      <pre data-lang="text"><code>data: {"id":"chatcmpl-x","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}
+
+data: {"id":"chatcmpl-x","choices":[{"index":0,"delta":{"content":"4"}}]}
+
+data: {"id":"chatcmpl-x","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"chatcmpl-x","choices":[],"usage":{"prompt_tokens":24,"completion_tokens":1,"total_tokens":25}}
+
+data: [DONE]
+
+</code></pre>
+
+      <figure>
+        <svg viewBox="0 0 820 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="SSE stream timeline">
+          <defs>
+            <marker id="sseArr" markerWidth="10" markerHeight="8" refX="10" refY="4" orient="auto">
+              <path d="M0,0 L10,4 L0,8 Z" fill="var(--accent)"/>
+            </marker>
+          </defs>
+
+          <!-- Client box -->
+          <rect x="20" y="30" width="120" height="44" rx="6" fill="var(--bg-elev-2)" stroke="var(--border-strong)"/>
+          <text x="80" y="50" text-anchor="middle" fill="var(--text)" font-family="JetBrains Mono" font-size="12" font-weight="600">client</text>
+          <text x="80" y="66" text-anchor="middle" fill="var(--text-muted)" font-family="JetBrains Mono" font-size="10">curl / agent</text>
+
+          <!-- Server box -->
+          <rect x="680" y="30" width="120" height="44" rx="6" fill="var(--bg-elev-2)" stroke="var(--border-strong)"/>
+          <text x="740" y="50" text-anchor="middle" fill="var(--text)" font-family="JetBrains Mono" font-size="12" font-weight="600">server</text>
+          <text x="740" y="66" text-anchor="middle" fill="var(--text-muted)" font-family="JetBrains Mono" font-size="10">vLLM / SGLang</text>
+
+          <!-- Request -->
+          <path d="M 140 52 h 540" stroke="var(--warn)" stroke-width="2" fill="none" marker-end="url(#sseArr)"/>
+          <text x="410" y="44" text-anchor="middle" fill="var(--warn)" font-family="JetBrains Mono" font-size="11">POST /v1/chat/completions  {"stream": true}</text>
+
+          <!-- Time axis -->
+          <line x1="80" y1="100" x2="740" y2="100" stroke="var(--border-strong)" stroke-width="2"/>
+          <text x="80" y="115" fill="var(--text-muted)" font-family="JetBrains Mono" font-size="10" text-anchor="middle">t0 (open)</text>
+          <text x="740" y="115" fill="var(--text-muted)" font-family="JetBrains Mono" font-size="10" text-anchor="middle">t_end</text>
+
+          <!-- Chunks flowing left to right -->
+          <g font-family="JetBrains Mono" font-size="10">
+            <!-- chunk 1: role -->
+            <g>
+              <rect x="155" y="135" width="120" height="44" rx="5" fill="var(--accent-soft)" stroke="var(--accent)"/>
+              <text x="215" y="153" text-anchor="middle" fill="var(--accent)" font-size="10" font-weight="700">data: {…}</text>
+              <text x="215" y="167" text-anchor="middle" fill="var(--text)" font-size="9">role: "assistant"</text>
+              <text x="215" y="177" text-anchor="middle" fill="var(--text-muted)" font-size="9">content: ""</text>
+              <line x1="215" y1="135" x2="215" y2="100" stroke="var(--accent)" stroke-width="1" stroke-dasharray="2 2"/>
+            </g>
+            <!-- chunk 2 -->
+            <g>
+              <rect x="290" y="135" width="120" height="44" rx="5" fill="var(--accent-soft)" stroke="var(--accent)"/>
+              <text x="350" y="153" text-anchor="middle" fill="var(--accent)" font-size="10" font-weight="700">data: {…}</text>
+              <text x="350" y="167" text-anchor="middle" fill="var(--text)" font-size="9">delta.content:</text>
+              <text x="350" y="177" text-anchor="middle" fill="var(--text)" font-size="9">"4"</text>
+              <line x1="350" y1="135" x2="350" y2="100" stroke="var(--accent)" stroke-width="1" stroke-dasharray="2 2"/>
+            </g>
+            <!-- chunk 3 -->
+            <g>
+              <rect x="425" y="135" width="120" height="44" rx="5" fill="var(--accent-soft)" stroke="var(--accent)"/>
+              <text x="485" y="153" text-anchor="middle" fill="var(--accent)" font-size="10" font-weight="700">data: {…}</text>
+              <text x="485" y="167" text-anchor="middle" fill="var(--text)" font-size="9">finish_reason:</text>
+              <text x="485" y="177" text-anchor="middle" fill="var(--text)" font-size="9">"stop"</text>
+              <line x1="485" y1="135" x2="485" y2="100" stroke="var(--accent)" stroke-width="1" stroke-dasharray="2 2"/>
+            </g>
+            <!-- chunk 4 usage -->
+            <g>
+              <rect x="560" y="135" width="120" height="44" rx="5" fill="rgba(126,231,135,0.18)" stroke="var(--good)"/>
+              <text x="620" y="153" text-anchor="middle" fill="var(--good)" font-size="10" font-weight="700">data: {…}</text>
+              <text x="620" y="167" text-anchor="middle" fill="var(--text)" font-size="9">usage:</text>
+              <text x="620" y="177" text-anchor="middle" fill="var(--text)" font-size="9">{prompt:24, comp:1}</text>
+              <line x1="620" y1="135" x2="620" y2="100" stroke="var(--good)" stroke-width="1" stroke-dasharray="2 2"/>
+            </g>
+            <!-- DONE -->
+            <g>
+              <rect x="695" y="135" width="60" height="44" rx="5" fill="rgba(240,180,41,0.18)" stroke="var(--warn)"/>
+              <text x="725" y="158" text-anchor="middle" fill="var(--warn)" font-size="10" font-weight="700">data:</text>
+              <text x="725" y="172" text-anchor="middle" fill="var(--warn)" font-size="10" font-weight="700">[DONE]</text>
+              <line x1="725" y1="135" x2="725" y2="100" stroke="var(--warn)" stroke-width="1" stroke-dasharray="2 2"/>
+            </g>
+          </g>
+
+          <!-- annotation for first non-empty token = TTFT -->
+          <path d="M 350 220 v 30" stroke="var(--warn)" stroke-width="1.5" fill="none" marker-end="url(#sseArr)"/>
+          <rect x="240" y="250" width="220" height="34" rx="4" fill="var(--bg-elev)" stroke="var(--warn)"/>
+          <text x="350" y="270" text-anchor="middle" fill="var(--warn)" font-size="11" font-weight="600">first non-empty delta</text>
+          <text x="350" y="282" text-anchor="middle" fill="var(--text-muted)" font-size="10">→ TTFT = t_this − t_open</text>
+
+          <!-- annotation for usage -->
+          <path d="M 620 220 v 30" stroke="var(--good)" stroke-width="1.5" fill="none" marker-end="url(#sseArr)"/>
+          <rect x="515" y="250" width="210" height="44" rx="4" fill="var(--bg-elev)" stroke="var(--good)"/>
+          <text x="620" y="268" text-anchor="middle" fill="var(--good)" font-size="11" font-weight="600">usage block</text>
+          <text x="620" y="281" text-anchor="middle" fill="var(--text-muted)" font-size="9">only present if</text>
+          <text x="620" y="291" text-anchor="middle" fill="var(--text-muted)" font-size="9">stream_options.include_usage</text>
+
+          <text x="410" y="335" text-anchor="middle" fill="var(--text-muted)" font-size="11" font-style="italic">
+            One HTTP request → many "data: {…}" chunks → terminating "data: [DONE]".
+          </text>
+        </svg>
+        <figcaption>SSE stream timeline. Each chunk is one <code>data: {…}\n\n</code> framed event flowing server → client over the open HTTP response.</figcaption>
+      </figure>
+
+      <p>Notice:</p>
+      <ul>
+        <li>Each event has a <strong><code>delta</code></strong> instead of a full <code>message</code>. The client must accumulate <code>delta.content</code>, <code>delta.tool_calls</code>, etc. across events.</li>
+        <li>The first event typically carries <code>role: "assistant"</code> and an empty content (signals "stream open, expect deltas").</li>
+        <li>Subsequent events carry incremental content fragments.</li>
+        <li><code>finish_reason</code> arrives in the second-to-last event with empty delta.</li>
+        <li>The <code>usage</code> block (if <code>stream_options.include_usage: true</code>) arrives in the last event before <code>[DONE]</code>. Without this option, you get <em>no</em> usage data when streaming — a common surprise.</li>
+      </ul>
+
+      <h3 id="why-sse">4.1 Why SSE and not WebSockets</h3>
+      <p>
+        SSE is HTTP-native. It works through every proxy, load-balancer, reverse-proxy,
+        and CDN that handles HTTP/1.1 chunked transfer encoding. WebSockets require
+        explicit upgrade handshakes that many infrastructure layers do not pass
+        through. For server → client streaming with no client → server back-channel,
+        SSE is strictly simpler.
+      </p>
+      <p>
+        The cost: SSE only flows one direction (server → client). The client must
+        reopen a new request to send anything new. For LLM inference this is fine —
+        each agent turn is one request.
+      </p>
+
+      <h3 id="ttft">4.2 Time-to-first-token in practice</h3>
+      <p>
+        The wall-clock delta <code>t_first_event − t_request_open</code> is the
+        <strong>TTFT</strong> that matters for user experience. It bundles network
+        latency, prefill cost, and the time to emit the first non-empty delta.
+      </p>
+
+      <p>
+        The bench harness in <code>scripts/bench/_bench_core.py</code> records this as
+        follows (excerpt):
+      </p>
+
+      <pre data-lang="python"><code class="language-python">t_open = time.time()
+t_first_token = None
+for t_event, payload in http_post_stream(url, body):
+    if payload == "[DONE]":
+        break
+    obj = json.loads(payload)
+    delta = obj.get("choices",[{}])[0].get("delta", {})
+    if t_first_token is None and (delta.get("content") or
+                                   delta.get("reasoning_content")):
+        t_first_token = t_event
+        # -> ttft_ms = (t_first_token - t_open) * 1000</code></pre>
+
+      <p>
+        Crucially, the bench counts <em>any</em> generated token toward TTFT —
+        content or reasoning. From the user's perspective, "the model started
+        producing" is the relevant event. This is documented in
+        <a href="bench-results.html">bench-results</a>'s methodology and matches how
+        agents like Claude Code measure their own latency.
+      </p>
+
+      <h3 id="tool-call-streaming">4.3 Tool-call streaming — the trickiest case</h3>
+      <p>Tool calls stream piecemeal too. A typical pattern:</p>
+
+      <pre data-lang="text"><code>data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"get_weather","arguments":""}}]}}]}
+
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\""}}]}}]}
+
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"city"}}]}}]}
+
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\":\""}}]}}]}
+
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"Paris"}}]}}]}
+
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"}"}}]}}]}
+
+data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}</code></pre>
+
+      <figure>
+        <svg viewBox="0 0 820 290" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Tool-call piecemeal arguments">
+          <defs>
+            <marker id="tcArr" markerWidth="10" markerHeight="8" refX="10" refY="4" orient="auto">
+              <path d="M0,0 L10,4 L0,8 Z" fill="var(--accent)"/>
+            </marker>
+          </defs>
+
+          <text x="410" y="22" text-anchor="middle" fill="var(--text)" font-size="14" font-weight="600">
+            Tool-call arguments accumulate across chunks
+          </text>
+
+          <!-- timeline -->
+          <line x1="40" y1="60" x2="780" y2="60" stroke="var(--border-strong)" stroke-width="2"/>
+          <text x="40" y="50" fill="var(--text-muted)" font-family="JetBrains Mono" font-size="10">t →</text>
+
+          <!-- chunks -->
+          <g font-family="JetBrains Mono" font-size="9">
+            <g>
+              <rect x="50" y="70" width="100" height="60" rx="4" fill="var(--accent-soft)" stroke="var(--accent)"/>
+              <text x="100" y="86" text-anchor="middle" fill="var(--accent)" font-size="9" font-weight="700">chunk 1</text>
+              <text x="100" y="100" text-anchor="middle" fill="var(--text)" font-size="8">id: call_abc</text>
+              <text x="100" y="111" text-anchor="middle" fill="var(--text)" font-size="8">name: get_weather</text>
+              <text x="100" y="122" text-anchor="middle" fill="var(--warn)" font-size="8">arguments: ""</text>
+            </g>
+            <g>
+              <rect x="160" y="70" width="100" height="60" rx="4" fill="var(--accent-soft)" stroke="var(--accent)"/>
+              <text x="210" y="86" text-anchor="middle" fill="var(--accent)" font-size="9" font-weight="700">chunk 2</text>
+              <text x="210" y="106" text-anchor="middle" fill="var(--warn)" font-size="9">arguments:</text>
+              <text x="210" y="120" text-anchor="middle" fill="var(--text)" font-size="9">"{\""</text>
+            </g>
+            <g>
+              <rect x="270" y="70" width="100" height="60" rx="4" fill="var(--accent-soft)" stroke="var(--accent)"/>
+              <text x="320" y="86" text-anchor="middle" fill="var(--accent)" font-size="9" font-weight="700">chunk 3</text>
+              <text x="320" y="106" text-anchor="middle" fill="var(--warn)" font-size="9">arguments:</text>
+              <text x="320" y="120" text-anchor="middle" fill="var(--text)" font-size="9">"city"</text>
+            </g>
+            <g>
+              <rect x="380" y="70" width="100" height="60" rx="4" fill="var(--accent-soft)" stroke="var(--accent)"/>
+              <text x="430" y="86" text-anchor="middle" fill="var(--accent)" font-size="9" font-weight="700">chunk 4</text>
+              <text x="430" y="106" text-anchor="middle" fill="var(--warn)" font-size="9">arguments:</text>
+              <text x="430" y="120" text-anchor="middle" fill="var(--text)" font-size="9">"\":\""</text>
+            </g>
+            <g>
+              <rect x="490" y="70" width="100" height="60" rx="4" fill="var(--accent-soft)" stroke="var(--accent)"/>
+              <text x="540" y="86" text-anchor="middle" fill="var(--accent)" font-size="9" font-weight="700">chunk 5</text>
+              <text x="540" y="106" text-anchor="middle" fill="var(--warn)" font-size="9">arguments:</text>
+              <text x="540" y="120" text-anchor="middle" fill="var(--text)" font-size="9">"Paris"</text>
+            </g>
+            <g>
+              <rect x="600" y="70" width="100" height="60" rx="4" fill="var(--accent-soft)" stroke="var(--accent)"/>
+              <text x="650" y="86" text-anchor="middle" fill="var(--accent)" font-size="9" font-weight="700">chunk 6</text>
+              <text x="650" y="106" text-anchor="middle" fill="var(--warn)" font-size="9">arguments:</text>
+              <text x="650" y="120" text-anchor="middle" fill="var(--text)" font-size="9">"\"}"</text>
+            </g>
+            <g>
+              <rect x="710" y="70" width="70" height="60" rx="4" fill="rgba(240,180,41,0.18)" stroke="var(--warn)"/>
+              <text x="745" y="86" text-anchor="middle" fill="var(--warn)" font-size="9" font-weight="700">chunk 7</text>
+              <text x="745" y="106" text-anchor="middle" fill="var(--text)" font-size="8">finish_reason:</text>
+              <text x="745" y="118" text-anchor="middle" fill="var(--text)" font-size="8">"tool_calls"</text>
+            </g>
+          </g>
+
+          <!-- concatenation arrow -->
+          <path d="M 100 145 v 30 h 600 v 0" stroke="var(--good)" stroke-width="2" stroke-dasharray="3 3" fill="none" marker-end="url(#tcArr)"/>
+
+          <!-- final concatenated -->
+          <rect x="220" y="195" width="380" height="60" rx="6" fill="rgba(126,231,135,0.15)" stroke="var(--good)"/>
+          <text x="410" y="215" text-anchor="middle" fill="var(--good)" font-size="11" font-weight="700">client concatenates → "{\"city\":\"Paris\"}"</text>
+          <text x="410" y="232" text-anchor="middle" fill="var(--text-muted)" font-size="10" font-style="italic">JSON.parse only after finish_reason: "tool_calls"</text>
+          <text x="410" y="246" text-anchor="middle" fill="var(--text-muted)" font-size="10">mid-stream args are partial / not valid JSON</text>
+        </svg>
+        <figcaption>Tool-call arguments arrive as JSON-encoded string fragments. The client concatenates them and only parses once <code>finish_reason: "tool_calls"</code> arrives.</figcaption>
+      </figure>
+
+      <p>Things to notice:</p>
+      <ul>
+        <li><code>id</code>, <code>name</code>, and <code>type</code> appear once (in the first event for that tool call); subsequent events for the same <code>index</code> only carry <code>arguments</code> deltas.</li>
+        <li><code>arguments</code> arrive as <strong>JSON-encoded string fragments</strong>, not pre-parsed JSON. The client must concatenate them and only <code>JSON.parse</code> once <code>finish_reason: "tool_calls"</code> arrives.</li>
+        <li>Multiple tool calls in one assistant turn use distinct <code>tool_calls[i].index</code> values. Streaming events can interleave them (rare in practice — most engines emit sequentially).</li>
+      </ul>
+
+      <h3 id="reasoning-streaming">4.4 Reasoning-content streaming</h3>
+      <p>
+        For models with <code>--reasoning-parser</code>, reasoning tokens arrive in
+        <code>delta.reasoning_content</code> (or <code>delta.reasoning</code> on older
+        vLLM versions). The bench's <code>stream_chat_completion</code> handles both:
+      </p>
+
+      <pre data-lang="python"><code class="language-python">reasoning_piece = (
+    delta.get("reasoning_content")
+    or delta.get("reasoning")
+)</code></pre>
+
+      <p>A typical reasoning-then-content stream looks like:</p>
+
+      <pre data-lang="text"><code>data: {"choices":[{"delta":{"reasoning_content":"The user asked..."}}]}
+data: {"choices":[{"delta":{"reasoning_content":" let me work this out."}}]}
+... (long reasoning trace) ...
+data: {"choices":[{"delta":{"reasoning_content":"So the answer is 4."}}]}
+data: {"choices":[{"delta":{"content":"4"}}]}
+data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+data: {"usage":{"prompt_tokens":24,"completion_tokens":2,"total_tokens":26}}
+data: [DONE]</code></pre>
+
+      <figure>
+        <svg viewBox="0 0 820 230" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Reasoning vs content delta channels">
+          <text x="410" y="22" text-anchor="middle" fill="var(--text)" font-size="14" font-weight="600">
+            Two delta channels: reasoning_content vs content
+          </text>
+
+          <!-- timeline -->
+          <line x1="40" y1="80" x2="780" y2="80" stroke="var(--border-strong)" stroke-width="2"/>
+          <text x="40" y="70" fill="var(--text-muted)" font-family="JetBrains Mono" font-size="10">t →</text>
+
+          <!-- reasoning lane -->
+          <text x="55" y="125" fill="var(--warn)" font-family="JetBrains Mono" font-size="11" font-weight="700">reasoning_content</text>
+          <g>
+            <rect x="180" y="100" width="70" height="34" rx="4" fill="rgba(240,180,41,0.18)" stroke="var(--warn)"/>
+            <text x="215" y="121" text-anchor="middle" fill="var(--warn)" font-size="9">"The user…"</text>
+            <rect x="260" y="100" width="90" height="34" rx="4" fill="rgba(240,180,41,0.18)" stroke="var(--warn)"/>
+            <text x="305" y="121" text-anchor="middle" fill="var(--warn)" font-size="9">" let me…"</text>
+            <rect x="360" y="100" width="60" height="34" rx="4" fill="rgba(240,180,41,0.18)" stroke="var(--warn)"/>
+            <text x="390" y="121" text-anchor="middle" fill="var(--warn)" font-size="9">…</text>
+            <rect x="430" y="100" width="110" height="34" rx="4" fill="rgba(240,180,41,0.18)" stroke="var(--warn)"/>
+            <text x="485" y="121" text-anchor="middle" fill="var(--warn)" font-size="9">"answer is 4."</text>
+          </g>
+
+          <!-- content lane -->
+          <text x="55" y="175" fill="var(--accent)" font-family="JetBrains Mono" font-size="11" font-weight="700">content</text>
+          <g>
+            <rect x="555" y="155" width="50" height="34" rx="4" fill="var(--accent-soft)" stroke="var(--accent)"/>
+            <text x="580" y="176" text-anchor="middle" fill="var(--accent)" font-size="11" font-weight="700">"4"</text>
+          </g>
+
+          <!-- finish + usage -->
+          <g>
+            <rect x="620" y="125" width="80" height="34" rx="4" fill="var(--bg-elev)" stroke="var(--border-strong)"/>
+            <text x="660" y="140" text-anchor="middle" fill="var(--text-muted)" font-size="9">finish_reason</text>
+            <text x="660" y="152" text-anchor="middle" fill="var(--text)" font-size="9">"stop"</text>
+
+            <rect x="710" y="125" width="60" height="34" rx="4" fill="rgba(126,231,135,0.15)" stroke="var(--good)"/>
+            <text x="740" y="140" text-anchor="middle" fill="var(--good)" font-size="9">usage</text>
+            <text x="740" y="152" text-anchor="middle" fill="var(--text)" font-size="9">comp:2</text>
+          </g>
+
+          <!-- caveat -->
+          <text x="410" y="215" text-anchor="middle" fill="var(--danger)" font-size="11" font-style="italic">
+            usage.completion_tokens = 2 — only the content tokens. Reasoning tokens are excluded by the qwen3 parser.
+          </text>
+        </svg>
+        <figcaption>Two parallel delta channels. <code>reasoning_content</code> chunks arrive first (long), then <code>content</code> emits the final answer. The <code>usage</code> block under-counts because the qwen3 reasoning parser excludes <code>reasoning_content</code> from <code>completion_tokens</code>.</figcaption>
+      </figure>
+
+      <p>
+        Notice the <code>usage.completion_tokens: 2</code> — only the content tokens.
+        This is the bug <a href="bench-results.html">bench-results</a>'s "TPS counting
+        fix" worked around.
+      </p>
+
+      <!-- §5 -->
+      <h2 id="anthropic-variant">5. The Anthropic /v1/messages variant</h2>
+      <p>
+        Claude SDK (and therefore Claude Code) talks Anthropic's protocol, which has
+        a <em>very similar</em> but not identical schema:
+      </p>
+
+      <pre data-lang="json"><code class="language-json">POST /v1/messages
+Content-Type: application/json
+anthropic-version: 2023-06-01
+
+{
+  "model": "claude-opus-4-7",
+  "max_tokens": 1024,
+  "messages": [
+    {"role": "user", "content": "What is 2 + 2?"}
+  ],
+  "system": "You are a helpful assistant."
+}</code></pre>
+
+      <p>Differences from <code>/v1/chat/completions</code>:</p>
+
+      <div class="card-grid">
+        <div class="card" style="border-left: 3px solid var(--accent)">
+          <h4 style="color: var(--accent)">OpenAI /v1/chat/completions</h4>
+          <ul>
+            <li>System prompt is a <code>message</code> with <code>role: "system"</code>.</li>
+            <li><code>max_tokens</code> defaults to the server's setting.</li>
+            <li>Response: <code>message.content: "..."</code> (single string).</li>
+            <li>Tools: separate <code>tool_calls</code> field on the message.</li>
+            <li>Streaming: unnamed <code>data: {…}</code> events.</li>
+          </ul>
+        </div>
+        <div class="card" style="border-left: 3px solid var(--warn)">
+          <h4 style="color: var(--warn)">Anthropic /v1/messages</h4>
+          <ul>
+            <li>System prompt is a <strong>top-level <code>system</code> field</strong>, not a message.</li>
+            <li><code>max_tokens</code> is <strong>required</strong>.</li>
+            <li>Response: <code>content: [{"type":"text","text":"…"}]</code> (typed array).</li>
+            <li>Tools: <code>content: [{"type":"tool_use", …}]</code> blocks within the same array.</li>
+            <li>Streaming: <strong>named SSE events</strong> (<code>event: message_start</code>, <code>event: content_block_delta</code>, …).</li>
+          </ul>
+        </div>
+      </div>
+
+      <p>
+        The router in this project translates between the two so Claude Code can talk
+        to local vLLM/SGLang/Ollama models served through any of the OpenAI-compatible
+        engines.
+      </p>
+
+      <!-- §6 -->
+      <h2 id="practical-implications">6. Practical implications</h2>
+      <div class="callout warn">
+        <div class="callout-icon">i</div>
+        <div>
+          <strong><code>stream_options.include_usage: true</code> is almost always
+          what you want.</strong> Without it, streaming responses give you no token
+          counts — no metering, no rate calculation, no bench TPS.
+        </div>
+      </div>
+
+      <div class="callout danger">
+        <div class="callout-icon">i</div>
+        <div>
+          <strong>Tool-call arguments are not valid JSON until the stream closes.</strong>
+          Don't try to parse them mid-stream; you will see partial strings.
+        </div>
+      </div>
+
+      <ul>
+        <li><strong><code>message.content</code> can be <code>null</code></strong> when the model only emits tool calls. Code that does <code>message.content.length</code> will crash.</li>
+        <li><strong><code>usage.completion_tokens</code> undercounts reasoning models.</strong> Use the bench's chars-/-4 fallback if you need parser-agnostic token-rate measurements.</li>
+        <li><strong>The <code>model</code> field in the response may differ from the request.</strong> vLLM echoes back <code>--served-model-name</code>, which the router sets to the bare model name without <code>@&lt;ctx&gt;</code> or <code>::&lt;reasoning&gt;</code> suffixes.</li>
+        <li><strong>Different servers expose different extensions.</strong> vLLM has <code>top_k</code>, <code>min_p</code>, <code>extra_body</code>. SGLang has <code>separate_reasoning</code>. Ollama has <code>options.num_ctx</code>. Pure-OpenAI clients see only the baseline; the router is what bridges these.</li>
+        <li><strong>Pure raw <code>httpx</code> / <code>urllib</code> is enough.</strong> You do not need the <code>openai</code> SDK to speak this protocol — <code>scripts/bench/_bench_core.py</code> uses stdlib <code>urllib.request</code> and works fine. The SDK adds typed models and retry logic, no protocol magic.</li>
+      </ul>
+
+      <!-- §7 -->
+      <h2 id="worked-example">7. Worked example — full request/response with curl</h2>
+      <p>Inspect the wire format yourself against the project's running router:</p>
+
+      <pre data-lang="bash"><code class="language-bash"># Non-streaming
+curl -s http://devai-router:11435/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "Qwen3-8B-NVFP4",
+    "messages": [{"role": "user", "content": "What is 2 + 2?"}],
+    "max_tokens": 16
+  }' | jq .
+
+# Streaming, with usage in the final event
+curl -N http://devai-router:11435/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "Qwen3-8B-NVFP4",
+    "messages": [{"role": "user", "content": "What is 2 + 2?"}],
+    "max_tokens": 16,
+    "stream": true,
+    "stream_options": {"include_usage": true}
+  }'</code></pre>
+
+      <p>
+        The first command returns one JSON document. The second emits the SSE stream
+        described in <a href="#streaming">§4</a>. Both go through the router which
+        applies the request rewrite chain (<a href="router.html">router</a>) before
+        proxying.
+      </p>
+
+      <!-- §8 -->
+      <h2 id="references">8. References</h2>
+
+      <h3>Protocol specifications</h3>
+      <ul>
+        <li>OpenAI Chat Completions API reference: <a href="https://platform.openai.com/docs/api-reference/chat/create">platform.openai.com/docs/api-reference/chat/create</a>. The canonical schema everyone copies.</li>
+        <li>OpenAI Streaming guide: <a href="https://platform.openai.com/docs/api-reference/streaming">platform.openai.com/docs/api-reference/streaming</a>.</li>
+        <li>Anthropic Messages API reference: <a href="https://docs.anthropic.com/en/api/messages">docs.anthropic.com/en/api/messages</a>. The <code>/v1/messages</code> variant.</li>
+        <li>Server-Sent Events (SSE) HTML standard: <a href="https://html.spec.whatwg.org/multipage/server-sent-events.html">html.spec.whatwg.org/multipage/server-sent-events.html</a>. Defines the <code>data:</code> framing.</li>
+      </ul>
+
+      <h3>Engine-specific extensions</h3>
+      <ul>
+        <li>vLLM OpenAI-compatible server documentation: <a href="https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html">docs.vllm.ai/en/latest/serving/openai_compatible_server.html</a>. Lists every vLLM-specific request extension (<code>top_k</code>, <code>min_p</code>, <code>extra_body</code>, etc.).</li>
+        <li>SGLang server arguments: <a href="https://docs.sglang.ai/router/router.html">docs.sglang.ai/router/router.html</a>.</li>
+        <li>Ollama API documentation: <a href="https://github.com/ollama/ollama/blob/main/docs/api.md">github.com/ollama/ollama/blob/main/docs/api.md</a>. Native <code>/api/chat</code> and <code>/api/generate</code>, plus the OpenAI-compat proxy.</li>
+      </ul>
+
+      <h3>Project-internal</h3>
+      <ul>
+        <li><a href="router.html">router</a> — the request rewrite chain, including override parsing, reasoning-policy application, tool stripping, and ctx injection. The router is <em>the</em> place where one request morphs across these protocols.</li>
+        <li><a href="backends.html">backends</a> — backend-specific lifecycle and parser registration.</li>
+        <li><a href="reasoning-tool-calling-chat-templates.html">reasoning-tool-calling-chat-templates</a> — the structured outputs (tool calls, reasoning content) this protocol carries.</li>
+        <li><a href="sampling-strategies.html">sampling-strategies</a> — the generation-control fields (<code>temperature</code>, <code>top_p</code>, etc.) in <a href="#generation-control">§2.2</a>.</li>
+        <li><code>scripts/bench/_bench_core.py::stream_chat_completion</code> — a worked, working SSE consumer in 80 lines of stdlib Python.</li>
+      </ul>
+
+    </div>
+
+    <aside class="toc-floating">
+      <h4>On this page</h4>
+      <ul></ul>
+    </aside>
+  </main>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-core.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/plugins/autoloader/prism-autoloader.min.js"></script>
+<script src="assets/nav.js"></script>
+<script src="assets/widgets.js"></script>
+<script src="assets/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Mixture of Experts — Dev AI Lab</title>
+<meta name="description" content="What gpt-oss-20b actually is. Total vs active parameters, the router, expert specialisation, and why MoE is harder to serve.">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism-tomorrow.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="site">
+  <main class="main">
+    <div class="content">
+
+      <header>
+        <span class="pill">Beginner's guide · architecture</span>
+        <h1>Mixture of Experts (MoE)</h1>
+        <p class="lead">
+          What <code>gpt-oss-20b</code> actually is. The architecture variation that breaks
+          every "8 B model fits in 8 × 0.5625 GB" assumption from the rest of this docs
+          folder — total params and active params can differ by 5-10×, and that
+          asymmetry is the whole reason the architecture exists.
+        </p>
+      </header>
+
+      <div class="callout">
+        <div class="callout-icon">i</div>
+        <div>
+          <strong>Reference example:</strong> <code>openai/gpt-oss-20b</code>, the project's
+          coding specialist (HumanEval 0.98 per
+          <a href="bench-results.html">bench-results</a>). Most of what is true for it
+          generalises to other MoE families — Mixtral, DeepSeek-V3, Qwen3-MoE, etc. If
+          <a href="attention-and-the-transformer.html">attention-and-the-transformer</a>
+          is your foundation, this doc swaps out the <strong>MLP sub-block</strong> from
+          §8 with an MoE variant. Everything else (attention, KV cache, RoPE, RMSNorm)
+          stays identical.
+        </div>
+      </div>
+
+      <!-- §1 -->
+      <h2 id="dense-vs-moe">1. Dense vs MoE — the one structural difference</h2>
+      <p>
+        Recall from
+        <a href="attention-and-the-transformer.html">attention-and-the-transformer</a>
+        §8 that the MLP sub-block in a dense transformer is:
+      </p>
+
+      <pre data-lang="text"><code>y = down_proj( silu(gate_proj(x)) * up_proj(x) )       # SwiGLU MLP</code></pre>
+
+      <p>
+        Three Linear layers, applied <em>to every token at every layer</em>. For
+        Qwen3-8B these MLPs hold ~5.4 B of the model's 7.6 B transformer parameters —
+        most of the model.
+      </p>
+
+      <p>
+        A <strong>Mixture of Experts</strong> MLP replaces this single MLP with <strong>N
+        parallel MLPs ("experts")</strong> plus a small <strong>router</strong> (a tiny
+        classifier) that decides which experts each token should use:
+      </p>
+
+      <pre data-lang="text"><code>gate_logits = router(x)                  # [N] scores over experts
+chosen = top_k_indices(gate_logits)      # pick K experts (K << N)
+weights = softmax(gate_logits[chosen])   # normalise over selected
+y = sum over k in chosen:
+      weights[k] * expert_k(x)           # SwiGLU MLP per expert</code></pre>
+
+      <p>
+        Every layer has its own set of <code>N</code> experts and its own router. A
+        typical config: <code>N = 64</code> experts per layer, <code>K = 4</code>
+        activated per token (top-4 routing).
+      </p>
+
+      <p>
+        The crucial property: <strong>each token only flows through K of N experts</strong>.
+        The other N−K experts sit idle for that token at that layer.
+      </p>
+
+      <h3 id="routing-svg">1.1 The routing mechanism, visualised</h3>
+
+      <figure>
+        <svg viewBox="0 0 760 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="MoE routing diagram">
+          <defs>
+            <marker id="moeArr" markerWidth="10" markerHeight="8" refX="10" refY="4" orient="auto">
+              <path d="M0,0 L10,4 L0,8 Z" fill="var(--text-muted)"/>
+            </marker>
+            <marker id="moeArrA" markerWidth="10" markerHeight="8" refX="10" refY="4" orient="auto">
+              <path d="M0,0 L10,4 L0,8 Z" fill="var(--accent)"/>
+            </marker>
+          </defs>
+
+          <!-- Input token -->
+          <text x="60" y="30" fill="var(--text-muted)" font-family="JetBrains Mono" font-size="11" font-weight="600">Token x</text>
+          <rect x="20" y="40" width="90" height="40" rx="6" fill="var(--bg-elev-2)" stroke="var(--border-strong)"/>
+          <text x="65" y="65" text-anchor="middle" fill="var(--text)" font-family="JetBrains Mono" font-size="12">x [4096]</text>
+
+          <!-- Arrow from token to router -->
+          <path d="M 110 60 h 60" stroke="var(--text-muted)" stroke-width="1.5" fill="none" marker-end="url(#moeArr)"/>
+
+          <!-- Router -->
+          <rect x="175" y="35" width="120" height="50" rx="8" fill="rgba(240,180,41,0.15)" stroke="var(--warn)" stroke-width="2"/>
+          <text x="235" y="58" text-anchor="middle" fill="var(--warn)" font-size="13" font-weight="700">Router</text>
+          <text x="235" y="74" text-anchor="middle" fill="var(--warn)" font-size="10">linear → softmax</text>
+
+          <!-- Gate logits -->
+          <text x="235" y="105" text-anchor="middle" fill="var(--text-muted)" font-size="10" font-family="JetBrains Mono">gate_logits [32]</text>
+
+          <!-- top-k label -->
+          <text x="360" y="60" text-anchor="middle" fill="var(--accent)" font-size="11" font-weight="700">top-4</text>
+          <path d="M 295 60 h 75" stroke="var(--accent)" stroke-width="2" fill="none" marker-end="url(#moeArrA)"/>
+
+          <!-- Experts grid (8 rows x 4 cols = 32 experts) -->
+          <g transform="translate(390, 25)">
+            <text x="120" y="0" text-anchor="middle" fill="var(--text-muted)" font-size="11" font-weight="600">32 Experts (SwiGLU MLPs)</text>
+            <!-- row 0 -->
+            <rect x="0"   y="10" width="50" height="22" rx="3" fill="var(--bg-elev-2)" stroke="var(--border-strong)"/>
+            <text x="25"  y="25" text-anchor="middle" fill="var(--text-muted)" font-size="9">E0</text>
+            <rect x="55"  y="10" width="50" height="22" rx="3" fill="var(--accent)" stroke="var(--accent)"/>
+            <text x="80"  y="25" text-anchor="middle" fill="#0a0f15" font-size="9" font-weight="700">E1·w=.31</text>
+            <rect x="110" y="10" width="50" height="22" rx="3" fill="var(--bg-elev-2)" stroke="var(--border-strong)"/>
+            <text x="135" y="25" text-anchor="middle" fill="var(--text-muted)" font-size="9">E2</text>
+            <rect x="165" y="10" width="50" height="22" rx="3" fill="var(--bg-elev-2)" stroke="var(--border-strong)"/>
+            <text x="190" y="25" text-anchor="middle" fill="var(--text-muted)" font-size="9">E3</text>
+            <rect x="220" y="10" width="50" height="22" rx="3" fill="var(--bg-elev-2)" stroke="var(--border-strong)"/>
+            <text x="245" y="25" text-anchor="middle" fill="var(--text-muted)" font-size="9">E4</text>
+            <!-- row 1 -->
+            <rect x="0"   y="38" width="50" height="22" rx="3" fill="var(--accent)" stroke="var(--accent)"/>
+            <text x="25"  y="53" text-anchor="middle" fill="#0a0f15" font-size="9" font-weight="700">E5·w=.28</text>
+            <rect x="55"  y="38" width="50" height="22" rx="3" fill="var(--bg-elev-2)" stroke="var(--border-strong)"/>
+            <text x="80"  y="53" text-anchor="middle" fill="var(--text-muted)" font-size="9">E6</text>
+            <rect x="110" y="38" width="50" height="22" rx="3" fill="var(--bg-elev-2)" stroke="var(--border-strong)"/>
+            <text x="135" y="53" text-anchor="middle" fill="var(--text-muted)" font-size="9">E7</text>
+            <rect x="165" y="38" width="50" height="22" rx="3" fill="var(--bg-elev-2)" stroke="var(--border-strong)"/>
+            <text x="190" y="53" text-anchor="middle" fill="var(--text-muted)" font-size="9">E8</text>
+            <rect x="220" y="38" width="50" height="22" rx="3" fill="var(--accent)" stroke="var(--accent)"/>
+            <text x="245" y="53" text-anchor="middle" fill="#0a0f15" font-size="9" font-weight="700">E9·w=.22</text>
+            <!-- row 2 -->
+            <rect x="0"   y="66" width="50" height="22" rx="3" fill="var(--bg-elev-2)" stroke="var(--border-strong)"/>
+            <text x="25"  y="81" text-anchor="middle" fill="var(--text-muted)" font-size="9">E10</text>
+            <rect x="55"  y="66" width="50" height="22" rx="3" fill="var(--bg-elev-2)" stroke="var(--border-strong)"/>
+            <text x="80"  y="81" text-anchor="middle" fill="var(--text-muted)" font-size="9">E11</text>
+            <rect x="110" y="66" width="50" height="22" rx="3" fill="var(--accent)" stroke="var(--accent)"/>
+            <text x="135" y="81" text-anchor="middle" fill="#0a0f15" font-size="9" font-weight="700">E12·w=.19</text>
+            <rect x="165" y="66" width="50" height="22" rx="3" fill="var(--bg-elev-2)" stroke="var(--border-strong)"/>
+            <text x="190" y="81" text-anchor="middle" fill="var(--text-muted)" font-size="9">E13</text>
+            <rect x="220" y="66" width="50" height="22" rx="3" fill="var(--bg-elev-2)" stroke="var(--border-strong)"/>
+            <text x="245" y="81" text-anchor="middle" fill="var(--text-muted)" font-size="9">E14</text>
+            <!-- row 3 (dim "…rest idle") -->
+            <text x="120" y="108" text-anchor="middle" fill="var(--text-dim)" font-size="10" font-style="italic">…E15 … E31 idle (cold this token)</text>
+          </g>
+
+          <!-- Arrow down to weighted sum -->
+          <path d="M 510 200 v 30" stroke="var(--accent)" stroke-width="2" fill="none" marker-end="url(#moeArrA)"/>
+
+          <!-- Weighted sum box -->
+          <rect x="380" y="235" width="260" height="40" rx="6" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="2"/>
+          <text x="510" y="260" text-anchor="middle" fill="var(--accent)" font-size="13" font-weight="700">
+            y = Σ w_k · expert_k(x)
+          </text>
+
+          <!-- Output -->
+          <path d="M 640 255 h 50" stroke="var(--accent)" stroke-width="2" fill="none" marker-end="url(#moeArrA)"/>
+          <rect x="690" y="235" width="50" height="40" rx="4" fill="var(--bg-elev-2)" stroke="var(--border-strong)"/>
+          <text x="715" y="260" text-anchor="middle" fill="var(--text)" font-family="JetBrains Mono" font-size="11">y</text>
+
+          <text x="380" y="305" fill="var(--text-muted)" font-size="11" font-style="italic">
+            Highlighted experts (E1, E5, E9, E12) fire for this token. Weights w_k are softmax-normalised over the four chosen logits.
+          </text>
+        </svg>
+        <figcaption>Top-4 of 32 routing for a single token at one MoE layer. Each layer has its own router + experts.</figcaption>
+      </figure>
+
+      <!-- §2 -->
+      <h2 id="total-vs-active">2. Total params vs active params — the headline difference</h2>
+
+      <p>
+        For <code>gpt-oss-20b</code> and similar MoE models, the model card lists two
+        numbers:
+      </p>
+
+      <ul>
+        <li><strong>Total parameters</strong> — count of every weight on disk. This is what <code>ls -lh</code> of the safetensors files reports. <strong>~21 B</strong> for <code>gpt-oss-20b</code>.</li>
+        <li><strong>Active parameters per token</strong> — count of weights actually used in the forward pass for a single token. <strong>~3.6 B</strong> for <code>gpt-oss-20b</code> (top-4 routing across 32 experts in the MLPs).</li>
+      </ul>
+
+      <p>The ratio (~6× for <code>gpt-oss-20b</code>) is the <strong>sparsity factor</strong>.</p>
+
+      <h3 id="dense-moe-svg">2.1 Activation pattern, side by side</h3>
+
+      <div class="card-grid">
+        <div class="card" style="border-left: 3px solid var(--good)">
+          <h4 style="color: var(--good)">Dense layer</h4>
+          <svg viewBox="0 0 240 140" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Dense layer activation">
+            <text x="120" y="18" text-anchor="middle" fill="var(--text-muted)" font-size="11" font-weight="600">All params active per token</text>
+            <!-- One big MLP block, all green -->
+            <rect x="40" y="35" width="160" height="80" rx="8" fill="rgba(126,231,135,0.25)" stroke="var(--good)" stroke-width="2"/>
+            <text x="120" y="70" text-anchor="middle" fill="var(--good)" font-size="13" font-weight="700">SwiGLU MLP</text>
+            <text x="120" y="90" text-anchor="middle" fill="var(--good)" font-size="11">1.81 B params</text>
+            <text x="120" y="105" text-anchor="middle" fill="var(--good)" font-size="10" font-style="italic">100% active</text>
+            <text x="120" y="132" text-anchor="middle" fill="var(--text-dim)" font-size="10">Qwen3-8B layer</text>
+          </svg>
+        </div>
+        <div class="card" style="border-left: 3px solid var(--accent)">
+          <h4 style="color: var(--accent)">MoE layer</h4>
+          <svg viewBox="0 0 240 140" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="MoE layer activation">
+            <text x="120" y="18" text-anchor="middle" fill="var(--text-muted)" font-size="11" font-weight="600">K of N experts active per token</text>
+            <!-- 32 small expert squares, 4 highlighted -->
+            <g>
+              <!-- row 0 (8 experts) -->
+              <rect x="30"  y="35" width="20" height="20" rx="2" fill="rgba(91,141,239,0.6)" stroke="var(--accent)"/>
+              <rect x="55"  y="35" width="20" height="20" rx="2" fill="var(--bg-elev-2)" stroke="var(--border-strong)"/>
+              <rect x="80"  y="35" width="20" height="20" rx="2" fill="var(--bg-elev-2)" stroke="var(--border-strong)"/>
+              <rect x="105" y="35" width="20" height="20" rx="2" fill="rgba(91,141,239,0.6)" stroke="var(--accent)"/>
+              <rect x="130" y="35" width="20" height="20" rx="2" fill="var(--bg-elev-2)" stroke="var(--border-strong)"/>
+              <rect x="155" y="35" width="20" height="20" rx="2" fill="var(--bg-elev-2)" stroke="var(--border-strong)"/>
+              <rect x="180" y="35" width="20" height="20" rx="2" fill="var(--bg-elev-2)" stroke="var(--border-strong)"/>
+              <rect x="205" y="35" width="20" height="20" rx="2" fill="var(--bg-elev-2)" stroke="var(--border-strong)"/>
+              <!-- row 1 -->
+              <rect x="30"  y="60" width="20" height="20" rx="2" fill="var(--bg-elev-2)" stroke="var(--border-strong)"/>
+              <rect x="55"  y="60" width="20" height="20" rx="2" fill="var(--bg-elev-2)" stroke="var(--border-strong)"/>
+              <rect x="80"  y="60" width="20" height="20" rx="2" fill="rgba(91,141,239,0.6)" stroke="var(--accent)"/>
+              <rect x="105" y="60" width="20" height="20" rx="2" fill="var(--bg-elev-2)" stroke="var(--border-strong)"/>
+              <rect x="130" y="60" width="20" height="20" rx="2" fill="var(--bg-elev-2)" stroke="var(--border-strong)"/>
+              <rect x="155" y="60" width="20" height="20" rx="2" fill="rgba(91,141,239,0.6)" stroke="var(--accent)"/>
+              <rect x="180" y="60" width="20" height="20" rx="2" fill="var(--bg-elev-2)" stroke="var(--border-strong)"/>
+              <rect x="205" y="60" width="20" height="20" rx="2" fill="var(--bg-elev-2)" stroke="var(--border-strong)"/>
+              <!-- row 2 (rest idle, slight dim) -->
+              <g fill="var(--bg-elev)" stroke="var(--border)">
+                <rect x="30"  y="85" width="20" height="20" rx="2"/>
+                <rect x="55"  y="85" width="20" height="20" rx="2"/>
+                <rect x="80"  y="85" width="20" height="20" rx="2"/>
+                <rect x="105" y="85" width="20" height="20" rx="2"/>
+                <rect x="130" y="85" width="20" height="20" rx="2"/>
+                <rect x="155" y="85" width="20" height="20" rx="2"/>
+                <rect x="180" y="85" width="20" height="20" rx="2"/>
+                <rect x="205" y="85" width="20" height="20" rx="2"/>
+              </g>
+              <!-- row 3 -->
+              <g fill="var(--bg-elev)" stroke="var(--border)">
+                <rect x="30"  y="110" width="20" height="20" rx="2"/>
+                <rect x="55"  y="110" width="20" height="20" rx="2"/>
+                <rect x="80"  y="110" width="20" height="20" rx="2"/>
+                <rect x="105" y="110" width="20" height="20" rx="2"/>
+                <rect x="130" y="110" width="20" height="20" rx="2"/>
+                <rect x="155" y="110" width="20" height="20" rx="2"/>
+                <rect x="180" y="110" width="20" height="20" rx="2"/>
+                <rect x="205" y="110" width="20" height="20" rx="2"/>
+              </g>
+            </g>
+            <!-- caption -->
+            <text x="120" y="138" text-anchor="middle" fill="var(--accent)" font-size="10" font-style="italic">4/32 active · gpt-oss-20b layer</text>
+          </svg>
+        </div>
+      </div>
+
+      <p>What this means in practice:</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Metric</th><th>Dense 8 B</th><th>MoE 21 B "active 3.6 B"</th></tr></thead>
+          <tbody>
+            <tr><td>Total weights on disk</td><td>~16 GB BF16 / ~5 GB NVFP4</td><td>~42 GB BF16 / ~12 GB NVFP4</td></tr>
+            <tr><td><strong>VRAM required to host</strong></td><td>total params</td><td><strong>total params</strong> (every expert must be loadable)</td></tr>
+            <tr><td>FLOPs per token</td><td>proportional to total params</td><td>proportional to <em>active</em> params</td></tr>
+            <tr><td>Memory bandwidth per decode token</td><td>proportional to <em>active</em> MLP params + all attn + all KV</td><td>similar — decode reads only loaded experts</td></tr>
+            <tr><td>Quality</td><td>dense baseline</td><td>matches a dense model 2-4× the active-param count</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>So <code>gpt-oss-20b</code>:</p>
+
+      <ul>
+        <li>Needs <strong>VRAM for all 21 B weights</strong> (you must store every expert even if you only use 4 per token).</li>
+        <li>Computes only <strong>~3.6 B params of work</strong> per token (4 of 32 experts active in MLP, plus full attention and embeddings).</li>
+        <li><strong>Quality of a much-smaller dense model</strong>? No — quality of roughly a <em>dense 12-14 B</em> model on most benchmarks. The sparsity gives you more capacity than active-param count would suggest, but less than total-param count.</li>
+      </ul>
+
+      <p>
+        The bench in <a href="bench-results.html">bench-results</a> ranks
+        <code>gpt-oss-20b</code> as the project's <strong>coding specialist</strong>
+        (HumanEval 0.98) — beating denser models like Qwen3-14B-NVFP4 (0.92) on
+        HumanEval despite a smaller active-param count, because the experts specialise.
+      </p>
+
+      <!-- §3 -->
+      <h2 id="router">3. The router, and what "specialisation" means</h2>
+      <p>
+        The MoE router is the model's own learned scheduler. During training, the router
+        learns to send different <em>kinds</em> of tokens to different experts. Common
+        patterns observed in interpretability research:
+      </p>
+
+      <ul>
+        <li>One expert specialises on syntactic tokens (punctuation, brackets).</li>
+        <li>One expert specialises on numbers.</li>
+        <li>One expert handles non-English text.</li>
+        <li>Several experts cover code-specific token patterns.</li>
+        <li>Some experts are "general purpose" backups.</li>
+      </ul>
+
+      <p>
+        The specialisation is <em>emergent</em> — the model discovers the partitioning
+        from data; nothing in the architecture says "expert 12 shall handle Python". The
+        training objective is an auxiliary <strong>load-balancing loss</strong> that
+        penalises the router for sending all tokens to the same expert (would collapse
+        to a single dense MLP).
+      </p>
+
+      <p>The mechanism:</p>
+
+      <pre data-lang="python"><code>def moe_forward(x):                       # x: [batch, seq, hidden]
+    gate_logits = router_linear(x)         # [batch, seq, num_experts]
+    weights, indices = top_k(gate_logits, k=4)  # pick 4 best per token
+    weights = softmax(weights, dim=-1)     # normalise the 4 chosen weights
+    y = zeros_like(x)
+    for k in range(4):
+        expert_idx = indices[:,:,k]
+        expert_input = x                   # entire token vector
+        expert_output = expert_lookup(expert_idx)(expert_input)
+        y += weights[:,:,k] * expert_output
+    return y</code></pre>
+
+      <p>
+        The actual implementation is a fused kernel that gathers the right expert
+        weights and dispatches in one shot, but the math is exactly the above.
+      </p>
+
+      <!-- §4 -->
+      <h2 id="serving-pain">4. Why MoE is harder to serve</h2>
+      <p>
+        The MoE architecture is a serving-engineer's nuisance. The challenges:
+      </p>
+
+      <h3 id="imbalanced-load">4.1 Imbalanced expert load → idle compute</h3>
+      <p>
+        Even with a load-balancing training loss, real workloads have non-uniform token
+        distributions. A code-only request might activate the same 4-6 "coding experts"
+        90 % of the time and leave the other 26 sitting cold. The cold experts still
+        take VRAM but contribute nothing.
+      </p>
+
+      <h3 id="defeats-batching">4.2 Per-token routing decisions defeat batching</h3>
+      <p>
+        In dense models, every token at every layer goes through the same weights. A
+        batch of 100 tokens does one big matmul. In MoE, those 100 tokens each pick
+        their top-4 experts independently, so the batched op becomes 32 <em>small</em>
+        matmuls (one per expert, with whatever subset of tokens routed there). The GPU
+        does less work per synchronisation point. Modern engines (vLLM, SGLang,
+        DeepSpeed-MoE) ship specialised kernels (<code>grouped_gemm</code>,
+        expert-parallel sharding) to mitigate this.
+      </p>
+
+      <h3 id="vram-bloat">4.3 Expert weights bloat VRAM</h3>
+      <p>
+        For <code>gpt-oss-20b</code> at NVFP4, total weights are ~12 GB — vs ~5 GB for a
+        dense 8 B model. The KV-cache and elastic-pool budget
+        (<a href="nvfp4-coldstart.html">nvfp4-coldstart</a> §2) is what is left after
+        weights, so MoE models leave much less room for context and concurrent
+        sequences.
+      </p>
+
+      <p>
+        <code>gpt-oss-20b</code> lands at peak 22.37 GB on the 24 GB RTX PRO 4000
+        Blackwell (<a href="bench-results.html">bench-results</a> "KV-pressure
+        observations") — comfortably fitting at 262 K context, but with only ~10 GB of
+        paged-KV pool vs ~13 GB for the dense Qwen3-8B-NVFP4.
+      </p>
+
+      <h3 id="cold-start">4.4 Cold-start time scales with total weights, not active</h3>
+      <p>
+        <code>gpt-oss-20b</code> has the project's slowest measured cold start among the
+        agentic-tier models (57.9 s vs 45.6 s for Qwen3-8B-NVFP4 — see
+        <a href="bench-results.html">bench-results</a> "Cold-start signal" table). All
+        experts must be loaded into VRAM before serving begins, even the ones that
+        won't fire on the first request.
+      </p>
+
+      <h3 id="router-fragility">4.5 Different router behaviour can break in subtle ways</h3>
+      <div class="callout warn">
+        <div class="callout-icon">i</div>
+        <div>
+          If the load-balancing loss was too weak during training, or if routing
+          collapses under low temperature, the model can degenerate into "always pick
+          expert 0" — equivalent to a dense model with one sixteenth the capacity. Some
+          MoE models behave noticeably worse at <code>temperature: 0</code> for this
+          reason. Test before assuming dense sampling defaults transfer.
+        </div>
+      </div>
+
+      <!-- §5 -->
+      <h2 id="why-worth-it">5. Why MoE is worth it</h2>
+      <p>For all the serving annoyance:</p>
+
+      <ul>
+        <li><strong>Quality per FLOP</strong> is much better than dense. A 21 B MoE with 3.6 B active params has FLOPs comparable to a dense 4 B model but quality competitive with a dense 13-14 B. The decode bandwidth cost (which scales with active params + KV reads) is also lower per token than a dense 13 B would be.</li>
+        <li><strong>Adding capacity is cheap to compute, expensive to serve.</strong> Want more knowledge? Add more experts. Active FLOPs stay the same; VRAM grows. This is the lever DeepSeek-V3 (671 B total / 37 B active) and Mixtral-8x22B use to scale.</li>
+        <li><strong>Specialisation matches multi-domain workloads.</strong> Coders, multilinguals, math problems all activate different experts. A single MoE model serves them all without paying full dense cost for any one.</li>
+      </ul>
+
+      <p>
+        For a single-card serving setup like this project's — one user, one agent at a
+        time — the MoE win is more nuanced. You <strong>pay full VRAM for total
+        params</strong> but only get <strong>active-params bandwidth savings</strong>.
+        This is why the bench ranks <code>gpt-oss-20b</code> as the <em>coding
+        specialist</em> (highest HumanEval) but not the <em>production agentic
+        default</em> (that title goes to dense Qwen3-8B-NVFP4 for its better tok/s and
+        lower cold-start cost).
+      </p>
+
+      <!-- §6 -->
+      <h2 id="bandwidth-math">6. Decode bandwidth math for MoE</h2>
+      <p>
+        The bandwidth derivation in
+        <a href="llm-tokens-and-speed.html">llm-tokens-and-speed</a> §7 generalises to
+        MoE with one caveat: the per-token byte budget includes only the <em>active</em>
+        MLP weights at each layer.
+      </p>
+
+      <p>For <code>gpt-oss-20b</code> at decode:</p>
+
+      <ul>
+        <li>Total weights: ~12 GB on device (NVFP4, all experts loaded).</li>
+        <li>Active per token: ~3.6 B params × 0.5625 B/param ≈ 2 GB (attention + 4-of-32 expert MLPs + embeddings).</li>
+        <li>Plus KV cache reads (similar to a dense model with the same attention structure).</li>
+      </ul>
+
+      <p>Theoretical decode ceiling at near-zero context:</p>
+
+      <pre data-lang="text"><code>ceiling = 640 GB/s / 2 GB ~ 320 tok/s</code></pre>
+
+      <p>
+        <strong>Measured</strong> (<code>bench-results.md</code>, post-fix):
+        <code>38.4 tok/s</code> (still flagged with a <code>+</code> as the bench hadn't
+        yet been re-run with the corrected TPS counter — likely the real number is
+        higher).
+      </p>
+
+      <p>The gap between 38 and 320 is large, suggesting either:</p>
+
+      <ul>
+        <li>The <code>+</code> qualifier is doing real work — we don't have a parser-corrected measurement yet.</li>
+        <li>MoE serving overhead (per-expert kernel dispatches, routing compute, gather/scatter costs) is non-trivial on this card and workload.</li>
+        <li>Both.</li>
+      </ul>
+
+      <p>
+        This is one of the open follow-ups in
+        <a href="bench-results.html">bench-results</a> — re-run <code>gpt-oss-20b</code>
+        with the post-fix TPS counter to get a definitive number.
+      </p>
+
+      <!-- §7 -->
+      <h2 id="spotting-moe">7. How to spot an MoE model in the wild</h2>
+      <p>Indicators you are looking at an MoE checkpoint:</p>
+
+      <ul>
+        <li><strong><code>config.json</code></strong>:
+          <ul>
+            <li><code>"model_type": "mixtral"</code> / <code>"qwen3_moe"</code> / <code>"deepseek_v3"</code> etc.</li>
+            <li><code>"num_experts"</code> / <code>"n_routed_experts"</code> field present.</li>
+            <li><code>"num_experts_per_tok"</code> / <code>"num_active_experts"</code> field present.</li>
+            <li><code>"router_aux_loss_coef"</code> field (load-balancing loss weight).</li>
+          </ul>
+        </li>
+        <li><strong>Model card text</strong>: phrases like "X total parameters, Y active per token", or "MoE with K experts".</li>
+        <li><strong>File sizes</strong>: total safetensors size dramatically larger than the active-param count would predict.</li>
+      </ul>
+
+      <p>
+        For <code>gpt-oss-20b</code> specifically (<code>config.json</code> excerpt —
+        public on the HuggingFace model card):
+      </p>
+
+      <pre data-lang="json"><code>"model_type": "gpt_oss",
+"num_experts": 32,
+"num_experts_per_tok": 4,
+"hidden_size": 4096,
+"num_attention_heads": 64,
+"num_key_value_heads": 8,
+"num_hidden_layers": 32</code></pre>
+
+      <p>So 32 experts, top-4 routing, 32 layers, GQA with 8 KV heads.</p>
+
+      <!-- §8 -->
+      <h2 id="practical">8. Practical implications</h2>
+
+      <div class="callout good">
+        <div class="callout-icon">i</div>
+        <div>
+          <ul style="margin-top:0">
+            <li><strong>Pick MoE for quality-per-active-FLOP, not for VRAM efficiency.</strong> An MoE model is bigger than its active-param dense equivalent, not smaller.</li>
+            <li><strong>Don't expect to fit a 200 B-total MoE on a 24 GB card.</strong> Even if active params are only 20 B, the total params must all sit in VRAM. The project deliberately scopes its MoE catalog to models that fit (<code>gpt-oss-20b</code> at 22.37 GB peak, the largest entry).</li>
+            <li><strong>Cold-start time grows with total weights</strong>, including unused experts. Budget accordingly; the router's <code>HEALTH_TIMEOUT_SECONDS = 600</code> is comfortable for this scale.</li>
+            <li><strong>Routing depends on temperature in subtle ways.</strong> If MoE quality feels degraded at <code>temperature: 0</code>, raise to <code>0.3-0.5</code> and retest — that often unblocks specialised experts.</li>
+            <li><strong>Streaming behaviour is identical.</strong> From an <a href="openai-api-and-streaming.html">openai-api-and-streaming</a> perspective, you can't tell an MoE response from a dense one without inspecting <code>model</code> and looking up its spec.</li>
+          </ul>
+        </div>
+      </div>
+
+      <!-- §9 -->
+      <h2 id="references">9. References</h2>
+
+      <h3>Foundational papers</h3>
+      <ul>
+        <li>Shazeer, N. <em>et al.</em> (2017). <em>Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer.</em> <a href="https://arxiv.org/abs/1701.06538">arXiv:1701.06538</a>. The original sparsely-gated MoE for transformers.</li>
+        <li>Fedus, W. <em>et al.</em> (2021). <em>Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity.</em> <a href="https://arxiv.org/abs/2101.03961">arXiv:2101.03961</a>. Switch Transformer; introduced top-1 routing.</li>
+        <li>Lepikhin, D. <em>et al.</em> (2020). <em>GShard: Scaling Giant Models with Conditional Computation and Automatic Sharding.</em> <a href="https://arxiv.org/abs/2006.16668">arXiv:2006.16668</a>. MoE on TPUs; shard-by-expert.</li>
+        <li>DeepSeek-V3 technical report (2024). Detailed MoE design at the frontier scale. <a href="https://arxiv.org/abs/2412.19437">arXiv:2412.19437</a>.</li>
+      </ul>
+
+      <h3>Engine-side</h3>
+      <ul>
+        <li>vLLM MoE kernels and expert parallelism: <a href="https://docs.vllm.ai/en/latest/serving/distributed_serving.html">docs.vllm.ai/serving/distributed_serving</a>.</li>
+        <li>DeepSpeed-MoE (Microsoft): <a href="https://github.com/microsoft/DeepSpeed-MLIR">github.com/microsoft/DeepSpeed-MLIR</a>.</li>
+        <li>HuggingFace MoE models docs page: <a href="https://huggingface.co/docs/transformers/main/en/model_doc/mixtral">huggingface.co/docs/transformers/model_doc/mixtral</a> and similar for <code>qwen3_moe</code>, <code>deepseek_v3</code>, <code>gpt_oss</code>.</li>
+      </ul>
+
+      <h3>Specific model cards</h3>
+      <ul>
+        <li><code>openai/gpt-oss-20b</code> model card on HuggingFace — architecture and expert count.</li>
+        <li>Mixtral 8x7B / 8x22B model cards (the MoE family that popularised the "XxY" naming convention).</li>
+      </ul>
+
+      <h3>Project-internal</h3>
+      <ul>
+        <li><a href="attention-and-the-transformer.html">attention-and-the-transformer</a> §8 — what the dense MLP looks like; MoE swaps just this sub-block.</li>
+        <li><a href="nvfp4-coldstart.html">nvfp4-coldstart</a> §2 — VRAM stack; MoE pushes the "weights" bar much higher relative to the elastic KV pool.</li>
+        <li><a href="llm-tokens-and-speed.html">llm-tokens-and-speed</a> §7 — decode bandwidth math; MoE substitutes "active params" for "total params" in the per-token byte budget.</li>
+        <li><a href="bench-results.html">bench-results</a> — <code>gpt-oss-20b</code> row, KV-pressure column, the <code>+</code>-qualified TPS pending re-run.</li>
+        <li><code>scripts/model-families.yaml</code> — <code>gpt-oss</code> family entry, including the harmony reasoning + tool parsers.</li>
+      </ul>
+
+    </div>
+
+    <aside class="toc-floating">
+      <h4>On this page</h4>
+      <ul></ul>
+    </aside>
+  </main>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-core.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/plugins/autoloader/prism-autoloader.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+<script src="assets/nav.js"></script>
+<script src="assets/widgets.js"></script>
+<script src="assets/site.js"></script>
+</body>
+</html>

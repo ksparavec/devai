@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sampling strategies — Dev AI Lab</title>
+<meta name="description" content="How the next token is actually chosen: greedy, temperature, top-k, top-p, min-p, repetition penalties — with an interactive sampling explorer.">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism-tomorrow.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="site">
+  <main class="main">
+    <div class="content">
+
+      <header>
+        <span class="pill">Beginner's guide</span>
+        <h1>Sampling strategies</h1>
+        <p class="lead">
+          What happens <em>after</em> the model emits its 151 936-element logit vector
+          and <em>before</em> a token reaches the user. Every "temperature", "top-p",
+          "top-k" knob you have seen in API docs lives here.
+        </p>
+      </header>
+
+      <div class="callout">
+        <div class="callout-icon">i</div>
+        <div>
+          This builds on <a href="attention-and-the-transformer.html">§10 of the transformer doc</a>: the model's final layer projects each
+          position's hidden vector through <code>lm_head</code> to produce a vector of
+          vocabulary scores called <strong>logits</strong>. Sampling turns one such vector
+          into one token ID.
+        </div>
+      </div>
+
+      <h2 id="logits-to-token">1. From logits to a token</h2>
+      <p>
+        Recall that the model emits, for each position, a vector of length
+        <code>vocab_size</code> (151 936 for Qwen3) of unnormalised real numbers — the
+        <strong>logits</strong>. They can be negative or positive, of any magnitude.
+        They are not probabilities.
+      </p>
+      <p>To get a probability distribution over the vocabulary, we apply the <strong>softmax</strong> function:</p>
+      <p style="text-align:center" id="softmax-formula"></p>
+
+      <p>This produces a vector of non-negative numbers summing to 1 — a probability for each possible next token. From that distribution, sampling picks one token.</p>
+
+      <p>Throughout this doc we will use a tiny worked example. Suppose the vocabulary has only 5 tokens: <code>{cat, dog, fish, bird, fox}</code>, and the model produces logits:</p>
+
+      <pre data-lang="text"><code>logits = [3.0, 2.5, 0.5, 0.3, -1.0]
+#         cat  dog  fish bird fox
+
+exp(logits) = [20.09, 12.18, 1.65, 1.35, 0.37]
+sum = 35.64
+probabilities = [0.564, 0.342, 0.046, 0.038, 0.010]</code></pre>
+
+      <p>
+        Absent any sampling controls, the model thinks "cat" has 56% chance, "dog" 34%, "fish" 5%, "bird" 4%, "fox" 1%.
+        The widget below lets you twist every knob and watch the distribution change live:
+      </p>
+
+      <div class="widget" data-widget="sampling"></div>
+
+      <p style="font-size: var(--text-sm); color: var(--text-muted)">
+        Try the presets, or drag the sliders to see the pipeline trace below the bars update in real time.
+        The right column is the distribution sampling actually draws from.
+      </p>
+
+      <h2 id="greedy">2. Greedy / argmax — the deterministic baseline</h2>
+      <p>The simplest strategy: always pick the most likely token.</p>
+      <pre data-lang="text"><code>chosen = argmax(probabilities) = "cat"</code></pre>
+      <p>In API terms this is <code>temperature: 0</code> (or, on some servers, also <code>top_k: 1</code>). Properties:</p>
+      <ul>
+        <li><strong>Deterministic</strong>: same prompt → same output, every time.</li>
+        <li><strong>Repetitive</strong>: long greedy generations tend to fall into loops ("the the the the…"), because once a token gets a slight edge it dominates downstream probabilities too.</li>
+        <li><strong>Best for</strong>: deterministic eval (see <a href="bench-results.html">bench-results</a> — GSM8K and HumanEval are scored under temperature 0), exact-answer tasks, regression tests.</li>
+      </ul>
+
+      <h2 id="temperature">3. Temperature — flatten or sharpen the distribution</h2>
+      <p>Temperature <code>T</code> divides the logits before softmax:</p>
+      <p style="text-align:center" id="temp-formula"></p>
+
+      <figure>
+        <svg viewBox="0 0 700 200" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Temperature effect on distribution">
+          <text x="350" y="20" text-anchor="middle" fill="var(--text)" font-size="13" font-weight="600">Same logits, three temperatures</text>
+          <g font-family="JetBrains Mono" font-size="10">
+            <!-- T=0.5 column -->
+            <g transform="translate(40, 40)">
+              <text x="100" y="0" text-anchor="middle" fill="var(--text)" font-weight="600">T = 0.5 (sharp)</text>
+              <rect x="40" y="20" width="120" height="20" fill="var(--bg-code)" stroke="var(--border)"/>
+              <rect x="40" y="20" width="118" height="20" fill="var(--accent)"/><text x="100" y="34" text-anchor="middle" fill="white">cat 79%</text>
+              <rect x="40" y="45" width="120" height="20" fill="var(--bg-code)" stroke="var(--border)"/>
+              <rect x="40" y="45" width="27" height="20" fill="var(--accent)" fill-opacity="0.6"/><text x="100" y="59" text-anchor="middle" fill="var(--text-muted)">dog 18%</text>
+              <rect x="40" y="70" width="120" height="20" fill="var(--bg-code)" stroke="var(--border)"/>
+              <text x="100" y="84" text-anchor="middle" fill="var(--text-dim)">fish/bird/fox &lt; 1%</text>
+            </g>
+            <!-- T=1.0 -->
+            <g transform="translate(270, 40)">
+              <text x="100" y="0" text-anchor="middle" fill="var(--text)" font-weight="600">T = 1.0 (raw)</text>
+              <rect x="40" y="20" width="120" height="20" fill="var(--bg-code)" stroke="var(--border)"/>
+              <rect x="40" y="20" width="68" height="20" fill="var(--accent)"/><text x="100" y="34" text-anchor="middle" fill="white">cat 56%</text>
+              <rect x="40" y="45" width="120" height="20" fill="var(--bg-code)" stroke="var(--border)"/>
+              <rect x="40" y="45" width="41" height="20" fill="var(--accent)" fill-opacity="0.7"/><text x="100" y="59" text-anchor="middle" fill="var(--text)">dog 34%</text>
+              <rect x="40" y="70" width="120" height="20" fill="var(--bg-code)" stroke="var(--border)"/>
+              <rect x="40" y="70" width="6" height="20" fill="var(--accent)" fill-opacity="0.4"/><text x="100" y="84" text-anchor="middle" fill="var(--text-muted)">tail 9% combined</text>
+            </g>
+            <!-- T=2.0 -->
+            <g transform="translate(500, 40)">
+              <text x="100" y="0" text-anchor="middle" fill="var(--text)" font-weight="600">T = 2.0 (flat)</text>
+              <rect x="40" y="20" width="120" height="20" fill="var(--bg-code)" stroke="var(--border)"/>
+              <rect x="40" y="20" width="47" height="20" fill="var(--accent)"/><text x="100" y="34" text-anchor="middle" fill="white">cat 39%</text>
+              <rect x="40" y="45" width="120" height="20" fill="var(--bg-code)" stroke="var(--border)"/>
+              <rect x="40" y="45" width="37" height="20" fill="var(--accent)" fill-opacity="0.7"/><text x="100" y="59" text-anchor="middle" fill="var(--text)">dog 31%</text>
+              <rect x="40" y="70" width="120" height="20" fill="var(--bg-code)" stroke="var(--border)"/>
+              <rect x="40" y="70" width="32" height="20" fill="var(--accent)" fill-opacity="0.5"/><text x="100" y="84" text-anchor="middle" fill="var(--text)">tail 30% (fox 5%)</text>
+            </g>
+          </g>
+          <text x="350" y="180" text-anchor="middle" fill="var(--text-muted)" font-size="11" font-style="italic">
+            Lower T = focused / conservative · Higher T = diverse / creative · T → ∞ = uniform random
+          </text>
+        </svg>
+        <figcaption>Same logits, different temperatures. At T=0.5 "cat" is nearly inevitable. At T=2 "fox" gets a real 5% chance.</figcaption>
+      </figure>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Token</th><th>logit</th><th><code>T = 0.5</code></th><th><code>T = 1.0</code></th><th><code>T = 2.0</code></th></tr></thead>
+          <tbody>
+            <tr><td>cat</td><td>3.0</td><td>0.79</td><td>0.564</td><td>0.391</td></tr>
+            <tr><td>dog</td><td>2.5</td><td>0.18</td><td>0.342</td><td>0.305</td></tr>
+            <tr><td>fish</td><td>0.5</td><td>0.003</td><td>0.046</td><td>0.112</td></tr>
+            <tr><td>bird</td><td>0.3</td><td>0.002</td><td>0.038</td><td>0.101</td></tr>
+            <tr><td>fox</td><td>−1.0</td><td>0.0001</td><td>0.010</td><td>0.052</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>
+        Most models default to <code>T = 1.0</code>; many APIs default to <code>T = 0.7–1.0</code>; chat product UIs commonly default to <code>T = 0.7–0.8</code>.
+      </p>
+      <div class="callout">
+        <div class="callout-icon">i</div>
+        <div>
+          <strong>Rule of thumb</strong>: lower temperature = more focused / conservative output;
+          higher temperature = more diverse / creative output. For code or math, use <code>T ≤ 0.3</code>.
+          For brainstorming, <code>T = 0.9–1.2</code>. Above 1.5 output usually becomes incoherent.
+        </div>
+      </div>
+
+      <h2 id="top-k">4. Top-k — truncate to the k most likely tokens</h2>
+      <p>Top-k zeros out all but the <code>k</code> highest-probability tokens before sampling. With our example and <code>k = 2</code>:</p>
+      <pre data-lang="text"><code>keep top 2: ["cat", "dog"]
+re-normalise probabilities: [0.564 / (0.564+0.342),
+                             0.342 / (0.564+0.342)] = [0.622, 0.378]
+sample from this restricted distribution</code></pre>
+      <p>"fish", "bird", "fox" have probability 0 of being chosen.</p>
+      <ul>
+        <li><strong>Cuts off the long tail.</strong> The model assigns small but non-zero probability to thousands of plausible tokens; top-k says "I don't care about anything past rank k".</li>
+        <li><strong>Depends on <code>k</code> being well-tuned</strong>: too low → repetitive (collapses to greedy at <code>k = 1</code>); too high → no-op.</li>
+        <li><strong>Common values</strong>: <code>k = 40</code>, <code>k = 50</code>, <code>k = 100</code>.</li>
+        <li><strong><code>k = -1</code> or <code>k = 0</code></strong>: disable top-k entirely.</li>
+      </ul>
+
+      <h2 id="top-p">5. Top-p (nucleus sampling) — adaptive truncation</h2>
+      <p>
+        Top-p, a.k.a. nucleus sampling
+        (<a href="https://arxiv.org/abs/1904.09751">Holtzman et al. 2019, arXiv:1904.09751</a>),
+        keeps the <strong>smallest set of tokens whose cumulative probability exceeds <code>p</code></strong>.
+      </p>
+      <p>With our example and <code>p = 0.9</code>:</p>
+      <pre data-lang="text"><code>sort by probability descending:
+   cat:  0.564
+   dog:  0.342  → cumulative 0.906  (just exceeds 0.9 — stop)
+   fish: 0.046
+   bird: 0.038
+   fox:  0.010
+
+nucleus = ["cat", "dog"]
+re-normalise within nucleus, sample</code></pre>
+
+      <p>Same restricted distribution as top-k=2 in this case. But for a different logit distribution where the top few tokens are <em>less</em> peaked, the nucleus would expand:</p>
+      <pre data-lang="text"><code>suppose probabilities = [0.3, 0.25, 0.2, 0.15, 0.1]
+p = 0.9 → keep [0.3, 0.25, 0.2, 0.15] (cumulative 0.9), drop the last
+nucleus = top 4 tokens</code></pre>
+
+      <ul>
+        <li><strong>Adaptive</strong>: when the model is confident, top-p selects few tokens; when uncertain, it selects many. <strong>Key advantage over fixed top-k.</strong></li>
+        <li><strong>Common values</strong>: <code>p = 0.9</code>, <code>p = 0.95</code>. <code>p = 1.0</code> disables; <code>p = 0</code> is degenerate.</li>
+        <li><strong>Often combined with temperature</strong>: temperature first, then top-p filter, then sample.</li>
+      </ul>
+
+      <h2 id="min-p">6. Min-p — a newer, simpler filter</h2>
+      <p>Min-p keeps tokens whose probability is at least <code>min_p × max_probability</code>. With our example and <code>min_p = 0.1</code>:</p>
+      <pre data-lang="text"><code>max_probability = 0.564 (cat)
+threshold = 0.1 × 0.564 = 0.0564
+keep tokens with p ≥ 0.0564:
+   cat (0.564), dog (0.342)  → both kept
+fish (0.046), bird (0.038), fox (0.010) → dropped</code></pre>
+
+      <ul>
+        <li><strong>Distribution-shape-aware</strong>: like top-p, it adapts. Unlike top-p, it scales relative to the top token's probability rather than cumulative mass.</li>
+        <li><strong>Robust at high temperatures</strong>: when temperature flattens the distribution and top-p's nucleus would explode, min-p still keeps only tokens reasonably probable relative to the leader.</li>
+        <li><strong>Common values</strong>: <code>min_p = 0.05</code> to <code>0.1</code>.</li>
+        <li><strong>Newer than top-p</strong>: available in vLLM (and SGLang via <code>extra_body</code>), not in older OpenAI-only servers.</li>
+      </ul>
+
+      <h2 id="penalties">7. Repetition / frequency / presence penalties</h2>
+      <p>These three penalties discourage the model from emitting tokens it has already used. They subtract from the logits <em>before</em> softmax.</p>
+
+      <h3 id="rep-penalty">7.1 Repetition penalty (HuggingFace style)</h3>
+      <pre data-lang="text"><code>for each token t already in the output:
+    if logits[t] &gt; 0: logits[t] /= penalty
+    else:             logits[t] *= penalty</code></pre>
+      <p>Multiplicative; values &gt; 1 push down the previous tokens' logits. Common values: <code>1.05</code> to <code>1.2</code>. <code>1.0</code> disables.</p>
+
+      <h3 id="freq-penalty">7.2 Frequency penalty (OpenAI style)</h3>
+      <pre data-lang="text"><code>for each token t in the output, count its occurrences c:
+    logits[t] -= frequency_penalty × c</code></pre>
+      <p>Subtractive, scales linearly with how often <code>t</code> already appeared. Common values: <code>0.0</code> to <code>2.0</code>.</p>
+
+      <h3 id="pres-penalty">7.3 Presence penalty (OpenAI style)</h3>
+      <pre data-lang="text"><code>for each token t in the output (regardless of count):
+    logits[t] -= presence_penalty</code></pre>
+      <p>Same as frequency penalty but doesn't scale with count — every token that has appeared <em>at all</em> gets the same fixed penalty. Common values: <code>0.0</code> to <code>2.0</code>.</p>
+
+      <h3 id="penalty-when">7.4 When to use them</h3>
+      <div class="card-grid">
+        <div class="card" style="border-left:3px solid var(--good)">
+          <h4 style="color:var(--good)">None</h4>
+          <p>For code, structured output, or anything where exact repetition is required (function names, JSON keys).</p>
+        </div>
+        <div class="card" style="border-left:3px solid var(--warn)">
+          <h4 style="color:var(--warn)">Mild</h4>
+          <p>(<code>0.1–0.3</code> OpenAI-style, <code>1.05–1.1</code> HF-style) for chat to suppress the obvious "the the the" loops.</p>
+        </div>
+        <div class="card" style="border-left:3px solid var(--danger)">
+          <h4 style="color:var(--danger)">Aggressive</h4>
+          <p>(<code>&gt; 0.5</code> OpenAI-style, <code>&gt; 1.2</code> HF-style) only if you observe loops; over-applied, these damage coherence (the model starts avoiding common words like "the").</p>
+        </div>
+      </div>
+
+      <h2 id="pipeline">8. Putting them together — the typical pipeline</h2>
+      <p>A real inference call applies these in a fixed order:</p>
+
+      <figure>
+        <svg viewBox="0 0 800 220" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Sampling pipeline">
+          <defs>
+            <marker id="sp-arr" markerWidth="10" markerHeight="8" refX="10" refY="4" orient="auto">
+              <path d="M0,0 L10,4 L0,8 Z" fill="var(--text-muted)"/>
+            </marker>
+          </defs>
+          <g font-family="JetBrains Mono" font-size="11">
+            <!-- Step boxes -->
+            <g>
+              <rect x="20" y="30" width="120" height="50" rx="6" fill="var(--bg-elev-2)" stroke="var(--border-strong)"/>
+              <text x="80" y="50" text-anchor="middle" fill="var(--text)" font-weight="600">1. logits</text>
+              <text x="80" y="68" text-anchor="middle" fill="var(--text-muted)" font-size="10">from model</text>
+            </g>
+            <g>
+              <rect x="160" y="30" width="120" height="50" rx="6" fill="rgba(255,123,114,0.10)" stroke="#ff7b72"/>
+              <text x="220" y="50" text-anchor="middle" fill="#ff7b72" font-weight="600">2. penalties</text>
+              <text x="220" y="68" text-anchor="middle" fill="var(--text-muted)" font-size="10">rep / freq / pres</text>
+            </g>
+            <g>
+              <rect x="300" y="30" width="120" height="50" rx="6" fill="rgba(240,180,41,0.10)" stroke="var(--warn)"/>
+              <text x="360" y="50" text-anchor="middle" fill="var(--warn)" font-weight="600">3. / T</text>
+              <text x="360" y="68" text-anchor="middle" fill="var(--text-muted)" font-size="10">temperature</text>
+            </g>
+            <g>
+              <rect x="440" y="30" width="120" height="50" rx="6" fill="rgba(126,231,135,0.10)" stroke="var(--good)"/>
+              <text x="500" y="50" text-anchor="middle" fill="var(--good)" font-weight="600">4. softmax</text>
+              <text x="500" y="68" text-anchor="middle" fill="var(--text-muted)" font-size="10">→ probs</text>
+            </g>
+            <g>
+              <rect x="580" y="30" width="200" height="50" rx="6" fill="rgba(91,141,239,0.10)" stroke="var(--accent)"/>
+              <text x="680" y="50" text-anchor="middle" fill="var(--accent)" font-weight="600">5–7. filter</text>
+              <text x="680" y="68" text-anchor="middle" fill="var(--text-muted)" font-size="10">top-k → top-p → min-p</text>
+            </g>
+
+            <!-- Arrows between -->
+            <path d="M 140 55 H 160" stroke="var(--text-muted)" fill="none" marker-end="url(#sp-arr)"/>
+            <path d="M 280 55 H 300" stroke="var(--text-muted)" fill="none" marker-end="url(#sp-arr)"/>
+            <path d="M 420 55 H 440" stroke="var(--text-muted)" fill="none" marker-end="url(#sp-arr)"/>
+            <path d="M 560 55 H 580" stroke="var(--text-muted)" fill="none" marker-end="url(#sp-arr)"/>
+
+            <!-- Step 8-9 below -->
+            <g>
+              <rect x="220" y="130" width="160" height="50" rx="6" fill="var(--bg-elev-2)" stroke="var(--border-strong)"/>
+              <text x="300" y="150" text-anchor="middle" fill="var(--text)" font-weight="600">8. re-normalise</text>
+              <text x="300" y="168" text-anchor="middle" fill="var(--text-muted)" font-size="10">surviving probs sum to 1</text>
+            </g>
+            <g>
+              <rect x="420" y="130" width="160" height="50" rx="6" fill="var(--accent)" stroke="var(--accent)"/>
+              <text x="500" y="150" text-anchor="middle" fill="white" font-weight="700">9. sample one</text>
+              <text x="500" y="168" text-anchor="middle" fill="white" font-size="10" opacity="0.9">→ token ID</text>
+            </g>
+
+            <!-- Arrows from 5-7 → 8 → 9 -->
+            <path d="M 680 85 V 110 H 300 V 130" stroke="var(--text-muted)" fill="none" marker-end="url(#sp-arr)"/>
+            <path d="M 380 155 H 420" stroke="var(--text-muted)" fill="none" marker-end="url(#sp-arr)"/>
+          </g>
+          <text x="400" y="210" text-anchor="middle" fill="var(--text-muted)" font-size="11" font-style="italic">
+            Steps 5–7 are filters; order between them is mostly defensive — the intersection is the same.
+          </text>
+        </svg>
+      </figure>
+
+      <h2 id="defaults">9. Sane defaults for common tasks</h2>
+      <p>Starting points, not law. Tune to your model and task.</p>
+
+      <div class="card-grid">
+        <div class="card">
+          <h4>Deterministic eval (GSM8K, HumanEval)</h4>
+          <pre data-lang="json" style="margin-top:var(--space-2);font-size:0.8rem"><code class="language-json">{ "temperature": 0 }</code></pre>
+          <p>Greedy decoding for reproducibility. The bench in this project runs this way.</p>
+        </div>
+        <div class="card">
+          <h4>Code generation (interactive)</h4>
+          <pre data-lang="json" style="margin-top:var(--space-2);font-size:0.8rem"><code class="language-json">{ "temperature": 0.2, "top_p": 0.95 }</code></pre>
+          <p>Low temperature for syntactic correctness; modest top-p to allow some variable-name / comment variety.</p>
+        </div>
+        <div class="card">
+          <h4>General chat / Q&amp;A</h4>
+          <pre data-lang="json" style="margin-top:var(--space-2);font-size:0.8rem"><code class="language-json">{ "temperature": 0.7, "top_p": 0.9 }</code></pre>
+          <p>The widely used "OpenAI default-ish" recipe.</p>
+        </div>
+        <div class="card">
+          <h4>Creative writing</h4>
+          <pre data-lang="json" style="margin-top:var(--space-2);font-size:0.8rem"><code class="language-json">{ "temperature": 1.0,
+  "top_p": 0.95,
+  "presence_penalty": 0.3 }</code></pre>
+          <p>Higher temperature for variety; presence penalty to keep the model from circling.</p>
+        </div>
+        <div class="card">
+          <h4>Reasoning models (<code>&lt;think&gt;</code>)</h4>
+          <pre data-lang="json" style="margin-top:var(--space-2);font-size:0.8rem"><code class="language-json">{ "temperature": 0.6, "top_p": 0.95 }</code></pre>
+          <p>DeepSeek-R1's recommended settings. Reasoning models collapse at T=0 and lose coherence at high T.</p>
+        </div>
+        <div class="card">
+          <h4>Tool calling</h4>
+          <pre data-lang="json" style="margin-top:var(--space-2);font-size:0.8rem"><code class="language-json">{ "temperature": 0,
+  "tool_choice": "auto" }</code></pre>
+          <p>Tool-call arguments are JSON; you want them syntactically perfect. Greedy is safest.</p>
+        </div>
+      </div>
+
+      <h2 id="practical">10. Practical implications</h2>
+      <ul>
+        <li><strong>Same prompt, same seed, same model, same temperature, same config → same output.</strong> Use <code>seed</code> for reproducibility under non-greedy sampling. (Greedy doesn't need a seed.)</li>
+        <li><strong><code>temperature: 0</code> makes every other sampling parameter a no-op.</strong> No need to set top-p, top-k, etc. when you're greedy.</li>
+        <li><strong>Lowering temperature is not the same as raising top-p.</strong> Temperature reshapes the entire distribution; top-p truncates the tail. They compose; they don't substitute.</li>
+        <li><strong>Repetition loops usually mean "raise temperature slightly, then add modest penalty"</strong>, not "raise penalty alone".</li>
+        <li><strong>Default sampling settings on a server are not always OpenAI's defaults.</strong> vLLM defaults to <code>T = 1.0, top_p = 1.0</code> (no truncation), which can feel "too random" to users coming from <code>T = 0.7</code> chat UIs. Always set what you want explicitly.</li>
+        <li><strong>Reasoning models lose quality at the extremes.</strong> Don't set <code>temperature: 0</code> on a thinking model — the reasoning trace collapses to one path.</li>
+      </ul>
+
+      <h2 id="references">11. References</h2>
+
+      <h3>Foundational</h3>
+      <ul>
+        <li>Holtzman, A. et al. (2019). <em>The Curious Case of Neural Text Degeneration.</em> <a href="https://arxiv.org/abs/1904.09751">arXiv:1904.09751</a>. Introduced top-p / nucleus sampling.</li>
+        <li>Fan, A. et al. (2018). <em>Hierarchical Neural Story Generation.</em> <a href="https://arxiv.org/abs/1805.04833">arXiv:1805.04833</a>. Original top-k sampling.</li>
+        <li>Su et al. (2022). <em>Contrastive Search Is What You Need For Neural Text Generation.</em> <a href="https://arxiv.org/abs/2210.14140">arXiv:2210.14140</a>. Background on failure modes of greedy/beam.</li>
+      </ul>
+
+      <h3>Engine-specific docs</h3>
+      <ul>
+        <li><a href="https://platform.openai.com/docs/api-reference/chat/create">OpenAI sampling parameters reference</a>. The <code>temperature</code>, <code>top_p</code>, <code>frequency_penalty</code>, <code>presence_penalty</code>, <code>seed</code> field semantics everyone copies.</li>
+        <li><a href="https://docs.vllm.ai/en/latest/dev/sampling_params.html">vLLM sampling parameters</a>. Includes vLLM-specific <code>top_k</code>, <code>min_p</code>, <code>repetition_penalty</code>, and the order of operations.</li>
+        <li><a href="https://github.com/ollama/ollama/blob/main/docs/modelfile.md#parameter">Ollama options reference</a>.</li>
+      </ul>
+
+      <h3>Recommended sampling settings per model</h3>
+      <ul>
+        <li>DeepSeek-R1 model card: <code>T = 0.5–0.7, top_p = 0.95</code> for reasoning prompts.</li>
+        <li>Qwen3 technical report: <code>T = 0.6, top_p = 0.95</code> for general chat, <code>T = 0</code> for evaluation.</li>
+      </ul>
+
+      <h3>Project-internal cross-links</h3>
+      <ul>
+        <li><a href="attention-and-the-transformer.html">attention-and-the-transformer §10</a> — where logits come from.</li>
+        <li><a href="openai-api-and-streaming.html">openai-api-and-streaming §2.2</a> — how to set these parameters via the API.</li>
+        <li><a href="reasoning-tool-calling-chat-templates.html">reasoning-tool-calling-chat-templates §3</a> — why reasoning models prefer different defaults.</li>
+        <li><a href="bench-results.html">bench-results</a> — runs at temperature 0 for scored evals.</li>
+      </ul>
+
+    </div>
+
+    <aside class="toc-floating">
+      <h4>On this page</h4>
+      <ul></ul>
+    </aside>
+  </main>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-core.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/plugins/autoloader/prism-autoloader.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+<script src="assets/nav.js"></script>
+<script src="assets/widgets.js"></script>
+<script src="assets/site.js"></script>
+<script>
+window.addEventListener('load', () => {
+  if (!window.katex) return;
+  const r = (id, tex) => {
+    const el = document.getElementById(id);
+    if (el) katex.render(tex, el, {throwOnError:false, displayMode:true});
+  };
+  r('softmax-formula', 'p[i] = \\frac{\\exp(\\text{logits}[i])}{\\sum_j \\exp(\\text{logits}[j])}');
+  r('temp-formula', 'p[i] = \\frac{\\exp(\\text{logits}[i] / T)}{\\sum_j \\exp(\\text{logits}[j] / T)}');
+});
+</script>
+</body>
+</html>

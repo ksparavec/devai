@@ -1,0 +1,676 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Dev AI Lab — Run AI models on your own hardware</title>
+<meta name="description" content="Containerized development environment for local LLM inference with JupyterLab and multiple AI coding assistants. Self-hosted, GPU-arbitrated, fully open.">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism-tomorrow.min.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="site">
+  <!-- sidebar injected by nav.js -->
+
+  <main class="main">
+    <div class="content">
+
+      <!-- HERO -->
+      <section class="hero">
+        <span class="pill accent">v1.0 · containerized · self-hosted</span>
+        <h1>Dev AI Lab</h1>
+        <p class="lead">
+          Run AI models entirely on your own hardware. No cloud APIs, no data leaving
+          your network, no per-token costs.
+        </p>
+        <p>
+          Dev AI Lab is a containerized development environment that brings together
+          <strong>JupyterLab</strong>, multiple <strong>AI coding assistants</strong>, and
+          <strong>local model inference</strong> into a single, reproducible setup. It runs
+          open-weight LLMs on your GPU — from 4&nbsp;B parameter models for quick tasks to
+          70&nbsp;B-class MoE models with active-parameter inference speed — all served
+          through a unified API with automatic GPU management and runtime-verified
+          capability detection.
+        </p>
+        <div class="pills">
+          <span class="pill">Ollama</span>
+          <span class="pill">vLLM</span>
+          <span class="pill">SGLang</span>
+          <span class="pill">NVFP4 / Blackwell</span>
+          <span class="pill">JupyterLab</span>
+          <span class="pill">Open WebUI</span>
+          <span class="pill">Podman · Docker</span>
+        </div>
+      </section>
+
+      <!-- WHY LOCAL -->
+      <h2 id="why-local">Why local inference?</h2>
+      <p>
+        Cloud AI services (ChatGPT, Claude API, Gemini API) are convenient but come with
+        trade-offs that matter in professional settings.
+      </p>
+      <div class="card-grid">
+        <div class="card">
+          <div class="icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg></div>
+          <h4>Data sovereignty</h4>
+          <p>Your code, documents, and conversations never leave your machine.</p>
+        </div>
+        <div class="card">
+          <div class="icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/></svg></div>
+          <h4>Regulatory compliance</h4>
+          <p>Meet data residency requirements: GDPR, HIPAA, financial regulations.</p>
+        </div>
+        <div class="card">
+          <div class="icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 000 7h5a3.5 3.5 0 010 7H6"/></svg></div>
+          <h4>Cost predictability</h4>
+          <p>No per-token billing, no surprise invoices.</p>
+        </div>
+        <div class="card">
+          <div class="icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><circle cx="12" cy="12" r="10"/></svg></div>
+          <h4>No internet dependency</h4>
+          <p>Works offline, on air-gapped networks, behind restrictive firewalls.</p>
+        </div>
+        <div class="card">
+          <div class="icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 11-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 11-2.83-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 110-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 112.83-2.83l.06.06a1.65 1.65 0 001.82.33H9a1.65 1.65 0 001-1.51V3a2 2 0 114 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 112.83 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9a1.65 1.65 0 001.51 1H21a2 2 0 110 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg></div>
+          <h4>Full control</h4>
+          <p>Choose your models, quantization, context length, serving parameters.</p>
+        </div>
+        <div class="card">
+          <div class="icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></div>
+          <h4>Privacy by design</h4>
+          <p>Conversations about proprietary code stay completely private.</p>
+        </div>
+      </div>
+      <p>
+        Dev AI Lab makes local inference practical by handling the operational complexity:
+        container builds, model management, GPU arbitration between multiple backends,
+        runtime probing for actual VRAM use and reasoning capability, and a web chat
+        UI — all through a single <code>make</code> command. For tasks where cloud AI is
+        appropriate, the JupyterLab environment also includes <strong>Claude Code</strong>,
+        <strong>OpenAI Codex</strong>, and <strong>Google Gemini CLI</strong>.
+      </p>
+
+      <!-- ARCHITECTURE DIAGRAM -->
+      <h2 id="architecture">Architecture</h2>
+      <p>
+        Three model serving backends sit behind a single GPU-aware router. The router
+        enforces GPU mutual exclusion — only one backend uses the GPU at a time — and
+        switches by stopping the current backend (with graceful drain) and starting the
+        next via the Podman API.
+      </p>
+
+      <figure>
+        <svg viewBox="0 0 800 500" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Architecture diagram">
+          <defs>
+            <linearGradient id="bgGrad" x1="0" x2="0" y1="0" y2="1">
+              <stop offset="0%" stop-color="var(--bg-elev)"/>
+              <stop offset="100%" stop-color="var(--bg-elev-2)"/>
+            </linearGradient>
+            <marker id="arrowhead" markerWidth="10" markerHeight="8" refX="10" refY="4" orient="auto">
+              <path d="M0,0 L10,4 L0,8 Z" fill="var(--text-muted)"/>
+            </marker>
+            <marker id="arrowblue" markerWidth="10" markerHeight="8" refX="10" refY="4" orient="auto">
+              <path d="M0,0 L10,4 L0,8 Z" fill="var(--accent)"/>
+            </marker>
+          </defs>
+
+          <!-- Browser layer -->
+          <rect x="40" y="20" width="720" height="60" rx="8" fill="none" stroke="var(--border)" stroke-dasharray="4 4"/>
+          <text x="60" y="42" fill="var(--text-muted)" font-size="12" font-family="JetBrains Mono">Browser / API clients</text>
+          <rect x="180" y="50" width="200" height="22" rx="4" fill="var(--bg-elev-2)" stroke="var(--border-strong)"/>
+          <text x="280" y="65" text-anchor="middle" fill="var(--text)" font-size="11" font-family="JetBrains Mono">https://&lt;HOST&gt;:8888 JupyterLab</text>
+          <rect x="420" y="50" width="200" height="22" rx="4" fill="var(--bg-elev-2)" stroke="var(--border-strong)"/>
+          <text x="520" y="65" text-anchor="middle" fill="var(--text)" font-size="11" font-family="JetBrains Mono">https://&lt;HOST&gt;:8443 Open WebUI</text>
+
+          <!-- devai-net frame -->
+          <rect x="40" y="100" width="720" height="380" rx="10" fill="url(#bgGrad)" stroke="var(--border)" />
+          <text x="60" y="124" fill="var(--accent)" font-size="11" font-family="JetBrains Mono" font-weight="600">devai-net (internal)</text>
+
+          <!-- Lab box -->
+          <rect x="80" y="140" width="240" height="80" rx="8" fill="var(--bg-elev)" stroke="var(--border-strong)"/>
+          <text x="200" y="166" text-anchor="middle" fill="var(--text)" font-size="14" font-weight="600">devai-lab-gpu</text>
+          <text x="200" y="188" text-anchor="middle" fill="var(--text-muted)" font-size="11">JupyterLab · AI CLIs</text>
+          <text x="200" y="205" text-anchor="middle" fill="var(--text-dim)" font-size="10" font-family="JetBrains Mono">Claude · Codex · Gemini · Aider</text>
+
+          <!-- WebUI box -->
+          <rect x="480" y="140" width="240" height="80" rx="8" fill="var(--bg-elev)" stroke="var(--border-strong)"/>
+          <text x="600" y="166" text-anchor="middle" fill="var(--text)" font-size="14" font-weight="600">devai-open-webui</text>
+          <text x="600" y="188" text-anchor="middle" fill="var(--text-muted)" font-size="11">Chat UI · nginx TLS proxy</text>
+
+          <!-- Lines to router -->
+          <path d="M 200 220 V 250 L 380 270" stroke="var(--text-muted)" fill="none" marker-end="url(#arrowhead)"/>
+          <path d="M 600 220 V 250 L 420 270" stroke="var(--text-muted)" fill="none" marker-end="url(#arrowhead)"/>
+
+          <!-- Router -->
+          <rect x="260" y="270" width="280" height="80" rx="10" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="2"/>
+          <text x="400" y="296" text-anchor="middle" fill="var(--accent)" font-size="16" font-weight="700">devai-router</text>
+          <text x="400" y="316" text-anchor="middle" fill="var(--text)" font-size="11">gpu-arbiter · reasoning policy</text>
+          <text x="400" y="334" text-anchor="middle" fill="var(--text-muted)" font-size="10" font-family="JetBrains Mono">:11434 · :11435 · :11436</text>
+
+          <!-- Backends -->
+          <g>
+            <rect x="80" y="390" width="180" height="70" rx="8" fill="var(--bg-elev)" stroke="var(--border-strong)"/>
+            <text x="170" y="416" text-anchor="middle" fill="var(--text)" font-size="13" font-weight="600">devai-ollama</text>
+            <text x="170" y="434" text-anchor="middle" fill="var(--good)" font-size="10" font-family="JetBrains Mono">:11434</text>
+            <text x="170" y="450" text-anchor="middle" fill="var(--text-muted)" font-size="10">GGUF · RAM-resident</text>
+          </g>
+
+          <g>
+            <rect x="310" y="390" width="180" height="70" rx="8" fill="var(--bg-elev)" stroke="var(--border-strong)"/>
+            <text x="400" y="416" text-anchor="middle" fill="var(--text)" font-size="13" font-weight="600">devai-vllm</text>
+            <text x="400" y="434" text-anchor="middle" fill="var(--good)" font-size="10" font-family="JetBrains Mono">:11435</text>
+            <text x="400" y="450" text-anchor="middle" fill="var(--text-muted)" font-size="10">NVFP4 · on-demand</text>
+          </g>
+
+          <g>
+            <rect x="540" y="390" width="180" height="70" rx="8" fill="var(--bg-elev)" stroke="var(--border-strong)"/>
+            <text x="630" y="416" text-anchor="middle" fill="var(--text)" font-size="13" font-weight="600">devai-sglang</text>
+            <text x="630" y="434" text-anchor="middle" fill="var(--good)" font-size="10" font-family="JetBrains Mono">:11436</text>
+            <text x="630" y="450" text-anchor="middle" fill="var(--text-muted)" font-size="10">NVFP4 · RadixAttn</text>
+          </g>
+
+          <!-- Router → backends -->
+          <path d="M 320 350 L 170 390" stroke="var(--accent)" fill="none" marker-end="url(#arrowblue)"/>
+          <path d="M 400 350 L 400 390" stroke="var(--accent)" fill="none" marker-end="url(#arrowblue)"/>
+          <path d="M 480 350 L 630 390" stroke="var(--accent)" fill="none" marker-end="url(#arrowblue)"/>
+        </svg>
+        <figcaption>The router routes by port → backend (no message inspection). Only one backend uses the GPU at a time.</figcaption>
+      </figure>
+
+      <div class="callout">
+        <div class="callout-icon">i</div>
+        <div>
+          <strong>Reference docs.</strong>
+          <ul style="margin-top: var(--space-2)">
+            <li><a href="router.html">router.md</a> — router architecture, ports, lifecycle, request rewrite chain</li>
+            <li><a href="backends.html">backends.md</a> — backend lifecycle, probing, parser plugins, failure modes</li>
+          </ul>
+        </div>
+      </div>
+
+      <!-- FEATURES -->
+      <h2 id="features">Features</h2>
+      <div class="card-grid">
+        <div class="card">
+          <h4>Two-step interactive picker</h4>
+          <p>Pick a model (+ backend for HF repos), then an agent. Arrow-key fzf navigation in the shell, same flow from JupyterLab launcher cards.</p>
+        </div>
+        <div class="card">
+          <h4>Probe-verified facts</h4>
+          <p>Every downloaded model is probed against the live runtime. VRAM, on-GPU confirmation, reasoning capability, tool parser — measured, not guessed.</p>
+        </div>
+        <div class="card">
+          <h4>MoE / dense awareness</h4>
+          <p>Ollama probe captures <code>expert_count</code> / <code>expert_used_count</code>. See at a glance which models give big-model quality at small-model speed.</p>
+        </div>
+        <div class="card">
+          <h4>Reasoning policy at the router</h4>
+          <p>Global <code>DEVAI_REASONING</code> setting with per-request and per-session overrides. The router maps to native protocol fields per backend.</p>
+        </div>
+        <div class="card">
+          <h4>Automatic GPU arbitration</h4>
+          <p>The router transparently switches backends and exposes a single endpoint per protocol (<code>/api/chat</code>, <code>/v1/chat/completions</code>, <code>/v1/messages</code>).</p>
+        </div>
+        <div class="card">
+          <h4>Fast iteration</h4>
+          <p>Two-layer container build separates rarely-changing system packages from frequently-updated tools. Aggressive caching of CLI binaries, APT, Docker Hub.</p>
+        </div>
+      </div>
+
+      <!-- QUICKSTART -->
+      <h2 id="quickstart">Quick start</h2>
+
+      <h3>Prerequisites (Debian 13 Trixie)</h3>
+      <pre data-lang="bash"><code class="language-bash"># Podman + Compose
+sudo apt install podman python3-podman-compose
+
+# Python tools (for model management scripts)
+sudo apt install python3-yaml
+
+# HuggingFace CLI (for vLLM model downloads)
+pip install --user huggingface-hub
+
+# NVIDIA GPU drivers (if not already installed)
+sudo apt install nvidia-driver nvidia-container-toolkit
+sudo nvidia-ctk runtime configure --runtime=podman --config=$HOME/.config/containers/containers.conf</code></pre>
+
+      <h3>1. Configure</h3>
+      <pre data-lang="bash"><code class="language-bash">cp .env.example .env
+# Edit .env: set JUPYTER_TOKEN, GPU_MEMORY_GB, adjust ports if needed</code></pre>
+
+      <h3>2. Build</h3>
+      <pre data-lang="bash"><code class="language-bash">make build           # Build all images (CPU + GPU + router)</code></pre>
+
+      <h3>3. Start infrastructure</h3>
+      <pre data-lang="bash"><code class="language-bash">make cache-up        # Start all services. vLLM/SGLang start as `sleep` placeholders;
+                     # router recreates them on demand.</code></pre>
+
+      <h3>4. Pull, probe &amp; select</h3>
+      <p>
+        Three orthogonal commands. <code>make probe</code> (Ollama) + <code>make probe-vllm</code> / <code>make probe-sglang</code> populate the probe caches;
+        <code>make model-fit</code> queries them; <code>make model-pull</code> downloads best-fit candidates across a (family, backend, context) matrix.
+      </p>
+      <pre data-lang="bash"><code class="language-bash"># Ollama probing (Make-orchestrated per PROBE_VRAMS bands)
+make probe                                    # probe every (VRAM, ctx) cell
+make probe PROBE_VRAMS=24G PROBE_CONTEXTS=128K # one band, one tier
+make probe PROBE_FORCE=1                      # re-probe everything, ignore cache
+
+# vLLM/SGLang probing (requires `make cache-down` first for exclusive GPU access)
+make cache-down
+make probe-vllm                               # probe vLLM across all (VRAM, ctx)
+make probe-sglang                             # probe SGLang across all (VRAM, ctx)
+make cache-up
+
+# Matrix-mode downloading (iterates all context tiers per family/backend)
+make model-pull                               # download best-fit (family, backend, ctx) triplets
+make model-pull FAMILY=qwen3.5                # scope to one family
+make model-pull CONTEXT=32768                 # single context; picks one best per (family, backend)
+make model-pull NAME=NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4   # pull one specific catalog row by name
+
+# Fit queries (probe-cache backed, no side effects)
+make model-fit                                # print fitting models at host VRAM x MAX_CONTEXT_LEN
+make model-fit VRAM=16 CONTEXT=32768          # query a different (VRAM, ctx)</code></pre>
+
+      <h3>5. Run</h3>
+      <pre data-lang="bash"><code class="language-bash">make lab-gpu         # Start JupyterLab with GPU (or make lab-cpu)
+# OR
+make shell-gpu       # Drop straight into the model picker (cwd = repo)
+# OR (standalone host launcher)
+make install                  # one-time: stage launcher + config
+devai-agent --init            # one-time: write default ~/.devai/preferences.yaml
+cd ~/myproject &amp;&amp; devai-agent # launch with myproject/ mounted as work dir</code></pre>
+
+      <p><strong>Access:</strong></p>
+      <ul>
+        <li><strong>JupyterLab</strong> — <code>https://&lt;HOST_IP&gt;:8888</code></li>
+        <li><strong>Open WebUI</strong> — <code>https://&lt;HOST_IP&gt;:8443</code></li>
+      </ul>
+
+      <!-- DEVAI-AGENT -->
+      <h2 id="devai-agent"><code>devai-agent</code> — standalone host launcher</h2>
+      <p>
+        <code>bin/devai-agent</code> is the same lab container as <code>make shell-gpu</code>,
+        runnable from anywhere on the host without invoking Make or being inside the repo
+        directory. State lives under <code>~/.devai/</code>; the repo is only consulted
+        once at <code>make install</code> time.
+      </p>
+
+      <h3>Install once</h3>
+      <pre data-lang="bash"><code class="language-bash">make install                       # default INSTALL_PREFIX=~/.local
+make install INSTALL_PREFIX=/opt   # alternative location</code></pre>
+
+      <p>This writes:</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Target</th><th>Purpose</th></tr></thead>
+          <tbody>
+            <tr><td><code>~/.local/bin/devai-agent</code></td><td>The launcher script.</td></tr>
+            <tr><td><code>~/.devai/.ollama-reasoning-cache.json</code></td><td>Symlink to the repo's probe cache so it stays fresh as <code>make probe</code> regenerates it.</td></tr>
+            <tr><td><code>~/.devai/model-picker.py</code></td><td>Symlink so the launcher can override the in-image picker via bind-mount.</td></tr>
+            <tr><td><code>~/.devai/sessions/</code></td><td>Per-<code>(agent, model)</code> session-history dir.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Run</h3>
+      <p>The work directory mounted as <code>/home/devai/work</code> is the shell's <code>$PWD</code> at the time of invocation — <code>cd</code> into the project you want to work on first.</p>
+      <pre data-lang="bash"><code class="language-bash">cd ~/projects/my-app &amp;&amp; devai-agent # GPU; my-app/ becomes /home/devai/work
+devai-agent --cpu                   # CPU lab
+devai-agent -C ~/other              # mount ~/other instead of $PWD this run
+devai-agent --model qwen3.5:9b-q8_0 --agent claude
+devai-agent --show                  # print resolved prefs + container cmd, no run
+devai-agent --init                  # reset preferences.yaml to defaults</code></pre>
+
+      <h3>Preferences (<code>~/.devai/preferences.yaml</code>)</h3>
+      <p>
+        The launcher reads these on entry and updates them on exit, so the next invocation
+        reuses the last known good state.
+      </p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Key</th><th>Type</th><th>Updated by</th></tr></thead>
+          <tbody>
+            <tr><td><code>vram</code></td><td>int (GB)</td><td><code>--init</code>; hand-edit</td></tr>
+            <tr><td><code>context</code></td><td>int (tokens)</td><td>the picker's per-row context tier</td></tr>
+            <tr><td><code>last_model</code></td><td>str</td><td>the picker's model selection</td></tr>
+            <tr><td><code>last_agent</code></td><td>str</td><td>the picker's agent selection</td></tr>
+            <tr><td><code>last_work_dir</code></td><td>path</td><td>actual directory mounted on the last run (informational)</td></tr>
+            <tr><td><code>agent_session_file</code></td><td>path | null</td><td>computed from <code>(last_agent, last_model)</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- GPU ARBITRATION -->
+      <h2 id="gpu-arbitration">GPU arbitration</h2>
+      <p>
+        The router (<code>devai-router</code>) is a small Go reverse proxy (~9 MB
+        distroless) that:
+      </p>
+      <ul>
+        <li>Routes by <strong>port → backend</strong> (no message inspection).</li>
+        <li>Manages <strong>GPU exclusion</strong>: only one backend uses the GPU at a time. Switches by stopping the current backend (with graceful drain for in-flight requests) and starting the next via the Podman API.</li>
+        <li>Sizes vLLM/SGLang launches dynamically (<code>--gpu-memory-utilization</code>, <code>--mem-fraction-static</code>, <code>--max-model-len</code>) from per-model VRAM budgets.</li>
+        <li>Auto-stops idle backends after <code>IDLE_TIMEOUT</code> seconds.</li>
+        <li>Applies the <strong>reasoning policy</strong> to each request.</li>
+      </ul>
+
+      <div class="callout">
+        <div class="callout-icon">!</div>
+        <div>
+          <strong>Status.</strong> All three backends are wired. vLLM and SGLang start as
+          <code>sleep infinity</code> placeholders (compose can't know which model the
+          user will pick); the router replaces them on demand via libpod when a request
+          arrives on port 11435 / 11436.
+        </div>
+      </div>
+
+      <!-- REASONING & MoE -->
+      <h2 id="reasoning-moe">Reasoning &amp; MoE detection</h2>
+      <p>
+        The router doesn't <em>guess</em> whether a model can reason.
+        <code>make probe</code> runs <code>scripts/probe-ollama-reasoning.py</code>
+        against the live Ollama. It probes a 2-D matrix per digest: every VRAM band in
+        <code>PROBE_VRAMS</code> crossed with every context tier in
+        <code>PROBE_CONTEXTS</code>.
+      </p>
+
+      <h3>Reasoning capabilities</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Capability</th><th>UI label</th><th>Description</th></tr></thead>
+          <tbody>
+            <tr><td><code>structured</code></td><td>Native reasoning</td><td>Model returns reasoning in a separate <code>message.thinking</code> field. Clean, agent-friendly.</td></tr>
+            <tr><td><code>inline</code></td><td>Inline reasoning</td><td>Reasoning appears as <code>&lt;think&gt;…&lt;/think&gt;</code> blocks inside <code>message.content</code>.</td></tr>
+            <tr><td><code>unsupported</code></td><td>No reasoning</td><td>No reasoning behavior observed.</td></tr>
+            <tr><td><code>error</code></td><td>Probe failed</td><td>Ollama rejected the probe, the request timed out, or the target context spilled to CPU/RAM.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Dense vs MoE</h3>
+      <p>
+        <code>MoE 8/128</code> means <strong>8 experts used per token, out of 128 total</strong>.
+        At every applicable transformer layer, the gating network picks the top-8 experts by score.
+      </p>
+      <p>
+        One token through <code>gemma4:26b</code> (MoE 8/128) does ~30 × 8 = 240 expert activations,
+        drawing on 6.25 % of expert weights <em>that token</em>. Over many tokens with varied
+        routing, you sample most of the pool — so all 128 experts must be in VRAM.
+        <strong>The MoE benefit is compute (small active fraction per token), not memory
+        (full pool always loaded).</strong>
+      </p>
+
+      <!-- CONFIG -->
+      <h2 id="configuration">Configuration</h2>
+      <h3><code>.env</code> — host/runtime settings</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Setting</th><th>Default</th><th>Description</th></tr></thead>
+          <tbody>
+            <tr><td><code>LAB_PORT</code></td><td>8888</td><td>JupyterLab port</td></tr>
+            <tr><td><code>WEBUI_PORT</code></td><td>8443</td><td>Open WebUI HTTPS port</td></tr>
+            <tr><td><code>CONTAINER_RUNTIME</code></td><td>podman</td><td><code>podman</code> or <code>docker</code></td></tr>
+            <tr><td><code>JUPYTER_TOKEN</code></td><td>—</td><td>Fixed access token (set in .env)</td></tr>
+            <tr><td><code>GPU_MEMORY_GB</code></td><td>24</td><td>Total GPU VRAM in GB. Picker filter ceiling.</td></tr>
+            <tr><td><code>MAX_CONTEXT_LEN</code></td><td>131072</td><td>Operator-side cap on per-model context, in tokens (128 K).</td></tr>
+            <tr><td><code>PROBE_VRAMS</code></td><td><code>16G,24G</code></td><td>Comma-separated VRAM bands <code>make probe</code> cycles through.</td></tr>
+            <tr><td><code>PROBE_CONTEXTS</code></td><td><code>32K,64K,128K,256K</code></td><td>Comma-separated context tiers probed inside each VRAM band.</td></tr>
+            <tr><td><code>DEVAI_REASONING</code></td><td>auto</td><td>Default reasoning policy: <code>auto|off|low|medium|high</code></td></tr>
+            <tr><td><code>IDLE_TIMEOUT</code></td><td>300</td><td>Seconds before auto-stopping vLLM/SGLang</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Per-request override</h3>
+      <p>Any agent that talks to the router can set <code>X-DevAI-Reasoning: off|auto|...</code> on its HTTP request to override the env-level policy for that one call. Useful for testing without restart.</p>
+
+      <h3><code>scripts/model-families.yaml</code> — family definitions</h3>
+      <p>
+        Hand-maintained source of model lineages. Each family declares its <code>ollama_repos</code>,
+        <code>hf_repos</code>, and/or <code>gguf_repos</code>, plus an <code>arch_ref</code> HF repo for architecture metadata.
+        The <code>thinking: true|false</code> flag is a hint for humans — final reasoning capability is determined per-variant at probe time.
+      </p>
+      <p>Source kinds:</p>
+      <ul>
+        <li><strong><code>ollama_repos:</code></strong> — list of library names under <code>ollama.com/library/&lt;name&gt;</code>. Every published tag for each library becomes a catalog row served by the Ollama backend.</li>
+        <li><strong><code>hf_repos:</code></strong> — list of HuggingFace repositories (transformers safetensors / FP8 / NVFP4 / AWQ / GPTQ). Each becomes one catalog row served by vLLM/SGLang.</li>
+        <li><strong><code>gguf_repos:</code></strong> — list of HuggingFace GGUF-only repositories with one entry per file. <code>make model-pull</code> downloads the <code>.gguf</code> blob, writes a Modelfile that emits <code>FROM &lt;file&gt;</code> plus <code>RENDERER &lt;family&gt;</code> and <code>PARSER &lt;family&gt;</code> directives, and runs <code>ollama create</code> to register the imported tag.</li>
+      </ul>
+
+      <h3><code>deploy/models.yaml</code> — generated catalog</h3>
+      <p>Auto-generated by <code>make catalog-regen</code> from upstream HF and Ollama APIs. Has size, architecture, and purpose for every variant. Don't hand-edit.</p>
+
+      <h3><code>deploy/.ollama-reasoning-cache.json</code> — probe cache (single source of truth)</h3>
+      <p>
+        Auto-generated by <code>make probe</code>. Schema v3, digest-keyed. Each entry carries
+        <code>aliases</code>, <code>max_context</code>, top-level <code>capability</code>, optional
+        <code>disable_verified</code>, and a 2-D <code>probes</code> map nested as
+        <code>probes[&lt;vram_gb&gt;][&lt;ctx&gt;]</code>. Each probe cell records <code>actual_total_gb</code>,
+        <code>actual_vram_gb</code>, <code>fully_on_gpu</code>, per-cell capability, and timestamp.
+        Both the router and the picker read this file directly — the cache IS the active set.
+      </p>
+
+      <h3>Adding Python packages</h3>
+      <p>Create <code>requirements.txt</code> in the repo root and rebuild:</p>
+      <pre data-lang="bash"><code class="language-bash">echo "langchain" &gt; requirements.txt
+make build-gpu</code></pre>
+
+      <!-- MAKE TARGETS -->
+      <h2 id="make-targets">Make targets</h2>
+      <p>Run <code>make help</code> for the full list. Highlights:</p>
+      <pre data-lang="text"><code>BUILD                                     INFRASTRUCTURE                            RUN
+build-cpu        Build image (CPU)        cache-up        Start services            lab-cpu        JupyterLab (CPU)
+build-gpu        Build image (GPU)        cache-down      Stop services             lab-gpu        JupyterLab (GPU)
+build-router     Build router image       cache-status    Show status               shell-cpu      Shell + picker (CPU)
+build            Build all                cache-clean     Remove cached data        shell-gpu      Shell + picker (GPU)
+fetch-cli        Update CLI binaries      logs            Tail SERVICE=devai-X
+pull-images      Pull base images         setup-logs      One-time: 100G LV at /var/cache/devai/logs
+
+OLLAMA (GGUF -- active)                   vLLM (NVFP4 -- dormant)                   CATALOG / FIT
+ollama-list      List downloaded models   vllm-list       List on-disk weights      catalog-regen     Refresh deploy/models.yaml from upstream
+ollama-rm        Remove model             vllm-rm         Remove weights            probe             Probe every (VRAM, ctx) cell
+ollama-status    Show status              vllm-status     Show status               model-fit         Print fitting models at VRAM/CONTEXT
+ollama-df        Disk usage               vllm-df         Disk usage                model-pull        Download best-fit candidates
+ollama-clean     Clean partials                                                     vram-fit          Show what fits without acting
+
+MAINTENANCE                                                                         TESTING
+clean            Remove all images        prune           Prune dangling images     test              Run all tests (router + ollama + matrix)
+                                                                                    test-router       Go unit tests for arbiter
+                                                                                    test-ollama       Ollama integration tests
+                                                                                    test-models       Matrix: every probed digest x wire x scenario
+                                                                                    test-agents       Smoke-test all agents against ollama</code></pre>
+
+      <!-- GPU SUPPORT -->
+      <h2 id="gpu-support">GPU support</h2>
+      <h3>Requirements</h3>
+      <ul>
+        <li>NVIDIA GPU with CUDA support</li>
+        <li>NVIDIA Container Toolkit</li>
+        <li>For NVFP4 models: Blackwell architecture</li>
+      </ul>
+      <h3>GPU images</h3>
+      <p>
+        The GPU lab image (<code>devai-lab-gpu</code>) includes PyTorch with CUDA. The base image
+        uses <code>nvidia/cuda:12.9.1-cudnn-runtime-ubuntu24.04</code>. Python is installed via uv
+        (not system apt) to ensure a single Python version across CPU and GPU images.
+      </p>
+
+      <!-- SSL -->
+      <h2 id="ssl-https">SSL / HTTPS</h2>
+      <p>Both JupyterLab and Open WebUI support HTTPS:</p>
+      <ul>
+        <li><strong>JupyterLab</strong>: auto-detects mkcert certificates in <code>~/.jupyter/ssl/</code></li>
+        <li><strong>Open WebUI</strong>: nginx proxy with mkcert certs or self-signed fallback</li>
+      </ul>
+      <p>Generate certificates on the browser workstation:</p>
+      <pre data-lang="bash"><code class="language-bash">mkcert &lt;HOST_IP&gt;
+# Copy &lt;HOST_IP&gt;.pem and &lt;HOST_IP&gt;-key.pem to the container host</code></pre>
+
+      <!-- REGISTRY MIRROR -->
+      <h2 id="registry-mirror">Podman registry mirror</h2>
+      <p>To route Docker Hub pulls through the local cache:</p>
+      <pre data-lang="bash"><code class="language-bash">cp deploy/registries.conf ~/.config/containers/registries.conf</code></pre>
+      <p>
+        This tells Podman to try <code>localhost:5000</code> (the registry mirror started by
+        <code>make cache-up</code>) before going to Docker Hub directly.
+      </p>
+
+      <!-- AUTO-START -->
+      <h2 id="auto-start">Auto-start at boot</h2>
+      <pre data-lang="bash"><code class="language-bash">make install-systemd            # stage compose + symlink caches into ~/.config/devai/, enable unit
+make uninstall-systemd          # reverse: disable unit + remove staged files</code></pre>
+      <p>
+        <code>install-systemd</code> stages a systemd user service that brings the infrastructure
+        containers up on login (<code>loginctl enable-linger</code> keeps them running after logout).
+        It <strong>copies</strong> <code>docker-compose.yaml</code> into <code>~/.config/devai/</code>
+        and <strong>symlinks</strong> the eight other paths the compose mounts
+        (<code>registry-config.yaml</code>, <code>logging.sh</code>, <code>recovery-flags.json</code>,
+        <code>vllm-plugins.json</code>, the three <code>.X-reasoning-cache.json</code> files, and the
+        <code>webui-proxy/</code> directory) back into the repo's <code>deploy/</code>. The symlinks
+        keep the systemd-managed stack reading the same probe caches that <code>make probe</code> writes —
+        no duplication, no drift.
+      </p>
+
+      <!-- UPDATING -->
+      <h2 id="updating">Updating</h2>
+      <pre data-lang="bash"><code class="language-bash">make fetch-cli                 # Update CLI binaries (Claude, Codex, Ollama, Gemini) via ETags
+make pull-images               # Pull latest base and infrastructure images
+make catalog-regen             # Refresh deploy/models.yaml from HF + Ollama upstream
+make model-pull &amp;&amp; make probe  # Pull any new fitting variants, then probe them
+make build                     # Rebuild all images with updated binaries/packages</code></pre>
+
+      <!-- STORAGE LAYOUT -->
+      <h2 id="storage-layout">Storage layout (LVM2)</h2>
+      <p>
+        All persistent data is stored on dedicated LVM2 thin-provisioned logical volumes under
+        <code>/var/cache/devai/</code>. This provides:
+      </p>
+      <ul>
+        <li><strong>Independent sizing</strong> — each volume can be extended without affecting others</li>
+        <li><strong>Thin provisioning</strong> — space is allocated on demand from a shared pool</li>
+        <li><strong>Clean separation</strong> — models, container images, and caches don't compete for space</li>
+      </ul>
+
+      <p>Reference implementation (volume group <code>vgais</code>):</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Volume</th><th>Mount</th><th>Size</th><th>Purpose</th></tr></thead>
+          <tbody>
+            <tr><td><code>cache_ollama</code></td><td><code>/var/cache/devai/ollama</code></td><td>200G</td><td>Ollama GGUF models + vLLM NVFP4 models</td></tr>
+            <tr><td><code>cache_registry</code></td><td><code>/var/cache/devai/registry</code></td><td>200G</td><td>Podman container image storage + Docker Hub mirror</td></tr>
+            <tr><td><code>cache_logs</code></td><td><code>/var/cache/devai/logs</code></td><td>100G</td><td>Persisted container stdout (one <code>&lt;service&gt;.log</code> per devai-* container)</td></tr>
+            <tr><td><code>cache_pip</code></td><td><code>/var/cache/devai/pip</code></td><td>30G</td><td>Python package cache (uv) + CLI binaries</td></tr>
+            <tr><td><code>cache_apt</code></td><td><code>/var/cache/devai/apt</code></td><td>10G</td><td>APT package cache (apt-cacher-ng)</td></tr>
+            <tr><td><code>cache_npm</code></td><td><code>/var/cache/devai/npm</code></td><td>10G</td><td>npm package cache</td></tr>
+            <tr><td><code>cache_open_webui</code></td><td><code>/var/cache/devai/open-webui</code></td><td>5G</td><td>Open WebUI application data</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>
+        <code>cache_logs</code> is the only volume that can be created entirely from the repo:
+        <code>make setup-logs</code> carves the LV in the existing <code>vgais/cachepool</code>,
+        <code>mkfs.xfs</code>, adds an <code>/etc/fstab</code> line, and mounts it. Re-running is a no-op;
+        <code>RECREATE=1 make setup-logs</code> rebuilds the volume from scratch.
+        The remaining volumes are still set up with the manual procedure below.
+      </p>
+
+      <p>Create the volumes:</p>
+      <pre data-lang="bash"><code class="language-bash"># Create thin pool (adjust size for your disk)
+sudo lvcreate -L 500G -T vgais/cachepool
+
+# Create thin volumes
+sudo lvcreate -V 200G -T vgais/cachepool -n cache_ollama
+sudo lvcreate -V 200G -T vgais/cachepool -n cache_registry
+sudo lvcreate -V 30G  -T vgais/cachepool -n cache_pip
+sudo lvcreate -V 10G  -T vgais/cachepool -n cache_apt
+sudo lvcreate -V 10G  -T vgais/cachepool -n cache_npm
+sudo lvcreate -V 5G   -T vgais/cachepool -n cache_open_webui
+
+# Format and mount
+for vol in cache_ollama cache_registry cache_pip cache_apt cache_npm cache_open_webui; do
+    sudo mkfs.xfs /dev/vgais/$vol
+done
+
+# Add to /etc/fstab
+cat &lt;&lt;'EOF' | sudo tee -a /etc/fstab
+/dev/vgais/cache_ollama     /var/cache/devai/ollama     xfs defaults 0 0
+/dev/vgais/cache_registry   /var/cache/devai/registry   xfs defaults 0 0
+/dev/vgais/cache_pip        /var/cache/devai/pip         xfs defaults 0 0
+/dev/vgais/cache_apt        /var/cache/devai/apt         xfs defaults 0 0
+/dev/vgais/cache_npm        /var/cache/devai/npm         xfs defaults 0 0
+/dev/vgais/cache_open_webui /var/cache/devai/open-webui  xfs defaults 0 0
+EOF
+
+sudo mkdir -p /var/cache/devai/{ollama,registry,pip,apt,npm,open-webui}
+sudo mount -a
+sudo chown -R $USER:$USER /var/cache/devai
+
+# Logs volume (handled by Make):
+make setup-logs                    # creates cache_logs LV (100G default)
+make setup-logs SIZE=200G          # override</code></pre>
+
+      <p>To extend a volume (e.g. when models fill up):</p>
+      <pre data-lang="bash"><code class="language-bash">sudo lvextend -L 300G /dev/vgais/cache_ollama
+sudo xfs_growfs /var/cache/devai/ollama</code></pre>
+
+      <!-- KEY FILES -->
+      <h2 id="key-files">Key files</h2>
+      <pre data-lang="text"><code>.env                              -- Host/runtime configuration
+.env.example                      -- Configuration template
+bin/devai-agent                   -- Standalone shell-agent launcher (no Make required)
+deploy/
+  models.yaml                     -- Generated catalog (ollama + hf + gguf rows)
+  .ollama-reasoning-cache.json    -- Probe cache (schema v3, digest-keyed,
+                                    probes nested by VRAM x CONTEXT) -- single
+                                    source of truth for fit data
+  docker-compose.yaml             -- Infrastructure services
+  Dockerfile.base                 -- Base image (system packages, Python, Node)
+  Dockerfile.lab                  -- Lab image (CLI tools, packages, JupyterLab)
+  Dockerfile.router               -- Router image (distroless, 9 MB)
+  webui-proxy/                    -- nginx TLS proxy for Open WebUI
+  systemd/                        -- Auto-start service
+gpu-arbiter/
+  main.go                         -- Router source (multi-port proxy + reasoning policy)
+  policy_test.go                  -- Unit tests for the reasoning policy
+scripts/
+  model-families.yaml             -- Hand-edited family definitions
+  _contexts.py                    -- Shared (VRAM, CONTEXT) tier arrays + parsers
+  generate-catalog.py             -- Refresh deploy/models.yaml from upstream APIs
+  probe-ollama-reasoning.py       -- Per-(VRAM, ctx) probe per digest (schema v3)
+  select-models.py                -- Print fitting models / pull catalog candidates
+  model-picker.py                 -- Two-step interactive picker (model/context/status -> agent)
+docs/
+  ollama_models.md                -- Reasoning detection design doc
+tests/
+  agent-matrix.sh                 -- Smoke-test all agents against ollama
+  test-router*.sh                 -- Router integration tests
+requirements-base.txt             -- Base Python packages (always installed)
+requirements.txt                  -- Optional project-specific packages
+packages/jupyter-ai-launchers     -- JupyterLab launcher extension</code></pre>
+
+      <!-- LICENSE -->
+      <h2 id="license">License</h2>
+      <p>MIT.</p>
+
+      <hr>
+      <p style="text-align: center; color: var(--text-dim); font-size: var(--text-sm);">
+        Explore the docs in the sidebar, or jump straight to
+        <a href="attention-and-the-transformer.html">how the transformer works</a> /
+        <a href="nvfp4-number-formats.html">how NVFP4 packs an 8 B model into 5 GB</a> /
+        <a href="router.html">how the router arbitrates the GPU</a>.
+      </p>
+
+    </div>
+  </main>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-core.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/plugins/autoloader/prism-autoloader.min.js"></script>
+<script src="assets/nav.js"></script>
+<script src="assets/site.js"></script>
+</body>
+</html>

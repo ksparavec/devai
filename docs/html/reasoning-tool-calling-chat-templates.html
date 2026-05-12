@@ -1,0 +1,848 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Reasoning, tool calling, and chat templates — Dev AI Lab</title>
+<meta name="description" content="The three mechanisms that make a modern LLM feel agentic. ChatML control tokens, tool-call parser plugins, and structured/inline/unsupported reasoning capabilities.">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism-tomorrow.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="site">
+  <main class="main">
+    <div class="content">
+
+      <header>
+        <span class="pill">Beginner's guide · agent runtime</span>
+        <h1>Reasoning, tool calling, and chat templates</h1>
+        <p class="lead">
+          The three things that make a modern LLM feel "agentic" — and the three things
+          this project's router code spends most of its complexity on. Different
+          mechanisms, but they interact tightly, which is why beginners conflate them.
+        </p>
+      </header>
+
+      <div class="callout">
+        <div class="callout-icon">i</div>
+        <div>
+          If you understand
+          <a href="attention-and-the-transformer.html">attention-and-the-transformer</a>
+          already, you know how the model emits one token at a time. This doc explains
+          the three layers above that: <strong>chat templates</strong> (how role-tagged
+          messages become tokens), <strong>tool calling</strong> (how the model
+          "invokes" functions using nothing but tokens), and <strong>reasoning
+          models</strong> (what <code>&lt;think&gt;</code> tokens are, and why the
+          project's bench harness had a TPS-counting bug for half a release cycle).
+          Each section maps directly to an entry in
+          <code>scripts/model-families.yaml</code>, a rewrite step in
+          <a href="router.html">router</a>, or a bug fix in
+          <a href="bench-results.html">bench-results</a>.
+        </div>
+      </div>
+
+      <!-- §1 -->
+      <h2 id="chat-templates">1. Chat templates — turning messages into tokens</h2>
+      <p>
+        A chat-tuned LLM is, mechanically, the same next-token predictor as the base
+        model (<a href="attention-and-the-transformer.html">attention-and-the-transformer</a>)
+        but trained on a corpus of <em>formatted multi-turn conversations</em>. The
+        formatting is the chat template: a deterministic recipe for turning a list of
+        <code>{role, content}</code> messages into one big string that gets tokenised
+        the usual way.
+      </p>
+
+      <h3 id="lifecycle-svg">1.1 Lifecycle, visualised</h3>
+
+      <figure>
+        <svg viewBox="0 0 820 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Chat template lifecycle">
+          <defs>
+            <marker id="ctArr" markerWidth="10" markerHeight="8" refX="10" refY="4" orient="auto">
+              <path d="M0,0 L10,4 L0,8 Z" fill="var(--accent)"/>
+            </marker>
+          </defs>
+
+          <!-- Stage 1: messages -->
+          <text x="80" y="25" text-anchor="middle" fill="var(--text-muted)" font-size="11" font-weight="600">1. messages[]</text>
+          <rect x="15" y="40" width="130" height="100" rx="6" fill="var(--bg-elev-2)" stroke="var(--border-strong)"/>
+          <g font-family="JetBrains Mono" font-size="10" fill="var(--text)">
+            <text x="25" y="60">{role: system,</text>
+            <text x="25" y="73">  content: "..."}</text>
+            <text x="25" y="92">{role: user,</text>
+            <text x="25" y="105">  content: "2+2?"}</text>
+            <text x="25" y="125" fill="var(--text-dim)" font-style="italic">...history</text>
+          </g>
+
+          <path d="M 150 90 h 30" stroke="var(--accent)" stroke-width="2" fill="none" marker-end="url(#ctArr)"/>
+
+          <!-- Stage 2: rendered string -->
+          <text x="265" y="25" text-anchor="middle" fill="var(--text-muted)" font-size="11" font-weight="600">2. Jinja → string</text>
+          <rect x="185" y="40" width="170" height="100" rx="6" fill="rgba(91,141,239,0.12)" stroke="var(--accent)"/>
+          <g font-family="JetBrains Mono" font-size="9" fill="var(--accent)">
+            <text x="193" y="58">&lt;|im_start|&gt;system</text>
+            <text x="193" y="71">You are...&lt;|im_end|&gt;</text>
+            <text x="193" y="86">&lt;|im_start|&gt;user</text>
+            <text x="193" y="99">2+2?&lt;|im_end|&gt;</text>
+            <text x="193" y="118" fill="var(--warn)">&lt;|im_start|&gt;assistant</text>
+            <text x="193" y="131" fill="var(--text-dim)" font-style="italic">(open turn)</text>
+          </g>
+
+          <path d="M 360 90 h 30" stroke="var(--accent)" stroke-width="2" fill="none" marker-end="url(#ctArr)"/>
+
+          <!-- Stage 3: model -->
+          <text x="455" y="25" text-anchor="middle" fill="var(--text-muted)" font-size="11" font-weight="600">3. Model</text>
+          <rect x="395" y="40" width="120" height="100" rx="8" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="2"/>
+          <text x="455" y="85" text-anchor="middle" fill="var(--accent)" font-size="13" font-weight="700">tokenise →</text>
+          <text x="455" y="105" text-anchor="middle" fill="var(--accent)" font-size="13" font-weight="700">decode loop</text>
+          <text x="455" y="125" text-anchor="middle" fill="var(--text-muted)" font-size="9" font-style="italic">stops on &lt;|im_end|&gt;</text>
+
+          <path d="M 520 90 h 30" stroke="var(--accent)" stroke-width="2" fill="none" marker-end="url(#ctArr)"/>
+
+          <!-- Stage 4: raw token stream -->
+          <text x="625" y="25" text-anchor="middle" fill="var(--text-muted)" font-size="11" font-weight="600">4. raw output</text>
+          <rect x="555" y="40" width="140" height="100" rx="6" fill="rgba(126,231,135,0.12)" stroke="var(--good)"/>
+          <g font-family="JetBrains Mono" font-size="9" fill="var(--good)">
+            <text x="563" y="58">&lt;think&gt;Let me</text>
+            <text x="563" y="71">work this out...&lt;/think&gt;</text>
+            <text x="563" y="90">&lt;tool_call&gt;</text>
+            <text x="563" y="103">{"name":"f",...}</text>
+            <text x="563" y="116">&lt;/tool_call&gt;</text>
+            <text x="563" y="131">4&lt;|im_end|&gt;</text>
+          </g>
+
+          <path d="M 700 90 h 30" stroke="var(--accent)" stroke-width="2" fill="none" marker-end="url(#ctArr)"/>
+
+          <!-- Stage 5: parser -->
+          <text x="775" y="25" text-anchor="middle" fill="var(--text-muted)" font-size="11" font-weight="600">5. parser</text>
+          <rect x="735" y="40" width="80" height="100" rx="6" fill="rgba(240,180,41,0.15)" stroke="var(--warn)"/>
+          <text x="775" y="90" text-anchor="middle" fill="var(--warn)" font-size="11" font-weight="700">split</text>
+          <text x="775" y="108" text-anchor="middle" fill="var(--warn)" font-size="9">reasoning /</text>
+          <text x="775" y="120" text-anchor="middle" fill="var(--warn)" font-size="9">tool / content</text>
+
+          <!-- Stage 6: structured output -->
+          <text x="410" y="180" text-anchor="middle" fill="var(--text-muted)" font-size="11" font-weight="600">6. Structured response surfaced to caller</text>
+          <rect x="60" y="195" width="700" height="100" rx="8" fill="var(--bg-elev-2)" stroke="var(--border-strong)"/>
+          <g font-family="JetBrains Mono" font-size="11" fill="var(--text)">
+            <text x="75" y="218"><tspan fill="var(--warn)">reasoning_content</tspan>: "Let me work this out..."</text>
+            <text x="75" y="240"><tspan fill="var(--accent)">tool_calls</tspan>: [{ name: "f", arguments: { ... } }]</text>
+            <text x="75" y="262"><tspan fill="var(--good)">content</tspan>: "4"</text>
+            <text x="75" y="284"><tspan fill="var(--text-muted)">finish_reason</tspan>: "tool_calls" | "stop"</text>
+          </g>
+
+          <!-- Arrow from parser down to structured -->
+          <path d="M 775 145 v 35 h -365" stroke="var(--accent)" stroke-width="1.5" fill="none" marker-end="url(#ctArr)"/>
+        </svg>
+        <figcaption>Six stages from a messages array to a parsed structured response. Stages 2 and 5 are where chat-template, tool, and reasoning parsers live.</figcaption>
+      </figure>
+
+      <h3 id="why-template">1.2 Why a template at all?</h3>
+      <p>
+        The model has no built-in concept of "user" vs "assistant". To it, every input
+        is an undifferentiated stream of token IDs. Telling the model "this is what the
+        user said, this is what you said, now respond" requires <em>reserved control
+        tokens</em> that mark turn boundaries. The chat template inserts them.
+      </p>
+
+      <h3 id="chatml">1.3 The Qwen3 / ChatML format</h3>
+      <p>
+        Qwen3 (and many other modern models — DeepSeek, Mistral, gpt-oss) use a variant
+        of the <strong>ChatML</strong> format, originally from OpenAI:
+      </p>
+
+      <pre data-lang="text"><code>&lt;|im_start|&gt;system
+You are a helpful assistant.&lt;|im_end|&gt;
+&lt;|im_start|&gt;user
+What is 2 + 2?&lt;|im_end|&gt;
+&lt;|im_start|&gt;assistant
+4&lt;|im_end|&gt;</code></pre>
+
+      <p>
+        The visible markers are <em>control tokens</em> with reserved IDs in the
+        tokeniser's vocabulary. They are not multi-character strings the model
+        interprets via parsing — they are <em>single tokens</em> whose role the model
+        learned during fine-tuning. For Qwen3:
+      </p>
+
+      <ul>
+        <li><code>&lt;|im_start|&gt;</code> — token ID 151644 (single token)</li>
+        <li><code>&lt;|im_end|&gt;</code> — token ID 151645 (single token)</li>
+        <li><code>&lt;|endoftext|&gt;</code> — token ID 151643 (single token, end of sequence)</li>
+        <li>... and dozens more for tool calls, reasoning, etc.</li>
+      </ul>
+
+      <p>
+        The roles <code>system</code>, <code>user</code>, <code>assistant</code> are
+        <em>normal text tokens</em> following the <code>&lt;|im_start|&gt;</code>
+        marker. The newline after the role and before the content is significant — it
+        is part of the trained format.
+      </p>
+
+      <h3 id="template-location">1.4 Where the template lives</h3>
+      <p>
+        Every HuggingFace model ships its template as a Jinja2 string in
+        <code>tokenizer_config.json</code> under the <code>chat_template</code> field.
+        You can inspect it directly:
+      </p>
+
+      <pre data-lang="bash"><code>jq -r '.chat_template' /var/cache/devai/.../tokenizer_config.json</code></pre>
+
+      <p>
+        For Qwen3 the template renders messages plus optional system prompt plus a
+        trailing <code>&lt;|im_start|&gt;assistant\n</code> to <em>prime the model to
+        respond</em>. When the user calls <code>/v1/chat/completions</code> with
+        messages, the inference engine (vLLM / SGLang / Ollama) runs this Jinja
+        template, then tokenises the resulting string.
+      </p>
+
+      <h3 id="generation-prompt">1.5 The "generation prompt" and where you stop</h3>
+      <p>
+        A subtle but critical point. After rendering all the prior messages, the
+        template ends with:
+      </p>
+
+      <pre data-lang="text"><code>&lt;|im_start|&gt;assistant</code></pre>
+
+      <p>
+        (no <code>&lt;|im_end|&gt;</code> yet — the assistant turn is <em>open</em>). The
+        model now generates token after token until it produces
+        <code>&lt;|im_end|&gt;</code> itself, at which point the inference engine stops
+        generating, strips the template scaffolding, and returns the assistant's content
+        to the caller.
+      </p>
+
+      <div class="callout danger">
+        <div class="callout-icon">i</div>
+        <div>
+          <strong>Template token leakage is a real bug</strong>: if the inference engine
+          fails to stop on <code>&lt;|im_end|&gt;</code> (wrong tokeniser, model emits
+          the <em>string</em> "&lt;|im_end|&gt;" instead of the <em>token</em>), the
+          user sees <code>&lt;|im_end|&gt;</code> in their output. The bench harness
+          explicitly probes for this — see
+          <a href="bench-results.html">bench-results</a> issue #3 for a real case
+          (<code>Nemotron-Nano-9B-v2-NVFP4</code> leaked <code>&lt;/think&gt;</code> 3
+          times in 40 prompts because vLLM was launched without
+          <code>--reasoning-parser</code>).
+        </div>
+      </div>
+
+      <h3 id="tokeniser-pairing">1.6 Tokeniser != model — keep them paired</h3>
+      <p>
+        A model trained with the Qwen3 tokeniser <strong>must</strong> be served with
+        the Qwen3 tokeniser. Cross-tokeniser inference produces nonsense — the model
+        expects token ID 151644 to mean <code>&lt;|im_start|&gt;</code> because that is
+        what it learned, but a Llama tokeniser will emit different IDs for the same
+        string. This is why every checkpoint ships its full tokeniser bundle
+        (<code>tokenizer.json</code>, <code>tokenizer_config.json</code>,
+        <code>merges.txt</code>, <code>vocab.json</code> for byte-pair-encoding
+        tokenisers) and why mixing pieces from different families is forbidden.
+      </p>
+
+      <!-- §2 -->
+      <h2 id="tool-calling">2. Tool calling — making the model invoke functions</h2>
+      <p>
+        The model has no internet, no shell, no databases, and no eyes. It emits
+        tokens. "Tool calling" is the convention by which a chat-tuned LLM emits tokens
+        that an external runtime parses into a structured function invocation, executes,
+        and feeds the result back in another turn. The whole loop is <em>token in,
+        token out</em> on the model's side.
+      </p>
+
+      <h3 id="tool-wire">2.1 What a tool call actually looks like over the wire</h3>
+      <p>
+        The OpenAI-compatible tool-call protocol (everyone copies this now — see
+        <a href="openai-api-and-streaming.html">openai-api-and-streaming</a>) expects the
+        <em>caller</em> to declare available tools via JSON Schema:
+      </p>
+
+      <pre data-lang="json"><code>"tools": [
+  {
+    "type": "function",
+    "function": {
+      "name": "get_weather",
+      "description": "Get the current weather for a city",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "city": {"type": "string"}
+        },
+        "required": ["city"]
+      }
+    }
+  }
+]</code></pre>
+
+      <p>
+        The inference engine renders these into the chat template (each model has its
+        own way — see §2.3). The model is fine-tuned to <em>recognise</em> this schema
+        and <em>emit</em> a structured response when it decides to call a tool. The
+        response comes back to the client as:
+      </p>
+
+      <pre data-lang="json"><code>"choices": [{
+  "message": {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [{
+      "id": "call_abc123",
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "arguments": "{\"city\": \"Paris\"}"
+      }
+    }]
+  },
+  "finish_reason": "tool_calls"
+}]</code></pre>
+
+      <p>
+        The client (an agent like Claude Code or Aider) executes the actual function,
+        then sends the result back as a new message:
+      </p>
+
+      <pre data-lang="json"><code>{"role": "tool", "tool_call_id": "call_abc123", "content": "{\"temp\":18,\"unit\":\"C\"}"}</code></pre>
+
+      <p>
+        The model takes another turn, sees the tool result in context, and continues —
+        possibly with another tool call, possibly with a final text answer.
+      </p>
+
+      <h3 id="how-model-emits">2.2 But how does the model "emit" a JSON object?</h3>
+      <p>
+        The model emits <strong>tokens</strong>. The tool-call object you see in the API
+        response is the result of <em>parsing</em> those tokens after the model is done
+        generating.
+      </p>
+
+      <p>
+        Different model families learned to emit tool calls in different formats during
+        fine-tuning. There is no universal convention. The five common parser plugins:
+      </p>
+
+      <div class="card-grid">
+        <div class="card" style="border-left: 3px solid var(--accent)">
+          <h4>hermes</h4>
+          <p style="color:var(--text-muted); font-size: var(--text-sm)">Used by some Qwen3 variants and Nous-Hermes models. JSON inside <code>&lt;tool_call&gt;...&lt;/tool_call&gt;</code> tags.</p>
+          <pre data-lang="text" style="margin-top: var(--space-3); font-size: 0.78rem"><code>&lt;tool_call&gt;
+{"name": "get_weather",
+ "arguments": {"city": "Paris"}}
+&lt;/tool_call&gt;</code></pre>
+        </div>
+        <div class="card" style="border-left: 3px solid var(--accent)">
+          <h4>qwen3_xml</h4>
+          <p style="color:var(--text-muted); font-size: var(--text-sm)">Qwen3 family default. XML-style nested tags, one element per parameter.</p>
+          <pre data-lang="text" style="margin-top: var(--space-3); font-size: 0.78rem"><code>&lt;tool_call&gt;
+&lt;function=get_weather&gt;
+&lt;parameter=city&gt;Paris&lt;/parameter&gt;
+&lt;/function&gt;
+&lt;/tool_call&gt;</code></pre>
+        </div>
+        <div class="card" style="border-left: 3px solid var(--accent)">
+          <h4>llama3_json</h4>
+          <p style="color:var(--text-muted); font-size: var(--text-sm)">Llama 3 family. Single-line JSON between <code>&lt;|python_tag|&gt;</code> and <code>&lt;|eom_id|&gt;</code>.</p>
+          <pre data-lang="text" style="margin-top: var(--space-3); font-size: 0.78rem"><code>&lt;|python_tag|&gt;{"name":"get_weather",
+"parameters":{"city":"Paris"}}&lt;|eom_id|&gt;</code></pre>
+        </div>
+        <div class="card" style="border-left: 3px solid var(--accent)">
+          <h4>openai / harmony</h4>
+          <p style="color:var(--text-muted); font-size: var(--text-sm)">gpt-oss family. Channel-based: <code>commentary</code> + <code>to=functions.NAME</code> routing.</p>
+          <pre data-lang="text" style="margin-top: var(--space-3); font-size: 0.78rem"><code>&lt;|channel|&gt;commentary
+to=functions.get_weather
+code: { "city": "Paris" }
+&lt;|return|&gt;</code></pre>
+        </div>
+        <div class="card" style="border-left: 3px solid var(--accent)">
+          <h4>deepseek_string</h4>
+          <p style="color:var(--text-muted); font-size: var(--text-sm)">R1-Distill family. Multi-tag delimiters wrapping JSON code blocks.</p>
+          <pre data-lang="text" style="margin-top: var(--space-3); font-size: 0.78rem"><code>&lt;|tool_calls_begin|&gt;
+&lt;|tool_call_begin|&gt;function&lt;|tool_sep|&gt;get_weather
+```json
+{"city": "Paris"}
+```
+&lt;|tool_call_end|&gt;
+&lt;|tool_calls_end|&gt;</code></pre>
+        </div>
+      </div>
+
+      <p>
+        Each format uses a different combination of reserved control tokens to mark "I
+        am calling a tool now" and to delimit the function name and arguments.
+      </p>
+
+      <h3 id="tool-call-parser-flag">2.3 The role of <code>--tool-call-parser</code></h3>
+      <p>
+        vLLM and SGLang ship pluggable parsers — <code>hermes</code>,
+        <code>qwen3_xml</code>, <code>llama3</code>, <code>llama3_json</code>,
+        <code>deepseek_string</code>, <code>openai</code> (harmony), etc. — each of
+        which knows how to:
+      </p>
+
+      <ol>
+        <li>Render the tool definitions into the model's expected format when building the prompt.</li>
+        <li>Detect the model's tool-call output in the streamed tokens.</li>
+        <li>Convert the model's format back into the OpenAI-compatible <code>tool_calls</code> JSON.</li>
+      </ol>
+
+      <p>
+        When you launch vLLM with
+        <code>--tool-call-parser qwen3_xml --enable-auto-tool-choice</code>, you are
+        saying <em>"this model uses Qwen3's XML format for tool calls; please parse them
+        and surface them as standard OpenAI <code>tool_calls</code> in the
+        response"</em>. Without the parser flag, vLLM either rejects the request
+        ("auto tool choice requires --enable-auto-tool-choice and --tool-call-parser",
+        a real error you have probably hit) or returns the raw XML in
+        <code>content</code> and the agent gets confused.
+      </p>
+
+      <h3 id="parser-picking">2.4 How this project picks the right parser</h3>
+      <p>
+        <code>scripts/model-families.yaml</code> curates the <em>expected</em> parser
+        per model family per backend. Excerpt for the Qwen3 NVFP4 family:
+      </p>
+
+      <pre data-lang="text"><code>- family: qwen3
+  ...
+  parsers:
+    vllm:
+      reasoning: qwen3
+      # qwen3_xml is the format Qwen3 chat templates actually emit,
+      # not plain hermes. Probe confirmed `hermes` left tool_calls
+      # empty on Qwen3.5-9B-NVFP4 -> switched to qwen3_xml.
+      tool: qwen3_xml
+    sglang:
+      reasoning: qwen3
+      # SGLang has no qwen3_xml parser -- `qwen` covers the same
+      # format under a different name.
+      tool: qwen</code></pre>
+
+      <p>
+        The probe drivers (<code>scripts/probe-vllm-reasoning.py</code>,
+        <code>probe-sglang-reasoning.py</code>) launch each model with these flags and
+        do a single round-trip with both a structured tool-call probe and a plain text
+        probe. If the parser actually works, the probe stores the verified flag in
+        <code>deploy/.vllm-reasoning-cache.json</code> /
+        <code>deploy/.sglang-reasoning-cache.json</code>. The router then reads the
+        <em>verified</em> values back when it recreates a container — so a model that
+        fails its parser probe simply gets launched without the parser flags, falling
+        back to no-tools mode.
+      </p>
+
+      <p>
+        This indirection (curated hint → probe → cache → router) means: when a new
+        model lands and the parser hint is wrong, the probe surfaces it as a probe
+        failure rather than a runtime crash. Read
+        <a href="backends.html">backends</a> for the lifecycle.
+      </p>
+
+      <h3 id="tool-choice">2.5 <code>tool_choice</code> — auto, none, required, forced</h3>
+      <p>Three variants of "what should the model do with the tools I declared":</p>
+
+      <ul>
+        <li><code>tool_choice: "auto"</code> (default) — the model decides whether to call a tool or just respond. Most flexible; works on every parser.</li>
+        <li><code>tool_choice: "none"</code> — explicitly disable tools for this turn. Same as not passing tools at all.</li>
+        <li><code>tool_choice: "required"</code> — force the model to call <em>some</em> tool, not just respond.</li>
+        <li><code>tool_choice: {"type": "function", "function": {"name": "X"}}</code> — <strong>force</strong> the model to call this specific function. The inference engine constrains the model's output during generation so it can only emit the tool-call format for <code>X</code>.</li>
+      </ul>
+
+      <p>
+        The "forced" variant is the trickiest. It is implemented either as
+        <strong>guided generation</strong> (the engine biases logits at each step so
+        only tokens consistent with the schema can be emitted), or as <strong>prompt
+        injection</strong> (the engine writes the tool-call opening tokens into the
+        prompt itself so the model "starts" the call and only has to fill in arguments).
+        Different parsers/engines handle this differently.
+      </p>
+
+      <p>
+        This is also where the project's <code>tool_choice_pinning_required</code>
+        router rule lives. Some agents send <code>tool_choice: "auto"</code> against a
+        model that the bench identified as "only reliable in forced mode". The router
+        refuses with HTTP 400 ("<code>tool_choice</code> must be pinned for this
+        model") rather than letting the agent get garbage. That refusal is what
+        surfaced as bench issue #2 in
+        <a href="bench-results.html">bench-results</a> — exactly the router doing its
+        job, breaking a bench task that didn't know to pin.
+      </p>
+
+      <!-- §3 -->
+      <h2 id="reasoning">3. Reasoning models — thinking out loud, in tokens</h2>
+      <p>
+        A "reasoning" or "thinking" model is one that was fine-tuned to <strong>emit a
+        long internal chain of thought before its final answer</strong>. The chain of
+        thought is not magical or special — it is just more tokens, generated by the
+        same next-token loop. The novelty is the training objective rewarded the model
+        for producing a high-quality reasoning trace, and the <em>interface</em> that
+        separates reasoning tokens from final-answer tokens.
+      </p>
+
+      <h3 id="think-block">3.1 The <code>&lt;think&gt;</code> block convention</h3>
+      <p>Reasoning models emit their chain of thought wrapped in markers:</p>
+
+      <pre data-lang="text"><code>&lt;think&gt;
+The user asked what 2+2 is. Let me work this out.
+2+2 = 4. That's a basic arithmetic fact. I should just say "4".
+&lt;/think&gt;4</code></pre>
+
+      <p>
+        The <code>&lt;think&gt;</code> and <code>&lt;/think&gt;</code> tags are reserved
+        control tokens (just like <code>&lt;|im_start|&gt;</code> from §1) for some
+        models, and plain text patterns for others. Different families:
+      </p>
+
+      <ul>
+        <li><strong>DeepSeek-R1 / R1-Distill</strong>: literal <code>&lt;think&gt;...&lt;/think&gt;</code> text with reserved tokens.</li>
+        <li><strong>Qwen3</strong> (with <code>--enable-thinking</code>): <code>&lt;think&gt;...&lt;/think&gt;</code> text, parser pulls it out.</li>
+        <li><strong>gpt-oss / harmony</strong>: uses <em>channels</em> — the model emits <code>&lt;|channel|&gt;analysis ... &lt;|message|&gt; ... &lt;|return|&gt;</code> for reasoning and <code>&lt;|channel|&gt;final ... &lt;|message|&gt; ... &lt;|return|&gt;</code> for the user-visible answer.</li>
+        <li><strong>Nemotron-Nano-v2</strong>: inline <code>&lt;think&gt;...&lt;/think&gt;</code> without reserved tokens (string-pattern parsing only).</li>
+      </ul>
+
+      <p>
+        Inside the <code>&lt;think&gt;</code> block the model can be wrong, change its
+        mind, write 1000 tokens of self-doubt, derive the same wrong answer five ways,
+        etc. The training rewards arriving at the <em>right</em> answer
+        <em>after</em> the trace. The trace is "throwaway" reasoning: the user should
+        not see it; the agent should not act on it; only the
+        post-<code>&lt;/think&gt;</code> content is the actual answer.
+      </p>
+
+      <h3 id="reasoning-parser-flag">3.2 The <code>--reasoning-parser</code> flag</h3>
+      <p>
+        Just as <code>--tool-call-parser</code> separates tool calls from content, the
+        <code>--reasoning-parser</code> flag tells vLLM/SGLang to extract
+        <code>&lt;think&gt;</code> content and surface it under a separate
+        <code>reasoning_content</code> field in the API response, rather than mixing it
+        into <code>content</code>:
+      </p>
+
+      <pre data-lang="json"><code>"choices": [{
+  "message": {
+    "role": "assistant",
+    "content": "4",
+    "reasoning_content": "The user asked what 2+2 is. Let me work this out.\n2+2 = 4..."
+  }
+}]</code></pre>
+
+      <p>
+        Streaming SSE works the same way — <code>delta.reasoning_content</code> arrives
+        piecemeal as the <code>&lt;think&gt;</code> block streams, then
+        <code>delta.content</code> arrives once the model emits
+        <code>&lt;/think&gt;</code>.
+      </p>
+
+      <p>
+        <code>scripts/model-families.yaml</code> curates per-family reasoning parser
+        hints just like tool parser hints. Excerpt:
+      </p>
+
+      <pre data-lang="text"><code>- family: deepseek-r1
+  parsers:
+    vllm:
+      reasoning: deepseek_r1
+      tool: deepseek_string
+
+- family: gpt-oss
+  parsers:
+    vllm:
+      reasoning: openai_gptoss   # vLLM registers harmony parser under this name
+      tool: openai
+
+- family: nemotron
+  parsers:
+    vllm:
+      reasoning: nemotron_v3
+      tool: hermes</code></pre>
+
+      <h3 id="capability-svg">3.3 Capability classification — structured / inline / unsupported</h3>
+
+      <figure>
+        <svg viewBox="0 0 760 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Reasoning capability classification">
+          <text x="380" y="22" text-anchor="middle" fill="var(--text)" font-size="14" font-weight="600">Three reasoning capability buckets</text>
+
+          <!-- Column 1: structured -->
+          <g transform="translate(20, 50)">
+            <rect width="230" height="240" rx="10" fill="rgba(126,231,135,0.10)" stroke="var(--good)" stroke-width="2"/>
+            <text x="115" y="30" text-anchor="middle" fill="var(--good)" font-size="14" font-weight="700">structured</text>
+            <text x="115" y="50" text-anchor="middle" fill="var(--good)" font-size="10" font-style="italic">parser separates streams</text>
+
+            <!-- output illustration -->
+            <rect x="20" y="70" width="190" height="22" rx="3" fill="rgba(240,180,41,0.20)" stroke="var(--warn)"/>
+            <text x="30" y="86" fill="var(--warn)" font-family="JetBrains Mono" font-size="10">reasoning_content: "..."</text>
+
+            <rect x="20" y="98" width="190" height="22" rx="3" fill="rgba(126,231,135,0.20)" stroke="var(--good)"/>
+            <text x="30" y="114" fill="var(--good)" font-family="JetBrains Mono" font-size="10">content: "answer"</text>
+
+            <text x="115" y="150" text-anchor="middle" fill="var(--text)" font-size="11" font-weight="600">::nothink supported</text>
+            <text x="115" y="170" text-anchor="middle" fill="var(--text-muted)" font-size="10">enable_thinking=false</text>
+            <text x="115" y="184" text-anchor="middle" fill="var(--text-muted)" font-size="10">suppresses the trace</text>
+
+            <text x="115" y="215" text-anchor="middle" fill="var(--text-muted)" font-size="10" font-style="italic">examples:</text>
+            <text x="115" y="230" text-anchor="middle" fill="var(--accent)" font-family="JetBrains Mono" font-size="10">Qwen3, DeepSeek-R1,</text>
+            <text x="115" y="244" text-anchor="middle" fill="var(--accent)" font-family="JetBrains Mono" font-size="10">gpt-oss (harmony)</text>
+          </g>
+
+          <!-- Column 2: inline -->
+          <g transform="translate(265, 50)">
+            <rect width="230" height="240" rx="10" fill="rgba(240,180,41,0.10)" stroke="var(--warn)" stroke-width="2"/>
+            <text x="115" y="30" text-anchor="middle" fill="var(--warn)" font-size="14" font-weight="700">inline</text>
+            <text x="115" y="50" text-anchor="middle" fill="var(--warn)" font-size="10" font-style="italic">no parser separation</text>
+
+            <rect x="20" y="70" width="190" height="50" rx="3" fill="rgba(240,180,41,0.20)" stroke="var(--warn)"/>
+            <text x="30" y="86" fill="var(--warn)" font-family="JetBrains Mono" font-size="10">content:</text>
+            <text x="30" y="100" fill="var(--warn)" font-family="JetBrains Mono" font-size="10">&lt;think&gt;trace...&lt;/think&gt;</text>
+            <text x="30" y="114" fill="var(--warn)" font-family="JetBrains Mono" font-size="10">answer</text>
+
+            <text x="115" y="150" text-anchor="middle" fill="var(--text)" font-size="11" font-weight="600">::nothink suppresses</text>
+            <text x="115" y="170" text-anchor="middle" fill="var(--text-muted)" font-size="10">via prompt instruction,</text>
+            <text x="115" y="184" text-anchor="middle" fill="var(--text-muted)" font-size="10">not parser toggle</text>
+
+            <text x="115" y="215" text-anchor="middle" fill="var(--text-muted)" font-size="10" font-style="italic">examples:</text>
+            <text x="115" y="230" text-anchor="middle" fill="var(--accent)" font-family="JetBrains Mono" font-size="10">Nemotron-Nano-v2,</text>
+            <text x="115" y="244" text-anchor="middle" fill="var(--accent)" font-family="JetBrains Mono" font-size="10">no-parser fallback</text>
+          </g>
+
+          <!-- Column 3: unsupported -->
+          <g transform="translate(510, 50)">
+            <rect width="230" height="240" rx="10" fill="rgba(255,123,114,0.10)" stroke="var(--danger)" stroke-width="2"/>
+            <text x="115" y="30" text-anchor="middle" fill="var(--danger)" font-size="14" font-weight="700">unsupported</text>
+            <text x="115" y="50" text-anchor="middle" fill="var(--danger)" font-size="10" font-style="italic">not reasoning-capable</text>
+
+            <rect x="20" y="70" width="190" height="22" rx="3" fill="rgba(126,231,135,0.20)" stroke="var(--good)"/>
+            <text x="30" y="86" fill="var(--good)" font-family="JetBrains Mono" font-size="10">content: "answer"</text>
+
+            <text x="115" y="120" text-anchor="middle" fill="var(--text-muted)" font-size="11">(no &lt;think&gt; tokens)</text>
+
+            <text x="115" y="150" text-anchor="middle" fill="var(--text)" font-size="11" font-weight="600">reasoning policy</text>
+            <text x="115" y="170" text-anchor="middle" fill="var(--text-muted)" font-size="10">is a no-op here</text>
+
+            <text x="115" y="215" text-anchor="middle" fill="var(--text-muted)" font-size="10" font-style="italic">examples:</text>
+            <text x="115" y="230" text-anchor="middle" fill="var(--accent)" font-family="JetBrains Mono" font-size="10">Llama-3.1-8B-Instruct,</text>
+            <text x="115" y="244" text-anchor="middle" fill="var(--accent)" font-family="JetBrains Mono" font-size="10">base chat models</text>
+          </g>
+        </svg>
+        <figcaption>The probe stores one of these three buckets per model in the cache. The picker uses the classification to decide whether to show a separate "Reasoning off" row.</figcaption>
+      </figure>
+
+      <p>
+        The probe driver classifies each model into one of three <strong>capability</strong>
+        buckets, stored in <code>deploy/.vllm-reasoning-cache.json</code>:
+      </p>
+
+      <ul>
+        <li><strong><code>structured</code></strong> — model + parser produces a clean <code>reasoning_content</code> separated from <code>content</code>. Best case; the router's "off" mode (<code>::nothink</code>) can suppress the trace by setting <code>enable_thinking=false</code>.</li>
+        <li><strong><code>inline</code></strong> — model emits <code>&lt;think&gt;...&lt;/think&gt;</code> as plain text without parser support, OR the parser exists but doesn't separate the two channels. Result: <code>content</code> contains both the trace and the answer. The router's "off" mode is meaningless here (no parser to toggle); the picker offers a separate <code>::nothink</code> row that suppresses thinking via prompt-side instruction.</li>
+        <li><strong><code>unsupported</code></strong> — the model is not reasoning-capable. No <code>&lt;think&gt;</code> emission expected. The router's reasoning-policy logic is a no-op.</li>
+      </ul>
+
+      <p>The picker UI uses these classifications to decide whether to show a separate "Reasoning off" row for each model.</p>
+
+      <h3 id="tps-bug">3.4 The TPS-counting bug — a worked example of why this matters</h3>
+      <p>This is the cleanest empirical illustration of why understanding reasoning matters operationally.</p>
+
+      <p>
+        <strong>The bug</strong>: the bench harness measured tokens-per-second by
+        reading <code>usage.completion_tokens</code> from the final SSE event and
+        dividing by <code>(t_done − t_first_token)</code>. For a 200-token answer over
+        2 seconds, that gives 100 tok/s. Sensible.
+      </p>
+
+      <p>
+        <strong>The catch</strong>: vLLM with <code>--reasoning-parser qwen3</code>
+        populates <code>usage.completion_tokens</code> with <strong>only the tokens in
+        <code>content</code></strong> — the <em>reasoning_content</em> tokens (which
+        can be 1000+ for a thinking model on a hard prompt) are excluded. So for a
+        Qwen3 reasoning trace of 1500 reasoning tokens + 50 content tokens streamed
+        over 2 seconds:
+      </p>
+
+      <ul>
+        <li>Wall-clock decode time: ~2.0 s</li>
+        <li>Stream produced ~1550 tokens of actual decode work</li>
+        <li><code>usage.completion_tokens</code> reports only 50 (just the content)</li>
+        <li>bench computes: 50 / 2.0 = <strong>25 tok/s</strong></li>
+        <li>True throughput: 1550 / 2.0 = <strong>775 tok/s</strong></li>
+      </ul>
+
+      <p>
+        The first bench pass on Qwen3-14B-NVFP4 reported 0.66 tok/s, underestimating
+        the true rate by roughly <strong>94×</strong> for thinking-heavy prompts where
+        99 % of the stream was reasoning. This was clearly wrong on inspection — the
+        GPU was working hard, the user saw tokens flowing rapidly — but the metric
+        said otherwise.
+      </p>
+
+      <p>
+        <strong>The fix</strong>
+        (<code>scripts/bench/_bench_core.py::stream_chat_completion</code>): accumulate
+        <code>delta.reasoning_content</code> chars alongside <code>delta.content</code>,
+        then derive:
+      </p>
+
+      <pre data-lang="python"><code>effective_tokens = max(usage.completion_tokens,
+                       (content_chars + reasoning_chars) // 4)</code></pre>
+
+      <p>
+        The <code>// 4</code> is the standard ~4-chars-per-token rule of thumb (see
+        <a href="llm-tokens-and-speed.html">llm-tokens-and-speed</a> §4). The
+        <code>max()</code> keeps accurate parsers from being penalised on short outputs
+        where the heuristic might underestimate.
+      </p>
+
+      <div class="callout good">
+        <div class="callout-icon">i</div>
+        <div>
+          The fix moved Qwen3-8B-NVFP4 from 14.53 tok/s to <strong>98.3 tok/s</strong>,
+          the number cited everywhere else in this project's docs. Validation: the
+          non-reasoning Llama-3.1-8B-Instruct-NVFP4 row moved from 95.53 to 95.88
+          tok/s — a 0.4 % drift consistent with measurement noise, proving the fix was
+          a no-op for non-reasoning models.
+        </div>
+      </div>
+
+      <h3 id="router-policies">3.5 Reasoning policies in the router</h3>
+      <p>The router exposes three knobs for handling reasoning traces:</p>
+
+      <ul>
+        <li><strong>Global <code>DEVAI_REASONING</code> env</strong>: <code>auto</code> (default), <code>off</code>, <code>low</code>, <code>medium</code>, <code>high</code>. Sets the per-request <code>reasoning_effort</code> field for engines that support it (vLLM with reasoning parser, harmony, etc.).</li>
+        <li><strong>Per-request <code>::&lt;reasoning&gt;</code> suffix</strong> in the model name (e.g. <code>Qwen3-8B-NVFP4::nothink@131072</code>): overrides the global policy for this one request only. Triggers a container recreate if the override changes (see <a href="nvfp4-coldstart.html">nvfp4-coldstart</a> §1's "What triggers a full cold start").</li>
+        <li><strong>Capability-gated rewrite</strong>: the router only emits <code>enable_thinking=false</code> on models the probe classified as <code>structured</code> (and <code>disable_verified=true</code>). On <code>inline</code> models the rewrite is a no-op because the parser cannot separate the streams anyway.</li>
+      </ul>
+
+      <p>
+        This three-layer setup matches the picker's UX: users see one row per (model,
+        ctx, reasoning_override) combination, and switching rows trips the right
+        cold-start path.
+      </p>
+
+      <!-- §4 -->
+      <h2 id="full-agent-loop">4. How they all interact — one full agent loop</h2>
+      <p>
+        Putting chat templates, tool calling, and reasoning together — here is what a
+        single agent turn looks like end-to-end:
+      </p>
+
+      <pre data-lang="text"><code>1. Agent (Claude Code) sends:
+     POST /v1/chat/completions
+     {model: "Qwen3-8B-NVFP4@131072",
+      messages: [...history...],
+      tools: [...declared tools...],
+      tool_choice: "auto",
+      stream: true}
+
+2. Router parses model name -> model = Qwen3-8B-NVFP4, ctx = 131072.
+   Checks current loaded model; recreates vLLM container if needed.
+   Forwards to vLLM with --reasoning-parser qwen3
+   --tool-call-parser qwen3_xml --max-model-len 131072.
+
+3. vLLM applies Qwen3 chat template:
+     &lt;|im_start|&gt;system\nYou are...\n&lt;|im_end|&gt;
+     &lt;|im_start|&gt;user\n...message...\n&lt;|im_end|&gt;
+     [each tool rendered as Qwen3 XML in the system message]
+     &lt;|im_start|&gt;assistant\n
+   then tokenises and runs inference.
+
+4. Model generates:
+     &lt;think&gt;The user wants the weather. I should call get_weather.&lt;/think&gt;
+     &lt;tool_call&gt;
+     &lt;function=get_weather&gt;&lt;parameter=city&gt;Paris&lt;/parameter&gt;&lt;/function&gt;
+     &lt;/tool_call&gt;
+     &lt;|im_end|&gt;
+
+5. vLLM streams SSE events:
+     a. delta.reasoning_content = "The user wants..." (parsed from &lt;think&gt;)
+     b. delta.tool_calls[0].function.name = "get_weather"
+     c. delta.tool_calls[0].function.arguments += "{\"city\":\"Paris\"}"
+     d. finish_reason = "tool_calls"
+
+6. Agent receives parsed tool call, executes get_weather("Paris"),
+   sends result back as new message:
+     {"role": "tool", "tool_call_id": "...", "content": "{\"temp\":18}"}
+
+7. Loop: back to step 1 with extended history. Router does NOT
+   recreate (same model + ctx + reasoning_override); vLLM extends
+   the KV cache with the new turn and continues from the existing
+   state.</code></pre>
+
+      <p>
+        Every numbered step has a concept covered above. The reason this project has so
+        much router code, so much YAML curation, and so much probe machinery is that
+        <strong>every model implements every step slightly differently</strong>, and
+        getting one detail wrong (parser name, tool format, reasoning override
+        semantics) means broken agents silently producing garbage instead of clean
+        errors.
+      </p>
+
+      <!-- §5 -->
+      <h2 id="practical">5. Practical implications</h2>
+
+      <div class="callout good">
+        <div class="callout-icon">i</div>
+        <div>
+          <ul style="margin-top:0">
+            <li><strong>Pick a model whose parsers your serving stack supports.</strong> A reasoning model with no parser plugin will leak <code>&lt;think&gt;</code> tokens into <code>content</code>. A tool model with no parser plugin will not call tools at all.</li>
+            <li><strong>Verify with the bench, not the model card.</strong> Model cards are optimistic. The probe + bench in this project is what tells you whether parsers actually work for <em>your</em> serving stack version.</li>
+            <li><strong>Don't conflate <code>reasoning_content</code> with <code>&lt;think&gt;</code>.</strong> The model emits <code>&lt;think&gt;</code> <em>tokens</em>; the parser separates them into the <code>reasoning_content</code> <em>field</em>. If you see literal <code>&lt;think&gt;</code> in your app's output, the parser failed.</li>
+            <li><strong>Don't conflate "tools" with "function calling" with "agentic".</strong> Tools are a JSON schema convention. Function calling is what tools-aware models do. "Agentic" is the higher-level loop where a host program actually executes the tools and feeds results back. The model is responsible only for emitting the middle bit.</li>
+            <li><strong>Cold-start cost includes parser flags.</strong> Changing reasoning override or tool-call mode triggers a container recreate (see <a href="nvfp4-coldstart.html">nvfp4-coldstart</a> §1). The picker surfaces these as separate rows so users opt-in deliberately.</li>
+            <li><strong>Streaming complicates everything.</strong> <code>tool_calls.arguments</code> arrives one character at a time and must be JSON-validated only after the stream closes. Same for <code>reasoning_content</code>. See <a href="openai-api-and-streaming.html">openai-api-and-streaming</a> for the wire format.</li>
+          </ul>
+        </div>
+      </div>
+
+      <!-- §6 -->
+      <h2 id="references">6. References</h2>
+
+      <h3>Chat templates</h3>
+      <ul>
+        <li>HuggingFace chat templating documentation: <a href="https://huggingface.co/docs/transformers/chat_templating">huggingface.co/docs/transformers/chat_templating</a>. The Jinja2 template format reference, with examples for ChatML, Llama 3, Mistral, and Phi.</li>
+        <li>OpenAI ChatML format (the original): <a href="https://github.com/openai/openai-python/blob/main/chatml.md">github.com/openai/openai-python/blob/main/chatml.md</a>. Historical reference — most modern models use a variant.</li>
+        <li>Qwen3 tokeniser config (chat_template, special tokens): <a href="https://huggingface.co/Qwen/Qwen3-8B/blob/main/tokenizer_config.json">huggingface.co/Qwen/Qwen3-8B/blob/main/tokenizer_config.json</a>.</li>
+      </ul>
+
+      <h3>Tool calling</h3>
+      <ul>
+        <li>OpenAI function-calling guide (the <em>de facto</em> protocol): <a href="https://platform.openai.com/docs/guides/function-calling">platform.openai.com/docs/guides/function-calling</a>.</li>
+        <li>vLLM tool-calling documentation, including parser plugins: <a href="https://docs.vllm.ai/en/latest/features/tool_calling.html">docs.vllm.ai/features/tool_calling</a>.</li>
+        <li>HuggingFace text-generation-inference tool docs (a separate but similar implementation): <a href="https://huggingface.co/docs/text-generation-inference/index">huggingface.co/docs/text-generation-inference</a>.</li>
+        <li>Hermes Function Calling spec (used by many open models): <a href="https://github.com/NousResearch/Hermes-Function-Calling">github.com/NousResearch/Hermes-Function-Calling</a>.</li>
+      </ul>
+
+      <h3>Reasoning models</h3>
+      <ul>
+        <li>DeepSeek-R1 paper (2025): <em>DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning.</em> <a href="https://arxiv.org/abs/2501.12948">arXiv:2501.12948</a>. Introduces the <code>&lt;think&gt;</code> block convention as an RL training target.</li>
+        <li>Qwen3 technical report — section on the thinking mode and <code>enable_thinking</code> flag.</li>
+        <li>gpt-oss model card (openai/gpt-oss-20b on HuggingFace) — describes the harmony channel format.</li>
+        <li>vLLM reasoning parser docs: <a href="https://docs.vllm.ai/en/latest/features/reasoning_outputs.html">docs.vllm.ai/features/reasoning_outputs</a>.</li>
+      </ul>
+
+      <h3>Project-internal</h3>
+      <ul>
+        <li><a href="router.html">router</a> — request rewrite chain, including <code>tool_choice_pinning_required</code> and reasoning-override propagation.</li>
+        <li><a href="backends.html">backends</a> — probe lifecycle that verifies parser flags before the router uses them.</li>
+        <li><a href="bench-results.html">bench-results</a> — TPS-counting fix history, template-leak issue with Nemotron, BPE-decode bug with R1-Distill-Llama-8B.</li>
+        <li><a href="attention-and-the-transformer.html">attention-and-the-transformer</a> — what the model <em>does</em> with the tokens the chat template produced.</li>
+        <li><a href="openai-api-and-streaming.html">openai-api-and-streaming</a> — the wire format these structured outputs travel over.</li>
+        <li><code>scripts/model-families.yaml</code> — per-family curated parser hints.</li>
+        <li><code>deploy/.vllm-reasoning-cache.json</code> — probe-verified parser results.</li>
+      </ul>
+
+    </div>
+
+    <aside class="toc-floating">
+      <h4>On this page</h4>
+      <ul></ul>
+    </aside>
+  </main>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-core.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/plugins/autoloader/prism-autoloader.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+<script src="assets/nav.js"></script>
+<script src="assets/widgets.js"></script>
+<script src="assets/site.js"></script>
+</body>
+</html>

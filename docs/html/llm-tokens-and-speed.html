@@ -1,0 +1,906 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LLM tokens and inference speeds — Dev AI Lab</title>
+<meta name="description" content="A beginner's guide to LLM tokens (BPE) and the prefill-vs-decode split. Derives the bandwidth-bound decode ceiling for Qwen3-8B-NVFP4 on RTX 4000 PRO Blackwell.">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism-tomorrow.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="site">
+  <main class="main">
+    <div class="content">
+
+      <header>
+        <span class="pill">Beginner's guide · tokens &amp; throughput</span>
+        <h1>LLM tokens and inference speeds</h1>
+        <p class="lead">
+          What an LLM token actually is (and why it is nothing like a compiler token), and
+          why "ingest a prompt" and "generate a reply" run at completely different speeds.
+          All concrete numbers come from this project's bench harness on
+          <code>nvidia/Qwen3-8B-NVFP4</code> running on an
+          NVIDIA RTX 4000 PRO Blackwell (24 GB GDDR7, ~640 GB/s).
+        </p>
+      </header>
+
+      <div class="callout">
+        <div class="callout-icon">i</div>
+        <div>
+          Companion to <a href="nvfp4-number-formats.html">nvfp4-number-formats</a> and
+          <a href="nvfp4-coldstart.html">nvfp4-coldstart</a>. Post-fix numbers in this doc
+          come from <a href="bench-results.html">bench-results</a> — prefer that file when
+          the rolled-up cache row in <code>deploy/.bench-cache.json</code> and this doc
+          disagree. If you already know what BPE is and can derive the memory-bandwidth
+          ceiling on a model in your head, skip to <a href="#hardware-bandwidth">§6</a>.
+        </div>
+      </div>
+
+      <!-- §1 -->
+      <h2 id="what-is-a-token">1. What is a "token", actually?</h2>
+      <p>
+        If you have a compiler background, the word <em>token</em> probably means
+        something specific: a syntactic unit produced by a lexer, like
+        <code>if</code>, <code>(</code>, <code>x</code>, <code>==</code>,
+        <code>42</code>, <code>)</code>, <code>{</code>. Each token corresponds to a
+        language construct chosen by the language designer. Two source files that mean
+        the same thing (modulo whitespace) tokenise the same way. This is
+        <strong>lexer tokenisation</strong> — a deterministic, designed split.
+      </p>
+      <p>
+        LLM tokens are a completely different beast. They are the output of a
+        <strong>learned, statistical compression</strong> of UTF-8 text. There is no
+        designer; there is a training corpus, a vocabulary size, and an algorithm that
+        picks subword units which appear <em>frequently</em> in the training data. The
+        tokeniser does not understand syntax, words, or languages. It just knows that
+        some sequences of bytes occur often enough to deserve their own slot in the
+        vocabulary.
+      </p>
+
+      <div class="callout warn">
+        <div class="callout-icon">i</div>
+        <div>
+          <strong>Four consequences to internalise up front:</strong>
+          <ul>
+            <li><strong>A token is not a word.</strong> Sometimes it is one whole word (<code>"hello"</code>). Often it is a fragment (<code>"un"</code>, <code>"believ"</code>, <code>"able"</code>), a single character, or even a single byte.</li>
+            <li><strong>A token includes its surrounding whitespace.</strong> <code>"hello"</code> and <code>" hello"</code> are <em>different</em> tokens with <em>different</em> IDs.</li>
+            <li><strong>Two LLMs do not share tokens.</strong> A Llama tokeniser and a Qwen tokeniser produce different token IDs for the same string and often a different <em>number</em> of tokens.</li>
+            <li><strong>Token count is what you pay for.</strong> API pricing, context windows, KV-cache memory, decode latency — all denominated in tokens, not characters.</li>
+          </ul>
+        </div>
+      </div>
+
+      <figure>
+        <svg viewBox="0 0 760 220" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Tokenisation example: hello world">
+          <defs>
+            <marker id="thinArr" markerWidth="10" markerHeight="8" refX="10" refY="4" orient="auto">
+              <path d="M0,0 L10,4 L0,8 Z" fill="var(--text-muted)"/>
+            </marker>
+          </defs>
+
+          <text x="380" y="22" text-anchor="middle" fill="var(--text)" font-size="14" font-weight="600">
+            How a Qwen-style BPE tokeniser splits <tspan font-family="JetBrains Mono">"hello world"</tspan>
+          </text>
+
+          <!-- Source string as one block of characters -->
+          <g font-family="JetBrains Mono" font-size="13">
+            <text x="40" y="58" fill="var(--text-muted)" font-size="11">UTF-8 string</text>
+            <rect x="40" y="68" width="240" height="34" rx="4" fill="var(--bg-elev)" stroke="var(--border-strong)"/>
+            <text x="160" y="90" text-anchor="middle" fill="var(--text)">"hello world"</text>
+            <text x="40" y="118" fill="var(--text-muted)" font-size="10">11 bytes — note the space at position 5</text>
+          </g>
+
+          <!-- Arrow down -->
+          <path d="M 160 130 v 20" stroke="var(--text-muted)" stroke-width="1.5" fill="none" marker-end="url(#thinArr)"/>
+
+          <!-- Token 1 -->
+          <g transform="translate(40, 160)">
+            <rect width="110" height="44" rx="6" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="2"/>
+            <text x="55" y="20" text-anchor="middle" fill="var(--accent)" font-family="JetBrains Mono" font-size="14" font-weight="700">"hello"</text>
+            <text x="55" y="36" text-anchor="middle" fill="var(--text-muted)" font-family="JetBrains Mono" font-size="10">ID 14990</text>
+          </g>
+
+          <!-- Plus -->
+          <text x="165" y="190" text-anchor="middle" fill="var(--text-muted)" font-size="18" font-weight="700">+</text>
+
+          <!-- Token 2 — leading space, different colour -->
+          <g transform="translate(180, 160)">
+            <rect width="140" height="44" rx="6" fill="rgba(240,180,41,0.18)" stroke="var(--warn)" stroke-width="2"/>
+            <text x="70" y="20" text-anchor="middle" fill="var(--warn)" font-family="JetBrains Mono" font-size="14" font-weight="700">"·world"</text>
+            <text x="70" y="36" text-anchor="middle" fill="var(--text-muted)" font-family="JetBrains Mono" font-size="10">ID 1879 (leading space)</text>
+          </g>
+
+          <!-- Comparison block: "hello" without leading space -->
+          <g transform="translate(440, 60)">
+            <text x="0" y="0" fill="var(--text-muted)" font-size="11">Same five letters, no leading space</text>
+            <rect width="280" height="44" rx="6" fill="var(--bg-elev)" stroke="var(--border-strong)"/>
+            <text x="20" y="28" fill="var(--text)" font-family="JetBrains Mono" font-size="13">"world"</text>
+            <text x="240" y="28" text-anchor="end" fill="var(--text-muted)" font-family="JetBrains Mono" font-size="11">ID 14460</text>
+          </g>
+
+          <g transform="translate(440, 130)">
+            <text x="0" y="0" fill="var(--text-muted)" font-size="11">With one leading space</text>
+            <rect width="280" height="44" rx="6" fill="rgba(240,180,41,0.18)" stroke="var(--warn)" stroke-width="2"/>
+            <text x="20" y="28" fill="var(--warn)" font-family="JetBrains Mono" font-size="13">"·world"</text>
+            <text x="240" y="28" text-anchor="end" fill="var(--text-muted)" font-family="JetBrains Mono" font-size="11">ID 1879</text>
+          </g>
+
+          <text x="580" y="200" text-anchor="middle" fill="var(--accent)" font-size="11" font-weight="600">
+            Different IDs · different rows in the embedding table
+          </text>
+        </svg>
+        <figcaption>
+          The yellow <code>·</code> visualises the leading space — GPT-style vocab files
+          mark it with U+0120 (a capital G with overdot). Two different IDs means two
+          different rows of the 4096-dim embedding table get looked up.
+        </figcaption>
+      </figure>
+
+      <p>
+        The Qwen3 tokeniser used by <code>Qwen3-8B-NVFP4</code> has a vocabulary of
+        <strong>151 936</strong> tokens (visible in <code>config.json</code> as
+        <code>vocab_size</code>). That's the entire universe of "things this model can
+        emit one of" at any given step.
+      </p>
+
+      <!-- §2 -->
+      <h2 id="bpe">2. How a BPE tokeniser actually works</h2>
+      <p>
+        The dominant algorithm in modern LLMs is <strong>Byte-Pair Encoding (BPE)</strong>,
+        originally a 1994 data-compression trick adapted to NLP by Sennrich, Haddow
+        &amp; Birch (2016 — <em>Neural Machine Translation of Rare Words with Subword
+        Units</em>, ACL).
+      </p>
+
+      <p>The training-time algorithm is short:</p>
+      <ol>
+        <li>Start with a vocabulary of all individual bytes (256 entries) or all individual Unicode characters (a few thousand).</li>
+        <li>Tokenise a large training corpus using just those base units.</li>
+        <li>Find the <strong>most frequent adjacent pair</strong> of tokens across the corpus. Add a new token that represents that pair, and rewrite every occurrence in the corpus to use the new merged token.</li>
+        <li>Repeat step 3 until the vocabulary reaches the target size (typically 30 K &ndash; 150 K).</li>
+      </ol>
+      <p>
+        The result is an ordered list of <strong>merge rules</strong> plus a vocabulary
+        mapping. Tokenising any new string at inference time means greedily applying the
+        merge rules in the order they were learned.
+      </p>
+
+      <h3 id="bpe-worked">2.1 Worked example — building tiny BPE in 5 steps</h3>
+      <p>
+        Suppose your entire training corpus is the string
+        <code>low low low lowest newest</code>. Start with character-level tokens:
+      </p>
+      <pre data-lang="text"><code>   l  o  w  _  l  o  w  _  l  o  w  _  l  o  w  e  s  t  _  n  e  w  e  s  t</code></pre>
+      <p>
+        (<code>_</code> represents a space.) Now look for the most frequent adjacent
+        pair. Every step:
+      </p>
+
+      <ul>
+        <li>
+          <strong>Step 1</strong>: pair <code>l o</code> appears 4 times → merge into new token <code>lo</code>. Corpus becomes:
+          <pre data-lang="text"><code>   lo w _ lo w _ lo w _ lo w e s t _ n e w e s t</code></pre>
+        </li>
+        <li>
+          <strong>Step 2</strong>: pair <code>lo w</code> appears 4 times → merge into <code>low</code>.
+          <pre data-lang="text"><code>   low _ low _ low _ low e s t _ n e w e s t</code></pre>
+        </li>
+        <li>
+          <strong>Step 3</strong>: pair <code>e s</code> appears 2 times → merge into <code>es</code>.
+          <pre data-lang="text"><code>   low _ low _ low _ low es t _ n e w es t</code></pre>
+        </li>
+        <li>
+          <strong>Step 4</strong>: pair <code>es t</code> appears 2 times → merge into <code>est</code>.
+          <pre data-lang="text"><code>   low _ low _ low _ low est _ n e w est</code></pre>
+        </li>
+        <li>
+          <strong>Step 5</strong>: pair <code>n e</code> appears 1 time, pair <code>w est</code> appears 1 time, etc. Keep going until you hit your vocabulary budget.
+        </li>
+      </ul>
+
+      <p>
+        The vocabulary is now <code>{l, o, w, _, e, s, t, n, lo, low, es, est}</code>.
+        Tokenising a <em>new</em> string like <code>lowest newest</code> runs the same
+        merge rules in order:
+      </p>
+      <pre data-lang="text"><code>   l o w e s t _ n e w e s t
+   -&gt; lo w e s t _ n e w e s t      (merge 1)
+   -&gt; low e s t _ n e w e s t       (merge 2)
+   -&gt; low es t _ n e w es t         (merge 3)
+   -&gt; low est _ n e w est           (merge 4)</code></pre>
+      <p>
+        Result: <code>["low", "est", "_", "n", "e", "w", "est"]</code> — 7 tokens for
+        13 characters. The merges learned during training make the common sequence
+        <code>low est</code> cheap (2 tokens) while the rare sequence <code>n e w</code>
+        stays expensive (3 tokens).
+      </p>
+
+      <p>
+        Real LLM tokenisers do this same thing on a multi-billion-character corpus with
+        vocabularies in the 30 K &ndash; 150 K range. The result is that frequent words
+        and word fragments collapse to single tokens, while rare strings split into many
+        short tokens.
+      </p>
+
+      <div class="callout good">
+        <div class="callout-icon">i</div>
+        <div>
+          <strong>Want to see this live?</strong> Andrej Karpathy's <em>Let's build the
+          GPT Tokenizer</em> (YouTube, 2024) walks through a from-scratch BPE
+          implementation and visualises the merges interactively — easily the best
+          educational resource on the topic.
+        </div>
+      </div>
+
+      <!-- §3 -->
+      <h2 id="surprises">3. Token surprises — things that catch newcomers off-guard</h2>
+
+      <h3 id="surprise-whitespace">3.1 Whitespace is part of the token</h3>
+      <p>
+        <code>"hello"</code> and <code>" hello"</code> (with a leading space) are
+        <strong>different tokens</strong> in every modern tokeniser. The leading space
+        is glued to the <em>following</em> word. This is why the GPT-style tokenisers
+        refer to "tokens with a leading space" using a special prefix character (Unicode
+        U+0120, often shown as a capital G with an overdot in vocab files) — that prefix
+        is the visualisation of a leading space.
+      </p>
+
+      <h3 id="surprise-numbers">3.2 Numbers usually split character-by-character</h3>
+      <p>
+        The string <code>"12345"</code> is rarely one token. Most tokenisers split it
+        into <code>["1", "23", "45"]</code> or even
+        <code>["1", "2", "3", "4", "5"]</code>. Why? Because the training corpus
+        contains every possible number, and no single multi-digit string is frequent
+        enough to earn its own merge. This has practical consequences: arithmetic-heavy
+        prompts use far more tokens than their character count would suggest, and LLMs
+        that "can't do arithmetic" are partly bottlenecked by their tokeniser.
+      </p>
+
+      <h3 id="surprise-code">3.3 Code can be very dense or very sparse</h3>
+      <p>
+        Common identifiers and keywords (<code>function</code>, <code>return</code>,
+        <code>console.log</code>, <code>import numpy as np</code>) often collapse to
+        1&ndash;2 tokens because they appeared millions of times in the training set.
+        Rare or domain-specific names (<code>def my_obscure_helper_function</code>) can
+        take many more tokens than their character count suggests.
+      </p>
+
+      <h3 id="surprise-language">3.4 Non-English text uses far more tokens per word</h3>
+      <p>
+        A tokeniser trained mostly on English will assign single-token slots to common
+        English words but encode Chinese, Arabic, Korean, or Cyrillic strings as long
+        sequences of byte-level tokens. The same sentence can take 1.3 tokens per word
+        in English, 3&ndash;5 tokens per word in German, and 6+ tokens per word in many
+        non-Latin scripts. Modern multilingual tokenisers (Qwen3 included — its 151 K
+        vocab is much larger than English-only models because most of the additional
+        slots are CJK characters) reduce but do not eliminate this gap.
+      </p>
+
+      <h3 id="surprise-special">3.5 Special tokens carry chat-template structure</h3>
+      <p>
+        Modern chat-tuned models reserve token IDs for <em>control tokens</em> that have
+        no character representation in normal text. Qwen3 reserves slots like
+        <code>&lt;|im_start|&gt;</code>, <code>&lt;|im_end|&gt;</code>,
+        <code>&lt;|tool_call|&gt;</code>, <code>&lt;|reasoning|&gt;</code>. The chat
+        template (e.g. <code>tokenizer_config.json</code>) inserts these around your
+        messages so the model can tell where each turn starts and stops.
+      </p>
+      <p>
+        This is why the bench harness explicitly looks for these markers in the
+        <em>output</em> — if the model emits <code>&lt;|im_end|&gt;</code> as visible
+        text instead of using it as a control token, the parser failed (see
+        <a href="bench-results.html">bench-results</a> "Issues surfaced", #3, for a real
+        example of <code>&lt;/think&gt;</code> leaking from
+        <code>Nemotron-Nano-9B-v2-NVFP4</code>).
+      </p>
+
+      <!-- §4 -->
+      <h2 id="rates">4. Rough conversion rates — tokens per word, characters, etc.</h2>
+      <p>Useful rules of thumb for English text on Latin-vocab tokenisers:</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Quantity</th><th>Approximate ratio</th><th>Source</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Characters per token</td><td>~4</td><td>OpenAI's tokeniser FAQ; consistent across BPE models</td></tr>
+            <tr><td>Tokens per English word</td><td>~1.3</td><td>empirical on Common Crawl</td></tr>
+            <tr><td>Words per token</td><td>~0.75</td><td>inverse of above</td></tr>
+            <tr><td>Tokens per page of single-spaced English</td><td>~500</td><td>rough</td></tr>
+            <tr><td>Tokens per typical chat turn (one user message)</td><td>10 &ndash; 100</td><td>user chat data</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>
+        <strong>Caveat — these break for code, JSON, numbers, and non-English text</strong>
+        by factors of 2&ndash;5. The bench harness's prompts
+        (<code>scripts/bench/data/latency_prompts.jsonl</code>) are short English
+        factual questions like <em>"What is 2 + 2?"</em> (14 chars ≈ 5 tokens) and
+        <em>"Name the largest planet in the Solar System. One word."</em>
+        (54 chars ≈ 14 tokens).
+      </p>
+
+      <!-- §5 -->
+      <h2 id="prefill-decode">5. The two phases of LLM inference</h2>
+      <p>
+        Generating a reply happens in two sharply different phases. Failing to
+        distinguish them is the single most common source of confusion when reading
+        inference benchmarks.
+      </p>
+
+      <figure>
+        <svg viewBox="0 0 760 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Prefill vs decode timeline">
+          <defs>
+            <marker id="prefArr" markerWidth="10" markerHeight="8" refX="10" refY="4" orient="auto">
+              <path d="M0,0 L10,4 L0,8 Z" fill="var(--accent)"/>
+            </marker>
+          </defs>
+
+          <text x="380" y="22" text-anchor="middle" fill="var(--text)" font-size="14" font-weight="600">
+            Prefill (compute-bound) vs Decode (memory-bandwidth-bound)
+          </text>
+
+          <!-- PREFILL: one wide bar -->
+          <g transform="translate(40, 50)">
+            <text x="0" y="14" fill="var(--accent)" font-size="13" font-weight="700">Prefill</text>
+            <text x="0" y="32" fill="var(--text-muted)" font-size="11">one parallel forward pass · all N input tokens at once</text>
+
+            <rect x="0" y="48" width="500" height="34" rx="4" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="2"/>
+            <text x="250" y="70" text-anchor="middle" fill="var(--accent)" font-family="JetBrains Mono" font-size="12" font-weight="700">
+              N × hidden  matmul  →  populate full KV cache
+            </text>
+            <text x="510" y="70" fill="var(--accent)" font-size="11">→ first token</text>
+
+            <text x="0" y="105" fill="var(--text-muted)" font-size="11">
+              Tensor cores busy · big matrix multiplies · bandwidth amortised across N positions
+            </text>
+            <text x="0" y="120" fill="var(--good)" font-size="11" font-weight="600">
+              Typical: thousands of tokens/s
+            </text>
+          </g>
+
+          <!-- DECODE: many small bars -->
+          <g transform="translate(40, 200)">
+            <text x="0" y="0" fill="var(--warn)" font-size="13" font-weight="700">Decode</text>
+            <text x="0" y="18" fill="var(--text-muted)" font-size="11">serial loop · one forward pass per generated token · seq-len = 1 each step</text>
+
+            <!-- 10 small bars -->
+            <g>
+              <rect x="0"   y="32" width="38" height="28" rx="3" fill="rgba(240,180,41,0.18)" stroke="var(--warn)"/>
+              <rect x="44"  y="32" width="38" height="28" rx="3" fill="rgba(240,180,41,0.18)" stroke="var(--warn)"/>
+              <rect x="88"  y="32" width="38" height="28" rx="3" fill="rgba(240,180,41,0.18)" stroke="var(--warn)"/>
+              <rect x="132" y="32" width="38" height="28" rx="3" fill="rgba(240,180,41,0.18)" stroke="var(--warn)"/>
+              <rect x="176" y="32" width="38" height="28" rx="3" fill="rgba(240,180,41,0.18)" stroke="var(--warn)"/>
+              <rect x="220" y="32" width="38" height="28" rx="3" fill="rgba(240,180,41,0.18)" stroke="var(--warn)"/>
+              <rect x="264" y="32" width="38" height="28" rx="3" fill="rgba(240,180,41,0.18)" stroke="var(--warn)"/>
+              <rect x="308" y="32" width="38" height="28" rx="3" fill="rgba(240,180,41,0.18)" stroke="var(--warn)"/>
+              <rect x="352" y="32" width="38" height="28" rx="3" fill="rgba(240,180,41,0.18)" stroke="var(--warn)"/>
+              <rect x="396" y="32" width="38" height="28" rx="3" fill="rgba(240,180,41,0.18)" stroke="var(--warn)"/>
+              <text x="217" y="50" text-anchor="middle" fill="var(--warn)" font-size="10" font-weight="700">tok 1</text>
+              <text x="440" y="50" fill="var(--warn)" font-size="11">…</text>
+            </g>
+
+            <text x="0" y="80" fill="var(--text-muted)" font-size="11">
+              Each step: read all weights (5.1 GB) + read full KV cache · compute is trivial
+            </text>
+            <text x="0" y="95" fill="var(--warn)" font-size="11" font-weight="600">
+              Measured: 98.3 tok/s for Qwen3-8B-NVFP4 (≈78% of 640 GB/s ceiling)
+            </text>
+          </g>
+        </svg>
+        <figcaption>
+          Prefill processes <em>N</em> input tokens in one parallel pass; decode produces
+          one token per loop iteration. The two phases stress different subsystems of the
+          GPU — that is why their tok/s numbers differ by an order of magnitude or more.
+        </figcaption>
+      </figure>
+
+      <h3 id="prefill">5.1 Prefill ("ingest") — process all input tokens at once</h3>
+      <p>
+        When you submit a prompt of, say, 200 tokens, the runtime tokenises the prompt
+        and then runs <strong>one forward pass</strong> through the model that processes
+        <em>all 200 tokens in parallel</em>. Inside that single pass:
+      </p>
+      <ul>
+        <li>Every Linear layer sees a (batch × 200 × hidden) input matrix and produces a (batch × 200 × hidden) output.</li>
+        <li>Attention runs once over the full 200×200 attention matrix.</li>
+        <li>The K and V values for every prompt token get computed and written to the KV cache.</li>
+        <li>The model emits one logit vector per token, but only the very last token's logits matter — that is the prediction for the next token.</li>
+      </ul>
+      <p>
+        Prefill is <strong>embarrassingly parallel across the sequence dimension</strong>.
+        Tensor cores get to chew on big matrix multiplies. Memory bandwidth is amortised
+        over many parallel ops on the same weights. This phase is
+        <strong>compute-bound</strong> on modern GPUs.
+      </p>
+      <p>
+        Prefill speed typically lands in the <em>thousands of tokens per second</em> for
+        small-to-medium models on a Blackwell card.
+      </p>
+
+      <h3 id="decode">5.2 Decode ("generate") — produce one token at a time</h3>
+      <p>Once prefill is done, the runtime enters a loop:</p>
+      <pre data-lang="text"><code>   for step in 1..max_new_tokens:
+       1. Take last predicted token, embed it, run forward pass
+          for sequence length 1.
+       2. Read all model weights from VRAM.
+       3. Read every K and V from the KV cache (length = prompt + step).
+       4. Sample next token from the resulting logits.
+       5. Append the new K and V to the cache.
+       6. Stream the token back to the client.</code></pre>
+      <p>
+        Each loop iteration produces <strong>one</strong> token. The model's full
+        weights must travel from VRAM through the on-chip caches to the tensor cores
+        <em>for every single token generated</em>. Worse, the per-token KV-cache read
+        grows linearly as the sequence lengthens.
+      </p>
+
+      <div class="callout danger">
+        <div class="callout-icon">i</div>
+        <div>
+          Decode is <strong>memory-bandwidth-bound</strong> at batch size 1. The tensor
+          cores are mostly idle — they could process 100× more matrix work, but they
+          have to wait for the next chunk of weights to arrive from VRAM. This is the
+          central performance reality of single-stream LLM serving.
+        </div>
+      </div>
+
+      <p>
+        Decode speed for the reference model is <strong>98.3 tok/s</strong> in this
+        project's bench (Qwen3-8B-NVFP4, post-fix; see
+        <a href="#decode-math">§7</a> for the math).
+      </p>
+
+      <h3 id="prefill-decode-ops">5.3 Why this matters operationally</h3>
+      <div class="card-grid">
+        <div class="card">
+          <h4>TTFT (time-to-first-token)</h4>
+          <p>Dominated by <em>prefill</em>: long prompt → long prefill → user waits longer for the first token.</p>
+        </div>
+        <div class="card">
+          <h4>Sustained tok/s</h4>
+          <p>The decode rate: how fast the reply streams <em>after</em> the first token. Long generations spend most of their wall time here.</p>
+        </div>
+        <div class="card">
+          <h4>Which one to optimise</h4>
+          <p>For an interactive agent, low TTFT often matters more than high sustained rate; for a batch summariser, the opposite.</p>
+        </div>
+      </div>
+
+      <!-- §6 -->
+      <h2 id="hardware-bandwidth">6. The hardware bandwidth hierarchy</h2>
+      <p>
+        LLM inference is, at its heart, a series of memory transfers. Here is the rough
+        hierarchy of bandwidth available to the GPU, fastest first (numbers are typical
+        orders of magnitude — exact figures vary by part):
+      </p>
+
+      <pre data-lang="text"><code>   +-------------------------------------------------------+
+   |  GPU register file &amp; L1 cache    ~10 000 GB/s        | on-chip
+   |  GPU L2 cache                    ~5 000 GB/s         |
+   |  ================================================    |
+   |  HBM3e (B100/B200)               ~8 000 GB/s         | off-chip but on-package
+   |  GDDR7 (RTX 4000/5090/PRO 6000)  ~650 - 1 800 GB/s   |
+   |  ================================================    |
+   |  PCIe Gen5 x16 (host &lt;-&gt; GPU)      ~64 GB/s peak,      | system-bus
+   |                                  ~55 GB/s practical  |
+   |  DDR5 host RAM                   ~50 - 80 GB/s       |
+   |  NVMe Gen5 SSD                    ~12 GB/s           | storage
+   |  NVMe Gen4 SSD                    ~7 GB/s            |
+   |  Gigabit Ethernet                 ~0.1 GB/s          | network
+   +-------------------------------------------------------+</code></pre>
+
+      <p>
+        (Sources: NVIDIA datasheets for Blackwell parts, JEDEC GDDR7 spec, PCI-SIG PCIe
+        5.0 spec, NVMe consortium published rates.)
+      </p>
+      <p>
+        The reference card — <strong>NVIDIA RTX 4000 PRO Blackwell</strong> — has 24 GB
+        of GDDR7 with a documented <strong>~640 GB/s memory bandwidth</strong> (see
+        <a href="bench-results.html">bench-results</a>, top of file).
+      </p>
+
+      <h3 id="tier-table">What each tier matters for</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Tier</th><th>When it matters</th><th>Example for Qwen3-8B-NVFP4</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>L1/L2 cache</td><td>Tiny tensors that fit on-chip — irrelevant to weights</td><td>rare for inference</td></tr>
+            <tr><td>HBM3e / GDDR7 (VRAM)</td><td><strong>Decode bandwidth</strong>: every generated token requires reading all weights</td><td>binds 98.3 tok/s steady decode</td></tr>
+            <tr><td>PCIe Gen5</td><td>Moving the model from system RAM to VRAM during cold start</td><td>~0.1 s for the 6 GB checkpoint</td></tr>
+            <tr><td>DDR5 RAM</td><td>Holding the safetensors mmap before / during page-cache warm-up</td><td>~50 GB/s, rarely the bottleneck</td></tr>
+            <tr><td>SSD / NVMe</td><td>First-time load from disk; cold page cache</td><td>~12 GB/s on Gen5 SSD</td></tr>
+            <tr><td>Network</td><td>Streaming reply tokens to the client</td><td>trivial for text</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>
+        The gap between VRAM bandwidth and PCIe bandwidth is roughly <strong>10×</strong>.
+        The gap between VRAM and L2 is another <strong>10×</strong>. This hierarchy is
+        exactly why a model that lives in VRAM serves at tens of tok/s, the same model
+        offloaded to system RAM serves at sub-1 tok/s, and the same model served from
+        disk-paged-in is unusable.
+      </p>
+
+      <!-- §7 -->
+      <h2 id="decode-math">7. Decode speed math — why Qwen3-8B-NVFP4 hits ~98 tok/s</h2>
+      <p>
+        Now we can connect the dots. For each generated token, decode at batch=1 must
+        read approximately:
+      </p>
+      <pre data-lang="text"><code>   bytes_per_token = (model weights on device) + (KV cache up to current position)</code></pre>
+
+      <p>
+        For Qwen3-8B-NVFP4 (see <a href="nvfp4-coldstart.html">nvfp4-coldstart</a> §2 for the breakdown):
+      </p>
+      <ul>
+        <li>NVFP4 transformer weights: <strong>~3.9 GB</strong></li>
+        <li>BF16 embeddings + lm_head (tied): <strong>~1.2 GB</strong></li>
+        <li>→ live weights: <strong>~5.1 GB</strong></li>
+      </ul>
+
+      <p>
+        The bench prompts are short (10 &ndash; 50 input tokens, generating up to 256
+        output tokens — see <code>scripts/bench/data/latency_prompts.jsonl</code>), so
+        the KV-cache term is small (under 100 MB) and we can ignore it.
+      </p>
+
+      <p><strong>Theoretical decode ceiling</strong> (perfect memory bandwidth utilisation, no compute overhead):</p>
+      <p style="text-align:center" id="ceiling-formula"></p>
+
+      <p><strong>Measured</strong> (<code>tps_sustained_p50</code> in <a href="bench-results.html">bench-results</a>):</p>
+      <p style="text-align:center" id="measured-formula"></p>
+
+      <p>
+        That 78 % is excellent for batch-size-1 decode. The remaining ~22 % goes to
+        NVFP4 dequantisation cost (per-block FP8 scales applied before each matmul),
+        framework overhead, kernel launch latency, and attention/RMSNorm compute.
+      </p>
+
+      <h3 id="bandwidth-chart">7.1 The bandwidth ceiling, charted</h3>
+      <p>
+        Two models, two weight formats, same card. The horizontal bars show measured
+        decode rate vs. the bandwidth-derived ceiling for each. NVFP4 sits at ~78 % of
+        its (higher) ceiling; BF16 pegs its own (lower) ceiling within measurement noise.
+      </p>
+
+      <figure>
+        <svg viewBox="0 0 760 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Bandwidth-bound ceiling: measured vs ceiling for two models">
+          <!-- Title -->
+          <text x="380" y="22" text-anchor="middle" fill="var(--text)" font-size="14" font-weight="600">
+            Bandwidth-bound decode ceiling vs. measured tok/s · RTX 4000 PRO Blackwell · 640 GB/s
+          </text>
+
+          <!-- Axes -->
+          <line x1="180" y1="60" x2="180" y2="280" stroke="var(--border-strong)" stroke-width="2"/>
+          <line x1="180" y1="280" x2="700" y2="280" stroke="var(--border-strong)" stroke-width="2"/>
+
+          <!-- X scale: 0 → 140 tok/s, 1 tok/s = 3.6 px -->
+          <!-- Grid lines + labels -->
+          <g font-family="JetBrains Mono" font-size="10" fill="var(--text-muted)">
+            <line x1="252" y1="60" x2="252" y2="280" stroke="var(--border)" stroke-dasharray="2 2"/>
+            <text x="252" y="296" text-anchor="middle">20</text>
+            <line x1="324" y1="60" x2="324" y2="280" stroke="var(--border)" stroke-dasharray="2 2"/>
+            <text x="324" y="296" text-anchor="middle">40</text>
+            <line x1="396" y1="60" x2="396" y2="280" stroke="var(--border)" stroke-dasharray="2 2"/>
+            <text x="396" y="296" text-anchor="middle">60</text>
+            <line x1="468" y1="60" x2="468" y2="280" stroke="var(--border)" stroke-dasharray="2 2"/>
+            <text x="468" y="296" text-anchor="middle">80</text>
+            <line x1="540" y1="60" x2="540" y2="280" stroke="var(--border)" stroke-dasharray="2 2"/>
+            <text x="540" y="296" text-anchor="middle">100</text>
+            <line x1="612" y1="60" x2="612" y2="280" stroke="var(--border)" stroke-dasharray="2 2"/>
+            <text x="612" y="296" text-anchor="middle">120</text>
+            <line x1="684" y1="60" x2="684" y2="280" stroke="var(--border)" stroke-dasharray="2 2"/>
+            <text x="684" y="296" text-anchor="middle">140</text>
+            <text x="440" y="312" text-anchor="middle" font-size="11">tokens / second (batch = 1, short context)</text>
+          </g>
+
+          <!-- ROW 1: Qwen3-8B-NVFP4 -->
+          <g>
+            <text x="170" y="92" text-anchor="end" fill="var(--text)" font-size="12" font-weight="600">Qwen3-8B-NVFP4</text>
+            <text x="170" y="106" text-anchor="end" fill="var(--text-muted)" font-size="10">5.1 GB weights</text>
+
+            <!-- Ceiling bar (lighter, full) -->
+            <!-- 125 tok/s = 125 * 3.6 = 450 px -->
+            <rect x="180" y="80" width="450" height="20" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.5" rx="3"/>
+            <text x="635" y="95" fill="var(--accent)" font-size="11" font-weight="600">ceiling ≈ 125 tok/s</text>
+
+            <!-- Measured bar (darker, partial) -->
+            <!-- 98.3 tok/s = 98.3 * 3.6 = 354 px -->
+            <rect x="180" y="104" width="354" height="20" fill="var(--accent)" rx="3"/>
+            <text x="540" y="119" fill="var(--accent)" font-size="11" font-weight="700">measured 98.3 tok/s · 78%</text>
+          </g>
+
+          <!-- ROW 2: DeepSeek-R1-Distill-Llama-8B BF16 -->
+          <g>
+            <text x="170" y="172" text-anchor="end" fill="var(--text)" font-size="12" font-weight="600">R1-Distill-Llama-8B</text>
+            <text x="170" y="186" text-anchor="end" fill="var(--text-muted)" font-size="10">16 GB weights (BF16)</text>
+
+            <!-- Ceiling bar -->
+            <!-- 40 tok/s = 144 px -->
+            <rect x="180" y="160" width="144" height="20" fill="rgba(240,180,41,0.20)" stroke="var(--warn)" stroke-width="1.5" rx="3"/>
+            <text x="330" y="175" fill="var(--warn)" font-size="11" font-weight="600">ceiling ≈ 40 tok/s</text>
+
+            <!-- Measured bar (slightly past ceiling) -->
+            <!-- 42 tok/s = 151 px -->
+            <rect x="180" y="184" width="151" height="20" fill="var(--warn)" rx="3"/>
+            <text x="340" y="199" fill="var(--warn)" font-size="11" font-weight="700">measured 42 tok/s · ≈100% (at wall)</text>
+          </g>
+
+          <!-- Caption -->
+          <text x="180" y="248" fill="var(--text-muted)" font-size="11">
+            <tspan x="180" dy="0">ceiling = (640 GB/s) / (weights in GB)  ·  ignores KV cache for short prompts</tspan>
+            <tspan x="180" dy="14" fill="var(--accent)" font-weight="600">NVFP4 wins by shrinking the per-token byte budget, not by being faster per byte.</tspan>
+          </text>
+        </svg>
+        <figcaption>
+          Each row plots one model. The lighter outline is the bandwidth-derived ceiling;
+          the solid bar is the measured decode rate from <code>bench-results.md</code>.
+          BF16 measured ≥ ceiling means the bench is at the memory wall to within
+          measurement noise — quantisation is the only way to go faster on this card.
+        </figcaption>
+      </figure>
+
+      <h3 id="bf16-math">7.2 The same math for BF16 — proves it's bandwidth-bound</h3>
+      <p>
+        The R1-Distill family in <a href="bench-results.html">bench-results</a> ships in
+        <strong>BF16</strong> rather than NVFP4. For an 8 B BF16 model:
+      </p>
+      <pre data-lang="text"><code>   bf16_weights = ~16 GB on device
+   ceiling      = 640 GB/s / 16 GB ~ 40 tok/s
+   measured     = 42 tok/s for DeepSeek-R1-Distill-Llama-8B</code></pre>
+
+      <div class="callout good">
+        <div class="callout-icon">i</div>
+        <div>
+          The measured number is <em>at the theoretical ceiling</em>. There is literally
+          no way to make BF16 batch=1 decode faster on this card without changing either
+          the bandwidth (different GPU) or the per-token byte budget (smaller weights →
+          quantisation).
+        </div>
+      </div>
+
+      <p>
+        This is the cleanest possible empirical proof that batch=1 LLM decode is
+        memory-bandwidth-bound. Both data points (NVFP4 at 78 % of its theoretical
+        ceiling; BF16 at 100+ % of its theoretical ceiling within measurement noise)
+        trace back to the same <code>bandwidth / weight_size</code> formula. NVFP4 wins
+        not because tensor cores are faster (although they are) but because each
+        generated token only has to <em>move</em> a quarter of the bytes a BF16 model
+        would move.
+      </p>
+
+      <div class="callout">
+        <div class="callout-icon">i</div>
+        <div>
+          <strong>From <code>bench-results.md</code>'s "Architectural finding" section:</strong>
+          the ~2.3× tok/s gap between NVFP4 and BF16 on this card is exactly what you
+          would predict from <code>(bf16 bytes / nvfp4 bytes)</code> after accounting
+          for the BF16 case running closer to 100 % of bandwidth peak than NVFP4 does.
+        </div>
+      </div>
+
+      <h3 id="long-context-decode">7.3 Why long contexts slow decode further</h3>
+      <p>
+        At long context, the KV cache is no longer negligible. For Qwen3-8B-NVFP4 with
+        FP8 KV at 128 K context:
+      </p>
+      <pre data-lang="text"><code>   weights + KV = 5.1 GB + 9.4 GB = 14.5 GB per token
+   ceiling     = 640 / 14.5 ~ 44 tok/s   (down from 125 tok/s at 0 KV)</code></pre>
+      <p>
+        Long context cuts the bandwidth ceiling proportionally. This is why the same
+        model "feels faster" at the start of a conversation and "feels slower" deep into
+        a long session — the KV cache grew and the per-token byte budget grew with it.
+      </p>
+
+      <!-- §8 -->
+      <h2 id="ttft-math">8. TTFT math — what makes the first token slow</h2>
+      <p>
+        <code>ttft_ms_first</code> (in the bench cache) and steady TTFT are two very
+        different things.
+      </p>
+
+      <h3 id="ttft-cold">8.1 Cold-start TTFT — 45.6 s for Qwen3-8B-NVFP4</h3>
+      <p>
+        The first request to a freshly recreated container pays the full cost of phases
+        1 &ndash; 11 in <a href="nvfp4-coldstart.html">nvfp4-coldstart</a>. The dominant
+        components on this card are:
+      </p>
+      <ul>
+        <li>Container start + Python imports (a few seconds)</li>
+        <li>Weight H2D copy over PCIe (~0.1 s for 6 GB at PCIe Gen5)</li>
+        <li>CUDA context init + cuBLAS workspaces</li>
+        <li><strong>CUDA graph capture</strong> with NVFP4 cutlass JIT autotune — usually the longest pole</li>
+        <li>First prefill of the actual prompt</li>
+        <li>First decode step</li>
+      </ul>
+      <p>
+        The 45.6 s figure measured here lumps all of those together — the project does
+        not yet have per-phase instrumentation.
+      </p>
+
+      <h3 id="ttft-steady">8.2 Steady-state TTFT — 32.7 ms p50 for Qwen3-8B-NVFP4</h3>
+      <p>
+        Once warm, TTFT is dominated by <strong>prefill of the prompt + first decode
+        step</strong>. For the bench's short prompts (~10&ndash;50 tokens):
+      </p>
+      <ul>
+        <li>Prefill ~50 tokens through an 8 B NVFP4 model on Blackwell tensor cores: a few milliseconds. Compute-bound, but these are small matmuls so total work is tiny.</li>
+        <li>First decode step: read all weights once → at 640 GB/s and 5.1 GB, about 8 ms; plus attention compute and sampling.</li>
+      </ul>
+      <p>
+        32.7 ms total is consistent with that arithmetic and matches the expectation
+        that prefill is fast for short prompts on a modern card.
+      </p>
+
+      <h3 id="ttft-long">8.3 TTFT scales with prompt length</h3>
+      <p>Long prompts make prefill expensive. For a 10 K-token prompt:</p>
+      <ul>
+        <li>Prefill: sequence length 10 K through every Linear → seconds of tensor-core work.</li>
+        <li>First decode: same ~8 ms as before.</li>
+      </ul>
+      <p>
+        Empirically, TTFT for very long prompts on Blackwell-class cards is on the order
+        of <strong>prompt_tokens × small_constant</strong> — usually 0.1 &ndash; 1 ms
+        per prompt token for an 8 B model, much higher for 70 B class. The bench harness
+        only measures short-prompt TTFT, so we don't have a long-prompt curve here; if
+        you need it, the <code>make bench-vllm</code> Makefile target can be re-run with
+        custom <code>scripts/bench/data/latency_prompts.jsonl</code> content.
+      </p>
+
+      <!-- §9 -->
+      <h2 id="headline">9. Putting it all together — the headline table</h2>
+      <p>
+        Cross-referencing <a href="bench-results.html">bench-results</a> for the
+        post-TPS-fix numbers on this card:
+      </p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Metric (Qwen3-8B-NVFP4 on RTX 4000 PRO Blackwell)</th><th>Value</th><th>Source</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Tokeniser vocabulary</td><td>151 936 tokens</td><td><code>config.json</code> <code>vocab_size</code></td></tr>
+            <tr><td>Cold-start TTFT (recreate + load + capture + prefill + first decode)</td><td><strong>45 600 ms</strong></td><td>bench <code>ttft_ms_first</code></td></tr>
+            <tr><td>Steady-state TTFT (warm; ~10&ndash;50 token prompt)</td><td><strong>32.7 ms p50 / 34.5 ms p95</strong></td><td>bench <code>ttft_ms_steady_p50/p95</code></td></tr>
+            <tr><td>Sustained decode throughput (batch=1, ~zero KV)</td><td><strong>98.3 tok/s</strong></td><td>bench <code>tps_sustained_p50</code> (post-fix)</td></tr>
+            <tr><td>Theoretical decode ceiling (bandwidth-bound, batch=1)</td><td>~125 tok/s</td><td>(640 GB/s) / (5.1 GB)</td></tr>
+            <tr><td>Bandwidth utilisation in decode</td><td>~78 %</td><td>measured / ceiling</td></tr>
+            <tr><td>GPU memory bandwidth</td><td>~640 GB/s</td><td>RTX 4000 PRO Blackwell datasheet</td></tr>
+            <tr><td>Peak observed VRAM</td><td>22.53 GB</td><td>bench <code>peak_vram_gb</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>For a different model class on the same card:</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Quantisation × class</th><th>TPS measured</th><th>Bandwidth ceiling</th><th>Utilisation</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>NVFP4 8B (Qwen3-8B-NVFP4)</td><td>98.3 tok/s</td><td>~125</td><td>~78 %</td></tr>
+            <tr><td>NVFP4 9B (Qwen3.5-9B-NVFP4)</td><td>55.7 tok/s</td><td>~110</td><td>~50 % (hybrid Mamba slows it)</td></tr>
+            <tr><td>BF16 8B (R1-Distill-Llama-8B)</td><td>42.5 tok/s</td><td>~40</td><td>~106 % (within measurement noise of ceiling)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>
+        The BF16 entry pegs the bandwidth ceiling exactly. Quantisation moves the
+        ceiling; it does not break the wall.
+      </p>
+
+      <!-- §10 -->
+      <h2 id="implications">10. Practical implications</h2>
+
+      <div class="card-grid">
+        <div class="card">
+          <h4>Choose models by your dominant phase</h4>
+          <p>Interactive agents care about TTFT (prefill cost + first decode) and short-context decode rate. Batch summarisers care about sustained tok/s on long context.</p>
+        </div>
+        <div class="card">
+          <h4>Use the smallest weight format your quality bar tolerates</h4>
+          <p>NVFP4 over BF16 doubled decode rate on this card while leaving GSM8K / HumanEval scores within the noise floor for Qwen3-class models. See <a href="bench-results.html">bench-results</a> for the actual quality-vs-speed comparison.</p>
+        </div>
+        <div class="card">
+          <h4>Watch context length</h4>
+          <p>Doubling context cuts decode ceiling roughly in half once KV starts to dominate. The <a href="nvfp4-coldstart.html">nvfp4-coldstart</a> §2 diagram shows the KV column growing visibly relative to weights at 128 K and 256 K.</p>
+        </div>
+        <div class="card">
+          <h4>Cold start is one-time — but per (model, ctx, reasoning) triple</h4>
+          <p>Switching among loaded options thrashes phases 1&ndash;11. The router exposes <code>@&lt;ctx&gt;</code> and <code>::reasoning</code> suffixes at picker time so users make the choice deliberately.</p>
+        </div>
+        <div class="card">
+          <h4>PCIe is fast enough for warm reloads</h4>
+          <p>The 6 GB Qwen3-8B-NVFP4 weights move from page cache into VRAM in ~0.1 s over PCIe Gen5. If your cold start is slow, the answer is almost never "buy more PCIe lanes."</p>
+        </div>
+        <div class="card">
+          <h4>Tokeniser inefficiency is a real cost</h4>
+          <p>A non-English prompt may use 3 &ndash; 5× more tokens than the same content in English. That multiplies prefill cost, KV cache size, and per-reply token count.</p>
+        </div>
+      </div>
+
+      <!-- §11 -->
+      <h2 id="references">11. References</h2>
+
+      <h3>Tokenisation (the BPE family)</h3>
+      <ul>
+        <li>Sennrich, R., Haddow, B., Birch, A. (2016). <em>Neural Machine Translation of Rare Words with Subword Units.</em> ACL 2016. <a href="https://arxiv.org/abs/1508.07909">arXiv:1508.07909</a>. Original paper that adapted BPE to NLP.</li>
+        <li>Kudo, T., Richardson, J. (2018). <em>SentencePiece: A simple and language independent subword tokenizer and detokenizer for Neural Text Processing.</em> EMNLP 2018. <a href="https://arxiv.org/abs/1808.06226">arXiv:1808.06226</a>. Reference implementation used in T5, mBART, etc.</li>
+        <li>Karpathy, A. (2024). <em>Let's build the GPT Tokenizer.</em> YouTube, 2 h 13 min. The single best educational walkthrough of BPE in practice; builds a working tokeniser from scratch.</li>
+        <li>HuggingFace tokenizers library docs: <a href="https://huggingface.co/docs/tokenizers">huggingface.co/docs/tokenizers</a> — actual source code for GPT-, Llama-, and Qwen-style BPE tokenisers.</li>
+        <li>OpenAI tokeniser FAQ (rule-of-thumb 4 chars / token): <a href="https://help.openai.com/en/articles/4936856">help.openai.com/en/articles/4936856</a>.</li>
+      </ul>
+
+      <h3>Inference performance (prefill, decode, KV cache)</h3>
+      <ul>
+        <li>Williams, S., Waterman, A., Patterson, D. (2009). <em>Roofline: An insightful visual performance model for multicore architectures.</em> CACM 52(4). Origin of the compute-bound vs memory-bound distinction used in §5 &ndash; §7.</li>
+        <li>Kwon, W. <em>et al.</em> (2023). <em>Efficient Memory Management for Large Language Model Serving with PagedAttention.</em> SOSP 2023. <a href="https://arxiv.org/abs/2309.06180">arXiv:2309.06180</a>. The vLLM paper; explains paged KV, prefill vs decode batching, and the scheduler that ships in the <code>vllm/vllm-openai</code> image this project uses.</li>
+        <li>Pope, R. <em>et al.</em> (2022). <em>Efficiently Scaling Transformer Inference.</em> MLSys 2023. <a href="https://arxiv.org/abs/2211.05102">arXiv:2211.05102</a>. Provides the "decode is bandwidth-bound" framing for batch size 1 and shows the arithmetic-intensity rooflines for various model sizes.</li>
+        <li>vLLM documentation on prefill / decode separation and chunked prefill: <a href="https://docs.vllm.ai/en/latest/usage/engine_args.html">docs.vllm.ai/en/latest/usage/engine_args.html</a> and <a href="https://docs.vllm.ai/en/latest/design/v1/prefix_caching.html">docs.vllm.ai/en/latest/design/v1/prefix_caching.html</a>.</li>
+      </ul>
+
+      <h3>Hardware bandwidths</h3>
+      <ul>
+        <li>NVIDIA Blackwell architecture whitepaper (2024 / 2025) — HBM3e and GDDR7 bandwidth figures.</li>
+        <li>NVIDIA RTX 4000 PRO Blackwell product page: 24 GB GDDR7, <a href="https://www.nvidia.com/en-us/products/workstations/professional-desktop-gpus/">nvidia.com/en-us/products/workstations/professional-desktop-gpus</a>.</li>
+        <li>JEDEC GDDR7 specification (JESD239-1, 2024): 28 &ndash; 32 Gbps per pin signalling rate.</li>
+        <li>PCI-SIG PCI Express Base Specification 5.0: 32 GT/s per lane → 64 GB/s peak for x16 (about 55 GB/s practical after framing overhead).</li>
+      </ul>
+
+      <h3>Project-internal</h3>
+      <ul>
+        <li><a href="bench-results.html">bench-results</a> — leaderboard, methodology, TPS counting fix, NVFP4 vs BF16 comparison. <strong>Source of truth for every measured number in this doc</strong>; if a value here disagrees with that file, the bench-results page wins.</li>
+        <li><a href="nvfp4-coldstart.html">nvfp4-coldstart</a> — graphviz timeline of the 11 cold-start phases plus the per-component VRAM budget.</li>
+        <li><a href="nvfp4-number-formats.html">nvfp4-number-formats</a> — beginner's guide to NVFP4, FP8, BF16 and the rest of the number-format ecosystem.</li>
+        <li><a href="router.html">router</a> — request rewrite chain, including how the picker's <code>@&lt;ctx&gt;</code> and <code>::reasoning</code> suffixes propagate to vLLM / SGLang launch flags.</li>
+        <li><code>deploy/.bench-cache.json</code> — raw rolled-up cache row consumed by the picker.</li>
+        <li><code>/var/cache/devai/bench/inspect-logs/*.eval</code> — full per-sample inspect_ai logs for the GSM8K / HumanEval / tools_use tasks.</li>
+      </ul>
+
+    </div>
+
+    <aside class="toc-floating">
+      <h4>On this page</h4>
+      <ul></ul>
+    </aside>
+  </main>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-core.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/plugins/autoloader/prism-autoloader.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+<script src="assets/nav.js"></script>
+<script src="assets/widgets.js"></script>
+<script src="assets/site.js"></script>
+<script>
+window.addEventListener('load', () => {
+  if (!window.katex) return;
+  const r = (id, tex, display=false) => {
+    const el = document.getElementById(id);
+    if (el) katex.render(tex, el, {throwOnError: false, displayMode: display});
+  };
+  r('ceiling-formula',
+    '\\text{ceiling}_{\\text{tok/s}} = \\frac{\\text{bandwidth}}{\\text{weights\\_per\\_token}} = \\frac{640~\\text{GB/s}}{5.1~\\text{GB}} \\approx 125~\\text{tok/s}',
+    true);
+  r('measured-formula',
+    '\\text{measured} = 98.3~\\text{tok/s} \\quad\\Rightarrow\\quad \\text{utilisation} = \\frac{98.3}{125} \\approx 78\\%~\\text{of peak memory bandwidth}',
+    true);
+});
+</script>
+</body>
+</html>
