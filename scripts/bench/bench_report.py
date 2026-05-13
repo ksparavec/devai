@@ -19,6 +19,7 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))
 from _probe_core import load_cache  # noqa: E402
 from bench._bench_core import (  # noqa: E402
     DEFAULT_CACHE_PATH,
+    assert_cache_schema_compatible,
     is_row_key,
     migrate_bench_cache_keys,
 )
@@ -164,6 +165,7 @@ def main() -> None:
     )
     args = ap.parse_args()
     cache = load_cache(args.cache)
+    assert_cache_schema_compatible(cache)
     # In-memory only -- bench_report is read-only against the on-disk cache.
     # The runner is the writer; it persists the migrated form on next save.
     migrate_bench_cache_keys(cache)

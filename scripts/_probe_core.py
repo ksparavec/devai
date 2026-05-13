@@ -36,9 +36,13 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
+import sys
 import urllib.request
 from pathlib import Path
 from typing import Callable
+
+from _capability import Capability
 
 
 # ── Time ─────────────────────────────────────────────────────────────────────
@@ -73,23 +77,43 @@ def http_get(url: str, timeout: float) -> dict:
 # ── Cache I/O ────────────────────────────────────────────────────────────────
 
 def load_cache(path: Path) -> dict:
-    """Return parsed cache or empty dict on missing / unreadable / invalid."""
+    """Return parsed cache or empty dict on missing.
+
+    A missing file is normal (first probe run). A corrupt file is NOT
+    normal -- it means a previous writer was killed mid-write or the
+    disk lost data. Treating corruption as "empty" silently discards
+    hundreds of probe-hours, so we log loudly and re-raise so the
+    caller can decide whether to abort or rebuild.
+    """
     if not path.is_file():
         return {}
     try:
         return json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
-        return {}
+    except json.JSONDecodeError as exc:
+        print(
+            f"[probe-core] CORRUPT cache at {path}: {exc}. "
+            f"Refusing to silently treat as empty. "
+            f"Delete the file to force a fresh probe run.",
+            file=sys.stderr,
+        )
+        raise
 
 
 def save_cache(path: Path, cache: dict) -> None:
-    """Write cache atomically-ish (no rename), sorted keys, trailing newline.
+    """Write cache atomically (tmp file + os.replace), sorted keys, trailing newline.
 
-    Sorted keys keep diffs stable across runs and across machines —
-    important for catching real probe deltas in code review.
+    POSIX guarantees os.replace is atomic on the same filesystem, so a
+    crash mid-write leaves either the old file intact or the new file
+    fully written -- never a partial JSON document that load_cache
+    would later refuse. Sorted keys keep diffs stable across runs and
+    across machines -- important for catching real probe deltas in
+    code review.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(cache, indent=2, sort_keys=True) + "\n")
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    payload = json.dumps(cache, indent=2, sort_keys=True) + "\n"
+    tmp.write_text(payload)
+    os.replace(tmp, path)
 
 
 # ── Alias selection ──────────────────────────────────────────────────────────
@@ -143,12 +167,12 @@ def smallest_clean_probe(entry: dict) -> dict | None:
             continue
         if "capability" in value:
             # Flat (single-dimension) probe record.
-            if value.get("capability") not in (None, "error"):
+            if value.get("capability") not in (None, Capability.ERROR):
                 candidates.append(value)
         else:
             # vram bucket (nested layout).
             for p in value.values():
-                if isinstance(p, dict) and p.get("capability") not in (None, "error"):
+                if isinstance(p, dict) and p.get("capability") not in (None, Capability.ERROR):
                     candidates.append(p)
     if not candidates:
         return None
@@ -167,12 +191,12 @@ def update_canonical_capability(entry: dict) -> None:
     """
     smallest = smallest_clean_probe(entry)
     if smallest:
-        entry["capability"] = smallest.get("capability") or "unknown"
+        entry["capability"] = smallest.get("capability") or Capability.UNKNOWN
         return
     if entry.get("probes"):
-        entry["capability"] = "error"
+        entry["capability"] = Capability.ERROR
     else:
-        entry.setdefault("capability", "unknown")
+        entry.setdefault("capability", Capability.UNKNOWN)
 
 
 # ── Implied-fail propagation ─────────────────────────────────────────────────

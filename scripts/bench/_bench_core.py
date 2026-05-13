@@ -223,6 +223,13 @@ def sweep_for_leaks(
 # ``<digest>::<backend>``. Consumers iterating cache.items() must skip these.
 META_KEYS: frozenset[str] = frozenset({"_meta"})
 
+# Top-level bench-cache schema version. Bumped when readers must change
+# behaviour to interpret a row correctly; row-level ``schema_version``
+# continues to track per-row evolution. ``assert_cache_schema_compatible``
+# is the gate that prevents a future v3 cache from being silently misread
+# by a v2 consumer.
+BENCH_CACHE_SCHEMA_VERSION: int = 2
+
 
 def is_row_key(key: str) -> bool:
     """True when ``key`` names a bench row (not a meta block).
@@ -231,6 +238,36 @@ def is_row_key(key: str) -> bool:
     meta keys are added later.
     """
     return not (key in META_KEYS or key.startswith("_"))
+
+
+def assert_cache_schema_compatible(cache: dict) -> None:
+    """Refuse to read a bench cache produced by a newer writer.
+
+    A cache with ``_meta.schema_version > BENCH_CACHE_SCHEMA_VERSION``
+    means a future writer added row fields or restructured keys; current
+    readers would silently mis-render the leaderboard or, worse, stamp
+    new rows into a layout the future writer doesn't expect. Older or
+    missing top-level versions are treated as v1 == compatible (no
+    structural changes required of readers).
+    """
+    meta = cache.get("_meta") or {}
+    version = meta.get("schema_version")
+    if isinstance(version, int) and version > BENCH_CACHE_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"bench cache has _meta.schema_version={version}, "
+            f"this binary supports up to {BENCH_CACHE_SCHEMA_VERSION}. "
+            f"Upgrade the harness or delete the cache to start fresh."
+        )
+
+
+def stamp_cache_schema(cache: dict) -> None:
+    """Write the current writer's schema version into ``cache["_meta"]``.
+
+    Called from update_row so any touched cache gets the marker even if
+    it predates this field. Idempotent.
+    """
+    meta = cache.setdefault("_meta", {})
+    meta["schema_version"] = BENCH_CACHE_SCHEMA_VERSION
 
 
 def update_row(
@@ -275,6 +312,7 @@ def update_row(
     # Schema bump on touch so older rows acquire the field even if no
     # other fields changed in this update.
     row["schema_version"] = max(int(row.get("schema_version", 1)), 2)
+    stamp_cache_schema(cache)
     if task_results:
         for tname, tresult in task_results.items():
             row["tasks"][tname] = tresult

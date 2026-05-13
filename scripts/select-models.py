@@ -33,6 +33,7 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
+from _capability import Capability  # noqa: E402
 from _contexts import effective_targets as _ctx_effective_targets  # noqa: E402
 
 CATALOG = REPO_ROOT / "deploy" / "models.yaml"
@@ -523,8 +524,8 @@ def lookup_capability(model_name: str, cache: ProbeCache) -> tuple[str, str | No
     model name."""
     rec = lookup_probe(model_name, cache)
     if not rec:
-        return "unknown", None
-    cap = rec.get("capability", "unknown")
+        return Capability.UNKNOWN, None
+    cap = rec.get("capability", Capability.UNKNOWN)
     disable = rec.get("disable_verified")
     if isinstance(disable, bool):
         return cap, "true" if disable else "false"
@@ -568,7 +569,7 @@ class HFProbeCaches:
         for entry in self.cache_for(backend).values():
             if not isinstance(entry, dict):
                 continue
-            if entry.get("capability") in ("error", "unsupported_arch"):
+            if entry.get("capability") in (Capability.ERROR, Capability.UNSUPPORTED_ARCH):
                 continue
             for band in (entry.get("probes") or {}).values():
                 if not isinstance(band, dict):
@@ -662,7 +663,7 @@ def print_active_set(rows: list["Row"], vram: float, context: int) -> None:
         m = r.model
         v = m.get("vram") or {}
         eff_ctx = int(v.get("context") or 0)
-        cap = v.get("context_capability") or "unknown"
+        cap = v.get("context_capability") or Capability.UNKNOWN
         total = v.get("total_gb") or 0.0
         family = m.get("family", "?")
         ctx_label = f"{eff_ctx // 1024}K" if eff_ctx >= 1024 else str(eff_ctx)
@@ -935,7 +936,7 @@ def _row_probe_rejected(
     unprobed at that tier.
     """
     entry = _row_probe_entry(row, backend, probe_cache, hf_caches)
-    if entry.get("capability") in ("error", "unsupported_arch"):
+    if entry.get("capability") in (Capability.ERROR, Capability.UNSUPPORTED_ARCH):
         return True
     cell = _row_probe_cell(row, backend, vram_band, ctx, probe_cache, hf_caches)
     if not cell:
@@ -1094,7 +1095,7 @@ def _hf_lookup_with_priority(
         if b not in backends:
             continue
         entry = hf_caches.lookup(repo, sha, b)
-        if entry and entry.get("capability") not in ("error", "unsupported_arch"):
+        if entry and entry.get("capability") not in (Capability.ERROR, Capability.UNSUPPORTED_ARCH):
             return entry, b
     return {}, None
 
@@ -1137,7 +1138,7 @@ def build_rows(
             vram_gb = float(probe_record.get("actual_vram_gb") or total)
             eff_ctx = int(probe_record.get("ctx") or probe_record.get("actual_context") or context)
             fully_on_gpu = bool(probe_record.get("fully_on_gpu", False))
-            ctx_capability = str(probe_record.get("capability") or "unknown")
+            ctx_capability = str(probe_record.get("capability") or Capability.UNKNOWN)
             details = {}
             if probe_entry.get("param_size_label"):
                 details["param_size"] = probe_entry["param_size_label"]
@@ -1167,7 +1168,7 @@ def build_rows(
                 "fully_on_gpu": False,
                 "context": context,
                 "max_context": probe_entry.get("max_context"),
-                "context_capability": "unknown",
+                "context_capability": Capability.UNKNOWN,
             }
         elif not model_is_ollama_only:
             hf_entry, hf_backend = _hf_lookup_with_priority(m, hf_caches)
@@ -1179,7 +1180,7 @@ def build_rows(
                 vram_actual = float(hf_record.get("actual_vram_gb") or 0.0)
                 eff_ctx = int(hf_record.get("actual_context") or hf_record.get("ctx") or context)
                 fits_flag = bool(hf_record.get("fits", False))
-                ctx_capability = str(hf_record.get("capability") or hf_entry.get("capability") or "unknown")
+                ctx_capability = str(hf_record.get("capability") or hf_entry.get("capability") or Capability.UNKNOWN)
                 # vLLM/SGLang load weights+KV+CUDA-graphs into the static
                 # pool — actual_vram_gb is the most honest "total" we have.
                 total = vram_actual or float(hf_entry.get("max_context") and parse_size_gb(m.get("size", "0")) or 0.0)
@@ -1206,7 +1207,7 @@ def build_rows(
                     "fully_on_gpu": False,
                     "context": context,
                     "max_context": hf_entry.get("max_context"),
-                    "context_capability": "unknown",
+                    "context_capability": Capability.UNKNOWN,
                 }
             else:
                 formula = vram_breakdown(m, context, kv_dtype)
@@ -1501,11 +1502,11 @@ def main() -> None:
                 vram_str = "—"
                 ctx_str = "—"
             if v.get("source") in ("probe", "hf-probe"):
-                cap = str(v.get("context_capability") or "unknown")
+                cap = str(v.get("context_capability") or Capability.UNKNOWN)
                 if not v.get("fully_on_gpu", True):
-                    cap = "error"
+                    cap = Capability.ERROR
             else:
-                cap = "unknown"
+                cap = Capability.UNKNOWN
             print(f"  {m['name']:<42s} {m['source']:<7s} {size:>8s} "
                   f"{vram_str:>8s} {ctx_str:>5s}  {cap:<11s} "
                   f"{fit_mark:<3s}  {disk_mark:<4s}  {action}")

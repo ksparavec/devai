@@ -41,6 +41,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -124,16 +125,32 @@ type configModel struct {
 }
 
 // configReasoning records what the runtime probe observed for this model.
-// Capability values (per docs/ollama_models.md):
+// Capability values, mirroring scripts/_capability.py (Python StrEnum).
+// Wire format on disk and over JSON uses the lowercase strings; these
+// constants prevent typo-driven mis-routing at the comparison sites
+// below. Keep this block in sync with the Python module when adding
+// or removing values.
 //
-//	structured  – native API exposes a separate reasoning trace field
-//	inline      – reasoning appears inline (e.g. <think> blocks) only
-//	unsupported – no reasoning behavior observed
-//	unknown     – not yet probed (e.g. vLLM/SGLang models pre-probe)
-//	error       – probe failed (model load error, HTTP 4xx, etc.)
+//	structured       – native API exposes a separate reasoning trace field
+//	inline           – reasoning appears inline (e.g. <think> blocks) only
+//	unsupported      – probe attempted, no reasoning behaviour observed
+//	none             – clean non-reasoning model (probe gave a clean answer)
+//	unsupported_arch – TERMINAL: backend can't load this arch
+//	error            – TERMINAL: probe failed (model load, HTTP 4xx, etc.)
+//	unknown          – not yet probed (e.g. vLLM/SGLang pre-probe)
 //
 // DisableVerified is set only for `structured` capability and reports
 // whether sending the protocol's "off" field actually suppresses reasoning.
+const (
+	CapStructured      = "structured"
+	CapInline          = "inline"
+	CapUnsupported     = "unsupported"
+	CapNone            = "none"
+	CapUnsupportedArch = "unsupported_arch"
+	CapError           = "error"
+	CapUnknown         = "unknown"
+)
+
 type configReasoning struct {
 	Capability      string `yaml:"capability"`
 	DisableVerified *bool  `yaml:"disable_verified,omitempty"`
@@ -153,15 +170,16 @@ type launchConfig struct {
 	// based, not file-path based, so its entrypoint ignores the fields.
 	ToolParserPlugin      string
 	ReasoningParserPlugin string
+	// RecoveryFlags carries per-model CLI args pre-resolved by
+	// containerRecreate from the arbiter's recovery registry. Passing
+	// them through launchConfig instead of having the entrypoints reach
+	// up to a package global keeps the entrypoint functions pure (no
+	// hidden global dependency) and lets a future signal-driven reload
+	// of recovery-flags.json swap the registry atomically without
+	// racing in-flight requests. Empty slice = no flags, which is the
+	// path test fixtures already exercise.
+	RecoveryFlags []string
 }
-
-// recoveryFlags is the package-level handle to deploy/recovery-flags.json.
-// Initialised in main() before the entrypoint helpers fire and shared with
-// the probe driver via the same JSON file (scripts/_probe_hf_common.py
-// reads its own copy). See gpu-arbiter/recovery_flags.go for the loader,
-// and the registry comment block in deploy/recovery-flags.json for the
-// schema and update procedure.
-var recoveryFlags *recoveryRegistry
 
 type configFile struct {
 	Defaults map[string]string `yaml:"defaults"`
@@ -236,9 +254,9 @@ func synthesizeFromCache(
 		if operatorMaxCtx > 0 && (effCtx == 0 || effCtx > operatorMaxCtx) {
 			effCtx = operatorMaxCtx
 		}
-		cap := entry.Capability
-		if cap == "" {
-			cap = "unknown"
+		capability := entry.Capability
+		if capability == "" {
+			capability = CapUnknown
 		}
 		// First alias is the placeholder Name; the rest are Aliases. The
 		// router registers every name into the lookup maps regardless.
@@ -256,7 +274,7 @@ func synthesizeFromCache(
 			Context:      effCtx,
 			ProbedMaxCtx: bestCtx,
 			Reasoning: &configReasoning{
-				Capability:      cap,
+				Capability:      capability,
 				DisableVerified: entry.DisableVerified,
 			},
 		})
@@ -336,8 +354,24 @@ func synthesizeHFFromCache(
 		if entry == nil || len(entry.Aliases) == 0 {
 			continue
 		}
+		// Refuse pre-v2 entries. v1 entries lack DisableVerified and
+		// have a nil ToolParser, which would otherwise pass through
+		// synthesizeHFFromCache as "no curated parsers". The router
+		// would then start the model with no --tool-call-parser flag,
+		// at which point maybeStripTools silently drops every tools/
+		// tool_choice the agent sends -- a corrupt-by-omission state
+		// where tool calling appears broken with no log entry. Log
+		// loudly and skip; operator re-probes the model to upgrade.
+		if entry.SchemaVersion < 2 {
+			repo := entry.Repo
+			if repo == "" {
+				repo = entry.Aliases[0]
+			}
+			log.Printf("warning: HF cache entry %s is schema_version=%d (< 2); skipping. Re-probe with `make probe-vllm` / `make probe-sglang` to upgrade.", repo, entry.SchemaVersion)
+			continue
+		}
 		// Terminal failure states never produce a serving row.
-		if entry.Capability == "unsupported_arch" || entry.Capability == "error" {
+		if entry.Capability == CapUnsupportedArch || entry.Capability == CapError {
 			continue
 		}
 		band, ok := entry.Probes[hostKey]
@@ -371,9 +405,9 @@ func synthesizeHFFromCache(
 		if operatorMaxCtx > 0 && (effCtx == 0 || effCtx > operatorMaxCtx) {
 			effCtx = operatorMaxCtx
 		}
-		cap := entry.Capability
-		if cap == "" {
-			cap = "unknown"
+		capability := entry.Capability
+		if capability == "" {
+			capability = CapUnknown
 		}
 		canonical := entry.Aliases[0]
 		var aliases []string
@@ -420,7 +454,7 @@ func synthesizeHFFromCache(
 			ReasoningParser: reasoningParser,
 			ToolMode:        toolMode,
 			Reasoning: &configReasoning{
-				Capability:      cap,
+				Capability:      capability,
 				DisableVerified: entry.DisableVerified,
 			},
 		})
@@ -532,6 +566,18 @@ type arbiter struct {
 	// deploy/vllm-plugins.json). Always non-nil; entries map is empty
 	// when the registry file is missing or has no plugins.
 	pluginRegistry *vllmPluginRegistry
+	// recoveryRegistry holds per-model recovery flags (CLI args and env
+	// vars) from deploy/recovery-flags.json. Always non-nil; lookups
+	// for unknown models return (zero, false). Held on the struct (vs.
+	// a package-level var) so a future SIGHUP-style reload can swap
+	// the pointer atomically without racing in-flight requests.
+	recoveryRegistry *recoveryRegistry
+	// healthClient is the short-timeout client used by backendIsServing
+	// to probe /health on each request that finds bs.running=true. A
+	// per-call &http.Client allocates a fresh transport (with its own
+	// connection pool) every time -- hoisted here so successive probes
+	// reuse the same idle connection.
+	healthClient *http.Client
 }
 
 // --- Proxy factories ---
@@ -766,10 +812,9 @@ func vllmEntrypoint(modelName string, lc launchConfig) []string {
 		args = append(args, "--enable-auto-tool-choice", "--tool-call-parser", lc.ToolParser)
 	}
 	// Per-model recovery flags (e.g. --enforce-eager for checkpoints that
-	// OOM at vLLM model-load time on 24G). See deploy/recovery-flags.json.
-	if rec, ok := recoveryFlags.Lookup(modelName); ok {
-		args = append(args, rec.Flags...)
-	}
+	// OOM at vLLM model-load time on 24G). Pre-resolved by containerRecreate
+	// from a.recoveryRegistry. See deploy/recovery-flags.json.
+	args = append(args, lc.RecoveryFlags...)
 	return args
 }
 
@@ -797,9 +842,7 @@ func sglangEntrypoint(modelName string, lc launchConfig) []string {
 	// Per-model recovery flags (mirrors vllmEntrypoint). SGLang's NVFP4
 	// loader path is currently broken upstream so this branch rarely
 	// fires today, but the symmetry keeps the behaviour predictable.
-	if rec, ok := recoveryFlags.Lookup(modelName); ok {
-		args = append(args, rec.Flags...)
-	}
+	args = append(args, lc.RecoveryFlags...)
 	return args
 }
 
@@ -829,7 +872,12 @@ func main() {
 	// the lookup maps) the same way they were fed by the YAML file.
 	var cfg configFile
 	cachePath := env("PROBE_CACHE", "/etc/devai/.ollama-reasoning-cache.json")
-	hostVRAMGB := envInt("GPU_MEMORY_GB", 24)
+	// Parse GPU_MEMORY_GB once as float64 -- envInt's Sscanf("%d") silently
+	// falls back to the default on values like "23.5", while envFloat
+	// parses them correctly. Round to nearest int for the band-key
+	// consumer (synthesizeFromCache filters on string(int) bands).
+	hostVRAMFloat := envFloat("GPU_MEMORY_GB", 24.0)
+	hostVRAMGB := int(math.Round(hostVRAMFloat))
 	operatorMaxCtx := envInt("MAX_CONTEXT_LEN", 262144)
 	if data, err := os.ReadFile(cachePath); err == nil {
 		var cache map[string]*cacheEntry
@@ -913,9 +961,9 @@ func main() {
 	for _, m := range cfg.Models {
 		names := append([]string{m.Name}, m.Aliases...)
 		sz := parseSizeGB(m.Size)
-		cap := "unknown"
+		capability := CapUnknown
 		if m.Reasoning != nil && m.Reasoning.Capability != "" {
-			cap = m.Reasoning.Capability
+			capability = m.Reasoning.Capability
 		}
 		disableOK := m.Reasoning != nil &&
 			m.Reasoning.DisableVerified != nil &&
@@ -930,7 +978,7 @@ func main() {
 			if m.Context > 0 {
 				modelContexts[name] = m.Context
 			}
-			modelCapability[name] = cap
+			modelCapability[name] = capability
 			if disableOK {
 				modelDisableOK[name] = true
 			}
@@ -966,7 +1014,7 @@ func main() {
 		}
 		// Count capability once per canonical row, not once per alias —
 		// otherwise a model with N aliases would dominate the histogram.
-		capCounts[cap]++
+		capCounts[capability]++
 	}
 	policy := strings.ToLower(env("DEVAI_REASONING", "auto"))
 	if !validPolicy(policy) {
@@ -974,14 +1022,17 @@ func main() {
 		policy = "auto"
 	}
 	log.Printf("reasoning policy: %s; capability counts: %v", policy, capCounts)
-	totalVRAMGB := envFloat("GPU_MEMORY_GB", 24.0)
+	// Reuse the float parsed above (hostVRAMFloat) so the int band-key
+	// consumer and the float memory-fraction consumer cannot disagree
+	// when GPU_MEMORY_GB is e.g. "23.5".
+	totalVRAMGB := hostVRAMFloat
 	maxCtx := envInt("MAX_CONTEXT_LEN", 262144)
 
 	pluginRegistry := loadVLLMPluginRegistry(
 		env("VLLM_PLUGINS_REGISTRY", "/etc/devai/vllm-plugins.json"),
 		env("VLLM_PLUGINS_HOST_DIR", ""),
 	)
-	recoveryFlags = loadRecoveryRegistry(
+	recoveryRegistry := loadRecoveryRegistry(
 		env("RECOVERY_FLAGS_REGISTRY", "/etc/devai/recovery-flags.json"),
 	)
 
@@ -1004,6 +1055,8 @@ func main() {
 		totalVRAMGB:          totalVRAMGB,
 		maxContextLen:        maxCtx,
 		pluginRegistry:       pluginRegistry,
+		recoveryRegistry:     recoveryRegistry,
+		healthClient:         &http.Client{Timeout: 2 * time.Second},
 	}
 
 	for _, bc := range backends {
@@ -1058,8 +1111,8 @@ func main() {
 // --- Podman container management ---
 
 func (a *arbiter) containerStop(name string) error {
-	url := fmt.Sprintf("http://d/v4.0.0/libpod/containers/%s/stop?timeout=10", name)
-	resp, err := a.podmanClient.Post(url, "", nil)
+	reqURL := fmt.Sprintf("http://d/v4.0.0/libpod/containers/%s/stop?timeout=10", name)
+	resp, err := a.podmanClient.Post(reqURL, "", nil)
 	if err != nil {
 		return fmt.Errorf("podman stop %s: %w", name, err)
 	}
@@ -1076,9 +1129,24 @@ func (a *arbiter) containerStop(name string) error {
 
 func (a *arbiter) containerRemove(name string) {
 	delURL := fmt.Sprintf("http://d/v4.0.0/libpod/containers/%s?force=true", name)
-	req, _ := http.NewRequest("DELETE", delURL, nil)
-	if resp, err := a.podmanClient.Do(req); err == nil {
-		resp.Body.Close()
+	req, err := http.NewRequest("DELETE", delURL, nil)
+	if err != nil {
+		log.Printf("warning: containerRemove %s: build request: %v", name, err)
+		return
+	}
+	resp, err := a.podmanClient.Do(req)
+	if err != nil {
+		log.Printf("warning: containerRemove %s: %v", name, err)
+		return
+	}
+	defer resp.Body.Close()
+	// 204/200 = removed, 404 = already gone (both fine). Anything else
+	// means the container will still be there on the next create call,
+	// which then fails with "name in use" -- log loudly so operators
+	// can correlate.
+	if resp.StatusCode >= 300 && resp.StatusCode != http.StatusNotFound {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		log.Printf("warning: containerRemove %s: HTTP %s: %s", name, resp.Status, body)
 	}
 }
 
@@ -1086,8 +1154,8 @@ func (a *arbiter) containerIsRunning(name string) bool {
 	if a.podmanClient == nil {
 		return false
 	}
-	url := fmt.Sprintf("http://d/v4.0.0/libpod/containers/%s/json", name)
-	resp, err := a.podmanClient.Get(url)
+	reqURL := fmt.Sprintf("http://d/v4.0.0/libpod/containers/%s/json", name)
+	resp, err := a.podmanClient.Get(reqURL)
 	if err != nil {
 		return false
 	}
@@ -1097,7 +1165,14 @@ func (a *arbiter) containerIsRunning(name string) bool {
 			Status string `json:"Status"`
 		} `json:"State"`
 	}
-	json.NewDecoder(resp.Body).Decode(&info)
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		// A malformed body would otherwise leave info.State.Status == ""
+		// and we'd return false -- triggering an unnecessary recreate of
+		// a backend that may be perfectly healthy. Treat decode failure
+		// as "unknown" but log so operators can spot a podman API regression.
+		log.Printf("warning: containerIsRunning %s: decode failed: %v", name, err)
+		return false
+	}
 	return info.State.Status == "running"
 }
 
@@ -1113,8 +1188,7 @@ func (a *arbiter) containerIsRunning(name string) bool {
 // triggers a containerRecreate at the call site.
 func (a *arbiter) backendIsServing(bs *backendState) bool {
 	healthURL := bs.config.BackendURL.String() + bs.config.HealthPath
-	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get(healthURL)
+	resp, err := a.healthClient.Get(healthURL)
 	if err != nil {
 		return false
 	}
@@ -1181,6 +1255,61 @@ func (a *arbiter) resolvePluginLaunch(
 	}, nil
 }
 
+// buildContainerSpec assembles the libpod container-create JSON spec.
+// Extracted from containerRecreate so the lifecycle method stays focused
+// on the launch sequence (stop, remove, compute launch config, post-
+// create, post-start) and the spec layout has one home.
+//
+// `pluginVolume` is the optional plugin bind mount returned by
+// resolvePluginLaunch (nil when the backend uses built-in parsers or
+// SGLang's Python-import plugin model). `recoveryEnv` carries per-model
+// env vars pre-resolved from the recovery registry.
+func buildContainerSpec(
+	cfg backendConfig,
+	modelName string,
+	lc launchConfig,
+	pluginVolume map[string]any,
+	recoveryEnv map[string]string,
+) map[string]any {
+	mounts := []map[string]any{{
+		"destination": "/models",
+		"source":      cfg.ModelsDir,
+		"type":        "bind",
+		"options":     []string{"ro"},
+	}}
+	if pluginVolume != nil {
+		mounts = append(mounts, pluginVolume)
+	}
+
+	spec := map[string]any{
+		"image":        cfg.Image,
+		"name":         cfg.ContainerName,
+		"entrypoint":   cfg.Entrypoint(modelName, lc),
+		"command":      []string{},
+		"mounts":       mounts,
+		"hostadd":      []string{"host.containers.internal:host-gateway"},
+		"netns":        map[string]any{"nsmode": "bridge"},
+		"Networks":     map[string]any{cfg.Network: map[string]any{}},
+		"devices":      []map[string]any{{"path": "nvidia.com/gpu=all"}},
+		"selinux_opts": []string{"disable"},
+		"hostname":     cfg.Name,
+	}
+	// Merge per-backend env (cfg.EnvVars) with per-model recovery env.
+	// Per-model entries win on key collision -- recovery env exists
+	// precisely to override defaults for borderline checkpoints.
+	envMap := make(map[string]string, len(cfg.EnvVars))
+	for k, v := range cfg.EnvVars {
+		envMap[k] = v
+	}
+	for k, v := range recoveryEnv {
+		envMap[k] = v
+	}
+	if len(envMap) > 0 {
+		spec["env"] = envMap
+	}
+	return spec
+}
+
 // containerRecreate launches the backend container with the given model.
 // `desiredCtx > 0` overrides the catalog cap (used when a request carries a
 // "<model>@<ctx>" picker override); 0 falls back to the catalog cap. The
@@ -1214,6 +1343,15 @@ func (a *arbiter) containerRecreate(bs *backendState, modelName string, desiredC
 	if parser := a.modelReasoningParser[cfg.Name][modelName]; parser != "" {
 		lc.ReasoningParser = parser
 	}
+	// Pre-resolve recovery flags from the arbiter's registry once, then
+	// hand both Flags (CLI args) and Env (env vars) to downstream code
+	// via launchConfig and the spec envMap below. Single lookup keeps
+	// the two halves synced if the registry ever swaps mid-call.
+	var recoveryEnv map[string]string
+	if rec, ok := a.recoveryRegistry.Lookup(modelName); ok {
+		lc.RecoveryFlags = rec.Flags
+		recoveryEnv = rec.Env
+	}
 	// Resolve parser plugin paths and the plugin volume. Only vLLM
 	// supports file-path plugins; SGLang's plugin model is Python-
 	// import based, so its launchConfig plugin fields stay empty.
@@ -1225,47 +1363,15 @@ func (a *arbiter) containerRecreate(bs *backendState, modelName string, desiredC
 		cfg.Name, modelSizeGB, a.totalVRAMGB, lc.MemFraction, lc.MaxContext/1024,
 		lc.ReasoningParser, lc.ToolParser, lc.ToolParserPlugin)
 
-	mounts := []map[string]any{{
-		"destination": "/models",
-		"source":      cfg.ModelsDir,
-		"type":        "bind",
-		"options":     []string{"ro"},
-	}}
-	if pluginVolume != nil {
-		mounts = append(mounts, pluginVolume)
-	}
+	spec := buildContainerSpec(cfg, modelName, lc, pluginVolume, recoveryEnv)
 
-	spec := map[string]any{
-		"image":        cfg.Image,
-		"name":         cfg.ContainerName,
-		"entrypoint":   cfg.Entrypoint(modelName, lc),
-		"command":      []string{},
-		"mounts":       mounts,
-		"hostadd":      []string{"host.containers.internal:host-gateway"},
-		"netns":        map[string]any{"nsmode": "bridge"},
-		"Networks":     map[string]any{cfg.Network: map[string]any{}},
-		"devices":      []map[string]any{{"path": "nvidia.com/gpu=all"}},
-		"selinux_opts": []string{"disable"},
-		"hostname":     cfg.Name,
+	body, err := json.Marshal(spec)
+	if err != nil {
+		// A marshal failure would otherwise POST a nil body to libpod,
+		// which silently creates a container with no entrypoint -- the
+		// next request then 502s with no obvious cause. Fail loud.
+		return fmt.Errorf("marshal container spec for %s: %w", cfg.ContainerName, err)
 	}
-	// Merge per-backend env (cfg.EnvVars) with per-model recovery env
-	// (modelRecoveryConfig). Per-model entries win on key collision —
-	// recovery env exists precisely to override defaults for borderline
-	// checkpoints.
-	envMap := make(map[string]string, len(cfg.EnvVars))
-	for k, v := range cfg.EnvVars {
-		envMap[k] = v
-	}
-	if rec, ok := recoveryFlags.Lookup(modelName); ok {
-		for k, v := range rec.Env {
-			envMap[k] = v
-		}
-	}
-	if len(envMap) > 0 {
-		spec["env"] = envMap
-	}
-
-	body, _ := json.Marshal(spec)
 	resp, err := a.podmanClient.Post(
 		"http://d/v4.0.0/libpod/containers/create",
 		"application/json",
@@ -1296,9 +1402,15 @@ func (a *arbiter) containerRecreate(bs *backendState, modelName string, desiredC
 func (a *arbiter) waitForHealthy(bs *backendState, timeout time.Duration) error {
 	healthURL := bs.config.BackendURL.String() + bs.config.HealthPath
 	log.Printf("waiting for %s at %s (timeout %s)...", bs.config.Name, healthURL, timeout)
+	// Per-probe timeout: the global http.DefaultClient has none, so a
+	// half-open TCP connection or a hung backend could block a single
+	// http.Get for the full 600s health window with no further attempts.
+	// 5s per probe is well above any realistic /health turnaround and
+	// keeps the polling loop progressing.
+	client := &http.Client{Timeout: 5 * time.Second}
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		resp, err := http.Get(healthURL)
+		resp, err := client.Get(healthURL)
 		if err == nil {
 			resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
@@ -1326,7 +1438,16 @@ func (a *arbiter) unloadOllama() {
 			Name string `json:"name"`
 		} `json:"models"`
 	}
-	json.NewDecoder(resp.Body).Decode(&ps)
+	if err := json.NewDecoder(resp.Body).Decode(&ps); err != nil {
+		// A malformed /api/ps body would silently leave ps.Models empty,
+		// the loop below would be a no-op, and stopOtherBackends would
+		// then believe Ollama's GPU memory was released -- the vLLM/SGLang
+		// container then starts on a GPU that still has Ollama's weights
+		// resident, producing OOM or corrupted inference. Refuse to
+		// proceed and log loudly so the operator sees the real cause.
+		log.Printf("error: unloadOllama: cannot decode /api/ps: %v -- skipping unload (GPU may still be held by ollama)", err)
+		return
+	}
 
 	for _, m := range ps.Models {
 		log.Printf("unloading ollama model: %s", m.Name)
@@ -1356,7 +1477,22 @@ func (a *arbiter) drainBackend(bs *backendState) {
 
 func (a *arbiter) stopOtherBackends(targetName string) {
 	for name, bs := range a.backends {
-		if name == targetName || !bs.running {
+		if name == targetName {
+			continue
+		}
+		// Wait out any in-flight recreate on this backend BEFORE checking
+		// `running`. A recreate that started after we last released a.mu
+		// (e.g. during another backend's waitForHealthy window) sets
+		// recreating=true but only flips running=true after the health
+		// wait completes. Without this wait we would observe running=false,
+		// skip the backend, return, and let our caller fire its own
+		// containerRecreate -- with the still-in-flight recreate competing
+		// for the same GPU. Block on recreateCond (held over a.mu) until
+		// the in-flight recreate exits its defer (success or failure).
+		for bs.recreating {
+			bs.recreateCond.Wait()
+		}
+		if !bs.running {
 			continue
 		}
 		log.Printf("stopping %s (switching to %s)", name, targetName)
@@ -1467,10 +1603,16 @@ func (a *arbiter) ensureBackendRunning(bs *backendState, modelName string, desir
 
 	// Release lock during health wait so concurrent /v1/* requests can
 	// queue / waiters can park on the cond. The recreating flag prevents
-	// them from kicking off duplicate recreates.
-	a.mu.Unlock()
-	err := a.waitForHealthy(bs, a.healthTimeout)
-	a.mu.Lock()
+	// them from kicking off duplicate recreates. The inner closure +
+	// `defer a.mu.Lock()` guarantees we re-acquire BEFORE returning from
+	// this scope, even on a panic out of waitForHealthy. Without that,
+	// the outer recreate defer above would fire without the lock held
+	// and race on bs.recreating / bs.pendingModel / bs.pendingContext.
+	err := func() error {
+		a.mu.Unlock()
+		defer a.mu.Lock()
+		return a.waitForHealthy(bs, a.healthTimeout)
+	}()
 
 	if err != nil {
 		return err
@@ -1502,16 +1644,35 @@ func (a *arbiter) makeRequestHandler(backendName string) http.HandlerFunc {
 		var modelName string
 		var numCtx int
 		if req.Method == http.MethodPost && req.Body != nil {
+			// Cap the request body before reading. Without this any peer
+			// on devai-net (or any container in the compose network) can
+			// stream an arbitrarily large body, exhaust RAM, and block
+			// concurrent inference behind the arbiter mutex. 32 MB covers
+			// any realistic chat-completion payload (huge multi-turn
+			// histories with base64 image content are well below this).
+			req.Body = http.MaxBytesReader(w, req.Body, 32<<20)
 			body, err := io.ReadAll(req.Body)
 			if err != nil {
-				http.Error(w, `{"error":"failed to read body"}`, http.StatusBadRequest)
+				// MaxBytesReader's error string is informative ("http:
+				// request body too large") but the HTTP status it has
+				// already written depends on Go version. Be explicit.
+				http.Error(w, `{"error":"failed to read body or body too large"}`, http.StatusRequestEntityTooLarge)
 				return
 			}
 
 			var parsed struct {
 				Model string `json:"model"`
 			}
-			json.Unmarshal(body, &parsed)
+			if err := json.Unmarshal(body, &parsed); err != nil {
+				// Malformed JSON would otherwise leave parsed.Model="",
+				// flow through to ensureBackendRunning, and surface as
+				// a confusing HTTP 503 ("model name required"). Fail
+				// fast with 400 and log so operators can find which
+				// client is misbehaving.
+				log.Printf("warning: bad JSON body from %s: %v", req.RemoteAddr, err)
+				http.Error(w, `{"error":"invalid JSON request body"}`, http.StatusBadRequest)
+				return
+			}
 
 			// Resolve the per-request num_ctx and strip any suffixes
 			// from the model name. Suffix order (convention): the
@@ -1525,17 +1686,57 @@ func (a *arbiter) makeRequestHandler(backendName string) http.HandlerFunc {
 			//   3. None → request passes through unchanged.
 			ctxStripped, ctxOverride := parseCtxOverride(parsed.Model)
 			cleanName, reasoningOverride := parseReasoningOverride(ctxStripped)
+			// Defense-in-depth: refuse path-traversal segments before the
+			// name flows into vllmEntrypoint/sglangEntrypoint where it is
+			// concatenated as `--model /models/<name>`. The /models bind
+			// mount is read-only so write-impact is bounded, but a name
+			// containing `..` could still resolve a backend's model loader
+			// to a file outside the intended directory. Slash is allowed
+			// because legitimate HF repos look like `nvidia/Qwen3-8B-NVFP4`.
+			if !isSafeModelName(cleanName) {
+				http.Error(w, `{"error":"invalid model name"}`, http.StatusBadRequest)
+				return
+			}
+			// Allowlist check for vLLM/SGLang: the name MUST be one the
+			// router was started with (loaded from the probe cache). The
+			// Ollama path forwards the name to upstream which has its own
+			// allowlist via locally pulled tags, so we skip this gate there.
+			if backendName != "ollama" && cleanName != "" {
+				known := false
+				for _, n := range bs.modelNames {
+					if n == cleanName {
+						known = true
+						break
+					}
+				}
+				if !known {
+					http.Error(w, fmt.Sprintf(`{"error":"unknown model %q for %s"}`, cleanName, backendName), http.StatusNotFound)
+					return
+				}
+			}
 			numCtx = ctxOverride
 			force := ctxOverride > 0
 			if numCtx == 0 {
-				if cap, ok := a.modelContexts[cleanName]; ok && cap > 0 {
-					numCtx = cap
+				if ctxCap, ok := a.modelContexts[cleanName]; ok && ctxCap > 0 {
+					numCtx = ctxCap
 				}
 			}
 			if cleanName != parsed.Model {
 				body = setTopJSONField(body, "model", cleanName)
 			}
-			body = setNumCtx(body, numCtx, force)
+			// Only inject options.num_ctx on Ollama's native API. Empirical
+			// finding (2026-05-13): Ollama discards options.num_ctx on its
+			// OpenAI-compat (/v1/chat/completions) and Anthropic-compat
+			// (/v1/messages) surfaces -- the load always picks up the
+			// global OLLAMA_CONTEXT_LENGTH. vLLM/SGLang don't parse
+			// `options` at all (ctx is baked into the container via
+			// --max-model-len / --context-length at recreate time, driven
+			// by the @<ctx> picker suffix). So this rewrite is meaningful
+			// only on /api/chat and /api/generate.
+			if backendName == "ollama" &&
+				(req.URL.Path == "/api/chat" || req.URL.Path == "/api/generate") {
+				body = setNumCtx(body, numCtx, force)
+			}
 			modelName = cleanName
 
 			// Capability lookup must resolve picker-materialised
@@ -1788,6 +1989,11 @@ func (a *arbiter) maybeStripTools(backendName, modelName string, body []byte) []
 	if err != nil {
 		return body
 	}
+	// Tell the operator the strip happened. Without this, "tool calling
+	// doesn't work for model X" reports have no trail -- the agent sent
+	// tools, the router dropped them, and the upstream never saw them.
+	log.Printf("info: stripped tools/tool_choice for %s/%s (no probe-verified tool_parser)",
+		backendName, modelName)
 	return out
 }
 
@@ -1847,6 +2053,8 @@ func (a *arbiter) applyVLLMPolicy(path, modelName, policy string, body []byte) [
 	}
 	switch a.reasoningAction(modelName, policy) {
 	case reasoningEnable:
+		log.Printf("info: vllm/%s reasoning ENABLE (policy=%q, effort=%s)",
+			modelName, policy, openAIReasoningEffort(policy))
 		body = setJSONFieldIfAbsent(
 			body,
 			[]string{"reasoning_effort", "reasoning"},
@@ -1859,6 +2067,7 @@ func (a *arbiter) applyVLLMPolicy(path, modelName, policy string, body []byte) [
 			true,
 		)
 	case reasoningDisable:
+		log.Printf("info: vllm/%s reasoning DISABLE (policy=%q)", modelName, policy)
 		body = setJSONFieldIfAbsent(
 			body,
 			[]string{"reasoning_effort", "reasoning"},
@@ -1886,6 +2095,7 @@ func (a *arbiter) applySGLangPolicy(path, modelName, policy string, body []byte)
 	}
 	switch a.reasoningAction(modelName, policy) {
 	case reasoningEnable:
+		log.Printf("info: sglang/%s reasoning ENABLE (policy=%q)", modelName, policy)
 		body = setJSONFieldIfAbsent(
 			body, []string{"separate_reasoning"}, "separate_reasoning", true,
 		)
@@ -1895,6 +2105,7 @@ func (a *arbiter) applySGLangPolicy(path, modelName, policy string, body []byte)
 			true,
 		)
 	case reasoningDisable:
+		log.Printf("info: sglang/%s reasoning DISABLE (policy=%q)", modelName, policy)
 		body = setJSONFieldIfAbsent(
 			body, []string{"separate_reasoning"}, "separate_reasoning", false,
 		)
@@ -1910,7 +2121,7 @@ func (a *arbiter) applySGLangPolicy(path, modelName, policy string, body []byte)
 
 func (a *arbiter) reasoningAction(modelName, policy string) reasoningAction {
 	switch a.modelCapability[modelName] {
-	case "structured":
+	case CapStructured:
 		switch policy {
 		case "auto", "low", "medium", "high":
 			return reasoningEnable
@@ -1922,7 +2133,7 @@ func (a *arbiter) reasoningAction(modelName, policy string) reasoningAction {
 				return reasoningDisable
 			}
 		}
-	case "inline":
+	case CapInline:
 		// Inline models leak `<think>` blocks into content — there's
 		// no parser that strips them. But the chat template typically
 		// honours `enable_thinking=false`, so an EXPLICIT user opt-out
@@ -2089,6 +2300,27 @@ func stripCtxVariantSuffix(name string) string {
 	return name[:loc[0]]
 }
 
+// isSafeModelName rejects names that would let `--model /models/<name>`
+// resolve outside the bind-mounted /models directory. Slash itself is
+// allowed because HuggingFace repo names like `nvidia/Qwen3-8B-NVFP4`
+// are the documented form for vLLM/SGLang. The empty name is treated
+// as safe here -- empty triggers a "model name required" error later
+// in ensureBackendRunning with a clearer message than "invalid name".
+func isSafeModelName(name string) bool {
+	if name == "" {
+		return true
+	}
+	if strings.ContainsRune(name, 0) {
+		return false
+	}
+	for _, seg := range strings.Split(name, "/") {
+		if seg == ".." {
+			return false
+		}
+	}
+	return true
+}
+
 // setTopJSONField overwrites a top-level field unconditionally (no
 // "if absent" gate). Used to rewrite the request's `model` field to
 // the clean name before forwarding to the backend.
@@ -2109,14 +2341,20 @@ func setTopJSONField(body []byte, key string, value any) []byte {
 	return out
 }
 
-// setNumCtx injects/overrides options.num_ctx in any of the wire
-// protocols Ollama accepts. `force=true` (picker @suffix override)
-// replaces any existing value; `force=false` (registered modelContexts
-// cap as a soft fallback) only sets when the client didn't.
+// setNumCtx injects/overrides options.num_ctx in an Ollama-native
+// request body. `force=true` (picker @suffix override) replaces any
+// existing value; `force=false` (registered modelContexts cap as a
+// soft fallback) only sets when the client didn't.
 //
-// Ollama's /api/chat, /api/generate, /v1/chat/completions, and
-// /v1/messages all honour `options.num_ctx` in the request body —
-// the OpenAI- and Anthropic-compat layers pass extra fields through.
+// IMPORTANT: only call from /api/chat and /api/generate handlers.
+// Ollama IGNORES options.num_ctx on its OpenAI-compat
+// (/v1/chat/completions) and Anthropic-compat (/v1/messages)
+// surfaces -- the load always picks up the global
+// OLLAMA_CONTEXT_LENGTH there. Empirically verified 2026-05-13:
+// a request with options.num_ctx=4096 to /v1/chat/completions
+// loaded with context_length=131072 (= OLLAMA_CONTEXT_LENGTH);
+// the same field on /api/chat loaded with context_length=4096.
+// Call site at makeRequestHandler gates accordingly.
 func setNumCtx(body []byte, numCtx int, force bool) []byte {
 	if numCtx <= 0 {
 		return body

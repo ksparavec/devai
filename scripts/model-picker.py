@@ -25,13 +25,25 @@ from __future__ import annotations
 import atexit
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 from pathlib import Path
 
 import yaml
+
+# _capability lives next to this script in both the repo (scripts/) and
+# inside the container (/usr/local/bin/, see Dockerfile.lab). Make the
+# import work in both layouts without depending on the caller's CWD or
+# PYTHONPATH being right.
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+from _capability import Capability  # noqa: E402
 
 
 # ── Configuration ────────────────────────────────────────────────────────────
@@ -233,7 +245,19 @@ def _load_hf_probe_records(paths: list[str]) -> dict[str, dict]:
         try:
             with open(path) as fh:
                 data = json.load(fh) or {}
-        except (OSError, json.JSONDecodeError):
+        except OSError as exc:
+            print(f"[picker] HF probe cache {path}: {exc}", file=sys.stderr)
+            return {}
+        except json.JSONDecodeError as exc:
+            # Corrupt cache would otherwise hide every HF model from
+            # the picker with no UI indication. Surface the path and
+            # the parse error so the operator can decide whether to
+            # delete the file (and re-probe) or restore a backup.
+            print(
+                f"[picker] HF probe cache {path} is CORRUPT: {exc}. "
+                f"No HF rows will appear until this is resolved.",
+                file=sys.stderr,
+            )
             return {}
         records: dict[str, dict] = {}
         for _key, entry in data.items():
@@ -269,7 +293,12 @@ def _load_bench_records(paths: list[str]) -> dict[tuple[str, str], dict]:
             continue
         if not isinstance(raw, dict):
             continue
-        for entry in raw.values():
+        for key, entry in raw.items():
+            # Skip _meta and any future top-level harness blocks. Previously
+            # this worked by accident because _meta had no "model"/"backend"
+            # keys; explicit gating means it stays correct as _meta grows.
+            if not _is_bench_row_key(key):
+                continue
             if not isinstance(entry, dict):
                 continue
             name = entry.get("model")
@@ -278,6 +307,14 @@ def _load_bench_records(paths: list[str]) -> dict[tuple[str, str], dict]:
                 out[(name, backend)] = entry
         return out
     return {}
+
+
+# Meta-block detection for bench cache iteration. Mirrors the source of
+# truth at scripts/bench/_bench_core.py:is_row_key — duplicated to avoid
+# making model-picker depend on the bench package (the picker ships as
+# a single file inside the lab image).
+def _is_bench_row_key(key: object) -> bool:
+    return isinstance(key, str) and key != "_meta" and not key.startswith("_")
 
 
 # Thresholds for the PRODUCTION_AGENTIC badge -- mirrors the formula
@@ -435,18 +472,35 @@ def _build_comparison_ctx(candidates: list[dict]) -> dict:
     return ctx
 
 
-def _migrate_in_memory(raw: dict) -> dict:
-    """Run probe-ollama-reasoning's v1/v2 → v3 conversion without touching disk."""
+_PROBE_MODULE = None  # cached after first migration call
+
+
+def _load_probe_module():
+    """Load probe-ollama-reasoning.py as a module (its filename has dashes
+    so it isn't importable directly). Cached at module scope to avoid
+    repeated exec_module + sys.path mutation on every cache refresh.
+    """
+    global _PROBE_MODULE
+    if _PROBE_MODULE is not None:
+        return _PROBE_MODULE
     import importlib.util
-    import sys
     here = Path(__file__).resolve().parent
-    sys.path.insert(0, str(here))
+    # One-shot sys.path insert; idempotent if the prober itself adds it.
+    if str(here) not in sys.path:
+        sys.path.insert(0, str(here))
     spec = importlib.util.spec_from_file_location(
         "_probe_module", here / "probe-ollama-reasoning.py",
     )
     mod = importlib.util.module_from_spec(spec)
     sys.modules["_probe_module"] = mod  # frozen-dataclass workaround
     spec.loader.exec_module(mod)
+    _PROBE_MODULE = mod
+    return mod
+
+
+def _migrate_in_memory(raw: dict) -> dict:
+    """Run probe-ollama-reasoning's v1/v2 -> v3 conversion without touching disk."""
+    mod = _load_probe_module()
     migrated, _, _ = mod.ensure_v3(raw)
     return migrated
 
@@ -460,7 +514,20 @@ def _ollama_disk_size_gb(library: str, tag: str) -> float:
         data = json.loads(manifest.read_text())
         total = sum(int(L.get("size", 0)) for L in data.get("layers", []))
         return total / (1024 ** 3)
-    except (OSError, ValueError, KeyError):
+    except OSError:
+        # Missing manifest / unreadable file is fine -- the model just
+        # isn't on disk yet. Silent 0.0 keeps the picker's row count
+        # honest (the discovery loop already filters out non-existent
+        # tags upstream of here).
+        return 0.0
+    except (ValueError, KeyError) as exc:
+        # Malformed manifest is NOT fine: it means the Ollama daemon
+        # wrote something we don't understand, and silently returning
+        # 0.0 would let it slide. Warn loudly so the operator notices.
+        print(
+            f"[picker] malformed Ollama manifest {manifest}: {exc}",
+            file=sys.stderr,
+        )
         return 0.0
 
 
@@ -630,9 +697,8 @@ def _params_label_from_name(name: str) -> str:
     `NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4` → `30B/A3B`. Returns "" when
     no recognised tokens appear.
     """
-    import re as _re
     upper = name.upper()
-    total_match = _re.search(r"(?<![A-Z0-9])(\d+(?:\.\d+)?)B(?![A-Z0-9])", upper)
+    total_match = re.search(r"(?<![A-Z0-9])(\d+(?:\.\d+)?)B(?![A-Z0-9])", upper)
     if not total_match:
         return ""
     total = total_match.group(0)  # e.g. "14B"
@@ -640,7 +706,7 @@ def _params_label_from_name(name: str) -> str:
     # total params token.
     active = ""
     tail = upper[total_match.end():]
-    active_match = _re.search(r"(?<![A-Z0-9])(A\d+(?:\.\d+)?B)(?![A-Z0-9])", tail)
+    active_match = re.search(r"(?<![A-Z0-9])(A\d+(?:\.\d+)?B)(?![A-Z0-9])", tail)
     if active_match:
         active = active_match.group(1)
     return f"{total}/{active}" if active else total
@@ -729,7 +795,7 @@ def _resolve_tool_parser(probe: dict, catalog_parsers: dict, backend: str) -> st
     return "N/A"
 
 
-def _capability_from_probe(probe: dict, fallback: str = "unknown") -> str:
+def _capability_from_probe(probe: dict, fallback: str = Capability.UNKNOWN) -> str:
     """Read the canonical capability from a v2 entry.
 
     Probe driver records the capability of the smallest fitting tier as
@@ -759,8 +825,7 @@ def _discover_models() -> list[dict]:
     # tags — they're a per-session artefact created by the picker via
     # Modelfile to bake `num_ctx` in. The user picks the parent; the
     # picker materialises the variant on launch.
-    import re as _re
-    _ctx_tag = _re.compile(r"-ctx\d+$")
+    _ctx_tag = re.compile(r"-ctx\d+$")
     base = Path(_OLLAMA_MANIFESTS)
     if base.is_dir():
         for lib_dir in sorted(base.iterdir()):
@@ -775,7 +840,7 @@ def _discover_models() -> list[dict]:
                 meta = catalog.get(name, {})
                 disk_gb = _ollama_disk_size_gb(lib_dir.name, tag_file.name)
                 probe = probes.get(name) or {}
-                cap = _capability_from_probe(probe, "unknown")
+                cap = _capability_from_probe(probe, Capability.UNKNOWN)
                 probe_details = _details_from_probe(probe)
                 out.append({
                     "name": name,
@@ -842,7 +907,7 @@ def _discover_models() -> list[dict]:
             entry = store.get(name)
             if not entry:
                 continue
-            if entry.get("capability") in ("error", "unsupported_arch"):
+            if entry.get("capability") in (Capability.ERROR, Capability.UNSUPPORTED_ARCH):
                 continue
             out_pairs.append((entry, backend))
         return out_pairs
@@ -895,7 +960,7 @@ def _discover_models() -> list[dict]:
                         **common,
                         "backend": backend,
                         "vram": _vram_from_hf_probe(probe, arch, weight_gb),
-                        "capability": _capability_from_probe(probe, "unknown"),
+                        "capability": _capability_from_probe(probe, Capability.UNKNOWN),
                         "probe": probe,
                         "tool_parser": _resolve_tool_parser(probe, cat_parsers, backend),
                     })
@@ -906,7 +971,7 @@ def _discover_models() -> list[dict]:
                     **common,
                     "backend": fallback_backend,
                     "vram": None,
-                    "capability": "unknown",
+                    "capability": Capability.UNKNOWN,
                     "probe": {},
                     "tool_parser": _resolve_tool_parser({}, cat_parsers, fallback_backend),
                 })
@@ -1067,24 +1132,23 @@ def _numbered_fallback(lines: list[str], header: str,
 # ── Row formatters ───────────────────────────────────────────────────────────
 
 _CAP_GLYPH = {
-    "structured":  "●",  # clean reasoning
-    "inline":      "◐",  # reasoning leaks into content
-    # `none` and `unsupported` both render as "No reasoning" in the menu.
-    # Cache distinguishes them: `none` = model produced a clean answer
-    # without a reasoning parser attempted (e.g. Llama-3.1 — working as
-    # designed); `unsupported` = parser was attempted but the model
-    # didn't emit reasoning content (configuration mismatch).
-    "none":        "·",
-    "unsupported": "·",
-    "unknown":     "?",  # not yet probed
-    "error":       "✗",  # probe failed
+    Capability.STRUCTURED:       "●",  # clean reasoning
+    Capability.INLINE:           "◐",  # reasoning leaks into content
+    # `none` is a probed-clean non-reasoning model (e.g. Llama-3.1
+    # working as designed); `unsupported` is a probed-but-no-reasoning
+    # outcome (typically a configuration mismatch). Distinct glyphs so
+    # the operator can tell the two apart in the preview pane.
+    Capability.NONE:             "○",  # non-reasoning by design
+    Capability.UNSUPPORTED:      "·",  # no reasoning detected
+    Capability.UNKNOWN:          "?",  # not yet probed
+    Capability.ERROR:            "✗",  # probe failed
 }
 
 _REASONING_LABEL = {
-    "structured": "Native reasoning",
-    "inline": "Inline reasoning",
-    "none": "No reasoning",
-    "unsupported": "No reasoning",
+    Capability.STRUCTURED:  "Native reasoning",
+    Capability.INLINE:      "Inline reasoning",
+    Capability.NONE:        "Non-reasoning model",
+    Capability.UNSUPPORTED: "No reasoning",
 }
 
 # Inline-reasoning models leak `<think>` blocks into content. They appear
@@ -1331,7 +1395,6 @@ def _format_model_row(m: dict, idx: int = 0) -> str:
 
 
 def _parse_param_b(label: str) -> float:
-    import re
     match = re.search(r"(?<![A-Za-z0-9])(\d+(?:\.\d+)?)\s*b\b", label.lower())
     return float(match.group(1)) if match else 0.0
 
@@ -1350,12 +1413,12 @@ def _params_hint(m: dict) -> float:
 # ── Capability scoring (flat list ordering) ──────────────────────────────────
 
 _REASONING_SCORE: dict[str, int] = {
-    "structured": 2,
-    "inline": 1,
-    "none": 0,
-    "unsupported": 0,
-    "unknown": 0,
-    "error": 0,
+    Capability.STRUCTURED:  2,
+    Capability.INLINE:      1,
+    Capability.NONE:        0,
+    Capability.UNSUPPORTED: 0,
+    Capability.UNKNOWN:     0,
+    Capability.ERROR:       0,
 }
 
 
@@ -1425,7 +1488,7 @@ def _score(m: dict) -> float:
     given realistic ranges (reasoning 0..2, tools 0..1, ctx_tier 0..3,
     MoE 0..1, params 0..~70).
     """
-    cap = str(m.get("capability") or "unknown")
+    cap = str(m.get("capability") or Capability.UNKNOWN)
     reasoning = _REASONING_SCORE.get(cap, 0)
     tools = 1 if _has_tools(m) else 0
     info = m.get("_picker_vram") or {}
@@ -1591,7 +1654,6 @@ def _format_quant_note(fmt: str, indent_cols: int = 11, wrap_cols: int = 50) -> 
     note = _FORMAT_NOTES.get(fmt.upper())
     if not note:
         return ""
-    import textwrap
     pad = " " * indent_cols
     wrapped = textwrap.wrap(note, width=wrap_cols)
     return "\n".join(f"{pad}{ln}" for ln in wrapped)
@@ -1681,9 +1743,9 @@ def _capability_summary_text(
     backend = str(m.get("backend") or "?")
     info = m.get("_picker_vram") or {}
     ctx = int(info.get("_picker_ctx") or m.get("_picker_context") or 0)
-    cap = str(m.get("capability") or "unknown")
+    cap = str(m.get("capability") or Capability.UNKNOWN)
     reason_label = _REASONING_LABEL.get(cap, "Unknown")
-    if cap == "inline" and reasoning_mode == "nothink":
+    if cap == Capability.INLINE and reasoning_mode == "nothink":
         reason_label = f"{reason_label} (forced OFF for this launch)"
     tools_label = "Yes" if _has_tools(m) else "No"
     type_label = "MoE" if _is_moe(m) else "Dense"
@@ -1946,8 +2008,8 @@ def _build_candidates(
     }
     candidates: list[dict] = []
     for m in models:
-        cap = str(m.get("capability") or "unknown")
-        if cap in ("unknown", "error", "unsupported_arch"):
+        cap = str(m.get("capability") or Capability.UNKNOWN)
+        if cap in (Capability.UNKNOWN, Capability.ERROR, Capability.UNSUPPORTED_ARCH):
             hidden["missing_capability"] += 1
             continue
         info = _max_fitting_ctx_info(m)
@@ -2174,7 +2236,7 @@ def _resolve_agent(agent_filter: str | None, model: dict) -> tuple[str, str] | N
     """
     reasoning_mode = "default"
     cap = str(model.get("capability") or "")
-    if cap == "inline":
+    if cap == Capability.INLINE:
         toggle_lines = [
             f"  Reasoning ON   {_DIM}(default — model thinks inline){_RESET}",
             f"  Reasoning OFF  {_DIM}(force enable_thinking=false / ::nothink){_RESET}",

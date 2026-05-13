@@ -87,6 +87,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
+from _capability import Capability  # noqa: E402  — local import after sys.path fix
 from _contexts import (  # noqa: E402  — local import after sys.path fix
     STANDARD_CONTEXTS,
     context_label,
@@ -262,18 +263,18 @@ def chat_probe(
 def classify(resp: dict) -> tuple[str, dict]:
     """Map /api/chat response to (capability, evidence_dict)."""
     if "error" in resp:
-        return "error", {"error": resp["error"]}
+        return Capability.ERROR, {"error": resp["error"]}
     msg = resp.get("message") or {}
     thinking = (msg.get("thinking") or "").strip()
     content = msg.get("content") or ""
     if thinking:
-        return "structured", {
+        return Capability.STRUCTURED, {
             "thinking_chars": len(thinking),
             "content_preview": content[:80],
         }
     if has_inline_think_markers(content):
-        return "inline", {"content_preview": content[:200]}
-    return "unsupported", {"content_preview": content[:120]}
+        return Capability.INLINE, {"content_preview": content[:200]}
+    return Capability.UNSUPPORTED, {"content_preview": content[:120]}
 
 
 # ── Probe orchestration ──────────────────────────────────────────────────────
@@ -312,14 +313,14 @@ def probe_one_context(
     )
     cap, evidence = classify(resp)
     think_rejected_note: str | None = None
-    if cap == "error" and _is_think_param_rejection(evidence):
+    if cap == Capability.ERROR and _is_think_param_rejection(evidence):
         think_rejected_note = str(evidence.get("error") or "HTTP 400")
         resp = chat_probe(
             ollama_url, model_name, prompt, think=False,
             num_predict=num_predict, timeout=timeout, num_ctx=ctx,
         )
         cap, evidence = classify(resp)
-        if cap != "error":
+        if cap != Capability.ERROR:
             evidence = {**evidence, "think_param_rejected": think_rejected_note}
     record: dict = {
         "ctx": ctx,
@@ -327,12 +328,12 @@ def probe_one_context(
         "evidence": evidence,
         "probed_at": now_iso(),
     }
-    if think_rejected_note and cap != "error":
+    if think_rejected_note and cap != Capability.ERROR:
         record["think_param_rejected"] = True
-    if cap != "error":
+    if cap != Capability.ERROR:
         vram = measure_vram(ollama_url, model_name, digest, timeout=10.0)
         if "error" in vram:
-            record["capability"] = "error"
+            record["capability"] = Capability.ERROR
             record["evidence"] = {"error": f"vram: {vram['error']}"}
         else:
             record.update({
@@ -352,7 +353,7 @@ def probe_one_context(
                     "actual_vram_gb": vram["actual_vram_gb"],
                     "original_capability": cap,
                 }
-                record["capability"] = "error"
+                record["capability"] = Capability.ERROR
     record["probe_seconds"] = round(time.time() - started, 2)
     return record
 
@@ -370,7 +371,7 @@ def maybe_probe_disable(
     Runs only when capability is `structured` and disable_verified isn't
     already recorded. Returns True iff a probe was issued.
     """
-    if entry.get("capability") != "structured":
+    if entry.get("capability") != Capability.STRUCTURED:
         entry.pop("disable_verified", None)
         entry.pop("evidence_disable", None)
         return False
@@ -422,13 +423,13 @@ def _migrate_one(entry: dict, old: dict) -> None:
     if "max_context" not in entry and old.get("model_max_context"):
         entry["max_context"] = old["model_max_context"]
 
-    v1_cap = old.get("capability") or "unknown"
+    v1_cap = old.get("capability") or Capability.UNKNOWN
     original_cap = (
         (old.get("evidence_enable") or {}).get("original_capability") or v1_cap
     )
     if "capability" not in entry:
         # If v1 flipped to "error" because of spill, recover the pre-spill cap.
-        entry["capability"] = original_cap if v1_cap == "error" else v1_cap
+        entry["capability"] = original_cap if v1_cap == Capability.ERROR else v1_cap
     if "disable_verified" not in entry and "disable_verified" in old:
         entry["disable_verified"] = old["disable_verified"]
     if "evidence_disable" not in entry and "evidence_disable" in old:
@@ -446,7 +447,7 @@ def _migrate_one(entry: dict, old: dict) -> None:
             continue
         fully_on_gpu = bool(point.get("fully_on_gpu", False))
         if not fully_on_gpu:
-            cap_for_probe = "error"
+            cap_for_probe = Capability.ERROR
             evidence: dict = {
                 "error": f"CPU/RAM spill at {ctx} context (migrated)",
                 "actual_total_gb": point.get("actual_total_gb"),
@@ -457,7 +458,7 @@ def _migrate_one(entry: dict, old: dict) -> None:
             cap_for_probe = original_cap
             evidence = {}
         else:
-            cap_for_probe = v1_cap if v1_cap != "error" else original_cap
+            cap_for_probe = v1_cap if v1_cap != Capability.ERROR else original_cap
             evidence = {}
         entry["probes"][ctx_key] = {
             "ctx": ctx,
@@ -534,10 +535,15 @@ def ensure_v2(cache: dict) -> tuple[dict, int]:
 def migrate_v2_to_v3(cache: dict) -> int:
     """In-place upgrade of v2 entries (flat probes) to v3 (vram-nested).
 
-    v2 probes carry no VRAM stamp, so we cannot safely re-bucket them.
-    The cells get wiped and the next probe run repopulates per-band.
+    v2 probes carry no VRAM stamp, so we cannot safely re-bucket them
+    into the v3 (vram_gb -> ctx -> record) layout. Active probes get
+    cleared so the next run repopulates per-band, but we PRESERVE the
+    old payload under `legacy_v2_probes` for forensics rather than
+    silently destroying probe-hours of data. The capability lookup
+    falls back to "unknown" until a fresh probe runs.
+
     Architectural fields (max_context, aliases, MoE/params/quant) are
-    kept verbatim — they don't depend on VRAM.
+    kept verbatim -- they don't depend on VRAM.
 
     Returns the number of entries upgraded.
     """
@@ -546,15 +552,29 @@ def migrate_v2_to_v3(cache: dict) -> int:
         if not isinstance(entry, dict) or is_v3_entry(entry):
             continue
         entry["schema_version"] = 3
-        # Probes are unbanded — drop them.
+        # Preserve the old probe payload before wiping the active slot
+        # so re-probing isn't a destructive operation. Forensics-only --
+        # no reader interprets legacy_v2_probes today; treat it as a
+        # blob until a future migration learns to re-bucket from it.
+        old = entry.get("probes")
+        if old:
+            entry["legacy_v2_probes"] = old
         entry["probes"] = {}
         # Capability and disable_verified come from probes; reset.
-        entry["capability"] = "unknown"
+        entry["capability"] = Capability.UNKNOWN
         entry.pop("disable_verified", None)
         entry.pop("evidence_disable", None)
         entry.pop("first_probed_at", None)
         entry.pop("last_probed_at", None)
         n += 1
+    if n > 0:
+        print(
+            f"[probe-ollama] migrated {n} v2 entries to v3. "
+            f"Old probes preserved under `legacy_v2_probes`; "
+            f"run `make probe` to repopulate the v3 cells "
+            f"-- until then these models will be hidden from the picker.",
+            file=sys.stderr,
+        )
     return n
 
 
@@ -820,7 +840,7 @@ def main() -> None:
             or _is_think_param_rejection(
                 (vram_band.get(str(t)) or {}).get("evidence") or {}
             )
-            and (vram_band.get(str(t)) or {}).get("capability") == "error"
+            and (vram_band.get(str(t)) or {}).get("capability") == Capability.ERROR
         ]
         if not missing:
             fully_cached += 1
@@ -871,7 +891,7 @@ def main() -> None:
                         "actual_vram_gb": _vram,
                         "actual_context": larger,
                         "fully_on_gpu": False,
-                        "capability": "error",
+                        "capability": Capability.ERROR,
                         "evidence": {
                             "error": (
                                 f"implied spill: "
@@ -908,9 +928,9 @@ def main() -> None:
             args.prompt, args.num_predict, args.timeout,
         )
 
-        cap = entry.get("capability") or "unknown"
+        cap = entry.get("capability") or Capability.UNKNOWN
         marker = ""
-        if cap == "structured":
+        if cap == Capability.STRUCTURED:
             dv = entry.get("disable_verified")
             if dv is True:
                 marker = " (disable verified)"
@@ -946,7 +966,7 @@ def main() -> None:
     print(file=sys.stderr)
     by_cap: dict[str, int] = {}
     for entry in cache.values():
-        c = entry.get("capability") or "unknown"
+        c = entry.get("capability") or Capability.UNKNOWN
         by_cap[c] = by_cap.get(c, 0) + 1
     summary = "  ".join(f"{c}={n}" for c, n in sorted(by_cap.items()))
     print(

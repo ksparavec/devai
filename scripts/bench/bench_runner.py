@@ -37,10 +37,12 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
+from _capability import Capability  # noqa: E402
 from _probe_core import http_get, load_cache, save_cache  # noqa: E402
 from bench import bench_latency_leak  # noqa: E402
 from bench._bench_core import (  # noqa: E402
     DEFAULT_CACHE_PATH,
+    assert_cache_schema_compatible,
     cache_key_for_entry,
     capture_host_env,
     migrate_bench_cache_keys,
@@ -213,7 +215,7 @@ def discover_models(
         if not isinstance(entry, dict):
             continue
         cap = entry.get("capability")
-        if cap in ("unsupported_arch",):
+        if cap == Capability.UNSUPPORTED_ARCH:
             continue
         if rx is not None and not rx.search(key):
             continue
@@ -413,6 +415,11 @@ def run_for_target(
                 print(f"    score: {score:.4f} (n={n})", file=sys.stderr)
             except Exception as e:  # noqa: BLE001 — inspect_ai surfaces many error shapes
                 print(f"    !! gsm8k failed: {e}", file=sys.stderr)
+                # Stamp the failure into the cache so a later non-`--force`
+                # run sees "errored once" instead of "never ran" -- the
+                # latter silently re-runs the same broken combo or omits
+                # the row from the leaderboard.
+                task_results["gsm8k_error"] = {"error": str(e), "ran_at": _now_iso()}
 
         if "humaneval" in tasks and (force or "humaneval" not in [_strip_subset(t) for t in existing_tasks]):
             from bench.tasks.humaneval import humaneval_task
@@ -435,6 +442,7 @@ def run_for_target(
                 print(f"    pass@1: {score:.4f} (n={n})", file=sys.stderr)
             except Exception as e:  # noqa: BLE001
                 print(f"    !! humaneval failed: {e}", file=sys.stderr)
+                task_results["humaneval_error"] = {"error": str(e), "ran_at": _now_iso()}
 
         if "tools" in tasks and (force or "tools" not in [_strip_subset(t) for t in existing_tasks]):
             from bench.tasks.tools_use import tools_use_task
@@ -467,6 +475,7 @@ def run_for_target(
                     print(f"    by_subcase: {by_sub}", file=sys.stderr)
             except Exception as e:  # noqa: BLE001
                 print(f"    !! tools_use failed: {e}", file=sys.stderr)
+                task_results["tools_use_error"] = {"error": str(e), "ran_at": _now_iso()}
 
         if "longctx" in tasks and (force or "longctx_probe" not in existing_tasks):
             from bench import bench_longctx
@@ -501,6 +510,7 @@ def run_for_target(
                     )
             except Exception as e:  # noqa: BLE001
                 print(f"    !! longctx failed: {e}", file=sys.stderr)
+                task_results["longctx_error"] = {"error": str(e), "ran_at": _now_iso()}
 
     finally:
         vram = sampler.stop()
@@ -609,13 +619,17 @@ def _now_iso() -> str:
 def _check_router(router_url: str) -> None:
     """Hit ``/health`` so a bad route fails before the first model
     runs (saves the cold-start startup time on a bogus endpoint).
+
+    Suppresses only the JSON-decode case: /health legitimately returns
+    non-JSON ("OK"), which http_get's json.loads chokes on, but that
+    means the port DID answer. Transport failures (URLError, OSError)
+    propagate so the operator sees "router not reachable" immediately
+    instead of chasing a 10-minute opaque streaming timeout on the
+    first model.
     """
     try:
         http_get(router_url + "/health", timeout=5.0)
-    except (urllib.error.URLError, OSError, json.JSONDecodeError):
-        # /health may return non-JSON ("OK"); we just want to confirm
-        # the port answers. urlopen raising URLError is the real
-        # failure case.
+    except json.JSONDecodeError:
         pass
 
 
@@ -678,6 +692,7 @@ def main() -> None:
     )
 
     cache = load_cache(args.cache)
+    assert_cache_schema_compatible(cache)
     n_migrated = migrate_bench_cache_keys(cache)
     if n_migrated:
         print(

@@ -22,6 +22,13 @@ func testBackend(name string, server *httptest.Server) *backendState {
 			HealthPath: "/health",
 		},
 		proxy: newProxy(u),
+		// Default allowlist for tests: production code populates this
+		// from modelsForBackend(cfg.Models, bc.Name) at startup. The
+		// handler's allowlist check (HI4) refuses unknown vllm/sglang
+		// model names with 404, so tests that hit the handler need at
+		// least the names they POST in the test body. Individual tests
+		// override modelNames where they need a different set.
+		modelNames: []string{"test-model"},
 		// recreateCond is bound to the arbiter's mutex in production code
 		// (see backend construction in main()). testArbiter rebinds it
 		// once the arbiter is constructed.
@@ -37,6 +44,9 @@ func testArbiter(backends ...*backendState) *arbiter {
 		modelContexts: map[string]int{},
 		totalVRAMGB:   24.0,
 		maxContextLen: 131072,
+		// Match production wiring so tests that exercise backendIsServing
+		// don't NPE on a nil client.
+		healthClient: &http.Client{Timeout: 2 * time.Second},
 	}
 	for _, bs := range backends {
 		bs.recreateCond = sync.NewCond(&a.mu)
@@ -269,14 +279,14 @@ func TestSynthesizeHFFromCache_FilteringAndShape(t *testing.T) {
 	cache := map[string]*hfCacheEntry{
 		// Healthy model — fits at 24G/32K. Should produce a row.
 		"nvidia/Llama-3.1-8B@bdb54e242984": {
-			SchemaVersion: 1,
+			SchemaVersion: 2,
 			Repo:          "nvidia/Llama-3.1-8B-Instruct-NVFP4",
 			Sha:           "bdb54e242984",
 			Aliases:       []string{"Llama-3.1-8B-Instruct-NVFP4"},
 			ModelKind:     "dense",
 			SizeGB:        5.61, // weight size; distinct from ActualVRAMGB (post-load)
 			MaxContext:    131072,
-			Capability:    "inline",
+			Capability:    CapInline,
 			ToolParser:    &parser,
 			Probes: map[string]map[string]hfCacheProbe{
 				"24": {
@@ -291,7 +301,7 @@ func TestSynthesizeHFFromCache_FilteringAndShape(t *testing.T) {
 			SchemaVersion: 1,
 			Repo:          "talkie-lm/talkie-1930-13b-it",
 			Aliases:       []string{"talkie-1930"},
-			Capability:    "unsupported_arch",
+			Capability:    CapUnsupportedArch,
 			Probes:        map[string]map[string]hfCacheProbe{},
 		},
 		// Infra failure — also dropped.
@@ -299,7 +309,7 @@ func TestSynthesizeHFFromCache_FilteringAndShape(t *testing.T) {
 			SchemaVersion: 1,
 			Repo:          "some/sglang-fp4",
 			Aliases:       []string{"sglang-fp4"},
-			Capability:    "error",
+			Capability:    CapError,
 			Probes: map[string]map[string]hfCacheProbe{
 				"24": {"32768": {Ctx: 32768, VramGB: 24, Fits: false}},
 			},
@@ -309,7 +319,7 @@ func TestSynthesizeHFFromCache_FilteringAndShape(t *testing.T) {
 			SchemaVersion: 1,
 			Repo:          "x/wrong-band",
 			Aliases:       []string{"wrong-band"},
-			Capability:    "inline",
+			Capability:    CapInline,
 			Probes: map[string]map[string]hfCacheProbe{
 				"16": {"32768": {Ctx: 32768, VramGB: 16, Fits: true}},
 			},
@@ -339,7 +349,7 @@ func TestSynthesizeHFFromCache_FilteringAndShape(t *testing.T) {
 	if r.Size != "5.61 GB" {
 		t.Errorf("Size=%q want \"5.61 GB\" (weight size, not post-load total)", r.Size)
 	}
-	if r.Reasoning == nil || r.Reasoning.Capability != "inline" {
+	if r.Reasoning == nil || r.Reasoning.Capability != CapInline {
 		t.Errorf("Reasoning=%+v want capability=inline", r.Reasoning)
 	}
 }
@@ -361,7 +371,7 @@ func TestSynthesizeHFFromCache_V2FieldsPropagated(t *testing.T) {
 			ModelKind:       "dense",
 			SizeGB:          7.4,
 			MaxContext:      32768,
-			Capability:      "structured",
+			Capability:      CapStructured,
 			ReasoningParser: &rp,
 			ToolParser:      &tp,
 			DisableVerified: &dv,
@@ -389,15 +399,18 @@ func TestSynthesizeHFFromCache_V2FieldsPropagated(t *testing.T) {
 		!*r.Reasoning.DisableVerified {
 		t.Errorf("DisableVerified must propagate as true, got %+v", r.Reasoning)
 	}
-	if r.Reasoning == nil || r.Reasoning.Capability != "structured" {
+	if r.Reasoning == nil || r.Reasoning.Capability != CapStructured {
 		t.Errorf("Capability=%v want structured", r.Reasoning)
 	}
 }
 
-func TestSynthesizeHFFromCache_V1BackwardCompat(t *testing.T) {
-	// v1 cache entries lack ReasoningParser / DisableVerified. The
-	// synthesizer must still emit a serving row, with both fields
-	// zero-valued so the router falls back to inline / no-disable.
+func TestSynthesizeHFFromCache_V1Rejected(t *testing.T) {
+	// v1 cache entries lack DisableVerified. Serving them would mean the
+	// router runs vLLM/SGLang with no --tool-call-parser flag and
+	// maybeStripTools then silently drops every tools/tool_choice the
+	// agent sends -- a corrupt-by-omission state with no log entry.
+	// The synthesizer must REFUSE v1 entries; the operator re-probes
+	// with `make probe-vllm` / `make probe-sglang` to upgrade.
 	tp := "llama3_json"
 	cache := map[string]*hfCacheEntry{
 		"nvidia/llama@v1deadbeef": {
@@ -408,7 +421,7 @@ func TestSynthesizeHFFromCache_V1BackwardCompat(t *testing.T) {
 			ModelKind:     "dense",
 			SizeGB:        5.6,
 			MaxContext:    131072,
-			Capability:    "inline",
+			Capability:    CapInline,
 			ToolParser:    &tp,
 			Probes: map[string]map[string]hfCacheProbe{
 				"24": {
@@ -419,18 +432,8 @@ func TestSynthesizeHFFromCache_V1BackwardCompat(t *testing.T) {
 		},
 	}
 	rows := synthesizeHFFromCache(cache, "vllm", 24, 131072)
-	if len(rows) != 1 {
-		t.Fatalf("expected 1 row, got %d", len(rows))
-	}
-	r := rows[0]
-	if r.ReasoningParser != "" {
-		t.Errorf("v1 entry ReasoningParser must be empty, got %q", r.ReasoningParser)
-	}
-	if r.ToolParser != "llama3_json" {
-		t.Errorf("ToolParser=%q want llama3_json", r.ToolParser)
-	}
-	if r.Reasoning == nil || r.Reasoning.DisableVerified != nil {
-		t.Errorf("DisableVerified must remain nil for v1, got %+v", r.Reasoning)
+	if len(rows) != 0 {
+		t.Fatalf("v1 entry must be rejected, got %d rows", len(rows))
 	}
 }
 
@@ -441,10 +444,10 @@ func TestSynthesizeHFFromCache_FallbackWhenSizeGBMissing(t *testing.T) {
 	// surfaces in CI as an intentional behavioural change.
 	cache := map[string]*hfCacheEntry{
 		"r/m@abc": {
-			SchemaVersion: 1,
+			SchemaVersion: 2,
 			Aliases:       []string{"m"},
 			MaxContext:    65536,
-			Capability:    "inline",
+			Capability:    CapInline,
 			// SizeGB intentionally missing
 			Probes: map[string]map[string]hfCacheProbe{
 				"24": {"32768": {Ctx: 32768, VramGB: 24, Fits: true,
@@ -465,10 +468,10 @@ func TestSynthesizeHFFromCache_FallbackWhenSizeGBMissing(t *testing.T) {
 func TestSynthesizeHFFromCache_OperatorCtxCapClamps(t *testing.T) {
 	cache := map[string]*hfCacheEntry{
 		"x/y@z": {
-			SchemaVersion: 1,
+			SchemaVersion: 2,
 			Aliases:       []string{"y"},
 			MaxContext:    262144, // model declares big ceiling
-			Capability:    "inline",
+			Capability:    CapInline,
 			Probes: map[string]map[string]hfCacheProbe{
 				"24": {
 					"32768":  {Ctx: 32768, VramGB: 24, Fits: true},

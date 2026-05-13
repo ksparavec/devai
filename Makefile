@@ -954,6 +954,11 @@ install: ## Install bin/devai-agent to $(INSTALL_PREFIX)/bin and stage config in
 	@# bind-mount; re-running `make install` after picker edits picks up the
 	@# new code without a full image rebuild.
 	@ln -sf "$(CURDIR)/scripts/model-picker.py" $(DEVAI_HOME)/model-picker.py
+	@# Same for the Capability constants module that the picker imports.
+	@# Without this symlink the picker's `from _capability import ...`
+	@# would fail when devai-agent bind-mounts the host picker over the
+	@# in-image one without bind-mounting the constants module too.
+	@ln -sf "$(CURDIR)/scripts/_capability.py" $(DEVAI_HOME)/_capability.py
 	@# Symlink each backend's probe cache so it stays fresh as the prober
 	@# regenerates it. If users want a frozen snapshot they can replace the
 	@# link with a copy after install. Missing caches are warned but not
@@ -994,6 +999,7 @@ uninstall: ## Remove devai-agent launcher and the staged config dir
 	@rm -f $(DEVAI_HOME)/.sglang-reasoning-cache.json
 	@rm -f $(DEVAI_HOME)/.bench-cache.json
 	@rm -f $(DEVAI_HOME)/model-picker.py
+	@rm -f $(DEVAI_HOME)/_capability.py
 	@echo "Removed $(INSTALL_PREFIX)/bin/devai-agent and the symlinks under $(DEVAI_HOME)/."
 	@echo "preferences.yaml and sessions/ are kept; remove $(DEVAI_HOME)/ manually if you want a clean slate."
 

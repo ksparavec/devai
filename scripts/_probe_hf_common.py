@@ -54,6 +54,7 @@ from _contexts import (  # noqa: E402  — local import after sys.path fix
     standard_vram_budgets,
     vram_label,
 )
+from _capability import Capability, is_terminal  # noqa: E402
 from _probe_core import (  # noqa: E402
     has_inline_think_markers,
     http_get,
@@ -125,14 +126,21 @@ RECOVERY_FLAGS_PATH = Path(
 def _load_recovery_registry(path: Path) -> dict[str, dict]:
     """Read deploy/recovery-flags.json and return {model_name: entry}.
 
-    Missing file or parse error → empty dict (every model launches without
-    extra flags, matching pre-registry behaviour).
+    Missing file is normal (no registry configured) -> empty dict.
+    A JSON parse error is data corruption -> warn and return empty so
+    probers can still make progress. Any other OSError (permission
+    denied, IO error, file is a directory, ...) means the operator's
+    environment is broken in a way that would otherwise cause every
+    model to silently launch without its recovery flags -- which on
+    24G cards typically OOMs during model load. Re-raise so the prober
+    aborts loudly instead of writing fits=false for models that would
+    have fit with the recovery flag.
     """
     try:
         data = json.loads(path.read_text())
     except FileNotFoundError:
         return {}
-    except (OSError, json.JSONDecodeError) as exc:
+    except json.JSONDecodeError as exc:
         print(f"[warn] recovery registry {path}: {exc}", file=sys.stderr)
         return {}
     models = data.get("models")
@@ -580,17 +588,17 @@ def classify_chat_response(
       5. otherwise → `unsupported`
     """
     if "error" in resp:
-        return "error", {"error": resp["error"]}
+        return Capability.ERROR, {"error": resp["error"]}
     choices = resp.get("choices") or []
     if not choices:
-        return "unsupported", {"reason": "no choices in response"}
+        return Capability.UNSUPPORTED, {"reason": "no choices in response"}
     msg = (choices[0].get("message") or {})
     reasoning = _extract_reasoning_content(msg)
     content = msg.get("content") or ""
     finish_reason = (choices[0].get("finish_reason") or "")
 
     if reasoning:
-        return "structured", {
+        return Capability.STRUCTURED, {
             "reasoning_preview": reasoning[:200],
             "content_preview": content[:120],
             "structured_reason": "reasoning_content_populated",
@@ -600,7 +608,7 @@ def classify_chat_response(
         # waiting for </think>. The parser was active — the budget was
         # too low. Classify as structured; the disable probe will
         # confirm wiring.
-        return "structured", {
+        return Capability.STRUCTURED, {
             "structured_reason": "thought_past_max_tokens",
             "finish_reason": finish_reason,
         }
@@ -608,12 +616,12 @@ def classify_chat_response(
         # Parser likely stripped an empty `<think></think>` block,
         # leaving the leading newlines. Distinct from a model that
         # genuinely starts with newlines (rare with our prompt).
-        return "structured", {
+        return Capability.STRUCTURED, {
             "structured_reason": "empty_think_stripped",
             "content_preview": content[:120],
         }
     if has_inline_think_markers(content):
-        return "inline", {"content_preview": content[:200]}
+        return Capability.INLINE, {"content_preview": content[:200]}
     # Distinguish "model doesn't reason and was never asked to" from
     # "we tried a reasoning parser and got nothing back". Both render
     # as `No reasoning` in the picker, but the cache audit needs to
@@ -624,11 +632,11 @@ def classify_chat_response(
         and finish_reason == "stop"
         and content
     ):
-        return "none", {
+        return Capability.NONE, {
             "none_reason": "clean_answer_no_parser_attempted",
             "content_preview": content[:120],
         }
-    return "unsupported", {"content_preview": content[:120]}
+    return Capability.UNSUPPORTED, {"content_preview": content[:120]}
 
 
 # Patterns must indicate an architecture *rejection*, not just the
@@ -920,7 +928,7 @@ def probe_one_cell(
     except (AttributeError, IndexError, TypeError):
         pass
 
-    if capability == "error":
+    if capability == Capability.ERROR:
         container_remove(runtime, container_name)
         return _failure_record(
             ctx=requested_ctx, vram_gb=band_gb, started=started,
@@ -932,7 +940,7 @@ def probe_one_cell(
     # Confirmed reasoning parser only when Probe A actually produced
     # `structured`. Any other capability means the curated parser
     # didn't apply (model emits inline or doesn't reason at all).
-    reasoning_parser_verified = reasoning_parser if capability == "structured" else None
+    reasoning_parser_verified = reasoning_parser if capability == Capability.STRUCTURED else None
 
     # ── Probe B: tool-call ───────────────────────────────────────────
     # Two-phase verification:
@@ -957,7 +965,7 @@ def probe_one_cell(
         # Reasoning models burn 500-2000 tokens on chain-of-thought before
         # any tool-call markers. The old 128-token budget guaranteed they
         # never reached the call. 2048 covers typical R1-Distill traces.
-        is_reasoning = capability in ("structured", "inline")
+        is_reasoning = capability in (Capability.STRUCTURED, Capability.INLINE)
         tool_max_tokens = 2048 if is_reasoning else 128
         auto_body = {
             "model": model_name,
@@ -1001,7 +1009,7 @@ def probe_one_cell(
     # ── Probe C: disable verification ────────────────────────────────
     disable_verified = False
     disable_evidence: dict | None = None
-    if capability == "structured":
+    if capability == Capability.STRUCTURED:
         disable_body = build_disable_thinking_body(spec.name, base_chat_body)
         disable_resp = _post_chat(base_url, disable_body)
         if not response_has_reasoning_content(disable_resp) and "error" not in disable_resp:
@@ -1075,7 +1083,7 @@ def _failure_record(
         "vram_gb": vram_gb,
         "fits": False,
         "actual_context": actual_context,
-        "capability": "error",
+        "capability": Capability.ERROR,
         "evidence": evidence,
         "probed_at": now_iso(),
         "probe_seconds": round(time.time() - started, 2),
@@ -1150,7 +1158,7 @@ def ensure_entry(
             # --max-model-len to a few thousand tokens.
             "size_gb": weight_size_gb,
             "max_context": 0,
-            "capability": "unknown",
+            "capability": Capability.UNKNOWN,
             # v2: confirmed parser names from the first probed cell. Null
             # when the curated family hint did not produce a verified
             # round-trip (or when no parsers were curated).
@@ -1218,18 +1226,22 @@ def refresh_top_level_from_cells(entry: dict) -> None:
     NOT downgrade a successful classification at a higher tier — a 16G
     spill doesn't invalidate a 24G fit.
     """
-    cur_cap = entry.get("capability") or "unknown"
+    cur_cap = entry.get("capability") or Capability.UNKNOWN
     cur_kind = ((entry.get("evidence") or {}).get("kind") or "")
-    is_terminal = (
-        cur_cap == "unsupported_arch"
-        or (cur_cap == "error" and cur_kind in ("arch", "quant"))
+    # Stickier than the global TERMINAL set: an `error` with arch/quant
+    # evidence is tier-independent (it'll fail at every VRAM band),
+    # whereas an `error` with oom/infra evidence is tier-specific and
+    # MUST allow a higher-tier success to overwrite it.
+    cur_is_terminal = (
+        cur_cap == Capability.UNSUPPORTED_ARCH
+        or (cur_cap == Capability.ERROR and cur_kind in ("arch", "quant"))
     )
-    if is_terminal:
+    if cur_is_terminal:
         return
 
     smallest = smallest_clean_probe(entry)
     if smallest is not None:
-        entry["capability"] = smallest.get("capability") or "unknown"
+        entry["capability"] = smallest.get("capability") or Capability.UNKNOWN
         ev = smallest.get("evidence") or {}
         if ev:
             entry["evidence"] = ev
@@ -1276,7 +1288,7 @@ def refresh_top_level_from_cells(entry: dict) -> None:
                 else [c for c in vram_bucket.values() if isinstance(c, dict)]
             )
             for cell in cells:
-                if cell.get("capability") in (None, "error"):
+                if cell.get("capability") in (None, Capability.ERROR):
                     continue
                 ac = int(cell.get("actual_context") or 0)
                 if ac > largest_ctx:
@@ -1306,13 +1318,13 @@ def refresh_top_level_from_cells(entry: dict) -> None:
                 chosen_severity = sev
                 chosen_ev = ev
     if chosen_severity == 3:
-        entry["capability"] = "unsupported_arch"
+        entry["capability"] = Capability.UNSUPPORTED_ARCH
         entry["evidence"] = chosen_ev
     elif chosen_severity >= 1:
-        entry["capability"] = "error"
+        entry["capability"] = Capability.ERROR
         entry["evidence"] = chosen_ev
     else:
-        entry.setdefault("capability", "unknown")
+        entry.setdefault("capability", Capability.UNKNOWN)
 
 
 # ── Argparse builder ─────────────────────────────────────────────────────────
@@ -1431,10 +1443,10 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
         row_tool_parser = row_parsers.get("tool") or None
 
         if args.force_arch:
-            entry["capability"] = "unknown"
+            entry["capability"] = Capability.UNKNOWN
             entry["evidence"] = {}
 
-        if (entry.get("capability") == "unsupported_arch"
+        if (entry.get("capability") == Capability.UNSUPPORTED_ARCH
                 and not args.force_arch):
             print(f"  [skip] {name}: unsupported_arch (cached)",
                   file=sys.stderr)
@@ -1539,7 +1551,7 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
                             "vram_gb": _vram,
                             "fits": False,
                             "actual_context": larger,
-                            "capability": "error",
+                            "capability": Capability.ERROR,
                             "evidence": {
                                 "kind": "implied_spill",
                                 "implied_from_ctx": _ctx,
@@ -1579,7 +1591,7 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
     print(file=sys.stderr)
     by_cap: dict[str, int] = {}
     for entry in cache.values():
-        c = entry.get("capability") or "unknown"
+        c = entry.get("capability") or Capability.UNKNOWN
         by_cap[c] = by_cap.get(c, 0) + 1
     summary = "  ".join(f"{c}={n}" for c, n in sorted(by_cap.items()))
     print(

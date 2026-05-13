@@ -51,6 +51,9 @@ import yaml
 CONFIG_DIR = Path.home() / ".devai"
 PREFS_FILE = CONFIG_DIR / "preferences.yaml"
 PICKER_SRC = CONFIG_DIR / "model-picker.py"
+# The picker imports `_capability` at module load -- bind-mounted next
+# to the picker so the import resolves on the in-container PYTHONPATH.
+CAPABILITY_SRC = CONFIG_DIR / "_capability.py"
 SESSIONS_DIR = CONFIG_DIR / "sessions"
 PICK_BACK_CHANNEL = CONFIG_DIR / ".last-pick.json"
 
@@ -270,6 +273,9 @@ def build_run_cmd(
     # `make install`) take effect without an image rebuild.
     if PICKER_SRC.is_file():
         cmd += ["-v", f"{PICKER_SRC}:/usr/local/bin/model-picker:ro"]
+    # Same for the Capability constants module the picker imports.
+    if CAPABILITY_SRC.is_file():
+        cmd += ["-v", f"{CAPABILITY_SRC}:/usr/local/bin/_capability.py:ro"]
 
     cmd += [*optional_mounts()]
 
@@ -363,6 +369,12 @@ def main() -> int:
     except FileNotFoundError:
         pass
 
+    # No timeout: this is an interactive container session (lab + picker
+    # TUI + agent CLI). The user may legitimately leave it open for
+    # hours. Ctrl-C in the parent shell or SIGTERM from a supervisor
+    # is the intended stop mechanism. Don't switch to subprocess.run
+    # with timeout= here without also wiring a way for the user to
+    # extend the budget interactively.
     rc = subprocess.call(cmd)
 
     # Update preferences from this run.
