@@ -121,6 +121,14 @@ if not _CONTEXT_CHOICES:
 # defaults match select-models defaults.
 _VRAM_BUDGET = float(os.environ.get("VRAM", os.environ.get("GPU_MEMORY_GB", "24")))
 
+# DEVAI_MTP_PREVIEW gates the multi-token-prediction UI (MTP column,
+# post-select sub-modal, and `::mtp` suffix emission). Off by default so
+# the picker behaves identically to pre-MTP builds during the Phase-3
+# rollout; turned on alongside the router's parseMTPOverride wiring in
+# Phase 5. See docs/multi-token-prediction.md Sec. 7.2 + the catalog-
+# crystalline-beaver plan.
+_MTP_PREVIEW = os.environ.get("DEVAI_MTP_PREVIEW", "0").lower() in ("1", "true", "yes", "on")
+
 #                     label        reason                                              port
 _BACKENDS: dict[str, tuple[str, str, int]] = {
     "ollama": ("Ollama", "GGUF quantized — wide compatibility, CPU+GPU",              11434),
@@ -1360,6 +1368,11 @@ def _format_model_row(m: dict, idx: int = 0) -> str:
     fmt_col = str(details.get("quantization") or "?")
     type_col = "MoE" if _is_moe(m) else "Dense"
     tools_col = "Yes" if _has_tools(m) else "No"
+    # MTP column is only rendered when the preview flag is on; until
+    # the router's parseMTPOverride wiring lands in Phase 5 the column
+    # would be informational-only and the sub-modal would have no
+    # downstream effect, so gate them together.
+    mtp_col = ("Yes" if _has_mtp(m) else "No") if _MTP_PREVIEW else ""
 
     # Bench scores -- four columns the user requested. Unbenched rows
     # render '-' so they sort to the bottom but still appear (with all
@@ -1376,6 +1389,7 @@ def _format_model_row(m: dict, idx: int = 0) -> str:
     # ``00.`` is a sentinel used only when the helper is invoked
     # outside ``_build_menu`` (e.g. unit-style tests).
     num_col = f"{idx:02d}."
+    mtp_segment = f"{mtp_col:>5s}  " if _MTP_PREVIEW else ""
     return (
         f"{num_col:>3s}  "
         f"{ctx_str:>5s}  "
@@ -1385,6 +1399,7 @@ def _format_model_row(m: dict, idx: int = 0) -> str:
         f"{type_col:>6s}  "
         f"{fmt_col:>7s}  "
         f"{tools_col:>5s}  "
+        f"{mtp_segment}"
         f"{tps_col:>7s}  "
         f"{code_col:>7s}  "
         f"{reas_col:>7s}  "
@@ -1468,6 +1483,28 @@ def _is_moe(m: dict) -> bool:
         return True
     name_lc = str(m.get("name") or "").lower()
     return any(hint in name_lc for hint in _MOE_NAME_HINTS)
+
+
+def _mtp_block(m: dict) -> dict | None:
+    """Return the catalog's `mtp:` block for this row, or None when
+    the row has no MTP variant. Source: catalog_meta attached during
+    _discover_models from deploy/models.yaml. Defensive against the
+    block being None or non-dict (legacy probe-cache entries pre-
+    catalog and operator-edited YAML).
+    """
+    meta = m.get("catalog_meta") or {}
+    if not isinstance(meta, dict):
+        return None
+    mtp = meta.get("mtp")
+    if not isinstance(mtp, dict) or not mtp.get("method"):
+        return None
+    return mtp
+
+
+def _has_mtp(m: dict) -> bool:
+    """Whether the catalog declares MTP for this row -- drives the
+    picker's MTP column ('Yes'/'No') and gates the sub-modal."""
+    return _mtp_block(m) is not None
 
 
 def _ctx_tier(ctx: int) -> int:
@@ -1768,6 +1805,16 @@ def _capability_summary_text(
     fmt_block = f"Format:    {fmt}\n"
     if fmt_note:
         fmt_block += fmt_note + "\n"
+    mtp = _mtp_block(m)
+    if mtp:
+        drafter = mtp.get("drafter")
+        drafter_label = drafter.split("/")[-1] if drafter else "(built-in head)"
+        mtp_line = (
+            f"MTP:       {mtp.get('method', '?')}  K={mtp.get('num_speculative_tokens', '?')}"
+            f"  drafter={drafter_label}\n"
+        )
+    else:
+        mtp_line = "MTP:       not available\n"
     head = (
         f"Model:     {name}\n"
         f"Backend:   {backend}\n"
@@ -1778,6 +1825,7 @@ def _capability_summary_text(
         f"\n"
         f"Reasoning: {reason_label}\n"
         f"Tools:     {tools_label}    (parser: {parser})\n"
+        f"{mtp_line}"
     )
     parts = [head]
     if properties_section:
@@ -2081,6 +2129,7 @@ def _build_menu(
         current sort and in which direction."""
         return f"{label}{arrow}" if mode_key == sort_mode else label
 
+    mtp_header_segment = f"{'MTP':>5s}  " if _MTP_PREVIEW else ""
     column_header = (
         f"{'##':>3s}  "
         f"{_hdr('CTX', 'ctx'):>5s}  "
@@ -2090,6 +2139,7 @@ def _build_menu(
         f"{'TYPE':>6s}  "
         f"{'FORMAT':>7s}  "
         f"{'TOOLS':>5s}  "
+        f"{mtp_header_segment}"
         f"{_hdr('TPS', 'tps'):>7s}  "
         f"{_hdr('CODE%', 'code'):>7s}  "
         f"{_hdr('REAS%', 'reas'):>7s}  "
@@ -2224,17 +2274,21 @@ def _build(agent_id: str, model_name: str, backend: str) -> list[str]:
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
-def _resolve_agent(agent_filter: str | None, model: dict) -> tuple[str, str] | None:
-    """Drive reasoning toggle (inline-reasoning only) → agent picker.
+def _resolve_agent(agent_filter: str | None, model: dict) -> tuple[str, str, str] | None:
+    """Drive reasoning toggle (inline-reasoning only) → MTP toggle (when
+    catalog declares it AND DEVAI_MTP_PREVIEW is on) → agent picker.
 
     The model details are shown live in the model-list preview pane, so
     there is no separate confirmation step here — Enter on the model row
     in the outer fzf advances directly to this function.
 
-    Returns (agent_id, reasoning_mode) on launch, or None when the user
-    pressed Esc and the caller should re-enter the model list.
+    Returns (agent_id, reasoning_mode, mtp_mode) on launch, or None when
+    the user pressed Esc and the caller should re-enter the model list.
+    mtp_mode is "off" by default; "on" only when the sub-modal explicitly
+    enables it. Always "off" when DEVAI_MTP_PREVIEW is unset.
     """
     reasoning_mode = "default"
+    mtp_mode = "off"
     cap = str(model.get("capability") or "")
     if cap == Capability.INLINE:
         toggle_lines = [
@@ -2251,6 +2305,34 @@ def _resolve_agent(agent_filter: str | None, model: dict) -> tuple[str, str] | N
         if idx == 1:
             reasoning_mode = "nothink"
 
+    # MTP sub-modal mirrors the reasoning one. Two gates: the env-flag
+    # rollout switch AND the catalog actually declaring an mtp: block
+    # for this row. Without the env flag we silently keep MTP off so
+    # the picker behaves identically to pre-MTP builds.
+    if _MTP_PREVIEW and _has_mtp(model):
+        mtp = _mtp_block(model) or {}
+        method = mtp.get("method", "?")
+        k = mtp.get("num_speculative_tokens", "?")
+        warn = ""
+        if cap == Capability.INLINE and reasoning_mode != "nothink":
+            warn = (
+                f"\n  {_DIM}note: MTP + reasoning on inline-reasoning models will be "
+                f"rejected by the router (vllm#34650). Choose ::nothink or MTP OFF.{_RESET}"
+            )
+        mtp_lines = [
+            f"  MTP OFF        {_DIM}(default — vanilla decode, no drafter){_RESET}",
+            f"  MTP ON         {_DIM}({method}, K={k} — ~2-3x decode speedup){_RESET}",
+        ]
+        mtp_header = (
+            f"MTP toggle  ▸  {_BOLD}{_strip_latest(model['name'])}{_RESET}"
+            f"   {_DIM}(Esc → back to model list){_RESET}{warn}"
+        )
+        idx = _fzf(mtp_lines, mtp_header)
+        if idx is None:
+            return None
+        if idx == 1:
+            mtp_mode = "on"
+
     if agent_filter:
         agent = next((a for a in _AGENTS if a[0] == agent_filter), None)
         if agent is None:
@@ -2258,10 +2340,15 @@ def _resolve_agent(agent_filter: str | None, model: dict) -> tuple[str, str] | N
                 f"error: unknown agent '{agent_filter}' "
                 f"(known: {', '.join(a[0] for a in _AGENTS)})"
             )
-        return (agent[0], reasoning_mode)
+        return (agent[0], reasoning_mode, mtp_mode)
 
     alines = [_format_agent_row(a) for a in _AGENTS]
-    mode_note = "  [no reasoning]" if reasoning_mode == "nothink" else ""
+    mode_notes = []
+    if reasoning_mode == "nothink":
+        mode_notes.append("no reasoning")
+    if mtp_mode == "on":
+        mode_notes.append("MTP")
+    mode_note = f"  [{', '.join(mode_notes)}]" if mode_notes else ""
     header = (
         f"Pick agent  ▸  {_BOLD}{_strip_latest(model['name'])}{_RESET}"
         f"{mode_note}  @ {_context_label(int(model.get('_picker_context') or 0))}"
@@ -2271,7 +2358,7 @@ def _resolve_agent(agent_filter: str | None, model: dict) -> tuple[str, str] | N
     idx = _fzf(alines, header)
     if idx is None:
         return None
-    return (_AGENTS[idx][0], reasoning_mode)
+    return (_AGENTS[idx][0], reasoning_mode, mtp_mode)
 
 
 def main() -> None:
@@ -2483,7 +2570,7 @@ def main() -> None:
         if decision is None:
             # Backed out of the info / agent modal. Re-enter the model list.
             continue
-        agent_id, reasoning_mode = decision
+        agent_id, reasoning_mode, mtp_mode = decision
 
         selected_context = int(model.get("_picker_context") or _DEFAULT_CONTEXT)
         os.environ["CONTEXT"] = str(selected_context)
@@ -2493,19 +2580,29 @@ def main() -> None:
         # parseReasoningOverride strips it and treats the request as
         # policy=off (enable_thinking=false / per-backend disable shape).
         reasoning_suffix = "::nothink" if reasoning_mode == "nothink" else ""
+        # `::mtp` rides on the model name when MTP is opted in via the
+        # sub-modal. Guarded by the same env flag that gates the column
+        # and the sub-modal -- never emitted until Phase-5 router wiring
+        # lands. Canonical emit order is `<name>::<reasoning>::<mtp>@<ctx>`
+        # so the router's right-to-left parse chain (ctx -> mtp ->
+        # reasoning) lines up cleanly.
+        mtp_suffix = "::mtp" if (_MTP_PREVIEW and mtp_mode == "on") else ""
         if model["backend"] == "ollama":
-            # Ollama: KV is dynamic per request; only the reasoning
-            # suffix rides on the model name.
-            serving_name = f"{base_name}{reasoning_suffix}"
+            # Ollama: KV is dynamic per request; only the suffixes ride
+            # on the model name.
+            serving_name = f"{base_name}{reasoning_suffix}{mtp_suffix}"
         else:
-            # vLLM / SGLang: order is `<name>::<reasoning>@<ctx>` so the
-            # router's parseCtxOverride (strips trailing @<int>) runs
-            # cleanly before parseReasoningOverride.
-            serving_name = f"{base_name}{reasoning_suffix}@{selected_context}"
+            # vLLM / SGLang: order is `<name>::<reasoning>::<mtp>@<ctx>`.
+            serving_name = f"{base_name}{reasoning_suffix}{mtp_suffix}@{selected_context}"
 
         cmd = _build(agent_id, serving_name, model["backend"])
         _record_pick(base_name, agent_id, selected_context)
-        mode_note = " [no reasoning]" if reasoning_suffix else ""
+        notes = []
+        if reasoning_suffix:
+            notes.append("no reasoning")
+        if mtp_suffix:
+            notes.append("MTP")
+        mode_note = f" [{', '.join(notes)}]" if notes else ""
         print(
             f"\n  {_BOLD}{agent_id}{_RESET}"
             f" → {base_name}{mode_note} @ {_context_label(selected_context)}"

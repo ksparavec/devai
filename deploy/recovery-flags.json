@@ -20,6 +20,78 @@
     "direct podman launch first."
   ],
   "models": {
+    "Qwen3.5-9B-NVFP4": {
+      "engine_flags": [
+        "--quantization", "modelopt",
+        "--language-model-only",
+        "--gpu-memory-utilization", "0.95"
+      ],
+      "_engine_flags_comment": [
+        "Qwen3.5-9B-NVFP4 needs three extras vs the router's default:",
+        "  --quantization modelopt   modelopt PTQ; vLLM autodetect can",
+        "                            miss it on dev images.",
+        "  --language-model-only     Qwen3_5ForConditionalGeneration",
+        "                            arch registers a vision tower; this",
+        "                            text-only quant has no vision_config",
+        "                            and this flag tells vLLM to skip",
+        "                            the encoder.",
+        "  --gpu-memory-utilization 0.95 (override the router's default 0.92).",
+        "                            Needed only when MTP is enabled at",
+        "                            long context (>=64K): baseline at 64K",
+        "                            already saturates the 0.92 cap (22.08 GiB)",
+        "                            with KV+activations, and MTP's ~1 GiB",
+        "                            scaffold pushes past. At 32K the 0.92",
+        "                            default is sufficient -- the bump is",
+        "                            harmless at short ctx (vLLM uses the",
+        "                            larger pool for prefix caching)."
+      ]
+    },
+    "Qwen3.6-27B-Text-NVFP4-MTP": {
+      "engine_flags": [
+        "--quantization", "modelopt",
+        "--language-model-only",
+        "--max-num-seqs", "4",
+        "--gpu-memory-utilization", "0.95"
+      ],
+      "engine_env": {
+        "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS": "0"
+      },
+      "_engine_flags_comment": [
+        "Qwen3.6-27B-Text-NVFP4-MTP needs five extras vs the router's",
+        "default vllmEntrypoint emission:",
+        "  --quantization modelopt   the checkpoint's quantization_config",
+        "                            uses NVIDIA TensorRT-Model-Optimizer's",
+        "                            modelopt schema; vLLM autodetect can",
+        "                            miss it on dev builds.",
+        "  --language-model-only     architectures: Qwen3_5ForConditionalGeneration",
+        "                            registers a vision tower; the `-Text-`",
+        "                            variant has no vision_config and this",
+        "                            flag tells vLLM to skip the encoder.",
+        "  --max-num-seqs 4          KV pool at 32K + the MTP head's extra",
+        "                            verification positions fits 4 in-flight",
+        "                            sequences comfortably on 24G.",
+        "  --gpu-memory-utilization 0.95 (override the router's default 0.92)",
+        "                            and  VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0",
+        "                            (env). vLLM 0.20.0's CUDA graph memory",
+        "                            profiler double-counts on Blackwell --",
+        "                            leaves only 0.71 GiB for KV at the",
+        "                            router's default 0.92, killing engine",
+        "                            init. The env var disables the profiler;",
+        "                            the bumped utilization gives KV room."
+      ]
+    },
+    "Gemma-4-26B-A4B-NVFP4": {
+      "engine_flags": [
+        "--max-num-batched-tokens", "4096"
+      ],
+      "_engine_flags_comment": [
+        "Gemma 4 is multi-modal (vision encoder). Without this, vLLM",
+        "errors at engine init with 'Chunked MM input disabled but",
+        "max_tokens_per_mm_item (2496) is larger than max_num_batched_tokens",
+        "(2048).' Raising the batch-token cap to 4096 clears the check",
+        "without significant VRAM impact at our typical decode batch sizes."
+      ]
+    },
     "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4": {
       "engine_flags": [
         "--max-num-seqs", "8",

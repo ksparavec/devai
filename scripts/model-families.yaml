@@ -80,8 +80,20 @@ families:
       - google/gemma-4-e4b-it
       - google/gemma-4-26b-a4b-it
       - google/gemma-4-31b-it
-      - nvidia/Gemma-4-31B-IT-NVFP4
+      # Two NVFP4 quants of the 26B-A4B MoE -- the NVIDIA-official one
+      # ships with the gemma4 MTP drafter wired in; the bg-digitalservices
+      # variant predates the drafter and stays MTP-less for comparison.
+      - repo: nvidia/Gemma-4-26B-A4B-NVFP4
+        mtp:
+          method: mtp
+          drafter: google/gemma-4-26B-A4B-it-assistant
+          num_speculative_tokens: 4
       - bg-digitalservices/Gemma-4-26B-A4B-it-NVFP4
+      - repo: nvidia/Gemma-4-31B-IT-NVFP4
+        mtp:
+          method: mtp
+          drafter: google/gemma-4-31B-it-assistant
+          num_speculative_tokens: 4
     gguf_repos:
       # Registry's gemma4:31b at Q4_K_M needs ~46G — doesn't fit on a
       # 24G card. Unsloth's Dynamic 2.0 Q3 variants drop weights to
@@ -98,11 +110,43 @@ families:
     arch_ref: google/gemma-4-26b-a4b-it
     thinking: true        # hint; runtime probe shows e2b/e4b are unsupported
 
+  - name: qwen3.6
+    # Qwen3.6 family. The text-only NVFP4 variant from
+    # sakamakismile is the only catalog row today and is built
+    # around the built-in MTP head (mtp_num_hidden_layers=1 in
+    # text_config, applied recursively for K speculative tokens).
+    # vLLM 0.20+ handles this via the `qwen3_5_mtp` method --
+    # different code path from the broken gemma4_mtp.py weight
+    # loader, so this is the live MTP target on the 24G card.
+    # No Ollama repos / GGUF repos here -- stock Ollama and
+    # llama.cpp ignore the MTP head; PR #22673 is the
+    # llama.cpp pre-merge branch that knows what to do with it.
+    hf_repos:
+      - repo: sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP
+        mtp:
+          method: qwen3_5_mtp
+          num_speculative_tokens: 3
+    parsers:
+      vllm:
+        reasoning: qwen3
+    arch_ref: sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP
+    thinking: true
+
   - name: qwen3.5
     ollama_repos:
       - qwen3.5
     hf_repos:
-      - ykarout/Qwen3.5-9B-NVFP4
+      # Qwen3.5-9B-NVFP4 -- the 9B size ships with the same
+      # mtp_num_hidden_layers=1 head as the 27B (verified in the
+      # upstream config.json) and ykarout's NVFP4 quant preserves
+      # all 15 MTP tensors in the safetensors index. Fits the 24G
+      # ceiling because the model is only ~5-6 GB at NVFP4 and the
+      # qwen3_5_mtp.py drafter scaffold (~2.4 GB in vLLM 0.20.x)
+      # has plenty of room.
+      - repo: ykarout/Qwen3.5-9B-NVFP4
+        mtp:
+          method: qwen3_5_mtp
+          num_speculative_tokens: 3
       - apolo13x/Qwen3.5-27B-NVFP4
       - apolo13x/Qwen3.5-35B-A3B-NVFP4
     parsers:

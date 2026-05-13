@@ -631,6 +631,87 @@ func TestParseSuffixes_OrderingMatchesPickerEmits(t *testing.T) {
 	}
 }
 
+// parseMTPOverride parses the `::mtp` / `::nomtp` suffix the picker
+// emits for catalog rows with an `mtp:` block. Cover the recognised
+// tokens plus the negative cases (no suffix, unknown token) and the
+// embedded `::` defensive case mirroring TestParseReasoningOverride.
+func TestParseMTPOverride_TokenMapping(t *testing.T) {
+	cases := []struct {
+		in       string
+		wantName string
+		wantPol  string
+	}{
+		{"Gemma-4-26B-A4B-NVFP4", "Gemma-4-26B-A4B-NVFP4", ""},
+		{"Gemma-4-26B-A4B-NVFP4::mtp", "Gemma-4-26B-A4B-NVFP4", "on"},
+		{"Gemma-4-26B-A4B-NVFP4::nomtp", "Gemma-4-26B-A4B-NVFP4", "off"},
+		{"Gemma-4-26B-A4B-NVFP4::MTP", "Gemma-4-26B-A4B-NVFP4", "on"},
+		{"Gemma-4-26B-A4B-NVFP4::NoMTP", "Gemma-4-26B-A4B-NVFP4", "off"},
+		// Unknown tokens leave the name untouched -- they must NOT be
+		// consumed (parseReasoningOverride may still recognise them).
+		{"Gemma-4-26B-A4B-NVFP4::nothink", "Gemma-4-26B-A4B-NVFP4::nothink", ""},
+		{"Gemma-4-26B-A4B-NVFP4::garbage", "Gemma-4-26B-A4B-NVFP4::garbage", ""},
+		// Embedded `::` in the name without a recognised token after
+		// the LAST occurrence is also a noop.
+		{"namespace::model", "namespace::model", ""},
+	}
+	for _, tc := range cases {
+		gotName, gotPol := parseMTPOverride(tc.in)
+		if gotName != tc.wantName || gotPol != tc.wantPol {
+			t.Errorf("parseMTPOverride(%q) = (%q, %q), want (%q, %q)",
+				tc.in, gotName, gotPol, tc.wantName, tc.wantPol)
+		}
+	}
+}
+
+// The picker's canonical emit order is `<name>::<reasoning>::<mtp>@<ctx>`.
+// The router peels right-to-left: ctx first, mtp second, reasoning third.
+// Exercise the full three-way chain end-to-end so Phase-1 parser additions
+// don't break the existing reasoning/ctx flow.
+func TestParseSuffixes_ThreeWayChainOrdering(t *testing.T) {
+	in := "Gemma-4-26B-A4B-NVFP4::nothink::mtp@131072"
+	// Step 1: strip @<ctx> from the right.
+	ctxStripped, ctxOverride := parseCtxOverride(in)
+	if ctxStripped != "Gemma-4-26B-A4B-NVFP4::nothink::mtp" || ctxOverride != 131072 {
+		t.Fatalf("after parseCtxOverride: got (%q, %d), want (%q, 131072)",
+			ctxStripped, ctxOverride, "Gemma-4-26B-A4B-NVFP4::nothink::mtp")
+	}
+	// Step 2: strip ::<mtp> from the right (now the LAST `::<token>`).
+	mtpStripped, mtpOverride := parseMTPOverride(ctxStripped)
+	if mtpStripped != "Gemma-4-26B-A4B-NVFP4::nothink" || mtpOverride != "on" {
+		t.Fatalf("after parseMTPOverride: got (%q, %q), want (%q, %q)",
+			mtpStripped, mtpOverride, "Gemma-4-26B-A4B-NVFP4::nothink", "on")
+	}
+	// Step 3: strip ::<reasoning>.
+	cleanName, reasoning := parseReasoningOverride(mtpStripped)
+	if cleanName != "Gemma-4-26B-A4B-NVFP4" || reasoning != "off" {
+		t.Fatalf("after parseReasoningOverride: got (%q, %q), want (%q, %q)",
+			cleanName, reasoning, "Gemma-4-26B-A4B-NVFP4", "off")
+	}
+}
+
+// MTP-only path -- a model name without a reasoning override, just
+// `::mtp@<ctx>`. Asserts that parseReasoningOverride doesn't accidentally
+// consume the MTP token when it's the only `::` segment present.
+func TestParseSuffixes_MTPOnlyPath(t *testing.T) {
+	in := "Gemma-4-26B-A4B-NVFP4::mtp@65536"
+	ctxStripped, ctxOverride := parseCtxOverride(in)
+	if ctxStripped != "Gemma-4-26B-A4B-NVFP4::mtp" || ctxOverride != 65536 {
+		t.Fatalf("after parseCtxOverride: got (%q, %d), want (%q, 65536)",
+			ctxStripped, ctxOverride, "Gemma-4-26B-A4B-NVFP4::mtp")
+	}
+	mtpStripped, mtpOverride := parseMTPOverride(ctxStripped)
+	if mtpStripped != "Gemma-4-26B-A4B-NVFP4" || mtpOverride != "on" {
+		t.Fatalf("after parseMTPOverride: got (%q, %q), want (%q, %q)",
+			mtpStripped, mtpOverride, "Gemma-4-26B-A4B-NVFP4", "on")
+	}
+	// parseReasoningOverride on the clean name must be a noop.
+	cleanName, reasoning := parseReasoningOverride(mtpStripped)
+	if cleanName != "Gemma-4-26B-A4B-NVFP4" || reasoning != "" {
+		t.Fatalf("after parseReasoningOverride: got (%q, %q), want (%q, \"\")",
+			cleanName, reasoning, "Gemma-4-26B-A4B-NVFP4")
+	}
+}
+
 // maybeStripTools strips `tools` and `tool_choice` for vLLM/SGLang
 // when the model has no probe-verified tool parser (engine launched
 // without --enable-auto-tool-choice / --tool-call-parser).

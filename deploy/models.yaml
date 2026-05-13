@@ -2,7 +2,7 @@
 #
 # Regenerate with: make catalog-regen
 # Source of truth:  scripts/model-families.yaml
-# Generated at:     2026-05-02T22:59:19+00:00
+# Generated at:     2026-05-13T15:45:59+00:00
 #
 # Every 'size' and 'arch' below was fetched live from the
 # upstream provider at generation time. Do not hand-edit.
@@ -13,7 +13,7 @@ models:
     backend: [vllm, sglang]
     repo: "google/gemma-4-e2b-it"
     source: hf
-    sha: "6b7e72c67d3c"
+    sha: "b324173c7d57"
     size: "9.54 GB"
     arch: { layers: 35, kv_heads: 1, head_dim: 256, k_eq_v: false }
     arch_source: "google/gemma-4-e2b-it/config.json"
@@ -25,7 +25,7 @@ models:
     backend: [vllm, sglang]
     repo: "google/gemma-4-e4b-it"
     source: hf
-    sha: "c53e9d33178b"
+    sha: "3555bddc93a6"
     size: "14.89 GB"
     arch: { layers: 42, kv_heads: 2, head_dim: 256, k_eq_v: false }
     arch_source: "google/gemma-4-e4b-it/config.json"
@@ -37,7 +37,7 @@ models:
     backend: [vllm, sglang]
     repo: "google/gemma-4-26b-a4b-it"
     source: hf
-    sha: "4c55b528bdc4"
+    sha: "462a98a12e28"
     size: "48.07 GB"
     arch: { layers: 30, kv_heads: 8, head_dim: 256, k_eq_v: true }
     arch_source: "google/gemma-4-26b-a4b-it/config.json"
@@ -49,24 +49,28 @@ models:
     backend: [vllm, sglang]
     repo: "google/gemma-4-31b-it"
     source: hf
-    sha: "145dc2508c48"
+    sha: "ba74f5b6c647"
     size: "58.25 GB"
     arch: { layers: 60, kv_heads: 16, head_dim: 256, k_eq_v: true }
     arch_source: "google/gemma-4-31b-it/config.json"
     purpose: "gemma4 · 58.3 GB · 60L/16kv/256h · k=v"
     conversational: true
 
-  - name: "Gemma-4-31B-IT-NVFP4"
+  - name: "Gemma-4-26B-A4B-NVFP4"
     family: gemma4
     backend: [vllm, sglang]
-    repo: "nvidia/Gemma-4-31B-IT-NVFP4"
+    repo: "nvidia/Gemma-4-26B-A4B-NVFP4"
     source: hf
-    sha: "05fa17010ac2"
-    size: "30.39 GB"
-    arch: { layers: 60, kv_heads: 16, head_dim: 256, k_eq_v: true }
-    arch_source: "nvidia/Gemma-4-31B-IT-NVFP4/config.json"
-    purpose: "gemma4 · 30.4 GB · 60L/16kv/256h · k=v"
+    sha: "a19cfe00be84"
+    size: "17.50 GB"
+    arch: { layers: 30, kv_heads: 8, head_dim: 256, k_eq_v: true }
+    arch_source: "nvidia/Gemma-4-26B-A4B-NVFP4/config.json"
+    purpose: "gemma4 · 17.5 GB · 30L/8kv/256h · k=v"
     conversational: true
+    mtp:
+      method: mtp
+      drafter: google/gemma-4-26B-A4B-it-assistant
+      num_speculative_tokens: 4
 
   - name: "Gemma-4-26B-A4B-it-NVFP4"
     family: gemma4
@@ -79,6 +83,22 @@ models:
     arch_source: "bg-digitalservices/Gemma-4-26B-A4B-it-NVFP4/config.json"
     purpose: "gemma4 · 15.3 GB · 30L/8kv/256h · k=v"
     conversational: true
+
+  - name: "Gemma-4-31B-IT-NVFP4"
+    family: gemma4
+    backend: [vllm, sglang]
+    repo: "nvidia/Gemma-4-31B-IT-NVFP4"
+    source: hf
+    sha: "e5ef03afa233"
+    size: "30.39 GB"
+    arch: { layers: 60, kv_heads: 16, head_dim: 256, k_eq_v: true }
+    arch_source: "nvidia/Gemma-4-31B-IT-NVFP4/config.json"
+    purpose: "gemma4 · 30.4 GB · 60L/16kv/256h · k=v"
+    conversational: true
+    mtp:
+      method: mtp
+      drafter: google/gemma-4-31B-it-assistant
+      num_speculative_tokens: 4
 
   - name: "gemma4:e2b-it-q4_K_M"
     family: gemma4
@@ -196,7 +216,7 @@ models:
     repo: "unsloth/gemma-4-31B-it-GGUF"
     source: gguf
     gguf_filename: "gemma-4-31B-it-UD-Q3_K_XL.gguf"
-    size: "14.27 GB"
+    size: "14.32 GB"
     arch: { layers: 30, kv_heads: 8, head_dim: 256, k_eq_v: true }
     arch_source: "google/gemma-4-26b-a4b-it/config.json"
     purpose: "gemma4 · 14.3 GB · 30L/8kv/256h · k=v"
@@ -207,10 +227,28 @@ models:
     repo: "unsloth/gemma-4-26B-A4B-it-GGUF"
     source: gguf
     gguf_filename: "gemma-4-26B-A4B-it-UD-Q3_K_XL.gguf"
-    size: "11.99 GB"
+    size: "12.02 GB"
     arch: { layers: 30, kv_heads: 8, head_dim: 256, k_eq_v: true }
     arch_source: "google/gemma-4-26b-a4b-it/config.json"
     purpose: "gemma4 · 12.0 GB · 30L/8kv/256h · k=v"
+
+  - name: "Qwen3.6-27B-Text-NVFP4-MTP"
+    family: qwen3.6
+    backend: [vllm, sglang]
+    repo: "sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP"
+    source: hf
+    sha: "6f194695406a"
+    size: "18.29 GB"
+    arch: { layers: 64, kv_heads: 4, head_dim: 256, k_eq_v: false }
+    arch_source: "sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP/config.json"
+    purpose: "qwen3.6 · 18.3 GB · 64L/4kv/256h"
+    conversational: true
+    parsers:
+      vllm:
+        reasoning: qwen3
+    mtp:
+      method: qwen3_5_mtp
+      num_speculative_tokens: 3
 
   - name: "Qwen3.5-9B-NVFP4"
     family: qwen3.5
@@ -230,6 +268,9 @@ models:
       sglang:
         reasoning: qwen3
         tool: qwen
+    mtp:
+      method: qwen3_5_mtp
+      num_speculative_tokens: 3
 
   - name: "Qwen3.5-27B-NVFP4"
     family: qwen3.5

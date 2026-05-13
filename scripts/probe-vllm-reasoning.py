@@ -45,6 +45,7 @@ def vllm_command_args(
     tool_parser: str | None = None,
     reasoning_parser_plugin: str | None = None,
     tool_parser_plugin: str | None = None,
+    speculative_config: str | None = None,
 ) -> list[str]:
     """Build the vLLM serve arguments. Mirrors gpu-arbiter vllmEntrypoint.
 
@@ -58,6 +59,12 @@ def vllm_command_args(
     precede the parser-name flag — vLLM resolves parser names at the
     point ``--tool-call-parser`` is evaluated, so the plugin module has
     to be loaded by then.
+
+    ``speculative_config`` -- when non-empty, append
+    ``--speculative-config <json>`` to enable multi-token-prediction.
+    Mirrors the router's vllmEntrypoint emission so probe-time and
+    serve-time launches use the same flag shape (and therefore the
+    same memory math).
     """
     args = [
         "-m", "vllm.entrypoints.openai.api_server",
@@ -86,6 +93,8 @@ def vllm_command_args(
         args.extend(["--tool-parser-plugin", tool_parser_plugin])
     if tool_parser:
         args.extend(["--enable-auto-tool-choice", "--tool-call-parser", tool_parser])
+    if speculative_config:
+        args.extend(["--speculative-config", speculative_config])
     return args
 
 

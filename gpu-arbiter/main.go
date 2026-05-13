@@ -48,6 +48,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
@@ -122,6 +123,14 @@ type configModel struct {
 	// MoE/GQA models like gpt-oss-20b aren't artificially clamped to 36K
 	// when the probe verified 256K loads cleanly.
 	ProbedMaxCtx int `yaml:"-"`
+	// MTP is populated from the catalog metadata side-table (loaded
+	// separately from the probe cache; see loadCatalogMTP). nil means
+	// the catalog declares no `mtp:` block for this row; non-nil means
+	// the model supports MTP and the picker may surface the `::mtp`
+	// opt-in. The router emits speculative-decoding launch flags only
+	// when both this is non-nil AND the per-request override resolves
+	// to "on".
+	MTP *configSpeculative `yaml:"-"`
 }
 
 // configReasoning records what the runtime probe observed for this model.
@@ -156,6 +165,23 @@ type configReasoning struct {
 	DisableVerified *bool  `yaml:"disable_verified,omitempty"`
 }
 
+// configSpeculative records the per-model multi-token-prediction (MTP) /
+// speculative-decoding parameters loaded from the catalog's `mtp:` block.
+// Mirrors the picker convention -- pointer-valued on configModel so a
+// nil pointer cleanly distinguishes "model has no MTP available" from
+// "model has MTP but it's currently off". Field semantics:
+//
+//	Method               vLLM/SGLang method name -- "mtp" / "qwen3_5_mtp" /
+//	                     "deepseek_mtp" / "eagle" / "eagle3" / etc.
+//	Drafter              HF repo path of the external drafter; empty for
+//	                     built-in MTP heads (DeepSeek V3, Qwen3.6).
+//	NumSpeculativeTokens K -- how many tokens the drafter proposes per round.
+type configSpeculative struct {
+	Method               string `yaml:"method"`
+	Drafter              string `yaml:"drafter,omitempty"`
+	NumSpeculativeTokens int    `yaml:"num_speculative_tokens"`
+}
+
 // launchConfig holds computed GPU parameters passed to backend entrypoints.
 type launchConfig struct {
 	MemFraction     float64
@@ -179,6 +205,15 @@ type launchConfig struct {
 	// racing in-flight requests. Empty slice = no flags, which is the
 	// path test fixtures already exercise.
 	RecoveryFlags []string
+	// Speculative carries the resolved multi-token-prediction launch
+	// parameters for this request. nil = MTP off (entrypoints emit no
+	// speculative-decoding flags); non-nil = the request body's model
+	// name carried `::mtp` AND the catalog declares an `mtp:` block
+	// for the resolved model name. Emitted as CLI args before
+	// RecoveryFlags so a recovery-flags entry can still override the
+	// flag value (vLLM/SGLang resolve duplicate flags last-wins). See
+	// docs/multi-token-prediction.md Sec. 7.2.
+	Speculative *configSpeculative
 }
 
 type configFile struct {
@@ -347,6 +382,7 @@ func synthesizeHFFromCache(
 	cache map[string]*hfCacheEntry,
 	backendName string,
 	hostVRAMGB, operatorMaxCtx int,
+	mtpRegistry *catalogMTPRegistry,
 ) []configModel {
 	hostKey := strconv.Itoa(hostVRAMGB)
 	out := make([]configModel, 0, len(cache))
@@ -442,6 +478,17 @@ func synthesizeHFFromCache(
 				sizeGB = bestProbe.ActualVRAMGB
 			}
 		}
+		// MTP metadata lives in the catalog side-table, not the probe
+		// cache. Look up by repo so the configModel carries the
+		// `Speculative` block when the catalog declares one. A nil
+		// registry (test fixture or missing models.yaml) leaves MTP
+		// unset and the model behaves as a normal non-MTP row.
+		var mtpBlock *configSpeculative
+		if mtpRegistry != nil {
+			if e, ok := mtpRegistry.Lookup(entry.Repo); ok {
+				mtpBlock = e
+			}
+		}
 		out = append(out, configModel{
 			Name:            canonical,
 			Aliases:         aliases,
@@ -457,6 +504,7 @@ func synthesizeHFFromCache(
 				Capability:      capability,
 				DisableVerified: entry.DisableVerified,
 			},
+			MTP: mtpBlock,
 		})
 	}
 	return out
@@ -468,6 +516,7 @@ func synthesizeHFFromCache(
 // parse failures emit a warning and skip without aborting.
 func loadHFCache(
 	path, backendName string, hostVRAMGB, operatorMaxCtx int,
+	mtpRegistry *catalogMTPRegistry,
 ) []configModel {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -484,7 +533,7 @@ func loadHFCache(
 		log.Printf("warning: %s probe cache parse failed: %v", backendName, jerr)
 		return nil
 	}
-	rows := synthesizeHFFromCache(cache, backendName, hostVRAMGB, operatorMaxCtx)
+	rows := synthesizeHFFromCache(cache, backendName, hostVRAMGB, operatorMaxCtx, mtpRegistry)
 	log.Printf("probe cache: %s loaded (%d entries → %d %s serving rows)",
 		path, len(cache), len(rows), backendName)
 	return rows
@@ -512,7 +561,13 @@ type backendState struct {
 	running        bool
 	currentModel   string
 	currentContext int // baked --max-model-len / --context-length for vLLM/SGLang; 0 for Ollama
-	lastRequest    time.Time
+	// currentSpec is the speculative-decoding configuration baked into
+	// the running container, or nil when MTP is off. A toggle (nil <->
+	// non-nil, or any field-level change) triggers a recreate the same
+	// way currentModel and currentContext changes do. Reset to nil
+	// whenever the container is observed gone.
+	currentSpec *configSpeculative
+	lastRequest time.Time
 	activeReqs     int64
 	// Recreate coalescing — without this, a second request that arrives
 	// during the 50–60s cold-start `waitForHealthy` window sees
@@ -559,6 +614,14 @@ type arbiter struct {
 	// is conservative for MoE/GQA models — when we have a fits=true cell
 	// at hostKey, we trust it over the heuristic at launch time.
 	modelProbedMaxCtx map[string]map[string]int // backend → model name → highest fits=true ctx
+	// modelMTP holds the catalog-declared multi-token-prediction launch
+	// params per (backend, model). Populated at startup from
+	// configModel.MTP (which the catalog metadata side-table in
+	// loadCatalogMTP wired in). A non-nil entry advertises MTP
+	// *availability*; whether it actually gets emitted at launch is
+	// gated by the per-request `::mtp` suffix (parseMTPOverride). nil
+	// = catalog declares no MTP for this row -- the suffix is ignored.
+	modelMTP map[string]map[string]*configSpeculative
 	defaultPolicy     string                    // DEVAI_REASONING env value: auto|off|low|medium|high
 	totalVRAMGB       float64
 	maxContextLen     int // global default from MAX_CONTEXT_LEN env (default 262144)
@@ -811,10 +874,101 @@ func vllmEntrypoint(modelName string, lc launchConfig) []string {
 	if lc.ToolParser != "" {
 		args = append(args, "--enable-auto-tool-choice", "--tool-call-parser", lc.ToolParser)
 	}
+	// Multi-token-prediction launch flag. Emitted only when the catalog
+	// declared MTP for this model AND the request carried `::mtp`. The
+	// JSON shape is `{"method": "<m>", "model": "/models/<drafter>",
+	// "num_speculative_tokens": <K>}` for external drafters, dropping the
+	// `model` field for built-in MTP heads (DeepSeek V3 / Qwen3.6). The
+	// drafter dir must already be mounted under VLLM_MODELS_DIR -- the
+	// path used here is the in-container address. Emitted before
+	// RecoveryFlags so operator overrides can still last-flag-wins
+	// override the spec (e.g. force MTP off in production).
+	if lc.Speculative != nil {
+		if cfg := vllmSpeculativeJSON(lc.Speculative); cfg != "" {
+			args = append(args, "--speculative-config", cfg)
+		}
+	}
 	// Per-model recovery flags (e.g. --enforce-eager for checkpoints that
 	// OOM at vLLM model-load time on 24G). Pre-resolved by containerRecreate
 	// from a.recoveryRegistry. See deploy/recovery-flags.json.
 	args = append(args, lc.RecoveryFlags...)
+	return args
+}
+
+// vllmSpeculativeJSON marshals a configSpeculative into the JSON shape
+// vLLM's --speculative-config expects. Compact (no whitespace) so the
+// argv element stays single-token through podman's exec layer.
+func vllmSpeculativeJSON(s *configSpeculative) string {
+	if s == nil || s.Method == "" {
+		return ""
+	}
+	type payload struct {
+		Method               string `json:"method"`
+		Model                string `json:"model,omitempty"`
+		NumSpeculativeTokens int    `json:"num_speculative_tokens"`
+	}
+	p := payload{
+		Method:               s.Method,
+		NumSpeculativeTokens: s.NumSpeculativeTokens,
+	}
+	if s.Drafter != "" {
+		// HF repo path → in-container path. Mirrors the convention used
+		// for the target model (--model /models/<basename>).
+		p.Model = "/models/" + path.Base(s.Drafter)
+	}
+	if p.NumSpeculativeTokens < 1 {
+		p.NumSpeculativeTokens = 1
+	}
+	out, err := json.Marshal(p)
+	if err != nil {
+		// Marshal of a small typed struct effectively cannot fail; log
+		// loud and degrade to MTP-off rather than corrupting the launch.
+		log.Printf("warning: vllmSpeculativeJSON marshal failed: %v", err)
+		return ""
+	}
+	return string(out)
+}
+
+// sglangSpeculativeArgs returns the SGLang --speculative-* flags for the
+// given config. Empty slice when Speculative is nil. Method-to-algorithm
+// mapping:
+//
+//	mtp        -> NEXTN  (the SGLang alias for EAGLE that mirrors the
+//	                       drop-in MTP behaviour vLLM exposes)
+//	eagle      -> EAGLE
+//	eagle3     -> EAGLE3
+//	other      -> the method verbatim (forward-compat for new methods)
+//
+// Empty Drafter -> built-in head path; SGLang's --speculative-draft-model-path
+// is omitted (NEXTN can find the in-model head). External drafter -> path
+// emitted as /models/<basename> mirroring vllmSpeculativeJSON.
+func sglangSpeculativeArgs(s *configSpeculative) []string {
+	if s == nil || s.Method == "" {
+		return nil
+	}
+	algo := strings.ToUpper(s.Method)
+	switch s.Method {
+	case "mtp", "qwen3_5_mtp", "deepseek_mtp":
+		algo = "NEXTN"
+	case "eagle":
+		algo = "EAGLE"
+	case "eagle3":
+		algo = "EAGLE3"
+	}
+	k := s.NumSpeculativeTokens
+	if k < 1 {
+		k = 1
+	}
+	args := []string{
+		"--speculative-algorithm", algo,
+		"--speculative-num-steps", fmt.Sprintf("%d", k),
+		"--speculative-num-draft-tokens", fmt.Sprintf("%d", k+1),
+		"--speculative-eagle-topk", "1",
+	}
+	if s.Drafter != "" {
+		args = append(args, "--speculative-draft-model-path",
+			"/models/"+path.Base(s.Drafter))
+	}
 	return args
 }
 
@@ -839,11 +993,43 @@ func sglangEntrypoint(modelName string, lc launchConfig) []string {
 	if lc.ToolParser != "" {
 		args = append(args, "--tool-call-parser", lc.ToolParser)
 	}
+	// MTP launch flags. SGLang's NVFP4 path is broken upstream (per
+	// scripts/model-families.yaml:60-72) so this branch rarely fires
+	// in practice -- but emitting the flags keeps the entrypoint
+	// forward-compatible for the day SGLang's NVFP4 loader is repaired.
+	args = append(args, sglangSpeculativeArgs(lc.Speculative)...)
 	// Per-model recovery flags (mirrors vllmEntrypoint). SGLang's NVFP4
 	// loader path is currently broken upstream so this branch rarely
 	// fires today, but the symmetry keeps the behaviour predictable.
 	args = append(args, lc.RecoveryFlags...)
 	return args
+}
+
+// specEqual returns true when two configSpeculative pointers carry the
+// same launch parameters. Both nil = equal (MTP off in both). One nil
+// = different (toggle). Both non-nil = field-by-field compare. Used by
+// containerRecreate's specChanged check to decide whether a recreate
+// is needed.
+func specEqual(a, b *configSpeculative) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	return a.Method == b.Method &&
+		a.Drafter == b.Drafter &&
+		a.NumSpeculativeTokens == b.NumSpeculativeTokens
+}
+
+// specLabel produces a short human-readable description of an MTP spec
+// for log lines. "off" for nil; otherwise "<method>/k=<N>". Drafter
+// path is intentionally omitted -- the log already names the model.
+func specLabel(s *configSpeculative) string {
+	if s == nil {
+		return "off"
+	}
+	return fmt.Sprintf("%s/k=%d", s.Method, s.NumSpeculativeTokens)
 }
 
 // --- Main ---
@@ -894,6 +1080,14 @@ func main() {
 		log.Printf("probe cache: %s not present — no models registered (run `make probe`)", cachePath)
 	}
 
+	// Catalog metadata side-table for MTP launch params. Loaded once at
+	// startup; consulted from synthesizeHFFromCache so each HF row picks
+	// up its MTP block (if any) without re-introducing models.yaml as a
+	// primary source of fit truth. Missing file = empty registry = MTP
+	// off for everyone; safe degradation.
+	catalogPath := env("CATALOG_FILE", "/etc/devai/models.yaml")
+	catalogMTP := loadCatalogMTP(catalogPath)
+
 	// Append HF-backend rows synthesized from the per-backend probe caches.
 	// Each cache is independent; missing files are not fatal — the
 	// corresponding backend just exposes no models. Tool-parser values
@@ -902,10 +1096,10 @@ func main() {
 	// (Phase 0) reads when starting the backend.
 	vllmCachePath := env("VLLM_PROBE_CACHE", "/etc/devai/.vllm-reasoning-cache.json")
 	cfg.Models = append(cfg.Models,
-		loadHFCache(vllmCachePath, "vllm", hostVRAMGB, operatorMaxCtx)...)
+		loadHFCache(vllmCachePath, "vllm", hostVRAMGB, operatorMaxCtx, catalogMTP)...)
 	sglangCachePath := env("SGLANG_PROBE_CACHE", "/etc/devai/.sglang-reasoning-cache.json")
 	cfg.Models = append(cfg.Models,
-		loadHFCache(sglangCachePath, "sglang", hostVRAMGB, operatorMaxCtx)...)
+		loadHFCache(sglangCachePath, "sglang", hostVRAMGB, operatorMaxCtx, catalogMTP)...)
 
 	backends := []backendConfig{
 		{
@@ -953,10 +1147,11 @@ func main() {
 	modelContexts := make(map[string]int)
 	modelCapability := make(map[string]string)
 	modelDisableOK := make(map[string]bool)
-	modelToolParser := make(map[string]map[string]string)      // backend → model → --tool-call-parser
-	modelReasoningParser := make(map[string]map[string]string) // backend → model → --reasoning-parser
-	modelToolMode := make(map[string]map[string]string)        // backend → model → "auto" | "forced"
-	modelProbedMaxCtx := make(map[string]map[string]int)       // backend → model → highest fits=true ctx
+	modelToolParser := make(map[string]map[string]string)             // backend → model → --tool-call-parser
+	modelReasoningParser := make(map[string]map[string]string)        // backend → model → --reasoning-parser
+	modelToolMode := make(map[string]map[string]string)               // backend → model → "auto" | "forced"
+	modelProbedMaxCtx := make(map[string]map[string]int)              // backend → model → highest fits=true ctx
+	modelMTP := make(map[string]map[string]*configSpeculative)        // backend → model → catalog MTP block
 	capCounts := make(map[string]int)
 	for _, m := range cfg.Models {
 		names := append([]string{m.Name}, m.Aliases...)
@@ -1010,6 +1205,12 @@ func main() {
 					}
 					modelProbedMaxCtx[backend][name] = m.ProbedMaxCtx
 				}
+				if m.MTP != nil {
+					if modelMTP[backend] == nil {
+						modelMTP[backend] = make(map[string]*configSpeculative)
+					}
+					modelMTP[backend][name] = m.MTP
+				}
 			}
 		}
 		// Count capability once per canonical row, not once per alias —
@@ -1051,6 +1252,7 @@ func main() {
 		modelReasoningParser: modelReasoningParser,
 		modelToolMode:        modelToolMode,
 		modelProbedMaxCtx:    modelProbedMaxCtx,
+		modelMTP:             modelMTP,
 		defaultPolicy:        policy,
 		totalVRAMGB:          totalVRAMGB,
 		maxContextLen:        maxCtx,
@@ -1315,7 +1517,15 @@ func buildContainerSpec(
 // "<model>@<ctx>" picker override); 0 falls back to the catalog cap. The
 // chosen context is always clamped against MAX_CONTEXT_LEN and against the
 // memory-driven fittableContext inside computeLaunchConfig.
-func (a *arbiter) containerRecreate(bs *backendState, modelName string, desiredCtx int) error {
+//
+// `desiredSpec` carries the multi-token-prediction config to bake into the
+// backend container. Nil = MTP off (no --speculative-config / no
+// --speculative-* SGLang flags emitted). Non-nil = the request's `::mtp`
+// suffix was on AND the catalog declares MTP for this model -- the
+// entrypoint emits the appropriate launch flags. A spec change vs. the
+// running container triggers a recreate the same way model/context
+// changes do.
+func (a *arbiter) containerRecreate(bs *backendState, modelName string, desiredCtx int, desiredSpec *configSpeculative) error {
 	cfg := bs.config
 	a.containerStop(cfg.ContainerName)
 	a.containerRemove(cfg.ContainerName)
@@ -1352,6 +1562,13 @@ func (a *arbiter) containerRecreate(bs *backendState, modelName string, desiredC
 		lc.RecoveryFlags = rec.Flags
 		recoveryEnv = rec.Env
 	}
+	// Speculative-decoding config (MTP). Set by the request handler when
+	// the model name carried `::mtp` AND the catalog declared an `mtp:`
+	// block for it. Plumbed through launchConfig so the entrypoint
+	// builders can emit --speculative-config / --speculative-* flags
+	// before RecoveryFlags get appended (operator overrides win
+	// last-flag-wins).
+	lc.Speculative = desiredSpec
 	// Resolve parser plugin paths and the plugin volume. Only vLLM
 	// supports file-path plugins; SGLang's plugin model is Python-
 	// import based, so its launchConfig plugin fields stay empty.
@@ -1519,7 +1736,7 @@ func (a *arbiter) stopOtherBackends(targetName string) {
 // max-ctx into the container. For vLLM and SGLang the context is baked
 // into the entrypoint at startup, so a context change requires a full
 // recreate even when the model is unchanged.
-func (a *arbiter) ensureBackendRunning(bs *backendState, modelName string, desiredCtx int) error {
+func (a *arbiter) ensureBackendRunning(bs *backendState, modelName string, desiredCtx int, desiredSpec *configSpeculative) error {
 	if bs.config.Name == "ollama" {
 		if !bs.running {
 			a.stopOtherBackends("ollama")
@@ -1556,13 +1773,18 @@ func (a *arbiter) ensureBackendRunning(bs *backendState, modelName string, desir
 		bs.running = false
 		bs.currentModel = ""
 		bs.currentContext = 0
+		bs.currentSpec = nil
 	}
 
-	// Recreate when the model OR the baked context cap changed. Context
-	// only matters here for vLLM/SGLang because Ollama returned above.
+	// Recreate when the model, the baked context cap, OR the
+	// speculative-decoding config changed. The third trigger is what
+	// makes the `::mtp` / `::nomtp` per-request suffix work -- toggling
+	// MTP requires re-launching the backend container with (or without)
+	// --speculative-config, which only takes effect at startup.
 	modelChanged := modelName != "" && bs.currentModel != modelName
 	contextChanged := desiredCtx > 0 && bs.currentContext > 0 && bs.currentContext != desiredCtx
-	needRecreate := !bs.running || modelChanged || contextChanged
+	specChanged := !specEqual(bs.currentSpec, desiredSpec)
+	needRecreate := !bs.running || modelChanged || contextChanged || specChanged
 	if !needRecreate {
 		return nil
 	}
@@ -1578,8 +1800,13 @@ func (a *arbiter) ensureBackendRunning(bs *backendState, modelName string, desir
 	} else if contextChanged {
 		log.Printf("switching %s context (model %s): %d → %d",
 			bs.config.Name, modelName, bs.currentContext, desiredCtx)
+	} else if specChanged {
+		log.Printf("switching %s MTP config (model %s): %s → %s",
+			bs.config.Name, modelName, specLabel(bs.currentSpec), specLabel(desiredSpec))
 	}
-	log.Printf("starting %s with model %s (ctx=%d)...", bs.config.Name, modelName, desiredCtx)
+	specSummary := specLabel(desiredSpec)
+	log.Printf("starting %s with model %s (ctx=%d, mtp=%s)...",
+		bs.config.Name, modelName, desiredCtx, specSummary)
 
 	// Mark the recreate in flight BEFORE releasing the lock. Concurrent
 	// callers landing in the wait loop above will block on recreateCond
@@ -1597,7 +1824,7 @@ func (a *arbiter) ensureBackendRunning(bs *backendState, modelName string, desir
 		bs.recreateCond.Broadcast()
 	}()
 
-	if err := a.containerRecreate(bs, modelName, desiredCtx); err != nil {
+	if err := a.containerRecreate(bs, modelName, desiredCtx, desiredSpec); err != nil {
 		return fmt.Errorf("failed to start %s: %w", bs.config.Name, err)
 	}
 
@@ -1627,6 +1854,11 @@ func (a *arbiter) ensureBackendRunning(bs *backendState, modelName string, desir
 	if desiredCtx > 0 {
 		bs.currentContext = desiredCtx
 	}
+	// Spec is recorded unconditionally (even when nil) so the next
+	// request can compute specChanged correctly: a request that omits
+	// `::mtp` after a previous `::mtp`-enabled launch is a recreate
+	// trigger, not a no-op.
+	bs.currentSpec = desiredSpec
 	return nil
 }
 
@@ -1643,6 +1875,10 @@ func (a *arbiter) makeRequestHandler(backendName string) http.HandlerFunc {
 		// policy via the backend's native protocol field.
 		var modelName string
 		var numCtx int
+		// mtpOverride must outlive the POST-body block: the
+		// desiredSpec resolution below reads it for both POSTs and
+		// GETs. A GET leaves it at "" (no override → MTP off).
+		var mtpOverride string
 		if req.Method == http.MethodPost && req.Body != nil {
 			// Cap the request body before reading. Without this any peer
 			// on devai-net (or any container in the compose network) can
@@ -1676,8 +1912,16 @@ func (a *arbiter) makeRequestHandler(backendName string) http.HandlerFunc {
 
 			// Resolve the per-request num_ctx and strip any suffixes
 			// from the model name. Suffix order (convention): the
-			// picker emits `<name>::<reasoning>@<ctx>`. We strip in
-			// the same order — @<ctx> first, ::<reasoning> second.
+			// picker emits `<name>::<reasoning>::<mtp>@<ctx>`. We strip
+			// right-to-left in the same order so each parser sees only
+			// the suffix it owns:
+			//   1. parseCtxOverride   strips trailing @<int>.
+			//   2. parseMTPOverride   strips trailing ::mtp / ::nomtp.
+			//   3. parseReasoningOverride strips trailing ::<reasoning>.
+			// Each parser falls through (returns input unchanged) on an
+			// unrecognised token, so a name that legitimately contains
+			// `::` survives intact.
+			//
 			// Override priority for num_ctx:
 			//   1. Picker-supplied @<int>  → force-injected (user choice).
 			//   2. Registered modelContexts cap (= min(model_max,
@@ -1685,7 +1929,9 @@ func (a *arbiter) makeRequestHandler(backendName string) http.HandlerFunc {
 			//      only set when the client didn't supply num_ctx.
 			//   3. None → request passes through unchanged.
 			ctxStripped, ctxOverride := parseCtxOverride(parsed.Model)
-			cleanName, reasoningOverride := parseReasoningOverride(ctxStripped)
+			var mtpStripped string
+			mtpStripped, mtpOverride = parseMTPOverride(ctxStripped)
+			cleanName, reasoningOverride := parseReasoningOverride(mtpStripped)
 			// Defense-in-depth: refuse path-traversal segments before the
 			// name flows into vllmEntrypoint/sglangEntrypoint where it is
 			// concatenated as `--model /models/<name>`. The /models bind
@@ -1757,6 +2003,24 @@ func (a *arbiter) makeRequestHandler(backendName string) http.HandlerFunc {
 				policy = reasoningOverride
 			}
 			body = a.applyReasoningPolicy(backendName, req.URL.Path, policyModel, policy, body)
+			// Reasoning + MTP + inline-reasoning guard for vllm#34650.
+			// When the picker (or a client) opts into MTP via `::mtp`
+			// on a model whose capability is `inline` while the
+			// effective reasoning policy is anything but `off`, vLLM's
+			// reasoning parser fails to detect the `</think>` close
+			// token under speculative decoding and reasoning content
+			// bleeds into the regular content stream. Refuse loud
+			// rather than silently corrupting the stream. Operator
+			// remedy: pick reasoning OFF (::nothink) or MTP OFF.
+			if mtpOverride == "on" && policy != "off" &&
+				a.modelCapability[policyModel] == CapInline {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(
+					`{"error":"reasoning+MTP combo blocked by vllm#34650 for inline-reasoning models; ` +
+						`pass ::nothink or omit ::mtp"}`))
+				return
+			}
 			// Promote tool_choice for models the probe verified only
 			// via forced choice (mode=forced). Single-tool requests
 			// get auto/absent → {function:{name:...}}; multi-tool
@@ -1786,9 +2050,26 @@ func (a *arbiter) makeRequestHandler(backendName string) http.HandlerFunc {
 			req.Header.Set("Content-Length", strconv.Itoa(len(body)))
 		}
 
+		// Resolve the speculative-decoding config for this request.
+		// Three preconditions: (a) the catalog declared `mtp:` for this
+		// (backend, model) -- looked up in a.modelMTP; (b) the request
+		// name carried `::mtp` -- captured in mtpOverride; (c) the
+		// override wasn't explicitly `nomtp`. When any condition fails,
+		// desiredSpec stays nil and the entrypoint emits no
+		// speculative-decoding flags. Ollama never participates --
+		// SGLang/vLLM only.
+		var desiredSpec *configSpeculative
+		if backendName != "ollama" && mtpOverride == "on" && modelName != "" {
+			if backendMTP, ok := a.modelMTP[backendName]; ok {
+				if spec, ok := backendMTP[modelName]; ok && spec != nil {
+					desiredSpec = spec
+				}
+			}
+		}
+
 		a.mu.Lock()
 		bs.lastRequest = time.Now()
-		if err := a.ensureBackendRunning(bs, modelName, numCtx); err != nil {
+		if err := a.ensureBackendRunning(bs, modelName, numCtx, desiredSpec); err != nil {
 			a.mu.Unlock()
 			log.Printf("error: %v", err)
 			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err), http.StatusServiceUnavailable)
@@ -2262,6 +2543,42 @@ func parseReasoningOverride(name string) (clean string, override string) {
 		return name[:idx], "auto"
 	case "off", "auto", "low", "medium", "high":
 		return name[:idx], token
+	}
+	return name, ""
+}
+
+// parseMTPOverride extracts a "<name>::mtp" / "<name>::nomtp" suffix
+// carrying a per-request multi-token-prediction toggle. Recognised
+// tokens:
+//
+//	mtp   → "on"
+//	nomtp → "off"
+//
+// The picker emits this suffix for catalog rows whose `mtp:` block
+// declares an MTP variant. It is independent of the reasoning override
+// (see parseReasoningOverride) and the context override (see
+// parseCtxOverride); the picker's canonical emit order is
+// `<name>::<reasoning>::<mtp>@<ctx>`, so the request handler strips
+// `@<ctx>` first, then `::<mtp>` from the right, then `::<reasoning>`.
+// Each parser is independent -- an unrecognised `::<token>` halts
+// peeling at that step, so a name that legitimately contains `::` is
+// left untouched.
+//
+// Empty override means no recognised suffix was present (passthrough).
+// Wired into the request handler in Phase 5; placed here for Phase 1
+// so the parser is testable in isolation.
+func parseMTPOverride(name string) (clean string, override string) {
+	const sep = "::"
+	idx := strings.LastIndex(name, sep)
+	if idx < 0 {
+		return name, ""
+	}
+	token := strings.ToLower(strings.TrimSpace(name[idx+len(sep):]))
+	switch token {
+	case "mtp":
+		return name[:idx], "on"
+	case "nomtp":
+		return name[:idx], "off"
 	}
 	return name, ""
 }

@@ -766,6 +766,9 @@ def probe_one_cell(
     prompt: str,
     reasoning_parser: str | None,
     tool_parser: str | None,
+    mtp_method: str | None = None,
+    mtp_drafter: str | None = None,
+    mtp_num_tokens: int | None = None,
 ) -> dict:
     """Launch the backend once, run up to three HTTP probes against the
     same container, return a single record.
@@ -792,11 +795,28 @@ def probe_one_cell(
     plugin_volume, tool_plugin_path, reasoning_plugin_path = _resolve_plugins(
         spec, reasoning_parser, tool_parser,
     )
+    # Multi-token-prediction launch flag. Built JSON-side so the same
+    # blob ends up in both probe-time and serve-time (router) launches.
+    # SGLang ignores this on day 1 (its NVFP4 path is broken upstream);
+    # vLLM appends `--speculative-config <json>` when present.
+    speculative_config_json: str | None = None
+    if mtp_method:
+        spec_payload: dict[str, object] = {
+            "method": mtp_method,
+            "num_speculative_tokens": int(mtp_num_tokens or 1),
+        }
+        if mtp_drafter:
+            # The drafter directory must already be on disk inside the
+            # bound /models tree. Mirror the router's path convention so
+            # the same JSON works at probe and serve time.
+            spec_payload["model"] = f"/models/{mtp_drafter.split('/')[-1]}"
+        speculative_config_json = json.dumps(spec_payload, separators=(",", ":"))
     cmd_args = spec.build_args(
         model_name, requested_ctx, host_frac,
         reasoning_parser=reasoning_parser, tool_parser=tool_parser,
         reasoning_parser_plugin=reasoning_plugin_path,
         tool_parser_plugin=tool_plugin_path,
+        speculative_config=speculative_config_json,
     )
 
     env_vars = {"VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1"}
@@ -1365,6 +1385,10 @@ def build_argparser(spec: BackendSpec, doc: str) -> argparse.ArgumentParser:
                     help="re-probe top-level arch/capability fields")
     ap.add_argument("--no-cache-write", action="store_true",
                     help="dry run — do not modify the cache")
+    ap.add_argument("--no-mtp", action="store_true",
+                    help="skip the per-cell MTP overhead probe for "
+                         "catalog rows declaring an `mtp:` block. Halves "
+                         "wall-time when MTP overhead is not needed.")
     return ap
 
 
@@ -1481,6 +1505,19 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
                   f"[{parser_label}] ...",
                   file=sys.stderr)
 
+            # Catalog MTP metadata for this row -- when present, the cell
+            # gets a second probe pass with --speculative-config enabled
+            # and the VRAM delta is folded into the baseline record. SGLang
+            # rows skip the second pass (its NVFP4 loader is broken
+            # upstream). --no-mtp at the driver-level disables the second
+            # pass globally for callers who only need fit data.
+            row_mtp = row.get("mtp") if isinstance(row.get("mtp"), dict) else None
+            mtp_should_probe = (
+                row_mtp is not None
+                and spec.name == "vllm"
+                and not getattr(args, "no_mtp", False)
+            )
+
             for ctx in missing:
                 rec = probe_one_cell(
                     spec,
@@ -1498,6 +1535,50 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
                     reasoning_parser=row_reasoning_parser,
                     tool_parser=row_tool_parser,
                 )
+
+                # Second pass: MTP overhead measurement. Only when the
+                # baseline cell fit (otherwise there's no point) AND the
+                # catalog declared an MTP block AND we're on vLLM AND the
+                # operator didn't pass --no-mtp.
+                if mtp_should_probe and rec.get("fits"):
+                    mtp_method = (row_mtp or {}).get("method")
+                    mtp_drafter = (row_mtp or {}).get("drafter")
+                    mtp_k = (row_mtp or {}).get("num_speculative_tokens")
+                    print(f"    {context_label(ctx):>4s}   ... re-probing with "
+                          f"MTP ({mtp_method}, K={mtp_k}, drafter={mtp_drafter or 'built-in'})",
+                          file=sys.stderr)
+                    mtp_rec = probe_one_cell(
+                        spec,
+                        runtime=args.runtime,
+                        image=args.image,
+                        # Separate container name so the second pass can't
+                        # collide with a half-torn-down baseline container.
+                        container_name=f"{args.container_name}-mtp",
+                        probe_port=args.probe_port,
+                        models_dir=str(models_dir),
+                        model_name=name,
+                        requested_ctx=ctx,
+                        band_gb=vram_gb,
+                        host_vram_gb=args.host_vram_gb,
+                        model_size_gb=size_gb,
+                        prompt=args.prompt,
+                        reasoning_parser=row_reasoning_parser,
+                        tool_parser=row_tool_parser,
+                        mtp_method=mtp_method,
+                        mtp_drafter=mtp_drafter,
+                        mtp_num_tokens=mtp_k,
+                    )
+                    rec["mtp_method"] = mtp_method
+                    if mtp_rec.get("fits"):
+                        base_vram = float(rec.get("actual_vram_gb", 0) or 0)
+                        mtp_vram = float(mtp_rec.get("actual_vram_gb", 0) or 0)
+                        rec["mtp_fits"] = True
+                        rec["mtp_overhead_gb"] = round(max(0.0, mtp_vram - base_vram), 2)
+                        rec["mtp_actual_vram_gb"] = round(mtp_vram, 2)
+                    else:
+                        rec["mtp_fits"] = False
+                        rec["mtp_evidence"] = mtp_rec.get("evidence", {})
+
                 band[str(ctx)] = rec
                 entry.setdefault("first_probed_at", rec["probed_at"])
                 entry["last_probed_at"] = rec["probed_at"]

@@ -325,7 +325,7 @@ func TestSynthesizeHFFromCache_FilteringAndShape(t *testing.T) {
 			},
 		},
 	}
-	rows := synthesizeHFFromCache(cache, "vllm", 24, 131072)
+	rows := synthesizeHFFromCache(cache, "vllm", 24, 131072, nil)
 	if len(rows) != 1 {
 		t.Fatalf("expected 1 emitted row, got %d: %+v", len(rows), rows)
 	}
@@ -383,7 +383,7 @@ func TestSynthesizeHFFromCache_V2FieldsPropagated(t *testing.T) {
 			},
 		},
 	}
-	rows := synthesizeHFFromCache(cache, "vllm", 24, 131072)
+	rows := synthesizeHFFromCache(cache, "vllm", 24, 131072, nil)
 	if len(rows) != 1 {
 		t.Fatalf("expected 1 row, got %d", len(rows))
 	}
@@ -431,7 +431,7 @@ func TestSynthesizeHFFromCache_V1Rejected(t *testing.T) {
 			},
 		},
 	}
-	rows := synthesizeHFFromCache(cache, "vllm", 24, 131072)
+	rows := synthesizeHFFromCache(cache, "vllm", 24, 131072, nil)
 	if len(rows) != 0 {
 		t.Fatalf("v1 entry must be rejected, got %d rows", len(rows))
 	}
@@ -455,7 +455,7 @@ func TestSynthesizeHFFromCache_FallbackWhenSizeGBMissing(t *testing.T) {
 			},
 		},
 	}
-	rows := synthesizeHFFromCache(cache, "vllm", 24, 65536)
+	rows := synthesizeHFFromCache(cache, "vllm", 24, 65536, nil)
 	if len(rows) != 1 {
 		t.Fatalf("want 1 row, got %d", len(rows))
 	}
@@ -482,7 +482,7 @@ func TestSynthesizeHFFromCache_OperatorCtxCapClamps(t *testing.T) {
 			},
 		},
 	}
-	rows := synthesizeHFFromCache(cache, "vllm", 24, 65536) // operator caps at 64K
+	rows := synthesizeHFFromCache(cache, "vllm", 24, 65536, nil) // operator caps at 64K
 	if len(rows) != 1 {
 		t.Fatalf("want 1 row, got %d", len(rows))
 	}
@@ -501,7 +501,7 @@ func TestEnsureBackendRunning_OllamaAlwaysSucceeds(t *testing.T) {
 	a := testArbiter(bs)
 
 	a.mu.Lock()
-	err := a.ensureBackendRunning(bs, "", 0)
+	err := a.ensureBackendRunning(bs, "", 0, nil)
 	a.mu.Unlock()
 
 	if err != nil {
@@ -523,7 +523,7 @@ func TestEnsureBackendRunning_RequiresModelForNonOllama(t *testing.T) {
 	a := testArbiter(bs)
 
 	a.mu.Lock()
-	err := a.ensureBackendRunning(bs, "", 0)
+	err := a.ensureBackendRunning(bs, "", 0, nil)
 	a.mu.Unlock()
 
 	if err == nil {
@@ -568,13 +568,13 @@ func TestEnsureBackendRunning_CoalescesConcurrentSameModelRecreates(t *testing.T
 	go func() {
 		defer wg.Done()
 		a.mu.Lock()
-		errA = a.ensureBackendRunning(bs, "test-model", 32768)
+		errA = a.ensureBackendRunning(bs, "test-model", 32768, nil)
 		a.mu.Unlock()
 	}()
 	go func() {
 		defer wg.Done()
 		a.mu.Lock()
-		errB = a.ensureBackendRunning(bs, "test-model", 32768)
+		errB = a.ensureBackendRunning(bs, "test-model", 32768, nil)
 		a.mu.Unlock()
 	}()
 
@@ -647,7 +647,7 @@ func TestEnsureBackendRunning_WaitersUnblockOnRecreateFailure(t *testing.T) {
 		// "model name required" check fires immediately and
 		// ensureBackendRunning returns without calling the real
 		// containerRecreate (which would touch podman).
-		_ = a.ensureBackendRunning(bs, "", 0)
+		_ = a.ensureBackendRunning(bs, "", 0, nil)
 		a.mu.Unlock()
 		close(done)
 	}()

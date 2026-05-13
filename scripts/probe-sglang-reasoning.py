@@ -57,6 +57,7 @@ def sglang_command_args(
     tool_parser: str | None = None,
     reasoning_parser_plugin: str | None = None,
     tool_parser_plugin: str | None = None,
+    speculative_config: str | None = None,
 ) -> list[str]:
     """Build SGLang launch arguments. Mirrors gpu-arbiter sglangEntrypoint.
 
@@ -69,8 +70,18 @@ def sglang_command_args(
     registers parsers via Python imports, not file-path args. They're
     in the signature for parity with vllm_command_args so the shared
     probe driver can call both backends through the same kwargs shape.
+
+    ``speculative_config`` is accepted but **discarded** for SGLang on
+    day 1: SGLang's NVFP4 path is broken upstream (see
+    scripts/model-families.yaml:60-72 — every NVFP4 cell fails at
+    modelopt_quant.py:1482), and probing MTP through it would only
+    produce noise. The kwarg lives in the signature so the shared probe
+    driver can call both backends through the same kwargs shape. When
+    SGLang's NVFP4 loader is repaired upstream, swap this for an actual
+    flag emission (the SGLang equivalent is the --speculative-* family,
+    pinned in deploy/backend-flags.yaml).
     """
-    del reasoning_parser_plugin, tool_parser_plugin
+    del reasoning_parser_plugin, tool_parser_plugin, speculative_config
     args = [
         "-m", "sglang.launch_server",
         "--model-path", f"/models/{model_name}",

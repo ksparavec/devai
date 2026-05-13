@@ -37,6 +37,10 @@ vllm:
   enable_auto_tool:     "--enable-auto-tool-choice"
   tool_call_parser:     "--tool-call-parser"
   reasoning_parser:     "--reasoning-parser"
+  # Multi-token-prediction launch flag (Phase 4 of the
+  # catalog-crystalline-beaver plan). Single JSON argument carries
+  # method, optional drafter path, and num_speculative_tokens.
+  speculative_config:   "--speculative-config"
 
 sglang:
   model_path:           "--model-path"
@@ -48,3 +52,15 @@ sglang:
   trust_remote_code:    "--trust-remote-code"
   tool_call_parser:     "--tool-call-parser"
   reasoning_parser:     "--reasoning-parser"
+  # Multi-token-prediction launch flags (pinned for forward-compat;
+  # the probe driver doesn't exercise them today since SGLang's NVFP4
+  # path is broken upstream -- see scripts/model-families.yaml:60-72).
+  # The router emits these when the catalog row carries an `mtp:` block
+  # AND the request name carries `::mtp`. When SGLang's NVFP4 loader is
+  # repaired, run `make verify-backend-flags` to assert the pinned image
+  # still exposes them.
+  speculative_algorithm:        "--speculative-algorithm"
+  speculative_num_steps:        "--speculative-num-steps"
+  speculative_num_draft_tokens: "--speculative-num-draft-tokens"
+  speculative_eagle_topk:       "--speculative-eagle-topk"
+  speculative_draft_model_path: "--speculative-draft-model-path"

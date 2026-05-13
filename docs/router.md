@@ -175,16 +175,24 @@ Every non-trivial request goes through this chain in order. Each step
 inspects and may mutate the JSON body. Steps are skipped when not
 applicable.
 
-### 1. Override parsing (`<name>@<ctx>` / `<name>::<reasoning>`)
+### 1. Override parsing (`<name>@<ctx>` / `<name>::<reasoning>` / `<name>::<mtp>`)
 
-The model name in the request body may carry suffixes:
+The model name in the request body may carry up to three suffixes,
+peeled right-to-left:
 
 | Suffix form               | Meaning                                          | Strip order |
 |---------------------------|--------------------------------------------------|-------------|
 | `<name>@<ctx>`            | per-session `--max-model-len` for vLLM/SGLang    | 1 (first)   |
-| `<name>::<reasoning>`     | per-request reasoning policy override            | 2           |
-| `<name>::nothink`         | shortcut for `enable_thinking=false`             | 2           |
-| `<name>::<reasoning>@<ctx>` | both, in either order; `@<ctx>` strips first    | 1 then 2    |
+| `<name>::mtp`             | enable multi-token-prediction (`::nomtp` to force off) | 2     |
+| `<name>::<reasoning>`     | per-request reasoning policy override            | 3           |
+| `<name>::nothink`         | shortcut for `enable_thinking=false`             | 3           |
+
+Picker convention: `<name>::<reasoning>::<mtp>@<ctx>` (each suffix
+optional). The parser chain strips `@<ctx>` first (`parseCtxOverride`),
+then `::<mtp>` (`parseMTPOverride`), then `::<reasoning>`
+(`parseReasoningOverride`). Each parser falls through on an
+unrecognised `::<token>`, so a name that legitimately contains `::`
+survives intact.
 
 Examples:
 - `Qwen3-8B-NVFP4@65536` -> recreate vLLM with `--max-model-len 65536`,
@@ -193,6 +201,15 @@ Examples:
   request only.
 - `gpt-oss-20b::low@131072` -> vLLM gets `--max-model-len 131072`,
   request gets `reasoning_effort: low`.
+- `Gemma-4-26B-A4B-NVFP4::mtp@32768` -> vLLM recreate with
+  `--max-model-len 32768` AND `--speculative-config '{"method":"mtp",
+  "model":"/models/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":4}'`.
+  Catalog must declare `mtp:` for the model (see
+  [`multi-token-prediction.md`](multi-token-prediction.md) Sec. 7.2).
+- `Qwen3-14B-NVFP4::think::mtp@65536` is **rejected** with HTTP 400 --
+  the reasoning+MTP+inline-reasoning combo triggers
+  [vllm#34650](https://github.com/vllm-project/vllm/issues/34650).
+  Use `::nothink::mtp@65536` or omit `::mtp`.
 
 ### 2. Reasoning policy
 

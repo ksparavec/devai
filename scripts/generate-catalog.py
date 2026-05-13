@@ -303,6 +303,13 @@ class Entry:
     conversational: bool | None = None  # presence of HF API tag
                                         # "conversational" — instruct/chat
                                         # tuned. None for non-HF rows.
+    mtp: dict | None = None  # multi-token-prediction launch params from the
+                             # family's hf_repos entry's `mtp:` block. Shape:
+                             # {"method": str, "drafter": str (optional),
+                             #  "num_speculative_tokens": int}.
+                             # None when the catalog declares no MTP for this
+                             # row -- the router emits no speculative flags
+                             # and the picker hides the `::mtp` toggle.
 
 
 def _gb(bytes_: int) -> float:
@@ -310,7 +317,8 @@ def _gb(bytes_: int) -> float:
 
 
 def _entry_hf(repo: str, family: str, fallback_arch: Arch,
-              thinking: bool, parsers: dict | None) -> Entry | None:
+              thinking: bool, parsers: dict | None,
+              mtp: dict | None = None) -> Entry | None:
     try:
         size_bytes = hf_weight_bytes(repo)
     except Exception as e:
@@ -355,6 +363,7 @@ def _entry_hf(repo: str, family: str, fallback_arch: Arch,
         sha=sha,
         parsers=_normalize_parsers(parsers),
         conversational=conversational,
+        mtp=_normalize_mtp(mtp),
     )
 
 
@@ -380,6 +389,57 @@ def _normalize_parsers(parsers: dict | None) -> dict | None:
         if kept:
             out[backend] = kept
     return out or None
+
+
+# Recognized speculative-decoding methods. Mirrors vLLM's SpeculativeMethod
+# registry (--speculative-config '{"method": ...}'). Catalog entries with
+# unknown methods are dropped with a warning -- safer than passing garbage
+# through to the entrypoint where vLLM would reject it at backend startup.
+_MTP_METHODS = frozenset({
+    "mtp",            # Gemma 4 external drafter
+    "qwen3_5_mtp",    # Qwen3.5 / Qwen3.6 built-in MTP head
+    "deepseek_mtp",   # DeepSeek V3 / V3.2 built-in MTP modules
+    "eagle",          # EAGLE-style draft head
+    "eagle3",         # EAGLE-3 draft head (NVIDIA recipe)
+    "medusa",         # Medusa multi-head drafter
+    "ngram",          # stateless n-gram suffix draft
+    "draft_model",    # generic external draft model
+})
+
+
+def _normalize_mtp(mtp: dict | None) -> dict | None:
+    """Validate and normalize an hf_repos entry's `mtp:` block.
+
+    Required keys: `method` (string from `_MTP_METHODS`),
+    `num_speculative_tokens` (int 1-8). Optional: `drafter` (HF repo path
+    of the external draft model; omitted for built-in MTP heads like
+    DeepSeek V3 or Qwen3.6).
+
+    Returns None when the input is absent, malformed, or declares an
+    unknown method -- the catalog row is then emitted without an `mtp:`
+    block, and the router / picker behave exactly as they would for any
+    other non-MTP model.
+    """
+    if not mtp or not isinstance(mtp, dict):
+        return None
+    method = mtp.get("method")
+    if not isinstance(method, str) or method.strip() not in _MTP_METHODS:
+        print(f"  [warn] mtp.method={method!r} not in {sorted(_MTP_METHODS)} "
+              f"— dropping MTP block", file=sys.stderr)
+        return None
+    n_tok = mtp.get("num_speculative_tokens")
+    if not isinstance(n_tok, int) or not (1 <= n_tok <= 8):
+        print(f"  [warn] mtp.num_speculative_tokens={n_tok!r} must be int 1-8 "
+              f"— dropping MTP block", file=sys.stderr)
+        return None
+    out: dict = {
+        "method": method.strip(),
+        "num_speculative_tokens": n_tok,
+    }
+    drafter = mtp.get("drafter")
+    if isinstance(drafter, str) and drafter.strip():
+        out["drafter"] = drafter.strip()
+    return out
 
 
 def _gguf_tag_token(filename: str) -> str:
@@ -493,12 +553,36 @@ def main() -> None:
         fam_arch = arch_from_config(hf_config(arch_ref),
                                     f"{arch_ref}/config.json")
 
-        for repo in fam.get("hf_repos") or []:
+        for spec in fam.get("hf_repos") or []:
+            # hf_repos entries may be either a bare repo string (the
+            # original shape) or a mapping with `repo:` + optional
+            # `mtp:` sub-key (added for multi-token-prediction support).
+            # gguf_repos has used the mapping form for a while -- this
+            # mirrors that precedent rather than forcing a uniform
+            # schema rewrite.
+            if isinstance(spec, str):
+                repo, mtp_block = spec, None
+            elif isinstance(spec, dict):
+                repo = spec.get("repo")
+                if not repo:
+                    print(f"  [warn] hf_repos mapping missing 'repo' — "
+                          f"skipping: {spec!r}", file=sys.stderr)
+                    continue
+                mtp_block = spec.get("mtp")
+            else:
+                print(f"  [warn] hf_repos entry has unsupported type "
+                      f"{type(spec).__name__} — skipping: {spec!r}",
+                      file=sys.stderr)
+                continue
             print(f"  HF: {repo} ... ", end="", flush=True)
-            e = _entry_hf(repo, name, fam_arch, thinking, parsers)
+            e = _entry_hf(repo, name, fam_arch, thinking, parsers, mtp_block)
             if e:
+                tags = []
+                if e.mtp:
+                    tags.append(f"mtp={e.mtp['method']}/k={e.mtp['num_speculative_tokens']}")
+                tag_suffix = ("  " + "  ".join(tags)) if tags else ""
                 print(f"{e.size_gb:.1f} GB  arch={e.arch.layers}L/"
-                      f"{e.arch.kv_heads}kv/{e.arch.head_dim}h")
+                      f"{e.arch.kv_heads}kv/{e.arch.head_dim}h{tag_suffix}")
                 all_entries.append(e)
 
         for lib in fam.get("ollama_repos") or []:
@@ -624,6 +708,19 @@ def main() -> None:
                 for key in ("reasoning", "tool"):
                     if key in block:
                         lines.append(f"        {key}: {block[key]}")
+        if e.mtp:
+            # Multi-token-prediction launch params from
+            # scripts/model-families.yaml. The Go router reads this
+            # block at startup via the catalog metadata side-table (see
+            # loadCatalogMTP in gpu-arbiter/main.go) and emits
+            # --speculative-config (vLLM) or --speculative-algorithm
+            # family (SGLang) when the request's model name carries
+            # the `::mtp` suffix. Only emitted for HF entries.
+            lines.append("    mtp:")
+            lines.append(f"      method: {e.mtp['method']}")
+            if "drafter" in e.mtp:
+                lines.append(f"      drafter: {e.mtp['drafter']}")
+            lines.append(f"      num_speculative_tokens: {e.mtp['num_speculative_tokens']}")
         lines.append("")
 
     OUTPUT_YAML.write_text("\n".join(lines))

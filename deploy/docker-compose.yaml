@@ -129,6 +129,11 @@ services:
       - ./.ollama-reasoning-cache.json:/etc/devai/.ollama-reasoning-cache.json:ro
       - ./.vllm-reasoning-cache.json:/etc/devai/.vllm-reasoning-cache.json:ro
       - ./.sglang-reasoning-cache.json:/etc/devai/.sglang-reasoning-cache.json:ro
+      # Catalog metadata side-table -- the router reads `mtp:` blocks
+      # from deploy/models.yaml at startup to thread MTP launch params
+      # into configModel rows (see loadCatalogMTP). Missing file = empty
+      # registry = MTP off for everyone; safe degradation.
+      - ./models.yaml:/etc/devai/models.yaml:ro
       # Plugin registry — the JSON map of parser-name → plugin-file.
       # The host plugin directory is NOT mounted into the router itself;
       # the router only needs the host path string (passed via env) to
