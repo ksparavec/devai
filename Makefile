@@ -69,7 +69,8 @@ CACHE_BUILD_ARGS = \
 	--build-arg BIN_HASH=$(BIN_HASH) \
 	-v $(CACHE_DIR)/pip:/root/.cache/uv \
 	-v $(CACHE_DIR)/npm:/root/.npm \
-	-v $(CACHE_DIR)/pip/bin:/var/cache/bin:ro
+	-v $(CACHE_DIR)/pip/bin:/var/cache/bin:ro \
+	$(if $(wildcard $(CACHE_DIR)/pip/wheels/skypilot),-v $(CACHE_DIR)/pip/wheels/skypilot:/var/cache/wheels/skypilot:ro,)
 
 # Proxy runtime env (passed to all container runs)
 PROXY_RUN_ENV = \
@@ -255,6 +256,26 @@ fetch-cli: ## Download all external binaries and packages to local cache (uses E
 			&& chmod +x $(CACHE_DIR)/pip/bin/sops && STATE="updated"; fi \
 		&& VERSION=$$($(CACHE_DIR)/pip/bin/sops --version 2>&1 | awk '{print $$2; exit}' || echo "?") \
 		&& echo "sops: $$STATE ($$VERSION)"
+	@# SkyPilot wheels (per docs/plans/skypilot-agent-skill.md
+	@# decision 1+5). Track upstream PyPI metadata so the lab's `sky`
+	@# CLI follows the fast-moving release train without manual
+	@# bumps. Same version-stamp pattern the Gemini CLI uses.
+	@LATEST=$$(curl -fsSL "https://pypi.org/pypi/skypilot/json" \
+	            | python3 -c "import sys,json; print(json.load(sys.stdin)['info']['version'])" 2>/dev/null) \
+	    && CACHED=$$(cat $(ETAG_DIR)/skypilot.version 2>/dev/null || echo "none") \
+	    && if [ -z "$$LATEST" ]; then echo "SkyPilot: PyPI fetch failed; skipping"; \
+	       elif [ "$$LATEST" = "$$CACHED" ]; then echo "SkyPilot: up to date ($$CACHED)"; \
+	       else \
+	           echo "SkyPilot: fetching $$LATEST wheels..." \
+	           && rm -rf $(CACHE_DIR)/pip/wheels/skypilot \
+	           && mkdir -p $(CACHE_DIR)/pip/wheels/skypilot \
+	           && uv pip download \
+	                  'skypilot[aws,gcp,azure,kubernetes,slurm,runpod,lambda]' \
+	                  --python-version 3.13 \
+	                  --dest $(CACHE_DIR)/pip/wheels/skypilot 2>/dev/null \
+	           && echo "$$LATEST" > $(ETAG_DIR)/skypilot.version \
+	           && echo "SkyPilot: updated to $$LATEST" \
+	           || echo "SkyPilot: download failed (check network / uv); existing cache preserved"; fi
 	@# age + age-keygen ship in one tarball.
 	@ARCH=$$(dpkg --print-architecture) \
 		&& case "$$ARCH" in amd64) AGE_ARCH=amd64;; arm64) AGE_ARCH=arm64;; esac \

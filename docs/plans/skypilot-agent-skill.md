@@ -7,9 +7,20 @@ instructions._
 
 ## Status
 
-Design **approved 2026-05-14** -- all six open questions resolved
-(see "Confirmed decisions" below). Can be implemented independently
-of the SkyPilot Fleet Provisioner plan; not yet scheduled.
+**In Progress.** Phase 1 (SkyPilot CLI install in the lab image)
+shipped 2026-05-15: Makefile fetch-cli SkyPilot wheel block,
+CACHE_BUILD_ARGS conditional wheel mount, Dockerfile.lab offline
+install via `uv pip install --offline --find-links`,
+`scripts/sky-setup.sh` first-launch helper,
+`docs/skypilot-user-guide.md` operator-facing reference. Build
+gracefully skips the install when the wheel cache is empty (lab
+without `sky` is the documented fallback for firewalled
+environments). Stdlib-unittest coverage in
+`tests/python/test_skypilot_agent_skill.py` for the Makefile
+fetch block, Dockerfile install conditional, sky-setup.sh shape,
+and docs sections. Phase 2 (per-agent plugin install) deferred --
+verifies against running Claude/Codex/Gemini sessions, an E2E
+concern for a follow-up.
 
 ## Dependencies
 

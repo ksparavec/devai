@@ -83,6 +83,28 @@ RUN --mount=type=bind,source=.,target=/src \
 RUN UV_TOOL_BIN_DIR=/usr/local/bin uv tool install aider-chat \
     --with audioop-lts
 
+# Install SkyPilot CLI (per docs/plans/skypilot-agent-skill.md).
+# Wheels pre-fetched by `make fetch-cli` into
+# /var/cache/devai/pip/wheels/skypilot/ and bind-mounted at build time
+# under /var/cache/wheels/skypilot. Offline install with --find-links
+# keeps the build network-free, matching the existing CLI pattern.
+#
+# The wheel directory is OPTIONAL at build time -- the lab image still
+# builds without it (the `if` skips the install gracefully). Operators
+# who skipped `make fetch-cli` for skypilot get a working lab without
+# the `sky` binary; they can install it later via
+# `uv pip install --system 'skypilot[aws,gcp,azure,kubernetes,slurm,runpod,lambda]'`.
+RUN --mount=type=bind,source=.,target=/src \
+    if [ -d /var/cache/wheels/skypilot ] && [ -n "$(ls -A /var/cache/wheels/skypilot 2>/dev/null)" ]; then \
+        uv pip install --system --offline \
+            --find-links /var/cache/wheels/skypilot \
+            'skypilot[aws,gcp,azure,kubernetes,slurm,runpod,lambda]' \
+        && sky --version >/dev/null 2>&1 \
+        || echo "WARN: skypilot install completed but 'sky --version' failed; investigate"; \
+    else \
+        echo "INFO: /var/cache/wheels/skypilot empty; skipping SkyPilot install. Run 'make fetch-cli' to populate."; \
+    fi
+
 # --- JupyterLab extension (depends on jupyterlab being installed above) ---
 
 # Install JupyterLab AI launcher extension (pre-built)
