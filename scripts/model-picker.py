@@ -277,20 +277,33 @@ def _load_hf_probe_records(paths: list[str]) -> dict[str, dict]:
     return {}
 
 
-def _load_bench_records(paths: list[str]) -> dict[tuple[str, str], dict]:
-    """Lookup of ``(model_name, backend) -> bench cache row``.
+def _load_bench_records(
+    paths: list[str],
+) -> dict[tuple[str, str, int], dict]:
+    """Lookup of ``(model_name, backend, ctx) -> bench cache row``.
 
     The bench cache (``deploy/.bench-cache.json``) is keyed at top
-    level by ``<repo>@<sha>::<backend>`` (HF) or
-    ``<digest>::<backend>`` (Ollama). For UI rendering we only need
-    the per-row data; index it by the alias the picker already
-    carries (the row's ``model`` field) plus its ``backend``.
+    level by ``<repo>@<sha>::<backend>::<ctx>`` (HF) or
+    ``<digest>::<backend>::<ctx>`` (Ollama) since schema v3 -- the ctx
+    suffix stops different-ctx benches of the same model from
+    silently overwriting each other (the same model can differ by
+    17+ tok/s between 32K and 128K under MTP).
+
+    The picker indexes by ``(row.model, row.backend, row.context)`` so
+    a lookup at the user's chosen ctx hits the matching row without
+    silently substituting a different ctx's number.
+
+    Pre-v3 rows (no ``context`` field, or ``context: 0``) emit a
+    one-line stderr warning and are treated as "no data at this ctx"
+    by callers -- the row is loaded but keyed at ctx=0 so it never
+    matches a real picker request. Mirrors the probe-cache loader's
+    v1-tolerance pattern at gpu-arbiter/main.go:357.
 
     Returns ``{}`` when no readable cache exists -- non-fatal: rows
     just won't render badges. The picker is fully usable without
     bench data.
     """
-    out: dict[tuple[str, str], dict] = {}
+    out: dict[tuple[str, str, int], dict] = {}
     for path in paths:
         if not os.path.isfile(path):
             continue
@@ -301,18 +314,31 @@ def _load_bench_records(paths: list[str]) -> dict[tuple[str, str], dict]:
             continue
         if not isinstance(raw, dict):
             continue
+        n_legacy = 0
         for key, entry in raw.items():
-            # Skip _meta and any future top-level harness blocks. Previously
-            # this worked by accident because _meta had no "model"/"backend"
-            # keys; explicit gating means it stays correct as _meta grows.
+            # Skip _meta and any future top-level harness blocks.
             if not _is_bench_row_key(key):
                 continue
             if not isinstance(entry, dict):
                 continue
             name = entry.get("model")
             backend = entry.get("backend")
-            if isinstance(name, str) and isinstance(backend, str):
-                out[(name, backend)] = entry
+            if not (isinstance(name, str) and isinstance(backend, str)):
+                continue
+            ctx_raw = entry.get("context")
+            try:
+                ctx = int(ctx_raw) if ctx_raw is not None else 0
+            except (TypeError, ValueError):
+                ctx = 0
+            if ctx == 0:
+                n_legacy += 1
+            out[(name, backend, ctx)] = entry
+        if n_legacy:
+            sys.stderr.write(
+                f"  picker: bench cache {path}: {n_legacy} pre-v3 row(s) "
+                f"without context -- treated as 'no data at this ctx'. "
+                f"Re-run `make bench` to populate.\n"
+            )
         return out
     return {}
 
@@ -1861,9 +1887,20 @@ def _format_model_properties(m: dict, comparison: dict | None) -> str:
     scores = m.get("_picker_scores") or {}
     bench_row = m.get("_picker_bench_row") or {}
     if scores.get("total") is None or not bench_row:
-        # No bench data for this row. Still emit the section header
-        # so the user knows it's *expected* to be there once the
-        # bench has run, rather than wondering why it's missing.
+        # No bench data for this (model, backend, ctx). Distinguish
+        # "model has bench rows at other ctxs but not this one" from
+        # "model never benched at all" -- the former is fixable with a
+        # targeted `make bench --ctx <N>`, the latter wants a full run.
+        ctx = int(m.get("_picker_context") or 0)
+        bench_other = m.get("_picker_bench_other_ctxs") or []
+        if bench_other:
+            tiers = ", ".join(_context_label(c) for c in sorted(bench_other))
+            return (
+                "Model properties:\n"
+                f"  Bench: not available at ctx={_context_label(ctx)} "
+                f"(have {tiers}; run `make bench --ctx "
+                f"{_context_label(ctx)}` to populate)\n"
+            )
         if comparison and comparison.get("n_benched", 0) > 0:
             return (
                 "Model properties:\n"
@@ -2038,7 +2075,7 @@ def _sort_key_for_mode(mode: str, sort_dir: str = "desc"):
 
 def _build_candidates(
     models: list[dict],
-    bench_records: dict[tuple[str, str], dict] | None = None,
+    bench_records: dict[tuple[str, str, int], dict] | None = None,
 ) -> tuple[list[dict], dict[str, int]]:
     """Decorate every fitting model with picker metadata and return the
     list once. Used by both ``_build_menu`` (sort/render) and the
@@ -2071,10 +2108,23 @@ def _build_candidates(
         decorated["_picker_glyph"] = _CAP_GLYPH.get(cap, "?")
         decorated["_picker_status_label"] = _REASONING_LABEL.get(cap, "Unknown")
         decorated["_picker_mode"] = "default"
-        bench_key = (str(decorated.get("name") or ""), str(decorated.get("backend") or ""))
+        name_key = str(decorated.get("name") or "")
+        backend_key = str(decorated.get("backend") or "")
+        ctx_key = int(decorated.get("_picker_context") or 0)
+        bench_key = (name_key, backend_key, ctx_key)
         bench_row = bench_records.get(bench_key)
+        # Capture other ctx tiers this (model, backend) is benched at so
+        # the preview pane can tell the user "have 32K, 128K; missing
+        # 64K" instead of the unhelpful "no bench data" when the row
+        # exists at a different ctx.
+        other_ctxs = sorted(
+            c
+            for (n, b, c), _row in bench_records.items()
+            if n == name_key and b == backend_key and c != ctx_key and c > 0
+        )
         decorated["_picker_scores"] = _picker_scores(bench_row)
         decorated["_picker_bench_row"] = bench_row
+        decorated["_picker_bench_other_ctxs"] = other_ctxs
         decorated["_picker_agentic"] = _is_production_agentic(decorated, bench_row)
         candidates.append(decorated)
     # HF dedup -- vLLM preferred over SGLang for the same name. Ollama
@@ -2086,7 +2136,7 @@ def _build_candidates(
 
 def _build_menu(
     models: list[dict],
-    bench_records: dict[tuple[str, str], dict] | None = None,
+    bench_records: dict[tuple[str, str, int], dict] | None = None,
     sort_mode: str = "total",
     sort_dir: str = "desc",
     *,
