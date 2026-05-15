@@ -116,3 +116,4 @@ gpu-arbiter/gpu-arbiter
 
 # Graphify
 graphify-out/
+.graphify-input/
