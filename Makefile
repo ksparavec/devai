@@ -138,7 +138,7 @@ endif
 .PHONY: catalog-regen catalog-suggest probe probe-vllm probe-sglang model-fit model-pull vram-fit verify-backend-flags ollama-cleanup-ctx-variants
 .PHONY: bench bench-vllm bench-sglang bench-ollama bench-report test-bench-smoke
 .PHONY: secrets-tmpfs secrets-edit secrets-render secrets-rotate age-keygen-host test-python
-.PHONY: mcp-up mcp-down mcp-logs mcp-test mcp-health
+.PHONY: mcp-up mcp-down mcp-logs mcp-test mcp-health build-worker-bootstrap
 
 all: help
 
@@ -506,6 +506,27 @@ mcp-test: ## Smoke-test the running MCP gateway (requires `make mcp-up`)
 
 mcp-health: ## Lightweight /health probe against the running MCP gateway
 	bash scripts/mcp-health.sh
+
+# Worker-bootstrap image (per docs/plans/gpu-arbiter-cluster-mode.md
+# decision 11). Minimal image SkyPilot launches on cloud workers --
+# arbiter binary + backend images + cloud-init entrypoint, no
+# user-facing surfaces.
+WORKER_BOOTSTRAP_IMAGE = devai-worker-bootstrap
+
+build-worker-bootstrap: ## Build the minimal cluster-worker bootstrap image (cluster-mode Phase 1)
+	@# Requires gpu-arbiter binary at gpu-arbiter/gpu-arbiter; build
+	@# with `make build-router` first when running outside the
+	@# project's distroless build flow.
+	@if [ ! -x gpu-arbiter/gpu-arbiter ]; then \
+		echo "ERROR: gpu-arbiter/gpu-arbiter not found or not executable." >&2; \
+		echo "       Run 'make build-router' first (or copy the binary built" >&2; \
+		echo "       by the distroless image into gpu-arbiter/gpu-arbiter)." >&2; \
+		exit 1; \
+	fi
+	$(CONTAINER_RUNTIME) build --network=host \
+		$(PROXY_BUILD_ARGS) \
+		-f deploy/Dockerfile.worker-bootstrap \
+		-t $(WORKER_BOOTSTRAP_IMAGE) .
 
 test-router: ## Run Go unit tests for gpu-arbiter router
 	$(CONTAINER_RUNTIME) run --rm \

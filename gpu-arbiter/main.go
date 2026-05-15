@@ -38,6 +38,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -568,7 +569,7 @@ type backendState struct {
 	// whenever the container is observed gone.
 	currentSpec *configSpeculative
 	lastRequest time.Time
-	activeReqs     int64
+	activeReqs  int64
 	// Recreate coalescing — without this, a second request that arrives
 	// during the 50–60s cold-start `waitForHealthy` window sees
 	// running=false, decides it needs its own recreate, and tears down
@@ -621,10 +622,10 @@ type arbiter struct {
 	// *availability*; whether it actually gets emitted at launch is
 	// gated by the per-request `::mtp` suffix (parseMTPOverride). nil
 	// = catalog declares no MTP for this row -- the suffix is ignored.
-	modelMTP map[string]map[string]*configSpeculative
-	defaultPolicy     string                    // DEVAI_REASONING env value: auto|off|low|medium|high
-	totalVRAMGB       float64
-	maxContextLen     int // global default from MAX_CONTEXT_LEN env (default 262144)
+	modelMTP      map[string]map[string]*configSpeculative
+	defaultPolicy string // DEVAI_REASONING env value: auto|off|low|medium|high
+	totalVRAMGB   float64
+	maxContextLen int // global default from MAX_CONTEXT_LEN env (default 262144)
 	// pluginRegistry resolves vLLM parser plugin names (loaded from
 	// deploy/vllm-plugins.json). Always non-nil; entries map is empty
 	// when the registry file is missing or has no plugins.
@@ -1034,7 +1035,29 @@ func specLabel(s *configSpeculative) string {
 
 // --- Main ---
 
+// arbiterMode selects single-host vs cluster behaviour. Default
+// "single" preserves the pre-cluster-mode code path byte-for-byte.
+// Per docs/plans/gpu-arbiter-cluster-mode.md decision 7 + 11.
+var arbiterMode = flag.String(
+	"mode", env("DEVAI_MODE", "single"),
+	"arbiter mode: single|worker|head",
+)
+
 func main() {
+	flag.Parse()
+	switch *arbiterMode {
+	case "single":
+		// Fall through to the existing single-host code path.
+	case "worker":
+		runWorkerMode()
+		return
+	case "head":
+		runHeadMode()
+		return
+	default:
+		log.Fatalf("unknown --mode %q (want single|worker|head)", *arbiterMode)
+	}
+
 	ollamaURL, _ := url.Parse(env("OLLAMA_URL", "http://devai-ollama:11434"))
 	vllmURL, _ := url.Parse(env("VLLM_URL", "http://devai-vllm:11434"))
 	sglangURL, _ := url.Parse(env("SGLANG_URL", "http://devai-sglang:11434"))
@@ -1147,11 +1170,11 @@ func main() {
 	modelContexts := make(map[string]int)
 	modelCapability := make(map[string]string)
 	modelDisableOK := make(map[string]bool)
-	modelToolParser := make(map[string]map[string]string)             // backend → model → --tool-call-parser
-	modelReasoningParser := make(map[string]map[string]string)        // backend → model → --reasoning-parser
-	modelToolMode := make(map[string]map[string]string)               // backend → model → "auto" | "forced"
-	modelProbedMaxCtx := make(map[string]map[string]int)              // backend → model → highest fits=true ctx
-	modelMTP := make(map[string]map[string]*configSpeculative)        // backend → model → catalog MTP block
+	modelToolParser := make(map[string]map[string]string)      // backend → model → --tool-call-parser
+	modelReasoningParser := make(map[string]map[string]string) // backend → model → --reasoning-parser
+	modelToolMode := make(map[string]map[string]string)        // backend → model → "auto" | "forced"
+	modelProbedMaxCtx := make(map[string]map[string]int)       // backend → model → highest fits=true ctx
+	modelMTP := make(map[string]map[string]*configSpeculative) // backend → model → catalog MTP block
 	capCounts := make(map[string]int)
 	for _, m := range cfg.Models {
 		names := append([]string{m.Name}, m.Aliases...)

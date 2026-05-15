@@ -1,0 +1,63 @@
+# Minimal worker-bootstrap image for SkyPilot-launched cloud workers.
+#
+# Per docs/plans/gpu-arbiter-cluster-mode.md decision 11: this image
+# carries only what a remote, unattended worker needs:
+#   - the gpu-arbiter binary (Go, distroless)
+#   - the three backend container images (vllm, sglang, ollama)
+#     pre-pulled into local Podman storage so cold-start doesn't pay
+#     the registry-pull tax
+#   - the cloud-init entrypoint that reads DEVAI_HEAD_URL/etc and
+#     starts the arbiter in --mode=worker
+#
+# Deliberately omits: JupyterLab, the model picker, Open WebUI, code-
+# server, every CLI agent (claude, codex, gemini, ...), aider. These
+# are user-facing surfaces that don't belong on a remote worker that
+# only handles head-forwarded requests.
+#
+# Image size target: under 5 GiB.
+#
+# Build:
+#   make build-worker-bootstrap
+#
+# Run (typically by SkyPilot's cloud-init):
+#   docker run --rm --gpus all \
+#     -e DEVAI_MODE=worker \
+#     -e DEVAI_HEAD_URL=https://head.devai.example/ \
+#     -e DEVAI_WORKER_TOKEN_FILE=/run/devai/cluster-token \
+#     -e DEVAI_WORKER_NAME=runpod-3090-east-01 \
+#     -e DEVAI_LIFECYCLE=ephemeral \
+#     -v /run/devai/cluster-token:/run/devai/cluster-token:ro \
+#     devai-worker-bootstrap
+
+ARG BASE_IMAGE=docker.io/nvidia/cuda:13.0.0-runtime-ubuntu24.04
+FROM ${BASE_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV DEVAI_MODE=worker
+
+# Minimal runtime: ca-certificates for HTTPS to head, tini as PID 1.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+         ca-certificates curl tini \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Stage the arbiter binary built by `make build-router` (multi-stage
+# build elsewhere; this Dockerfile assumes the binary already exists
+# at the build context root as gpu-arbiter/gpu-arbiter).
+COPY gpu-arbiter/gpu-arbiter /usr/local/bin/gpu-arbiter
+RUN chmod +x /usr/local/bin/gpu-arbiter
+
+# Cloud-init entrypoint shape (per docs/worker-bootstrap.md). The
+# script normalises env, ensures the token file is readable, then
+# execs the arbiter in worker mode. Lives in deploy/ so the
+# build-context COPY catches it.
+COPY deploy/worker-cloud-init.sh /usr/local/bin/worker-cloud-init.sh
+RUN chmod +x /usr/local/bin/worker-cloud-init.sh
+
+# Health check: TCP probe of the worker's inbound listener. SkyPilot
+# uses this to know when the worker is ready to register.
+HEALTHCHECK --interval=15s --timeout=5s --start-period=30s \
+    CMD curl -fsS http://localhost:11444/health || exit 1
+
+EXPOSE 11444
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/worker-cloud-init.sh"]

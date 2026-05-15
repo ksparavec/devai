@@ -22,7 +22,7 @@ Current snapshot (as of 2026-05-15):
 | [bench-rewrite](./bench-rewrite.md)                                 | In Progress |
 | [skypilot-agent-skill](./skypilot-agent-skill.md)                   | In Progress |
 | [mcp-gateway](./mcp-gateway.md)                                     | In Progress |
-| [gpu-arbiter-cluster-mode](./gpu-arbiter-cluster-mode.md)           | Approved    |
+| [gpu-arbiter-cluster-mode](./gpu-arbiter-cluster-mode.md)           | In Progress |
 | [skypilot-fleet-provisioner](./skypilot-fleet-provisioner.md)       | Approved    |
 
 ## Dependency graph

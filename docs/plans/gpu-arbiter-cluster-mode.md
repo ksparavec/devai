@@ -8,8 +8,26 @@ of the existing router._
 
 ## Status
 
-Design **approved 2026-05-14** -- all open questions resolved (see
-"Confirmed decisions" below). Not yet scheduled for execution.
+**In Progress.** Phase 1 shipped 2026-05-15: `--mode` flag dispatch
+in `main.go` (single mode untouched), `cluster_proto.go` (shared
+types), `cluster_auth.go` (TokenStore + middleware),
+`parse_minimal.go` (head-side parser), `cluster_worker.go` (Worker
+with WorkerState, register-with-backoff, heartbeat loop, command
+dispatch with lifecycle gating), `cluster_main.go` (worker entry
+point + placeholder noop executor + inbound listener),
+`deploy/Dockerfile.worker-bootstrap`, `deploy/worker-cloud-init.sh`,
+`Makefile build-worker-bootstrap` target. Docs:
+`docs/cluster-mode.md`, `docs/cluster-env.md`,
+`docs/worker-bootstrap.md`. 45 Go test cases (TestParseModelAndSuffixes,
+TestParseMinimal_FromBody, TestBearerFromHeader, TestTokenStore_*,
+TestLifecycleClass_IsValid, TestRegisterRequest_Validate,
+TestHeartbeatRequest_*, TestCommandTypeConstants, TestWorkerState_*,
+TestWorker_*, TestJitter_*, TestFloat64Bits_*).
+
+Phase 1.5 (preflight test script) and Phase 2 (head + routing)
+pending. The Phase 1 noop command executor reports successful
+acknowledgement of `serve` commands but doesn't yet proxy a real
+request body -- Phase 2 wires that path.
 
 **Amended 2026-05-14**: (1) Pre-flight verification promoted from
 informal decision 13 to a numbered **Phase 1.5** with explicit
