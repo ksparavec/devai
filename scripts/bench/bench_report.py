@@ -80,6 +80,20 @@ def _kv_pressure_pct(peak_vram_gb: float | None, host_vram_gb: float) -> float |
     return float(peak_vram_gb) / float(host_vram_gb) * 100.0
 
 
+def _ctx_label(ctx: int) -> str:
+    """Render a context size as ``32K``, ``128K``, etc. when the value
+    is a clean multiple of 1024; otherwise fall back to the raw int.
+    ``0`` and unknown ctxs render as ``-`` so the leaderboard column
+    stays narrow.
+    """
+    if not ctx or ctx <= 0:
+        return "-"
+    if ctx % 1024 == 0:
+        k = ctx // 1024
+        return f"{k}K"
+    return str(ctx)
+
+
 def render(cache: dict, host_vram_gb: float = DEFAULT_HOST_VRAM_GB) -> str:
     rows: list[dict] = []
     for key, row in cache.items():
@@ -90,14 +104,25 @@ def render(cache: dict, host_vram_gb: float = DEFAULT_HOST_VRAM_GB) -> str:
         if not isinstance(row, dict):
             continue
         agg = _aggregate(row)
+        ctx_raw = row.get("context")
+        try:
+            ctx = int(ctx_raw) if ctx_raw is not None else 0
+        except (TypeError, ValueError):
+            ctx = 0
         rows.append({
             "key": key,
             "model": row.get("model", key),
             "backend": row.get("backend", "?"),
+            "ctx": ctx,
             "agg": agg,
             "row": row,
         })
-    rows.sort(key=lambda r: (r["agg"] is None, -(r["agg"] or 0.0)))
+    # Group by (model, ctx) so multi-ctx benches cluster together; ties
+    # broken by aggregate score so the strongest row floats up within
+    # each cluster.
+    rows.sort(
+        key=lambda r: (r["model"], r["ctx"], r["agg"] is None, -(r["agg"] or 0.0))
+    )
 
     meta = cache.get("_meta") or {}
     history = meta.get("host_env_history") or {}
@@ -116,11 +141,11 @@ def render(cache: dict, host_vram_gb: float = DEFAULT_HOST_VRAM_GB) -> str:
         )
         lines.append("")
     lines.append(
-        "| Model | Backend | Env | Agg | GSM8K | HumanEval | Tools | Leak rate | "
-        "TTFT first | TTFT p50 | TPS | Peak VRAM | KV % |"
+        "| Model | Backend | CTX | Env | Agg | GSM8K | HumanEval | Tools | "
+        "Leak rate | TTFT first | TTFT p50 | TPS | Peak VRAM | KV % |"
     )
     lines.append(
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
     )
     for r in rows:
         row = r["row"]
@@ -139,11 +164,18 @@ def render(cache: dict, host_vram_gb: float = DEFAULT_HOST_VRAM_GB) -> str:
         kv_str = "-" if kv_pct is None else f"{kv_pct:.1f}%"
         env_id = row.get("host_env_id") or "-"
         lines.append(
-            f"| {r['model']} | {r['backend']} | {env_id} | {_fmt(r['agg'])} | "
+            f"| {r['model']} | {r['backend']} | {_ctx_label(r['ctx'])} | "
+            f"{env_id} | {_fmt(r['agg'])} | "
             f"{_fmt(gsm)} | {_fmt(he)} | {_fmt(tools)} | {_fmt(leak)} | "
             f"{_fmt(ttft_first, ' ms')} | {_fmt(ttft_p50, ' ms')} | "
             f"{_fmt(tps, ' tok/s')} | {_fmt(peak, ' GB')} | {kv_str} |"
         )
+    lines.append("")
+    lines.append(
+        "_Schema v3: each row reflects one (model, backend, ctx) cell. "
+        "Rows are grouped by (model, ctx); `-` means no bench data at "
+        "that cell. Re-run `make bench --ctx <N>` to fill missing tiers._"
+    )
     lines.append("")
     lines.append(
         f"_KV % = `peak_vram_gb / {host_vram_gb:g}` (host VRAM cap, "
