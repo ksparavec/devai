@@ -138,7 +138,7 @@ endif
 .PHONY: catalog-regen catalog-suggest probe probe-vllm probe-sglang model-fit model-pull vram-fit verify-backend-flags ollama-cleanup-ctx-variants
 .PHONY: bench bench-vllm bench-sglang bench-ollama bench-report test-bench-smoke
 .PHONY: secrets-tmpfs secrets-edit secrets-render secrets-rotate age-keygen-host test-python
-.PHONY: mcp-up mcp-down mcp-logs mcp-test mcp-health build-worker-bootstrap test-cluster-preflight
+.PHONY: mcp-up mcp-down mcp-logs mcp-test mcp-health build-worker-bootstrap test-cluster-preflight cluster-head-up cluster-head-down cluster-status
 
 all: help
 
@@ -518,6 +518,15 @@ test-cluster-preflight: ## Phase 1.5 preflight (worker + stub head end-to-end; n
 	@# scenarios per docs/plans/gpu-arbiter-cluster-mode.md Phase 1.5.
 	@# Wall time ~1 minute.
 	bash tests/test-cluster-preflight.sh
+
+cluster-head-up: ## Start the head-mode router (cluster-mode Phase 2)
+	$(COMPOSE) -f $(CACHE_COMPOSE) -f $(CURDIR)/deploy/compose.head.yaml up -d router
+
+cluster-head-down: ## Stop the head-mode router
+	$(COMPOSE) -f $(CACHE_COMPOSE) -f $(CURDIR)/deploy/compose.head.yaml stop router
+
+cluster-status: ## Pretty-print the head's /v1/cluster/status JSON
+	@curl -fsS http://localhost:11444/v1/cluster/status | python3 -m json.tool
 
 build-worker-bootstrap: ## Build the minimal cluster-worker bootstrap image (cluster-mode Phase 1)
 	@# Requires gpu-arbiter binary at gpu-arbiter/gpu-arbiter; build

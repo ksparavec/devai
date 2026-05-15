@@ -66,17 +66,60 @@ Per [plan decision 3](plans/gpu-arbiter-cluster-mode.md):
 
 ## Head mode
 
-Phase 2 of the cluster-mode plan; not yet implemented. When it
-lands, the operator runs:
+Phase 2 shipped 2026-05-15. The head host runs the same arbiter
+binary in head mode -- no GPU on the head, no backend containers,
+just routing:
+
+```bash
+make cluster-head-up      # compose override disables local backends
+make cluster-status       # pretty-prints /v1/cluster/status JSON
+```
+
+Or directly:
 
 ```bash
 export DEVAI_MODE=head
 gpu-arbiter --mode=head
 ```
 
-The head listens on the same OpenAI-compat ports (11434/5/6) and
-proxies to whichever registered worker scores highest for the
-incoming `(model, ctx)` request.
+The head:
+
+1. Listens on the cluster control plane port (`DEVAI_HEAD_LISTEN_PORT`,
+   default 11444) for `/v1/cluster/{register,heartbeat,status}`.
+2. Listens on the OpenAI-compat ports (11434/5/6) for client requests
+   and proxies to the highest-scoring registered worker.
+3. Runs an idle-sweep loop that expires workers whose last heartbeat
+   is older than `HeartbeatTTL` (30s default).
+4. Optionally injects `shutdown` commands into ephemeral workers
+   that have been idle for `DEVAI_IDLE_MINUTES`.
+
+### Routing scoring
+
+Per the plan's decision 4:
+
+| Score | Condition                                              |
+| ----- | ------------------------------------------------------ |
+| 100   | `loaded_model == model AND loaded_ctx >= ctx`          |
+| 50    | `loaded_model == model AND loaded_ctx <  ctx`          |
+| 30    | `loaded_model == ""` (idle, no cold-load yet)          |
+| 10    | `loaded_model != model` (different model loaded)       |
+
+Tiebreak: round-robin per bucket. Workers above
+`DEVAI_QUEUE_DEPTH_THRESHOLD` are skipped (overloaded). When no
+worker fits, the head returns 503 + a JSON `no_worker_fit` error
+with the requested model/ctx/backend echoed back.
+
+### compose.head.yaml override
+
+`deploy/compose.head.yaml` is the head-host overlay. It sets
+`DEVAI_MODE=head` on the router and zeroes the local backend
+service replicas so the head host's compose stack doesn't include
+ollama/vllm/sglang. Apply via:
+
+```bash
+podman-compose -f deploy/docker-compose.yaml \
+               -f deploy/compose.head.yaml up -d router
+```
 
 ## Authentication
 

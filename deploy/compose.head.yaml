@@ -1,0 +1,39 @@
+# compose override for cluster-head deployments.
+#
+# Usage:
+#   podman-compose -f deploy/docker-compose.yaml \
+#                  -f deploy/compose.head.yaml up -d devai-router
+#
+# Per docs/plans/gpu-arbiter-cluster-mode.md Phase 2 step 7:
+# when --mode=head, gpu-arbiter doesn't host backend containers
+# locally. This override:
+#   - Sets DEVAI_MODE=head on the router so it dispatches to head
+#     mode at startup.
+#   - Removes the ollama / vllm / sglang services so the head host's
+#     compose stack doesn't include the backends.
+#
+# The webui-proxy + open-webui + logger services stay (operators want
+# them on the head too -- they just point at the cluster's frontend
+# ports rather than at local backends).
+
+services:
+  router:
+    environment:
+      - DEVAI_MODE=head
+      - DEVAI_HEAD_LISTEN_PORT=11444
+      # Operators tune the threshold per fleet via .env.
+      - DEVAI_QUEUE_DEPTH_THRESHOLD=${DEVAI_QUEUE_DEPTH_THRESHOLD:-0}
+      - DEVAI_IDLE_MINUTES=${DEVAI_IDLE_MINUTES:-10}
+
+  # Disable the local backend services on the head host. Set
+  # `replicas: 0` per podman-compose semantics; for plain
+  # docker-compose, comment them out via a manual extends.
+  ollama:
+    deploy:
+      replicas: 0
+  vllm:
+    deploy:
+      replicas: 0
+  sglang:
+    deploy:
+      replicas: 0
