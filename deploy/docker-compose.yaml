@@ -175,6 +175,36 @@ services:
       - open-webui
     restart: unless-stopped
 
+  # MCP Gateway (per docs/plans/mcp-gateway.md). Phase 1 ships the 10
+  # Tier 1 servers (no secrets). Phase 2 adds the four Tier 2 servers
+  # with sops-rendered secrets at /run/devai/mcp-secrets.env (mounted
+  # only when present; absent on Phase 1 installs).
+  #
+  # Started by default per decision 5 in the plan. Operator can opt
+  # out by setting MCP_PROFILE=mcp-disabled in .env (compose ignores
+  # the service when its profile doesn't match).
+  mcp-gateway:
+    image: docker.io/docker/mcp-gateway:v0.42.1
+    container_name: devai-mcp-gateway
+    hostname: mcp-gateway
+    restart: unless-stopped
+    ports:
+      - "${MCP_PORT:-8088}:8088"
+    environment:
+      - MCP_GATEWAY_PORT=8088
+    volumes:
+      - ${XDG_RUNTIME_DIR:-/run/user/1000}/podman/podman.sock:/var/run/docker.sock:Z
+      - ./mcp-servers.yaml:/app/catalog.yaml:ro
+      - mcp-state:/data
+    command:
+      - "--catalog=/app/catalog.yaml"
+      - "--port=8088"
+      - "--transport=streaming"
+      - "--block-secrets"
+    security_opt:
+      - "no-new-privileges:true"
+    profiles: [mcp]
+
   # Aggregates stdout from every devai-* service into per-container
   # log files on the host (/var/cache/devai/logs/<name>.log). Survives
   # source-container recreation — the follower reconnects to the new
@@ -204,3 +234,9 @@ networks:
   default:
     name: devai-net
     external: true
+
+volumes:
+  # MCP gateway state (server logs, transient working data). Lives in
+  # podman's named-volume storage; survives container restarts. Wipe
+  # via `podman volume rm devai_mcp-state` if it ever gets corrupted.
+  mcp-state:

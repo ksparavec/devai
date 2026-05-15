@@ -137,6 +137,7 @@ endif
 .PHONY: catalog-regen catalog-suggest probe probe-vllm probe-sglang model-fit model-pull vram-fit verify-backend-flags ollama-cleanup-ctx-variants
 .PHONY: bench bench-vllm bench-sglang bench-ollama bench-report test-bench-smoke
 .PHONY: secrets-tmpfs secrets-edit secrets-render secrets-rotate age-keygen-host test-python
+.PHONY: mcp-up mcp-down mcp-logs mcp-test mcp-health
 
 all: help
 
@@ -464,6 +465,26 @@ secrets-rotate: ## Re-key every deploy/*.sops.env file against the current .sops
 
 age-keygen-host: ## Generate a per-host age keypair under ~/.config/sops/age/ and print the public key
 	bash scripts/age-keygen-host.sh
+
+# MCP gateway (per docs/plans/mcp-gateway.md). Phase 1: start the
+# gateway with the 10 Tier 1 servers via the 'mcp' compose profile.
+# Phase 2 will append a `mcp-secrets-render` prerequisite that depends
+# on the shared sops-age secrets-tmpfs/render targets.
+mcp-up: ## Start the MCP gateway (10 Tier 1 servers, no secrets)
+	$(COMPOSE) -f $(CACHE_COMPOSE) --profile mcp up -d devai-mcp-gateway
+
+mcp-down: ## Stop the MCP gateway
+	$(COMPOSE) -f $(CACHE_COMPOSE) stop devai-mcp-gateway || true
+	$(COMPOSE) -f $(CACHE_COMPOSE) rm -f devai-mcp-gateway || true
+
+mcp-logs: ## Tail the MCP gateway log
+	$(CONTAINER_RUNTIME) logs -f devai-mcp-gateway
+
+mcp-test: ## Smoke-test the running MCP gateway (requires `make mcp-up`)
+	bash tests/test-mcp.sh
+
+mcp-health: ## Lightweight /health probe against the running MCP gateway
+	bash scripts/mcp-health.sh
 
 test-router: ## Run Go unit tests for gpu-arbiter router
 	$(CONTAINER_RUNTIME) run --rm \

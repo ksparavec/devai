@@ -21,7 +21,7 @@ Current snapshot (as of 2026-05-15):
 | [sops-age-secrets](./sops-age-secrets.md)                           | In Progress |
 | [bench-rewrite](./bench-rewrite.md)                                 | In Progress |
 | [skypilot-agent-skill](./skypilot-agent-skill.md)                   | Approved    |
-| [mcp-gateway](./mcp-gateway.md)                                     | Approved    |
+| [mcp-gateway](./mcp-gateway.md)                                     | In Progress |
 | [gpu-arbiter-cluster-mode](./gpu-arbiter-cluster-mode.md)           | Approved    |
 | [skypilot-fleet-provisioner](./skypilot-fleet-provisioner.md)       | Approved    |
 

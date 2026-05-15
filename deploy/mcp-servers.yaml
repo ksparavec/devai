@@ -1,0 +1,134 @@
+# MCP Gateway server catalog (per docs/plans/mcp-gateway.md).
+#
+# Phase 1: 10 Tier 1 servers, no secrets required. Phase 2 adds the
+# Tier 2 entries (github-official, firecrawl, hugging-face, context7)
+# with {secret: NAME} references rendered from
+# /run/devai/mcp-secrets.env.
+#
+# Each entry pins the upstream image tag. Bump deliberately; the
+# gateway image (docker/mcp-gateway:v0.42.1 in docker-compose.yaml)
+# stays in lockstep with the catalog schema it understands -- if the
+# gateway is bumped, validate every server entry still parses.
+#
+# Source of names: github.com/docker/mcp-registry (329 servers), trimmed
+# to the workflows an ML/AI developer in the devai lab actually needs.
+# See docs/mcp.md for the full rationale per server.
+
+apiVersion: v1
+schemaVersion: 1
+servers:
+
+  # ── Tier 1 (no secrets) ─────────────────────────────────────────
+
+  - name: filesystem
+    image: docker.io/mcp/filesystem:0.7.0
+    description: |
+      Read/write files in the user's workspace. Scoped via mounted
+      directories; the gateway adds a default --root pointing at the
+      lab's working directory.
+    permissions:
+      - filesystem.read
+      - filesystem.write
+
+  - name: git
+    image: docker.io/mcp/git:0.7.0
+    description: |
+      Local git operations (status, log, diff, blame). Read-only by
+      default; write operations gated behind explicit user consent
+      in the agent's UI.
+    permissions:
+      - filesystem.read
+
+  - name: sqlite
+    image: docker.io/mcp/sqlite:0.7.0
+    description: |
+      Query SQLite databases. devai consumers: probe caches, bench
+      cache, model catalog. Read-only by convention; the agent must
+      pass an explicit write flag to mutate.
+    permissions:
+      - filesystem.read
+
+  - name: fetch
+    image: docker.io/mcp/fetch:0.7.0
+    description: |
+      Generic HTTP GET. The cheap, no-key alternative to firecrawl
+      for plain-text scraping. Honours robots.txt by default.
+    permissions:
+      - network.outbound
+
+  - name: memory
+    image: docker.io/mcp/memory:0.7.0
+    description: |
+      In-process scratch storage scoped to the agent session.
+      Working memory across tool calls within one conversation.
+
+  - name: time
+    image: docker.io/mcp/time:0.7.0
+    description: |
+      Current date/time + timezone conversions. Eliminates the
+      "what is today" hallucination class.
+
+  - name: sequentialthinking
+    image: docker.io/mcp/sequentialthinking:0.7.0
+    description: |
+      Chain-of-thought scaffolding for multi-step reasoning. Helps
+      models that don't have built-in reasoning produce structured
+      decompositions.
+
+  - name: duckduckgo
+    image: docker.io/mcp/duckduckgo:0.7.0
+    description: |
+      Free baseline web search. No API key required.
+    permissions:
+      - network.outbound
+
+  - name: arxiv
+    image: docker.io/mcp/arxiv-mcp-server:0.7.0
+    description: |
+      Search and fetch arXiv papers. Directly relevant to ML
+      researchers comparing methods, looking up cited work.
+    permissions:
+      - network.outbound
+
+  - name: wikipedia
+    image: docker.io/mcp/wikipedia-mcp:0.7.0
+    description: |
+      Wikipedia article lookups. Cheap factual grounding for any
+      domain question that doesn't need primary literature.
+    permissions:
+      - network.outbound
+
+  # ── Tier 2 (one secret each, ship in Phase 2) ──────────────────
+  #
+  # Phase 2 will append entries here referencing
+  # {secret: NAME} rendered from /run/devai/mcp-secrets.env.
+  # Skeleton kept commented so the catalog stays a single
+  # source of truth across the phase boundary.
+  #
+  # - name: github-official
+  #   image: docker.io/mcp/github:0.7.0
+  #   environment:
+  #     - GITHUB_PERSONAL_ACCESS_TOKEN={secret: GITHUB_TOKEN}
+  #   permissions:
+  #     - network.outbound
+  #
+  # - name: firecrawl
+  #   image: docker.io/mcp/firecrawl:0.7.0
+  #   environment:
+  #     - FIRECRAWL_API_KEY={secret: FIRECRAWL_API_KEY}
+  #   permissions:
+  #     - network.outbound
+  #
+  # - name: hugging-face
+  #   image: docker.io/mcp/hugging-face:0.7.0
+  #   environment:
+  #     - HF_TOKEN={secret: HF_TOKEN}
+  #   permissions:
+  #     - network.outbound
+  #
+  # - name: context7
+  #   image: docker.io/mcp/context7:0.7.0
+  #   environment:
+  #     - CONTEXT7_API_KEY={secret: CONTEXT7_API_KEY}
+  #   permissions:
+  #     - network.outbound

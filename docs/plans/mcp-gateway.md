@@ -2,9 +2,16 @@
 
 ## Status
 
-Design **approved 2026-05-14** -- all six open questions resolved
-(see "Confirmed decisions" below). Not yet scheduled for execution
-pending the prerequisite plans listed under Dependencies.
+**In Progress.** Phase 1 shipped 2026-05-15 (10 Tier 1 servers,
+no secrets): `deploy/docker-compose.yaml` service,
+`deploy/mcp-servers.yaml` catalog, `deploy/mcp-gateway.env`,
+`scripts/mcp-health.sh`, `tests/test-mcp.sh`, Makefile targets
+(`mcp-up` / `mcp-down` / `mcp-logs` / `mcp-test` / `mcp-health`),
+`docs/mcp.md`. Stdlib-unittest coverage in
+`tests/python/test_mcp_gateway_phase1.py` for catalog shape,
+compose-service mount/port/security flags, env file, script
+syntax, and docs sections. Phase 2 pending sops-age-secrets
+scaffold (already shipped 2026-05-15, ready to consume).
 
 **Amended 2026-05-14**: Phase 2's shared sops/age scaffold
 (fetch-cli additions, tmpfs mount, render script, `.sops.yaml`,
