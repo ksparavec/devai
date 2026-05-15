@@ -39,6 +39,20 @@ The router is a Go reverse proxy in front of three inference backends.
 It listens on three ports inside the `devai-net` network, one per
 backend, and proxies requests after rewriting them.
 
+The same Go binary supports three modes via the `--mode` flag (or
+`DEVAI_MODE` env var):
+
+| Mode      | Behaviour                                                                            |
+| --------- | ------------------------------------------------------------------------------------ |
+| `single`  | Default. Today's per-host scheduler -- byte-identical to pre-cluster-mode behaviour. The diagram below applies. |
+| `worker`  | Same single-host scheduling code path PLUS a register/heartbeat loop against a head; accepts head-forwarded requests on `/v1/cluster/inbound`. See `docs/cluster-mode.md`. |
+| `head`    | No GPU backends locally. Listens on the same OpenAI-compat ports (11434/5/6) and proxies each request to the highest-scoring registered worker per the 4-tier policy. See `docs/cluster-mode.md`. |
+
+Single mode (default) is what most operators run; cluster mode is
+opt-in via `DEVAI_MODE=worker` or `DEVAI_MODE=head` and requires the
+shared sops/age scaffold for the bearer token. The remainder of this
+document covers single mode unless noted.
+
 ```
 +--------------+                         +------------------------------+
 |   agents     |                         |        devai-router          |
@@ -64,6 +78,27 @@ The vLLM and SGLang containers start as `sleep infinity` placeholders
 live engine on the first request to their port via the Podman libpod
 API, with the right `--model`, `--max-model-len`, parser flags, and
 plugin mounts derived from the probe cache.
+
+### Cluster mode
+
+In `--mode=head`, the router's frontend handlers (still on ports
+11434/5/6) replace the local recreate/serve path with a routing
+decision: parse the `model` + `@<ctx>` + `::<reasoning>` from the
+request body (`parse_minimal.go`), score the worker fleet
+(`routing_policy.go` -- 4 tiers: exact-match=100,
+right-model-too-small-ctx=50, idle=30, different-model=10), proxy the
+request to the chosen worker's `/v1/cluster/inbound`
+(`cluster_proxy.go`, SSE-aware). The control plane lives on a
+separate port (default 11444) and serves
+`/v1/cluster/{register,heartbeat,status}` behind the bearer-token
+middleware (`cluster_auth.go`). Workers register with the head
+(`cluster_worker.go`) and send 10s heartbeats; the head's
+`commandsFor` may inject `shutdown` for ephemeral workers idle past
+`DEVAI_IDLE_MINUTES`. The compose overlay
+`deploy/compose.head.yaml` zeroes the local backend service replicas
+on a head host. See `docs/cluster-mode.md` for the operator
+walkthrough and `docs/cluster-mode-preflight.md` for the Phase 1.5
+preflight test report.
 
 ### What the router IS
 

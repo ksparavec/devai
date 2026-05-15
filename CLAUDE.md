@@ -20,6 +20,15 @@ This is **Dev AI Lab** -- a containerized development environment for AI experim
 - `docs/sampling-strategies.md` -- beginner's guide to how the next token is actually picked from the model's logit vector. Covers greedy, temperature, top-k, top-p (nucleus), min-p, repetition/frequency/presence penalties -- each with a worked example on a tiny 5-token vocabulary distribution. Ends with sane defaults per task type (deterministic eval, code, chat, creative, reasoning, tool calling). Self-contained ~400-line read.
 - `docs/paged-attention-and-vllm-internals.md` -- beginner's guide to the trick that makes the "elastic KV pool" referenced in `nvfp4-coldstart.md` actually work. Explains internal/external KV-cache fragmentation in the naive approach, the OS-style page-table indirection vLLM uses (block_size 16, fixed pool, per-sequence block tables), the five wins (zero waste, prefix caching, continuous batching, dynamic admission, copy-on-write), the kernel-level cost, and SGLang's RadixAttention extension. Computes the actual block count for Qwen3-8B-NVFP4 on the project's hardware (~11 950 blocks ~ 191 K tokens of pool capacity).
 - `docs/mixture-of-experts.md` -- beginner's guide to MoE models, anchored in `gpt-oss-20b` (the project's coding specialist). Explains total vs active parameters (~21 B total / ~3.6 B active for gpt-oss-20b), why VRAM scales with total but FLOPs scale with active, the router/specialisation mechanism, why MoE is harder to serve (expert load imbalance, batching defeated, slower cold start), and how to spot an MoE model in `config.json`. Notes the open follow-up in `bench-results.md` to re-run gpt-oss-20b TPS post-fix.
+- `docs/secrets.md` -- canonical reference for the shared sops + age secret-store scaffold consumed by mcp-gateway Phase 2, gpu-arbiter cluster mode, and the SkyPilot fleet provisioner. Setup walkthrough (install binaries, `make age-keygen-host`, add the public key to `.sops.yaml`, `make secrets-tmpfs`), the edit / render / rotate cycle, recovery posture (lost age key = lost secrets; offline backup pattern), multi-host onboarding, and the operator pre-commit checklist that catches a stale `age1xxx...` placeholder. **Source of truth for the secret scaffold.**
+- `docs/mcp.md` -- operator reference for the Docker MCP Gateway (peer service to `devai-router`). Phase 1 ships 10 Tier 1 servers (filesystem / git / sqlite / fetch / memory / time / sequentialthinking / duckduckgo / arxiv / wikipedia, no secrets). Phase 2 adds 4 Tier 2 servers (`github-official`, `firecrawl`, `hugging-face`, `context7`) backed by sops-rendered tmpfs secrets. Covers bring-up, client configs (Claude Code / Gemini / Codex / Open WebUI), the security model, troubleshooting.
+- `docs/cluster-mode.md` -- operator reference for `gpu-arbiter --mode={single,worker,head}`. Single (default) is byte-identical to the pre-cluster code path; worker registers with a head and serves head-forwarded requests; head listens on cluster control plane port 11444 + the OpenAI-compat ports (11434/5/6) and proxies to whichever registered worker scores highest for the incoming `(model, ctx)`. Documents the routing scoring (4-tier per cluster-mode decision 4), the lifecycle classes (ephemeral vs persistent), the heartbeat protocol shape, the compose.head.yaml override, and troubleshooting.
+- `docs/cluster-env.md` -- canonical per-env-var contract table for cluster mode (DEVAI_MODE, DEVAI_HEAD_URL, DEVAI_LIFECYCLE, DEVAI_IDLE_MINUTES, etc.). Downstream consumer plans extend this table when they add their own env vars; PR review checklist enforces it.
+- `docs/worker-bootstrap.md` -- minimal cloud-VM image (`devai-worker-bootstrap`) that SkyPilot launches on remote workers. Carries only the gpu-arbiter binary + cloud-init + pre-pulled backend images -- no JupyterLab, no model picker, no agent CLIs. Documents the env-var contract SkyPilot consumes via `worker-cloud-init.sh`, the image layout, build + verify steps, the upgrade story.
+- `docs/cluster-mode-preflight.md` -- one-time test report for the cluster-mode Phase 1.5 preflight (`tests/test-cluster-preflight.sh`). Lists the 7 scenarios validated, the host first-run record (kernel / driver / GPU / arbiter version / wall time), per-scenario observed behaviour, known limitations, re-run guidance.
+- `docs/skypilot.md` -- operator reference for the system-side SkyPilot fleet provisioner. Phase 1 ships `devai-skypilot-api-server` as a long-lived compose service on the `cluster` profile (image pinned to `berkeleyskypilot/skypilot:0.12.1`, port 46580). Phase 2 (code only so far) wires the head-side Go integration (`skypilot_client.go`, `skypilot_policy.go`, two-step idle teardown). Covers bring-up, volume layout, endpoint surface, cost guidance, troubleshooting.
+- `docs/skypilot-user-guide.md` -- user-facing SkyPilot CLI guide (sibling to the system-side provisioner above). The lab image bundles `sky` + the Agent Skill plugin so any CLI agent (Claude Code, Gemini CLI, Codex) can spin up cloud GPUs through natural-language. Covers per-cloud credential setup, hello-world, agent-driven flow, cost guidance with $/hr table.
+- `docs/plans/` -- 6 design plans + execution-order README. `bench-rewrite` (Phases 1-5 shipped, Phase 6 deferred to live GPU). `sops-age-secrets` (scaffold shipped). `mcp-gateway` (Phases 1+2 shipped). `skypilot-agent-skill` (Phase 1 shipped, Phase 2 plugin install deferred). `gpu-arbiter-cluster-mode` (Phases 1, 1.5, 2 shipped; Phase 3 federation optional). `skypilot-fleet-provisioner` (Phase 1+2 code shipped; live cloud-burst E2E deferred).
 
 ## Build and Run Commands
 
@@ -71,7 +80,9 @@ make logs SERVICE=devai-router LINES=200
 make setup-logs                 # One-time: 100G LV at /var/cache/devai/logs (sudo)
 
 # Tests
-make test-router                # Go unit tests for arbiter
+make test-router                # Go unit tests for arbiter (single-host + cluster mode)
+make test-python                # Python stdlib unittests (bench v3, picker, sops/age, MCP, SkyPilot)
+make test-cluster-preflight     # cluster-mode Phase 1.5 preflight (worker + stub head; no GPU)
 make test-ollama                # Ollama integration tests
 make test-models                # Matrix: every probed digest x wire x scenario
 make test-vllm                  # Live vLLM integration (chat, ctx switch, GPU exclusion)
@@ -81,6 +92,38 @@ make test-probe-vllm            # Probe smoke: cache schema assertion (requires 
 make test-probe-sglang          # Same for SGLang
 make test-probe-ollama-idempotent  # Byte-identical regression check on refactored Ollama prober
 make test                       # All of the above in sequence (~30-60 min wall time)
+
+# MCP gateway (per docs/mcp.md). Phase 1 = 10 Tier 1 servers; Phase 2 = 4 Tier 2 servers + sops-rendered secrets.
+make mcp-up                     # Start the gateway via the 'mcp' compose profile (port 8088)
+make mcp-down                   # Stop the gateway
+make mcp-logs                   # Tail gateway log
+make mcp-test                   # End-to-end /health + tools/list smoke test
+make mcp-health                 # Lightweight /health probe
+make mcp-secrets-render         # Phase 2: render deploy/mcp-secrets.sops.env -> /run/devai/mcp-secrets.env
+
+# Cluster mode (per docs/cluster-mode.md). Single mode is unchanged; head/worker are opt-in.
+make cluster-head-up            # Start router in head mode (compose.head.yaml zeroes local backends)
+make cluster-head-down          # Stop the head router
+make cluster-status             # Pretty-print head's /v1/cluster/status
+make build-worker-bootstrap     # Build minimal cloud-VM image (arbiter + cloud-init only)
+
+# SkyPilot fleet provisioner (per docs/skypilot.md). Profile=cluster, opt-in.
+make skypilot-up                # Start devai-skypilot-api-server (port 46580)
+make skypilot-down              # Stop it
+make skypilot-check             # /api/v1/version + sky check inside container
+make skypilot-secrets-render    # Render deploy/skypilot-credentials.sops.env -> tmpfs
+
+# Secrets scaffold (per docs/secrets.md). Shared by mcp-gateway + cluster-mode + fleet-provisioner.
+make age-keygen-host            # One-time per host: generate ~/.config/sops/age/keys.txt
+make secrets-tmpfs              # Mount /run/devai as 4MiB tmpfs (one-time per boot)
+make secrets-edit SOPS_FILE=... # Edit a sops-encrypted file in place
+make secrets-render SOPS_FILE=... DEST=...  # Generic single-file render
+make secrets-rotate             # Re-key every deploy/*.sops.env after .sops.yaml changes
+
+# Bench harness (schema v3 -- per-context rows; see docs/bench-results.md)
+make bench                      # All backends. Largest fitting ctx per model by default.
+make bench-vllm                 # Just vLLM
+make bench-report               # Markdown leaderboard (CTX column shows the per-row context)
 
 # Maintenance
 make clean           # Remove all images (CPU + GPU + router)
@@ -105,6 +148,32 @@ Model catalog is in `deploy/models.yaml` (single source of truth for all models)
 - `GPU_MEMORY_GB` -- Total GPU VRAM in GB (default: 24). Used by router to calculate memory fractions and context limits.
 - `MAX_CONTEXT_LEN` -- Default max context length in tokens (default: 131072 = 128K). The router caps each model's per-name context at `min(model.max_context, MAX_CONTEXT_LEN)`. The probe cache (`deploy/.ollama-reasoning-cache.json`) is the source of truth -- `deploy/active-models.yaml` no longer exists.
 
+### Cluster-mode env vars (opt-in; see docs/cluster-env.md)
+
+- `DEVAI_MODE` -- `single` (default), `worker`, or `head`. Single is byte-identical to the pre-cluster-mode code path.
+- `DEVAI_HEAD_URL` -- worker mode: full URL of the head's cluster control plane (e.g. `http://devai-head.lan:11444`).
+- `DEVAI_WORKER_TOKEN_FILE` -- worker mode: path to the bearer token rendered from `cluster-token.sops.env` (default `/run/devai/cluster-token`).
+- `DEVAI_WORKER_NAME` -- worker mode: unique-per-fleet identifier (default `$(hostname)`).
+- `DEVAI_LIFECYCLE` -- worker mode: `ephemeral` (head MAY shutdown) or `persistent` (head MUST NOT shutdown). Defaults: `ephemeral` for SkyPilot-launched VMs, `persistent` for on-prem systemd-launched workers.
+- `DEVAI_GPU_TYPE` -- worker mode: short label the head uses for routing (e.g. `RTX4000`, `A100`, `H100`).
+- `DEVAI_BACKENDS` -- worker mode: comma-separated subset (default `ollama,vllm,sglang`).
+- `DEVAI_WORKER_INBOUND_PORT` -- worker mode: TCP port for forwarded requests (default 11444).
+- `DEVAI_HEAD_LISTEN_PORT` -- head mode: cluster control plane port (default 11444).
+- `DEVAI_IDLE_MINUTES` -- head mode: idle threshold for shutdown of ephemeral workers (default 10; see cluster-mode decision 14).
+- `DEVAI_QUEUE_DEPTH_THRESHOLD` -- head mode: skip workers above this queue depth in routing (0 = disabled).
+
+### MCP gateway env vars (opt-in; see docs/mcp.md)
+
+- `MCP_PORT` -- host port the gateway listens on (default 8088).
+- `MCP_SECRETS_FILE` -- Phase 2: path to the rendered tmpfs file (defaults to `/dev/null` so Phase 1 installs boot cleanly).
+- `MCP_SECRETS_PATH` -- Phase 2: container-side path the gateway reads (defaults to `/dev/null`).
+
+### SkyPilot fleet-provisioner env vars (opt-in; see docs/skypilot.md)
+
+- `SKYPILOT_API_PORT` -- host port for the API server (default 46580; container side stays at 46580).
+- `SKYPILOT_CREDENTIALS_FILE` -- path to sops-rendered cloud creds (defaults to `/dev/null` so the `$HOME` mount alone suffices).
+- `SKYPILOT_API_ENDPOINT` -- head-mode env: when set, gpu-arbiter calls the API server for cloud-burst provisioning. Unset = local-fleet-only routing.
+
 ## Architecture
 
 ### Lab container (devai-lab-cpu / devai-lab-gpu)
@@ -118,11 +187,24 @@ Build cache: CLI binaries pre-downloaded to `/var/cache/devai/pip/bin/` via `mak
 
 ### Inference stack (deploy/docker-compose.yaml)
 
+Single-host (default):
+
 ```
 Agent -> devai-router:11434 -> devai-ollama:11434 (GGUF models)
 Agent -> devai-router:11435 -> devai-vllm:11434   (NVFP4 / safetensors via vLLM)
 Agent -> devai-router:11436 -> devai-sglang:11434 (NVFP4 / safetensors via SGLang)
 ```
+
+Cluster mode (opt-in via `DEVAI_MODE=head|worker`; see `docs/cluster-mode.md`):
+
+```
+Agent -> devai-router (head):11434/5/6 -> devai-router (worker N):11444 -> devai-{ollama,vllm,sglang}
+                       |                          ^
+                       v                          |
+                  /v1/cluster/{register,heartbeat,status}  (control plane on :11444)
+```
+
+Single mode (default) preserves the pre-cluster code path byte-for-byte. Worker mode runs the existing single-host scheduler and adds an outbound register/heartbeat loop. Head mode runs no GPU backends locally; it parses the `model` + `@<ctx>` + `::<reasoning>` from each request, scores the worker fleet (4-tier policy: exact-match / right-model-too-small-ctx / idle / different-model), and proxies to the chosen worker's `/v1/cluster/inbound`. The compose overlay at `deploy/compose.head.yaml` zeroes the local backend services on a head host.
 
 - **devai-router** -- Multi-port GPU-aware reverse proxy. One port per backend. No message inspection -- port determines backend. Manages GPU exclusion (only one backend uses GPU at a time), graceful drain on switch, idle timeout (`IDLE_TIMEOUT` env, default 300s), health check timeout (`HEALTH_TIMEOUT_SECONDS` env, default 600s for NVFP4 cold-start with CUDA graph compilation), dynamic GPU memory allocation (`--gpu-memory-utilization` for vLLM, `--mem-fraction-static` for SGLang). Per-request context cap comes from `<name>@<ctx>` override (picker-supplied) or the probe cache row's `min(model.max_context, MAX_CONTEXT_LEN)`. Both `currentModel` and `currentContext` are tracked per backend; either change triggers a recreate. **Reasoning policy** (`DEVAI_REASONING`): global policy is `auto|off|low|medium|high` (default auto); per-request suffix `::<reasoning>` overrides (e.g., `::nothink` -> `enable_thinking=off` for inline-reasoning models). Ollama uses native `think:` field; vLLM/SGLang inject `extra_body.chat_template_kwargs.enable_thinking` plus `reasoning_effort` (vLLM) or `separate_reasoning` (SGLang). Capability=`inline` + policy=`off` now returns `reasoningDisable` (explicit user opt-out). **Tool stripping** (`maybeStripTools`): when vLLM/SGLang models have no probe-verified tool parser, the router drops `tools` and `tool_choice` from the request body to prevent "BadRequestError: auto tool choice requires --enable-auto-tool-choice and --tool-call-parser" rejections. Disable rewrite is gated on `disable_verified` (per-model probe outcome).
 - **devai-ollama** -- Unmodified `ollama/ollama:latest`. GGUF models, GPU auto-detected. `OLLAMA_MAX_LOADED_MODELS=1` ensures clean model switching. `OLLAMA_CONTEXT_LENGTH` defaults to 262144 (compose env).
@@ -131,13 +213,15 @@ Agent -> devai-router:11436 -> devai-sglang:11434 (NVFP4 / safetensors via SGLan
 - **devai-webui-proxy** -- nginx TLS proxy for Open WebUI (mkcert certs or self-signed fallback).
 - **devai-open-webui** -- Web chat interface, connects to router's ollama port (:11434).
 - **devai-logger** -- Sidecar that streams `podman --remote logs --follow` for every devai-* container into `/var/cache/devai/logs/<service>.log`. Survives container restarts. Tail via `make logs SERVICE=<name> [LINES=N]`. Requires the `cache_logs` LV (one-time setup via `make setup-logs`).
+- **devai-mcp-gateway** (opt-in, profile=`mcp`) -- Docker MCP Gateway peer service. Single HTTP endpoint on port 8088 that any MCP-aware agent can target; per-call MCP server containers spawned via the host's Podman socket. Phase 1 ships 10 Tier 1 servers; Phase 2 adds 4 Tier 2 servers backed by sops-rendered `/run/devai/mcp-secrets.env`. `--block-secrets` + `no-new-privileges` enforced. See `docs/mcp.md`.
+- **devai-skypilot-api-server** (opt-in, profile=`cluster`) -- Long-lived SkyPilot API server (`berkeleyskypilot/skypilot:0.12.1`) on port 46580. Called by gpu-arbiter in head mode to provision cluster workers across cloud / Slurm / on-prem. Cloud creds via `$HOME` mount (interactive AWS/GCP/Sky configs) and/or sops-rendered `/run/devai/skypilot-credentials.env` (RunPod / Lambda API keys + the `SKYPILOT_API_TOKEN` for the gpu-arbiter <-> API-server channel). See `docs/skypilot.md`.
 
 ### Supporting services
 
 - **apt-cacher-ng** -- APT package cache (port 3142)
 - **Registry mirror** -- Docker Hub pull-through cache (port 5000)
 
-All services share `devai-net` network. Model data stored under `/var/cache/devai/`.
+All services share `devai-net` network. Model data stored under `/var/cache/devai/`. Secret render targets live on a tmpfs at `/run/devai/` (per `docs/secrets.md`).
 
 ### SSL / HTTPS
 
@@ -187,9 +271,35 @@ deploy/.bench-cache.json      -- Bench cache (schema v3). Top-level `_meta` bloc
 deploy/backend-flags.yaml     -- Pinned launch-flag *names* per backend; `make verify-backend-flags` asserts presence after image bumps
 deploy/docker-compose.yaml    -- Infrastructure services (vllm/sglang start as `sleep` placeholders; router recreates on demand)
 deploy/Dockerfile.base        -- Base image
-deploy/Dockerfile.lab         -- Lab image
+deploy/Dockerfile.lab         -- Lab image (now also installs SkyPilot CLI offline from pre-fetched wheels per skypilot-agent-skill plan Phase 1)
 deploy/Dockerfile.router      -- Router image (distroless)
-gpu-arbiter/main.go           -- GPU arbiter source (multi-port proxy, ~1070 lines Go)
+deploy/Dockerfile.worker-bootstrap -- Minimal cloud-VM image SkyPilot launches: arbiter binary + cloud-init + pre-pulled backend images, no JupyterLab/picker/agents (per cluster-mode decision 11). Build via `make build-worker-bootstrap`.
+deploy/worker-cloud-init.sh   -- Cloud-init entrypoint baked into Dockerfile.worker-bootstrap; validates env vars (DEVAI_HEAD_URL, DEVAI_WORKER_TOKEN_FILE, ...) and execs `gpu-arbiter --mode=worker`. The contract SkyPilot consumes.
+deploy/compose.head.yaml      -- Compose overlay for cluster-head deployments. Sets DEVAI_MODE=head on router and zeroes the local backend service replicas. Used by `make cluster-head-up`.
+deploy/mcp-servers.yaml       -- MCP gateway catalog (10 Tier 1 + 4 Tier 2 servers). Tier 2 entries reference `{secret: NAME}` resolved by the gateway from `/run/devai/mcp-secrets.env`.
+deploy/mcp-gateway.env        -- Non-secret MCP gateway config (MCP_PORT default 8088).
+deploy/mcp-secrets.sops.env   -- (gitignored at canonical name) Encrypted Tier 2 secrets. Operators copy `mcp-secrets.sops.env.example` -> fill in real values -> `sops --encrypt` -> commit.
+deploy/skypilot-api.env       -- Non-secret SkyPilot API server config (SKYPILOT_API_PORT default 46580).
+deploy/skypilot-credentials.sops.env -- (gitignored at canonical name) Encrypted RunPod / Lambda API keys + the SKYPILOT_API_TOKEN bearer token for the head <-> API-server channel.
+deploy/setup-secrets-tmpfs.sh -- Idempotent tmpfs mount at /run/devai (4 MiB, mode 0700, nodev/nosuid/noexec). One-time per boot; `make secrets-tmpfs` wraps it.
+.sops.yaml                    -- creation_rules for sops/age. Single rule covers `deploy/*.sops.env`. Operators add their host's age public key to the `age:` list, then `sops updatekeys`.
+gpu-arbiter/main.go           -- GPU arbiter source (multi-port proxy, ~1070 lines Go). Now dispatches on `--mode={single,worker,head}` (default single is byte-identical to pre-cluster behaviour).
+gpu-arbiter/cluster_proto.go  -- Shared cluster-mode protocol types (RegisterRequest/Response, HeartbeatRequest/Response, Command, LifecycleClass, StatusEntry). JSON omitempty for forward compatibility.
+gpu-arbiter/cluster_auth.go   -- Bearer-token TokenStore with cache TTL + AuthMiddleware. Constant-time compare; re-reads file on TTL expiry so rotated tokens become effective without restart.
+gpu-arbiter/parse_minimal.go  -- Head-side minimal request parser. Strips `@<ctx>` and `::<reasoning>` suffixes; preserves HF sha @-prefixes (non-numeric tail = not ctx).
+gpu-arbiter/cluster_worker.go -- Worker mode: WorkerState (atomic state), register-with-exponential-backoff, heartbeat loop @ 10s, dispatchCommand with lifecycle-policy gating (persistent refuses shutdown).
+gpu-arbiter/cluster_main.go   -- runWorkerMode + runHeadMode entrypoints. Worker assembles WorkerConfig from env vars, mounts /v1/cluster/inbound listener, runs Worker.Start. Head dispatches to NewClusterHead via init()-registered factory.
+gpu-arbiter/fleet_state.go    -- Head-side in-memory worker map. Register/Heartbeat/Get/Snapshot/ExpireOlderThan, all mutex-protected. Re-registration by Name replaces the entry (handles worker restart).
+gpu-arbiter/routing_policy.go -- 4-tier scoring (exact-match=100, right-model=50, idle=30, different-model=10) + backend-advertise filter + queue-depth threshold + per-bucket round-robin tiebreak.
+gpu-arbiter/cluster_head.go   -- ClusterHead with control plane (port 11444) + frontend proxies (11434/5/6) + idle-sweep loop. Handlers for /v1/cluster/{register,heartbeat,status}; frontend handler runs ParseMinimal + RouteDecision then hands off to HeadForwarder.
+gpu-arbiter/cluster_proxy.go  -- ClusterProxy implements HeadForwarder. Bearer-auth POST to worker's /v1/cluster/inbound, mirror response headers, strip Content-Length on text/event-stream so SSE flushes through with http.Flusher.
+gpu-arbiter/skypilot_client.go -- HTTP client for SkyPilot /api/v1/{launch,status,down}. Bearer-token auth via TokenStore (re-read each call). IsConfigured guard so a head with no SKYPILOT_API_ENDPOINT degrades to local-fleet-only routing.
+gpu-arbiter/skypilot_policy.go -- SkyPilotPolicy (PickCheapest + per-launch budget gate + BuildLaunchRequest with worker-bootstrap env contract) + IdleTeardownCoordinator (two-step "send shutdown via heartbeat then sky down" sequence).
+scripts/age-keygen-host.sh    -- One-time per host: generates ~/.config/sops/age/keys.txt mode 0600 + prints public key. Idempotent.
+scripts/render-secret.sh      -- Generic single-file decrypt to tmpfs. Refuses non-tmpfs destinations (override via DEVAI_RENDER_ALLOW_NON_TMPFS=1) so a missing `make secrets-tmpfs` fails loudly.
+scripts/mcp-health.sh         -- Lightweight /health + /servers probe for the running MCP gateway.
+scripts/skypilot-api-health.sh -- /api/v1/version + `sky check` smoke test for the running SkyPilot API server.
+scripts/sky-setup.sh          -- First-launch helper inside the lab: enumerates detected cloud creds, runs `sky check`, prints next-step + cost guidance.
 scripts/generate-catalog.py   -- Refresh deploy/models.yaml from upstream (HF + Ollama registry)
 scripts/_probe_core.py        -- Backend-agnostic probe helpers (cache I/O, classifier, implied-spill propagation)
 scripts/_probe_hf_common.py   -- Shared scaffold for vLLM/SGLang probers (BackendSpec, podman driver, single-launch + 3-chat probe, nvidia-smi)
@@ -207,7 +317,21 @@ deploy/setup-logs-volume.sh   -- Idempotent LVM/XFS/fstab setup for /var/cache/d
 deploy/logging.sh             -- Logger sidecar entrypoint (runs `podman --remote logs --follow` per devai-* container)
 tests/test-router.sh          -- Ollama-side router integration tests
 tests/test-model-matrix.sh    -- Exhaustive matrix: every probed digest x wire x scenario
+tests/test-cluster-preflight.sh -- cluster-mode Phase 1.5 preflight (worker + stub head). 7 scripted scenarios (registration, heartbeat cadence, drain/serve/shutdown commands, lifecycle policy, head-bounce recovery, token rotation, inbound auth gating). No GPU required; ~55s wall time.
+tests/test-mcp.sh             -- MCP gateway end-to-end (/health + JSON-RPC tools/list). Skips with exit 77 when gateway not running.
+tests/test-fleet-routing.sh   -- Fleet-routing skeleton; skips with exit 77 when SKYPILOT_API_ENDPOINT unset. Full provisioning test deferred to E2E.
+tests/fixtures/stub-head.py   -- Minimal stub head (stdlib HTTP) used by test-cluster-preflight.sh; predictable register/heartbeat/introspect surface.
+tests/python/                 -- Python stdlib-unittest cases (138 tests as of 2026-05-15) covering bench v3 schema migration + runner ctx flags + picker keying + report rendering, sops/age scaffold script gates, MCP gateway Phase 1+2 catalog/compose/Makefile shape, SkyPilot agent-skill Dockerfile + fetch-cli + docs, SkyPilot fleet Phase 1 service shape + creds template, stub-head HTTP surface. Run via `make test-python`.
 docs/backends.md              -- Lifecycle, probing, cache hygiene, failure-mode taxonomy across all 3 backends
+docs/secrets.md               -- Source of truth for the sops/age scaffold (one-time setup, edit, render, rotation, recovery, multi-host onboarding, paranoid-mode pointer).
+docs/mcp.md                   -- Operator reference for the MCP gateway (Tier 1/2 catalog, client configs, security model, Phase 2 walkthrough).
+docs/cluster-mode.md          -- Operator reference for `gpu-arbiter --mode={single,worker,head}` (worker bring-up, lifecycle classes, head routing scoring, compose.head.yaml overlay, troubleshooting).
+docs/cluster-env.md           -- Canonical env-var contract table for cluster mode + downstream consumer plans.
+docs/worker-bootstrap.md      -- Cloud-VM bootstrap image reference (build, env contract, cloud-init shape, layout, upgrades).
+docs/cluster-mode-preflight.md -- Phase 1.5 preflight test report (host first-run record + per-scenario observed behaviour).
+docs/skypilot.md              -- System-side fleet provisioner (devai-skypilot-api-server bring-up, volume layout, endpoint surface, Phase 2 preview, cost guidance).
+docs/skypilot-user-guide.md   -- User-facing CLI guide (per-cloud credential setup, hello-world, agent-driven flow).
+docs/plans/                   -- 6 design plans + execution-order README. See "Documentation" section above for status snapshot.
 ```
 
 ## Documentation conventions

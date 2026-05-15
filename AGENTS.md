@@ -11,6 +11,23 @@ on demand when a request arrives on the backend's port. See
 `docs/backends.md` for the lifecycle, probing procedure, and failure-mode
 taxonomy before changing backend behavior.
 
+Optional opt-in surfaces (all gated behind compose profiles or the `--mode` flag,
+default behaviour unchanged):
+
+- **Cluster mode** (`gpu-arbiter --mode={single,worker,head}`) for multi-host
+  fleets. Single is byte-identical to today; worker registers with a head;
+  head proxies to whichever worker scores highest for the incoming
+  `(model, ctx)`. See `docs/cluster-mode.md`.
+- **MCP gateway** (profile=`mcp`) -- Docker MCP Gateway peer service on port
+  8088 with 10 Tier 1 + 4 Tier 2 servers. See `docs/mcp.md`.
+- **SkyPilot fleet provisioner** (profile=`cluster`) -- long-lived API server
+  on port 46580 that head mode calls for cloud-burst provisioning. See
+  `docs/skypilot.md`. The lab image also bundles the SkyPilot CLI for the
+  user-facing flow (`docs/skypilot-user-guide.md`).
+- **sops + age secret store** -- shared encrypted-at-rest scaffold consumed by
+  the three above. Operators run `make age-keygen-host` once and append their
+  public key to `.sops.yaml`. See `docs/secrets.md`.
+
 The project supports both Podman and Docker. Most workflows are intentionally
 driven through `make` targets so contributors do not need to remember container
 flags, mounted paths, or runtime environment variables.
@@ -101,9 +118,36 @@ Use `make help` to list supported targets. Common commands:
 - `make test-probe-ollama-idempotent`: byte-identical regression check
   on the refactored Ollama prober.
 - `make test`: runs **every** available test in sequence — Go unit +
-  Ollama integration + matrix + vLLM/SGLang integration + E2E + probe
-  smoke. Wall time 30-60+ min. Each layer skips cleanly when its
-  prerequisites aren't met.
+  Python unit + Ollama integration + matrix + vLLM/SGLang integration +
+  E2E + probe smoke. Wall time 30-60+ min. Each layer skips cleanly
+  when its prerequisites aren't met.
+- `make test-python`: stdlib-unittest cases (138 tests as of
+  2026-05-15) covering bench v3 schema migration + runner ctx flags
+  + picker keying + report rendering, sops/age scaffold script
+  gates, MCP gateway Phase 1+2 catalog/compose/Makefile shape,
+  SkyPilot agent-skill, SkyPilot fleet Phase 1 service shape, and
+  the cluster-mode Phase 1.5 stub head's HTTP surface.
+- `make test-cluster-preflight`: runs the 7-scenario cluster-mode
+  Phase 1.5 preflight against a real arbiter binary + stub head
+  (no GPU; ~55s wall time). Gates every PR touching `gpu-arbiter/`
+  cluster files.
+
+Cluster / MCP / SkyPilot / secrets targets (opt-in):
+
+- `make cluster-head-up` / `make cluster-head-down` /
+  `make cluster-status`: head-mode router lifecycle.
+- `make build-worker-bootstrap`: build the minimal cloud-VM image
+  (arbiter binary + cloud-init only). Requires
+  `gpu-arbiter/gpu-arbiter` to exist; build via `make build-router`
+  first when running outside the distroless image flow.
+- `make mcp-up` / `make mcp-down` / `make mcp-test` /
+  `make mcp-secrets-render`: MCP gateway (profile=`mcp`).
+- `make skypilot-up` / `make skypilot-down` /
+  `make skypilot-check` / `make skypilot-secrets-render`: SkyPilot
+  API server (profile=`cluster`).
+- `make age-keygen-host` / `make secrets-tmpfs` /
+  `make secrets-edit SOPS_FILE=...` / `make secrets-rotate`:
+  shared sops/age scaffold.
 
 JupyterLab extension changes must be built inside a container, not directly on
 the host. Use the documented container build flow from `CLAUDE.md` or
@@ -171,6 +215,20 @@ Important runtime knobs:
 - `PROBE_FORCE`, `PROBE_FORCE_CTX`: re-probe the current VRAM band /
   the named tier, ignoring existing cache cells.
 - `DEVAI_REASONING`: `auto|off|low|medium|high`.
+
+Cluster + MCP + SkyPilot env knobs (full table in `docs/cluster-env.md`):
+
+- `DEVAI_MODE`: `single` (default), `worker`, or `head`.
+- `DEVAI_HEAD_URL`, `DEVAI_WORKER_TOKEN_FILE`, `DEVAI_WORKER_NAME`,
+  `DEVAI_LIFECYCLE`, `DEVAI_GPU_TYPE`, `DEVAI_BACKENDS`,
+  `DEVAI_WORKER_INBOUND_PORT`: worker-side configuration.
+- `DEVAI_HEAD_LISTEN_PORT`, `DEVAI_IDLE_MINUTES`,
+  `DEVAI_QUEUE_DEPTH_THRESHOLD`: head-side configuration.
+- `MCP_PORT`, `MCP_SECRETS_FILE`: MCP gateway (Phase 2 mounts the
+  secrets file when set; default `/dev/null`).
+- `SKYPILOT_API_PORT`, `SKYPILOT_CREDENTIALS_FILE`,
+  `SKYPILOT_API_ENDPOINT`: SkyPilot fleet provisioner (head mode
+  reads `SKYPILOT_API_ENDPOINT`; unset = local-fleet-only routing).
 
 ## Coding Style & Naming Conventions
 
@@ -244,6 +302,15 @@ Do not commit secrets, API tokens, private keys, model weights, cache contents,
 or generated logs. `.env` is local configuration; keep `.env.example` generic.
 Proxy variables and runtime settings should be documented without embedding
 private infrastructure details.
+
+Encrypted credentials live in `deploy/*.sops.env` (committed) and are rendered
+to `/run/devai/*.env` (tmpfs, gitignored) by `make *-secrets-render`. Plaintext
+templates are shipped as `*.sops.env.example` so operators see the expected
+variable names without decrypting anything. `.gitignore` blocks `*.env.plain`
+and `/run/devai`; the `!deploy/*.sops.env` exception ensures encrypted files
+stay tracked even under broader rules. Run the sops/age scaffold's pre-commit
+checklist (per `docs/secrets.md`) before any commit that touches `.sops.yaml`
+or a `.sops.env` file -- it catches the literal `age1xxx...` placeholder.
 
 Prefer Make targets over raw container commands. They preserve expected mounts,
 network names, user settings, and environment variables. If a workflow truly
