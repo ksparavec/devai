@@ -75,16 +75,17 @@ class TestMcpServersYaml(unittest.TestCase):
             missing, set(), msg=f"Tier 1 servers missing: {missing}"
         )
 
-    def test_no_tier2_enabled(self) -> None:
-        # Phase 1 ships Tier 2 commented in the YAML source.
+    def test_tier1_present(self) -> None:
+        # Phase 1 invariant: every Tier 1 server stays catalog-listed
+        # even after Phase 2 added Tier 2 entries above.
         with open(self.path) as f:
             doc = self.yaml.safe_load(f)
         names = {s.get("name") for s in doc["servers"]}
-        leaked = TIER2_SERVERS & names
+        # All 10 Tier 1 still there.
+        missing_t1 = TIER1_SERVERS - names
         self.assertEqual(
-            leaked,
-            set(),
-            msg=f"Tier 2 servers enabled before Phase 2 ships: {leaked}",
+            missing_t1, set(),
+            msg=f"Tier 1 servers regressed after Phase 2 added Tier 2: {missing_t1}",
         )
 
     def test_every_server_has_image_and_description(self) -> None:

@@ -15,11 +15,14 @@ phase split live in
 
 - **Phase 1 shipped**: 10 Tier 1 servers (no secrets), gateway
   reachable on port 8088 by default.
-- **Phase 2 pending**: 4 Tier 2 servers (`github-official`,
-  `firecrawl`, `hugging-face`, `context7`) gated on the shared
+- **Phase 2 shipped**: 4 Tier 2 servers (`github-official`,
+  `firecrawl`, `hugging-face`, `context7`) backed by the shared
   sops/age secret-store scaffold from
-  [docs/secrets.md](secrets.md). Catalog entries are present
-  but commented; uncomment after Phase 2 ships.
+  [docs/secrets.md](secrets.md). Operators encrypt
+  `deploy/mcp-secrets.sops.env`, run `make mcp-secrets-render`
+  to populate `/run/devai/mcp-secrets.env`, then `make mcp-up`.
+  When the secrets file is absent the gateway runs in Phase 1
+  mode -- Tier 2 entries log "missing secret" and skip.
 
 ## Bring-up
 

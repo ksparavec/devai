@@ -195,12 +195,22 @@ services:
     volumes:
       - ${XDG_RUNTIME_DIR:-/run/user/1000}/podman/podman.sock:/var/run/docker.sock:Z
       - ./mcp-servers.yaml:/app/catalog.yaml:ro
+      # Phase 2 secrets mount. /run/devai/mcp-secrets.env is rendered
+      # by `make mcp-secrets-render` from deploy/mcp-secrets.sops.env;
+      # absent on Phase 1 installs. Compose tolerates the missing
+      # source via the conditional bind path -- Podman will refuse to
+      # start the container if the source doesn't exist, so consumers
+      # who want Tier 2 must run mcp-secrets-render first; consumers
+      # who only want Tier 1 should leave the MCP_SECRETS_FILE env
+      # unset so this volume entry is dropped.
+      - ${MCP_SECRETS_FILE:-/dev/null}:/secrets/.env:ro
       - mcp-state:/data
     command:
       - "--catalog=/app/catalog.yaml"
       - "--port=8088"
       - "--transport=streaming"
       - "--block-secrets"
+      - "--secrets=${MCP_SECRETS_PATH:-/dev/null}"
     security_opt:
       - "no-new-privileges:true"
     profiles: [mcp]

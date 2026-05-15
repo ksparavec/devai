@@ -138,7 +138,7 @@ endif
 .PHONY: catalog-regen catalog-suggest probe probe-vllm probe-sglang model-fit model-pull vram-fit verify-backend-flags ollama-cleanup-ctx-variants
 .PHONY: bench bench-vllm bench-sglang bench-ollama bench-report test-bench-smoke
 .PHONY: secrets-tmpfs secrets-edit secrets-render secrets-rotate age-keygen-host test-python
-.PHONY: mcp-up mcp-down mcp-logs mcp-test mcp-health build-worker-bootstrap test-cluster-preflight cluster-head-up cluster-head-down cluster-status
+.PHONY: mcp-up mcp-down mcp-logs mcp-test mcp-health mcp-secrets-render build-worker-bootstrap test-cluster-preflight cluster-head-up cluster-head-down cluster-status
 
 all: help
 
@@ -506,6 +506,26 @@ mcp-test: ## Smoke-test the running MCP gateway (requires `make mcp-up`)
 
 mcp-health: ## Lightweight /health probe against the running MCP gateway
 	bash scripts/mcp-health.sh
+
+mcp-secrets-render: secrets-tmpfs ## Render deploy/mcp-secrets.sops.env to /run/devai/mcp-secrets.env
+	@# Phase 2 wrapper around the shared scripts/render-secret.sh.
+	@# Operator must have:
+	@#   1. ran `make age-keygen-host` once (ships under sops-age plan)
+	@#   2. added the printed public key to .sops.yaml
+	@#   3. encrypted real values into deploy/mcp-secrets.sops.env via
+	@#      `cp .../mcp-secrets.sops.env.example /tmp/mcp.env`,
+	@#      `sops --encrypt /tmp/mcp.env > deploy/mcp-secrets.sops.env`,
+	@#      `shred -u /tmp/mcp.env`
+	@if [ ! -f deploy/mcp-secrets.sops.env ]; then \
+		echo "ERROR: deploy/mcp-secrets.sops.env not present." >&2; \
+		echo "       See deploy/mcp-secrets.sops.env.example for the" >&2; \
+		echo "       expected variable names. Encrypt your file with" >&2; \
+		echo "       sops, then re-run this target." >&2; \
+		exit 1; \
+	fi
+	bash scripts/render-secret.sh \
+	     deploy/mcp-secrets.sops.env \
+	     /run/devai/mcp-secrets.env
 
 # Worker-bootstrap image (per docs/plans/gpu-arbiter-cluster-mode.md
 # decision 11). Minimal image SkyPilot launches on cloud workers --

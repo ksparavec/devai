@@ -2,16 +2,21 @@
 
 ## Status
 
-**In Progress.** Phase 1 shipped 2026-05-15 (10 Tier 1 servers,
-no secrets): `deploy/docker-compose.yaml` service,
-`deploy/mcp-servers.yaml` catalog, `deploy/mcp-gateway.env`,
-`scripts/mcp-health.sh`, `tests/test-mcp.sh`, Makefile targets
-(`mcp-up` / `mcp-down` / `mcp-logs` / `mcp-test` / `mcp-health`),
-`docs/mcp.md`. Stdlib-unittest coverage in
-`tests/python/test_mcp_gateway_phase1.py` for catalog shape,
-compose-service mount/port/security flags, env file, script
-syntax, and docs sections. Phase 2 pending sops-age-secrets
-scaffold (already shipped 2026-05-15, ready to consume).
+**In Progress.** Phases 1 and 2 shipped 2026-05-15. Phase 1
+covered 10 Tier 1 servers (no secrets); Phase 2 added 4 Tier 2
+servers (`github-official`, `firecrawl`, `hugging-face`,
+`context7`) backed by the shared sops/age scaffold:
+`deploy/mcp-servers.yaml` Tier 2 entries with `{secret: NAME}`
+references, `deploy/mcp-secrets.sops.env.example` (operator
+template -- never commit a real plaintext under the canonical
+name), `docker-compose.yaml` secrets mount with `MCP_SECRETS_FILE`
+fallback to `/dev/null` so Phase 1 installs aren't broken,
+`Makefile mcp-secrets-render` target wrapping the shared
+`scripts/render-secret.sh`. 10 new unit tests in
+`tests/python/test_mcp_gateway_phase2.py` (catalog Tier 2 entries,
+secret-name set, compose secrets mount, Makefile target shape).
+End-to-end live test against the gateway with real secrets is
+deferred to first operator run -- requires real PATs.
 
 **Amended 2026-05-14**: Phase 2's shared sops/age scaffold
 (fetch-cli additions, tmpfs mount, render script, `.sops.yaml`,

@@ -98,37 +98,56 @@ servers:
     permissions:
       - network.outbound
 
-  # ── Tier 2 (one secret each, ship in Phase 2) ──────────────────
+  # ── Tier 2 (one secret each, Phase 2) ──────────────────────────
   #
-  # Phase 2 will append entries here referencing
-  # {secret: NAME} rendered from /run/devai/mcp-secrets.env.
-  # Skeleton kept commented so the catalog stays a single
-  # source of truth across the phase boundary.
+  # Each entry references a {secret: NAME} value resolved by the
+  # gateway from the env file rendered by `make mcp-secrets-render`.
+  # The actual secrets live in deploy/mcp-secrets.sops.env, encrypted
+  # via the shared sops/age scaffold (docs/secrets.md).
   #
-  # - name: github-official
-  #   image: docker.io/mcp/github:0.7.0
-  #   environment:
-  #     - GITHUB_PERSONAL_ACCESS_TOKEN={secret: GITHUB_TOKEN}
-  #   permissions:
-  #     - network.outbound
-  #
-  # - name: firecrawl
-  #   image: docker.io/mcp/firecrawl:0.7.0
-  #   environment:
-  #     - FIRECRAWL_API_KEY={secret: FIRECRAWL_API_KEY}
-  #   permissions:
-  #     - network.outbound
-  #
-  # - name: hugging-face
-  #   image: docker.io/mcp/hugging-face:0.7.0
-  #   environment:
-  #     - HF_TOKEN={secret: HF_TOKEN}
-  #   permissions:
-  #     - network.outbound
-  #
-  # - name: context7
-  #   image: docker.io/mcp/context7:0.7.0
-  #   environment:
-  #     - CONTEXT7_API_KEY={secret: CONTEXT7_API_KEY}
-  #   permissions:
-  #     - network.outbound
+  # The gateway only loads these entries when --secrets is passed
+  # AND the corresponding env var is present in the file. Missing
+  # secrets log a warning and skip the server -- safe degradation.
+
+  - name: github-official
+    image: docker.io/mcp/github:0.7.0
+    description: |
+      GitHub repo / issue / PR / search operations. Requires a
+      GitHub personal access token with read scope on the repos
+      the agent should see.
+    environment:
+      - "GITHUB_PERSONAL_ACCESS_TOKEN={secret: GITHUB_TOKEN}"
+    permissions:
+      - network.outbound
+
+  - name: firecrawl
+    image: docker.io/mcp/firecrawl:0.7.0
+    description: |
+      Higher-quality web scraping than the bare `fetch` server.
+      Pricing-tier dependent; the free tier suffices for most ML
+      research use.
+    environment:
+      - "FIRECRAWL_API_KEY={secret: FIRECRAWL_API_KEY}"
+    permissions:
+      - network.outbound
+
+  - name: hugging-face
+    image: docker.io/mcp/hugging-face:0.7.0
+    description: |
+      Hugging Face Hub: list / inspect / download models. Fits
+      devai's existing model-management surface.
+    environment:
+      - "HF_TOKEN={secret: HF_TOKEN}"
+    permissions:
+      - network.outbound
+
+  - name: context7
+    image: docker.io/mcp/context7:0.7.0
+    description: |
+      Up-to-date library documentation. Anthropic-blessed pattern
+      for keeping agents aware of library changes that postdate
+      the model's training cutoff.
+    environment:
+      - "CONTEXT7_API_KEY={secret: CONTEXT7_API_KEY}"
+    permissions:
+      - network.outbound
