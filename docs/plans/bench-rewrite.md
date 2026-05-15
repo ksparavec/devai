@@ -2,13 +2,23 @@
 
 ## Status
 
-**Approved.** All five design decisions confirmed -- see
-"Confirmed decisions" below. Ready for implementation in a single
-working session (~3-4 hours of code + ~45-60 min re-bench sweep,
-both required).
+**In Progress.** Phases 1-5 (schema + migrator + runner flags +
+picker + report + docs) shipped 2026-05-15 with full unit-test
+coverage in `tests/python/` (59 stdlib unittest cases, run via
+`make test-python`). The migrator runs idempotently on first writer
+invocation and the 9 historical rows hardcoded in
+`RECOVERED_CTX_MAP` get their context recovered from the
+2026-05-05 router log. Phase 6 (backfill) is deferred to a real
+GPU host -- it requires `~45-60 min` of live cold-start + bench
+runs against the project's RTX 4000 PRO Blackwell, which is
+out-of-scope for the current implementation pass; it lands as a
+separate commit once the host is available.
 
 **Amended 2026-05-14**: Phase 6 (backfill) promoted from optional
 to required. Rationale captured in the "Phased rollout" section.
+
+**Amended 2026-05-15**: Phases 1-5 complete; only Phase 6 remains
+(deferred to live GPU bench session).
 
 ## Dependencies
 

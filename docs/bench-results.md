@@ -165,8 +165,13 @@ Per (model, backend) pair:
 5. **VRAM sampler** thread polls `nvidia-smi` at 1 Hz throughout each
    model's run, reports peak/mean.
 
-Results merge into one row per model in `deploy/.bench-cache.json`,
-keyed by `<repo@sha>` to join with the probe cache.
+Results merge into one row per (model, backend, ctx) in
+`deploy/.bench-cache.json` (schema v3), keyed by
+`<repo>@<sha>::<backend>::<ctx>` (HF) or `<digest>::<backend>::<ctx>`
+(Ollama). The same model benched at two ctx tiers lands in two rows so
+TPS / TTFT differences across ctx are not silently averaged. The probe
+cache (`<repo>@<sha>` for HF, digest for Ollama) is the join surface
+for fit data.
 
 ## TPS counting fix
 

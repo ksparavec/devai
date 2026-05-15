@@ -16,14 +16,14 @@ authoritative -- update this file to match.
 
 Current snapshot (as of 2026-05-15):
 
-| Plan                                                                | Status   |
-| ------------------------------------------------------------------- | -------- |
-| [sops-age-secrets](./sops-age-secrets.md)                           | Draft    |
-| [bench-rewrite](./bench-rewrite.md)                                 | Approved |
-| [skypilot-agent-skill](./skypilot-agent-skill.md)                   | Approved |
-| [mcp-gateway](./mcp-gateway.md)                                     | Approved |
-| [gpu-arbiter-cluster-mode](./gpu-arbiter-cluster-mode.md)           | Approved |
-| [skypilot-fleet-provisioner](./skypilot-fleet-provisioner.md)       | Approved |
+| Plan                                                                | Status      |
+| ------------------------------------------------------------------- | ----------- |
+| [sops-age-secrets](./sops-age-secrets.md)                           | Draft       |
+| [bench-rewrite](./bench-rewrite.md)                                 | In Progress |
+| [skypilot-agent-skill](./skypilot-agent-skill.md)                   | Approved    |
+| [mcp-gateway](./mcp-gateway.md)                                     | Approved    |
+| [gpu-arbiter-cluster-mode](./gpu-arbiter-cluster-mode.md)           | Approved    |
+| [skypilot-fleet-provisioner](./skypilot-fleet-provisioner.md)       | Approved    |
 
 ## Dependency graph
 
