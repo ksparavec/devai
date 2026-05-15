@@ -6,10 +6,20 @@ on-prem._
 
 ## Status
 
-Design **approved 2026-05-14** -- all seven open questions resolved
-(see "Confirmed decisions" below). Not yet scheduled for execution
-pending the gpu-arbiter cluster-mode and worker-bootstrap plans
-listed under Dependencies.
+**In Progress.** Phase 1 shipped 2026-05-15: `devai-skypilot-api-server`
+compose service (image pinned to `berkeleyskypilot/skypilot:0.12.1`,
+profile=cluster, port 46580, `skypilot-state` named volume,
+`$HOME` + `/secrets/.env` mounts), `deploy/skypilot-api.env`,
+`deploy/skypilot-credentials.sops.env.example`,
+`scripts/skypilot-api-health.sh`, Makefile targets
+(`skypilot-up` / `skypilot-down` / `skypilot-check` /
+`skypilot-secrets-render`), `docs/skypilot.md`. 18 unit tests in
+`tests/python/test_skypilot_fleet_phase1.py` cover service shape
++ env file + creds template + health-script syntax + Makefile
+targets + docs sections. Live cloud provisioning test (sky launch
++ sky down against RunPod) deferred to E2E. Phase 2 (head-side
+gpu-arbiter integration) and Phase 3 (cost-cap, spot, pre-warming)
+pending.
 
 **Amended 2026-05-14**: (1) Worker bootstrap dependency now points
 at gpu-arbiter-cluster-mode Phase 1 (where the bootstrap image and

@@ -138,7 +138,7 @@ endif
 .PHONY: catalog-regen catalog-suggest probe probe-vllm probe-sglang model-fit model-pull vram-fit verify-backend-flags ollama-cleanup-ctx-variants
 .PHONY: bench bench-vllm bench-sglang bench-ollama bench-report test-bench-smoke
 .PHONY: secrets-tmpfs secrets-edit secrets-render secrets-rotate age-keygen-host test-python
-.PHONY: mcp-up mcp-down mcp-logs mcp-test mcp-health mcp-secrets-render build-worker-bootstrap test-cluster-preflight cluster-head-up cluster-head-down cluster-status
+.PHONY: mcp-up mcp-down mcp-logs mcp-test mcp-health mcp-secrets-render build-worker-bootstrap test-cluster-preflight cluster-head-up cluster-head-down cluster-status skypilot-up skypilot-down skypilot-check skypilot-secrets-render
 
 all: help
 
@@ -547,6 +547,31 @@ cluster-head-down: ## Stop the head-mode router
 
 cluster-status: ## Pretty-print the head's /v1/cluster/status JSON
 	@curl -fsS http://localhost:11444/v1/cluster/status | python3 -m json.tool
+
+# SkyPilot fleet-provisioner Phase 1 (per
+# docs/plans/skypilot-fleet-provisioner.md). Long-lived API server
+# the head calls to provision cluster workers. Profile=cluster, opt-in.
+skypilot-up: ## Start the SkyPilot API server (cluster profile)
+	$(COMPOSE) -f $(CACHE_COMPOSE) --profile cluster up -d devai-skypilot-api-server
+
+skypilot-down: ## Stop the SkyPilot API server
+	$(COMPOSE) -f $(CACHE_COMPOSE) stop devai-skypilot-api-server || true
+	$(COMPOSE) -f $(CACHE_COMPOSE) rm -f devai-skypilot-api-server || true
+
+skypilot-check: ## Health-check the running SkyPilot API server
+	bash scripts/skypilot-api-health.sh
+
+skypilot-secrets-render: secrets-tmpfs ## Render deploy/skypilot-credentials.sops.env to tmpfs
+	@if [ ! -f deploy/skypilot-credentials.sops.env ]; then \
+		echo "ERROR: deploy/skypilot-credentials.sops.env not present." >&2; \
+		echo "       See deploy/skypilot-credentials.sops.env.example for the" >&2; \
+		echo "       expected variable names. Encrypt your file with sops," >&2; \
+		echo "       then re-run this target." >&2; \
+		exit 1; \
+	fi
+	bash scripts/render-secret.sh \
+	     deploy/skypilot-credentials.sops.env \
+	     /run/devai/skypilot-credentials.env
 
 build-worker-bootstrap: ## Build the minimal cluster-worker bootstrap image (cluster-mode Phase 1)
 	@# Requires gpu-arbiter binary at gpu-arbiter/gpu-arbiter; build

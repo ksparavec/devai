@@ -215,6 +215,47 @@ services:
       - "no-new-privileges:true"
     profiles: [mcp]
 
+  # SkyPilot API server (per docs/plans/skypilot-fleet-provisioner.md
+  # Phase 1). Long-lived service that gpu-arbiter (in head mode) calls
+  # to provision cluster workers on demand. Opt-in via the 'cluster'
+  # compose profile -- only operators running cluster mode bring it up.
+  #
+  # Image is the upstream berkeleyskypilot/skypilot release. Container
+  # port 46580 is upstream's default; host port tunable via
+  # SKYPILOT_API_PORT in .env.
+  skypilot-api-server:
+    image: docker.io/berkeleyskypilot/skypilot:0.12.1
+    container_name: devai-skypilot-api-server
+    hostname: skypilot-api-server
+    restart: unless-stopped
+    ports:
+      - "${SKYPILOT_API_PORT:-46580}:46580"
+    environment:
+      # Where SkyPilot reads its global config. Mounted from the
+      # named-volume so credential discovery survives restarts.
+      - SKYPILOT_GLOBAL_CONFIG=/root/.api-server-config.yaml
+    volumes:
+      - skypilot-state:/root/.sky
+      # $HOME mount surfaces interactive-style cloud creds (~/.aws,
+      # ~/.config/gcloud, ~/.config/sky) -- the same mechanism the
+      # lab uses; matches skypilot-agent-skill.md decision 3.
+      - ${HOME}:/root:rw
+      # sops-rendered service credentials (RunPod / Lambda API keys).
+      # Defaults to /dev/null so Phase 1 installs without SkyPilot
+      # creds boot cleanly; operators rendering real creds set
+      # SKYPILOT_CREDENTIALS_FILE in .env to point at
+      # /run/devai/skypilot-credentials.env.
+      - ${SKYPILOT_CREDENTIALS_FILE:-/dev/null}:/secrets/.env:ro
+    entrypoint: [tini]
+    command:
+      - "--"
+      - sky
+      - api
+      - start
+      - "--deploy"
+      - "--foreground"
+    profiles: [cluster]
+
   # Aggregates stdout from every devai-* service into per-container
   # log files on the host (/var/cache/devai/logs/<name>.log). Survives
   # source-container recreation — the follower reconnects to the new
@@ -250,3 +291,9 @@ volumes:
   # podman's named-volume storage; survives container restarts. Wipe
   # via `podman volume rm devai_mcp-state` if it ever gets corrupted.
   mcp-state:
+
+  # SkyPilot API server state (provisioned cluster registry, task
+  # logs, per-cloud config). Survives container restarts so a head
+  # bounce doesn't lose track of in-flight workers. Per
+  # skypilot-fleet-provisioner.md decision 4.
+  skypilot-state:
