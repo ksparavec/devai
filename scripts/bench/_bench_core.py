@@ -219,23 +219,46 @@ def sweep_for_leaks(
 # ── Cache row builder ───────────────────────────────────────────────────────
 
 # Top-level cache keys reserved for harness metadata (schema v2+). Anything
-# else at the top level is a bench row keyed by ``<repo>@<sha>::<backend>`` or
-# ``<digest>::<backend>``. Consumers iterating cache.items() must skip these.
+# else at the top level is a bench row keyed by
+# ``<repo>@<sha>::<backend>::<ctx>`` or ``<digest>::<backend>::<ctx>``.
+# Consumers iterating cache.items() must skip these.
 META_KEYS: frozenset[str] = frozenset({"_meta"})
 
 # Top-level bench-cache schema version. Bumped when readers must change
 # behaviour to interpret a row correctly; row-level ``schema_version``
 # continues to track per-row evolution. ``assert_cache_schema_compatible``
-# is the gate that prevents a future v3 cache from being silently misread
-# by a v2 consumer.
-BENCH_CACHE_SCHEMA_VERSION: int = 2
+# is the gate that prevents a future v4 cache from being silently misread
+# by a v3 consumer.
+BENCH_CACHE_SCHEMA_VERSION: int = 3
+
+
+# Recovered context-tier evidence for the 9 v2 rows produced before the
+# bench harness started stamping ``context``. Sourced from
+# /var/cache/devai/logs/devai-router.log for the 2026-05-05 bench window
+# (see docs/plans/bench-rewrite.md > "Context"). Hardcoded by design --
+# captures historical fact, not policy. Never edited after v2 -> v3
+# migration ships; future rows that escape this map land with ``ctx=0``
+# and are treated by readers as "no data at this ctx" until re-benched.
+RECOVERED_CTX_MAP: dict[str, int] = {
+    "DeepSeek-R1-Distill-Llama-8B":            32768,
+    "DeepSeek-R1-Distill-Qwen-7B":             65536,
+    "Llama-3.1-8B-Instruct-NVFP4":            131072,
+    "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4":   131072,
+    "NVIDIA-Nemotron-Nano-9B-v2-NVFP4":        65536,
+    "Qwen3-14B-NVFP4":                         65536,
+    "Qwen3-8B-NVFP4":                         131072,
+    "Qwen3.5-9B-NVFP4":                       131072,
+    "gpt-oss-20b":                            262144,
+}
 
 
 def is_row_key(key: str) -> bool:
     """True when ``key`` names a bench row (not a meta block).
 
-    Centralised so report/picker/migration code stays in sync if more
-    meta keys are added later.
+    Accepts the v2 ``<base>::<backend>`` shape and the v3
+    ``<base>::<backend>::<ctx>`` shape. Centralised so
+    report/picker/migration code stays in sync if more meta keys are
+    added later.
     """
     return not (key in META_KEYS or key.startswith("_"))
 
@@ -277,6 +300,7 @@ def update_row(
     model: str,
     backend: str,
     router_endpoint: str,
+    context: int = 0,
     task_results: dict[str, dict] | None = None,
     metrics: dict | None = None,
     host_env_id: str | None = None,
@@ -288,6 +312,12 @@ def update_row(
     Updates ``last_benched_at`` always; sets ``first_benched_at`` only
     when the row is fresh.
 
+    ``context`` stamps the row-level ctx the bench was launched at.
+    Schema v3 keys carry ``::<ctx>`` so different-ctx benches of the
+    same model land in distinct rows; ``context`` is the in-row mirror.
+    Pass ``0`` only when the caller cannot determine the ctx (legacy
+    callers, tests); readers treat ctx=0 as "pre-migration / unknown".
+
     ``host_env_id`` (when supplied) is stamped on the row so the
     leaderboard can join back to ``cache["_meta"]["host_env_history"]``
     and prove which kernel + driver + GPU produced these numbers. Each
@@ -296,9 +326,10 @@ def update_row(
     """
     now = _now_iso()
     row = cache.get(key) or {
-        "schema_version": 2,
+        "schema_version": BENCH_CACHE_SCHEMA_VERSION,
         "model": model,
         "backend": backend,
+        "context": int(context),
         "router_endpoint": router_endpoint,
         "tasks": {},
         "metrics": {},
@@ -307,11 +338,18 @@ def update_row(
     row["model"] = model
     row["backend"] = backend
     row["router_endpoint"] = router_endpoint
+    if context:
+        row["context"] = int(context)
+    else:
+        row.setdefault("context", 0)
     row.setdefault("tasks", {})
     row.setdefault("metrics", {})
     # Schema bump on touch so older rows acquire the field even if no
     # other fields changed in this update.
-    row["schema_version"] = max(int(row.get("schema_version", 1)), 2)
+    row["schema_version"] = max(
+        int(row.get("schema_version", 1)),
+        BENCH_CACHE_SCHEMA_VERSION,
+    )
     stamp_cache_schema(cache)
     if task_results:
         for tname, tresult in task_results.items():
@@ -470,19 +508,28 @@ def router_url_for(backend: str) -> str:
 
 # ── Catalog helpers ─────────────────────────────────────────────────────────
 
-def cache_key_for_entry(entry: dict, backend: str) -> str | None:
+def cache_key_for_entry(
+    entry: dict, backend: str, ctx: int | None = None
+) -> str | None:
     """Resolve the top-level key for the **bench** cache.
 
     The same model can be served by more than one backend (the only
     overlap on this hardware is ``gpt-oss-20b`` and
     ``DeepSeek-R1-Distill-Qwen-7B``, which both fit on vLLM and
     SGLang). Bench scores, cold-start times, peak VRAM and TPS all
-    depend on the backend, so each (model, backend) pair gets its
-    own row. The key shape is:
+    depend on the backend AND the context the model was launched at,
+    so each (model, backend, ctx) triple gets its own row. The key
+    shape is:
 
-    - HF backends: ``<repo>@<sha>::<backend>`` (e.g.
-      ``openai/gpt-oss-20b@6cee5e81ee83::vllm``).
-    - Ollama: ``<digest>::ollama``.
+    - HF backends: ``<repo>@<sha>::<backend>::<ctx>`` (e.g.
+      ``openai/gpt-oss-20b@6cee5e81ee83::vllm::262144``).
+    - Ollama: ``<digest>::ollama::<ctx>``.
+
+    When ``ctx`` is ``None`` (callers that haven't been ported to v3
+    keying yet) the legacy ``<base>::<backend>`` shape is returned;
+    the writer then attaches ``::<ctx>`` at row creation time. New
+    callers should always pass a real ctx so the key matches the row
+    content.
 
     Returns None when the underlying probe cache entry is malformed
     (no digest for Ollama, no repo+sha for HF).
@@ -504,40 +551,120 @@ def cache_key_for_entry(entry: dict, backend: str) -> str | None:
             base = f"{repo}@{sha}"
     if base is None:
         return None
-    return f"{base}::{backend}"
+    if ctx is None:
+        return f"{base}::{backend}"
+    return f"{base}::{backend}::{int(ctx)}"
+
+
+def _key_suffix_count(key: str) -> int:
+    """Number of ``::``-delimited suffixes after the ``<base>`` segment.
+
+    ``<base>``                  -> 0  (pre-2026-05-02)
+    ``<base>::<backend>``        -> 1  (v2)
+    ``<base>::<backend>::<ctx>`` -> 2  (v3)
+
+    The base may itself contain ``::`` (it doesn't today, but stay
+    safe): we count from the right by splitting on ``::`` and counting
+    trailing segments that look like a backend name or an integer.
+    """
+    parts = key.split("::")
+    if len(parts) == 1:
+        return 0
+    n = 0
+    if len(parts) >= 2 and parts[-1].isdigit():
+        # ctx tail; backend should be the segment before it.
+        n = 2
+    elif len(parts) >= 2:
+        n = 1
+    return n
 
 
 def migrate_bench_cache_keys(cache: dict) -> int:
-    """Idempotent migration from pre-2026-05-02 cache keys (no
-    ``::<backend>`` suffix) to the composite form. Walks the cache
-    once and renames in place. Returns the number of keys renamed.
+    """Idempotent migration of cache keys to the v3 composite form.
 
-    Old rows always carry a ``backend`` field, so we use that to
-    decide the suffix. Calling this on an already-migrated cache is
-    a no-op. Top-level meta keys (``_meta`` etc.) are skipped via
-    ``is_row_key``.
+    Two layered migrations:
+
+    1. Pre-2026-05-02 -> v2: bare ``<base>`` keys gain the
+       ``::<backend>`` suffix using each row's ``backend`` field.
+    2. v2 -> v3: ``<base>::<backend>`` keys gain a ``::<ctx>``
+       suffix. ``ctx`` is recovered from the row's ``context`` field
+       when present, else from ``RECOVERED_CTX_MAP`` keyed by the
+       row's ``model`` alias, else ``0`` (treated by readers as
+       "pre-migration / unknown").
+
+    Walks the cache once per layer and renames in place. Returns the
+    total number of keys renamed across both layers. Calling this on
+    an already-v3 cache is a no-op. Top-level meta keys (``_meta``)
+    are skipped via ``is_row_key``.
     """
-    renames: list[tuple[str, str]] = []
+    total = 0
+    # Layer 1: bare base -> base::backend.
+    renames_v2: list[tuple[str, str]] = []
     for k in list(cache.keys()):
         if not is_row_key(k):
             continue
         v = cache.get(k)
         if not isinstance(v, dict):
             continue
-        if "::" in k:
+        if _key_suffix_count(k) >= 1:
             continue
         backend = v.get("backend")
         if not isinstance(backend, str) or not backend:
             continue
-        renames.append((k, f"{k}::{backend}"))
-    for old, new in renames:
+        renames_v2.append((k, f"{k}::{backend}"))
+    for old, new in renames_v2:
         if new in cache:
             # Defensive: if a composite-key row already exists, leave
             # the old one alone rather than overwriting. Caller should
             # investigate manually.
             continue
         cache[new] = cache.pop(old)
-    return len(renames)
+        total += 1
+
+    # Layer 2: base::backend -> base::backend::ctx.
+    renames_v3: list[tuple[str, str, int]] = []
+    for k in list(cache.keys()):
+        if not is_row_key(k):
+            continue
+        v = cache.get(k)
+        if not isinstance(v, dict):
+            continue
+        if _key_suffix_count(k) >= 2:
+            continue
+        # Recover ctx: row field first, then RECOVERED_CTX_MAP, else 0.
+        ctx_field = v.get("context")
+        recovered: int | None = None
+        if isinstance(ctx_field, int) and ctx_field > 0:
+            recovered = ctx_field
+        else:
+            model = v.get("model")
+            if isinstance(model, str):
+                recovered = RECOVERED_CTX_MAP.get(model)
+        ctx = int(recovered) if recovered else 0
+        renames_v3.append((k, f"{k}::{ctx}", ctx))
+    for old, new, ctx in renames_v3:
+        if new in cache:
+            continue
+        row = cache.pop(old)
+        if isinstance(row, dict):
+            # Stamp the recovered ctx onto the row so downstream
+            # consumers see the same value the key carries. Bump
+            # schema_version so any per-row reader can branch on it.
+            row["context"] = int(ctx)
+            row["schema_version"] = max(
+                int(row.get("schema_version", 1)),
+                BENCH_CACHE_SCHEMA_VERSION,
+            )
+            if ctx == 0:
+                row.setdefault(
+                    "_migration_warning",
+                    "ctx not recovered; re-bench to populate",
+                )
+        cache[new] = row
+        total += 1
+    if renames_v2 or renames_v3:
+        stamp_cache_schema(cache)
+    return total
 
 
 def serving_alias(entry: dict) -> str | None:

@@ -406,6 +406,12 @@ test-router: ## Run Go unit tests for gpu-arbiter router
 		docker.io/library/golang:1.23-bookworm \
 		-c "go test -race -v -count=1 ./..."
 
+test-python: ## Run Python stdlib unittests (bench/picker schema, pure-Python helpers)
+	@# Stdlib-only; runs locally, no container start needed. The bench
+	@# harness modules import without third-party deps so unittest can
+	@# execute them on any host with Python 3.11+.
+	cd $(CURDIR) && python3 -m unittest discover -v -s tests/python -p 'test_*.py'
+
 test-ollama: cache-up ## Run Ollama-only integration tests
 	./tests/test-router.sh
 
@@ -494,7 +500,7 @@ test-agents: ## Smoke-test every (agent × backend) cell against the live router
 		$(IMAGE_NAME_GPU) /usr/local/bin/agent-matrix
 	@echo "  logs preserved at $(CURDIR)/tests/.matrix-logs/"
 
-test: test-router test-probe-ollama-idempotent test-ollama test-e2e test-vllm test-sglang test-models ## Run every available test in sequence (Go unit + Ollama + E2E + vLLM/SGLang integration + matrix + probes; ~30-60 min)
+test: test-router test-python test-probe-ollama-idempotent test-ollama test-e2e test-vllm test-sglang test-models ## Run every available test in sequence (Go unit + Python unit + Ollama + E2E + vLLM/SGLang integration + matrix + probes; ~30-60 min)
 	@# The cache-up suite runs as prerequisites above. Probe smoke tests
 	@# require the live backends to be DOWN (the prober self-checks for
 	@# router/vllm/sglang containers and aborts otherwise) — they run
