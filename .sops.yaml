@@ -1,0 +1,25 @@
+# sops + age encryption rules for devai's shared secret store.
+#
+# Each plan that ships an encrypted secrets file in deploy/*.sops.env
+# is matched by the path_regex below; encrypted_regex covers every
+# value (we never store plaintext keys alongside encrypted ones).
+#
+# The age: list is the union of every host that should be able to
+# decrypt any secret in this repo:
+#   1. Run scripts/age-keygen-host.sh on the host -- it prints the
+#      public key.
+#   2. Append that public key to the age: list below.
+#   3. Run `sops updatekeys deploy/*.sops.env` to re-key every
+#      existing encrypted file with the new recipient.
+#   4. Commit both this file and the re-keyed *.sops.env files.
+#
+# Per docs/plans/sops-age-secrets.md decision 5: one creation_rules
+# entry shipped here. Consumer plans (mcp-gateway Phase 2,
+# gpu-arbiter cluster mode, SkyPilot fleet provisioner) inherit this
+# rule rather than each defining their own.
+
+creation_rules:
+  - path_regex: deploy/.*\.sops\.env$
+    encrypted_regex: ^.*$
+    age: >-
+      age1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx

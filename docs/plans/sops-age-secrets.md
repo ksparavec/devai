@@ -7,12 +7,19 @@ re-implementing it._
 
 ## Status
 
-Draft. Not yet scheduled. Carved out 2026-05-14 from the dependency
-review of `bench-rewrite`, `mcp-gateway`, `gpu-arbiter-cluster-mode`,
-and `skypilot-fleet-provisioner` -- three of those plans declare a
-"soft dep on mcp-gateway Phase 2" for the sops/age pattern, which
-means whichever of the three lands first has to build the same
-scaffold. Factoring it out removes the ambiguity.
+**In Progress.** Scaffold shipped 2026-05-15 (one PR, all
+deliverables landed). `scripts/age-keygen-host.sh`,
+`scripts/render-secret.sh`, `deploy/setup-secrets-tmpfs.sh`,
+`.sops.yaml` (placeholder rule), `Makefile` targets
+(`secrets-tmpfs` / `secrets-edit` / `secrets-render` /
+`secrets-rotate` / `age-keygen-host`), `fetch-cli` block for sops
++ age binaries, `docs/secrets.md`, `.gitignore` exception.
+Stdlib-unittest coverage in
+`tests/python/test_sops_age_scaffold.py` for the script gates,
+.sops.yaml shape, idempotency, and the non-tmpfs refusal path.
+Real binary fetch (`make fetch-cli`) and live encrypt/decrypt
+round-trip require an actual age keypair on a host -- deferred to
+the operator's first real `age-keygen-host` run.
 
 ## Dependencies
 

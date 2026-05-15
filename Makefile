@@ -136,6 +136,7 @@ endif
 .PHONY: fetch-cli pull-images install install-systemd uninstall test test-router test-ollama test-agents test-models test-probe-vllm test-probe-sglang test-probe-ollama-idempotent test-vllm test-sglang test-e2e test-full help
 .PHONY: catalog-regen catalog-suggest probe probe-vllm probe-sglang model-fit model-pull vram-fit verify-backend-flags ollama-cleanup-ctx-variants
 .PHONY: bench bench-vllm bench-sglang bench-ollama bench-report test-bench-smoke
+.PHONY: secrets-tmpfs secrets-edit secrets-render secrets-rotate age-keygen-host test-python
 
 all: help
 
@@ -236,6 +237,37 @@ fetch-cli: ## Download all external binaries and packages to local cache (uses E
 			&& chmod +x $(CACHE_DIR)/pip/bin/late && STATE="updated"; fi \
 		&& VERSION=$$($(CACHE_DIR)/pip/bin/late --version 2>&1 | awk '{print $$2; exit}' | sed 's/^v//') \
 		&& echo "LATE: $$STATE ($$VERSION)"
+	@# sops + age (sops-age-secrets plan): static Go binaries from GitHub
+	@# releases. ETag-stamped per the existing CLI pattern. Both projects
+	@# publish single-arch binaries with a -linux-${arch}.tar.gz naming
+	@# convention; we curl the asset, verify it's non-empty, and unpack
+	@# into /var/cache/devai/pip/bin/.
+	@ARCH=$$(dpkg --print-architecture) \
+		&& case "$$ARCH" in amd64) SOPS_ARCH=amd64;; arm64) SOPS_ARCH=arm64;; esac \
+		&& HTTP_CODE=$$(curl -fsSL -w '%{http_code}' -o $(CACHE_DIR)/pip/bin/sops.tmp \
+			--etag-compare $(ETAG_DIR)/sops.etag --etag-save $(ETAG_DIR)/sops.etag \
+			"https://github.com/getsops/sops/releases/latest/download/sops-v3.10.2.linux.$${SOPS_ARCH}") \
+		&& if [ "$$HTTP_CODE" = "304" ] || [ ! -s $(CACHE_DIR)/pip/bin/sops.tmp ]; then \
+			rm -f $(CACHE_DIR)/pip/bin/sops.tmp; STATE="up to date"; \
+		else \
+			mv $(CACHE_DIR)/pip/bin/sops.tmp $(CACHE_DIR)/pip/bin/sops \
+			&& chmod +x $(CACHE_DIR)/pip/bin/sops && STATE="updated"; fi \
+		&& VERSION=$$($(CACHE_DIR)/pip/bin/sops --version 2>&1 | awk '{print $$2; exit}' || echo "?") \
+		&& echo "sops: $$STATE ($$VERSION)"
+	@# age + age-keygen ship in one tarball.
+	@ARCH=$$(dpkg --print-architecture) \
+		&& case "$$ARCH" in amd64) AGE_ARCH=amd64;; arm64) AGE_ARCH=arm64;; esac \
+		&& HTTP_CODE=$$(curl -fsSL -w '%{http_code}' -o $(CACHE_DIR)/pip/bin/age.tar.gz \
+			--etag-compare $(ETAG_DIR)/age.etag --etag-save $(ETAG_DIR)/age.etag \
+			"https://github.com/FiloSottile/age/releases/latest/download/age-v1.2.1-linux-$${AGE_ARCH}.tar.gz") \
+		&& if [ "$$HTTP_CODE" = "304" ] || [ ! -s $(CACHE_DIR)/pip/bin/age.tar.gz ]; then \
+			rm -f $(CACHE_DIR)/pip/bin/age.tar.gz; STATE="up to date"; \
+		else \
+			tar -xzf $(CACHE_DIR)/pip/bin/age.tar.gz -C $(CACHE_DIR)/pip/bin --strip-components=1 age/age age/age-keygen \
+			&& chmod +x $(CACHE_DIR)/pip/bin/age $(CACHE_DIR)/pip/bin/age-keygen \
+			&& rm -f $(CACHE_DIR)/pip/bin/age.tar.gz && STATE="updated"; fi \
+		&& VERSION=$$($(CACHE_DIR)/pip/bin/age --version 2>&1 | head -n1 || echo "?") \
+		&& echo "age: $$STATE ($$VERSION)"
 
 # Base images used by build and infrastructure
 BASE_IMAGES = debian:trixie $(GPU_BASE_IMAGE)
@@ -397,6 +429,41 @@ clean-router: ## Remove the router image
 
 prune: ## Clean up dangling images only (keeps tagged images and volumes)
 	$(CONTAINER_RUNTIME) image prune -f
+
+# sops/age secret-store scaffold (per docs/plans/sops-age-secrets.md).
+# Consumer plans (mcp-gateway Phase 2, gpu-arbiter cluster mode,
+# SkyPilot fleet provisioner) wrap secrets-render with their own
+# (input, output) pair and gate cache-up on the result.
+SOPS_FILE ?=
+
+secrets-tmpfs: ## Mount /run/devai as a 4 MiB tmpfs (one-time per boot)
+	@# Idempotent. Sudo because tmpfs requires CAP_SYS_ADMIN.
+	sudo bash deploy/setup-secrets-tmpfs.sh
+
+secrets-edit: ## Edit a sops-encrypted file in place. Pass SOPS_FILE=deploy/<name>.sops.env
+	@if [ -z "$(SOPS_FILE)" ]; then \
+		echo "ERROR: pass SOPS_FILE=deploy/<name>.sops.env" >&2; exit 2; \
+	fi
+	sops "$(SOPS_FILE)"
+
+secrets-render: ## Generic single-file render: pass SOPS_FILE and DEST. Consumer plans wrap this with concrete pairs.
+	@if [ -z "$(SOPS_FILE)" ] || [ -z "$(DEST)" ]; then \
+		echo "ERROR: pass SOPS_FILE=deploy/<name>.sops.env DEST=/run/devai/<name>.env" >&2; \
+		echo "       Or use a consumer-plan target (e.g. 'make mcp-secrets-render')." >&2; \
+		exit 2; \
+	fi
+	bash scripts/render-secret.sh "$(SOPS_FILE)" "$(DEST)"
+
+secrets-rotate: ## Re-key every deploy/*.sops.env file against the current .sops.yaml recipient list
+	@for f in deploy/*.sops.env; do \
+		if [ -f "$$f" ]; then \
+			echo ">>> updating keys for $$f"; \
+			sops updatekeys -y "$$f"; \
+		fi; \
+	done
+
+age-keygen-host: ## Generate a per-host age keypair under ~/.config/sops/age/ and print the public key
+	bash scripts/age-keygen-host.sh
 
 test-router: ## Run Go unit tests for gpu-arbiter router
 	$(CONTAINER_RUNTIME) run --rm \

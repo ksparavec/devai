@@ -18,7 +18,7 @@ Current snapshot (as of 2026-05-15):
 
 | Plan                                                                | Status      |
 | ------------------------------------------------------------------- | ----------- |
-| [sops-age-secrets](./sops-age-secrets.md)                           | Draft       |
+| [sops-age-secrets](./sops-age-secrets.md)                           | In Progress |
 | [bench-rewrite](./bench-rewrite.md)                                 | In Progress |
 | [skypilot-agent-skill](./skypilot-agent-skill.md)                   | Approved    |
 | [mcp-gateway](./mcp-gateway.md)                                     | Approved    |

@@ -117,3 +117,9 @@ gpu-arbiter/gpu-arbiter
 # Graphify
 graphify-out/
 .graphify-input/
+
+# sops/age secrets render targets and any plaintext working files.
+# Encrypted *.sops.env files are tracked (see exception below).
+/run/devai
+*.env.plain
+!deploy/*.sops.env
