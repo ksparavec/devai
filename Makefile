@@ -138,7 +138,7 @@ endif
 .PHONY: catalog-regen catalog-suggest probe probe-vllm probe-sglang model-fit model-pull vram-fit verify-backend-flags ollama-cleanup-ctx-variants
 .PHONY: bench bench-vllm bench-sglang bench-ollama bench-report test-bench-smoke
 .PHONY: secrets-tmpfs secrets-edit secrets-render secrets-rotate age-keygen-host test-python
-.PHONY: mcp-up mcp-down mcp-logs mcp-test mcp-health build-worker-bootstrap
+.PHONY: mcp-up mcp-down mcp-logs mcp-test mcp-health build-worker-bootstrap test-cluster-preflight
 
 all: help
 
@@ -512,6 +512,12 @@ mcp-health: ## Lightweight /health probe against the running MCP gateway
 # arbiter binary + backend images + cloud-init entrypoint, no
 # user-facing surfaces.
 WORKER_BOOTSTRAP_IMAGE = devai-worker-bootstrap
+
+test-cluster-preflight: ## Phase 1.5 preflight (worker + stub head end-to-end; no GPU required)
+	@# Builds the arbiter binary if missing, then drives 7 scripted
+	@# scenarios per docs/plans/gpu-arbiter-cluster-mode.md Phase 1.5.
+	@# Wall time ~1 minute.
+	bash tests/test-cluster-preflight.sh
 
 build-worker-bootstrap: ## Build the minimal cluster-worker bootstrap image (cluster-mode Phase 1)
 	@# Requires gpu-arbiter binary at gpu-arbiter/gpu-arbiter; build
