@@ -6,20 +6,34 @@ on-prem._
 
 ## Status
 
-**In Progress.** Phase 1 shipped 2026-05-15: `devai-skypilot-api-server`
-compose service (image pinned to `berkeleyskypilot/skypilot:0.12.1`,
-profile=cluster, port 46580, `skypilot-state` named volume,
-`$HOME` + `/secrets/.env` mounts), `deploy/skypilot-api.env`,
+**In Progress.** Phases 1 and 2 shipped 2026-05-15.
+
+Phase 1: `devai-skypilot-api-server` compose service (image pinned
+to `berkeleyskypilot/skypilot:0.12.1`, profile=cluster, port 46580,
+`skypilot-state` named volume, `$HOME` + `/secrets/.env` mounts),
+`deploy/skypilot-api.env`,
 `deploy/skypilot-credentials.sops.env.example`,
 `scripts/skypilot-api-health.sh`, Makefile targets
 (`skypilot-up` / `skypilot-down` / `skypilot-check` /
-`skypilot-secrets-render`), `docs/skypilot.md`. 18 unit tests in
-`tests/python/test_skypilot_fleet_phase1.py` cover service shape
-+ env file + creds template + health-script syntax + Makefile
-targets + docs sections. Live cloud provisioning test (sky launch
-+ sky down against RunPod) deferred to E2E. Phase 2 (head-side
-gpu-arbiter integration) and Phase 3 (cost-cap, spot, pre-warming)
-pending.
+`skypilot-secrets-render`), `docs/skypilot.md`. 18 Python unit
+tests in `tests/python/test_skypilot_fleet_phase1.py`.
+
+Phase 2 (code only): `gpu-arbiter/skypilot_client.go` (HTTP client
+for /api/v1/{launch,status,down} with bearer auth + token-store
+re-read on every call), `gpu-arbiter/skypilot_policy.go`
+(SkyPilotPolicy with PickCheapest + per-launch budget gate +
+BuildLaunchRequest with the worker-bootstrap env contract +
+IdleTeardownCoordinator implementing the two-step shutdown +
+sky-down sequence). 20 new Go unit tests cover client validation,
+HTTP error paths, status-list decode, policy budget refusal,
+launch-request env wiring, teardown coordinator deadline behaviour,
+tryDown nil/unconfigured no-ops. `tests/test-fleet-routing.sh`
+shipped as a skip-when-no-endpoint skeleton; full cloud-burst
+integration (head -> SkyPilot launch -> worker register -> serve)
+deferred to E2E (real cloud creds + ~$1/run).
+
+Phase 3 (per-day/per-cloud budgets, spot preference with on-demand
+fallback, pre-warming, observability) pending.
 
 **Amended 2026-05-14**: (1) Worker bootstrap dependency now points
 at gpu-arbiter-cluster-mode Phase 1 (where the bootstrap image and

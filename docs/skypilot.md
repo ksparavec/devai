@@ -16,12 +16,18 @@ for the agent-driven flow.
 - **Phase 1 shipped** (2026-05-15): `devai-skypilot-api-server` runs
   as a long-lived compose service on the `cluster` profile.
   Reachable on port 46580. `make skypilot-up` brings it live.
-- **Phase 2 pending**: gpu-arbiter head-mode integration --
-  `skypilot_client.go`, provisioning policy, two-step idle teardown.
-  Worker bootstrap image (Phase 1 of cluster-mode) is the consumer
-  surface.
-- **Phase 3 pending**: cost-cap enforcement, spot-instance preference,
-  pre-warming, observability hooks.
+- **Phase 2 shipped** (2026-05-15, code only): `skypilot_client.go`
+  (Launch / Status / Down + bearer auth), `skypilot_policy.go`
+  (cheapest-cloud picker + per-launch budget cap + LaunchRequest
+  builder + IdleTeardownCoordinator implementing the two-step
+  "send shutdown via heartbeat then sky down" path). Live
+  cloud-burst integration (head -> SkyPilot launch -> worker
+  register -> serve) is gated behind `SKYPILOT_API_ENDPOINT` --
+  when unset the head degrades to local-fleet-only routing per
+  plan step 5.
+- **Phase 3 pending**: cost-cap enforcement (per-day, per-cloud,
+  per-user budgets), spot-instance preference with on-demand
+  fallback, pre-warming N workers, observability hooks.
 
 ## Bring-up
 
