@@ -170,15 +170,18 @@ def _fetch_backend_metrics(backend: str) -> dict[str, float]:
 
 # --- Model discovery ---
 
-def _has_fitting_cell(entry: dict, host_vram_gb: int) -> tuple[bool, int]:
-    """Return ``(any_fits, best_ctx)`` for the host's VRAM band. The
-    "fits" verdict varies per backend: Ollama uses ``fully_on_gpu``,
-    HF uses ``fits``. We accept either.
+def _fitting_ctxs(entry: dict, host_vram_gb: int) -> list[int]:
+    """Return the sorted list of ctx tiers (ints) where ``entry`` fits at
+    ``host_vram_gb``. The "fits" verdict varies per backend: Ollama uses
+    ``fully_on_gpu``, HF uses ``fits``. We accept either.
+
+    Empty list when nothing fits. Sorted ascending; callers that want
+    "largest fitting" take ``[-1]``.
     """
     band = (entry.get("probes") or {}).get(str(host_vram_gb)) or {}
     if not isinstance(band, dict):
-        return (False, 0)
-    best_ctx = 0
+        return []
+    out: list[int] = []
     for ctx_str, cell in band.items():
         if not isinstance(cell, dict):
             continue
@@ -189,21 +192,39 @@ def _has_fitting_cell(entry: dict, host_vram_gb: int) -> tuple[bool, int]:
             ctx = int(ctx_str)
         except ValueError:
             continue
-        if ctx > best_ctx:
-            best_ctx = ctx
-    return (best_ctx > 0, best_ctx)
+        if ctx > 0:
+            out.append(ctx)
+    return sorted(out)
 
 
 def discover_models(
-    backend: str, *, host_vram_gb: int, repo_filter: str | None
+    backend: str,
+    *,
+    host_vram_gb: int,
+    repo_filter: str | None,
+    ctx_filter: list[int] | None = None,
 ) -> list[dict]:
     """Return a list of bench targets from the probe cache.
 
     Each target is ``{"key": <top-level-key>, "alias": <model-name>,
-    "ctx": <best-fitting-ctx>}``. ``alias`` is what gets sent to the
-    router as the OpenAI ``model`` field; for HF backends the
-    runner appends ``@<ctx>`` so the router recreates with the right
-    ``--max-model-len``.
+    "ctx": <ctx-int>, "entry": <probe-row>}``. ``alias`` is what gets
+    sent to the router as the OpenAI ``model`` field; for HF backends
+    the runner appends ``@<ctx>`` so the router recreates with the
+    right ``--max-model-len``.
+
+    ``ctx_filter`` semantics (per docs/plans/bench-rewrite.md):
+
+    - ``None`` (default): one target per (model, largest-fitting-ctx).
+      Same wall-clock cost as the pre-v3 runner.
+    - explicit list (e.g. ``[32768, 131072]``): one target per
+      (model, ctx) for each ctx that's both in the filter AND a
+      fits=true cell. Missing-cell pairs are skipped with a stderr
+      note.
+    - explicit list spelled ``[-1]``: shorthand for "all fitting ctxs"
+      -- emits one target per (model, ctx) for every fits=true cell.
+
+    The bench-cache key is minted with ``cache_key_for_entry(entry,
+    backend, ctx)`` so each ctx tier writes to its own row.
     """
     import re
 
@@ -211,6 +232,7 @@ def discover_models(
     cache_path = PROBE_CACHE_BY_BACKEND[backend]
     cache = load_cache(cache_path)
     out: list[dict] = []
+    all_ctxs = ctx_filter == [-1]
     for key, entry in cache.items():
         if not isinstance(entry, dict):
             continue
@@ -219,14 +241,78 @@ def discover_models(
             continue
         if rx is not None and not rx.search(key):
             continue
-        ok, best_ctx = _has_fitting_cell(entry, host_vram_gb)
-        if not ok:
+        fitting = _fitting_ctxs(entry, host_vram_gb)
+        if not fitting:
             continue
+        if ctx_filter is None:
+            chosen = [fitting[-1]]
+        elif all_ctxs:
+            chosen = list(fitting)
+        else:
+            chosen = [c for c in ctx_filter if c in fitting]
+            missing = [c for c in ctx_filter if c not in fitting]
+            if missing:
+                print(
+                    f"  note: {key}: skipping ctx(s) {missing} -- no "
+                    f"fits=true cell at host_vram={host_vram_gb}G "
+                    f"(fitting tiers: {fitting})",
+                    file=sys.stderr,
+                )
+            if not chosen:
+                continue
         alias = serving_alias(entry)
-        cache_key = cache_key_for_entry(entry, backend) or key
         if not alias:
             continue
-        out.append({"key": cache_key, "alias": alias, "ctx": best_ctx, "entry": entry})
+        for ctx in chosen:
+            cache_key = cache_key_for_entry(entry, backend, ctx) or key
+            out.append(
+                {
+                    "key": cache_key,
+                    "alias": alias,
+                    "ctx": int(ctx),
+                    "entry": entry,
+                }
+            )
+    return out
+
+
+# --- CLI ctx parsing helpers ---
+
+_CTX_TIER_ALIASES: dict[str, int] = {
+    "32K": 32768,
+    "64K": 65536,
+    "128K": 131072,
+    "256K": 262144,
+}
+
+
+def _parse_ctx_token(token: str) -> int:
+    """``32K`` -> 32768; ``128k`` -> 131072; integer string -> int.
+
+    Raises ValueError on malformed input so the CLI parser surfaces
+    a clear error instead of silently dropping the tier.
+    """
+    s = token.strip().upper()
+    if not s:
+        raise ValueError("empty ctx token")
+    if s in _CTX_TIER_ALIASES:
+        return _CTX_TIER_ALIASES[s]
+    if s.endswith("K"):
+        head = s[:-1]
+        return int(head) * 1024
+    return int(s)
+
+
+def parse_ctx_list(raw: str) -> list[int]:
+    """Comma-separated list of ctx tiers. Empty input -> empty list."""
+    if not raw:
+        return []
+    out: list[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        out.append(_parse_ctx_token(part))
     return out
 
 
@@ -544,6 +630,7 @@ def run_for_target(
         model=target["alias"],
         backend=backend,
         router_endpoint=router_url,
+        context=int(target["ctx"]),
         task_results=task_results,
         metrics=metrics,
         host_env_id=host_env_id,
@@ -563,6 +650,7 @@ def _latency_metrics_into_row(
     update_row(
         cache, key,
         model=target["alias"], backend=backend, router_endpoint=router_url,
+        context=int(target.get("ctx") or 0),
         metrics={
             "ttft_ms_first": latency.get("ttft_ms_first"),
             "ttft_ms_steady_p50": latency.get("ttft_ms_steady_p50"),
@@ -662,6 +750,17 @@ def main() -> None:
     )
     ap.add_argument("--cache", type=Path, default=DEFAULT_CACHE_PATH)
     ap.add_argument("--log-dir", type=Path, default=DEFAULT_INSPECT_LOG_DIR)
+    ap.add_argument(
+        "--ctx",
+        default="",
+        help="comma-separated ctx tiers (e.g. '32K,128K' or '32768,131072'). "
+             "Default: largest fitting ctx per model.",
+    )
+    ap.add_argument(
+        "--all-ctx",
+        action="store_true",
+        help="iterate every fits=true ctx per model (overrides --ctx).",
+    )
     args = ap.parse_args()
 
     tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
@@ -673,10 +772,19 @@ def main() -> None:
     _check_router(router_url)
 
     repo_filter = args.repo or None
+    if args.all_ctx:
+        ctx_filter: list[int] | None = [-1]
+    else:
+        try:
+            parsed = parse_ctx_list(args.ctx)
+        except ValueError as e:
+            sys.exit(f"--ctx parse error: {e}")
+        ctx_filter = parsed or None
     targets = discover_models(
         args.backend,
         host_vram_gb=args.host_vram_gb,
         repo_filter=repo_filter,
+        ctx_filter=ctx_filter,
     )
     if not targets:
         sys.exit(
