@@ -25,6 +25,7 @@ Current snapshot (as of 2026-05-15):
 | [gpu-arbiter-cluster-mode](./gpu-arbiter-cluster-mode.md)           | In Progress |
 | [skypilot-fleet-provisioner](./skypilot-fleet-provisioner.md)       | In Progress |
 | [router-shortcircuit](./router-shortcircuit.md)                     | Draft       |
+| [router-fanout](./router-fanout.md)                                 | Draft       |
 
 ## Dependency graph
 
@@ -150,6 +151,11 @@ path:
   and no dependents; ships at any point. Phase 1 (fingerprint logger)
   is the productized "empirical pass" and can run standalone wherever a
   live stack exists.
+- router-fanout (Draft) -- NOT free-floating: Phase 1 (single-host
+  demux) has no deps, but Phases 2-3 (concurrent demux + broadcast, the
+  cluster-first payoff) depend on gpu-arbiter-cluster-mode Phase 2.
+  Schedule Phase 1 any time; gate Phases 2-3 behind the cluster-mode
+  head landing.
 
 ## When this file becomes stale
 
