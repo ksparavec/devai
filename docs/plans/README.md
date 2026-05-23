@@ -24,6 +24,7 @@ Current snapshot (as of 2026-05-15):
 | [mcp-gateway](./mcp-gateway.md)                                     | In Progress |
 | [gpu-arbiter-cluster-mode](./gpu-arbiter-cluster-mode.md)           | In Progress |
 | [skypilot-fleet-provisioner](./skypilot-fleet-provisioner.md)       | In Progress |
+| [router-shortcircuit](./router-shortcircuit.md)                     | Draft       |
 
 ## Dependency graph
 
@@ -145,6 +146,10 @@ path:
   parallel with cluster-mode Phase 1 onwards.
 - cluster-mode Phase 3 (step 12) -- no dependents; activate on
   demand.
+- router-shortcircuit (Draft) -- single-mode router feature, no deps
+  and no dependents; ships at any point. Phase 1 (fingerprint logger)
+  is the productized "empirical pass" and can run standalone wherever a
+  live stack exists.
 
 ## When this file becomes stale
 
