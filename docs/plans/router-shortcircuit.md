@@ -1,6 +1,6 @@
 # Router request short-circuit
 
-_Answer model-independent Claude Code probe requests directly in the router, without spinning up or occupying a GPU backend._
+_Answer model-independent Claude Code probe requests directly in the router (without spinning up or occupying a GPU backend), and block Ollama download/mutation endpoints to enforce the local model-access policy._
 
 ## Status
 
@@ -408,6 +408,80 @@ tokenizer.
 
 ---
 
+## Phase 5 -- Ollama mutation-endpoint guard (model-access policy)
+
+### Goal
+
+Enforce the devai model-access policy -- "local GPU = picker-vetted
+models only, no downloading" (see
+[pi-coding-agent](./pi-coding-agent.md) "Model-access policy") -- by
+blocking Ollama download/mutation endpoints at the router's inbound
+listener. It belongs in this plan because it is the same surface as the
+short-circuit: an explicit, deterministic intervention in
+`makeRequestHandler` / the backend mux, before the request reaches the
+backend. vLLM/SGLang already enforce vetted-only via the model allowlist
+(`main.go:1969-1985`); this closes the Ollama gap, where the allowlist is
+skipped (`main.go:1973`) and unmatched paths proxy straight through (the
+catch-all at `main.go:1320`).
+
+Independently shippable, and arguably should ship first: a small
+security/policy guard with no calibration step, unlike the probe
+short-circuits.
+
+### Deliverables
+
+```
+gpu-arbiter/main.go        modify -- register 403 handlers for Ollama mutation endpoints on the ollama listener, before the catch-all
+gpu-arbiter/main_test.go   modify -- 403 on each guarded endpoint; chat/generate/tags/v1 still pass
+docs/router.md             modify -- document the guard, the model-access policy, and why provisioning is unaffected
+deploy/docker-compose.yaml modify -- DEVAI_OLLAMA_GUARD env (default on)
+```
+
+### Detailed steps
+
+1. On the Ollama backend's mux (where `/v1/models`, `/api/tags`,
+   `/health`, `/` are registered -- `main.go:1317-1320`), register
+   explicit handlers returning HTTP 403 for the download/mutation
+   endpoints, ONLY on the Ollama listener (vLLM/SGLang do not expose
+   them):
+   - `/api/pull`   -- download a model (the primary vector)
+   - `/api/create` -- build/derive a model from a Modelfile
+   - `/api/push`   -- upload to a registry (exfiltration)
+   - `/api/copy`   -- mutate the local store
+   - `/api/delete` -- destructive removal
+   - `/api/blobs/` -- blob upload (path-prefix handler)
+   The catch-all `/` keeps proxying `/api/chat`, `/api/generate`,
+   embeddings, etc.
+2. 403 body, actionable: `{"error":"endpoint disabled by devai policy:
+   local models are picker-vetted only (no downloading). Provision on the
+   host with 'make model-pull'."}`.
+3. Gate behind `DEVAI_OLLAMA_GUARD` (default ON -- the policy is the
+   default). An operator who genuinely needs `/api/delete` etc. disables
+   it.
+4. The guard is on the INBOUND listener only. The router's own outbound
+   Ollama calls (warmup `/api/generate` at `main.go:1695`, `keep_alive`,
+   `/api/ps`) go directly to `ollamaURL` and are unaffected.
+
+### Exit criteria
+
+- POST to `/api/pull`, `/api/create`, `/api/push`, `/api/copy`,
+  `/api/delete` on the Ollama router port returns 403; `/api/chat`,
+  `/api/generate`, `/api/tags`, `/v1/*` still work (`make test-router`).
+- `make model-pull` still downloads -- the sanctioned path execs `ollama
+  create` inside the devai-ollama container (`select-models.py:262`),
+  bypassing the router entirely.
+- With `DEVAI_OLLAMA_GUARD=off`, behaviour is byte-identical to today.
+
+### Phase 5 risks
+
+| Risk                                                          | Mitigation                                                                 |
+| ------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| A devai workflow pulls via the router (`OLLAMA_HOST=devai-router` + `ollama pull`) and breaks | Verified the sanctioned pull path execs inside devai-ollama (`select-models.py:262`), bypassing the router; probers probe existing models and do not pull. Audit for router-routed pulls before enabling |
+| Ollama adds a new download endpoint in a later version        | Guard is an explicit block-list; revisit on Ollama image bumps (same discipline as `deploy/backend-flags.yaml` pinning) |
+| Over-blocking (`/api/delete`, `/api/copy` are mutations, not downloads) | Conservative reading of "vetted-only + no download"; per-endpoint granularity + the `DEVAI_OLLAMA_GUARD` toggle allow exempting them |
+
+---
+
 ## Combined risk register
 
 | Risk                                                | Phase | Mitigation                                                                 |
@@ -416,6 +490,7 @@ tokenizer.
 | Patterns rot across Claude Code versions            | 2-4   | Config-driven patterns; graceful fall-through; fixture-pinned regression tests |
 | Privacy: request content in logs                    | 1     | Hash by default; raw is a separate explicit opt-in flag; logs are local    |
 | Feature interacts badly with cluster head mode      | all   | Phases target `makeRequestHandler` (single/worker). In cluster mode a probe forwarded to a worker is still short-circuited at the worker, so correctness holds; short-circuiting at the head to save the head->worker hop is a noted optional follow-on, not part of this plan |
+| Agent triggers a model download/mutation via the Ollama port | 5     | Router 403s `/api/pull` / `/api/create` / `/api/push` / `/api/copy` / `/api/delete`; provisioning bypasses the router (`select-models.py:262`) |
 
 ## Migration / rollback story
 
@@ -426,6 +501,10 @@ tokenizer.
   flipping the env off or reverting the PR.
 - Phase 1 (instrumentation) is independently revertible and has no
   dependency on Phases 2-4.
+- Phase 5 (Ollama guard) defaults ON -- the policy is the default --
+  unlike the probe short-circuit which defaults off. Disable per-install
+  with `DEVAI_OLLAMA_GUARD=off`; rollback = revert the PR. It adds no
+  state.
 
 ## Estimated effort
 
@@ -435,7 +514,8 @@ tokenizer.
 | Phase 2 | 1 PR, ~250 LoC Go + registry + SSE + tests  | 1-2 days     |
 | Phase 3 | 1 PR, ~150 LoC Go + fixtures                | ~1 day       |
 | Phase 4 | 1 PR (optional), tokenizer-dependent        | 1-3 days or shelved |
-| Total   | 3-4 PRs                                      | ~3-5 days (Phases 1-3) |
+| Phase 5 | 1 PR, ~60 LoC Go + tests (Ollama guard)     | ~0.5 day     |
+| Total   | 4-5 PRs                                      | ~3-6 days (Phases 1-3 + 5) |
 
 ## References
 
@@ -450,3 +530,5 @@ tokenizer.
   idea correctly lives.
 - `deploy/recovery-flags.json`, `deploy/vllm-plugins.json` -- existing
   config-registry precedents the pattern registry follows.
+- [pi-coding-agent](./pi-coding-agent.md) "Model-access policy" -- the
+  general local=vetted-only / cloud=unrestricted rule Phase 5 enforces.
