@@ -26,6 +26,7 @@ Current snapshot (as of 2026-05-15):
 | [skypilot-fleet-provisioner](./skypilot-fleet-provisioner.md)       | In Progress |
 | [router-shortcircuit](./router-shortcircuit.md)                     | Draft       |
 | [router-fanout](./router-fanout.md)                                 | Draft       |
+| [pi-coding-agent](./pi-coding-agent.md)                             | Draft       |
 
 ## Dependency graph
 
@@ -156,6 +157,8 @@ path:
   cluster-first payoff) depend on gpu-arbiter-cluster-mode Phase 2.
   Schedule Phase 1 any time; gate Phases 2-3 behind the cluster-mode
   head landing.
+- pi-coding-agent (Draft) -- lab-image + picker change, no deps and no
+  dependents; same shape as skypilot-agent-skill. Ships at any point.
 
 ## When this file becomes stale
 
