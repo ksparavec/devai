@@ -27,6 +27,7 @@ Current snapshot (as of 2026-05-15):
 | [router-shortcircuit](./router-shortcircuit.md)                     | Draft       |
 | [router-fanout](./router-fanout.md)                                 | Draft       |
 | [pi-coding-agent](./pi-coding-agent.md)                             | Draft       |
+| [kv-cache-quantization](./kv-cache-quantization.md)                 | Draft       |
 
 ## Dependency graph
 
@@ -159,6 +160,11 @@ path:
   head landing.
 - pi-coding-agent (Draft) -- lab-image + picker change, no deps and no
   dependents; same shape as skypilot-agent-skill. Ships at any point.
+- kv-cache-quantization (Draft) -- single-mode router + tooling feature,
+  no hard deps and no dependents; ships at any point. Phase 1 (SGLang fp8
+  parity + fit-math correctness) is behavior-preserving and standalone;
+  Phase 3's bench-cache key change softly assumes bench-rewrite's v3
+  schema is already landed.
 
 ## When this file becomes stale
 
