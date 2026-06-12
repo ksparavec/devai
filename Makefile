@@ -246,9 +246,10 @@ fetch-cli: ## Download all external binaries and packages to local cache (uses E
 	@# into /var/cache/devai/pip/bin/.
 	@ARCH=$$(dpkg --print-architecture) \
 		&& case "$$ARCH" in amd64) SOPS_ARCH=amd64;; arm64) SOPS_ARCH=arm64;; esac \
+		&& SOPS_VERSION=$$(curl -fsSL https://api.github.com/repos/getsops/sops/releases/latest | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])") \
 		&& HTTP_CODE=$$(curl -fsSL -w '%{http_code}' -o $(CACHE_DIR)/pip/bin/sops.tmp \
 			--etag-compare $(ETAG_DIR)/sops.etag --etag-save $(ETAG_DIR)/sops.etag \
-			"https://github.com/getsops/sops/releases/latest/download/sops-v3.10.2.linux.$${SOPS_ARCH}") \
+			"https://github.com/getsops/sops/releases/latest/download/sops-$${SOPS_VERSION}.linux.$${SOPS_ARCH}") \
 		&& if [ "$$HTTP_CODE" = "304" ] || [ ! -s $(CACHE_DIR)/pip/bin/sops.tmp ]; then \
 			rm -f $(CACHE_DIR)/pip/bin/sops.tmp; STATE="up to date"; \
 		else \
@@ -269,19 +270,20 @@ fetch-cli: ## Download all external binaries and packages to local cache (uses E
 	           echo "SkyPilot: fetching $$LATEST wheels..." \
 	           && rm -rf $(CACHE_DIR)/pip/wheels/skypilot \
 	           && mkdir -p $(CACHE_DIR)/pip/wheels/skypilot \
-	           && uv pip download \
+	           && python3 -m pip download \
 	                  'skypilot[aws,gcp,azure,kubernetes,slurm,runpod,lambda]' \
-	                  --python-version 3.13 \
-	                  --dest $(CACHE_DIR)/pip/wheels/skypilot 2>/dev/null \
+	                  --python-version 3.13 --only-binary=:all: \
+	                  --dest $(CACHE_DIR)/pip/wheels/skypilot \
 	           && echo "$$LATEST" > $(ETAG_DIR)/skypilot.version \
 	           && echo "SkyPilot: updated to $$LATEST" \
-	           || echo "SkyPilot: download failed (check network / uv); existing cache preserved"; fi
+	           || echo "SkyPilot: download failed (check network / pip); existing cache preserved"; fi
 	@# age + age-keygen ship in one tarball.
 	@ARCH=$$(dpkg --print-architecture) \
 		&& case "$$ARCH" in amd64) AGE_ARCH=amd64;; arm64) AGE_ARCH=arm64;; esac \
+		&& AGE_VERSION=$$(curl -fsSL https://api.github.com/repos/FiloSottile/age/releases/latest | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])") \
 		&& HTTP_CODE=$$(curl -fsSL -w '%{http_code}' -o $(CACHE_DIR)/pip/bin/age.tar.gz \
 			--etag-compare $(ETAG_DIR)/age.etag --etag-save $(ETAG_DIR)/age.etag \
-			"https://github.com/FiloSottile/age/releases/latest/download/age-v1.2.1-linux-$${AGE_ARCH}.tar.gz") \
+			"https://github.com/FiloSottile/age/releases/latest/download/age-$${AGE_VERSION}-linux-$${AGE_ARCH}.tar.gz") \
 		&& if [ "$$HTTP_CODE" = "304" ] || [ ! -s $(CACHE_DIR)/pip/bin/age.tar.gz ]; then \
 			rm -f $(CACHE_DIR)/pip/bin/age.tar.gz; STATE="up to date"; \
 		else \
