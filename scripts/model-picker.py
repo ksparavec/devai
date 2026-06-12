@@ -156,6 +156,7 @@ _AGENTS: list[tuple[str, str, str]] = [
     ("claude",      "Claude Code",       "AI coding assistant with agentic terminal"),
     ("aider",       "Aider",             "Git-aware pair programming"),
     ("codex",       "Codex",             "OpenAI terminal coding agent"),
+    ("opencode",    "OpenCode",          "Open-source terminal agent; strong with local models"),
     ("late",        "LATE",              "Lightweight AI Terminal Environment — ephemeral subagents"),
     ("interpreter", "Open Interpreter",  "Natural language computer control"),
 ]
@@ -2252,6 +2253,47 @@ def _format_agent_row(agent: tuple[str, str, str]) -> str:
 
 # ── Command builder ──────────────────────────────────────────────────────────
 
+def _ensure_opencode_model(backend: str, name: str) -> None:
+    """Register the chosen model in OpenCode's config so it passes validation.
+
+    OpenCode validates `provider/model` against the provider's declared
+    `models` map -- an undeclared id fails at launch with "model is not
+    valid". The picker chooses models dynamically, so the static seeded
+    config cannot list them ahead of time. Merge the chosen model into
+    ~/.config/opencode/opencode.json under router-<backend> right before
+    launch. Idempotent; declared models accumulate harmlessly across picks
+    (they simply show up in `opencode models`).
+    """
+    _, _, port = _BACKENDS[backend]
+    provider_id = f"router-{backend}"
+    cfg_home = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    cfg_path = Path(cfg_home) / "opencode" / "opencode.json"
+
+    try:
+        cfg = json.loads(cfg_path.read_text()) if cfg_path.exists() else {}
+    except (OSError, ValueError):
+        cfg = {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+
+    cfg.setdefault("$schema", "https://opencode.ai/config.json")
+    providers = cfg.setdefault("provider", {})
+    prov = providers.get(provider_id)
+    if not isinstance(prov, dict):
+        prov = {
+            "npm": "@ai-sdk/openai-compatible",
+            "name": f"{backend} via DevAI router",
+            "options": {"baseURL": f"http://{_ROUTER}:{port}/v1", "apiKey": "local"},
+        }
+        providers[provider_id] = prov
+    models = prov.setdefault("models", {})
+    if name not in models:
+        models[name] = {"name": name}
+
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(json.dumps(cfg, indent=2) + "\n")
+
+
 def _build(agent_id: str, model_name: str, backend: str) -> list[str]:
     _, _, port = _BACKENDS[backend]
     base = f"http://{_ROUTER}:{port}"
@@ -2301,6 +2343,16 @@ def _build(agent_id: str, model_name: str, backend: str) -> list[str]:
             "--local-provider", f"router-{backend}",
             "-c", f'model="{name}"',
         ]
+
+    if agent_id == "opencode":
+        # OpenCode reads custom OpenAI-compatible providers from
+        # ~/.config/opencode/opencode.json (seeded by the entrypoint):
+        # router-ollama / router-vllm / router-sglang point at the router
+        # ports. The chosen model must be declared under the provider's
+        # `models` map or OpenCode rejects it ("model is not valid"), so
+        # register it just-in-time before launching.
+        _ensure_opencode_model(backend, name)
+        return ["opencode", "-m", f"router-{backend}/{name}"]
 
     if agent_id == "late":
         # LATE appends `/v1/chat/completions` itself — OPENAI_BASE_URL must

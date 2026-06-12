@@ -44,9 +44,9 @@ ARG BIN_HASH=unknown
 # Install CLI binaries (pre-downloaded to /var/cache/bin/ via cache mount).
 # LATE is installed as late-bin; a shell wrapper is installed as `late` to
 # apply sensible OPENAI_* defaults pointing at the in-cluster router.
-RUN cp /var/cache/bin/uv /var/cache/bin/uvx /var/cache/bin/claude /var/cache/bin/codex /var/cache/bin/ollama /usr/local/bin/ \
+RUN cp /var/cache/bin/uv /var/cache/bin/uvx /var/cache/bin/claude /var/cache/bin/codex /var/cache/bin/opencode /var/cache/bin/ollama /usr/local/bin/ \
     && cp /var/cache/bin/late /usr/local/bin/late-bin \
-    && chmod +x /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/claude /usr/local/bin/codex /usr/local/bin/late-bin /usr/local/bin/ollama
+    && chmod +x /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/claude /usr/local/bin/codex /usr/local/bin/opencode /usr/local/bin/late-bin /usr/local/bin/ollama
 
 # Install code-server (pre-downloaded)
 RUN cp -a /var/cache/bin/code-server /usr/local/lib/code-server \
@@ -134,6 +134,7 @@ RUN getent group 1000 >/dev/null || groupadd -g 1000 devai \
     && mkdir -p /home/devai/work /home/devai/.local/bin \
     && ln -s /usr/local/bin/claude /home/devai/.local/bin/claude \
     && ln -s /usr/local/bin/codex /home/devai/.local/bin/codex \
+    && ln -s /usr/local/bin/opencode /home/devai/.local/bin/opencode \
     && ln -s /usr/local/bin/gemini /home/devai/.local/bin/gemini \
     && ln -s /usr/local/bin/late /home/devai/.local/bin/late \
     && ln -s /usr/local/bin/ollama /home/devai/.local/bin/ollama \
@@ -142,6 +143,7 @@ RUN getent group 1000 >/dev/null || groupadd -g 1000 devai \
 
 # Seed config files for coding agents (copied to $HOME by entrypoint if absent)
 COPY config/codex/config.toml /etc/devai/codex-config.toml
+COPY config/opencode/opencode.json /etc/devai/opencode.json
 
 # Copy entrypoint script
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh

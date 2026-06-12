@@ -94,6 +94,12 @@ if [ -f /etc/devai/codex-config.toml ] && [ ! -f "$HOME_DIR/.codex/config.toml" 
     cp /etc/devai/codex-config.toml "$HOME_DIR/.codex/config.toml"
 fi
 
+# Seed opencode config if absent — never overwrite an existing one.
+if [ -f /etc/devai/opencode.json ] && [ ! -f "$HOME_DIR/.config/opencode/opencode.json" ]; then
+    mkdir -p "$HOME_DIR/.config/opencode"
+    cp /etc/devai/opencode.json "$HOME_DIR/.config/opencode/opencode.json"
+fi
+
 # Prepare the command
 CMD=("$@")
 

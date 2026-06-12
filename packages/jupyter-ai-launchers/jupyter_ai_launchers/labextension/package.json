@@ -40,7 +40,7 @@
     "extension": true,
     "outputDir": "jupyter_ai_launchers/labextension",
     "_build": {
-      "load": "static/remoteEntry.9a16525a07c1261da9f1.js",
+      "load": "static/remoteEntry.c609fa89e61411f25157.js",
       "extension": "./extension",
       "style": "./style"
     }

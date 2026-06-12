@@ -178,6 +178,21 @@ fetch-cli: ## Download all external binaries and packages to local cache (uses E
 			&& rm -f $(CACHE_DIR)/pip/bin/codex.tar.gz && STATE="updated"; fi \
 		&& VERSION=$$($(CACHE_DIR)/pip/bin/codex --version 2>&1 | awk '{print $$2; exit}') \
 		&& echo "OpenAI Codex: $$STATE ($$VERSION)"
+	@# OpenCode (sst/opencode): single glibc binary, tar.gz with no version in
+	@# the asset name -- so latest/download resolves correctly without pinning.
+	@ARCH=$$(dpkg --print-architecture) \
+		&& case "$$ARCH" in amd64) OC_ARCH=x64;; arm64) OC_ARCH=arm64;; esac \
+		&& HTTP_CODE=$$(curl -fsSL -w '%{http_code}' -o $(CACHE_DIR)/pip/bin/opencode.tar.gz \
+			--etag-compare $(ETAG_DIR)/opencode.etag --etag-save $(ETAG_DIR)/opencode.etag \
+			"https://github.com/sst/opencode/releases/latest/download/opencode-linux-$${OC_ARCH}.tar.gz") \
+		&& if [ "$$HTTP_CODE" = "304" ] || [ ! -s $(CACHE_DIR)/pip/bin/opencode.tar.gz ]; then \
+			rm -f $(CACHE_DIR)/pip/bin/opencode.tar.gz; STATE="up to date"; \
+		else \
+			tar -xzf $(CACHE_DIR)/pip/bin/opencode.tar.gz -C $(CACHE_DIR)/pip/bin opencode \
+			&& chmod +x $(CACHE_DIR)/pip/bin/opencode \
+			&& rm -f $(CACHE_DIR)/pip/bin/opencode.tar.gz && STATE="updated"; fi \
+		&& VERSION=$$($(CACHE_DIR)/pip/bin/opencode --version 2>&1 | awk '{print $$1; exit}') \
+		&& echo "OpenCode: $$STATE ($$VERSION)"
 	@ARCH=$$(dpkg --print-architecture) \
 		&& case "$$ARCH" in amd64) OL_ARCH=amd64;; arm64) OL_ARCH=arm64;; esac \
 		&& HTTP_CODE=$$(curl -fsSL -w '%{http_code}' -o $(CACHE_DIR)/pip/bin/ollama.tar.zst \
