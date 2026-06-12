@@ -166,6 +166,26 @@ def recovery_overrides(model_name: str) -> tuple[list[str], dict[str, str]]:
     return list(flags), dict(env)
 
 
+def recovery_image(model_name: str) -> str | None:
+    """Return the per-model container-image override, or None.
+
+    Mirrors the `image` field consumed by gpu-arbiter/recovery_flags.go:
+    a model whose recovery entry pins a non-default engine image must be
+    PROBED on that same image, otherwise the probe launches the global
+    default engine, fails to load the checkpoint, and records a spurious
+    fits=false cell -- hiding the model from the picker. Keeps probe-time
+    and serve-time launches on the same engine (the registry's
+    single-source-of-truth contract). DiffusionGemma is the first user:
+    it needs the vLLM "gemma" build, which can't be the global default
+    because it regresses Qwen NVFP4 loading.
+    """
+    entry = _RECOVERY_REGISTRY.get(model_name)
+    if not entry:
+        return None
+    img = entry.get("image")
+    return img if isinstance(img, str) and img else None
+
+
 # ── Backend spec ─────────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -829,6 +849,15 @@ def probe_one_cell(
         cmd_args = list(cmd_args) + extra_flags
     if extra_env:
         env_vars = {**env_vars, **extra_env}
+    # Per-model image override: probe on the SAME engine the router serves
+    # on (mirrors gpu-arbiter buildContainerSpec). Without this a model
+    # pinned to a non-default image probes on the wrong engine and records
+    # a spurious fits=false cell.
+    image_override = recovery_image(model_name)
+    if image_override and image_override != image:
+        print(f"    [recovery] {model_name}: probing on pinned image "
+              f"{image_override}", file=sys.stderr)
+        image = image_override
     extra_volumes: list[tuple[str, str, str]] = []
     if plugin_volume is not None:
         extra_volumes.append(plugin_volume)

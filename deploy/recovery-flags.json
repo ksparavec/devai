@@ -112,6 +112,68 @@
         "VLLM_USE_FLASHINFER_MOE_FP4": "1",
         "VLLM_FLASHINFER_MOE_BACKEND": "throughput"
       }
+    },
+    "diffusiongemma-26B-A4B-it-NVFP4": {
+      "image": "docker.io/vllm/vllm-openai:gemma-x86_64-cu130",
+      "engine_flags": [
+        "--quantization", "modelopt",
+        "--max-num-seqs", "4",
+        "--gpu-memory-utilization", "0.90",
+        "--max-num-batched-tokens", "512",
+        "--mm-processor-kwargs", "{\"max_soft_tokens\": 1120}",
+        "--limit-mm-per-prompt", "{\"image\": 7}"
+      ],
+      "engine_env": {
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
+      },
+      "_image_comment": [
+        "DiffusionGemma requires the vLLM 'gemma' bring-up build (vLLM",
+        "0.22.1rc1+, arch DiffusionGemmaForBlockDiffusion). That build",
+        "REGRESSES Qwen NVFP4 + fp8-KV weight loading",
+        "(KVCacheScaleParameter.weight_loader signature mismatch), so it",
+        "cannot be the global VLLM_IMAGE. This per-model override routes",
+        "ONLY DiffusionGemma to it; every other model stays on the global",
+        "default. Remove this override once mainline vLLM ships both",
+        "DiffusionGemma support and the Qwen fix in one image."
+      ],
+      "_engine_flags_comment": [
+        "DiffusionGemma is a discrete-diffusion (block-autoregressive)",
+        "encoder-decoder dLLM, served by vLLM 0.22.1+ (the gemma-cu130",
+        "image; arch DiffusionGemmaForBlockDiffusion). The ~18 GiB NVFP4",
+        "checkpoint leaves a tight budget on 24G; verified flags (direct",
+        "podman launch, real decode at 128K) vs the router default:",
+        "  --quantization modelopt   modelopt NVFP4; matches the other",
+        "                            NVFP4 rows.",
+        "  --max-num-seqs 4          per the vLLM DiffusionGemma recipe",
+        "                            (>4 OOMs).",
+        "  --gpu-memory-utilization 0.90 (override the router's 0.92). The",
+        "                            killer is NOT the KV pool but a fixed",
+        "                            ~1 GiB logits transient in",
+        "                            diffusion_gemma.py:_softcap_logits",
+        "                            (chunk_tokens x vocab 262144 x fp32).",
+        "                            Util must leave room OUTSIDE the pool",
+        "                            for it; 0.90 + the cap below fits.",
+        "  --max-num-batched-tokens 512  THE key flag. The softcap logits",
+        "                            buffer is (prefill_chunk x vocab x 4B);",
+        "                            at the default 1024-token chunk that is",
+        "                            exactly 1024 MiB and engine init OOMs",
+        "                            regardless of context/util. Capping the",
+        "                            chunk to 512 halves it to ~512 MiB,",
+        "                            which fits. Trade-off: image inputs",
+        "                            (mm item up to max_soft_tokens=1120) are",
+        "                            constrained at this batch size -- this",
+        "                            row is tuned text-first on 24G.",
+        "  --mm-processor-kwargs / --limit-mm-per-prompt  per the recipe.",
+        "  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True  reclaims the",
+        "                            fragmented tail so the transient lands.",
+        "Verified to serve and DECODE at up to 256K on 24G with these",
+        "flags: KV 2.72 GiB = ~269K tokens (1.03x concurrency), 23.5/24",
+        "GiB peak. The 512 batch-token cap is what unlocks 256K -- it both",
+        "shrinks the logits transient AND cuts activation reservation,",
+        "freeing KV. Smaller ctx -> more concurrency headroom (128K ~1.95x).",
+        "Without the cap, 256K OOMs (KV check at util 0.90, logits transient",
+        "at 0.95)."
+      ]
     }
   }
 }

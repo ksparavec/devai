@@ -110,6 +110,25 @@ families:
     arch_ref: google/gemma-4-26b-a4b-it
     thinking: true        # hint; runtime probe shows e2b/e4b are unsupported
 
+  - name: diffusiongemma
+    # DiffusionGemma 26B-A4B-it: Google's discrete-diffusion dLLM on the
+    # Gemma 4 26B/A4B MoE backbone (arch DiffusionGemmaForBlockDiffusion,
+    # block-autoregressive multi-canvas sampling). vLLM-only: SGLang has
+    # no diffusion path and cannot serve NVFP4 (see the SGLang NVFP4 note
+    # above), and Ollama/llama.cpp has no block-diffusion sampler. Needs
+    # the vLLM gemma-cu130 image (>=0.22.1). 128K context ceiling on the
+    # 24G card; the load-critical memory tuning (--max-num-batched-tokens
+    # 512 et al.) lives in deploy/recovery-flags.json. Multimodal in
+    # (text+image+video), tuned text-first on 24G.
+    hf_repos:
+      - nvidia/diffusiongemma-26B-A4B-it-NVFP4
+    parsers:
+      vllm:
+        reasoning: gemma4
+        tool: gemma4
+    arch_ref: nvidia/diffusiongemma-26B-A4B-it-NVFP4
+    thinking: true
+
   - name: qwen3.6
     # Qwen3.6 family. The text-only NVFP4 variant from
     # sakamakismile is the only catalog row today and is built

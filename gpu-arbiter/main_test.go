@@ -1091,3 +1091,35 @@ func TestMakeRequestHandler_Returns503WhenBackendFails(t *testing.T) {
 		t.Errorf("expected 503, got %d", w.Code)
 	}
 }
+
+// TestBuildContainerSpecImageOverride locks the per-model image-override
+// contract: launchConfig.RecoveryImage (sourced from a recovery-flags
+// `image` field) wins over the backend default; empty preserves it. This
+// is what routes DiffusionGemma to the vLLM "gemma" build while every
+// other model stays on the global default.
+func TestBuildContainerSpecImageOverride(t *testing.T) {
+	cfg := backendConfig{
+		Name:          "vllm",
+		ContainerName: "devai-vllm",
+		Image:         "docker.io/vllm/vllm-openai:latest-cu130-ubuntu2404",
+		ModelsDir:     "/models",
+		Network:       "devai-net",
+		Entrypoint:    func(string, launchConfig) []string { return []string{"sleep"} },
+	}
+	tests := []struct {
+		name          string
+		recoveryImage string
+		want          string
+	}{
+		{"empty override falls back to backend default", "", cfg.Image},
+		{"override wins", "docker.io/vllm/vllm-openai:gemma-x86_64-cu130", "docker.io/vllm/vllm-openai:gemma-x86_64-cu130"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spec := buildContainerSpec(cfg, "m", launchConfig{RecoveryImage: tt.recoveryImage}, nil, nil)
+			if got := spec["image"]; got != tt.want {
+				t.Errorf("spec[image] = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

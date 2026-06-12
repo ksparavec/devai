@@ -33,6 +33,15 @@ MAX_CONTEXT_LEN ?= 262144
 # the user already exported in their shell still wins (?= keeps the
 # external value), and `make MAX_CONTEXT_LEN=X cache-up` overrides both.
 export GPU_MEMORY_GB MAX_CONTEXT_LEN
+# vLLM image: .env (or the shell) overrides; default matches compose's
+# fallback. Exported so host-run probers (scripts/probe-vllm-reasoning.py)
+# launch the SAME image the router/compose use -- without this a .env
+# VLLM_IMAGE bump reaches compose but the prober silently falls back to
+# its own hardcoded default, probing the wrong engine. (SGLANG_IMAGE is
+# intentionally NOT exported here: it has no .env value, so exporting it
+# empty would beat the prober's os.environ.get default and break it.)
+VLLM_IMAGE ?= docker.io/vllm/vllm-openai:latest-cu130-ubuntu2404
+export VLLM_IMAGE
 CACHE_COMPOSE = $(CURDIR)/deploy/docker-compose.yaml
 INFERENCE_CONFIG = deploy/models.yaml
 HF_CLI = hf

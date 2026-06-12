@@ -2,7 +2,7 @@
 #
 # Regenerate with: make catalog-regen
 # Source of truth:  scripts/model-families.yaml
-# Generated at:     2026-05-13T15:45:59+00:00
+# Generated at:     2026-06-12T14:43:44+00:00
 #
 # Every 'size' and 'arch' below was fetched live from the
 # upstream provider at generation time. Do not hand-edit.
@@ -13,7 +13,7 @@ models:
     backend: [vllm, sglang]
     repo: "google/gemma-4-e2b-it"
     source: hf
-    sha: "b324173c7d57"
+    sha: "70af34e20bd4"
     size: "9.54 GB"
     arch: { layers: 35, kv_heads: 1, head_dim: 256, k_eq_v: false }
     arch_source: "google/gemma-4-e2b-it/config.json"
@@ -25,7 +25,7 @@ models:
     backend: [vllm, sglang]
     repo: "google/gemma-4-e4b-it"
     source: hf
-    sha: "3555bddc93a6"
+    sha: "fee6332c1aba"
     size: "14.89 GB"
     arch: { layers: 42, kv_heads: 2, head_dim: 256, k_eq_v: false }
     arch_source: "google/gemma-4-e4b-it/config.json"
@@ -37,7 +37,7 @@ models:
     backend: [vllm, sglang]
     repo: "google/gemma-4-26b-a4b-it"
     source: hf
-    sha: "462a98a12e28"
+    sha: "20da991ab4af"
     size: "48.07 GB"
     arch: { layers: 30, kv_heads: 8, head_dim: 256, k_eq_v: true }
     arch_source: "google/gemma-4-26b-a4b-it/config.json"
@@ -49,7 +49,7 @@ models:
     backend: [vllm, sglang]
     repo: "google/gemma-4-31b-it"
     source: hf
-    sha: "ba74f5b6c647"
+    sha: "3548789868c5"
     size: "58.25 GB"
     arch: { layers: 60, kv_heads: 16, head_dim: 256, k_eq_v: true }
     arch_source: "google/gemma-4-31b-it/config.json"
@@ -154,6 +154,33 @@ models:
     arch_source: "google/gemma-4-26b-a4b-it/config.json"
     purpose: "gemma4 · 14.9 GB · 30L/8kv/256h · k=v"
 
+  - name: "gemma4:12b-it-q4_K_M"
+    family: gemma4
+    backend: [ollama]
+    source: ollama
+    size: "7.04 GB"
+    arch: { layers: 30, kv_heads: 8, head_dim: 256, k_eq_v: true }
+    arch_source: "google/gemma-4-26b-a4b-it/config.json"
+    purpose: "gemma4 · 7.0 GB · 30L/8kv/256h · k=v"
+
+  - name: "gemma4:12b-it-q8_0"
+    family: gemma4
+    backend: [ollama]
+    source: ollama
+    size: "11.96 GB"
+    arch: { layers: 30, kv_heads: 8, head_dim: 256, k_eq_v: true }
+    arch_source: "google/gemma-4-26b-a4b-it/config.json"
+    purpose: "gemma4 · 12.0 GB · 30L/8kv/256h · k=v"
+
+  - name: "gemma4:12b-it-bf16"
+    family: gemma4
+    backend: [ollama]
+    source: ollama
+    size: "22.36 GB"
+    arch: { layers: 30, kv_heads: 8, head_dim: 256, k_eq_v: true }
+    arch_source: "google/gemma-4-26b-a4b-it/config.json"
+    purpose: "gemma4 · 22.4 GB · 30L/8kv/256h · k=v"
+
   - name: "gemma4:26b-a4b-it-q4_K_M"
     family: gemma4
     backend: [ollama]
@@ -162,15 +189,6 @@ models:
     arch: { layers: 30, kv_heads: 8, head_dim: 256, k_eq_v: true }
     arch_source: "google/gemma-4-26b-a4b-it/config.json"
     purpose: "gemma4 · 16.8 GB · 30L/8kv/256h · k=v"
-
-  - name: "gemma4:26b-a4b-it-q8_0"
-    family: gemma4
-    backend: [ollama]
-    source: ollama
-    size: "26.13 GB"
-    arch: { layers: 30, kv_heads: 8, head_dim: 256, k_eq_v: true }
-    arch_source: "google/gemma-4-26b-a4b-it/config.json"
-    purpose: "gemma4 · 26.1 GB · 30L/8kv/256h · k=v"
 
   - name: "gemma4:31b-it-q4_K_M"
     family: gemma4
@@ -231,6 +249,22 @@ models:
     arch: { layers: 30, kv_heads: 8, head_dim: 256, k_eq_v: true }
     arch_source: "google/gemma-4-26b-a4b-it/config.json"
     purpose: "gemma4 · 12.0 GB · 30L/8kv/256h · k=v"
+
+  - name: "diffusiongemma-26B-A4B-it-NVFP4"
+    family: diffusiongemma
+    backend: [vllm, sglang]
+    repo: "nvidia/diffusiongemma-26B-A4B-it-NVFP4"
+    source: hf
+    sha: "2ea837236295"
+    size: "17.53 GB"
+    arch: { layers: 30, kv_heads: 8, head_dim: 256, k_eq_v: false }
+    arch_source: "nvidia/diffusiongemma-26B-A4B-it-NVFP4/config.json"
+    purpose: "diffusiongemma · 17.5 GB · 30L/8kv/256h"
+    conversational: true
+    parsers:
+      vllm:
+        reasoning: gemma4
+        tool: gemma4
 
   - name: "Qwen3.6-27B-Text-NVFP4-MTP"
     family: qwen3.6

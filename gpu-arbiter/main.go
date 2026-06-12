@@ -215,6 +215,12 @@ type launchConfig struct {
 	// flag value (vLLM/SGLang resolve duplicate flags last-wins). See
 	// docs/multi-token-prediction.md Sec. 7.2.
 	Speculative *configSpeculative
+	// RecoveryImage optionally overrides the vLLM container image for this
+	// model only (from the recovery registry's per-model `image` field).
+	// Empty = use the global $VLLM_IMAGE default. Lets a single model that
+	// needs a different engine build (e.g. DiffusionGemma on the vLLM
+	// "gemma" image) run without changing the image for every other model.
+	RecoveryImage string
 }
 
 type configFile struct {
@@ -1506,8 +1512,18 @@ func buildContainerSpec(
 		mounts = append(mounts, pluginVolume)
 	}
 
+	// Per-model image override (recovery registry `image` field) wins over
+	// the backend's global default. Lets one model run on a different
+	// engine build (e.g. DiffusionGemma on the vLLM "gemma" image) without
+	// changing the image for every other model. The override travels with
+	// the model name, so the existing model-change -> recreate path already
+	// swaps it in; no separate image-change detection is needed.
+	image := cfg.Image
+	if lc.RecoveryImage != "" {
+		image = lc.RecoveryImage
+	}
 	spec := map[string]any{
-		"image":        cfg.Image,
+		"image":        image,
 		"name":         cfg.ContainerName,
 		"entrypoint":   cfg.Entrypoint(modelName, lc),
 		"command":      []string{},
@@ -1584,6 +1600,7 @@ func (a *arbiter) containerRecreate(bs *backendState, modelName string, desiredC
 	if rec, ok := a.recoveryRegistry.Lookup(modelName); ok {
 		lc.RecoveryFlags = rec.Flags
 		recoveryEnv = rec.Env
+		lc.RecoveryImage = rec.Image
 	}
 	// Speculative-decoding config (MTP). Set by the request handler when
 	// the model name carried `::mtp` AND the catalog declared an `mtp:`

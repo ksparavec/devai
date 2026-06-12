@@ -19,10 +19,16 @@ import (
 	"os"
 )
 
-// recoveryEntry is the per-model flag set. Either field may be empty.
+// recoveryEntry is the per-model flag set. Any field may be empty.
 type recoveryEntry struct {
 	Flags []string          `json:"engine_flags"`
 	Env   map[string]string `json:"engine_env"`
+	// Image optionally overrides the vLLM container image for this model
+	// only (falls back to $VLLM_IMAGE when empty). Needed when a model
+	// requires a different engine build than the global default -- e.g.
+	// DiffusionGemma needs the vLLM "gemma" bring-up image, which in turn
+	// regresses Qwen NVFP4 loading, so it cannot be the global default.
+	Image string `json:"image"`
 }
 
 // recoveryRegistry resolves canonical model names to their recovery
