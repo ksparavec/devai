@@ -2644,9 +2644,12 @@ def main() -> None:
     #               REAS > CTX). Direction is preserved across cycles.
     #   ctrl-r   -- flip sort direction (desc <-> asc). Mode is
     #               preserved across flips.
-    #   ?        -- toggle preview pane on/off. Single-char fzf
-    #               action; reliable across terminals. Cost: '?' can
-    #               no longer be typed into the fuzzy-search query.
+    #   ?        -- toggle the model-details preview pane on/off. The
+    #               pane starts HIDDEN (see preview_window below): the
+    #               picker no longer shoves details in the operator's
+    #               face on launch -- they opt in by pressing '?'.
+    #               Single-char fzf action; reliable across terminals.
+    #               Cost: '?' can no longer be typed into the search.
     #   ctrl-p   -- alias for ?:toggle-preview.
     # Non-selectable rows (column header / sort note / formula note)
     # are made un-focusable via `--header-lines=3` below, so the
@@ -2663,6 +2666,12 @@ def main() -> None:
             lines, header,
             selectable=selectable,
             preview_cmd=preview_cmd,
+            # Start the details pane hidden: the `:hidden` flag makes
+            # fzf launch with the preview collapsed, and `?` / ctrl-p
+            # toggle-preview reveals it at the same right:42% geometry
+            # on demand. Previously the pane defaulted to visible and
+            # showed every model's details unprompted on launch.
+            preview_window="right:42%:wrap:hidden",
             extra_bindings=bindings,
             input_text=sort_files[("total", "desc")].read_text(),
             # Column header + sort note + formula note. _build_menu
