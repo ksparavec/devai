@@ -27,7 +27,12 @@ class TestMakefileFetchCli(unittest.TestCase):
     def test_skypilot_wheel_block_present(self) -> None:
         self.assertIn("skypilot.version", self.text)
         self.assertIn("pip/wheels/skypilot", self.text)
-        self.assertIn("uv pip download", self.text)
+        # The wheel fetch uses `python3 -m pip download` (not `uv pip
+        # download`, which has no `download` subcommand) with
+        # `--only-binary=:all:` so only stable pre-built wheels are
+        # pulled. See commit 91d8e15 (repair SkyPilot wheel fetch).
+        self.assertIn("python3 -m pip download", self.text)
+        self.assertIn("--only-binary=:all:", self.text)
 
     def test_broad_cloud_extras(self) -> None:
         # Per skypilot-agent-skill plan decision 2: broad set so the

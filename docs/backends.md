@@ -155,6 +155,71 @@ entry, and the router launches without the flag.
 | `PROBE_REPO=Llama-3.1-8B` | Regex filter on catalog rows (HF probers only) |
 | `PROBE_FORCE=1` | Re-probe every cell even if cached |
 | `PROBE_FORCE_ARCH=1` | Re-probe top-level capability/arch fields |
+| `PROBE_NEEDLE_DEPTH=0.5` | Load probe: fractional depth (0.0 top, 1.0 bottom) of the recall needle |
+
+### Load probing -- serving-time VRAM under near-full context
+
+The fit probe (steps 2-3 above) snapshots `nvidia-smi` once, right
+after `/health` plus a short chat. That captures the *load ceiling* --
+weights + the reserved KV pool -- but NOT the *serving transient* that
+vLLM/SGLang allocate per decode step once a real, near-full-context
+request arrives: the softcap-logits buffer (`max_num_batched_tokens x
+vocab x 4 bytes`) plus attention/activation workspace. A model can fit
+at load and still OOM on the first large prompt -- this is exactly what
+DiffusionGemma did (fit=true at 256K in the cache, crash-loop on any
+prompt over one prefill chunk).
+
+The LOAD probe closes that gap. It is a SECOND pass that *layers onto*
+the existing fit cache -- it never rewrites a fit cell, only augments
+it:
+
+```bash
+make cache-down                 # same exclusive-GPU precondition as fit probing
+make probe-vllm                 # fit cache must exist first
+make probe-load-vllm            # then layer serving-time data on top
+make probe-load-sglang          # likewise for SGLang
+make probe-load-vllm PROBE_REPO=Gemma PROBE_CONTEXTS=32K,64K,128K
+make cache-up
+```
+
+For each downloaded model, at the host VRAM band, it walks the context
+tiers **ascending** (32K -> 64K -> 128K -> 256K) and, for every tier the
+fit probe already marked `fits=true`, it:
+
+1. relaunches the backend at that `--max-model-len` with the SAME
+   verified parsers + recovery flags the router serves with,
+2. records a baseline VRAM reading once `/health` passes (idle),
+3. builds a haystack prompt filled to `ctx - 2048` tokens from a
+   public-domain corpus (Moby-Dick + War and Peace), with a unique needle
+   (`RHINO-7741-DELTA-VAULT`) inserted at `PROBE_NEEDLE_DEPTH`. The corpus
+   is fetched from Project Gutenberg on first use into
+   `~/.cache/devai/probe-corpus/` (override with `DEVAI_PROBE_CORPUS_DIR`;
+   pre-populate it on an air-gapped host) -- it is NOT vendored in git,
+4. sends ONE ~2048-token completion while a 0.1s VRAM sampler runs,
+5. captures the peak, scores needle retrieval, classifies OOM
+   (transport error / container exit / OOM markers in logs),
+6. augments the cell with `serving_ok`, `serving_peak_gb`,
+   `transient_gb` (= peak - baseline), `needle_score`, and the
+   `predicted_logits_gb` diagnostic,
+7. **stops ascending at the first OOM** -- a larger context cannot fit a
+   transient that already overflowed -- and marks the higher tiers
+   `serving_ok=false` (implied) without launching them.
+
+The new fields are additive; no schema bump. Both consumers gate on
+`serving_ok` **only when present** -- a cell the load probe never
+touched (`serving_ok` absent) keeps the pre-load-probe behaviour
+byte-for-byte:
+
+- **router** (`synthesizeHFFromCache`): a `fits=true` / `serving_ok=false`
+  cell is excluded from `ProbedMaxCtx`, so the per-name request ceiling
+  falls back to the largest tier that both fits AND serves.
+- **picker** (`_vram_from_hf_probe`): the same cell gets
+  `fully_on_gpu=false`, so `_max_fitting_ctx_info` won't advertise a ctx
+  the router would refuse.
+
+The probe is vLLM/SGLang only today (the BackendSpec path). Ollama
+allocates KV per-request from `num_ctx` via llama.cpp and has no LOAD
+pass yet.
 
 ### Custom vLLM parser plugins
 
@@ -281,6 +346,16 @@ When a probe records `fits: false`, `evidence.kind` tells you why:
 The `evidence.matched_pattern` field (when present) names the substring
 that triggered the classification -- useful for auditing why a particular
 launch was tagged a particular way.
+
+The LOAD probe records its verdict separately. A cell that fit but
+failed under near-full context gets `serving_ok: false` plus a
+`serving_error` string naming the cause -- `request_error:` (the
+completion call itself errored), `api_error:` (the backend returned a
+500 body), `container_state=exited` (the engine crashed), `oom_marker:`
+(an OOM string appeared in the logs while the response carried no
+choices), or `implied_by_lower_tier_oom` (a smaller ctx already OOMed,
+so this larger tier was marked without launching). These live alongside
+the fit-probe `evidence`, never overwriting it.
 
 ## Coordination -- only one backend at a time
 

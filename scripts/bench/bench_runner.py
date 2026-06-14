@@ -185,7 +185,12 @@ def _fitting_ctxs(entry: dict, host_vram_gb: int) -> list[int]:
     for ctx_str, cell in band.items():
         if not isinstance(cell, dict):
             continue
-        ok = bool(cell.get("fully_on_gpu") or cell.get("fits"))
+        # serving_ok=false (set by `make probe-load-*`) means the cell
+        # loaded but OOMed under a near-full-context request -- benching
+        # there would just reproduce the OOM. Skip it; serving_ok absent
+        # (load probe never ran) keeps the fit-only verdict.
+        ok = (bool(cell.get("fully_on_gpu") or cell.get("fits"))
+              and cell.get("serving_ok") is not False)
         if not ok:
             continue
         try:

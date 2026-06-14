@@ -65,6 +65,8 @@ make cache-status    # Show status, models, disk usage
 make probe                      # Probe every (VRAM, ctx, backend) cell; Ollama only
 make probe-vllm                 # Probe every (VRAM, ctx) cell for vLLM; requires `make cache-down`
 make probe-sglang               # Probe every (VRAM, ctx) cell for SGLang; requires `make cache-down`
+make probe-load-vllm            # Serving-time LOAD probe: augment vLLM fit cache with serving_ok/transient/needle; ascending ctx, stop at OOM. Run after probe-vllm.
+make probe-load-sglang          # Same LOAD probe against the SGLang cache. Run after probe-sglang.
 make model-fit                  # Print which models fit at chosen VRAM/CONTEXT (no writes)
 make model-pull                 # Download best-fit (family, backend, context) candidates (matrix mode)
 make model-pull FAMILY=qwen3.5  # Scope to one family; still iterates 4-context matrix per backend
@@ -223,6 +225,8 @@ Single mode (default) preserves the pre-cluster code path byte-for-byte. Worker 
 
 All services share `devai-net` network. Model data stored under `/var/cache/devai/`. Secret render targets live on a tmpfs at `/run/devai/` (per `docs/secrets.md`).
 
+**`/var/cache/devai/` mount-point convention:** the top-level folders under `/var/cache/devai/` (e.g. `ollama/`, `pip/`, `logs/`, `registry/`) are each an external-volume mount point (a dedicated LV/mount), not ordinary directories. Do NOT create new top-level directories directly under `/var/cache/devai/` -- a new folder there is not backed by a volume and silently lands on the root filesystem. Caches that are not external-volume-backed (e.g. the load-probe corpus, see `scripts/_probe_load.py`) belong under the user cache `~/.cache/devai/` (`DEVAI_PROBE_CORPUS_DIR` / `XDG_CACHE_HOME` aware), not here.
+
 ### SSL / HTTPS
 
 - JupyterLab: auto-detects mkcert certs in `~/.jupyter/ssl/`
@@ -247,6 +251,8 @@ Interactive model -> agent selection via fzf. Used by `make shell-*` (via `agent
 
 **Do not add custom tags to cached models.** In particular, do not derive `<parent>:<tag>-ctx<N>` Modelfile siblings via `ollama create` to bake `num_ctx` (or any other PARAMETER) in. Per-session context is plumbed dynamically -- via the router's `setNumCtx` injection on Ollama's `/api/chat` and via the `@<ctx>` suffix for vLLM/SGLang launch flags -- so derived tags add nothing the runtime can use. They share digests with the parent (`make cache-status` then shows duplicate-looking rows), the picker filters them via `_ctx_tag` and the prober skips them via `_CTX_VARIANT_RE`, so they're inert leftovers from the pre-3a98ed0 design. The only sanctioned `ollama create` call is `select-models.py:pull_gguf` writing the canonical catalog tag from a downloaded GGUF blob; nothing else should mint Ollama tags.
 
+**Use models as delivered -- no operator YaRN / rope_scaling edits.** Every model serves only up to its as-shipped context ceiling (`max_position_embeddings`, rope-extended when the checkpoint already ships a `rope_scaling` block). We do NOT hand-edit a checkpoint's `config.json` or inject `--rope-scaling` / `--hf-overrides` to extend a model past what it was delivered with. A model trained short with no YaRN config (e.g. `Qwen3-8B/14B-NVFP4`, `max_position_embeddings=40960`, `rope_scaling=null`) is used at that 40K ceiling and capped to the largest standard tier within it (32K); it is NOT extended to 131K by adding YaRN. Long context comes ONLY from models that ship it -- native (e.g. Qwen3.5-9B, Llama-3.1-8B at 128K, DiffusionGemma at 256K) or YaRN baked-in (e.g. gpt-oss-20b to 131K). This is enforced automatically by the load probe's `position_limit` cap (see `_probe_hf_common.effective_position_limit`): the fit probe never advertises a context the model would device-side-assert on at serve time. Rationale: as-delivered checkpoints are reproducible and avoid the documented YaRN sub-32K quality regression; the fleet already covers long context with purpose-built models, so per-model rope surgery buys nothing.
+
 ### Building the JupyterLab extension
 
 Never build on the host. Build inside a container:
@@ -265,7 +271,7 @@ Pre-built output lives in `packages/jupyter-ai-launchers/jupyter_ai_launchers/la
 ```
 deploy/models.yaml            -- Auto-generated catalog (every variant the upstream catalog declares); filters out :latest, bare-size aliases, routing variants, cloud placeholders; recognises quant markers
 deploy/.ollama-reasoning-cache.json -- Ollama probe cache (schema v3, digest-keyed); per-cell: actual_total_gb, actual_vram_gb, fully_on_gpu, per-cell capability, timestamp; captures capabilities array
-deploy/.vllm-reasoning-cache.json   -- vLLM probe cache (schema v2, repo+sha-keyed); top-level: reasoning_parser, tool_parser, disable_verified; per-cell: fits, evidence
+deploy/.vllm-reasoning-cache.json   -- vLLM probe cache (schema v2, repo+sha-keyed); top-level: reasoning_parser, tool_parser, disable_verified; per-cell: fits, evidence. The LOAD probe (`make probe-load-vllm`) additively augments fitting cells with serving_ok / serving_peak_gb / transient_gb / needle_score / predicted_logits_gb -- serving-time VRAM under a near-full-context request, catching the per-step transient (softcap-logits + attention workspace) the single-shot fit probe misses. Router + picker gate on serving_ok ONLY when present (absent = pre-load-probe behaviour). No schema bump.
 deploy/.sglang-reasoning-cache.json -- SGLang probe cache (schema v2, repo+sha-keyed; same shape as vLLM)
 deploy/.bench-cache.json      -- Bench cache (schema v3). Top-level `_meta` block holds `host_env_history` keyed by 12-char SHA-256 id (kernel, driver_version, gpu_name, gpu_memory_gb, cuda_version, captured_at) plus `current_host_env_id` pointer. Every row stamps `host_env_id` so re-benches against a different driver/kernel are auditable. Row keys carry a `::<ctx>` suffix: `<repo>@<sha>::<backend>::<ctx>` (HF) or `<digest>::<backend>::<ctx>` (Ollama) -- so the same model benched at 32K and 128K lands in distinct rows instead of silently overwriting (under MTP a single model can differ by 17+ tok/s between ctx tiers). Rows mirror the suffix in a `context: int` field and hold `tasks` (gsm8k/humaneval/tools_use/leak/longctx subsets) + `metrics` (peak/mean VRAM, ttft, tps_sustained_p50, vllm_kv_cache_usage_perc, etc.). v2 -> v3 migration runs idempotently on first writer invocation; the 9 historical pre-v3 rows are mapped via `_bench_core.RECOVERED_CTX_MAP` (a one-shot artefact captured from the 2026-05-05 router log -- never edited after the migration ships, future unrecognised rows land at ctx=0 and re-bench is the right answer). Gitignored.
 deploy/backend-flags.yaml     -- Pinned launch-flag *names* per backend; `make verify-backend-flags` asserts presence after image bumps
@@ -302,7 +308,8 @@ scripts/skypilot-api-health.sh -- /api/v1/version + `sky check` smoke test for t
 scripts/sky-setup.sh          -- First-launch helper inside the lab: enumerates detected cloud creds, runs `sky check`, prints next-step + cost guidance.
 scripts/generate-catalog.py   -- Refresh deploy/models.yaml from upstream (HF + Ollama registry)
 scripts/_probe_core.py        -- Backend-agnostic probe helpers (cache I/O, classifier, implied-spill propagation)
-scripts/_probe_hf_common.py   -- Shared scaffold for vLLM/SGLang probers (BackendSpec, podman driver, single-launch + 3-chat probe, nvidia-smi)
+scripts/_probe_hf_common.py   -- Shared scaffold for vLLM/SGLang probers (BackendSpec, podman driver, single-launch + 3-chat probe, nvidia-smi). `build_argparser` carries `--load`/`--needle-depth` flags consumed by the load probe.
+scripts/_probe_load.py        -- Serving-time LOAD probe (vLLM/SGLang). Reuses _probe_hf_common's container driver + BackendSpec.build_args + recovery flags and bench.VramSampler. `run_load_probe_pass` walks fitting cells ascending, relaunches each at its ctx, fills a haystack prompt to ctx-2048 tokens from a public-domain corpus with a recall needle, samples peak VRAM at 0.1s, classifies OOM, augments the cell, stops at first OOM. Driven by `probe-{vllm,sglang}-reasoning.py --load`. The corpus (Moby-Dick + War and Peace, ~1M tokens) is fetched from Project Gutenberg (#2701/#2600, boilerplate-stripped) on first `--load` run into `~/.cache/devai/probe-corpus/` (override `DEVAI_PROBE_CORPUS_DIR`; pre-populate for air-gapped hosts) -- NOT vendored in git. Also stamps each HF cache entry's `position_limit` (config.json max_position_embeddings, rope-extended) so the fit probe stops over-promising a context the model asserts on -- via `_probe_hf_common.effective_position_limit`.
 scripts/verify-backend-flags.py -- Asserts `--help` of pinned vLLM/SGLang images exposes every flag in deploy/backend-flags.yaml
 scripts/probe-ollama-reasoning.py -- Ollama prober (Make-orchestrated VRAM bands)
 scripts/probe-vllm-reasoning.py   -- vLLM prober (BackendSpec wrapper)

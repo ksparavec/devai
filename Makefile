@@ -40,7 +40,7 @@ export GPU_MEMORY_GB MAX_CONTEXT_LEN
 # its own hardcoded default, probing the wrong engine. (SGLANG_IMAGE is
 # intentionally NOT exported here: it has no .env value, so exporting it
 # empty would beat the prober's os.environ.get default and break it.)
-VLLM_IMAGE ?= docker.io/vllm/vllm-openai:latest-cu130-ubuntu2404
+VLLM_IMAGE ?= docker.io/vllm/vllm-openai:latest-x86_64-cu129-ubuntu2404
 export VLLM_IMAGE
 CACHE_COMPOSE = $(CURDIR)/deploy/docker-compose.yaml
 INFERENCE_CONFIG = deploy/models.yaml
@@ -144,7 +144,7 @@ endif
 .PHONY: vllm-list vllm-rm vllm-status vllm-df
 .PHONY: clean clean-cpu clean-gpu clean-router prune
 .PHONY: fetch-cli pull-images install install-systemd uninstall test test-router test-ollama test-agents test-models test-probe-vllm test-probe-sglang test-probe-ollama-idempotent test-vllm test-sglang test-e2e test-full help
-.PHONY: catalog-regen catalog-suggest probe probe-vllm probe-sglang model-fit model-pull vram-fit verify-backend-flags ollama-cleanup-ctx-variants
+.PHONY: catalog-regen catalog-suggest probe probe-vllm probe-sglang probe-load-vllm probe-load-sglang model-fit model-pull vram-fit verify-backend-flags ollama-cleanup-ctx-variants
 .PHONY: bench bench-vllm bench-sglang bench-ollama bench-report test-bench-smoke
 .PHONY: secrets-tmpfs secrets-edit secrets-render secrets-rotate age-keygen-host test-python
 .PHONY: mcp-up mcp-down mcp-logs mcp-test mcp-health mcp-secrets-render build-worker-bootstrap test-cluster-preflight cluster-head-up cluster-head-down cluster-status skypilot-up skypilot-down skypilot-check skypilot-secrets-render
@@ -1070,6 +1070,32 @@ probe-sglang: ## Probe every downloaded SGLang/HF model per (VRAM, CONTEXT) cell
 	    $(if $(PROBE_FORCE),--force,) \
 	    $(if $(PROBE_FORCE_ARCH),--force-arch,)
 
+probe-load-vllm: ## Serving-time LOAD probe for vLLM: augment fit cache with serving_ok/transient/needle, ascending ctx, stop at OOM.
+	@# Layers onto deploy/.vllm-reasoning-cache.json — run `make probe-vllm`
+	@# first so the fit cells exist. Same GPU-exclusivity precondition as
+	@# probe-vllm (devai-router/vllm/sglang stopped; the script self-checks).
+	@# Knobs:
+	@#   PROBE_CONTEXTS=32K,...      ctx tiers (ascending; stops at first OOM)
+	@#   PROBE_REPO=<regex>          filter catalog rows by repo
+	@#   PROBE_FORCE=1               re-run cells that already have serving_ok
+	@#   PROBE_NEEDLE_DEPTH=0.5      needle insertion depth (0.0 top, 1.0 bottom)
+	python3 scripts/probe-vllm-reasoning.py --load \
+	    --host-vram-gb $(GPU_MEMORY_GB) \
+	    $(if $(PROBE_CONTEXTS),--ctx $(PROBE_CONTEXTS),) \
+	    $(if $(PROBE_REPO),--repo $(PROBE_REPO),) \
+	    $(if $(PROBE_FORCE),--force,) \
+	    $(if $(PROBE_NEEDLE_DEPTH),--needle-depth $(PROBE_NEEDLE_DEPTH),)
+
+probe-load-sglang: ## Serving-time LOAD probe for SGLang: same as probe-load-vllm against the SGLang cache.
+	@# Layers onto deploy/.sglang-reasoning-cache.json — run `make probe-sglang`
+	@# first. Same precondition + knobs as probe-load-vllm.
+	python3 scripts/probe-sglang-reasoning.py --load \
+	    --host-vram-gb $(GPU_MEMORY_GB) \
+	    $(if $(PROBE_CONTEXTS),--ctx $(PROBE_CONTEXTS),) \
+	    $(if $(PROBE_REPO),--repo $(PROBE_REPO),) \
+	    $(if $(PROBE_FORCE),--force,) \
+	    $(if $(PROBE_NEEDLE_DEPTH),--needle-depth $(PROBE_NEEDLE_DEPTH),)
+
 model-fit: ## Print which models fit at the chosen (VRAM, CONTEXT) — diagnostic, no writes.
 	@OLLAMA_CONTAINER=$(OLLAMA_CONTAINER) CONTAINER_RUNTIME=$(CONTAINER_RUNTIME) \
 	 VLLM_MODELS_DIR=$(VLLM_MODELS_DIR) HF_CLI=$(HF_CLI) \
@@ -1294,6 +1320,8 @@ BENCH_CACHE_MOUNTS = \
 BENCH_RUN_FLAGS = \
 	$(if $(BENCH_TASKS),--tasks '$(BENCH_TASKS)',) \
 	$(if $(BENCH_REPO),--repo '$(BENCH_REPO)',) \
+	$(if $(BENCH_CTX),--ctx '$(BENCH_CTX)',) \
+	$(if $(BENCH_ALL_CTX),--all-ctx,) \
 	$(if $(BENCH_FORCE),--force,) \
 	$(if $(BENCH_N_GSM8K),--n-gsm8k $(BENCH_N_GSM8K),) \
 	$(if $(BENCH_N_HUMANEVAL),--n-humaneval $(BENCH_N_HUMANEVAL),) \

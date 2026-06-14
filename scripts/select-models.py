@@ -1179,7 +1179,15 @@ def build_rows(
             if hf_record:
                 vram_actual = float(hf_record.get("actual_vram_gb") or 0.0)
                 eff_ctx = int(hf_record.get("actual_context") or hf_record.get("ctx") or context)
-                fits_flag = bool(hf_record.get("fits", False))
+                # Mirror the router's synthesizeHFFromCache + the picker's
+                # _vram_from_hf_probe gate: a cell that loaded (fits=true)
+                # but OOMed under a near-full-context request
+                # (serving_ok=false, set by `make probe-load-*`) is NOT
+                # serveable at that ctx, so model-fit / model-pull must not
+                # report it as fitting. serving_ok absent (load probe never
+                # ran) keeps the fit-only verdict (legacy behaviour).
+                fits_flag = (bool(hf_record.get("fits", False))
+                             and hf_record.get("serving_ok") is not False)
                 ctx_capability = str(hf_record.get("capability") or hf_entry.get("capability") or Capability.UNKNOWN)
                 # vLLM/SGLang load weights+KV+CUDA-graphs into the static
                 # pool — actual_vram_gb is the most honest "total" we have.

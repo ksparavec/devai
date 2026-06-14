@@ -777,7 +777,18 @@ def _vram_from_hf_probe(probe: dict, arch: dict | None = None,
             if not isinstance(cell, dict):
                 continue
             new_cell = dict(cell)
-            new_cell.setdefault("fully_on_gpu", bool(cell.get("fits", False)))
+            # Eligibility mirrors the router's synthesizeHFFromCache gate:
+            # a cell that loaded (fits=True) but OOMed under a near-full
+            # context request (serving_ok=False, set by the LOAD probe in
+            # scripts/_probe_load.py) is NOT serveable at that ctx, so it
+            # must not count toward the picker's max-fitting-ctx. serving_ok
+            # is None when the load probe hasn't run for this cell -> fall
+            # back to the fit verdict alone (pre-load-probe behaviour).
+            fits = bool(cell.get("fits", False))
+            serving_ok = cell.get("serving_ok")
+            new_cell.setdefault(
+                "fully_on_gpu", fits and (serving_ok is not False)
+            )
             try:
                 ctx = int(ctx_key)
             except (TypeError, ValueError):

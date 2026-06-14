@@ -338,6 +338,16 @@ type hfCacheProbe struct {
 	ActualVRAMGB  float64 `json:"actual_vram_gb"`
 	ActualContext int     `json:"actual_context"`
 	Capability    string  `json:"capability"`
+	// ServingOk is set by the serving-time LOAD probe (probe-vllm --load,
+	// scripts/_probe_load.py): true when a near-full-context request ran
+	// without OOMing the engine, false when the per-step transient
+	// (softcap-logits + attention workspace) overflowed the VRAM the fit
+	// probe left unmeasured. Nil when the load probe hasn't run for this
+	// cell. The synthesizer treats a fits=true/serving_ok=false cell as
+	// NOT serveable at that ctx, so the per-name context cap falls back to
+	// the largest tier that both fits AND serves. A nil pointer preserves
+	// pre-load-probe behaviour byte-for-byte (fit verdict alone gates).
+	ServingOk *bool `json:"serving_ok,omitempty"`
 }
 
 // hfCacheEntry mirrors the per-(repo, sha) record in the HF probe caches.
@@ -432,6 +442,14 @@ func synthesizeHFFromCache(
 				continue
 			}
 			if !probe.Fits {
+				continue
+			}
+			// Serving-time gate: a cell that loaded (fits=true) but OOMed
+			// under a near-full-context request (serving_ok=false) cannot
+			// serve at that ctx. Exclude it so bestCtx settles on the
+			// largest tier that both fits AND serves. Nil = load probe
+			// hasn't run -> fall through on fit alone (legacy behaviour).
+			if probe.ServingOk != nil && !*probe.ServingOk {
 				continue
 			}
 			if c >= bestCtx {
@@ -1143,7 +1161,7 @@ func main() {
 			ListenPort:    envInt("VLLM_PORT", 11435),
 			BackendURL:    vllmURL,
 			ContainerName: env("VLLM_CONTAINER", "devai-vllm"),
-			Image:         env("VLLM_IMAGE", "docker.io/vllm/vllm-openai:latest-cu130-ubuntu2404"),
+			Image:         env("VLLM_IMAGE", "docker.io/vllm/vllm-openai:latest-x86_64-cu129-ubuntu2404"),
 			ModelsDir:     env("VLLM_MODELS_DIR", "/var/cache/devai/ollama/models/vllm"),
 			Network:       network,
 			HealthPath:    "/health",

@@ -42,6 +42,7 @@ from _probe_hf_common import (  # noqa: E402  — local import after sys.path fi
     build_argparser,
     run_probe_pass,
 )
+from _probe_load import run_load_probe_pass  # noqa: E402
 
 
 SGLANG_RESERVE_GB = 3.0  # mirrors gpu-arbiter/main.go memFraction
@@ -113,7 +114,11 @@ SPEC = BackendSpec(
 
 def main() -> None:
     ap = build_argparser(SPEC, __doc__)
-    run_probe_pass(SPEC, ap.parse_args())
+    args = ap.parse_args()
+    if args.load:
+        run_load_probe_pass(SPEC, args)
+    else:
+        run_probe_pass(SPEC, args)
 
 
 if __name__ == "__main__":

@@ -358,6 +358,58 @@ def model_kind_from_disk(model_name: str, models_dir: Path) -> str:
     return "dense"
 
 
+def effective_position_limit(model_name: str, models_dir: Path) -> int | None:
+    """Largest token position the model can actually serve, read from its
+    config.json -- the HARD architectural ceiling, distinct from a model
+    card's advertised context.
+
+    Returns max_position_embeddings (top-level or text_config, whichever
+    is larger), widened to factor*original_max_position_embeddings when a
+    rope_scaling block declares a larger extended range. None when the
+    field is absent (model unaffected by the cap).
+
+    Why this exists: nvidia/Qwen3-8B-NVFP4 ships max_position_embeddings
+    =40960 with rope_scaling=null. vLLM loads it at --max-model-len 131072
+    (VLLM_ALLOW_LONG_MAX_MODEL_LEN bypasses the startup guard -- it only
+    raises the scheduler's max-len, it does NOT add YaRN), so the fit
+    probe records fits=true at 131072. But a >40960-token prompt indexes
+    RoPE out of range and triggers a CUDA device-side assert at serve
+    time (confirmed: Qwen3 model cards + QwenLM/Qwen3#1361, vLLM#17924).
+    Capping the probe + max_context at this limit stops the fit probe
+    over-promising a context the model cannot serve. gpt-oss-20b
+    (max_position_embeddings=131072, YaRN to 131072) is the same story
+    one tier up: it must not advertise 256K.
+    """
+    cfg_path = models_dir / model_name / "config.json"
+    try:
+        cfg = json.loads(cfg_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(cfg, dict):
+        return None
+    scopes = [cfg]
+    if isinstance(cfg.get("text_config"), dict):
+        scopes.append(cfg["text_config"])
+    mpe = 0
+    rope: dict | None = None
+    for s in scopes:
+        v = s.get("max_position_embeddings")
+        if isinstance(v, int) and v > mpe:
+            mpe = v
+        r = s.get("rope_scaling")
+        if rope is None and isinstance(r, dict):
+            rope = r
+    if mpe <= 0:
+        return None
+    limit = mpe
+    if isinstance(rope, dict):
+        factor = rope.get("factor")
+        orig = rope.get("original_max_position_embeddings")
+        if isinstance(factor, (int, float)) and isinstance(orig, int) and orig > 0:
+            limit = max(limit, int(factor * orig))
+    return limit
+
+
 # ── Container lifecycle (podman CLI) ─────────────────────────────────────────
 
 def assert_no_active_backends(runtime: str) -> None:
@@ -1094,11 +1146,18 @@ def probe_one_cell(
     return rec
 
 
-def _post_chat(base_url: str, body: dict) -> dict:
-    """POST a chat-completion body, normalize errors to `{error: ...}`."""
+def _post_chat(base_url: str, body: dict, timeout: float = CHAT_TIMEOUT) -> dict:
+    """POST a chat-completion body, normalize errors to `{error: ...}`.
+
+    `timeout` defaults to the fit-probe's short CHAT_TIMEOUT. The load
+    probe overrides it with a context-scaled value -- a near-full
+    256K-token prefill takes minutes, far longer than 60s, so the short
+    default would mis-classify a still-progressing prefill as a serving
+    failure.
+    """
     try:
         return http_post(
-            f"{base_url}/v1/chat/completions", body, timeout=CHAT_TIMEOUT,
+            f"{base_url}/v1/chat/completions", body, timeout=timeout,
         )
     except urllib.error.HTTPError as e:
         raw = e.read() if hasattr(e, "read") else b""
@@ -1342,7 +1401,20 @@ def refresh_top_level_from_cells(entry: dict) -> None:
                 ac = int(cell.get("actual_context") or 0)
                 if ac > largest_ctx:
                     largest_ctx = ac
-        if largest_ctx and (entry.get("max_context") or 0) < largest_ctx:
+        # Cap at the model's HARD position limit when known. The fit
+        # probe can load (fits=true) at a ctx beyond max_position_embeddings
+        # because VLLM_ALLOW_LONG_MAX_MODEL_LEN bypasses vLLM's guard, but
+        # the model asserts on any prompt that long at serve time -- so
+        # max_context must not advertise it. position_limit is stamped on
+        # the entry by run_probe_pass from config.json (see
+        # effective_position_limit). This also SHRINKS a value a prior
+        # (pre-cap) probe run recorded as an over-promise.
+        pos_limit = entry.get("position_limit")
+        if isinstance(pos_limit, int) and pos_limit > 0:
+            largest_ctx = min(largest_ctx, pos_limit)
+        cur = entry.get("max_context") or 0
+        capped_down = isinstance(pos_limit, int) and 0 < pos_limit < cur
+        if largest_ctx and (cur < largest_ctx or capped_down):
             entry["max_context"] = largest_ctx
         return
 
@@ -1418,6 +1490,17 @@ def build_argparser(spec: BackendSpec, doc: str) -> argparse.ArgumentParser:
                     help="skip the per-cell MTP overhead probe for "
                          "catalog rows declaring an `mtp:` block. Halves "
                          "wall-time when MTP overhead is not needed.")
+    ap.add_argument("--load", action="store_true",
+                    help="run the serving-time LOAD probe instead of the "
+                         "fit probe: relaunch each already-fitting cell, "
+                         "send a near-full-context request under a VRAM "
+                         "sampler, record serving_ok/transient/needle. "
+                         "Ascends ctx tiers and stops at the first OOM. "
+                         "Requires the fit cache to already exist.")
+    ap.add_argument("--needle-depth", type=float, default=0.5,
+                    help="fractional depth (0.0=top, 1.0=bottom) at which "
+                         "the load probe inserts its recall needle "
+                         "(default 0.5)")
     return ap
 
 
@@ -1487,6 +1570,13 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
             cache, key, repo, sha, name, spec.schema_version, kind, size_gb,
         )
 
+        # Stamp the HARD position limit from config.json so
+        # refresh_top_level_from_cells caps max_context at it and the
+        # tier loop below never probes a context the model can't serve.
+        pos_limit = effective_position_limit(name, models_dir)
+        if isinstance(pos_limit, int) and pos_limit > 0:
+            entry["position_limit"] = pos_limit
+
         # Pull curated parser hints for this backend from the catalog
         # row. The probe driver passes these to spec.build_args; the
         # cell record only confirms them when the backend round-trip
@@ -1516,6 +1606,13 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
             targets = effective_targets(ctxs, entry.get("max_context") or 0)
             if not targets:
                 targets = sorted(set(ctxs))
+            # Don't probe past the HARD position limit: the engine would
+            # load (guard bypassed) and record a fits=true the model can't
+            # serve. Keep at least the smallest tier so the operator still
+            # sees one real outcome even for a sub-32K-limit model.
+            if isinstance(pos_limit, int) and pos_limit > 0:
+                within = [t for t in targets if t <= pos_limit]
+                targets = within or [min(targets)]
 
             missing = [
                 t for t in targets

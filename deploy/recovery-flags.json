@@ -126,6 +126,17 @@
       "engine_env": {
         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
       },
+      "_stability_note": [
+        "The vLLM-recipe diffusion-sampling flags (--hf-overrides",
+        "diffusion_sampler=entropy_bound, --diffusion-config canvas_length,",
+        "--generation-config vllm) were tried and REVERTED: they served fine",
+        "for single sequential requests but crash-looped the engine under the",
+        "bench harness's request pattern (model-switch + concurrency) on this",
+        "96%-full 24G card. The default sampler is stable across a request",
+        "sequence up to 1500-token outputs with no crash, and long answers",
+        "(900+ tokens) are not truncated, so --generation-config vllm is",
+        "unnecessary here. Stability over the ~24% sampler speedup."
+      ],
       "_image_comment": [
         "DiffusionGemma requires the vLLM 'gemma' bring-up build (vLLM",
         "0.22.1rc1+, arch DiffusionGemmaForBlockDiffusion). That build",

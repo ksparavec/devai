@@ -491,6 +491,106 @@ func TestSynthesizeHFFromCache_OperatorCtxCapClamps(t *testing.T) {
 	}
 }
 
+// TestSynthesizeHFFromCache_ServingOkGate verifies the serving-time LOAD
+// probe gate: a cell that loaded (fits=true) but OOMed under a near-full
+// context request (serving_ok=false) must NOT raise the per-name context
+// cap. The cap settles on the largest tier that both fits AND serves.
+// This is the DiffusionGemma regression: the fit probe said fits@256K,
+// the load probe says serving_ok=false there, so the router must cap the
+// model at the highest serving-verified tier instead of advertising 256K.
+func TestSynthesizeHFFromCache_ServingOkGate(t *testing.T) {
+	servingOK := true
+	servingBad := false
+	cache := map[string]*hfCacheEntry{
+		"vendor/diffgemma@cafe": {
+			SchemaVersion: 2,
+			Repo:          "vendor/diffgemma",
+			Aliases:       []string{"diffgemma"},
+			MaxContext:    262144,
+			Capability:    CapInline,
+			Probes: map[string]map[string]hfCacheProbe{
+				"24": {
+					// Loads AND serves at 32K/64K.
+					"32768": {Ctx: 32768, VramGB: 24, Fits: true, ServingOk: &servingOK},
+					"65536": {Ctx: 65536, VramGB: 24, Fits: true, ServingOk: &servingOK},
+					// Loads but OOMs under load at 128K/256K — must be excluded.
+					"131072": {Ctx: 131072, VramGB: 24, Fits: true, ServingOk: &servingBad},
+					"262144": {Ctx: 262144, VramGB: 24, Fits: true, ServingOk: &servingBad},
+				},
+			},
+		},
+	}
+	rows := synthesizeHFFromCache(cache, "vllm", 24, 262144, nil)
+	if len(rows) != 1 {
+		t.Fatalf("want 1 row, got %d", len(rows))
+	}
+	// ProbedMaxCtx is the runtime request ceiling (applyProbeCeiling caps
+	// each request to it). It must settle on the largest serving-verified
+	// tier — 128K/256K fit but serving_ok=false, so 64K wins.
+	if rows[0].ProbedMaxCtx != 65536 {
+		t.Errorf("ProbedMaxCtx=%d want 65536 (largest serving-verified tier; "+
+			"128K/256K fit but serving_ok=false)", rows[0].ProbedMaxCtx)
+	}
+}
+
+// TestSynthesizeHFFromCache_NilServingOkIsLegacy verifies that a cell
+// with no load-probe data (ServingOk == nil) gates on the fit verdict
+// alone — byte-for-byte the pre-load-probe behaviour. A model probed for
+// fit but never load-probed must still advertise its largest fitting ctx.
+func TestSynthesizeHFFromCache_NilServingOkIsLegacy(t *testing.T) {
+	cache := map[string]*hfCacheEntry{
+		"x/y@z": {
+			SchemaVersion: 2,
+			Aliases:       []string{"y"},
+			MaxContext:    131072,
+			Capability:    CapInline,
+			Probes: map[string]map[string]hfCacheProbe{
+				"24": {
+					"32768":  {Ctx: 32768, VramGB: 24, Fits: true},  // ServingOk nil
+					"131072": {Ctx: 131072, VramGB: 24, Fits: true}, // ServingOk nil
+				},
+			},
+		},
+	}
+	rows := synthesizeHFFromCache(cache, "vllm", 24, 262144, nil)
+	if len(rows) != 1 {
+		t.Fatalf("want 1 row, got %d", len(rows))
+	}
+	if rows[0].ProbedMaxCtx != 131072 {
+		t.Errorf("ProbedMaxCtx=%d want 131072 (fit-only gate when load "+
+			"probe never ran)", rows[0].ProbedMaxCtx)
+	}
+}
+
+// TestSynthesizeHFFromCache_AllServingFailDropsRow verifies the drop
+// path: a model whose ONLY fitting cell loads but OOMs under load
+// (serving_ok=false everywhere) must not be advertised at all. bestCtx
+// stays 0 and the row is dropped — handing an agent a model that
+// crash-loops on every request is worse than hiding it. This is the
+// pure DiffusionGemma case if even its smallest tier failed under load.
+func TestSynthesizeHFFromCache_AllServingFailDropsRow(t *testing.T) {
+	bad := false
+	cache := map[string]*hfCacheEntry{
+		"vendor/unservable@beef": {
+			SchemaVersion: 2,
+			Repo:          "vendor/unservable",
+			Aliases:       []string{"unservable"},
+			MaxContext:    32768,
+			Capability:    CapInline,
+			Probes: map[string]map[string]hfCacheProbe{
+				"24": {
+					"32768": {Ctx: 32768, VramGB: 24, Fits: true, ServingOk: &bad},
+				},
+			},
+		},
+	}
+	rows := synthesizeHFFromCache(cache, "vllm", 24, 131072, nil)
+	if len(rows) != 0 {
+		t.Errorf("want 0 rows (model fits but never serves), got %d: %+v",
+			len(rows), rows)
+	}
+}
+
 // --- TestGPUExclusion ---
 
 func TestEnsureBackendRunning_OllamaAlwaysSucceeds(t *testing.T) {
