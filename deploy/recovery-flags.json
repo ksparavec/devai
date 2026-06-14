@@ -113,6 +113,23 @@
         "VLLM_FLASHINFER_MOE_BACKEND": "throughput"
       }
     },
+    "Qwen3-Coder-30B-A3B-Instruct-FP4": {
+      "engine_flags": [
+        "--enforce-eager"
+      ],
+      "_engine_flags_comment": [
+        "Same CUDA-graph-workspace trade as Nemotron-3-Nano-30B (the sibling",
+        "30B MoE NVFP4 on this card). The load probe found engine init aborts",
+        "at 64K with 'ValueError: 3.0 GiB KV cache needed > 2.27 GiB",
+        "available' -- a ~0.73 GiB deficit after weights + the ~4 GiB",
+        "cudagraph workspace. --enforce-eager frees that workspace so the KV",
+        "pool fits, lifting the model past its previous 32K serve cap. Cost:",
+        "~10-20% decode throughput (no graph batching); zero correctness or",
+        "quality impact (identical kernels, just launched eagerly). Model has",
+        "max_position_embeddings=262144 native, so this is engine tuning, not",
+        "a context extension -- consistent with the as-delivered policy."
+      ]
+    },
     "diffusiongemma-26B-A4B-it-NVFP4": {
       "image": "docker.io/vllm/vllm-openai:gemma-x86_64-cu130",
       "engine_flags": [
