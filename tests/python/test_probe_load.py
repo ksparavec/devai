@@ -97,7 +97,7 @@ class TestBuildHaystackPrompt(unittest.TestCase):
     def test_fill_scales_with_chars_per_token(self) -> None:
         ctx = 16384
         p = L.build_haystack_prompt(self.corpus, ctx, depth=0.5)
-        body_tokens = ctx - L._CTX_HEADROOM_TOKENS
+        body_tokens = ctx - L._OUTPUT_HEADROOM_TOKENS
         expected_body_chars = int(body_tokens * L._CHARS_PER_TOKEN)
         # Prompt = body + needle sentence + question; should exceed the
         # body estimate but stay within a small constant overhead of it.
@@ -110,6 +110,107 @@ class TestBuildHaystackPrompt(unittest.TestCase):
         bottom = L.build_haystack_prompt(self.corpus, 8192, depth=0.9)
         self.assertLess(top.index(L._NEEDLE_CODE) / len(top), 0.5)
         self.assertGreater(bottom.index(L._NEEDLE_CODE) / len(bottom), 0.5)
+
+
+class TestFullWindowFill(unittest.TestCase):
+    """Tokenizer-verified sizing fills the KV pool to ~99% of ctx so the
+    load probe exercises the true ceiling, not the ~88% a char estimate
+    reaches. No real network -- _count_tokens / http_post are stubbed."""
+
+    def setUp(self) -> None:
+        self.corpus = "Word " * 500_000
+
+    def test_falls_back_to_char_estimate_without_tokenizer(self) -> None:
+        orig = L._count_tokens
+        L._count_tokens = lambda b, m, p: None
+        try:
+            prompt, count, method = L.build_full_window_prompt(
+                "http://x", "m", self.corpus, 8192, 0.5)
+        finally:
+            L._count_tokens = orig
+        self.assertEqual(method, "char-estimate")
+        self.assertIsNone(count)
+        self.assertIn(L._NEEDLE_CODE, prompt)
+
+    def test_converges_to_target_and_never_overshoots(self) -> None:
+        # Simulate a tokenizer at ~4.0 chars/token -- denser than the 3.5
+        # seed, so the first pass undershoots and the loop must grow it.
+        calls = {"n": 0}
+
+        def fake_count(base_url, model_name, prompt):
+            calls["n"] += 1
+            return len(prompt) // 4
+
+        orig = L._count_tokens
+        L._count_tokens = fake_count
+        try:
+            ctx = 65536
+            prompt, count, method = L.build_full_window_prompt(
+                "http://x", "m", self.corpus, ctx, 0.5)
+        finally:
+            L._count_tokens = orig
+        target = ctx - L._OUTPUT_HEADROOM_TOKENS
+        self.assertEqual(method, "tokenized")
+        self.assertLessEqual(count, target)               # never over ctx
+        self.assertGreaterEqual(count, target - L._TOKENIZE_TOL)  # near target
+        # ~99% of the window -> the pool is genuinely exercised.
+        self.assertGreater(count / ctx, 0.98)
+        self.assertGreater(calls["n"], 1)                 # iterated
+
+    def test_calibration_fallback_when_no_tokenize(self) -> None:
+        # /tokenize absent (SGLang) but the calibration chat works -> size
+        # from the measured chars/token, method="calibrated".
+        orig_count, orig_cal = L._count_tokens, L._calibrate_chars_per_token
+        L._count_tokens = lambda b, m, p: None
+        L._calibrate_chars_per_token = lambda b, m, c: 4.0
+        try:
+            ctx = 65536
+            prompt, count, method = L.build_full_window_prompt(
+                "http://x", "m", self.corpus, ctx, 0.5)
+        finally:
+            L._count_tokens, L._calibrate_chars_per_token = orig_count, orig_cal
+        self.assertEqual(method, "calibrated")
+        self.assertIsNone(count)
+        # Sized at ~4 chars/token to just under the token target -> the
+        # char length should be near (ctx - headroom - tol) * 4.
+        approx = (ctx - L._OUTPUT_HEADROOM_TOKENS - L._TOKENIZE_TOL) * 4.0
+        self.assertGreater(len(prompt), approx * 0.9)
+
+    def test_char_estimate_when_calibration_also_fails(self) -> None:
+        orig_count, orig_cal = L._count_tokens, L._calibrate_chars_per_token
+        L._count_tokens = lambda b, m, p: None
+        L._calibrate_chars_per_token = lambda b, m, c: None
+        try:
+            _, count, method = L.build_full_window_prompt(
+                "http://x", "m", self.corpus, 8192, 0.5)
+        finally:
+            L._count_tokens, L._calibrate_chars_per_token = orig_count, orig_cal
+        self.assertEqual(method, "char-estimate")
+        self.assertIsNone(count)
+
+    def test_count_tokens_none_on_transport_error(self) -> None:
+        orig = L.http_post
+
+        def boom(url, body, timeout):
+            raise OSError("connection refused")
+
+        L.http_post = boom
+        try:
+            self.assertIsNone(L._count_tokens("http://x", "m", "hi"))
+        finally:
+            L.http_post = orig
+
+    def test_count_tokens_parses_count_then_tokens(self) -> None:
+        orig = L.http_post
+        L.http_post = lambda url, body, timeout: {"count": 42}
+        try:
+            self.assertEqual(L._count_tokens("http://x", "m", "hi"), 42)
+            L.http_post = lambda url, body, timeout: {"tokens": [1, 2, 3]}
+            self.assertEqual(L._count_tokens("http://x", "m", "hi"), 3)
+            L.http_post = lambda url, body, timeout: {"error": "no"}
+            self.assertIsNone(L._count_tokens("http://x", "m", "hi"))
+        finally:
+            L.http_post = orig
 
 
 class TestScoreNeedle(unittest.TestCase):

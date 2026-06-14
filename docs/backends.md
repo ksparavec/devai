@@ -189,13 +189,24 @@ fit probe already marked `fits=true`, it:
 1. relaunches the backend at that `--max-model-len` with the SAME
    verified parsers + recovery flags the router serves with,
 2. records a baseline VRAM reading once `/health` passes (idle),
-3. builds a haystack prompt filled to `ctx - 2048` tokens from a
-   public-domain corpus (Moby-Dick + War and Peace), with a unique needle
-   (`RHINO-7741-DELTA-VAULT`) inserted at `PROBE_NEEDLE_DEPTH`. The corpus
-   is fetched from Project Gutenberg on first use into
-   `~/.cache/devai/probe-corpus/` (override with `DEVAI_PROBE_CORPUS_DIR`;
-   pre-populate it on an air-gapped host) -- it is NOT vendored in git,
-4. sends ONE ~2048-token completion while a 0.1s VRAM sampler runs,
+3. builds a haystack prompt that fills the KV pool to ~99% of the window
+   (target `ctx - 512` tokens, so the pool is exercised near its true
+   ceiling where real OOMs happen -- a static char estimate only reaches
+   ~85-88%). The size is tokenizer-verified: the prompt is grown/trimmed
+   against the backend's `/tokenize` endpoint until it lands at-or-just-
+   under target. vLLM exposes `/tokenize` (exact, lands at 0.98-1.00 fill);
+   SGLang does NOT, so it falls back to calibrating chars/token from a
+   short chat's `usage.prompt_tokens` (`serving_fill_method=calibrated`,
+   lands ~0.76-0.94 -- less precise, but SGLang's models are non-tight).
+   Each cell records `serving_fill_ratio` + `serving_fill_method` for
+   audit. The haystack is a public-domain corpus (Moby-Dick + War and
+   Peace) with a unique needle (`RHINO-7741-DELTA-VAULT`) at
+   `PROBE_NEEDLE_DEPTH`; the corpus is fetched from Project Gutenberg on
+   first use into `~/.cache/devai/probe-corpus/` (override with
+   `DEVAI_PROBE_CORPUS_DIR`; pre-populate on an air-gapped host) -- it is
+   NOT vendored in git,
+4. sends ONE completion (max_tokens 256, small so prompt+output stays
+   under `--max-model-len`) while a 0.1s VRAM sampler runs,
 5. captures the peak, scores needle retrieval, classifies OOM
    (transport error / container exit / OOM markers in logs),
 6. augments the cell with `serving_ok`, `serving_peak_gb`,

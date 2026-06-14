@@ -75,6 +75,7 @@ from _probe_hf_common import (
     gpu_memory_used_mb,
     host_scaled_fraction,
     http_get,
+    http_post,
     is_downloaded,
     load_catalog_hf_rows,
     model_size_gb_from_row,
@@ -119,14 +120,31 @@ _CORPUS_SOURCES: dict[str, list[str]] = {
 # mirror. Both target books are > 1 MB.
 _CORPUS_MIN_CHARS = 200_000
 
-# Matches bench_longctx's estimate. English prose averages ~4 chars/token
-# under BPE; 3.5 is deliberately conservative so a target of (ctx - 2048)
-# undershoots rather than overflows the model's --max-model-len.
+# Seed estimate only -- the real prompt size is tokenizer-verified against
+# the backend's /tokenize endpoint (see build_full_window_prompt). English
+# prose is ~4 chars/token under BPE; 3.5 deliberately undershoots so the
+# first pass is below target and we grow up to it rather than overflow.
 _CHARS_PER_TOKEN = 3.5
 
-# Headroom (in tokens) reserved below --max-model-len for the completion
-# plus prompt-overhead slack. The fill targets ctx minus this.
-_CTX_HEADROOM_TOKENS = 2048
+# Tokens reserved below --max-model-len for the completion. Small, so the
+# PROMPT fills the KV pool to ~99% during prefill -- that is the point of
+# the load probe: exercise the pool near its true ceiling, where real OOMs
+# happen, not the ~88% a char estimate lands at. max_tokens is set below
+# this so prompt+output stays under ctx (no length-reject).
+_OUTPUT_HEADROOM_TOKENS = 512
+_MAX_OUTPUT_TOKENS = 256
+
+# Tokenizer-verify loop bounds: converge the prompt to within _TOKENIZE_TOL
+# tokens of (ctx - _OUTPUT_HEADROOM_TOKENS), at most _TOKENIZE_MAX_ITERS
+# /tokenize round-trips. Land AT or just UNDER target (never over, so the
+# request can't be length-rejected).
+_TOKENIZE_TOL = 96
+_TOKENIZE_MAX_ITERS = 6
+
+# Chars of corpus sent in the calibration chat when /tokenize is absent
+# (e.g. SGLang) -- enough to measure chars/token accurately, small enough
+# to prefill in a couple seconds.
+_CALIBRATION_SAMPLE_CHARS = 40_000
 
 # A novel string that cannot be in any training set, so a correct answer
 # proves retrieval from THIS context rather than memorisation.
@@ -225,25 +243,132 @@ def load_corpus() -> str:
     return "\n\n".join(parts)
 
 
-def build_haystack_prompt(corpus: str, ctx_target: int, depth: float = 0.5) -> str:
-    """Fill the corpus to ``ctx_target - headroom`` tokens, insert the
-    needle at ``depth`` (0.0=top, 1.0=bottom), append the recall
-    question. Char-based estimate; the actual prompt_tokens are read back
-    from the response usage for the cell record.
-    """
-    body_tokens = max(256, ctx_target - _CTX_HEADROOM_TOKENS)
-    body_chars = int(body_tokens * _CHARS_PER_TOKEN)
+def _assemble_prompt(corpus: str, body_chars: int, depth: float) -> str:
+    """Build a haystack of ``body_chars`` chars from the (repeated) corpus,
+    insert the needle at ``depth`` (0.0=top, 1.0=bottom) snapped to a
+    paragraph boundary, and append the recall question."""
+    body_chars = max(1, body_chars)
     haystack = corpus
     while len(haystack) < body_chars:
         haystack += "\n\n" + corpus
     haystack = haystack[:body_chars]
     cut = max(0, min(len(haystack), int(len(haystack) * depth)))
-    # Snap forward to the next paragraph boundary so the needle lands
-    # between sentences, not mid-word.
     nl = haystack.find("\n", cut)
     if nl != -1:
         cut = nl
     return haystack[:cut] + _NEEDLE_SENTENCE + haystack[cut:] + _QUESTION
+
+
+def build_haystack_prompt(corpus: str, ctx_target: int, depth: float = 0.5) -> str:
+    """Char-estimate fill to ``ctx_target - _OUTPUT_HEADROOM_TOKENS`` tokens.
+    Used as the seed/fallback when no tokenizer is reachable; the actual
+    full-window fill is tokenizer-verified by build_full_window_prompt."""
+    body_tokens = max(256, ctx_target - _OUTPUT_HEADROOM_TOKENS)
+    return _assemble_prompt(corpus, int(body_tokens * _CHARS_PER_TOKEN), depth)
+
+
+def _count_tokens(base_url: str, model_name: str, prompt: str) -> int | None:
+    """Token count of ``prompt`` AS the backend will see it in a chat
+    request -- i.e. with the chat template applied (add_generation_prompt)
+    so template overhead is included. Uses the OpenAI-compatible /tokenize
+    endpoint (vLLM and SGLang both expose it). None when unavailable, so
+    the caller falls back to the char estimate.
+    """
+    body = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": prompt}],
+        "add_generation_prompt": True,
+    }
+    try:
+        resp = http_post(f"{base_url}/tokenize", body, timeout=30.0)
+    except (urllib.error.URLError, TimeoutError, OSError,
+            json.JSONDecodeError):
+        return None
+    if not isinstance(resp, dict) or resp.get("error"):
+        return None
+    if isinstance(resp.get("count"), int):
+        return resp["count"]
+    toks = resp.get("tokens")
+    return len(toks) if isinstance(toks, list) else None
+
+
+def _calibrate_chars_per_token(
+    base_url: str, model_name: str, corpus: str,
+) -> float | None:
+    """Measure chars/token for this model+corpus from a short chat's
+    usage.prompt_tokens -- a backend-agnostic substitute for /tokenize on
+    engines that don't expose it (e.g. SGLang). Returns None when the
+    calibration chat fails (caller then keeps the static char estimate).
+    """
+    sample = corpus[:_CALIBRATION_SAMPLE_CHARS]
+    resp = _post_chat(
+        base_url,
+        {"model": model_name,
+         "messages": [{"role": "user", "content": sample}],
+         "max_tokens": 1, "temperature": 0.0, "stream": False},
+        timeout=180.0,
+    )
+    if isinstance(resp, dict) and not resp.get("error"):
+        pt = (resp.get("usage") or {}).get("prompt_tokens")
+        if isinstance(pt, int) and pt > 0:
+            return len(sample) / pt
+    return None
+
+
+def build_full_window_prompt(
+    base_url: str, model_name: str, corpus: str, ctx: int, depth: float,
+) -> tuple[str, int | None, str]:
+    """Build a prompt that fills the KV pool to ~99% of ``ctx``: target
+    ``ctx - _OUTPUT_HEADROOM_TOKENS`` ACTUAL tokens, verified via /tokenize
+    and grown/trimmed to land at-or-just-under target. This is what makes
+    the load probe exercise the pool near its true ceiling instead of the
+    ~88% a static char estimate reaches.
+
+    Returns ``(prompt, actual_tokens|None, method)`` where method is
+    ``"tokenized"`` (verified) or ``"char-estimate"`` (no /tokenize -- the
+    fill may undershoot; the caller records the real fill from usage).
+    """
+    target = max(256, ctx - _OUTPUT_HEADROOM_TOKENS)
+    body_chars = int(target * _CHARS_PER_TOKEN)
+    prompt = _assemble_prompt(corpus, body_chars, depth)
+    count = _count_tokens(base_url, model_name, prompt)
+    if count is None:
+        # /tokenize unavailable (e.g. SGLang): calibrate chars/token from a
+        # short chat's usage.prompt_tokens and size from the measured ratio
+        # -- far closer to the window than the static 3.5 estimate, with no
+        # /tokenize dependency. Aims just under target so the request can't
+        # be length-rejected; the HTTP-400 retry is the final backstop.
+        cpt = _calibrate_chars_per_token(base_url, model_name, corpus)
+        if cpt is None:
+            return prompt, None, "char-estimate"
+        safe_target = max(256, target - _TOKENIZE_TOL)
+        prompt = _assemble_prompt(corpus, int(safe_target * cpt), depth)
+        return prompt, None, "calibrated"
+
+    for _ in range(_TOKENIZE_MAX_ITERS):
+        # Done once we are within tolerance AND not over target (staying
+        # under guarantees the request can't be length-rejected).
+        if target - _TOKENIZE_TOL <= count <= target:
+            break
+        # Re-estimate chars/token from the live measurement and aim a
+        # half-tolerance under target so we converge from below.
+        measured_cpt = len(prompt) / max(1, count)
+        desired = target - _TOKENIZE_TOL // 2
+        body_chars = max(1, body_chars + int((desired - count) * measured_cpt))
+        prompt = _assemble_prompt(corpus, body_chars, depth)
+        new_count = _count_tokens(base_url, model_name, prompt)
+        if new_count is None:
+            break
+        count = new_count
+
+    # Final guard: if we still overshot target, shrink until <= target so
+    # prompt + max_tokens stays under ctx.
+    while count is not None and count > target and body_chars > 1:
+        body_chars = int(body_chars * 0.97)
+        prompt = _assemble_prompt(corpus, body_chars, depth)
+        count = _count_tokens(base_url, model_name, prompt)
+
+    return prompt, count, "tokenized"
 
 
 def score_needle(response_text: str) -> float:
@@ -478,12 +603,17 @@ def load_probe_one_cell(
     # request. transient = peak - baseline isolates the per-step buffers.
     baseline_gb = round(gpu_memory_used_mb() / 1024, 2)
 
-    prompt = build_haystack_prompt(corpus, requested_ctx, depth=needle_depth)
+    # Tokenizer-verified fill to ~99% of the window so the KV pool is
+    # exercised near its true ceiling (where real OOMs happen), not the
+    # ~88% a static char estimate reaches. max_tokens stays well under the
+    # headroom so prompt+output can't exceed --max-model-len.
+    prompt, fill_tokens, fill_method = build_full_window_prompt(
+        base_url, model_name, corpus, requested_ctx, needle_depth)
     body = {
         "model": model_name,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.0,
-        "max_tokens": 2048,
+        "max_tokens": _MAX_OUTPUT_TOKENS,
         "stream": False,
     }
 
@@ -556,6 +686,13 @@ def load_probe_one_cell(
         "needle_score": needle,
         "serving_input_tokens": input_tokens,
         "serving_output_tokens": output_tokens,
+        # How full the KV pool actually got: input_tokens / ctx, from the
+        # engine's own usage count. ~0.99 means the window was genuinely
+        # exercised; a low value (char-estimate fallback) means the OOM
+        # ceiling at full fill was NOT tested -- surfaced for auditing.
+        "serving_fill_ratio": (round(input_tokens / requested_ctx, 3)
+                               if input_tokens else None),
+        "serving_fill_method": fill_method,
         "predicted_logits_gb": pred_logits,
         "serving_chat_timeout_s": round(chat_timeout, 1),
         "serving_probed_at": now_iso(),
