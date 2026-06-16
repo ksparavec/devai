@@ -123,3 +123,9 @@ graphify-out/
 /run/devai
 *.env.plain
 !deploy/*.sops.env
+# pipelock egress proxy: the CA is per-host and NEVER committed. The private
+# key lives on the host (~/.config/devai/pipelock-ca-key.pem, 0600); the public
+# cert (deploy/pipelock-ca.crt) is only a local build input the lab image bakes
+# in. Both are regenerated per host by `make pipelock-ca-init`. Ignore both.
+deploy/pipelock-ca.crt
+deploy/*-ca-key.pem

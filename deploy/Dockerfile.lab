@@ -25,6 +25,11 @@ ENV ANTHROPIC_API_KEY=""
 # don't validate it.
 ENV CODEX_HOME=/home/devai/.codex
 ENV OPENAI_API_KEY=local
+# Enable opencode's built-in Exa-backed web SEARCH tool (no API key; calls Exa's
+# hosted endpoint, which egresses through pipelock and is inspected). Without
+# this, opencode has only webfetch (specific URLs) and the model resorts to
+# guessing URLs. opencode reads this env var at startup.
+ENV OPENCODE_ENABLE_EXA=1
 ENV UV_BREAK_SYSTEM_PACKAGES=1
 ENV PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1
 ENV PATH="/home/devai/.local/bin:${PATH}"
@@ -34,8 +39,25 @@ ENV PATH="/home/devai/.local/bin:${PATH}"
 # loads X11 client libs even in headless mode. Without it, OI crashes on
 # the first prompt with `libxcb.so.1: cannot open shared object file`.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ripgrep fzf libxcb1 \
+        ripgrep fzf libxcb1 ca-certificates \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# --- pipelock MITM CA trust (egress fail-closed; see docs/pipelock.md) ---
+# The lab egresses ONLY through the pipelock proxy, which presents per-host
+# leaf certs signed by this CA. Bake the CA into the system trust store so
+# curl / git / pip / uv / node validate transparently. deploy/pipelock-ca.crt
+# is the operator's CA public cert -- regenerate it for a real deployment with
+# `make pipelock-ca-init` (the shipped default's private key is intentionally
+# not distributed). Proxy env (HTTPS_PROXY/NO_PROXY) is injected at RUNTIME by
+# bin/devai-agent and the make lab/shell targets, not baked here.
+COPY deploy/pipelock-ca.crt /usr/local/share/ca-certificates/pipelock-ca.crt
+RUN update-ca-certificates
+ENV NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/pipelock-ca.crt \
+    REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
+    SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+    CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
+    GIT_SSL_CAINFO=/etc/ssl/certs/ca-certificates.crt \
+    PIP_CERT=/etc/ssl/certs/ca-certificates.crt
 
 # --- Binary installs (from local cache, populated by: make fetch) ---
 

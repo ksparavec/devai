@@ -7,6 +7,7 @@ services:
       - "3142:3142"
     volumes:
       - /var/cache/devai/apt:/var/cache/apt-cacher-ng
+    networks: [default, devai-lab-egress]   # also reachable by the egress-locked lab
     restart: unless-stopped
 
   registry-cache:
@@ -18,6 +19,7 @@ services:
     volumes:
       - /var/cache/devai/registry:/var/lib/registry
       - ./registry-config.yaml:/etc/docker/registry/config.yml:ro
+    networks: [default, devai-lab-egress]   # also reachable by the egress-locked lab
     restart: unless-stopped
 
   ollama:
@@ -84,6 +86,7 @@ services:
     image: localhost/devai-router:latest
     container_name: devai-router
     hostname: router
+    networks: [default, devai-lab-egress]   # also reachable by the egress-locked lab
     environment:
       - OLLAMA_URL=http://ollama:11434
       - OLLAMA_PORT=11434
@@ -281,9 +284,50 @@ services:
     network_mode: none
     restart: unless-stopped
 
+  # Egress firewall for the lab. The lab joins ONLY the internal
+  # devai-lab-egress network (no internet route); pipelock is dual-homed
+  # (devai-net = internet leg + devai-lab-egress = serves the lab) and is the
+  # lab's ONLY path out. It MITM-inspects TLS, DLP-blocks accidental secret
+  # egress (buggy-leak posture), and logs every decision (captured by the
+  # logger sidecar). See docs/pipelock.md. Always-on -- the locked lab depends
+  # on it. Requires an operator-bootstrapped CA (`make pipelock-ca-init`);
+  # without the host key it fails its healthcheck and the launcher refuses to
+  # start the lab (fail-closed, not fail-open).
+  pipelock:
+    image: ghcr.io/luckypipewrench/pipelock:latest
+    container_name: devai-pipelock
+    hostname: pipelock
+    command: ["run", "--listen", "0.0.0.0:8888", "--config", "/config/pipelock.yaml"]
+    networks: [default, devai-lab-egress]
+    volumes:
+      - ./pipelock.yaml:/config/pipelock.yaml:ro
+      - ./pipelock-ca.crt:/config/ca.crt:ro
+      # CA private key. `make cache-up` sets PIPELOCK_CA_KEY_FILE to the host
+      # key (~/.config/devai/pipelock-ca-key.pem, from `make pipelock-ca-init`).
+      # Defaults to /dev/null so installs that haven't bootstrapped the CA still
+      # parse; pipelock then fails its healthcheck and the lab launcher refuses
+      # to start (fail-closed).
+      - ${PIPELOCK_CA_KEY_FILE:-/dev/null}:/config/ca-key.pem:ro
+    cap_drop: [ALL]
+    security_opt:
+      - "no-new-privileges:true"
+    healthcheck:
+      test: ["CMD", "/pipelock", "healthcheck"]
+      interval: 10s
+      timeout: 3s
+      start_period: 10s
+      retries: 5
+    restart: unless-stopped
+
 networks:
   default:
     name: devai-net
+    external: true
+  # Internal (no-NAT) network the lab is confined to. Created with --internal
+  # by `make cache-up`; declared external here so compose attaches to the
+  # Makefile-created net rather than managing its lifecycle.
+  devai-lab-egress:
+    name: devai-lab-egress
     external: true
 
 volumes:
