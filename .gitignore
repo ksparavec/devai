@@ -123,3 +123,6 @@ graphify-out/
 /run/devai
 *.env.plain
 !deploy/*.sops.env
+
+deploy/pipelock-ca.crt
+
