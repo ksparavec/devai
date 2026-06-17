@@ -368,7 +368,7 @@ Python-style escape (`\u0120`) rather than pasting the glyph itself.
 
 ## Use the codebase knowledge base before/while editing
 
-**If a top-level `.understand-anything/` folder exists, consult it before making code changes.** It is an [Understand-Anything](https://github.com/Egonex-AI/Understand-Anything) knowledge graph of this repo — `knowledge-graph.json` (nodes/edges for files, functions, classes; 8 architectural layers; a guided tour), `meta.json` (commit it was built at), and `fingerprints.json`. It is generated from source under `src/fireman/` (tests/examples/slides are excluded by `.understand-anything/.understandignore`). Treat it as a navigation aid, not ground truth — always confirm against the actual source, and note it may be stale if `meta.json`'s `gitCommitHash` predates current `HEAD`.
+**If a top-level `.understand-anything/` folder exists, consult it before making code changes.** It is an [Understand-Anything](https://github.com/Egonex-AI/Understand-Anything) knowledge graph of this repo -- `knowledge-graph.json` (nodes/edges for files, functions, classes; 7 architectural layers; a 13-step guided tour), `meta.json` (commit it was built at), and `fingerprints.json`. It is generated from the whole repo -- the Go GPU-arbiter (`gpu-arbiter/`), the Python probe/bench/picker tooling (`scripts/`), the JupyterLab extension (`packages/`), the deploy/ansible infrastructure, and the `docs/` knowledge base. Only generated artifacts are excluded by `.understand-anything/.understandignore` (the `graphify-out/` graph, the runtime probe/bench caches, the compiled `gpu-arbiter/gpu-arbiter` binary, local agent state, and `.understand-anything/` itself); tests, docs, and scripts are included. Treat it as a navigation aid, not ground truth -- always confirm against the actual source, and note it may be stale if `meta.json`'s `gitCommitHash` predates current `HEAD`.
 
 Recommended commands (all from the `understand-anything` plugin; if the graph is missing, build it first with `/understand-anything:understand`):
 
@@ -381,7 +381,7 @@ Recommended commands (all from the `understand-anything` plugin; if the graph is
 | Visualize the graph | `/understand-anything:understand-dashboard` | Launches the interactive web dashboard |
 | Refresh the graph after commits | `/understand-anything:understand` (add `--full` to rebuild) | Incremental update of changed files; re-baselines `meta.json`/`fingerprints.json` |
 
-Typical loop for a change: `understand-explain` the area you're about to edit → make the edit → `understand-diff` to sanity-check impact and affected components → refresh with `/understand-anything:understand` if the change was structural.
+Typical loop for a change: `understand-explain` the area you're about to edit -> make the edit -> `understand-diff` to sanity-check impact and affected components -> refresh with `/understand-anything:understand` if the change was structural.
 
 # AK's CLAUDE.md
 
