@@ -50,7 +50,17 @@ follow() {
     # `--follow` blocks until the container ends or the stream errors.
     # `--timestamps` prepends RFC3339Nano per line so we can correlate
     # across log files.
-    $PODMAN logs --follow --timestamps "$name" >> "$out" 2>&1 || true
+    #
+    # devai-pipelock emits a benign net.ErrClosed line ("use of closed network
+    # connection") on every proxied request teardown -- pipelock has no config
+    # knob to suppress it (see docs/pipelock.md). Drop it from the persisted log
+    # for that one service; all other streams pass through unfiltered.
+    if [ "$name" = "devai-pipelock" ]; then
+      $PODMAN logs --follow --timestamps "$name" 2>&1 \
+        | grep -v --line-buffered 'use of closed network connection' >> "$out" || true
+    else
+      $PODMAN logs --follow --timestamps "$name" >> "$out" 2>&1 || true
+    fi
     echo "[$(stamp)] [logger] follower for $name exited; retry in 5s" >> "$out"
     sleep 5
   done

@@ -84,7 +84,16 @@ DEFAULTS: dict = {
     "agent_session_file": None,
 }
 
-DEVAI_NETWORK = "devai-net"
+# Fail-closed egress: the lab joins this INTERNAL network (no internet route)
+# and reaches the outside world only through the pipelock MITM proxy. Set
+# DEVAI_NO_EGRESS_LOCK=1 to fall back to the open network (UNSAFE -- no egress
+# control; debugging only). See docs/pipelock.md.
+DEVAI_NETWORK = "devai-lab-egress"
+DEVAI_OPEN_NETWORK = "devai-net"
+PIPELOCK_CONTAINER = "devai-pipelock"
+PIPELOCK_PROXY = "http://devai-pipelock:8888"
+# Internal hosts that must bypass the proxy (router for inference, caches).
+NO_PROXY_HOSTS = "devai-router,router,apt-cache,registry-cache,ollama,localhost,127.0.0.1,::1"
 OLLAMA_HOST = "http://devai-router:11434"
 FALLBACK_MODEL = "qwen3.5:9b-q8_0"
 CONTAINER_USER = "devai"
@@ -139,6 +148,19 @@ def runtime_check(runtime: str, kind: str, name: str) -> bool:
     return cp.returncode == 0
 
 
+def _egress_locked() -> bool:
+    """Fail-closed egress is on unless explicitly disabled for debugging."""
+    return not os.environ.get("DEVAI_NO_EGRESS_LOCK")
+
+
+def _pipelock_healthy(runtime: str) -> bool:
+    cp = subprocess.run(
+        [runtime, "inspect", "-f", "{{.State.Health.Status}}", PIPELOCK_CONTAINER],
+        capture_output=True, text=True, check=False,
+    )
+    return cp.returncode == 0 and cp.stdout.strip() == "healthy"
+
+
 def preflight(runtime: str, image: str) -> None:
     if not shutil.which(runtime):
         sys.exit(f"error: container runtime {runtime!r} not on PATH "
@@ -147,9 +169,18 @@ def preflight(runtime: str, image: str) -> None:
         which = "cpu" if image.endswith("-cpu") else "gpu"
         sys.exit(f"error: image {image!r} not found.\n"
                  f"       Build it from the devai repo: `make build-{which}`.")
-    if not runtime_check(runtime, "network", DEVAI_NETWORK):
-        sys.exit(f"error: network {DEVAI_NETWORK!r} not found.\n"
+    net = DEVAI_NETWORK if _egress_locked() else DEVAI_OPEN_NETWORK
+    if not runtime_check(runtime, "network", net):
+        sys.exit(f"error: network {net!r} not found.\n"
                  f"       Start the cache services: `make cache-up`.")
+    if _egress_locked() and not _pipelock_healthy(runtime):
+        sys.exit("error: egress proxy 'devai-pipelock' is not healthy.\n"
+                 "       The lab is network fail-closed and has no internet\n"
+                 "       route except through it. Start the cache services\n"
+                 "       (`make cache-up`) and bootstrap the CA once\n"
+                 "       (`make pipelock-ca-init`).\n"
+                 "       To bypass without egress control (UNSAFE):\n"
+                 "       set DEVAI_NO_EGRESS_LOCK=1.")
     # Require at least the Ollama cache — without it the picker's first
     # screen is empty. vLLM and SGLang caches are optional.
     ollama_cache = PROBE_CACHES["ollama"]
@@ -169,8 +200,27 @@ def gpu_flags(runtime: str, cpu_only: bool) -> list[str]:
     return ["--gpus", "all"]
 
 
+def network_flags() -> list[str]:
+    if _egress_locked():
+        # Internal net, no internet route, no host-gateway: the lab can reach
+        # only pipelock + dual-homed infra. This is the fail-closed lock.
+        return ["--network", DEVAI_NETWORK]
+    return ["--network", DEVAI_OPEN_NETWORK,
+            "--add-host=host.containers.internal:host-gateway"]
+
+
 def proxy_env() -> list[str]:
-    out: list[str] = []
+    if _egress_locked():
+        # Force ALL egress through pipelock; internal hosts bypass via NO_PROXY.
+        out: list[str] = []
+        for var in ("HTTP_PROXY", "HTTPS_PROXY"):
+            out += ["-e", f"{var}={PIPELOCK_PROXY}",
+                    "-e", f"{var.lower()}={PIPELOCK_PROXY}"]
+        out += ["-e", f"NO_PROXY={NO_PROXY_HOSTS}",
+                "-e", f"no_proxy={NO_PROXY_HOSTS}"]
+        return out
+    # Legacy/unsafe: pass through whatever the host has set.
+    out = []
     for var in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"):
         val = os.environ.get(var)
         if val:
@@ -219,8 +269,7 @@ def build_run_cmd(
 
     cmd += [
         *gpu_flags(runtime, cpu_only),
-        "--network", DEVAI_NETWORK,
-        "--add-host=host.containers.internal:host-gateway",
+        *network_flags(),
         *proxy_env(),
         "-e", f"OLLAMA_HOST={OLLAMA_HOST}",
         "-e", f"OLLAMA_DEFAULT_MODEL={pref_model or FALLBACK_MODEL}",
