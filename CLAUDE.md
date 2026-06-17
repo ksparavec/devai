@@ -366,6 +366,23 @@ fixtures, byte-level BPE markers). Inside markdown, when discussing
 such codepoints, refer to them by hex name (`U+0120`) or by
 Python-style escape (`\u0120`) rather than pasting the glyph itself.
 
+## Use the codebase knowledge base before/while editing
+
+**If a top-level `.understand-anything/` folder exists, consult it before making code changes.** It is an [Understand-Anything](https://github.com/Egonex-AI/Understand-Anything) knowledge graph of this repo — `knowledge-graph.json` (nodes/edges for files, functions, classes; 8 architectural layers; a guided tour), `meta.json` (commit it was built at), and `fingerprints.json`. It is generated from source under `src/fireman/` (tests/examples/slides are excluded by `.understand-anything/.understandignore`). Treat it as a navigation aid, not ground truth — always confirm against the actual source, and note it may be stale if `meta.json`'s `gitCommitHash` predates current `HEAD`.
+
+Recommended commands (all from the `understand-anything` plugin; if the graph is missing, build it first with `/understand-anything:understand`):
+
+| Need | Command | What it does |
+|------|---------|--------------|
+| Explain a file/function/module before touching it | `/understand-anything:understand-explain <path-or-symbol>` | Deep-dive explanation of a specific file, function, or module |
+| Understand impact/risk of current changes | `/understand-anything:understand-diff` | Analyzes the git diff / PR: what changed, affected components, blast radius, risks |
+| Ask free-form questions about the code | `/understand-anything:understand-chat` | Q&A over the codebase grounded in the knowledge graph |
+| Extract / explore domain knowledge | `/understand-anything:understand-domain` | Builds an interactive business-domain flow graph (derives from the existing graph when present) |
+| Visualize the graph | `/understand-anything:understand-dashboard` | Launches the interactive web dashboard |
+| Refresh the graph after commits | `/understand-anything:understand` (add `--full` to rebuild) | Incremental update of changed files; re-baselines `meta.json`/`fingerprints.json` |
+
+Typical loop for a change: `understand-explain` the area you're about to edit → make the edit → `understand-diff` to sanity-check impact and affected components → refresh with `/understand-anything:understand` if the change was structural.
+
 # AK's CLAUDE.md
 
 Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-specific instructions as needed.

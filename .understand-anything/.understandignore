@@ -126,3 +126,5 @@ deploy/.bench-cache.json
 .codex
 .aider*
 tests/.matrix-logs/
+# understand-anything's own working dir -- don't analyze the graph's own state files
+.understand-anything/
