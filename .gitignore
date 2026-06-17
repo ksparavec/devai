@@ -130,3 +130,9 @@ graphify-out/
 # in. Both are regenerated per host by `make pipelock-ca-init`. Ignore both.
 deploy/pipelock-ca.crt
 deploy/*-ca-key.pem
+
+# understand-anything: keep the graph (knowledge-graph.json, meta.json,
+# fingerprints.json, config.json, .understandignore) but never commit scratch
+.understand-anything/.trash-*/
+.understand-anything/tmp/
+

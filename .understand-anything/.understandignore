@@ -1,0 +1,128 @@
+# .understandignore — patterns for files/dirs to exclude from analysis
+# Syntax: same as .gitignore (globs, # comments, ! negation, trailing / for dirs)
+# Lines below are suggestions — uncomment to activate.
+# Use ! prefix to force-include something excluded by defaults.
+#
+# Built-in defaults (always excluded unless negated):
+#   node_modules/, .git/, dist/, build/, obj/, *.lock, *.min.js, etc.
+#
+# --- From .gitignore (uncomment to exclude) ---
+
+# *.py[cod]
+# *$py.class
+# *.so
+# .Python
+# develop-eggs/
+# downloads/
+# eggs/
+# .eggs/
+# lib/
+# lib64/
+# parts/
+# sdist/
+# var/
+# wheels/
+# *.egg-info/
+# .installed.cfg
+# *.egg
+# MANIFEST
+# .env
+# requirements.txt
+# env/
+# ENV/
+# env.bak/
+# venv.bak/
+# .ipynb_checkpoints/
+# *.o
+# *.obj
+# *.elf
+# *.exe
+# *.out
+# *.app
+# *.i
+# *.s
+# *.so
+# *.dylib
+# *.dll
+# *.lib
+# *.a
+# *.pch
+# *.d
+# *.gch
+# *.tlog
+# /target/
+# **/*.rs.bk
+# debug/
+# release/
+# .DS_Store
+# .DS_Store?
+# ._*
+# .Spotlight-V100
+# .Trashes
+# ehthumbs.db
+# Thumbs.db
+# .Trash-0/
+# *.swp
+# *.swo
+# *~
+# deploy/compose/.env
+# deploy/compose/work/
+# deploy/terraform/**/.terraform/
+# deploy/terraform/**/.terraform.lock.hcl
+# deploy/terraform/**/terraform.tfstate
+# deploy/terraform/**/terraform.tfstate.backup
+# deploy/terraform/**/terraform.tfvars
+# deploy/terraform/**/*.tfplan
+# deploy/terraform/**/crash.log
+# deploy/kubernetes/**/secrets.yaml
+# config/secrets.yaml
+# !deploy/compose/.env.example
+# !deploy/terraform/**/terraform.tfvars.example
+# !config/secrets.example.yaml
+# **/.yarn/install-state.gz
+# *.tsbuildinfo
+# .claude/
+# tests/.matrix-logs
+# .aider*
+# .codex
+# deploy/.ollama-reasoning-cache.json
+# deploy/.vllm-reasoning-cache.json
+# deploy/.sglang-reasoning-cache.json
+# deploy/.bench-cache.json
+# gpu-arbiter/gpu-arbiter
+# graphify-out/
+# .graphify-input/
+# /run/devai
+# *.env.plain
+# !deploy/*.sops.env
+# deploy/pipelock-ca.crt
+# deploy/*-ca-key.pem
+
+# --- Detected directories (uncomment to exclude) ---
+
+# tests/
+# docs/
+# scripts/
+
+# --- Test file patterns (uncomment to exclude) ---
+
+# *.test.*
+# *.spec.*
+# *.snap
+
+# --- ACTIVE: generated artifacts / local tool state (NOT devai source) ---
+# graphify tool output: 16M, 151 md + 380 json -- another tool's graph, not our code.
+graphify-out/
+.graphify-input/
+# compiled Go binary
+gpu-arbiter/gpu-arbiter
+# runtime probe/bench caches (gitignored, machine-generated data dumps)
+deploy/.ollama-reasoning-cache.json
+deploy/.vllm-reasoning-cache.json
+deploy/.sglang-reasoning-cache.json
+deploy/.bench-cache.json
+# local agent/test state
+.claude/
+.codex
+.aider*
+tests/.matrix-logs/
