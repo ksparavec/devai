@@ -66,6 +66,14 @@ from _probe_core import (  # noqa: E402
     smallest_clean_probe,
 )
 from _vllm_plugins import PluginEntry, PluginRegistry, get_registry  # noqa: E402
+from _model_status import (  # noqa: E402
+    clear as _ledger_clear,
+    exclusion_reason as _ledger_reason,
+    is_excluded as _ledger_is_excluded,
+    load_ledger as _load_ledger,
+    record_exclusion as _ledger_record,
+    save_ledger as _save_ledger,
+)
 
 
 # ── Defaults ─────────────────────────────────────────────────────────────────
@@ -744,17 +752,49 @@ _OOM_PATTERNS = (
 )
 
 
+# Lines that mark the START of the real failure, so the saved excerpt
+# captures the root cause and not just the generic "Engine core
+# initialization failed" tail that buried it (the gemma-4 case).
+_FAILURE_ANCHORS = (
+    "Traceback (most recent call last)",
+    "ValueError", "RuntimeError", "AssertionError", "KeyError",
+    "ImportError", "OSError", "Error:",
+)
+
+
+def _failure_excerpt(logs: str, context: int = 120) -> str:
+    """Pick the most informative ~`context` lines of a failed-launch log.
+
+    Anchors on the first explicit error/traceback line so the root cause is
+    preserved (vLLM prints a long traceback ending in a generic wrapper; the
+    real cause is near the top of it). Falls back to the tail when no anchor
+    is found.
+    """
+    lines = logs.strip().splitlines()
+    if len(lines) <= context:
+        return "\n".join(lines)
+    start = next(
+        (i for i, ln in enumerate(lines)
+         if any(a in ln for a in _FAILURE_ANCHORS)),
+        None,
+    )
+    if start is None:
+        return "\n".join(lines[-context:])
+    start = max(0, start - 3)
+    return "\n".join(lines[start:start + context])
+
+
 def classify_failure_logs(logs: str) -> dict:
     """Inspect container logs after a failed launch and tag the cause.
 
     Returns {kind, log_excerpt, matched_pattern?}. kind ∈ {arch, quant,
     oom_startup, infra}. The matched pattern is recorded when the cause
     is determined by a keyword match (everything except `infra`) so an
-    operator can audit why a particular run was tagged the way it was —
-    crucial because pattern matching runs against the full log but only
-    the last 30 lines land in the excerpt.
+    operator can audit why a particular run was tagged the way it was.
+    Pattern matching runs against the FULL log; `_failure_excerpt` then
+    saves the root-cause region (not just the tail) for the cache.
     """
-    excerpt = "\n".join(logs.strip().splitlines()[-30:])
+    excerpt = _failure_excerpt(logs)
     lc = logs.lower()
     for pat in _ARCH_ERROR_PATTERNS:
         if pat.lower() in lc:
@@ -1247,6 +1287,97 @@ def _latest_cell_with(entry: dict, field: str) -> dict | None:
 
 # ── Top-level entry maintenance ──────────────────────────────────────────────
 
+def _carry_forward_terminal(cache: dict, repo: str, new_entry: dict) -> bool:
+    """Inherit a sibling sha's TERMINAL verdict for the same repo.
+
+    A re-quant/commit changes the `repo@sha` cache key, so without this an
+    `unsupported_arch` model re-probes under the new key every catalog-regen
+    (the gemma double-key churn). Only `unsupported_arch` carries -- it does
+    not depend on the exact weights. OOM is weight-specific and is re-checked
+    on a new sha (plan decision 2); `infra`/`error` are run-specific.
+    """
+    for k, e in cache.items():
+        if not isinstance(e, dict) or k.startswith("_") or e is new_entry:
+            continue
+        if e.get("repo") == repo and e.get("capability") == Capability.UNSUPPORTED_ARCH:
+            new_entry["capability"] = Capability.UNSUPPORTED_ARCH
+            new_entry["evidence"] = dict(e.get("evidence") or {})
+            new_entry["carried_from_sha"] = e.get("sha")
+            return True
+    return False
+
+
+def prune_orphaned_shas(cache: dict, catalog_rows: list[dict]) -> int:
+    """Drop `repo@sha` entries stranded by a re-quant/commit.
+
+    An orphan is a cache entry whose `repo` is still in the catalog but at a
+    DIFFERENT (current) sha. Pruned ONLY when a current-sha entry for that
+    repo already exists in the cache, so the last/only data for a repo is
+    never lost (and a carried-forward terminal verdict already lives on the
+    current-sha entry by the time this runs). Returns the count pruned.
+    """
+    current: dict[str, str] = {}
+    for row in catalog_rows:
+        repo = row.get("repo")
+        sha = (row.get("sha") or "").strip()
+        if repo and sha:
+            current[repo] = sha
+    have_current = {
+        e.get("repo") for k, e in cache.items()
+        if isinstance(e, dict) and not k.startswith("_")
+        and e.get("repo") in current and e.get("sha") == current[e["repo"]]
+    }
+    orphans = [
+        k for k, e in cache.items()
+        if isinstance(e, dict) and not k.startswith("_")
+        and e.get("repo") in current
+        and e.get("sha") != current.get(e.get("repo"))
+        and e.get("repo") in have_current
+    ]
+    for k in orphans:
+        del cache[k]
+    return len(orphans)
+
+
+def _entry_fits_anywhere(entry: dict) -> bool:
+    """True iff any (vram, ctx) cell loaded with fits=true -- i.e. the model
+    serves on this host at some tier. Used to un-exclude a recovered model."""
+    for band in (entry.get("probes") or {}).values():
+        if not isinstance(band, dict):
+            continue
+        for cell in band.values():
+            if isinstance(cell, dict) and cell.get("fits"):
+                return True
+    return False
+
+
+_OOM_CELL_KINDS = frozenset({"oom_startup", "oom", "implied_spill"})
+
+
+def _entry_oom_everywhere(entry: dict) -> bool:
+    """True iff the model fits at NO tier and its failures are OOM (not arch).
+
+    The fit probe walks ascending ctx and stops at the first OOM, so an entry
+    that fits nowhere and whose cells are OOM-kind genuinely does not fit this
+    GPU at any context -> a ledger `oom` exclusion (re-checked on a new sha).
+    """
+    if _entry_fits_anywhere(entry):
+        return False
+    saw_oom = False
+    for band in (entry.get("probes") or {}).values():
+        if not isinstance(band, dict):
+            continue
+        for cell in band.values():
+            if not isinstance(cell, dict) or cell.get("fits"):
+                continue
+            kind = (cell.get("evidence") or {}).get("kind")
+            if kind in _OOM_CELL_KINDS:
+                saw_oom = True
+            elif kind in ("arch", "quant"):
+                return False  # terminal arch/quant owns this, not oom
+    return saw_oom
+
+
 def ensure_entry(
     cache: dict, key: str, repo: str, sha: str, alias: str,
     schema_version: int, model_kind: str, weight_size_gb: float,
@@ -1289,6 +1420,10 @@ def ensure_entry(
             "probes": {},
         }
         cache[key] = entry
+        # A prior sha of this repo that was terminally unsupported_arch makes
+        # this fresh entry inherit the verdict, so run_probe_pass skips it
+        # instead of re-probing a known-dead arch after a re-quant.
+        _carry_forward_terminal(cache, repo, entry)
     else:
         if alias and alias not in entry.get("aliases", []):
             entry.setdefault("aliases", []).append(alias)
@@ -1530,6 +1665,7 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
         sys.exit("error: --vram or --ctx produced an empty list")
 
     cache = load_cache(args.cache)
+    ledger = _load_ledger()
 
     print(f"  prober:         probe-{spec.name}-reasoning", file=sys.stderr)
     print(f"  cache:          {args.cache} ({len(cache)} entries)", file=sys.stderr)
@@ -1547,6 +1683,7 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
     fully_cached = 0
     skipped_missing = 0
     skipped_arch = 0
+    skipped_excluded = 0
 
     for row in catalog_rows:
         name = row.get("name") or ""
@@ -1555,6 +1692,16 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
         if not (name and repo and sha):
             print(f"  [skip] catalog row missing fields: name={name!r} "
                   f"repo={repo!r} sha={sha!r}", file=sys.stderr)
+            continue
+
+        # Host-local exclusion ledger: a too_big / too_small / unsupported_arch
+        # model is skipped SILENTLY (no "not on disk" noise) and never probed.
+        # --force-arch re-evaluates a cached unsupported_arch, so honor it here
+        # too. Stability rules (vram/sha) live in is_excluded.
+        if (not args.force_arch
+                and _ledger_is_excluded(ledger, name, spec.name,
+                                        host_vram=args.host_vram_gb, sha=sha)):
+            skipped_excluded += 1
             continue
 
         if not is_downloaded(name, models_dir):
@@ -1593,6 +1740,10 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
                 and not args.force_arch):
             print(f"  [skip] {name}: unsupported_arch (cached)",
                   file=sys.stderr)
+            _ledger_record(ledger, name, spec.name, "unsupported_arch",
+                           detail=(entry.get("evidence") or {}).get(
+                               "matched_pattern") or "arch load failure",
+                           repo=repo, host_vram=args.host_vram_gb, sha=sha)
             skipped_arch += 1
             continue
 
@@ -1792,12 +1943,46 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
         # save here just persists the last state; terminal states like
         # `unsupported_arch` are sticky inside that helper.
         refresh_top_level_from_cells(entry)
+        # Reconcile the host ledger with the fresh probe result:
+        #  - terminal arch -> mirror unsupported_arch (sha-stable, gates
+        #    download + future probes).
+        #  - now fits (e.g. a --force-arch re-probe recovered the model, or a
+        #    recovery flag was added) -> clear a stale prober-owned exclusion
+        #    so the ledger NEVER hides a model the cache says fits. (Leave a
+        #    `manual` operator pin alone.)
+        if entry.get("capability") == Capability.UNSUPPORTED_ARCH:
+            _ledger_record(ledger, name, spec.name, "unsupported_arch",
+                           detail=(entry.get("evidence") or {}).get(
+                               "matched_pattern") or "arch load failure",
+                           repo=repo, host_vram=args.host_vram_gb, sha=sha)
+        elif _entry_fits_anywhere(entry):
+            # Recovered/fitting -> clear a stale prober-owned exclusion.
+            if _ledger_reason(ledger, name, spec.name) in (
+                    "unsupported_arch", "oom"):
+                _ledger_clear(ledger, name, spec.name)
+        elif _entry_oom_everywhere(entry):
+            # Fits at no tier and the failure is OOM -> record `oom`
+            # (re-checked on a new sha; decision 2). Stops re-probing a model
+            # that does not fit this GPU.
+            _ledger_record(ledger, name, spec.name, "oom",
+                           detail="OOM at every probed ctx; does not fit GPU",
+                           repo=repo, host_vram=args.host_vram_gb, sha=sha)
         if not args.no_cache_write:
             save_cache(args.cache, cache)
+
+    # Drop sha-orphaned entries left by re-quant/commit (terminal verdicts
+    # have already been carried forward onto the current-sha entries).
+    pruned = prune_orphaned_shas(cache, catalog_rows)
+    if pruned and not args.no_cache_write:
+        save_cache(args.cache, cache)
+    if not args.no_cache_write:
+        _save_ledger(ledger, host_vram_gb=args.host_vram_gb)
 
     print(file=sys.stderr)
     by_cap: dict[str, int] = {}
     for entry in cache.values():
+        if not isinstance(entry, dict):
+            continue
         c = entry.get("capability") or Capability.UNKNOWN
         by_cap[c] = by_cap.get(c, 0) + 1
     summary = "  ".join(f"{c}={n}" for c, n in sorted(by_cap.items()))
@@ -1805,7 +1990,9 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
         f"  done: {fresh_probes} probe(s); "
         f"{fully_cached} band(s) fully cached; "
         f"{skipped_missing} not on disk; "
-        f"{skipped_arch} skipped as cached unsupported_arch",
+        f"{skipped_excluded} ledger-excluded; "
+        f"{skipped_arch} skipped as cached unsupported_arch; "
+        f"{pruned} orphan sha(s) pruned",
         file=sys.stderr,
     )
     print(f"  capability counts: {summary}", file=sys.stderr)

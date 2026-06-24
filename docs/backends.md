@@ -88,6 +88,30 @@ The picker hides any model that lacks a `fits=true` probe at the host
 VRAM band. The router synthesizes `/v1/models` rows from these caches.
 Without probes, models are invisible.
 
+### Exclusion ledger (`deploy/.model-status.json`)
+
+A host-local overlay (gitignored, schema v1) recording models the host
+should NOT bother with, so they are not re-downloaded, re-probed, or
+re-listed as "not on disk". The catalog stays the host-agnostic superset;
+the ledger is the negative space the probe caches do not cover. Keyed by
+catalog `name` + backend (sha-stable, unlike the repo+sha probe key).
+Reasons:
+
+- `too_big` / `too_small` -- outside the host VRAM window. Written by
+  `make model-pull` (`select-models.py`), which already excludes these from
+  download; the ledger persists the verdict so the probers skip them
+  silently. Re-derived on a GPU-VRAM change.
+- `unsupported_arch` -- the engine cannot load the architecture. Written by
+  the HF probers when a launch fails with `kind=arch`. Terminal, vram- and
+  sha-stable (carried forward across a re-quant by `_carry_forward_terminal`
+  + `prune_orphaned_shas`). Re-evaluated with `PROBE_FORCE_ARCH=1`.
+- `oom` -- re-checked on a new sha (weight-specific). `manual` -- operator
+  pinned.
+
+Inspect with `make model-status`; clear an entry with
+`make model-status CLEAR=<name>[::<backend>]`. The ledger fails open: a
+missing or malformed file simply means "nothing excluded".
+
 ### Procedure
 
 ```bash

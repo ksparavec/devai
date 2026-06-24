@@ -28,6 +28,7 @@ Current snapshot (as of 2026-05-15):
 | [router-fanout](./router-fanout.md)                                 | Draft       |
 | [pi-coding-agent](./pi-coding-agent.md)                             | Draft       |
 | [kv-cache-quantization](./kv-cache-quantization.md)                 | Draft       |
+| [model-lifecycle-ledger](./model-lifecycle-ledger.md)               | In Progress |
 
 ## Dependency graph
 

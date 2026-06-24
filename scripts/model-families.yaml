@@ -51,6 +51,33 @@
 #                     applies to hf_repos / NVFP4 / safetensors variants —
 #                     Ollama handles reasoning and tool-calling natively.
 #   defaults        – advisory default tags per backend (optional)
+#   discover        – OPTIONAL override for `make catalog-discover` (the
+#                     read-only newer-version finder, scripts/catalog-
+#                     discover.py). Discovery is HYBRID: by default each
+#                     family's lineage (brand + version + sub-lineage) and
+#                     its trusted authors are AUTO-DERIVED from the family
+#                     `name` and its existing hf_repos / ollama_repos /
+#                     gguf_repos -- no `discover:` block needed (qwen3.5 ->
+#                     auto-finds qwen3.6/qwen3.7, llama3.2 -> llama3.3,
+#                     etc). Add a `discover:` block ONLY to override that:
+#                       discover:
+#                         enabled: false        # skip this lineage entirely
+#                         hf_authors:           # REPLACES the auto-derived
+#                           - nvidia            # author allowlist (use to
+#                           - apolo13x          # RESTRICT to vetted authors)
+#                         name_regex: 'Qwen3'   # REPLACES the default brand
+#                                               # match (widen/narrow; also
+#                                               # disables the structural
+#                                               # line-membership filter)
+#                         min_version: '3.5'    # quote it -- bare 3.10 is a
+#                                               # YAML float (== 3.1)
+#                         ollama_names:         # extra ollama libraries to
+#                           - qwen-next         # probe by exact name
+#                     Every sub-field is optional; a present field replaces
+#                     its auto-derived counterpart (ollama_names is
+#                     additive). The block is read ONLY by catalog-discover;
+#                     generate-catalog.py ignores it. catalog-discover never
+#                     edits anything -- it prints candidates to review.
 #
 # YAML formatting rule: every list element on its own line. Do NOT use
 # inline brackets `[a, b]` or inline maps `{key: val}`.
@@ -94,6 +121,9 @@ families:
           method: mtp
           drafter: google/gemma-4-31B-it-assistant
           num_speculative_tokens: 4
+      - google/gemma-4-12B-it
+      - bg-digitalservices/Gemma-4-E4B-it-NVFP4
+      - unsloth/gemma-4-12b-it
     gguf_repos:
       # Registry's gemma4:31b at Q4_K_M needs ~46G — doesn't fit on a
       # 24G card. Unsloth's Dynamic 2.0 Q3 variants drop weights to
@@ -107,6 +137,9 @@ families:
         tag_prefix: 26b-a4b
         include:
           - UD-Q3_K_XL
+      - repo: google/gemma-4-26B-A4B-it-qat-q4_0-gguf
+        tag_prefix: 26b-a4b
+        include: []   # TODO: quant allowlist e.g. UD-Q3_K_XL ([] emits nothing)
     arch_ref: google/gemma-4-26b-a4b-it
     thinking: true        # hint; runtime probe shows e2b/e4b are unsupported
 
@@ -130,6 +163,21 @@ families:
     thinking: true
 
   - name: qwen3.6
+    ollama_repos:
+      - qwen3.6
+    gguf_repos:
+      - repo: unsloth/Qwen3.6-35B-A3B-GGUF
+        tag_prefix: 35b-a3b
+        include: []   # TODO: quant allowlist e.g. UD-Q3_K_XL ([] emits nothing)
+      - repo: unsloth/Qwen3.6-35B-A3B-MTP-GGUF
+        tag_prefix: 35b-a3b
+        include: []   # TODO: quant allowlist e.g. UD-Q3_K_XL ([] emits nothing)
+      - repo: unsloth/Qwen3.6-27B-MTP-GGUF
+        tag_prefix: 27b
+        include: []   # TODO: quant allowlist e.g. UD-Q3_K_XL ([] emits nothing)
+      - repo: unsloth/Qwen3.6-27B-GGUF
+        tag_prefix: 27b
+        include: []   # TODO: quant allowlist e.g. UD-Q3_K_XL ([] emits nothing)
     # Qwen3.6 family. The text-only NVFP4 variant from
     # sakamakismile is the only catalog row today and is built
     # around the built-in MTP head (mtp_num_hidden_layers=1 in
@@ -145,6 +193,9 @@ families:
         mtp:
           method: qwen3_5_mtp
           num_speculative_tokens: 3
+      - nvidia/Qwen3.6-35B-A3B-NVFP4
+      - unsloth/Qwen3.6-27B-NVFP4
+      - sakamakismile/Qwen3.6-27B-MTP-pi-tune-NVFP4
     parsers:
       vllm:
         reasoning: qwen3
@@ -229,6 +280,7 @@ families:
       # NVFP4) but compute-light. Distinct from the qwen3.5 family's
       # 35B-A3B variants which have a different tokenizer.
       - nvidia/Qwen3-30B-A3B-NVFP4
+      - nvidia/Qwen3-14B-FP8
     parsers:
       vllm:
         reasoning: qwen3

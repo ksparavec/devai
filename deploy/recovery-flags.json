@@ -92,6 +92,30 @@
         "without significant VRAM impact at our typical decode batch sizes."
       ]
     },
+    "Gemma-4-31B-IT-NVFP4": {
+      "engine_flags": [
+        "--max-num-batched-tokens", "4096",
+        "--enforce-eager"
+      ],
+      "_engine_flags_comment": [
+        "Two fixes for the 31B dense NVFP4 on 24G:",
+        "  --max-num-batched-tokens 4096  multi-modal fix, same as the 26B-A4B",
+        "    sibling: Gemma 4 ships a vision encoder, so without it vLLM aborts",
+        "    engine init with 'Chunked MM input disabled but",
+        "    max_tokens_per_mm_item (...) is larger than max_num_batched_tokens'.",
+        "  --enforce-eager  the 31B is dense (~17 GiB NVFP4) and OOMed at",
+        "    engine init (oom_startup at 32K) WITH the MM flag alone -- weights",
+        "    + fp8 KV + the ~4 GiB CUDA-graph capture workspace overflow 24G.",
+        "    Same trade as Nemotron-3-Nano-30B / Qwen3-Coder-30B (the sibling",
+        "    30B-class NVFP4 rows on this card): --enforce-eager frees that",
+        "    workspace so the model loads, at ~10-20% decode throughput cost.",
+        "Serves on the DEFAULT vLLM image -- only DiffusionGemma needs the",
+        "'gemma' build (which regresses Qwen NVFP4). If it STILL OOMs after",
+        "this, it is genuinely too big for 24G -> the prober records `oom` in",
+        "the exclusion ledger and it stops being re-probed.",
+        "Confirm: `make probe-vllm PROBE_REPO=Gemma-4-31B-IT-NVFP4 PROBE_FORCE=1`."
+      ]
+    },
     "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4": {
       "engine_flags": [
         "--max-num-seqs", "8",

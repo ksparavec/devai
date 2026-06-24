@@ -163,7 +163,7 @@ endif
 .PHONY: vllm-list vllm-rm vllm-status vllm-df
 .PHONY: clean clean-cpu clean-gpu clean-router prune
 .PHONY: fetch-cli pull-images install install-systemd uninstall test test-router test-ollama test-agents test-models test-probe-vllm test-probe-sglang test-probe-ollama-idempotent test-vllm test-sglang test-e2e test-full help
-.PHONY: catalog-regen catalog-suggest probe probe-vllm probe-sglang probe-load-vllm probe-load-sglang model-fit model-pull vram-fit verify-backend-flags ollama-cleanup-ctx-variants
+.PHONY: catalog-regen catalog-suggest catalog-discover catalog-discover-add probe probe-vllm probe-sglang probe-load-vllm probe-load-sglang model-fit model-pull model-status model-sync vram-fit verify-backend-flags ollama-cleanup-ctx-variants
 .PHONY: bench bench-vllm bench-sglang bench-ollama bench-report test-bench-smoke
 .PHONY: secrets-tmpfs secrets-edit secrets-render secrets-rotate age-keygen-host test-python
 .PHONY: mcp-up mcp-down mcp-logs mcp-test mcp-health mcp-secrets-render build-worker-bootstrap test-cluster-preflight cluster-head-up cluster-head-down cluster-status skypilot-up skypilot-down skypilot-check skypilot-secrets-render
@@ -1186,6 +1186,47 @@ catalog-suggest: ## Suggest GGUF candidates llmfit ranks well that aren't yet in
 	   $(if $(USE_CASE),--use-case $(USE_CASE),) \
 	   $(if $(MIN_FIT),--min-fit $(MIN_FIT),) \
 	 | python3 scripts/llmfit-catalog-diff.py
+
+catalog-discover: ## Find newer-version members of tracked lineages (e.g. qwen3.7 when qwen3.5 is tracked) within the GPU's usable VRAM band. Read-only; probe before adding.
+	@#   FAMILY=<substr>      scope to lineages whose family name contains this
+	@#   INCLUDE_SAME=1       list every untracked repo at a tracked version
+	@#   INCLUDE_OVERSIZED=1  also show candidates too big to load
+	@#   INCLUDE_UNDERSIZED=1 also show candidates too small (waste the GPU)
+	@#   INCLUDE_BASE=1       also show base / non-chat (pretraining) checkpoints
+	@#   VRAM_TOLERANCE=<x>   how far above the family max a candidate may go (default 1.25)
+	@#   MIN_VRAM_FRAC=<f>    hide models using < this fraction of the GPU (default 0.5)
+	@#   NO_HF=1 / NO_OLLAMA=1   skip one source
+	@# VRAM budget comes from GPU_MEMORY_GB (exported above; default 24).
+	@python3 scripts/catalog-discover.py \
+	  $(if $(FAMILY),--family $(FAMILY),) \
+	  $(if $(INCLUDE_SAME),--include-same,) \
+	  $(if $(INCLUDE_OVERSIZED),--include-oversized,) \
+	  $(if $(INCLUDE_UNDERSIZED),--include-undersized,) \
+	  $(if $(INCLUDE_BASE),--include-base,) \
+	  $(if $(VRAM_TOLERANCE),--vram-tolerance $(VRAM_TOLERANCE),) \
+	  $(if $(MIN_VRAM_FRAC),--min-vram-frac $(MIN_VRAM_FRAC),) \
+	  $(if $(NO_HF),--no-hf,) \
+	  $(if $(NO_OLLAMA),--no-ollama,)
+
+catalog-discover-add: ## Discover, then CONFIRM-add candidates into scripts/model-families.yaml (existing families only). WRITES the file.
+	@#   FAMILY=<substr>   scope discovery to matching lineages
+	@#   ADD=<repo-id>     add one specific repo non-interactively (skips discovery)
+	@#   YES=1             skip the per-add confirmation prompt (scripting)
+	@# After adding: make catalog-regen && make probe (probe before relying on it).
+	@python3 scripts/catalog-discover.py \
+	  $(if $(ADD),--add $(ADD),--add) \
+	  $(if $(FAMILY),--family $(FAMILY),) \
+	  $(if $(YES),--yes,)
+
+model-status: ## Show the host-local model exclusion ledger (too_big/too_small/unsupported_arch). CLEAR=<name[::backend]> removes an entry.
+	@python3 scripts/_model_status.py $(if $(CLEAR),--clear $(CLEAR),)
+
+model-sync: ## Closed loop: diff catalog vs probed+excluded, auto download+probe genuinely-new rows. DRY_RUN=1, SYNC_MAX_DOWNLOADS=<n>, FAMILY=<f>, REGEN=1 (catalog-regen first).
+	@$(if $(REGEN),python3 scripts/generate-catalog.py;) true
+	python3 scripts/model-sync.py \
+	  $(if $(DRY_RUN),--dry-run,) \
+	  $(if $(SYNC_MAX_DOWNLOADS),--max-downloads $(SYNC_MAX_DOWNLOADS),) \
+	  $(if $(FAMILY),--family $(FAMILY),)
 
 verify-backend-flags: ## Assert pinned vLLM/SGLang images expose every flag in deploy/backend-flags.yaml (run after image bump)
 	python3 scripts/verify-backend-flags.py

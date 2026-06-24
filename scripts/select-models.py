@@ -35,6 +35,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 from _capability import Capability  # noqa: E402
 from _contexts import effective_targets as _ctx_effective_targets  # noqa: E402
+import _model_status  # noqa: E402
 
 CATALOG = REPO_ROOT / "deploy" / "models.yaml"
 PROBE_CACHE = REPO_ROOT / "deploy" / ".ollama-reasoning-cache.json"
@@ -1424,6 +1425,46 @@ def main() -> None:
     prunable = [r for r in rows
                 if r.downloaded and (r.total_gb > args.vram
                                      or r.total_gb < min_total)]
+
+    # ── Reconcile size exclusions into the host ledger (Phase 3) ─────────
+    # The fit window already drops too_big/too_small from download candidates,
+    # but never RECORDED it -- so it reappeared as "not on disk" probe noise
+    # and was not auditable. Persist those verdicts (only on --download, so
+    # the diagnostic path stays write-free) and clear any that are now back in
+    # window. too_small uses the LARGEST ctx (total only grows with ctx, so
+    # too_small there => too_small at every tier); too_big uses the SMALLEST.
+    if args.download and not args.dry_run:
+        ledger = _model_status.load_ledger()
+        small_rows = {r.model["name"]: r for r in rows_by_ctx[max(contexts)]}
+        big_rows = {r.model["name"]: r for r in rows_by_ctx[min(contexts)]}
+        for nm in set(small_rows) | set(big_rows):
+            rs, rb = small_rows.get(nm), big_rows.get(nm)
+            model = (rb or rs).model
+            too_big = rb is not None and rb.total_gb > args.vram
+            too_small = (rs is not None and rs.total_gb > 0
+                         and rs.total_gb < min_total)
+            for backend in _backends_for(model):
+                existing = _model_status.exclusion_reason(ledger, nm, backend)
+                # select-models owns ONLY the size verdicts; never clobber a
+                # prober-owned unsupported_arch/oom or an operator manual pin
+                # (they carry durability the size verdicts do not).
+                if existing in ("unsupported_arch", "oom", "manual"):
+                    continue
+                if too_big:
+                    _model_status.record_exclusion(
+                        ledger, nm, backend, "too_big",
+                        detail=f"~{rb.total_gb:.1f} GB > {args.vram:g} GB budget",
+                        repo=model.get("repo"), host_vram=args.vram,
+                        ctx=min(contexts))
+                elif too_small:
+                    _model_status.record_exclusion(
+                        ledger, nm, backend, "too_small",
+                        detail=f"~{rs.total_gb:.1f} GB < {min_total:.0f} GB floor",
+                        repo=model.get("repo"), host_vram=args.vram,
+                        ctx=max(contexts))
+                elif existing in ("too_big", "too_small"):
+                    _model_status.clear(ledger, nm, backend)  # back in window
+        _model_status.save_ledger(ledger, host_vram_gb=args.vram)
 
     # ── Print plan ───────────────────────────────────────────────────────
     print()
