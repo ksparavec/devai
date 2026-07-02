@@ -195,6 +195,20 @@ families:
           num_speculative_tokens: 3
       - nvidia/Qwen3.6-35B-A3B-NVFP4
       - unsloth/Qwen3.6-27B-NVFP4
+      # NO mtp: block for the pi-tune below, on purpose. Benched 2026-07-02 on
+      # the 24G card: the qwen3_5_mtp draft lm_head (~2.37 GiB, vocab-sized so
+      # context-INDEPENDENT) OOMs at MODEL LOAD -- serve @32K died ~0.5 GiB
+      # short (needed 2.37, 1.86 free) in qwen3_5_mtp.py ParallelLMHead init,
+      # BEFORE KV allocation. So it is NOT recoverable by lowering
+      # --gpu-memory-utilization, --enforce-eager, or a smaller context (all
+      # act after the failing allocation). Baseline (MTP off) serves fine @32K
+      # ~33 tok/s. Do not re-add an mtp: block here without ~0.5 GiB more
+      # usable VRAM or a draft-head-tied vLLM MTP build. The fit probe DID
+      # catch this: a separate -mtp pass records mtp_fits=false / oom_startup.
+      # The gap is that NOTHING consumes mtp_fits -- the router serves ::mtp off
+      # the catalog mtp block alone -- so a stray mtp block here would still be
+      # advertised and OOM at serve. (The Text-NVFP4-MTP sibling above is
+      # text-only with more headroom; its mtp block is untested here.)
       - sakamakismile/Qwen3.6-27B-MTP-pi-tune-NVFP4
     parsers:
       vllm:
