@@ -153,8 +153,11 @@ class TestFullWindowFill(unittest.TestCase):
         self.assertEqual(method, "tokenized")
         self.assertLessEqual(count, target)               # never over ctx
         self.assertGreaterEqual(count, target - L._TOKENIZE_TOL)  # near target
-        # ~99% of the window -> the pool is genuinely exercised.
-        self.assertGreater(count / ctx, 0.98)
+        # Fill reaches within the tokenize tolerance of the target window
+        # (ctx - _OUTPUT_HEADROOM_TOKENS). Expressed as a fraction so it tracks
+        # the headroom instead of hardcoding a fill % (headroom was raised to
+        # 2304 for reasoning-model needle recall).
+        self.assertGreaterEqual(count / ctx, (target - L._TOKENIZE_TOL) / ctx)
         self.assertGreater(calls["n"], 1)                 # iterated
 
     def test_calibration_fallback_when_no_tokenize(self) -> None:
