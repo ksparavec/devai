@@ -126,13 +126,20 @@ _CORPUS_MIN_CHARS = 200_000
 # first pass is below target and we grow up to it rather than overflow.
 _CHARS_PER_TOKEN = 3.5
 
-# Tokens reserved below --max-model-len for the completion. Small, so the
-# PROMPT fills the KV pool to ~99% during prefill -- that is the point of
-# the load probe: exercise the pool near its true ceiling, where real OOMs
-# happen, not the ~88% a char estimate lands at. max_tokens is set below
-# this so prompt+output stays under ctx (no length-reject).
-_OUTPUT_HEADROOM_TOKENS = 512
-_MAX_OUTPUT_TOKENS = 256
+# Tokens reserved below --max-model-len for the completion, and the max
+# completion length. Reasoning models (capability structured/inline) emit a
+# long <think> trace before the final answer; a 256-token budget gets
+# consumed by the trace and the needle-recall answer never lands, scoring a
+# FALSE needle=0.0 (observed on Qwen3.6-27B-MTP-pi-tune-NVFP4: 0.0 at 256,
+# 1.0 at 2048 -- reasoning recall was fine all along). 2048 gives think room.
+# Trade-off: the larger headroom fills the KV pool slightly less at prefill
+# (~93% at 32K vs ~98% before), so the pool-ceiling OOM signal is marginally
+# weaker at small ctx. Accepted: the dominant serving OOM on this fleet is the
+# max_num_batched_tokens softcap-logits / attention-workspace transient
+# (independent of this budget), not the last few % of KV. max_tokens stays
+# below headroom so prompt+output < ctx (no length-reject).
+_OUTPUT_HEADROOM_TOKENS = 2304
+_MAX_OUTPUT_TOKENS = 2048
 
 # Tokenizer-verify loop bounds: converge the prompt to within _TOKENIZE_TOL
 # tokens of (ctx - _OUTPUT_HEADROOM_TOKENS), at most _TOKENIZE_MAX_ITERS
