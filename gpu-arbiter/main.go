@@ -132,6 +132,12 @@ type configModel struct {
 	// when both this is non-nil AND the per-request override resolves
 	// to "on".
 	MTP *configSpeculative `yaml:"-"`
+	// MTPProbedUnfit is true when the fit prober's MTP pass recorded
+	// mtp_fits=false for this model (the draft lm_head OOMs at load) and
+	// never true. The router refuses to emit --speculative-config for such
+	// a model even when the catalog declares `mtp:`, serving baseline.
+	// False when MTP fit was verified OR never probed (prior behaviour).
+	MTPProbedUnfit bool `yaml:"-"`
 }
 
 // configReasoning records what the runtime probe observed for this model.
@@ -348,6 +354,13 @@ type hfCacheProbe struct {
 	// the largest tier that both fits AND serves. A nil pointer preserves
 	// pre-load-probe behaviour byte-for-byte (fit verdict alone gates).
 	ServingOk *bool `json:"serving_ok,omitempty"`
+	// MtpFits is set by the fit prober's separate MTP pass (probe-vllm on a
+	// catalog row declaring `mtp:`, without --no-mtp): true when the model
+	// loaded with --speculative-config, false when the draft lm_head OOMed
+	// at model init. Nil when no MTP pass ran for this cell. The router
+	// suppresses ::mtp for a model whose cells recorded mtp_fits=false so a
+	// speculative launch that would 503 falls back to baseline instead.
+	MtpFits *bool `json:"mtp_fits,omitempty"`
 }
 
 // hfCacheEntry mirrors the per-(repo, sha) record in the HF probe caches.
@@ -460,6 +473,24 @@ func synthesizeHFFromCache(
 		if bestCtx == 0 {
 			continue
 		}
+		// MTP fit verdict: the fit prober records mtp_fits per cell in a
+		// separate --speculative-config pass. If any cell recorded false and
+		// none true, MTP OOMs at load for this model on this card -> flag it
+		// so the router won't emit --speculative-config even when the catalog
+		// declares `mtp:`. Absent (un-probed) or any true leaves it false
+		// (offer MTP; prior behaviour).
+		var sawMTPTrue, sawMTPFalse bool
+		for _, probe := range band {
+			if probe.MtpFits == nil {
+				continue
+			}
+			if *probe.MtpFits {
+				sawMTPTrue = true
+			} else {
+				sawMTPFalse = true
+			}
+		}
+		mtpProbedUnfit := sawMTPFalse && !sawMTPTrue
 		// Effective context cap mirrors the Ollama path:
 		// min(model_max, operator_max).
 		effCtx := entry.MaxContext
@@ -529,7 +560,8 @@ func synthesizeHFFromCache(
 				Capability:      capability,
 				DisableVerified: entry.DisableVerified,
 			},
-			MTP: mtpBlock,
+			MTP:            mtpBlock,
+			MTPProbedUnfit: mtpProbedUnfit,
 		})
 	}
 	return out
@@ -646,7 +678,12 @@ type arbiter struct {
 	// *availability*; whether it actually gets emitted at launch is
 	// gated by the per-request `::mtp` suffix (parseMTPOverride). nil
 	// = catalog declares no MTP for this row -- the suffix is ignored.
-	modelMTP      map[string]map[string]*configSpeculative
+	modelMTP map[string]map[string]*configSpeculative
+	// modelMTPUnfit[backend][model] = true when the fit probe recorded
+	// mtp_fits=false (the qwen3_5_mtp draft lm_head OOMs at load). The
+	// ::mtp gate consults this and serves baseline rather than 503-looping
+	// a speculative launch that cannot fit.
+	modelMTPUnfit map[string]map[string]bool
 	defaultPolicy string // DEVAI_REASONING env value: auto|off|low|medium|high
 	totalVRAMGB   float64
 	maxContextLen int // global default from MAX_CONTEXT_LEN env (default 262144)
@@ -1199,6 +1236,7 @@ func main() {
 	modelToolMode := make(map[string]map[string]string)        // backend → model → "auto" | "forced"
 	modelProbedMaxCtx := make(map[string]map[string]int)       // backend → model → highest fits=true ctx
 	modelMTP := make(map[string]map[string]*configSpeculative) // backend → model → catalog MTP block
+	modelMTPUnfit := make(map[string]map[string]bool)          // backend → model → probe recorded mtp_fits=false
 	capCounts := make(map[string]int)
 	for _, m := range cfg.Models {
 		names := append([]string{m.Name}, m.Aliases...)
@@ -1257,6 +1295,12 @@ func main() {
 						modelMTP[backend] = make(map[string]*configSpeculative)
 					}
 					modelMTP[backend][name] = m.MTP
+					if m.MTPProbedUnfit {
+						if modelMTPUnfit[backend] == nil {
+							modelMTPUnfit[backend] = make(map[string]bool)
+						}
+						modelMTPUnfit[backend][name] = true
+					}
 				}
 			}
 		}
@@ -1300,6 +1344,7 @@ func main() {
 		modelToolMode:        modelToolMode,
 		modelProbedMaxCtx:    modelProbedMaxCtx,
 		modelMTP:             modelMTP,
+		modelMTPUnfit:        modelMTPUnfit,
 		defaultPolicy:        policy,
 		totalVRAMGB:          totalVRAMGB,
 		maxContextLen:        maxCtx,
@@ -2121,6 +2166,15 @@ func (a *arbiter) makeRequestHandler(backendName string) http.HandlerFunc {
 			if backendMTP, ok := a.modelMTP[backendName]; ok {
 				if spec, ok := backendMTP[modelName]; ok && spec != nil {
 					desiredSpec = spec
+				}
+			}
+			// Suppress MTP when the fit probe recorded mtp_fits=false: the
+			// draft lm_head OOMs at model load, so --speculative-config would
+			// 503 the request. Serve baseline (no speculative decoding).
+			if desiredSpec != nil {
+				if unfit, ok := a.modelMTPUnfit[backendName]; ok && unfit[modelName] {
+					log.Printf("warning: MTP requested for %s/%s but the fit probe recorded mtp_fits=false (draft head OOMs); serving baseline", backendName, modelName)
+					desiredSpec = nil
 				}
 			}
 		}

@@ -1539,10 +1539,37 @@ def _mtp_block(m: dict) -> dict | None:
     return mtp
 
 
+def _mtp_probe_unfit(m: dict) -> bool:
+    """True when the fit probe recorded mtp_fits=false for this row (the
+    qwen3_5_mtp draft lm_head OOMs at load) and never true. Reads the raw
+    HF probe cells at m['probe']['probes'][vram][ctx]. Absent (un-probed for
+    MTP) or any true -> False, so MTP stays offerable (prior behaviour).
+    Mirrors the router's suppression (gpu-arbiter modelMTPUnfit) so the
+    picker never offers a ::mtp the router would 503 at serve."""
+    bands = (m.get("probe") or {}).get("probes") or {}
+    if not isinstance(bands, dict):
+        return False
+    saw_false = False
+    for band in bands.values():
+        if not isinstance(band, dict):
+            continue
+        for cell in band.values():
+            if not isinstance(cell, dict):
+                continue
+            v = cell.get("mtp_fits")
+            if v is True:
+                return False
+            if v is False:
+                saw_false = True
+    return saw_false
+
+
 def _has_mtp(m: dict) -> bool:
-    """Whether the catalog declares MTP for this row -- drives the
-    picker's MTP column ('Yes'/'No') and gates the sub-modal."""
-    return _mtp_block(m) is not None
+    """Whether MTP is OFFERABLE for this row: the catalog declares an `mtp:`
+    block AND the fit probe didn't record mtp_fits=false (draft-head OOM).
+    Drives the MTP column ('Yes'/'No') and gates the sub-modal, so the picker
+    never surfaces a ::mtp that would 503 at serve."""
+    return _mtp_block(m) is not None and not _mtp_probe_unfit(m)
 
 
 def _ctx_tier(ctx: int) -> int:
@@ -1844,7 +1871,12 @@ def _capability_summary_text(
     if fmt_note:
         fmt_block += fmt_note + "\n"
     mtp = _mtp_block(m)
-    if mtp:
+    if mtp and _mtp_probe_unfit(m):
+        mtp_line = (
+            f"MTP:       {mtp.get('method', '?')}  K={mtp.get('num_speculative_tokens', '?')}"
+            f"  (probe: draft head OOMs at load -- off)\n"
+        )
+    elif mtp:
         drafter = mtp.get("drafter")
         drafter_label = drafter.split("/")[-1] if drafter else "(built-in head)"
         mtp_line = (
