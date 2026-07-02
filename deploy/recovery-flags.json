@@ -20,6 +20,83 @@
     "direct podman launch first."
   ],
   "models": {
+    "Qwen3.6-27B-MTP-pi-tune-NVFP4": {
+      "engine_flags": [
+        "--language-model-only",
+        "--max-num-seqs", "4",
+        "--gpu-memory-utilization", "0.95"
+      ],
+      "engine_env": {
+        "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS": "0"
+      },
+      "_engine_flags_comment": [
+        "Modeled on the same-author sibling Qwen3.6-27B-Text-NVFP4-MTP (a",
+        "working vLLM row): SAME arch Qwen3_5ForConditionalGeneration, SAME",
+        "27B text backbone. With router defaults this checkpoint fully loaded",
+        "+ finished torch.compile + warmup on 24G, then OOMed inside vLLM's",
+        "CUDA-graph memory profiler (determine_available_memory ->",
+        "profile_cudagraph_memory) -- the Blackwell double-count the env var",
+        "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0 disables.",
+        "  --language-model-only  UNLIKE the sibling, this checkpoint ships a",
+        "                         resident vision tower (vision_config present,",
+        "                         language_model_only:false); dropping it",
+        "                         recovers the headroom the sibling never spent.",
+        "  --max-num-seqs 4 + --gpu-memory-utilization 0.95  KV-pool room, per",
+        "                         the sibling entry.",
+        "DELIBERATELY NO --quantization modelopt (the sibling has it): this",
+        "checkpoint is compressed-tensors/nvfp4-pack-quantized, NOT modelopt,",
+        "and vLLM autodetect already loaded the weights cleanly. If a future",
+        "image breaks autodetect, add --quantization compressed-tensors (NEVER",
+        "modelopt). Expected: serves at 32K on vLLM; escalate with",
+        "--enforce-eager if 64K+ OOMs. SGLang is NOT viable for this arch",
+        "(Triton FLA gated-delta-rule kernel crash) -- vLLM only.",
+        "Verify: make probe-vllm PROBE_REPO=Qwen3.6-27B-MTP-pi-tune-NVFP4 PROBE_FORCE=1"
+      ]
+    },
+    "Qwen3.6-35B-A3B-NVFP4": {
+      "engine_flags": [
+        "--quantization", "modelopt",
+        "--language-model-only",
+        "--enforce-eager",
+        "--max-num-seqs", "4",
+        "--max-num-batched-tokens", "4096",
+        "--gpu-memory-utilization", "0.95"
+      ],
+      "engine_env": {
+        "PYTORCH_ALLOC_CONF": "expandable_segments:True"
+      },
+      "_engine_flags_comment": [
+        "qwen3_5_moe hybrid GatedDeltaNet+MoE, modelopt NVFP4, ~21.8 GiB text",
+        "weights -- the most weight-saturated row on 24G. Router defaults",
+        "loaded all 3 shards + built the arch, then OOMed in the CUDA-graph",
+        "profiler ~0.75 GiB short. Union of two shipped precedents:",
+        "  --quantization modelopt + --language-model-only  Qwen3.5/3.6 arch",
+        "                         (vision tower present); modelopt IS correct",
+        "                         here (unlike the 27B pi-tune sibling).",
+        "  --enforce-eager        frees the ~2-4 GiB cudagraph-capture",
+        "                         workspace AND bypasses the profiler step that",
+        "                         crashed -- same trade as Nemotron-3-Nano-30B",
+        "                         and Qwen3-Coder-30B (sibling 30B-class MoE).",
+        "  --max-num-seqs 4 + --gpu-memory-utilization 0.95 + expandable_segments",
+        "                         env  KV room + allocator defrag.",
+        "  --max-num-batched-tokens 4096  the qwen3_5_moe Mamba/GatedDeltaNet",
+        "                         state cache asserts block_size(2096) <=",
+        "                         max_num_batched_tokens; the 2048 default is 48",
+        "                         short. 4096 clears it (same flag the Gemma-4",
+        "                         entries use for their own init check).",
+        "REMOVED the Nemotron-style FlashInfer MoE-FP4 env (VLLM_USE_FLASHINFER_MOE_FP4",
+        "/ VLLM_FLASHINFER_MOE_BACKEND): on the pinned vLLM they are deprecated AND",
+        "forced the FLASHINFER_CUTLASS NvFp4 MoE kernel, which raised 'NvFp4 MoE",
+        "backend FLASHINFER_CUTLASS does not support the deployment configuration'",
+        "for this qwen3_5_moe hybrid. Let vLLM auto-select a compatible MoE backend;",
+        "--enforce-eager still addresses the original ~0.75 GiB cudagraph-profiler OOM.",
+        "Expected: serves text at 32K; likely will NOT reach 64K/128K (the",
+        "hybrid GatedDeltaNet needs a state cache atop the KV pool). SGLang is",
+        "NOT viable (validate_block_quant_shapes rejects the 32-wide gated-",
+        "delta-net projection: not divisible by block_n=128) -- vLLM only.",
+        "Verify: make probe-vllm PROBE_REPO=Qwen3.6-35B-A3B-NVFP4 PROBE_FORCE=1"
+      ]
+    },
     "Qwen3.5-9B-NVFP4": {
       "engine_flags": [
         "--quantization", "modelopt",

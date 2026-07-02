@@ -199,6 +199,7 @@ families:
     parsers:
       vllm:
         reasoning: qwen3
+        tool: qwen3_xml
     arch_ref: sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP
     thinking: true
 
