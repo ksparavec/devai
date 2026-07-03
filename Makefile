@@ -146,6 +146,16 @@ ifneq ($(findstring podman,$(CONTAINER_RUNTIME)),podman)
 	USER_ENV += -e USER_ID=$(shell id -u) -e GROUP_ID=$(shell id -g)
 endif
 
+# Interactive containers run as the devai user (uid 1000), mapped to the host
+# user. Rootless podman needs --userns=keep-id so devai's uid 1000 maps back to
+# the host uid -- otherwise uid 1000 maps to a subuid and the bind-mounted
+# home/work dirs become unwritable. Docker already drops to devai via the
+# entrypoint's gosu remap (USER_ENV above), so this is a no-op there.
+DEVAI_USER_FLAGS =
+ifeq ($(findstring podman,$(CONTAINER_RUNTIME)),podman)
+	DEVAI_USER_FLAGS = --userns=keep-id --user devai
+endif
+
 # GPU runtime flags
 GPU_FLAGS =
 ifeq ($(findstring podman,$(CONTAINER_RUNTIME)),podman)
@@ -413,6 +423,7 @@ lab-cpu: ## Run the container (CPU)
 	$(CONTAINER_RUNTIME) run -it --rm \
 		--name $(IMAGE_NAME) \
 		$(RUN_FLAGS) \
+		$(DEVAI_USER_FLAGS) \
 		--network $(DEVAI_EGRESS_NETWORK) \
 		$(EGRESS_PROXY_ENV) \
 		-e OLLAMA_HOST=$(OLLAMA_HOST) \
@@ -438,6 +449,7 @@ lab-gpu: ## Run the container (GPU/CUDA)
 	$(CONTAINER_RUNTIME) run -it --rm \
 		--name $(IMAGE_NAME_GPU) \
 		$(RUN_FLAGS) \
+		$(DEVAI_USER_FLAGS) \
 		$(GPU_FLAGS) \
 		--network $(DEVAI_EGRESS_NETWORK) \
 		$(EGRESS_PROXY_ENV) \
@@ -461,6 +473,7 @@ shell-cpu: ## Start an interactive shell (CPU)
 	$(CONTAINER_RUNTIME) run -it --rm \
 		--name $(IMAGE_NAME)-shell \
 		$(RUN_FLAGS) \
+		$(DEVAI_USER_FLAGS) \
 		--network $(DEVAI_EGRESS_NETWORK) \
 		$(EGRESS_PROXY_ENV) \
 		-e OLLAMA_HOST=$(OLLAMA_HOST) \
@@ -480,6 +493,7 @@ shell-gpu: ## Start an interactive shell (GPU)
 	$(CONTAINER_RUNTIME) run -it --rm \
 		--name $(IMAGE_NAME_GPU)-shell \
 		$(RUN_FLAGS) \
+		$(DEVAI_USER_FLAGS) \
 		$(GPU_FLAGS) \
 		--network $(DEVAI_EGRESS_NETWORK) \
 		$(EGRESS_PROXY_ENV) \

@@ -212,22 +212,30 @@ applicable.
 
 ### 1. Override parsing (`<name>@<ctx>` / `<name>::<reasoning>` / `<name>::<mtp>`)
 
-The model name in the request body may carry up to three suffixes,
-peeled right-to-left:
+The model name in the request body may carry up to three suffixes.
+`peelControlSuffixes` peels whichever recognised suffix is currently
+trailing and loops until none remain, so **the order the client uses
+does not matter**:
 
-| Suffix form               | Meaning                                          | Strip order |
-|---------------------------|--------------------------------------------------|-------------|
-| `<name>@<ctx>`            | per-session `--max-model-len` for vLLM/SGLang    | 1 (first)   |
-| `<name>::mtp`             | enable multi-token-prediction (`::nomtp` to force off) | 2     |
-| `<name>::<reasoning>`     | per-request reasoning policy override            | 3           |
-| `<name>::nothink`         | shortcut for `enable_thinking=false`             | 3           |
+| Suffix form           | Meaning                                                |
+|-----------------------|--------------------------------------------------------|
+| `<name>@<ctx>`        | per-session `--max-model-len` for vLLM/SGLang          |
+| `<name>::mtp`         | enable multi-token-prediction (`::nomtp` to force off) |
+| `<name>::<reasoning>` | per-request reasoning policy override                  |
+| `<name>::nothink`     | shortcut for `enable_thinking=false`                   |
 
 Picker convention: `<name>::<reasoning>::<mtp>@<ctx>` (each suffix
-optional). The parser chain strips `@<ctx>` first (`parseCtxOverride`),
-then `::<mtp>` (`parseMTPOverride`), then `::<reasoning>`
-(`parseReasoningOverride`). Each parser falls through on an
-unrecognised `::<token>`, so a name that legitimately contains `::`
-survives intact.
+optional, ctx last). But some clients append their own suffix out of
+order -- e.g. aiagent/litellm carries a `default_reasoning` and appends
+`::<reasoning>` AFTER the picker's `@<ctx>`, yielding
+`<name>@<ctx>::<reasoning>`. A strict ctx-last strip choked on that
+(`Atoi("<ctx>::nothink")` fails, leaving `@<ctx>` glued to the name so
+the allowlist rejected it as unknown). The order-independent peel handles
+either ordering: each sub-parser (`parseCtxOverride` / `parseMTPOverride`
+/ `parseReasoningOverride`) strips only a token it recognises (integer
+ctx / mtp keyword / reasoning keyword) and otherwise leaves the name
+unchanged, so a name that legitimately contains `::` or `@` survives
+intact, and every peel shortens the name so the loop always terminates.
 
 Examples:
 - `Qwen3-8B-NVFP4@65536` -> recreate vLLM with `--max-model-len 65536`,
@@ -236,6 +244,11 @@ Examples:
   request only.
 - `gpt-oss-20b::low@131072` -> vLLM gets `--max-model-len 131072`,
   request gets `reasoning_effort: low`.
+- `Nemotron-3-Nano-30B-A3B-NVFP4@131072::nothink` (aiagent/litellm
+  order, reasoning appended after ctx) -> identical result to
+  `::nothink@131072`: recreate vLLM with `--max-model-len 131072` and
+  `enable_thinking=false`. The order-independent peel makes the two
+  spellings equivalent.
 - `Gemma-4-26B-A4B-NVFP4::mtp@32768` -> vLLM recreate with
   `--max-model-len 32768` AND `--speculative-config '{"method":"mtp",
   "model":"/models/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":4}'`.

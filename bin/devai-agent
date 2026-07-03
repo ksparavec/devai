@@ -236,6 +236,19 @@ def user_env(runtime: str) -> list[str]:
     return ["-e", f"USER_ID={os.getuid()}", "-e", f"GROUP_ID={os.getgid()}"]
 
 
+def devai_user_flags(runtime: str) -> list[str]:
+    """Run the container as the devai user (uid 1000), mapped to the host user.
+
+    Rootless podman needs --userns=keep-id so devai's uid 1000 maps back to the
+    host uid, keeping the bind-mounted home/work dirs writable (without it, uid
+    1000 → a subuid and those mounts go unwritable). Docker already drops to
+    devai via the entrypoint's gosu remap (see user_env), so this is a no-op.
+    """
+    if "podman" not in runtime:
+        return []
+    return ["--userns=keep-id", "--user", "devai"]
+
+
 def optional_mounts() -> list[str]:
     out: list[str] = []
     home = Path.home()
@@ -266,6 +279,8 @@ def build_run_cmd(
     cmd: list[str] = [runtime, "run", "--rm"]
     if prompt is None:
         cmd += ["-i", "-t"]
+
+    cmd += devai_user_flags(runtime)
 
     cmd += [
         *gpu_flags(runtime, cpu_only),

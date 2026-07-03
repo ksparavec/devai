@@ -2013,28 +2013,23 @@ func (a *arbiter) makeRequestHandler(backendName string) http.HandlerFunc {
 				return
 			}
 
-			// Resolve the per-request num_ctx and strip any suffixes
-			// from the model name. Suffix order (convention): the
-			// picker emits `<name>::<reasoning>::<mtp>@<ctx>`. We strip
-			// right-to-left in the same order so each parser sees only
-			// the suffix it owns:
-			//   1. parseCtxOverride   strips trailing @<int>.
-			//   2. parseMTPOverride   strips trailing ::mtp / ::nomtp.
-			//   3. parseReasoningOverride strips trailing ::<reasoning>.
-			// Each parser falls through (returns input unchanged) on an
-			// unrecognised token, so a name that legitimately contains
-			// `::` survives intact.
-			//
 			// Override priority for num_ctx:
 			//   1. Picker-supplied @<int>  → force-injected (user choice).
 			//   2. Registered modelContexts cap (= min(model_max,
 			//      MAX_CONTEXT_LEN) from the probe cache) → soft cap,
 			//      only set when the client didn't supply num_ctx.
 			//   3. None → request passes through unchanged.
-			ctxStripped, ctxOverride := parseCtxOverride(parsed.Model)
-			var mtpStripped string
-			mtpStripped, mtpOverride = parseMTPOverride(ctxStripped)
-			cleanName, reasoningOverride := parseReasoningOverride(mtpStripped)
+			// Peel the picker/control-surface suffixes off the model name
+			// in whatever order the client appended them. Canonical emit
+			// order is `<name>::<reasoning>::<mtp>@<ctx>`, but aiagent/
+			// litellm appends its own `::<reasoning>` AFTER the picker's
+			// `@<ctx>`, so a strict ctx-last strip would leave `@<ctx>` in
+			// the name and the vLLM/SGLang allowlist would reject it. See
+			// peelControlSuffixes.
+			var cleanName string
+			var ctxOverride int
+			var reasoningOverride string
+			cleanName, ctxOverride, mtpOverride, reasoningOverride = peelControlSuffixes(parsed.Model)
 			// Defense-in-depth: refuse path-traversal segments before the
 			// name flows into vllmEntrypoint/sglangEntrypoint where it is
 			// concatenated as `--model /models/<name>`. The /models bind
@@ -2711,6 +2706,45 @@ func parseCtxOverride(name string) (clean string, override int) {
 		return name, 0
 	}
 	return name[:at], n
+}
+
+// peelControlSuffixes strips every recognised picker/control-surface suffix
+// from a model name, in whatever order the client appended them. The picker's
+// canonical emit order is `<name>::<reasoning>::<mtp>@<ctx>` (ctx last), and the
+// original handler stripped strictly in that order. But not every client
+// respects it: aiagent/litellm carries its own `default_reasoning` and appends
+// `::<reasoning>` AFTER the `@<ctx>` the picker already baked into the tag,
+// producing `<name>@<ctx>::<reasoning>`. Under a strict ctx-last strip,
+// parseCtxOverride's Atoi("<ctx>::<reasoning>") fails, so `@<ctx>` stays in the
+// name and the vLLM/SGLang allowlist rejects it as an unknown model.
+//
+// Instead, peel whichever of the three recognised suffixes is currently
+// trailing and loop until none remain, so the order the client used doesn't
+// matter. Each sub-parser strips only a token it recognises (integer ctx / mtp
+// keyword / reasoning keyword) and otherwise returns its input unchanged, so a
+// name that legitimately contains `::` or `@` survives untouched. Every peel
+// shortens the name, so the loop always terminates. When the same suffix class
+// appears more than once (malformed input), the innermost -- last-peeled --
+// value wins, matching the strict parser's single-strip behaviour on the
+// canonical order.
+func peelControlSuffixes(name string) (clean string, ctx int, mtp, reasoning string) {
+	clean = name
+	for {
+		if s, ov := parseCtxOverride(clean); ov > 0 {
+			clean, ctx = s, ov
+			continue
+		}
+		if s, ov := parseMTPOverride(clean); ov != "" {
+			clean, mtp = s, ov
+			continue
+		}
+		if s, ov := parseReasoningOverride(clean); ov != "" {
+			clean, reasoning = s, ov
+			continue
+		}
+		break
+	}
+	return clean, ctx, mtp, reasoning
 }
 
 // stripCtxVariantSuffix peels the "-ctx<int>" suffix the picker adds when

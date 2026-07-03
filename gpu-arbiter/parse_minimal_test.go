@@ -38,6 +38,17 @@ func TestParseModelAndSuffixes(t *testing.T) {
 			},
 		},
 		{
+			// aiagent/litellm appends its default_reasoning AFTER the
+			// picker's @<ctx>; the head must still recover model+ctx.
+			name: "aiagent order: reasoning after @ctx",
+			in:   "Qwen3-8B-NVFP4@65536::nothink",
+			want: MinimalRequest{
+				Model:     "Qwen3-8B-NVFP4",
+				Context:   65536,
+				Reasoning: "nothink",
+			},
+		},
+		{
 			name: "HF name with sha @ but no ctx (sha not numeric)",
 			in:   "openai/gpt-oss-20b@deadbeef",
 			want: MinimalRequest{Model: "openai/gpt-oss-20b@deadbeef"},

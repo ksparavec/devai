@@ -148,6 +148,7 @@ RUN --mount=type=bind,source=.,target=/src \
 # Optional: skip gracefully when the operator hasn't run `make fetch-cli` yet.
 RUN if [ -f /var/cache/bin/aiagent-install.sh ]; then \
         AIAGENT_PREFIX=/opt/aiagent sh /var/cache/bin/aiagent-install.sh </dev/null \
+        && chmod -R a+rX /opt/aiagent \
         && ln -sf /opt/aiagent/bin/aiagent /usr/local/bin/aiagent \
         && aiagent version >/dev/null 2>&1 \
         || echo "WARN: aiagent install completed but 'aiagent version' failed; investigate"; \
@@ -182,19 +183,50 @@ COPY scripts/vram-fit.py /usr/local/bin/vram-fit.py
 COPY deploy/models.yaml /etc/devai/models.yaml
 RUN chmod +x /usr/local/bin/ollama-chat /usr/local/bin/aider-launcher /usr/local/bin/late /usr/local/bin/aiagent-shell /usr/local/bin/agent-picker /usr/local/bin/model-picker
 
-# Create user and directories (handle GID/UID conflicts in GPU base images)
-RUN getent group 1000 >/dev/null || groupadd -g 1000 devai \
-    && id -u 1000 >/dev/null 2>&1 || useradd -u 1000 -g 1000 -m -s /bin/bash devai \
-    && mkdir -p /home/devai/work /home/devai/.local/bin \
-    && ln -s /usr/local/bin/claude /home/devai/.local/bin/claude \
-    && ln -s /usr/local/bin/codex /home/devai/.local/bin/codex \
-    && ln -s /usr/local/bin/opencode /home/devai/.local/bin/opencode \
-    && ln -s /usr/local/bin/gemini /home/devai/.local/bin/gemini \
-    && ln -s /usr/local/bin/late /home/devai/.local/bin/late \
-    && ln -s /usr/local/bin/ollama /home/devai/.local/bin/ollama \
-    && ln -s /usr/local/bin/code-server /home/devai/.local/bin/code-server \
-    && { [ -e /usr/local/bin/aiagent ] && ln -s /usr/local/bin/aiagent /home/devai/.local/bin/aiagent || true; } \
-    && chown -R 1000:1000 /home/devai
+# Name the GPU 'render' group in /etc/group. On the host, /dev/dri/renderD* is
+# owned by group `render` (GID 992 here); `--device nvidia.com/gpu=all` (NVIDIA
+# CDI) injects that GID as a supplementary group inside the container so the GPU
+# is reachable, but the base image's /etc/group has only `video` (44), leaving
+# 992 nameless. Debian's /etc/bash.bashrc then runs `$(groups)` at the start of
+# every interactive shell and prints "groups: cannot find name for group ID 992".
+# Naming it here silences that for every agent/shell (the `video` half is already
+# named by the base image). Idempotent; tune RENDER_GID for a host whose render
+# group differs.
+ARG RENDER_GID=992
+RUN getent group "$RENDER_GID" >/dev/null 2>&1 \
+    || groupadd -g "$RENDER_GID" render 2>/dev/null \
+    || echo "render:x:${RENDER_GID}:" >> /etc/group
+
+# Create the devai user/group at uid/gid 1000 with home /home/devai. The GPU base
+# (nvidia/cuda:...-ubuntu2404) already ships an `ubuntu` user/group at 1000, so a
+# plain `useradd devai` is skipped there and uid 1000 stays `ubuntu` -- which
+# breaks `--user devai` (non-root mode) and is inconsistent with the CPU (debian)
+# image. Instead, RENAME whatever occupies 1000 to `devai` (mirroring what the
+# docker-path entrypoint does at runtime), so uid 1000 == devai on both bases.
+RUN set -eu; \
+    if getent group 1000 >/dev/null 2>&1; then \
+        g="$(getent group 1000 | cut -d: -f1)"; \
+        [ "$g" = devai ] || groupmod -n devai "$g"; \
+    else \
+        groupadd -g 1000 devai; \
+    fi; \
+    if getent passwd 1000 >/dev/null 2>&1; then \
+        u="$(getent passwd 1000 | cut -d: -f1)"; \
+        [ "$u" = devai ] || usermod -l devai "$u"; \
+        usermod -g 1000 -d /home/devai -s /bin/bash -c '' devai; \
+    else \
+        useradd -u 1000 -g 1000 -d /home/devai -s /bin/bash devai; \
+    fi; \
+    mkdir -p /home/devai/work /home/devai/.local/bin; \
+    ln -s /usr/local/bin/claude      /home/devai/.local/bin/claude; \
+    ln -s /usr/local/bin/codex       /home/devai/.local/bin/codex; \
+    ln -s /usr/local/bin/opencode    /home/devai/.local/bin/opencode; \
+    ln -s /usr/local/bin/gemini      /home/devai/.local/bin/gemini; \
+    ln -s /usr/local/bin/late        /home/devai/.local/bin/late; \
+    ln -s /usr/local/bin/ollama      /home/devai/.local/bin/ollama; \
+    ln -s /usr/local/bin/code-server /home/devai/.local/bin/code-server; \
+    { [ -e /usr/local/bin/aiagent ] && ln -s /usr/local/bin/aiagent /home/devai/.local/bin/aiagent || true; }; \
+    chown -R 1000:1000 /home/devai
 
 # Seed config files for coding agents (copied to $HOME by entrypoint if absent)
 COPY config/codex/config.toml /etc/devai/codex-config.toml

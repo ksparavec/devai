@@ -45,6 +45,11 @@ make lab-gpu         # Run JupyterLab with GPU
 make lab-cpu         # Run JupyterLab CPU-only
 make shell-gpu       # Interactive shell (GPU) -- cwd = repo root
 make shell-cpu       # Interactive shell (CPU) -- cwd = repo root
+# All interactive containers run as the devai user (uid 1000), mapped to the
+# host user -- NOT container-root. Rootless podman uses --userns=keep-id --user
+# devai (devai's uid 1000 maps back to your host uid, so bind-mounted home/work
+# stay writable); docker drops to devai via the entrypoint gosu remap. Need root
+# inside a running container? `podman exec -u 0 <container> ...`.
 
 # Install standalone launcher (one-time; stages launcher + config under ~/.devai/)
 make install         # writes ~/.local/bin/devai-agent + ~/.devai/{model-picker.py,probe-cache symlink}
@@ -253,7 +258,7 @@ Interactive model -> agent selection via fzf. Used by `make shell-*` (via `agent
 **Per-session context binding & reasoning overrides.** Two paths:
 
 - **Ollama**: the picker emits just the parent name (or `<name>::nothink` for reasoning-off). KV cache is allocated *dynamically* per request from the loaded `context_length` ceiling (set globally via `OLLAMA_CONTEXT_LENGTH` env, default 256K). Clients hitting `/api/chat` / `/api/generate` get `options.num_ctx` injected by the router's `setNumCtx` (Ollama honours it on those paths). Clients hitting `/v1/chat/completions` or `/v1/messages` get the global `OLLAMA_CONTEXT_LENGTH` -- Ollama upstream ignores `options.num_ctx` on those compat surfaces and we accept that. `::nothink` suffix forces `enable_thinking=false` even when the global `DEVAI_REASONING` policy isn't off.
-- **vLLM / SGLang**: the picker emits `<name>@<ctx>` (e.g. `Llama-3.1-8B-Instruct-NVFP4@32768`) or `<name>::<reasoning>@<ctx>` for reasoning overrides. The router's `parseReasoningOverride` and `parseCtxOverride` strip the suffixes (order: `@<ctx>` first, `::<reasoning>` second), propagate the ctx into `containerRecreate` which sets `--max-model-len` (vLLM) or `--context-length` (SGLang), and handle the reasoning override (e.g. `::<reasoning>` -> `enable_thinking=off` even on models with inline capability). No client-side tag materialization needed -- the router's tracking handles the rest.
+- **vLLM / SGLang**: the picker emits `<name>@<ctx>` (e.g. `Llama-3.1-8B-Instruct-NVFP4@32768`) or `<name>::<reasoning>@<ctx>` for reasoning overrides. The router's `peelControlSuffixes` strips the `@<ctx>` / `::<mtp>` / `::<reasoning>` suffixes **in any order** (it peels whichever is currently trailing and loops until none remain), then propagates the ctx into `containerRecreate` which sets `--max-model-len` (vLLM) or `--context-length` (SGLang), and handles the reasoning override (e.g. `::<reasoning>` -> `enable_thinking=off` even on models with inline capability). Order-independence matters because some clients append their own suffix out of the picker's canonical `<name>::<reasoning>::<mtp>@<ctx>` order -- notably aiagent/litellm appends its `default_reasoning` as `::<reasoning>` AFTER the `@<ctx>`, producing `<name>@<ctx>::<reasoning>`; a strict ctx-last strip would leave `@<ctx>` glued to the name and the vLLM/SGLang allowlist would reject it as unknown. No client-side tag materialization needed -- the router's tracking handles the rest.
 
 **Do not add custom tags to cached models.** In particular, do not derive `<parent>:<tag>-ctx<N>` Modelfile siblings via `ollama create` to bake `num_ctx` (or any other PARAMETER) in. Per-session context is plumbed dynamically -- via the router's `setNumCtx` injection on Ollama's `/api/chat` and via the `@<ctx>` suffix for vLLM/SGLang launch flags -- so derived tags add nothing the runtime can use. They share digests with the parent (`make cache-status` then shows duplicate-looking rows), the picker filters them via `_ctx_tag` and the prober skips them via `_CTX_VARIANT_RE`, so they're inert leftovers from the pre-3a98ed0 design. The only sanctioned `ollama create` call is `select-models.py:pull_gguf` writing the canonical catalog tag from a downloaded GGUF blob; nothing else should mint Ollama tags.
 
