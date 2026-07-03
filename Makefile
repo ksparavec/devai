@@ -335,6 +335,23 @@ fetch-cli: ## Download all external binaries and packages to local cache (uses E
 			&& rm -f $(CACHE_DIR)/pip/bin/age.tar.gz && STATE="updated"; fi \
 		&& VERSION=$$($(CACHE_DIR)/pip/bin/age --version 2>&1 | head -n1 || echo "?") \
 		&& echo "age: $$STATE ($$VERSION)"
+	@# aiagent (devitops-com/aiagent): a self-extracting makeself bundle (~63 MB)
+	@# that carries its own CPython 3.13, so the lab image needs no extra Python
+	@# or zstd to run it. ETag-stamped like the other CLIs, which keeps the lab
+	@# on the aiagent release train AND -- because BIN_HASH is the md5 of every
+	@# etag -- busts the image's binary-install layer whenever the bundle
+	@# changes. Dockerfile.lab extracts it to /usr/local (=> /usr/local/bin/
+	@# aiagent). Linux x86_64 only; the bootstrap refuses other platforms.
+	@AIAGENT_VERSION=$$(curl -fsSL https://api.github.com/repos/devitops-com/aiagent/releases/latest | python3 -c "import sys,json; print(json.load(sys.stdin).get('tag_name','?'))" 2>/dev/null || echo "?") \
+		&& HTTP_CODE=$$(curl -fsSL -w '%{http_code}' -o $(CACHE_DIR)/pip/bin/aiagent-install.sh.tmp \
+			--etag-compare $(ETAG_DIR)/aiagent.etag --etag-save $(ETAG_DIR)/aiagent.etag \
+			"https://github.com/devitops-com/aiagent/releases/latest/download/aiagent-install.sh") \
+		&& if [ "$$HTTP_CODE" = "304" ] || [ ! -s $(CACHE_DIR)/pip/bin/aiagent-install.sh.tmp ]; then \
+			rm -f $(CACHE_DIR)/pip/bin/aiagent-install.sh.tmp; STATE="up to date"; \
+		else \
+			mv $(CACHE_DIR)/pip/bin/aiagent-install.sh.tmp $(CACHE_DIR)/pip/bin/aiagent-install.sh \
+			&& chmod +x $(CACHE_DIR)/pip/bin/aiagent-install.sh && STATE="updated"; fi \
+		&& echo "aiagent: $$STATE ($$AIAGENT_VERSION)"
 
 # Base images used by build and infrastructure
 BASE_IMAGES = debian:trixie $(GPU_BASE_IMAGE)

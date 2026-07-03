@@ -16,6 +16,8 @@ Usage:
     model-picker --agent claude   Pre-select agent, only show step 1
     model-picker --agent gemini   Shortcut: launch gemini directly
     model-picker --agent bash     Shortcut: drop to bash immediately
+    model-picker --agent aiagent  Pick model, then drop to a bash shell
+                                  pre-configured for the aiagent CLI
 
 Errors propagate verbatim. No exception swallowing.
 """
@@ -159,6 +161,7 @@ _AGENTS: list[tuple[str, str, str]] = [
     ("opencode",    "OpenCode",          "Open-source terminal agent; strong with local models"),
     ("late",        "LATE",              "Lightweight AI Terminal Environment — ephemeral subagents"),
     ("interpreter", "Open Interpreter",  "Natural language computer control"),
+    ("aiagent",     "AIAgent (shell)",   "DSPy agent CLI — drops to bash; run `aiagent` yourself"),
 ]
 
 # ANSI helpers — chosen for legibility on a black terminal background.
@@ -2414,10 +2417,76 @@ def _build(agent_id: str, model_name: str, backend: str) -> list[str]:
             "--api_key", "local",
         ]
 
+    if agent_id == "aiagent":
+        # aiagent is a CLI the user drives herself, so we do NOT exec it.
+        # Instead we configure the router endpoint + model in the environment
+        # and hand off to the shell launcher (aiagent-launcher.sh, installed
+        # as `aiagent-shell`), which prints a hint and drops into interactive
+        # bash. aiagent resolves AIAGENT_API_BASE -> OPENAI_BASE_URL ->
+        # OLLAMA_HOST; its README's devai integration contract sets
+        # AIAGENT_API_BASE to the router base INCLUDING the /v1 suffix.
+        # `name` is the serving name the router understands (bare Ollama tag,
+        # or `<name>@<ctx>` for vLLM) -- aiagent's registry parses the
+        # `@<ctx>::<reasoning>` control-surface suffix itself.
+        os.environ["AIAGENT_API_BASE"] = f"{base}/v1"
+        os.environ["AIAGENT_API_KEY"] = "local"
+        os.environ["AIAGENT_MODEL"] = name
+        # OpenAI-compat fallbacks so other SDK tools launched from the same
+        # shell inherit the router without extra setup. setdefault: never
+        # clobber a value the user (or an outer launcher) already exported.
+        os.environ.setdefault("OPENAI_BASE_URL", f"{base}/v1")
+        os.environ.setdefault("OPENAI_API_KEY", "local")
+        # DEVAI_AIAGENT_GPU is set by _resolve_agent's GPU sub-modal (default
+        # router-only); the launcher applies CUDA_VISIBLE_DEVICES accordingly.
+        return ["aiagent-shell"]
+
     sys.exit(f"error: unknown agent '{agent_id}'")
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
+
+def _resolve_aiagent_gpu_mode() -> str | None:
+    """Return the GPU-sharing mode for the aiagent shell.
+
+    A pre-set ``DEVAI_AIAGENT_GPU`` env value wins and suppresses the prompt
+    (env-flag override). Otherwise a sub-modal (mirroring the reasoning / MTP
+    ones) offers: router-only (default -- hide the GPU so aiagent cannot
+    contend with the router-loaded model for VRAM) vs share (GPU visible;
+    aiagent may run its own CUDA code, accepting the OOM risk). Returns
+    ``"router-only"`` / ``"share"``, or ``None`` when the user backed out
+    (Esc) so the caller re-enters the model list.
+    """
+    env = (os.environ.get("DEVAI_AIAGENT_GPU") or "").strip().lower()
+    if env == "share":
+        return "share"
+    if env in ("router-only", "router_only", "routeronly"):
+        return "router-only"
+    lines = [
+        f"  Router-only  {_DIM}(default — hide GPU; all compute via the router){_RESET}",
+        f"  Share GPU    {_DIM}(aiagent may run its own CUDA code; risks OOM vs the loaded model){_RESET}",
+    ]
+    header = f"aiagent GPU access  ▸  {_DIM}(Esc → back to model list){_RESET}"
+    idx = _fzf(lines, header)
+    if idx is None:
+        return None
+    return "share" if idx == 1 else "router-only"
+
+
+def _apply_aiagent_gpu(agent_id: str) -> bool:
+    """Resolve + record the GPU-sharing mode for the aiagent shell.
+
+    No-op (returns True) for every other agent. Sets ``DEVAI_AIAGENT_GPU`` in
+    the environment so aiagent-launcher.sh applies ``CUDA_VISIBLE_DEVICES``.
+    Returns False when the user backed out of the GPU sub-modal.
+    """
+    if agent_id != "aiagent":
+        return True
+    mode = _resolve_aiagent_gpu_mode()
+    if mode is None:
+        return False
+    os.environ["DEVAI_AIAGENT_GPU"] = mode
+    return True
+
 
 def _resolve_agent(agent_filter: str | None, model: dict) -> tuple[str, str, str] | None:
     """Drive reasoning toggle (inline-reasoning only) → MTP toggle (when
@@ -2485,6 +2554,8 @@ def _resolve_agent(agent_filter: str | None, model: dict) -> tuple[str, str, str
                 f"error: unknown agent '{agent_filter}' "
                 f"(known: {', '.join(a[0] for a in _AGENTS)})"
             )
+        if not _apply_aiagent_gpu(agent[0]):
+            return None
         return (agent[0], reasoning_mode, mtp_mode)
 
     alines = [_format_agent_row(a) for a in _AGENTS]
@@ -2503,7 +2574,10 @@ def _resolve_agent(agent_filter: str | None, model: dict) -> tuple[str, str, str
     idx = _fzf(alines, header)
     if idx is None:
         return None
-    return (_AGENTS[idx][0], reasoning_mode, mtp_mode)
+    agent_id = _AGENTS[idx][0]
+    if not _apply_aiagent_gpu(agent_id):
+        return None
+    return (agent_id, reasoning_mode, mtp_mode)
 
 
 def main() -> None:

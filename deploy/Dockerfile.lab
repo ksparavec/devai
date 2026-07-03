@@ -61,12 +61,18 @@ ENV NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/pipelock-ca.crt \
 
 # --- Binary installs (from local cache, populated by: make fetch) ---
 
-# Cache-bust when binaries change (hash computed by Makefile)
+# Cache-bust when binaries change (hash computed by Makefile).
+# BIN_HASH MUST be referenced inside the RUN below (not just declared) or the
+# layer cache is never invalidated: podman only busts a RUN's cache when a
+# build-arg it actually uses changes. Without the `echo "$BIN_HASH"`, a changed
+# bundle (e.g. an aiagent release bump) silently reuses the stale binary-install
+# layer, and every layer downstream (code-server, gemini, aiagent) with it.
 ARG BIN_HASH=unknown
 # Install CLI binaries (pre-downloaded to /var/cache/bin/ via cache mount).
 # LATE is installed as late-bin; a shell wrapper is installed as `late` to
 # apply sensible OPENAI_* defaults pointing at the in-cluster router.
-RUN cp /var/cache/bin/uv /var/cache/bin/uvx /var/cache/bin/claude /var/cache/bin/codex /var/cache/bin/opencode /var/cache/bin/ollama /usr/local/bin/ \
+RUN echo "binary cache key: BIN_HASH=$BIN_HASH" \
+    && cp /var/cache/bin/uv /var/cache/bin/uvx /var/cache/bin/claude /var/cache/bin/codex /var/cache/bin/opencode /var/cache/bin/ollama /usr/local/bin/ \
     && cp /var/cache/bin/late /usr/local/bin/late-bin \
     && chmod +x /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/claude /usr/local/bin/codex /usr/local/bin/opencode /usr/local/bin/late-bin /usr/local/bin/ollama
 
@@ -127,6 +133,28 @@ RUN --mount=type=bind,source=.,target=/src \
         echo "INFO: /var/cache/wheels/skypilot empty; skipping SkyPilot install. Run 'make fetch-cli' to populate."; \
     fi
 
+# Install aiagent (devitops-com/aiagent): a self-extracting makeself bundle that
+# ships its OWN bundled CPython 3.13, used by aiagent ONLY. Installed to an
+# ISOLATED prefix /opt/aiagent so aiagent's interpreter
+# (/opt/aiagent/bin/python3.13) stays OFF the system PATH -- the two interpreters
+# never mix: the lab's modules go to the /usr/local python via
+# `uv pip install --system`, and NOTHING is ever installed into aiagent's tree.
+# (Installing aiagent under /usr/local previously put its python on PATH, so
+# uv --system resolved to it and bled the whole lab requirement set -- torch,
+# jupyterlab, a transitive typer -- into the bundle, overwriting its pinned deps
+# and breaking the CLI.) Only the `aiagent` launcher is symlinked onto PATH; the
+# bundled python is never exposed. Pre-fetched by `make fetch-cli` into
+# /var/cache/bin/aiagent-install.sh (bind-mounted read-only at build time).
+# Optional: skip gracefully when the operator hasn't run `make fetch-cli` yet.
+RUN if [ -f /var/cache/bin/aiagent-install.sh ]; then \
+        AIAGENT_PREFIX=/opt/aiagent sh /var/cache/bin/aiagent-install.sh </dev/null \
+        && ln -sf /opt/aiagent/bin/aiagent /usr/local/bin/aiagent \
+        && aiagent version >/dev/null 2>&1 \
+        || echo "WARN: aiagent install completed but 'aiagent version' failed; investigate"; \
+    else \
+        echo "INFO: /var/cache/bin/aiagent-install.sh missing; skipping aiagent install. Run 'make fetch-cli' to populate."; \
+    fi
+
 # --- JupyterLab extension (depends on jupyterlab being installed above) ---
 
 # Install JupyterLab AI launcher extension (pre-built)
@@ -138,6 +166,10 @@ COPY packages/jupyter-ai-launchers/jupyter_ai_launchers/labextension /usr/local/
 COPY scripts/ollama-chat.sh /usr/local/bin/ollama-chat
 COPY scripts/aider-launcher.sh /usr/local/bin/aider-launcher
 COPY scripts/late-launcher.sh /usr/local/bin/late
+# aiagent shell launcher: the picker's "AIAgent (shell)" agent configures the
+# router endpoint + model, then execs this to drop the user into an interactive
+# bash shell where they run `aiagent ...` themselves. See scripts/aiagent-launcher.sh.
+COPY scripts/aiagent-launcher.sh /usr/local/bin/aiagent-shell
 COPY scripts/agent-picker.sh /usr/local/bin/agent-picker
 COPY scripts/model-picker.py /usr/local/bin/model-picker
 # Capability constants module imported by the picker at startup. Co-located
@@ -148,7 +180,7 @@ COPY scripts/model-picker.py /usr/local/bin/model-picker
 COPY scripts/_capability.py /usr/local/bin/_capability.py
 COPY scripts/vram-fit.py /usr/local/bin/vram-fit.py
 COPY deploy/models.yaml /etc/devai/models.yaml
-RUN chmod +x /usr/local/bin/ollama-chat /usr/local/bin/aider-launcher /usr/local/bin/late /usr/local/bin/agent-picker /usr/local/bin/model-picker
+RUN chmod +x /usr/local/bin/ollama-chat /usr/local/bin/aider-launcher /usr/local/bin/late /usr/local/bin/aiagent-shell /usr/local/bin/agent-picker /usr/local/bin/model-picker
 
 # Create user and directories (handle GID/UID conflicts in GPU base images)
 RUN getent group 1000 >/dev/null || groupadd -g 1000 devai \
@@ -161,6 +193,7 @@ RUN getent group 1000 >/dev/null || groupadd -g 1000 devai \
     && ln -s /usr/local/bin/late /home/devai/.local/bin/late \
     && ln -s /usr/local/bin/ollama /home/devai/.local/bin/ollama \
     && ln -s /usr/local/bin/code-server /home/devai/.local/bin/code-server \
+    && { [ -e /usr/local/bin/aiagent ] && ln -s /usr/local/bin/aiagent /home/devai/.local/bin/aiagent || true; } \
     && chown -R 1000:1000 /home/devai
 
 # Seed config files for coding agents (copied to $HOME by entrypoint if absent)
