@@ -67,7 +67,10 @@ jobs:
       - name: Build devai-router image
         run: docker build -f deploy/Dockerfile.router -t devai-router:ci .
       - name: Run Trivy
-        uses: aquasecurity/trivy-action@v0.29.0
+        # v0.29.0's own action.yaml points at a since-deleted
+        # aquasecurity/setup-trivy tag (v0.2.2) and fails to resolve;
+        # v0.36.0 pins that nested action by hash to the still-live v0.2.6.
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: devai-router:ci
           exit-code: "0"
