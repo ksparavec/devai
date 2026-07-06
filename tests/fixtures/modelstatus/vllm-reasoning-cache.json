@@ -1,0 +1,22 @@
+{
+  "nvidia/Qwen3-8B-NVFP4@abc123def456": {
+    "schema_version": 2,
+    "repo": "nvidia/Qwen3-8B-NVFP4",
+    "sha": "abc123def456",
+    "aliases": ["Qwen3-8B-NVFP4"],
+    "reasoning_parser": "qwen3",
+    "tool_parser": "hermes",
+    "disable_verified": true,
+    "probes": {
+      "24": {
+        "131072": {
+          "ctx": 131072,
+          "vram_gb": 24,
+          "fits": true,
+          "actual_vram_gb": 18.4,
+          "capability": "structured"
+        }
+      }
+    }
+  }
+}

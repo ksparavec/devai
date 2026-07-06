@@ -1,0 +1,26 @@
+# Minimal deploy/models.yaml fixture for tests/test-mcp-modelstatus.sh.
+# Shape matches the real catalog (deploy/models.yaml) exactly -- see
+# devai-tools/internal/modelcache/catalog.go.
+
+models:
+  - name: "qwen3.5:9b-q8_0"
+    family: qwen3.5
+    backend: [ollama]
+    source: ollama
+    size: "9.60 GB"
+    arch: { layers: 36, kv_heads: 8, head_dim: 128, k_eq_v: false }
+    arch_source: "Qwen/Qwen3.5-9B/config.json"
+    purpose: "qwen3.5 - 9.6 GB - 36L/8kv/128h"
+    conversational: true
+
+  - name: "Qwen3-8B-NVFP4"
+    family: qwen3
+    backend: [vllm, sglang]
+    repo: "nvidia/Qwen3-8B-NVFP4"
+    source: hf
+    sha: "abc123def456"
+    size: "5.2 GB"
+    arch: { layers: 36, kv_heads: 8, head_dim: 128, k_eq_v: false }
+    arch_source: "nvidia/Qwen3-8B-NVFP4/config.json"
+    purpose: "qwen3 - 5.2 GB - 36L/8kv/128h"
+    conversational: true

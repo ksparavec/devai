@@ -1,0 +1,35 @@
+# devai-mcp-modelstatus -- stdio MCP server exposing model catalog/probe/
+# bench query tools + live router status. Registered with the Docker MCP
+# Gateway (deploy/mcp-servers.yaml), spawned per-call over stdio -- never
+# invoked directly by agents. See docs/mcp-model-status.md.
+#
+# Build: podman build -f deploy/Dockerfile.mcp-modelstatus -t devai-mcp-modelstatus .
+
+FROM docker.io/library/golang:1.25-bookworm AS build
+WORKDIR /src
+COPY devai-tools/ devai-tools/
+COPY deploy/models.yaml deploy/models.yaml
+RUN cd devai-tools && go mod tidy && CGO_ENABLED=0 go build -ldflags="-s -w" -o /devai-mcp-modelstatus ./cmd/devai-mcp-modelstatus
+
+# The 4 probe/bench cache files are gitignored, host-generated
+# (`make probe`, `make bench`) state -- not guaranteed to exist in a
+# fresh checkout. Stage them here (falling back to an empty `{}` cache,
+# read by modelcache.Load*Cache identically to "file absent") so the
+# final-stage COPY below always has a source, whether or not this host
+# has probed/benched anything yet.
+COPY deploy/.ollama-reasoning-cache.json* deploy/.vllm-reasoning-cache.json* deploy/.sglang-reasoning-cache.json* deploy/.bench-cache.json* /tmp/maybe-caches/
+RUN mkdir -p /etc/devai && cp deploy/models.yaml /etc/devai/models.yaml && \
+    for f in .ollama-reasoning-cache.json .vllm-reasoning-cache.json .sglang-reasoning-cache.json .bench-cache.json; do \
+        if [ -f "/tmp/maybe-caches/$f" ]; then cp "/tmp/maybe-caches/$f" "/etc/devai/$f"; else echo '{}' > "/etc/devai/$f"; fi; \
+    done
+
+FROM gcr.io/distroless/static-debian12
+COPY --from=build /devai-mcp-modelstatus /devai-mcp-modelstatus
+# Baked in at build time, not bind-mounted: the pinned MCP Gateway
+# (docker/mcp-gateway:v0.42.1) catalog schema doesn't have a confirmed
+# per-server volume-mount field (none of the other 14 entries in
+# deploy/mcp-servers.yaml demonstrate one -- see docs/mcp-model-status.md).
+# Refresh by rebuilding this image (`make build-mcp-modelstatus-image`)
+# after `make probe`/`make bench` update the source files.
+COPY --from=build /etc/devai /etc/devai
+ENTRYPOINT ["/devai-mcp-modelstatus"]

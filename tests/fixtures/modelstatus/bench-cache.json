@@ -1,0 +1,19 @@
+{
+  "_meta": {
+    "current_host_env_id": "fixture0000"
+  },
+  "nvidia/Qwen3-8B-NVFP4@abc123def456::vllm::131072": {
+    "context": 131072,
+    "backend": "vllm",
+    "metrics": {
+      "tps_sustained_p50": 98.3,
+      "peak_vram_gb": 22.54
+    },
+    "tasks": {
+      "gsm8k_subset_100": {"score": 0.95, "ran_at": "2026-06-01T00:00:00Z"},
+      "humaneval_subset_50": {"pass@1": 0.98, "ran_at": "2026-06-01T00:00:00Z"},
+      "tools_use_20": {"score": 1.0, "ran_at": "2026-06-01T00:00:00Z"},
+      "leak_probe": {"leak_rate": 0.0, "n_prompts": 40}
+    }
+  }
+}

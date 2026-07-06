@@ -176,9 +176,9 @@ endif
 .PHONY: catalog-regen catalog-suggest catalog-discover catalog-discover-add probe probe-vllm probe-sglang probe-load-vllm probe-load-sglang model-fit model-pull model-status model-sync vram-fit verify-backend-flags ollama-cleanup-ctx-variants
 .PHONY: bench bench-vllm bench-sglang bench-ollama bench-report test-bench-smoke
 .PHONY: secrets-tmpfs secrets-edit secrets-render secrets-rotate age-keygen-host test-python
-.PHONY: build-backup-tool test-devai-tools
+.PHONY: build-backup-tool build-mcp-modelstatus build-mcp-modelstatus-image test-devai-tools
 .PHONY: backup-create backup-list backup-verify backup-restore test-backup-restore
-.PHONY: mcp-up mcp-down mcp-logs mcp-test mcp-health mcp-secrets-render build-worker-bootstrap test-cluster-preflight cluster-head-up cluster-head-down cluster-status skypilot-up skypilot-down skypilot-check skypilot-secrets-render
+.PHONY: mcp-up mcp-down mcp-logs mcp-test mcp-health mcp-secrets-render test-mcp-modelstatus build-worker-bootstrap test-cluster-preflight cluster-head-up cluster-head-down cluster-status skypilot-up skypilot-down skypilot-check skypilot-secrets-render
 
 all: help
 
@@ -576,6 +576,19 @@ build-backup-tool: ## Build devai-tools/bin/devai-backup
 		docker.io/library/golang:1.25-bookworm \
 		-c "mkdir -p bin && go build -o bin/devai-backup ./cmd/devai-backup"
 
+build-mcp-modelstatus: ## Build devai-tools/bin/devai-mcp-modelstatus
+	$(CONTAINER_RUNTIME) run --rm \
+		--entrypoint bash \
+		-v "$$(pwd)/devai-tools:/src:z" \
+		-w /src \
+		docker.io/library/golang:1.25-bookworm \
+		-c "mkdir -p bin && go build -o bin/devai-mcp-modelstatus ./cmd/devai-mcp-modelstatus"
+
+build-mcp-modelstatus-image: ## Build the devai-mcp-modelstatus container image (for the MCP gateway catalog)
+	$(CONTAINER_RUNTIME) build --network=host \
+		-f deploy/Dockerfile.mcp-modelstatus \
+		-t devai-mcp-modelstatus .
+
 test-devai-tools: ## Run Go unit tests for devai-tools/
 	$(CONTAINER_RUNTIME) run --rm \
 		--entrypoint bash \
@@ -623,6 +636,9 @@ mcp-logs: ## Tail the MCP gateway log
 
 mcp-test: ## Smoke-test the running MCP gateway (requires `make mcp-up`)
 	bash tests/test-mcp.sh
+
+test-mcp-modelstatus: ## End-to-end test of the devai-model-status MCP server against the live gateway
+	bash tests/test-mcp-modelstatus.sh
 
 mcp-health: ## Lightweight /health probe against the running MCP gateway
 	bash scripts/mcp-health.sh

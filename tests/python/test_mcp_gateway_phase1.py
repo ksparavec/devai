@@ -94,7 +94,10 @@ class TestMcpServersYaml(unittest.TestCase):
         for s in doc["servers"]:
             with self.subTest(server=s.get("name")):
                 self.assertIsInstance(s.get("image"), str)
-                self.assertTrue(s["image"].startswith(("docker.io/", "ghcr.io/", "mcp/")))
+                # localhost/ covers first-party servers built locally rather
+                # than pulled from a registry (e.g. devai-model-status --
+                # see docs/mcp-model-status.md).
+                self.assertTrue(s["image"].startswith(("docker.io/", "ghcr.io/", "mcp/", "localhost/")))
                 self.assertIsInstance(s.get("description"), str)
                 self.assertGreater(len(s["description"]), 10)
 
