@@ -37,7 +37,7 @@ services:
     volumes:
       - /var/cache/devai/ollama:/root/.ollama
     devices:
-      - nvidia.com/gpu=all
+      - ${DEVAI_GPU_DEVICE:-nvidia.com/gpu=all}
     security_opt:
       - label=disable
     restart: unless-stopped
@@ -57,7 +57,7 @@ services:
       - /var/cache/devai/ollama/models/vllm:/models:ro
     entrypoint: ["sleep", "infinity"]
     devices:
-      - nvidia.com/gpu=all
+      - ${DEVAI_GPU_DEVICE:-nvidia.com/gpu=all}
     security_opt:
       - label=disable
     restart: "no"
@@ -70,7 +70,7 @@ services:
       - /var/cache/devai/ollama/models/vllm:/models:ro
     entrypoint: ["sleep", "infinity"]
     devices:
-      - nvidia.com/gpu=all
+      - ${DEVAI_GPU_DEVICE:-nvidia.com/gpu=all}
     security_opt:
       - label=disable
     restart: "no"

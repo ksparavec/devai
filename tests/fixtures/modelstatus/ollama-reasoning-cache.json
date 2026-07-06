@@ -1,0 +1,18 @@
+{
+  "sha256:fixturedigest0000000000000000000000000000000000000000000000": {
+    "schema_version": 3,
+    "aliases": ["qwen3.5:9b-q8_0"],
+    "capability": "structured",
+    "probes": {
+      "24": {
+        "131072": {
+          "ctx": 131072,
+          "actual_total_gb": 12.3,
+          "actual_vram_gb": 12.3,
+          "fully_on_gpu": true,
+          "capability": "structured"
+        }
+      }
+    }
+  }
+}

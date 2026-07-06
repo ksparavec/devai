@@ -110,8 +110,15 @@ EGRESS_PROXY_ENV = \
 	-e no_proxy=$(PIPELOCK_NO_PROXY)
 
 
-# GPU build settings
+# GPU build settings. Base image defaults on DEVAI_GPU_VENDOR (from .env,
+# via -include .env above; set by `make gpu-vendor VENDOR=amd`) -- an
+# explicit GPU_BASE_IMAGE in .env or the shell still wins either way
+# (?= only assigns when unset). See docs/gpu-vendors.md.
+ifeq ($(DEVAI_GPU_VENDOR),amd)
+GPU_BASE_IMAGE ?= docker.io/rocm/dev-ubuntu-24.04:6.4.3-complete
+else
 GPU_BASE_IMAGE ?= docker.io/nvidia/cuda:12.9.1-cudnn-runtime-ubuntu24.04
+endif
 
 # Mount host config files (gitconfig, ssh) to staging dir for entrypoint to copy
 HOME_MOUNT_ARG =
@@ -157,9 +164,12 @@ ifeq ($(findstring podman,$(CONTAINER_RUNTIME)),podman)
 endif
 
 # GPU runtime flags
+# DEVAI_GPU_DEVICE comes from .env (via -include .env above), written by
+# `make gpu-vendor VENDOR=amd` (devai-tools/cmd/devai-gpu-vendor). Defaults
+# to NVIDIA's CDI device string when unset -- see docs/gpu-vendors.md.
 GPU_FLAGS =
 ifeq ($(findstring podman,$(CONTAINER_RUNTIME)),podman)
-	GPU_FLAGS += --device nvidia.com/gpu=all --security-opt=label=disable
+	GPU_FLAGS += --device $(or $(DEVAI_GPU_DEVICE),nvidia.com/gpu=all) --security-opt=label=disable
 else
 	GPU_FLAGS += --gpus all
 endif
@@ -176,7 +186,10 @@ endif
 .PHONY: catalog-regen catalog-suggest catalog-discover catalog-discover-add probe probe-vllm probe-sglang probe-load-vllm probe-load-sglang model-fit model-pull model-status model-sync vram-fit verify-backend-flags ollama-cleanup-ctx-variants
 .PHONY: bench bench-vllm bench-sglang bench-ollama bench-report test-bench-smoke
 .PHONY: secrets-tmpfs secrets-edit secrets-render secrets-rotate age-keygen-host test-python
-.PHONY: mcp-up mcp-down mcp-logs mcp-test mcp-health mcp-secrets-render build-worker-bootstrap test-cluster-preflight cluster-head-up cluster-head-down cluster-status skypilot-up skypilot-down skypilot-check skypilot-secrets-render
+.PHONY: build-backup-tool build-gpu-vendor-tool build-mcp-modelstatus build-mcp-modelstatus-image build-devai-tools test-devai-tools
+.PHONY: gpu-vendor test-gpu-vendor
+.PHONY: backup-create backup-list backup-verify backup-restore test-backup-restore
+.PHONY: mcp-up mcp-down mcp-logs mcp-test mcp-health mcp-secrets-render test-mcp-modelstatus build-worker-bootstrap test-cluster-preflight cluster-head-up cluster-head-down cluster-status skypilot-up skypilot-down skypilot-check skypilot-secrets-render
 
 all: help
 
@@ -410,6 +423,7 @@ build-gpu: build-base-gpu fetch-cli ## Build the container image (GPU/CUDA)
 		$(CACHE_BUILD_ARGS) \
 		--build-arg BASE_IMAGE=$(BASE_IMAGE_NAME_GPU) \
 		--build-arg GPU_BUILD=true \
+		--build-arg GPU_VENDOR=$(or $(DEVAI_GPU_VENDOR),nvidia) \
 		--build-arg OLLAMA_HOST=$(OLLAMA_HOST) \
 		--build-arg OLLAMA_DEFAULT_MODEL=$(OLLAMA_DEFAULT_MODEL) \
 		-f deploy/Dockerfile.lab \
@@ -561,6 +575,63 @@ secrets-rotate: ## Re-key every deploy/*.sops.env file against the current .sops
 age-keygen-host: ## Generate a per-host age keypair under ~/.config/sops/age/ and print the public key
 	bash scripts/age-keygen-host.sh
 
+# devai-tools (devai-tools/go.mod): first-party Go CLIs sibling to
+# gpu-arbiter -- devai-backup, devai-mcp-modelstatus, devai-gpu-vendor.
+# Built/tested with the host's own Go toolchain (consolidated to the
+# current stable release across both modules -- see gpu-arbiter/go.mod),
+# not a pinned container: needs Go >= the go.mod floor on PATH.
+
+build-backup-tool: ## Build devai-tools/bin/devai-backup
+	cd devai-tools && mkdir -p bin && go build -o bin/devai-backup ./cmd/devai-backup
+
+build-mcp-modelstatus: ## Build devai-tools/bin/devai-mcp-modelstatus
+	cd devai-tools && mkdir -p bin && go build -o bin/devai-mcp-modelstatus ./cmd/devai-mcp-modelstatus
+
+build-mcp-modelstatus-image: ## Build the devai-mcp-modelstatus container image (for the MCP gateway catalog)
+	$(CONTAINER_RUNTIME) build --network=host \
+		-f deploy/Dockerfile.mcp-modelstatus \
+		-t devai-mcp-modelstatus .
+
+build-gpu-vendor-tool: ## Build devai-tools/bin/devai-gpu-vendor
+	cd devai-tools && mkdir -p bin && go build -o bin/devai-gpu-vendor ./cmd/devai-gpu-vendor
+
+gpu-vendor: build-gpu-vendor-tool ## Switch GPU vendor in .env. VENDOR=nvidia|amd (required)
+	@if [ "$(VENDOR)" != "nvidia" ] && [ "$(VENDOR)" != "amd" ]; then \
+		echo "ERROR: pass VENDOR=nvidia or VENDOR=amd" >&2; exit 2; \
+	fi
+	devai-tools/bin/devai-gpu-vendor --env-file .env --vendor $(VENDOR)
+
+test-gpu-vendor: ## Verify the GPU-vendor overlay renders correctly both directions
+	bash tests/test-gpu-vendor.sh
+
+build-devai-tools: build-backup-tool build-mcp-modelstatus build-gpu-vendor-tool ## Build every devai-tools/ binary
+
+test-devai-tools: ## Run Go unit tests for devai-tools/ (backup, modelcache, routerclient, gpu-vendor)
+	cd devai-tools && go test -race -v -count=1 ./...
+
+# Backup/restore (devai-tools/cmd/devai-backup; see docs/backup-restore.md).
+# Snapshots probe/bench caches, ~/.devai/ preferences+sessions, and the
+# sops/age key. YES=1 mirrors the confirm-flag convention catalog-discover-add
+# already uses for a destructive default-off operation.
+
+backup-create: build-backup-tool ## Snapshot host-local state. DEST=<dir> to override.
+	devai-tools/bin/devai-backup snapshot $(if $(DEST),--dest $(DEST))
+
+backup-list: build-backup-tool ## List existing backup archives. DEST=<dir> to override.
+	devai-tools/bin/devai-backup list $(if $(DEST),--dest $(DEST))
+
+backup-verify: build-backup-tool ## Verify an archive's integrity. ARCHIVE=<path> (required).
+	@if [ -z "$(ARCHIVE)" ]; then echo "ERROR: pass ARCHIVE=path/to/backup.tar.gz" >&2; exit 2; fi
+	devai-tools/bin/devai-backup verify --archive "$(ARCHIVE)"
+
+backup-restore: build-backup-tool ## Restore from an archive. ARCHIVE=<path> YES=1 (both required).
+	@if [ -z "$(ARCHIVE)" ]; then echo "ERROR: pass ARCHIVE=path/to/backup.tar.gz" >&2; exit 2; fi
+	@if [ "$(YES)" != "1" ]; then echo "ERROR: restore overwrites host state -- pass YES=1 to confirm" >&2; exit 2; fi
+	devai-tools/bin/devai-backup restore --archive "$(ARCHIVE)" --yes
+
+test-backup-restore: test-devai-tools ## devai-tools Go tests + tests/test-backup-restore.sh
+	./tests/test-backup-restore.sh
+
 # MCP gateway (per docs/plans/mcp-gateway.md). Phase 1: start the
 # gateway with the 10 Tier 1 servers via the 'mcp' compose profile.
 # Phase 2 will append a `mcp-secrets-render` prerequisite that depends
@@ -577,6 +648,9 @@ mcp-logs: ## Tail the MCP gateway log
 
 mcp-test: ## Smoke-test the running MCP gateway (requires `make mcp-up`)
 	bash tests/test-mcp.sh
+
+test-mcp-modelstatus: ## End-to-end test of the devai-model-status MCP server against the live gateway
+	bash tests/test-mcp-modelstatus.sh
 
 mcp-health: ## Lightweight /health probe against the running MCP gateway
 	bash scripts/mcp-health.sh
@@ -684,12 +758,7 @@ build-worker-bootstrap: ## Build the minimal cluster-worker bootstrap image (clu
 		-t $(WORKER_BOOTSTRAP_IMAGE) .
 
 test-router: ## Run Go unit tests for gpu-arbiter router
-	$(CONTAINER_RUNTIME) run --rm \
-		--entrypoint bash \
-		-v "$$(pwd)/gpu-arbiter:/src:z" \
-		-w /src \
-		docker.io/library/golang:1.23-bookworm \
-		-c "go test -race -v -count=1 ./..."
+	cd gpu-arbiter && go test -race -v -count=1 ./...
 
 test-python: ## Run Python stdlib unittests (bench/picker schema, pure-Python helpers)
 	@# Stdlib-only; runs locally, no container start needed. The bench
@@ -785,7 +854,7 @@ test-agents: ## Smoke-test every (agent × backend) cell against the live router
 		$(IMAGE_NAME_GPU) /usr/local/bin/agent-matrix
 	@echo "  logs preserved at $(CURDIR)/tests/.matrix-logs/"
 
-test: test-router test-python test-probe-ollama-idempotent test-ollama test-e2e test-vllm test-sglang test-models ## Run every available test in sequence (Go unit + Python unit + Ollama + E2E + vLLM/SGLang integration + matrix + probes; ~30-60 min)
+test: test-router test-devai-tools test-python test-backup-restore test-gpu-vendor test-probe-ollama-idempotent test-ollama test-e2e test-vllm test-sglang test-models ## Run every available test in sequence (Go unit + Python unit + Ollama + E2E + vLLM/SGLang integration + matrix + probes; ~30-60 min)
 	@# The cache-up suite runs as prerequisites above. Probe smoke tests
 	@# require the live backends to be DOWN (the prober self-checks for
 	@# router/vllm/sglang containers and aborts otherwise) — they run

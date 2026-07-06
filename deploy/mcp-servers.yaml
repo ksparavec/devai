@@ -98,6 +98,29 @@ servers:
     permissions:
       - network.outbound
 
+  # ── First-party (devai-authored) ────────────────────────────────
+  #
+  # Built locally, not pulled from a registry: `make build-mcp-modelstatus-image`
+  # (devai-tools/cmd/devai-mcp-modelstatus, deploy/Dockerfile.mcp-modelstatus)
+  # tags localhost/devai-mcp-modelstatus:latest in the same host's Podman
+  # image store the gateway already spawns containers from -- no push
+  # needed. See docs/mcp-model-status.md.
+
+  - name: devai-model-status
+    image: localhost/devai-mcp-modelstatus:latest
+    description: |
+      Read-only devai model catalog / probe-cache / bench-cache / live
+      router-status queries: list_fitting_models, get_model_bench,
+      get_router_status. The 4 source files (models.yaml + 3 probe
+      caches + bench cache) are baked into the image at build time, not
+      bind-mounted -- rebuild the image after `make probe`/`make bench`
+      to refresh (see docs/mcp-model-status.md for why: the pinned
+      gateway version's per-server volume-mount schema isn't confirmed).
+      get_router_status reaches the live devai-router via
+      host.containers.internal, so it stays current without a rebuild.
+    permissions:
+      - network.outbound
+
   # ── Tier 2 (one secret each, Phase 2) ──────────────────────────
   #
   # Each entry references a {secret: NAME} value resolved by the

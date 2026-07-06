@@ -70,6 +70,16 @@ Servers run in their own per-call containers spawned by the gateway,
 with `no-new-privileges` enforced (set on the gateway in
 `docker-compose.yaml`).
 
+## First-party servers
+
+`devai-model-status` is the first devai-authored MCP server (built
+locally via `make build-mcp-modelstatus-image`, not pulled from a
+registry) -- model catalog / probe-cache / bench-cache queries plus
+live router status. See
+[docs/mcp-model-status.md](mcp-model-status.md) for the tool
+reference and the template it establishes for any future first-party
+server.
+
 ## Client configurations
 
 ### Claude Code

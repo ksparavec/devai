@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is **Dev AI Lab** -- a containerized development environment for AI experimentation featuring JupyterLab and multiple AI CLIs (Gemini, Claude, OpenAI, Ollama). Built on Debian Trixie with Python 3.13 (uv-managed), Node.js 22 LTS. Two-layer image build for fast iteration. Compatible with Podman and Docker. GPU/CUDA support.
+This is **Dev AI Lab** -- a containerized development environment for AI experimentation featuring JupyterLab and multiple AI CLIs (Gemini, Claude, OpenAI, Ollama). Built on Debian Trixie with Python 3.13 (uv-managed), Node.js 22 LTS. Two-layer image build for fast iteration. Compatible with Podman and Docker. GPU/CUDA support (NVIDIA default; AMD/ROCm opt-in via `DEVAI_GPU_VENDOR`, build-time-verified only so far -- see docs/gpu-vendors.md).
 
 **Backends:** all three are wired -- Ollama (GGUF, port 11434), vLLM (NVFP4/safetensors, port 11435), SGLang (NVFP4/safetensors, port 11436). The router enforces GPU mutual exclusion: only one backend serves at a time. vLLM and SGLang start as `sleep infinity` placeholders and are recreated on demand by the router when a request arrives.
 
@@ -29,6 +29,10 @@ This is **Dev AI Lab** -- a containerized development environment for AI experim
 - `docs/skypilot.md` -- operator reference for the system-side SkyPilot fleet provisioner. Phase 1 ships `devai-skypilot-api-server` as a long-lived compose service on the `cluster` profile (image pinned to `berkeleyskypilot/skypilot:0.12.1`, port 46580). Phase 2 (code only so far) wires the head-side Go integration (`skypilot_client.go`, `skypilot_policy.go`, two-step idle teardown). Covers bring-up, volume layout, endpoint surface, cost guidance, troubleshooting.
 - `docs/skypilot-user-guide.md` -- user-facing SkyPilot CLI guide (sibling to the system-side provisioner above). The lab image bundles `sky` + the Agent Skill plugin so any CLI agent (Claude Code, Gemini CLI, Codex) can spin up cloud GPUs through natural-language. Covers per-cloud credential setup, hello-world, agent-driven flow, cost guidance with $/hr table.
 - `docs/aiagent.md` -- reference for the "AIAgent (shell)" picker agent. aiagent (github.com/devitops-com/aiagent) is a DSPy CLI the user drives herself, so the picker drops to an interactive bash shell pre-configured with the router endpoint (`AIAGENT_API_BASE=<router>/v1`) + model instead of exec'ing it. Covers the env contract, the `DEVAI_AIAGENT_GPU` router-only|share toggle (default router-only hides the GPU so aiagent can't contend with the router-loaded model), build-time install of the makeself bundle to an isolated `/opt/aiagent`, the verified qwen3.6:27b-q4_K_M example, and the five upstream aiagent bugs found + fixed during integration (devitops-com/aiagent#1-5, all fixed in v0.1.2, which the lab image bakes).
+- `docs/backup-restore.md` -- reference for `devai-backup` (`devai-tools/cmd/devai-backup`): what gets snapshotted (probe/bench caches, `~/.devai/` preferences+sessions, the sops/age private key) and what's deliberately excluded, the age-key "no backdoor" warning, command reference, restore semantics (path-traversal validation before any writes, rename-aside rather than delete), a recovery walkthrough.
+- `docs/security-ci.md` -- reference for the two GitHub Actions workflows (`security-blocking.yml`, `security-advisory.yml`) plus `dependabot.yml`: which checks block a merge vs which are advisory-only, branch-protection setup, the containerized local pre-push command sequence, how to read advisory findings (Security tab for CodeQL, job logs for govulncheck/Trivy).
+- `docs/mcp-model-status.md` -- reference for `devai-model-status`, the first devai-authored MCP server (`devai-tools/cmd/devai-mcp-modelstatus`, registered in `deploy/mcp-servers.yaml`). Three read-only tools: `list_fitting_models`, `get_model_bench`, `get_router_status` (cluster-head vs single-mode fallback vs unreachable). Config files are baked into the image at build time, not bind-mounted -- rebuild after `make probe`/`make bench` to refresh.
+- `docs/gpu-vendors.md` -- reference for the NVIDIA/AMD GPU-vendor overlay (`DEVAI_GPU_VENDOR`, flipped via `make gpu-vendor VENDOR=nvidia|amd` or `devai-agent --gpu-vendor`). Every hardcoded `nvidia.com/gpu=all` call site and why 2 of the 9 are deliberately left NVIDIA-only, the `devai-lab-gpu` image's ROCm base + PyTorch wheel-index branch, and an honest verification-status note: NVIDIA is fully verified, AMD/ROCm is unverified even at build time (Docker Hub was unreachable in the session this shipped from) pending a real ROCm host.
 - `docs/plans/` -- 6 design plans + execution-order README. `bench-rewrite` (Phases 1-5 shipped, Phase 6 deferred to live GPU). `sops-age-secrets` (scaffold shipped). `mcp-gateway` (Phases 1+2 shipped). `skypilot-agent-skill` (Phase 1 shipped, Phase 2 plugin install deferred). `gpu-arbiter-cluster-mode` (Phases 1, 1.5, 2 shipped; Phase 3 federation optional). `skypilot-fleet-provisioner` (Phase 1+2 code shipped; live cloud-burst E2E deferred).
 
 ## Build and Run Commands
@@ -93,7 +97,10 @@ make setup-logs                 # One-time: 100G LV at /var/cache/devai/logs (su
 
 # Tests
 make test-router                # Go unit tests for arbiter (single-host + cluster mode)
+make test-devai-tools            # Go unit tests for devai-tools/ (backup, modelcache, routerclient, envfile, gpu-vendor)
 make test-python                # Python stdlib unittests (bench v3, picker, sops/age, MCP, SkyPilot)
+make test-backup-restore        # devai-backup Go tests + tests/test-backup-restore.sh
+make test-gpu-vendor            # GPU-vendor overlay: flips DEVAI_GPU_VENDOR, asserts rendered compose config both directions
 make test-cluster-preflight     # cluster-mode Phase 1.5 preflight (worker + stub head; no GPU)
 make test-ollama                # Ollama integration tests
 make test-models                # Matrix: every probed digest x wire x scenario
@@ -105,6 +112,17 @@ make test-probe-sglang          # Same for SGLang
 make test-probe-ollama-idempotent  # Byte-identical regression check on refactored Ollama prober
 make test                       # All of the above in sequence (~30-60 min wall time)
 
+# Backup / restore (per docs/backup-restore.md). Snapshots probe/bench caches,
+# ~/.devai/ preferences+sessions, and the sops/age key.
+make backup-create [DEST=...]   # Snapshot host-local state to ~/.devai/backups/<timestamp>.tar.gz
+make backup-list [DEST=...]     # List existing archives (JSON: path, size, mtime, top-level dirs)
+make backup-verify ARCHIVE=...  # Validate an archive without extracting
+make backup-restore ARCHIVE=... YES=1  # Restore; destructive, requires YES=1
+
+# GPU vendor (per docs/gpu-vendors.md). NVIDIA is the default; AMD/ROCm is
+# build-time-only so far (no ROCm hardware verified against yet).
+make gpu-vendor VENDOR=nvidia|amd  # Flip DEVAI_GPU_VENDOR + its 3 derived .env vars
+
 # MCP gateway (per docs/mcp.md). Phase 1 = 10 Tier 1 servers; Phase 2 = 4 Tier 2 servers + sops-rendered secrets.
 make mcp-up                     # Start the gateway via the 'mcp' compose profile (port 8088)
 make mcp-down                   # Stop the gateway
@@ -112,6 +130,8 @@ make mcp-logs                   # Tail gateway log
 make mcp-test                   # End-to-end /health + tools/list smoke test
 make mcp-health                 # Lightweight /health probe
 make mcp-secrets-render         # Phase 2: render deploy/mcp-secrets.sops.env -> /run/devai/mcp-secrets.env
+make build-mcp-modelstatus-image  # Build the devai-model-status MCP server image (per docs/mcp-model-status.md)
+make test-mcp-modelstatus       # End-to-end test of devai-model-status against the live gateway
 
 # Cluster mode (per docs/cluster-mode.md). Single mode is unchanged; head/worker are opt-in.
 make cluster-head-up            # Start router in head mode (compose.head.yaml zeroes local backends)
@@ -159,6 +179,8 @@ Model catalog is in `deploy/models.yaml` (single source of truth for all models)
 
 - `GPU_MEMORY_GB` -- Total GPU VRAM in GB (default: 24). Used by router to calculate memory fractions and context limits.
 - `MAX_CONTEXT_LEN` -- Default max context length in tokens (default: 131072 = 128K). The router caps each model's per-name context at `min(model.max_context, MAX_CONTEXT_LEN)`. The probe cache (`deploy/.ollama-reasoning-cache.json`) is the source of truth -- `deploy/active-models.yaml` no longer exists.
+- `DEVAI_GPU_VENDOR` -- `nvidia` (default) or `amd`; set via `make gpu-vendor VENDOR=nvidia|amd`, not by hand (see docs/gpu-vendors.md). Derives `DEVAI_GPU_DEVICE`, `VLLM_IMAGE`, `SGLANG_IMAGE`.
+- `DEVAI_GPU_DEVICE` -- CDI device string for the backend containers and `make lab-gpu`/`shell-gpu` (default: `nvidia.com/gpu=all`). AMD/ROCm is build-time-verified only so far, not yet run against real ROCm hardware.
 
 ### Cluster-mode env vars (opt-in; see docs/cluster-env.md)
 
@@ -290,6 +312,7 @@ deploy/docker-compose.yaml    -- Infrastructure services (vllm/sglang start as `
 deploy/Dockerfile.base        -- Base image
 deploy/Dockerfile.lab         -- Lab image (now also installs SkyPilot CLI offline from pre-fetched wheels per skypilot-agent-skill plan Phase 1)
 deploy/Dockerfile.router      -- Router image (distroless)
+deploy/Dockerfile.mcp-modelstatus -- devai-model-status MCP server image (distroless, 2-stage like Dockerfile.router). Bakes models.yaml + the 4 probe/bench cache files into /etc/devai/ at build time (falls back to an empty `{}` cache for any that don't exist yet) rather than bind-mounting -- see docs/mcp-model-status.md for why. Build via `make build-mcp-modelstatus-image`.
 deploy/Dockerfile.worker-bootstrap -- Minimal cloud-VM image SkyPilot launches: arbiter binary + cloud-init + pre-pulled backend images, no JupyterLab/picker/agents (per cluster-mode decision 11). Build via `make build-worker-bootstrap`.
 deploy/worker-cloud-init.sh   -- Cloud-init entrypoint baked into Dockerfile.worker-bootstrap; validates env vars (DEVAI_HEAD_URL, DEVAI_WORKER_TOKEN_FILE, ...) and execs `gpu-arbiter --mode=worker`. The contract SkyPilot consumes.
 deploy/compose.head.yaml      -- Compose overlay for cluster-head deployments. Sets DEVAI_MODE=head on router and zeroes the local backend service replicas. Used by `make cluster-head-up`.
@@ -312,6 +335,14 @@ gpu-arbiter/cluster_head.go   -- ClusterHead with control plane (port 11444) + f
 gpu-arbiter/cluster_proxy.go  -- ClusterProxy implements HeadForwarder. Bearer-auth POST to worker's /v1/cluster/inbound, mirror response headers, strip Content-Length on text/event-stream so SSE flushes through with http.Flusher.
 gpu-arbiter/skypilot_client.go -- HTTP client for SkyPilot /api/v1/{launch,status,down}. Bearer-token auth via TokenStore (re-read each call). IsConfigured guard so a head with no SKYPILOT_API_ENDPOINT degrades to local-fleet-only routing.
 gpu-arbiter/skypilot_policy.go -- SkyPilotPolicy (PickCheapest + per-launch budget gate + BuildLaunchRequest with worker-bootstrap env contract) + IdleTeardownCoordinator (two-step "send shutdown via heartbeat then sky down" sequence).
+devai-tools/                  -- Sibling Go module (own go.mod) hosting first-party devai CLIs. File-per-concern + table-driven-test convention mirrors gpu-arbiter's. Both modules' go.mod pin the same consolidated current-stable Go release; devai-tools' floor is still driven by cmd/devai-mcp-modelstatus's MCP go-sdk dependency (go >= 1.25.0), just no longer split from gpu-arbiter's version. Built/tested with the host's own Go toolchain (`make build-devai-tools`, `make test-devai-tools` -- no container, needs Go on PATH), output to devai-tools/bin/ (gitignored), not the repo-root bin/ (the Python devai-agent launcher's own install target).
+devai-tools/cmd/devai-backup   -- Backup/restore CLI (snapshot/list/verify/restore). See docs/backup-restore.md.
+devai-tools/cmd/devai-mcp-modelstatus -- devai-model-status MCP server (stdio, official modelcontextprotocol/go-sdk). See docs/mcp-model-status.md.
+devai-tools/cmd/devai-gpu-vendor -- Flips DEVAI_GPU_VENDOR + its 3 derived .env vars (add-or-replace, comment-preserving). See docs/gpu-vendors.md.
+devai-tools/internal/backup/  -- Manifest + tar snapshot/verify/restore logic, path-traversal validation shared by verify and restore.
+devai-tools/internal/modelcache/ -- deploy/models.yaml + the 3 probe caches + the bench cache: parsing, the list_fitting_models join, the get_model_bench formula (matches scripts/model-picker.py's REAS/TOTAL exactly).
+devai-tools/internal/routerclient/ -- get_router_status: cluster-head /v1/cluster/status probe, single-mode per-backend /health fallback, unreachable degradation.
+devai-tools/internal/envfile/ -- Add-or-replace .env key mutation preserving comments/other lines; devai-gpu-vendor's only writer of .env.
 scripts/age-keygen-host.sh    -- One-time per host: generates ~/.config/sops/age/keys.txt mode 0600 + prints public key. Idempotent.
 scripts/render-secret.sh      -- Generic single-file decrypt to tmpfs. Refuses non-tmpfs destinations (override via DEVAI_RENDER_ALLOW_NON_TMPFS=1) so a missing `make secrets-tmpfs` fails loudly.
 scripts/mcp-health.sh         -- Lightweight /health + /servers probe for the running MCP gateway.
@@ -341,7 +372,11 @@ tests/test-router.sh          -- Ollama-side router integration tests
 tests/test-model-matrix.sh    -- Exhaustive matrix: every probed digest x wire x scenario
 tests/test-cluster-preflight.sh -- cluster-mode Phase 1.5 preflight (worker + stub head). 7 scripted scenarios (registration, heartbeat cadence, drain/serve/shutdown commands, lifecycle policy, head-bounce recovery, token rotation, inbound auth gating). No GPU required; ~55s wall time.
 tests/test-mcp.sh             -- MCP gateway end-to-end (/health + JSON-RPC tools/list). Skips with exit 77 when gateway not running.
+tests/test-mcp-modelstatus.sh -- devai-model-status end-to-end against the live gateway (builds the image, asserts its 3 tools appear in tools/list, calls get_router_status for real). Skips with exit 77 when the gateway/image isn't available. The stronger stdio-protocol-level test (real MCP client, no gateway needed) is devai-tools/cmd/devai-mcp-modelstatus/e2e_test.go, run via `make test-devai-tools`.
+tests/test-backup-restore.sh  -- devai-backup end-to-end: snapshot -> list -> verify -> delete originals -> restore --yes -> diff, against temp dirs standing in for deploy/, ~/.devai/, ~/.config/sops/age/ (--repo-root/--home-dir overrides; never touches the real $HOME).
+tests/test-gpu-vendor.sh      -- Flips DEVAI_GPU_VENDOR both directions, asserts the rendered `compose config` shows the right device string + backend image tags each time (and that the other vendor's values are absent).
 tests/test-fleet-routing.sh   -- Fleet-routing skeleton; skips with exit 77 when SKYPILOT_API_ENDPOINT unset. Full provisioning test deferred to E2E.
+tests/fixtures/modelstatus/   -- Hand-crafted models.yaml + probe-cache + bench-cache fixtures matching the real schemas, shared by the Go unit tests and tests/test-mcp-modelstatus.sh.
 tests/fixtures/stub-head.py   -- Minimal stub head (stdlib HTTP) used by test-cluster-preflight.sh; predictable register/heartbeat/introspect surface.
 tests/python/                 -- Python stdlib-unittest cases (299 tests as of 2026-06-23) covering bench v3 schema migration + runner ctx flags + picker keying + report rendering, sops/age scaffold script gates, MCP gateway Phase 1+2 catalog/compose/Makefile shape, SkyPilot agent-skill Dockerfile + fetch-cli + docs, SkyPilot fleet Phase 1 service shape + creds template, stub-head HTTP surface, catalog-discover lineage/version parsing + structural line filter + VRAM-band filter (under/oversized) + base-model filter + real-size fetch + discover-block overrides + comment-preserving YAML add, model-lifecycle probe-failure classifier + sha-stable carry-forward/orphan-prune + exclusion-ledger stability rules + model-sync diff, network-stubbed end-to-end. Run via `make test-python`.
 docs/backends.md              -- Lifecycle, probing, cache hygiene, failure-mode taxonomy across all 3 backends
@@ -353,6 +388,10 @@ docs/worker-bootstrap.md      -- Cloud-VM bootstrap image reference (build, env 
 docs/cluster-mode-preflight.md -- Phase 1.5 preflight test report (host first-run record + per-scenario observed behaviour).
 docs/skypilot.md              -- System-side fleet provisioner (devai-skypilot-api-server bring-up, volume layout, endpoint surface, Phase 2 preview, cost guidance).
 docs/skypilot-user-guide.md   -- User-facing CLI guide (per-cloud credential setup, hello-world, agent-driven flow).
+docs/backup-restore.md        -- devai-backup reference: what's backed up/excluded, the age-key recovery warning, command reference, restore semantics.
+docs/security-ci.md           -- GitHub Actions security-CI reference: blocking vs advisory checks, branch protection, local pre-push commands.
+docs/mcp-model-status.md      -- devai-model-status MCP server reference: the 3 tools, image/catalog registration, verification.
+docs/gpu-vendors.md           -- GPU-vendor overlay reference (NVIDIA default, AMD/ROCm opt-in): the switch, every call site touched, verification status.
 docs/plans/                   -- 6 design plans + execution-order README. See "Documentation" section above for status snapshot.
 ```
 

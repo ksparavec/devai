@@ -1,0 +1,21 @@
+# gitleaks config for devai (see docs/security-ci.md).
+#
+# Extends gitleaks' default ruleset. The only allowlist entries are
+# path-scoped, not a blanket exemption for deploy/:
+#   - deploy/*.sops.env          already-encrypted ciphertext (sops+age);
+#                                 high-entropy blobs that read as false
+#                                 positives against generic secret rules.
+#   - deploy/*.sops.env.example  dummy placeholder tokens by design, meant
+#                                 to be copied and encrypted by the operator.
+
+title = "devai gitleaks config"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "sops-encrypted ciphertext and its example templates"
+paths = [
+  '''deploy/[^/]+\.sops\.env$''',
+  '''deploy/[^/]+\.sops\.env\.example$''',
+]

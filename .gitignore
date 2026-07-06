@@ -114,6 +114,7 @@ deploy/.model-status.json
 # Go build artifacts (router binary built by `make build-router` lands here
 # on hosts that compile outside the container; the repo only tracks source).
 gpu-arbiter/gpu-arbiter
+devai-tools/bin/
 
 # Graphify
 graphify-out/

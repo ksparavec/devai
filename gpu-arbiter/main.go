@@ -1594,7 +1594,7 @@ func buildContainerSpec(
 		"hostadd":      []string{"host.containers.internal:host-gateway"},
 		"netns":        map[string]any{"nsmode": "bridge"},
 		"Networks":     map[string]any{cfg.Network: map[string]any{}},
-		"devices":      []map[string]any{{"path": "nvidia.com/gpu=all"}},
+		"devices":      []map[string]any{{"path": env("DEVAI_GPU_DEVICE", "nvidia.com/gpu=all")}},
 		"selinux_opts": []string{"disable"},
 		"hostname":     cfg.Name,
 	}
