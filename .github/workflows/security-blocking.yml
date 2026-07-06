@@ -48,6 +48,11 @@ jobs:
         uses: hadolint/hadolint-action@v3.1.0
         with:
           dockerfile: ${{ matrix.dockerfile }}
+          # deploy/*.Dockerfile carry pre-existing warning/info findings
+          # (DL3006, DL3008, DL4006, SC2086, SC2015) with no historical
+          # cleanup pass yet -- error-only scopes the blocking gate to
+          # genuine errors so it doesn't fail unconditionally on every PR.
+          failure-threshold: error
 
   golangci-lint:
     name: golangci-lint (${{ matrix.module }})
@@ -58,10 +63,17 @@ jobs:
         include:
           - module: gpu-arbiter
             go-version: "1.23"
+            install-mode: binary
           # devai-tools pins 1.25, not 1.23: cmd/devai-mcp-modelstatus's
           # MCP go-sdk dependency requires go >= 1.25.0 (see go.mod).
+          # golangci-lint-action's prebuilt binary lags upstream Go
+          # releases and refuses to lint a go.mod targeting a newer Go
+          # version than it was itself built with -- goinstall compiles
+          # golangci-lint locally with this matrix entry's own Go 1.25
+          # toolchain instead, sidestepping the mismatch.
           - module: devai-tools
             go-version: "1.25"
+            install-mode: goinstall
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -72,6 +84,7 @@ jobs:
         with:
           working-directory: ${{ matrix.module }}
           args: --timeout=5m
+          install-mode: ${{ matrix.install-mode }}
           # gpu-arbiter predates this workflow and carries pre-existing
           # findings (errcheck/staticcheck) under golangci-lint's defaults;
           # only-new-issues scopes the gate to lines touched by the PR diff

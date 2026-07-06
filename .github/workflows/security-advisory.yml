@@ -67,7 +67,7 @@ jobs:
       - name: Build devai-router image
         run: docker build -f deploy/Dockerfile.router -t devai-router:ci .
       - name: Run Trivy
-        uses: aquasecurity/trivy-action@0.29.0
+        uses: aquasecurity/trivy-action@v0.29.0
         with:
           image-ref: devai-router:ci
           exit-code: "0"
