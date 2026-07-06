@@ -86,6 +86,14 @@ func planEntries(archivePath string, roots map[string]string) ([]plannedEntry, e
 		if err := ValidateHeader(hdr); err != nil {
 			return nil, err
 		}
+		// Belt-and-suspenders on top of ValidateHeader/ValidateName: reject
+		// any entry name containing ".." right before it's used to build a
+		// filesystem path, so the guard sits directly against the value
+		// that reaches resolveTarget below rather than only inside a
+		// helper several calls away.
+		if strings.Contains(hdr.Name, "..") {
+			return nil, fmt.Errorf("rejected: path traversal %q", hdr.Name)
+		}
 		target, err := resolveTarget(roots, hdr.Name)
 		if err != nil {
 			return nil, err
