@@ -112,5 +112,9 @@ func resolveTarget(roots map[string]string, name string) (string, error) {
 	if len(parts) == 1 {
 		return root, nil
 	}
-	return filepath.Join(root, parts[1]), nil
+	target := filepath.Join(root, parts[1])
+	if target != root && !strings.HasPrefix(target, root+string(os.PathSeparator)) {
+		return "", fmt.Errorf("rejected: entry %q escapes root %q", name, root)
+	}
+	return target, nil
 }

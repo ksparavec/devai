@@ -70,6 +70,14 @@ func TestRestoreRejectsMaliciousArchiveWithNoWrites(t *testing.T) {
 		{"relative-traversal", &tar.Header{Name: "../../evil", Typeflag: tar.TypeReg, Mode: 0o644, Size: 7}},
 		{"absolute-path", &tar.Header{Name: "/etc/passwd", Typeflag: tar.TypeReg, Mode: 0o644, Size: 7}},
 		{"symlink-escape", &tar.Header{Name: "deploy/link", Typeflag: tar.TypeSymlink, Linkname: "/etc/passwd"}},
+		// "sops-age" is one archive-name segment but maps to a real root
+		// three directories deep (homeDir/.config/sops/age): a single ".."
+		// cancels cleanly in the archive-name's own coordinate space (so
+		// ValidateName sees plain "evil" and accepts it) while still
+		// escaping the real "sops-age" root into a sibling directory
+		// (homeDir/.config/sops/evil) once joined. Only resolveTarget's
+		// containment check on the resolved path catches this.
+		{"root-depth-mismatch-escape", &tar.Header{Name: "sops-age/../evil", Typeflag: tar.TypeReg, Mode: 0o644, Size: 7}},
 	}
 
 	for _, c := range cases {
@@ -79,6 +87,7 @@ func TestRestoreRejectsMaliciousArchiveWithNoWrites(t *testing.T) {
 			homeDir := filepath.Join(parent, "home")
 			mustMkdirAll(t, filepath.Join(repoRoot, "deploy"))
 			mustMkdirAll(t, filepath.Join(homeDir, ".devai"))
+			mustMkdirAll(t, filepath.Join(homeDir, ".config", "sops", "age"))
 
 			archiveDir := t.TempDir()
 			archivePath := filepath.Join(archiveDir, "evil.tar.gz")
