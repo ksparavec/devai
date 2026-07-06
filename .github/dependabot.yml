@@ -1,0 +1,24 @@
+# Dependabot config for devai. See docs/security-ci.md for the ecosystem
+# coverage rationale, including why there is no `pip` entry.
+
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /gpu-arbiter
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: gomod
+    directory: /devai-tools
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: docker
+    directory: /deploy
+    schedule:
+      interval: weekly
