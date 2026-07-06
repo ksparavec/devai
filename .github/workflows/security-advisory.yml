@@ -22,12 +22,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Both modules consolidated to the current stable Go release
+          # (see gpu-arbiter/go.mod, devai-tools/go.mod).
           - module: gpu-arbiter
-            go-version: "1.23"
-          # devai-tools pins 1.25, not 1.23: cmd/devai-mcp-modelstatus's
-          # MCP go-sdk dependency requires go >= 1.25.0 (see go.mod).
+            go-version: "1.26"
           - module: devai-tools
-            go-version: "1.25"
+            go-version: "1.26"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5

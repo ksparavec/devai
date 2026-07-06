@@ -61,18 +61,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Both modules consolidated to the current stable Go release
+          # (see gpu-arbiter/go.mod, devai-tools/go.mod). install-mode:
+          # goinstall compiles golangci-lint locally with each matrix
+          # entry's own toolchain instead of using golangci-lint-action's
+          # prebuilt binary, which lags upstream Go releases and refuses
+          # to lint a go.mod targeting a newer Go version than it was
+          # itself built with -- goinstall sidesteps that mismatch for
+          # both modules, not just whichever one currently runs ahead.
           - module: gpu-arbiter
-            go-version: "1.23"
-            install-mode: binary
-          # devai-tools pins 1.25, not 1.23: cmd/devai-mcp-modelstatus's
-          # MCP go-sdk dependency requires go >= 1.25.0 (see go.mod).
-          # golangci-lint-action's prebuilt binary lags upstream Go
-          # releases and refuses to lint a go.mod targeting a newer Go
-          # version than it was itself built with -- goinstall compiles
-          # golangci-lint locally with this matrix entry's own Go 1.25
-          # toolchain instead, sidestepping the mismatch.
+            go-version: "1.26"
+            install-mode: goinstall
           - module: devai-tools
-            go-version: "1.25"
+            go-version: "1.26"
             install-mode: goinstall
     steps:
       - uses: actions/checkout@v4

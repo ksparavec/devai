@@ -1,11 +1,10 @@
 module github.com/sparavec/devai-tools
 
-// 1.25, not gpu-arbiter's 1.23: github.com/modelcontextprotocol/go-sdk
-// (cmd/devai-mcp-modelstatus) requires go >= 1.25.0. Old code compiles
-// fine under the higher directive; only the build container's Go tag
-// needs to match (see Makefile's build-mcp-modelstatus /
-// test-devai-tools targets: golang:1.25-bookworm, not 1.23).
-go 1.25.0
+// Consolidated to the current stable Go release across both modules
+// (see gpu-arbiter/go.mod) -- comfortably above the go >= 1.25.0 floor
+// github.com/modelcontextprotocol/go-sdk (cmd/devai-mcp-modelstatus)
+// itself requires.
+go 1.26
 
 require gopkg.in/yaml.v3 v3.0.1
 

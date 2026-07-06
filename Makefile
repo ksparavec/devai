@@ -577,24 +577,15 @@ age-keygen-host: ## Generate a per-host age keypair under ~/.config/sops/age/ an
 
 # devai-tools (devai-tools/go.mod): first-party Go CLIs sibling to
 # gpu-arbiter -- devai-backup, devai-mcp-modelstatus, devai-gpu-vendor.
-# Containerized build/test, no local Go toolchain required, matching
-# test-router's pattern.
+# Built/tested with the host's own Go toolchain (consolidated to the
+# current stable release across both modules -- see gpu-arbiter/go.mod),
+# not a pinned container: needs Go >= the go.mod floor on PATH.
 
 build-backup-tool: ## Build devai-tools/bin/devai-backup
-	$(CONTAINER_RUNTIME) run --rm \
-		--entrypoint bash \
-		-v "$$(pwd)/devai-tools:/src:z" \
-		-w /src \
-		docker.io/library/golang:1.25-bookworm \
-		-c "mkdir -p bin && go build -o bin/devai-backup ./cmd/devai-backup"
+	cd devai-tools && mkdir -p bin && go build -o bin/devai-backup ./cmd/devai-backup
 
 build-mcp-modelstatus: ## Build devai-tools/bin/devai-mcp-modelstatus
-	$(CONTAINER_RUNTIME) run --rm \
-		--entrypoint bash \
-		-v "$$(pwd)/devai-tools:/src:z" \
-		-w /src \
-		docker.io/library/golang:1.25-bookworm \
-		-c "mkdir -p bin && go build -o bin/devai-mcp-modelstatus ./cmd/devai-mcp-modelstatus"
+	cd devai-tools && mkdir -p bin && go build -o bin/devai-mcp-modelstatus ./cmd/devai-mcp-modelstatus
 
 build-mcp-modelstatus-image: ## Build the devai-mcp-modelstatus container image (for the MCP gateway catalog)
 	$(CONTAINER_RUNTIME) build --network=host \
@@ -602,12 +593,7 @@ build-mcp-modelstatus-image: ## Build the devai-mcp-modelstatus container image 
 		-t devai-mcp-modelstatus .
 
 build-gpu-vendor-tool: ## Build devai-tools/bin/devai-gpu-vendor
-	$(CONTAINER_RUNTIME) run --rm \
-		--entrypoint bash \
-		-v "$$(pwd)/devai-tools:/src:z" \
-		-w /src \
-		docker.io/library/golang:1.25-bookworm \
-		-c "mkdir -p bin && go build -o bin/devai-gpu-vendor ./cmd/devai-gpu-vendor"
+	cd devai-tools && mkdir -p bin && go build -o bin/devai-gpu-vendor ./cmd/devai-gpu-vendor
 
 gpu-vendor: build-gpu-vendor-tool ## Switch GPU vendor in .env. VENDOR=nvidia|amd (required)
 	@if [ "$(VENDOR)" != "nvidia" ] && [ "$(VENDOR)" != "amd" ]; then \
@@ -621,12 +607,7 @@ test-gpu-vendor: ## Verify the GPU-vendor overlay renders correctly both directi
 build-devai-tools: build-backup-tool build-mcp-modelstatus build-gpu-vendor-tool ## Build every devai-tools/ binary
 
 test-devai-tools: ## Run Go unit tests for devai-tools/ (backup, modelcache, routerclient, gpu-vendor)
-	$(CONTAINER_RUNTIME) run --rm \
-		--entrypoint bash \
-		-v "$$(pwd):/repo:z" \
-		-w /repo/devai-tools \
-		docker.io/library/golang:1.25-bookworm \
-		-c "go test -race -v -count=1 ./..."
+	cd devai-tools && go test -race -v -count=1 ./...
 
 # Backup/restore (devai-tools/cmd/devai-backup; see docs/backup-restore.md).
 # Snapshots probe/bench caches, ~/.devai/ preferences+sessions, and the
@@ -777,12 +758,7 @@ build-worker-bootstrap: ## Build the minimal cluster-worker bootstrap image (clu
 		-t $(WORKER_BOOTSTRAP_IMAGE) .
 
 test-router: ## Run Go unit tests for gpu-arbiter router
-	$(CONTAINER_RUNTIME) run --rm \
-		--entrypoint bash \
-		-v "$$(pwd)/gpu-arbiter:/src:z" \
-		-w /src \
-		docker.io/library/golang:1.23-bookworm \
-		-c "go test -race -v -count=1 ./..."
+	cd gpu-arbiter && go test -race -v -count=1 ./...
 
 test-python: ## Run Python stdlib unittests (bench/picker schema, pure-Python helpers)
 	@# Stdlib-only; runs locally, no container start needed. The bench
