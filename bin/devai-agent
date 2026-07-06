@@ -28,6 +28,11 @@ Preferences (in ~/.devai/preferences.yaml):
                                   launcher ran from (informational —
                                   the work dir is always $PWD)
     agent_session_file  str|null  per-(agent,model) session, if supported
+    gpu_vendor          str       nvidia (default) or amd -- see
+                                  docs/gpu-vendors.md. This launcher does
+                                  not read .env (see below), so ROCm
+                                  operators set this once via
+                                  --gpu-vendor amd; it then persists.
 
 The script does NOT read the repo's .env, NOT modify the parent shell,
 NOT write to the repo. Everything it touches at runtime lives under
@@ -82,6 +87,7 @@ DEFAULTS: dict = {
     "last_agent": None,
     "last_work_dir": None,        # set by the first run; informational only
     "agent_session_file": None,
+    "gpu_vendor": "nvidia",
 }
 
 # Fail-closed egress: the lab joins this INTERNAL network (no internet route)
@@ -192,11 +198,12 @@ def preflight(runtime: str, image: str) -> None:
 
 # ── Container command construction ──────────────────────────────────────────
 
-def gpu_flags(runtime: str, cpu_only: bool) -> list[str]:
+def gpu_flags(runtime: str, cpu_only: bool, gpu_vendor: str = "nvidia") -> list[str]:
     if cpu_only:
         return []
     if "podman" in runtime:
-        return ["--device", "nvidia.com/gpu=all", "--security-opt=label=disable"]
+        device = "amd.com/gpu=all" if gpu_vendor == "amd" else "nvidia.com/gpu=all"
+        return ["--device", device, "--security-opt=label=disable"]
     return ["--gpus", "all"]
 
 
@@ -267,6 +274,7 @@ def build_run_cmd(
     *, runtime: str, image: str, cpu_only: bool,
     work_dir: Path, prefs: dict,
     pref_model: str | None, pref_agent: str | None,
+    gpu_vendor: str = "nvidia",
     prompt: str | None = None,
 ) -> list[str]:
     home_volume = Path(os.environ.get("HOME_VOLUME", str(Path.home() / "devai-home")))
@@ -283,7 +291,7 @@ def build_run_cmd(
     cmd += devai_user_flags(runtime)
 
     cmd += [
-        *gpu_flags(runtime, cpu_only),
+        *gpu_flags(runtime, cpu_only, gpu_vendor),
         *network_flags(),
         *proxy_env(),
         "-e", f"OLLAMA_HOST={OLLAMA_HOST}",
@@ -361,6 +369,10 @@ def make_parser() -> argparse.ArgumentParser:
                     help="reset ~/.devai/preferences.yaml to defaults and exit")
     ap.add_argument("--cpu", action="store_true",
                     help="use the CPU lab image instead of GPU")
+    ap.add_argument("--gpu-vendor", choices=("nvidia", "amd"),
+                    help="override gpu_vendor for this run "
+                         "(persisted to preferences on exit; see "
+                         "docs/gpu-vendors.md)")
     ap.add_argument("-C", "--workdir",
                     help="mount this directory as /home/devai/work "
                          "instead of the current $PWD "
@@ -411,6 +423,7 @@ def main() -> int:
 
     pref_model = args.model or prefs.get("last_model")
     pref_agent = args.agent or prefs.get("last_agent")
+    pref_gpu_vendor = args.gpu_vendor or prefs.get("gpu_vendor", "nvidia")
 
     preflight(runtime, image)
 
@@ -418,6 +431,7 @@ def main() -> int:
         runtime=runtime, image=image, cpu_only=args.cpu,
         work_dir=work_dir, prefs=prefs,
         pref_model=pref_model, pref_agent=pref_agent,
+        gpu_vendor=pref_gpu_vendor,
         prompt=args.prompt,
     )
 
@@ -444,6 +458,7 @@ def main() -> int:
     # Update preferences from this run.
     new_prefs = dict(prefs)
     new_prefs["last_work_dir"] = str(work_dir)
+    new_prefs["gpu_vendor"] = pref_gpu_vendor
 
     pick: dict = {}
     if PICK_BACK_CHANNEL.exists():

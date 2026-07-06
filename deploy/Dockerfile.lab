@@ -7,6 +7,9 @@ ARG HTTP_PROXY
 ARG HTTPS_PROXY
 ARG NO_PROXY
 ARG GPU_BUILD=false
+# Separate from GPU_BUILD ("is this a GPU build at all"): which vendor's
+# wheel index to use when it is. See docs/gpu-vendors.md.
+ARG GPU_VENDOR=nvidia
 ARG OLLAMA_HOST=http://devai-router:11434
 ARG OLLAMA_DEFAULT_MODEL=qwen3.5:9b
 
@@ -89,7 +92,12 @@ RUN cp -a /var/cache/bin/gemini/lib/node_modules/@google /usr/local/lib/node_mod
 # Host cache dirs are bind-mounted via -v at build time (see Makefile).
 
 COPY requirements-base.txt /tmp/requirements-base.txt
-RUN if [ "$GPU_BUILD" = "true" ]; then \
+RUN if [ "$GPU_BUILD" = "true" ] && [ "$GPU_VENDOR" = "amd" ]; then \
+        # Full index-url replacement, not --extra-index-url like the CPU
+        # branch below: default PyPI would still be consulted first and
+        # could resolve a CUDA wheel on an AMD host.
+        TORCH_ARGS="torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm6.4"; \
+    elif [ "$GPU_BUILD" = "true" ]; then \
         TORCH_ARGS="torch torchvision torchaudio"; \
     else \
         TORCH_ARGS="torch torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/cpu"; \

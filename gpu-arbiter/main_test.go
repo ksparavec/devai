@@ -1223,3 +1223,37 @@ func TestBuildContainerSpecImageOverride(t *testing.T) {
 		})
 	}
 }
+
+// TestBuildContainerSpecGPUDevice locks the GPU-vendor overlay contract
+// (docs/gpu-vendors.md): DEVAI_GPU_DEVICE overrides the CDI device string,
+// defaulting to NVIDIA's when unset so an nvidia-only host needs no config.
+func TestBuildContainerSpecGPUDevice(t *testing.T) {
+	cfg := backendConfig{
+		Name:          "vllm",
+		ContainerName: "devai-vllm",
+		Image:         "docker.io/vllm/vllm-openai:latest-cu130-ubuntu2404",
+		ModelsDir:     "/models",
+		Network:       "devai-net",
+		Entrypoint:    func(string, launchConfig) []string { return []string{"sleep"} },
+	}
+
+	t.Run("defaults to nvidia when unset", func(t *testing.T) {
+		spec := buildContainerSpec(cfg, "m", launchConfig{}, nil, nil)
+		devices, ok := spec["devices"].([]map[string]any)
+		if !ok || len(devices) != 1 {
+			t.Fatalf("spec[devices] = %#v, want a single-element []map[string]any", spec["devices"])
+		}
+		if got := devices[0]["path"]; got != "nvidia.com/gpu=all" {
+			t.Errorf("devices[0][path] = %v, want nvidia.com/gpu=all", got)
+		}
+	})
+
+	t.Run("DEVAI_GPU_DEVICE overrides", func(t *testing.T) {
+		t.Setenv("DEVAI_GPU_DEVICE", "amd.com/gpu=all")
+		spec := buildContainerSpec(cfg, "m", launchConfig{}, nil, nil)
+		devices := spec["devices"].([]map[string]any)
+		if got := devices[0]["path"]; got != "amd.com/gpu=all" {
+			t.Errorf("devices[0][path] = %v, want amd.com/gpu=all", got)
+		}
+	})
+}
