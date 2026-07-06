@@ -176,6 +176,8 @@ endif
 .PHONY: catalog-regen catalog-suggest catalog-discover catalog-discover-add probe probe-vllm probe-sglang probe-load-vllm probe-load-sglang model-fit model-pull model-status model-sync vram-fit verify-backend-flags ollama-cleanup-ctx-variants
 .PHONY: bench bench-vllm bench-sglang bench-ollama bench-report test-bench-smoke
 .PHONY: secrets-tmpfs secrets-edit secrets-render secrets-rotate age-keygen-host test-python
+.PHONY: build-backup-tool test-devai-tools
+.PHONY: backup-create backup-list backup-verify backup-restore test-backup-restore
 .PHONY: mcp-up mcp-down mcp-logs mcp-test mcp-health mcp-secrets-render build-worker-bootstrap test-cluster-preflight cluster-head-up cluster-head-down cluster-status skypilot-up skypilot-down skypilot-check skypilot-secrets-render
 
 all: help
@@ -561,6 +563,50 @@ secrets-rotate: ## Re-key every deploy/*.sops.env file against the current .sops
 age-keygen-host: ## Generate a per-host age keypair under ~/.config/sops/age/ and print the public key
 	bash scripts/age-keygen-host.sh
 
+# devai-tools (devai-tools/go.mod): first-party Go CLIs sibling to
+# gpu-arbiter -- devai-backup, devai-mcp-modelstatus, devai-gpu-vendor.
+# Containerized build/test, no local Go toolchain required, matching
+# test-router's pattern.
+
+build-backup-tool: ## Build devai-tools/bin/devai-backup
+	$(CONTAINER_RUNTIME) run --rm \
+		--entrypoint bash \
+		-v "$$(pwd)/devai-tools:/src:z" \
+		-w /src \
+		docker.io/library/golang:1.25-bookworm \
+		-c "mkdir -p bin && go build -o bin/devai-backup ./cmd/devai-backup"
+
+test-devai-tools: ## Run Go unit tests for devai-tools/
+	$(CONTAINER_RUNTIME) run --rm \
+		--entrypoint bash \
+		-v "$$(pwd)/devai-tools:/src:z" \
+		-w /src \
+		docker.io/library/golang:1.25-bookworm \
+		-c "go test -race -v -count=1 ./..."
+
+# Backup/restore (devai-tools/cmd/devai-backup; see docs/backup-restore.md).
+# Snapshots probe/bench caches, ~/.devai/ preferences+sessions, and the
+# sops/age key. YES=1 mirrors the confirm-flag convention catalog-discover-add
+# already uses for a destructive default-off operation.
+
+backup-create: build-backup-tool ## Snapshot host-local state. DEST=<dir> to override.
+	devai-tools/bin/devai-backup snapshot $(if $(DEST),--dest $(DEST))
+
+backup-list: build-backup-tool ## List existing backup archives. DEST=<dir> to override.
+	devai-tools/bin/devai-backup list $(if $(DEST),--dest $(DEST))
+
+backup-verify: build-backup-tool ## Verify an archive's integrity. ARCHIVE=<path> (required).
+	@if [ -z "$(ARCHIVE)" ]; then echo "ERROR: pass ARCHIVE=path/to/backup.tar.gz" >&2; exit 2; fi
+	devai-tools/bin/devai-backup verify --archive "$(ARCHIVE)"
+
+backup-restore: build-backup-tool ## Restore from an archive. ARCHIVE=<path> YES=1 (both required).
+	@if [ -z "$(ARCHIVE)" ]; then echo "ERROR: pass ARCHIVE=path/to/backup.tar.gz" >&2; exit 2; fi
+	@if [ "$(YES)" != "1" ]; then echo "ERROR: restore overwrites host state -- pass YES=1 to confirm" >&2; exit 2; fi
+	devai-tools/bin/devai-backup restore --archive "$(ARCHIVE)" --yes
+
+test-backup-restore: test-devai-tools ## devai-tools Go tests + tests/test-backup-restore.sh
+	./tests/test-backup-restore.sh
+
 # MCP gateway (per docs/plans/mcp-gateway.md). Phase 1: start the
 # gateway with the 10 Tier 1 servers via the 'mcp' compose profile.
 # Phase 2 will append a `mcp-secrets-render` prerequisite that depends
@@ -785,7 +831,7 @@ test-agents: ## Smoke-test every (agent × backend) cell against the live router
 		$(IMAGE_NAME_GPU) /usr/local/bin/agent-matrix
 	@echo "  logs preserved at $(CURDIR)/tests/.matrix-logs/"
 
-test: test-router test-python test-probe-ollama-idempotent test-ollama test-e2e test-vllm test-sglang test-models ## Run every available test in sequence (Go unit + Python unit + Ollama + E2E + vLLM/SGLang integration + matrix + probes; ~30-60 min)
+test: test-router test-devai-tools test-python test-backup-restore test-probe-ollama-idempotent test-ollama test-e2e test-vllm test-sglang test-models ## Run every available test in sequence (Go unit + Python unit + Ollama + E2E + vLLM/SGLang integration + matrix + probes; ~30-60 min)
 	@# The cache-up suite runs as prerequisites above. Probe smoke tests
 	@# require the live backends to be DOWN (the prober self-checks for
 	@# router/vllm/sglang containers and aborts otherwise) — they run
