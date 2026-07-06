@@ -623,8 +623,8 @@ build-devai-tools: build-backup-tool build-mcp-modelstatus build-gpu-vendor-tool
 test-devai-tools: ## Run Go unit tests for devai-tools/ (backup, modelcache, routerclient, gpu-vendor)
 	$(CONTAINER_RUNTIME) run --rm \
 		--entrypoint bash \
-		-v "$$(pwd)/devai-tools:/src:z" \
-		-w /src \
+		-v "$$(pwd):/repo:z" \
+		-w /repo/devai-tools \
 		docker.io/library/golang:1.25-bookworm \
 		-c "go test -race -v -count=1 ./..."
 
