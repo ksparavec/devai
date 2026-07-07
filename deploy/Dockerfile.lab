@@ -124,6 +124,11 @@ RUN UV_TOOL_BIN_DIR=/usr/local/bin uv tool install aider-chat \
 # /var/cache/devai/pip/wheels/skypilot/ and bind-mounted at build time
 # under /var/cache/wheels/skypilot. Offline install with --find-links
 # keeps the build network-free, matching the existing CLI pattern.
+# --no-index is REQUIRED (not just --offline): without it uv resolves
+# against its cached PyPI metadata and can pick a dependency version
+# (e.g. a newer fastapi) whose wheel was never pre-fetched, failing the
+# build. --no-index restricts the package universe to exactly the
+# wheels `make fetch-cli` downloaded -- a consistent, complete closure.
 #
 # The wheel directory is OPTIONAL at build time -- the lab image still
 # builds without it (the `if` skips the install gracefully). Operators
@@ -132,7 +137,7 @@ RUN UV_TOOL_BIN_DIR=/usr/local/bin uv tool install aider-chat \
 # `uv pip install --system 'skypilot[aws,gcp,azure,kubernetes,slurm,runpod,lambda]'`.
 RUN --mount=type=bind,source=.,target=/src \
     if [ -d /var/cache/wheels/skypilot ] && [ -n "$(ls -A /var/cache/wheels/skypilot 2>/dev/null)" ]; then \
-        uv pip install --system --offline \
+        uv pip install --system --offline --no-index \
             --find-links /var/cache/wheels/skypilot \
             'skypilot[aws,gcp,azure,kubernetes,slurm,runpod,lambda]' \
         && sky --version >/dev/null 2>&1 \
