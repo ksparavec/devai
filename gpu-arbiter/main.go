@@ -641,17 +641,27 @@ type backendState struct {
 }
 
 type arbiter struct {
-	backends        map[string]*backendState
-	mu              sync.Mutex
-	ollamaURL       *url.URL
-	podmanClient    *http.Client
-	idleTimeout     time.Duration
-	drainTimeout    time.Duration
-	healthTimeout   time.Duration      // configurable per HEALTH_TIMEOUT_SECONDS env (default 600s — vLLM/SGLang cold-start with NVFP4 weights + CUDA graph compilation can exceed 5 min on consumer GPUs)
-	modelSizes      map[string]float64 // model name → weight size in GB
-	modelContexts   map[string]int     // model name → declared max context (from models.yaml)
-	modelCapability map[string]string  // model name → reasoning.capability
-	modelDisableOK  map[string]bool    // model name → disable_verified (only when present)
+	backends      map[string]*backendState
+	mu            sync.Mutex
+	ollamaURL     *url.URL
+	podmanClient  *http.Client
+	idleTimeout   time.Duration
+	drainTimeout  time.Duration
+	healthTimeout time.Duration      // configurable per HEALTH_TIMEOUT_SECONDS env (default 600s — vLLM/SGLang cold-start with NVFP4 weights + CUDA graph compilation can exceed 5 min on consumer GPUs)
+	modelSizes    map[string]float64 // model name → weight size in GB
+	modelContexts map[string]int     // model name → declared max context (from models.yaml)
+	// Capability and disable-verified are backend-specific for the same
+	// reason the parser maps below are: a model that runs on both vLLM and
+	// SGLang can carry different reasoning classifications per engine.
+	// openai/gpt-oss-20b is the canonical case — its Harmony format cannot
+	// disable reasoning under vLLM (reasoning_effort="none" is rejected, so
+	// the prober records disable_verified=false), but SGLang disables it via
+	// separate_reasoning=false (disable_verified=true). A name-only map let
+	// SGLang's `true` leak into the vLLM path and inject the invalid
+	// reasoning_effort="none". Key by (backend, modelName) so each engine
+	// honours its own probe verdict.
+	modelCapability map[string]map[string]string // backend → model name → reasoning.capability
+	modelDisableOK  map[string]map[string]bool   // backend → model name → disable_verified (only when present)
 	// Parser names are backend-specific: a model that runs on both vLLM and
 	// SGLang (e.g. openai/gpt-oss-20b) typically uses different parser
 	// names on each engine (vLLM: openai_gptoss/openai; SGLang: gpt-oss/
@@ -1229,8 +1239,8 @@ func main() {
 	// the same context cap and capability as the canonical "qwen3.5:9b-q8_0".
 	modelSizes := make(map[string]float64)
 	modelContexts := make(map[string]int)
-	modelCapability := make(map[string]string)
-	modelDisableOK := make(map[string]bool)
+	modelCapability := make(map[string]map[string]string)      // backend → model → reasoning.capability
+	modelDisableOK := make(map[string]map[string]bool)         // backend → model → disable_verified
 	modelToolParser := make(map[string]map[string]string)      // backend → model → --tool-call-parser
 	modelReasoningParser := make(map[string]map[string]string) // backend → model → --reasoning-parser
 	modelToolMode := make(map[string]map[string]string)        // backend → model → "auto" | "forced"
@@ -1258,14 +1268,21 @@ func main() {
 			if m.Context > 0 {
 				modelContexts[name] = m.Context
 			}
-			modelCapability[name] = capability
-			if disableOK {
-				modelDisableOK[name] = true
-			}
-			// Parser maps and the probe-verified ctx ceiling are keyed by
-			// backend so the same model name can carry different values on
-			// vLLM vs SGLang without one backend overwriting the other.
+			// Capability, disable-verified, parser maps, and the
+			// probe-verified ctx ceiling are all keyed by backend so the
+			// same model name can carry different values on vLLM vs SGLang
+			// without one backend overwriting the other.
 			for _, backend := range m.Backend {
+				if modelCapability[backend] == nil {
+					modelCapability[backend] = make(map[string]string)
+				}
+				modelCapability[backend][name] = capability
+				if disableOK {
+					if modelDisableOK[backend] == nil {
+						modelDisableOK[backend] = make(map[string]bool)
+					}
+					modelDisableOK[backend][name] = true
+				}
 				if m.ToolParser != "" {
 					if modelToolParser[backend] == nil {
 						modelToolParser[backend] = make(map[string]string)
@@ -2111,7 +2128,7 @@ func (a *arbiter) makeRequestHandler(backendName string) http.HandlerFunc {
 			// rather than silently corrupting the stream. Operator
 			// remedy: pick reasoning OFF (::nothink) or MTP OFF.
 			if mtpOverride == "on" && policy != "off" &&
-				a.modelCapability[policyModel] == CapInline {
+				a.modelCapability[backendName][policyModel] == CapInline {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusBadRequest)
 				_, _ = w.Write([]byte(
@@ -2439,7 +2456,7 @@ func (a *arbiter) applyVLLMPolicy(path, modelName, policy string, body []byte) [
 	if strings.TrimRight(path, "/") != "/v1/chat/completions" {
 		return body
 	}
-	switch a.reasoningAction(modelName, policy) {
+	switch a.reasoningAction("vllm", modelName, policy) {
 	case reasoningEnable:
 		log.Printf("info: vllm/%s reasoning ENABLE (policy=%q, effort=%s)",
 			modelName, policy, openAIReasoningEffort(policy))
@@ -2481,7 +2498,7 @@ func (a *arbiter) applySGLangPolicy(path, modelName, policy string, body []byte)
 	if strings.TrimRight(path, "/") != "/v1/chat/completions" {
 		return body
 	}
-	switch a.reasoningAction(modelName, policy) {
+	switch a.reasoningAction("sglang", modelName, policy) {
 	case reasoningEnable:
 		log.Printf("info: sglang/%s reasoning ENABLE (policy=%q)", modelName, policy)
 		body = setJSONFieldIfAbsent(
@@ -2507,17 +2524,20 @@ func (a *arbiter) applySGLangPolicy(path, modelName, policy string, body []byte)
 	}
 }
 
-func (a *arbiter) reasoningAction(modelName, policy string) reasoningAction {
-	switch a.modelCapability[modelName] {
+func (a *arbiter) reasoningAction(backend, modelName, policy string) reasoningAction {
+	switch a.modelCapability[backend][modelName] {
 	case CapStructured:
 		switch policy {
 		case "auto", "low", "medium", "high":
 			return reasoningEnable
 		case "off":
 			// Disable only when the prober verified the model honours
-			// `enable_thinking=false` / equivalent. Without that
-			// confirmation the disable injection is a footgun.
-			if a.modelDisableOK[modelName] {
+			// `enable_thinking=false` / equivalent on THIS backend. Without
+			// that confirmation the disable injection is a footgun — e.g.
+			// gpt-oss under vLLM 400s on the reasoning_effort="none" shape,
+			// so its vLLM disable_verified is false even though SGLang's is
+			// true. Backend-keying keeps the two verdicts separate.
+			if a.modelDisableOK[backend][modelName] {
 				return reasoningDisable
 			}
 		}
@@ -2551,7 +2571,7 @@ func (a *arbiter) reasoningAction(modelName, policy string) reasoningAction {
 //
 // Client-supplied `think` always wins; we never override it.
 func (a *arbiter) applyOllamaNativePolicy(modelName, policy string, body []byte) []byte {
-	switch a.reasoningAction(modelName, policy) {
+	switch a.reasoningAction("ollama", modelName, policy) {
 	case reasoningEnable:
 		return setJSONFieldIfAbsent(body, []string{"think"}, "think", true)
 	case reasoningDisable:
@@ -2562,7 +2582,7 @@ func (a *arbiter) applyOllamaNativePolicy(modelName, policy string, body []byte)
 }
 
 func (a *arbiter) applyOllamaOpenAIChatPolicy(modelName, policy string, body []byte) []byte {
-	switch a.reasoningAction(modelName, policy) {
+	switch a.reasoningAction("ollama", modelName, policy) {
 	case reasoningEnable:
 		return setJSONFieldIfAbsent(
 			body,
@@ -2583,7 +2603,7 @@ func (a *arbiter) applyOllamaOpenAIChatPolicy(modelName, policy string, body []b
 }
 
 func (a *arbiter) applyOllamaAnthropicMessagesPolicy(modelName, policy string, body []byte) []byte {
-	switch a.reasoningAction(modelName, policy) {
+	switch a.reasoningAction("ollama", modelName, policy) {
 	case reasoningEnable:
 		return setJSONFieldIfAbsent(
 			body,

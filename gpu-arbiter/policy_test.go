@@ -7,18 +7,33 @@ import (
 	"testing"
 )
 
+// perBackend fans a name-keyed map out across each backend key, so a test
+// model resolves identically regardless of which engine the test exercises.
+// The backend-keying itself (a model carrying different verdicts per engine)
+// is covered directly by TestPolicy_DisableVerifiedIsBackendScoped.
+func perBackend[V any](backends []string, m map[string]V) map[string]map[string]V {
+	out := make(map[string]map[string]V, len(backends))
+	for _, b := range backends {
+		inner := make(map[string]V, len(m))
+		for k, v := range m {
+			inner[k] = v
+		}
+		out[b] = inner
+	}
+	return out
+}
+
 func newTestArbiter() *arbiter {
-	disableTrue := true
 	return &arbiter{
-		modelCapability: map[string]string{
+		modelCapability: perBackend([]string{"ollama", "vllm"}, map[string]string{
 			"qwen3.5:9b":         "structured",
 			"gemma4:e4b-it-bf16": "unsupported",
 			"llama3.2:latest":    "error",
 			"some-vllm-model":    "unknown",
-		},
-		modelDisableOK: map[string]bool{
-			"qwen3.5:9b": disableTrue,
-		},
+		}),
+		modelDisableOK: perBackend([]string{"ollama", "vllm"}, map[string]bool{
+			"qwen3.5:9b": true,
+		}),
 		defaultPolicy: "auto",
 	}
 }
@@ -288,16 +303,16 @@ func TestValidPolicy(t *testing.T) {
 // structured switch); `Untouched-Model` is unknown (the new noop case).
 func newTestArbiterHF() *arbiter {
 	return &arbiter{
-		modelCapability: map[string]string{
+		modelCapability: perBackend([]string{"vllm", "sglang"}, map[string]string{
 			"Qwen3.5-9B-NVFP4":            "structured",
 			"Qwen3-14B-NVFP4":             "structured",
 			"Llama-3.1-8B-Instruct-NVFP4": "inline",
 			"Untouched-Model":             "unknown",
-		},
-		modelDisableOK: map[string]bool{
+		}),
+		modelDisableOK: perBackend([]string{"vllm", "sglang"}, map[string]bool{
 			"Qwen3.5-9B-NVFP4": true,
 			// Qwen3-14B-NVFP4 has structured but disable not verified.
-		},
+		}),
 		// Qwen3.5-9B-NVFP4 has a probe-verified tool parser (used by the
 		// strip-tools test); Qwen3-14B-NVFP4 doesn't. Keyed by backend.
 		modelToolParser: map[string]map[string]string{
@@ -373,6 +388,41 @@ func TestPolicy_VLLMOffWithoutDisableVerifiedNoop(t *testing.T) {
 	out := a.applyReasoningPolicy("vllm", "/v1/chat/completions", "Qwen3-14B-NVFP4", "off", in)
 	if string(out) != string(in) {
 		t.Fatalf("off without disable_verified must not modify body, got %s", out)
+	}
+}
+
+// TestPolicy_DisableVerifiedIsBackendScoped is the regression test for the
+// gpt-oss Harmony bug: the same model name can be disable-verified on one
+// engine but not another. openai/gpt-oss-20b disables cleanly under SGLang
+// (separate_reasoning=false, disable_verified=true) but NOT under vLLM, whose
+// Harmony format rejects reasoning_effort="none" (so the prober records
+// disable_verified=false). When the maps were keyed by name only, SGLang's
+// `true` leaked into the vLLM path and injected the invalid reasoning_effort,
+// producing an upstream 400. Backend-scoping must keep the verdicts separate.
+func TestPolicy_DisableVerifiedIsBackendScoped(t *testing.T) {
+	a := &arbiter{
+		modelCapability: map[string]map[string]string{
+			"vllm":   {"gpt-oss-20b": "structured"},
+			"sglang": {"gpt-oss-20b": "structured"},
+		},
+		modelDisableOK: map[string]map[string]bool{
+			// Only SGLang verified the disable path for this model.
+			"sglang": {"gpt-oss-20b": true},
+		},
+		defaultPolicy: "auto",
+	}
+	in := []byte(`{"model":"gpt-oss-20b","messages":[]}`)
+
+	// vLLM: off must NOT inject reasoning_effort="none" (would 400 on Harmony).
+	vout := a.applyReasoningPolicy("vllm", "/v1/chat/completions", "gpt-oss-20b", "off", in)
+	if string(vout) != string(in) {
+		t.Fatalf("vllm off (disable not verified) must leave body untouched, got %s", vout)
+	}
+
+	// SGLang: off DOES disable via its own mechanism (separate_reasoning=false).
+	sout := a.applyReasoningPolicy("sglang", "/v1/chat/completions", "gpt-oss-20b", "off", in)
+	if setSR, valSR := bodyBoolField(t, sout, "separate_reasoning"); !setSR || valSR {
+		t.Fatalf("sglang off (disable verified) must set separate_reasoning=false, got set=%v val=%v body=%s", setSR, valSR, sout)
 	}
 }
 
