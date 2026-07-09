@@ -74,7 +74,7 @@ the per-model behavioural difference (5-token vs 525-token call latency).
 ## What's NOT done (deliberate)
 
 - **Plugin source baked into an image.** Skipped: vLLM runs in the
-  upstream `vllm/vllm-openai:latest-cu130-ubuntu2404` image which we
+  upstream `vllm/vllm-openai:v0.22.1-x86_64-cu129-ubuntu2404` image which we
   don't fork, and our lab/router images don't run vLLM. Bind-mount is
   the only wiring path; the bake step from the original plan was
   misaligned with how the stack is actually deployed.

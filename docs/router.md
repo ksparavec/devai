@@ -509,7 +509,7 @@ the shell when invoking compose.
 | `VLLM_URL`           | `http://devai-vllm:11434`                                  | upstream                      |
 | `VLLM_PORT`          | `11435`                                                    | router listen                 |
 | `VLLM_CONTAINER`     | `devai-vllm`                                               | name to recreate              |
-| `VLLM_IMAGE`         | `docker.io/vllm/vllm-openai:latest-cu130-ubuntu2404`       | image to launch               |
+| `VLLM_IMAGE`         | `docker.io/vllm/vllm-openai:v0.22.1-x86_64-cu129-ubuntu2404`       | image to launch               |
 | `VLLM_MODELS_DIR`    | `/var/cache/devai/ollama/models/vllm`                      | host path bound to `/models`  |
 | `SGLANG_URL`         | `http://devai-sglang:11434`                                | upstream                      |
 | `SGLANG_PORT`        | `11436`                                                    | router listen                 |

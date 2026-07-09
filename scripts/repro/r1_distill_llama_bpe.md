@@ -25,7 +25,7 @@ tokenizer alone.
 
 ## Environment
 
-- vLLM image: `vllm/vllm-openai:latest-cu130-ubuntu2404`
+- vLLM image: `vllm/vllm-openai:v0.22.1-x86_64-cu129-ubuntu2404`
   (digest: `<fill in: docker inspect | jq -r .[].Id>`)
 - GPU: NVIDIA RTX 4000 PRO Blackwell (CUDA 13.0)
 - Affected model: `deepseek-ai/DeepSeek-R1-Distill-Llama-8B`

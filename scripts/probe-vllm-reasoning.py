@@ -35,7 +35,7 @@ from _probe_load import run_load_probe_pass  # noqa: E402
 
 VLLM_RESERVE_GB = 2.0  # mirrors gpu-arbiter/main.go memFraction
 DEFAULT_VLLM_IMAGE = os.environ.get(
-    "VLLM_IMAGE", "docker.io/vllm/vllm-openai:latest-cu130-ubuntu2404"
+    "VLLM_IMAGE", "docker.io/vllm/vllm-openai:v0.22.1-x86_64-cu129-ubuntu2404"
 )
 
 

@@ -10,7 +10,7 @@ when the probe cache has confirmed values for the model.
 | Backend | Port | Image | Models |
 |---|---|---|---|
 | Ollama  | 11434 | `ollama/ollama:latest` | GGUF (Q3/Q4/Q5/Q8/etc.) |
-| vLLM    | 11435 | `vllm/vllm-openai:latest-cu130-ubuntu2404` | NVFP4, FP8, BF16/FP16 safetensors |
+| vLLM    | 11435 | `vllm/vllm-openai:v0.22.1-x86_64-cu129-ubuntu2404` | NVFP4, FP8, BF16/FP16 safetensors |
 | SGLang  | 11436 | `lmsysorg/sglang:v0.5.10.post1-cu130` | NVFP4, FP8, BF16/FP16 safetensors (RadixAttention multi-turn) |
 
 Backend launch-flag *names* are pinned in `deploy/backend-flags.yaml`.

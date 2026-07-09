@@ -20,7 +20,7 @@ these four keys in `.env` (not a blind `sed` -- a fresh checkout's
 
 | `DEVAI_GPU_VENDOR` | `DEVAI_GPU_DEVICE` | `VLLM_IMAGE` | `SGLANG_IMAGE` |
 |---|---|---|---|
-| `nvidia` (default) | `nvidia.com/gpu=all` | `docker.io/vllm/vllm-openai:latest-x86_64-cu129-ubuntu2404` | `docker.io/lmsysorg/sglang:v0.5.10.post1-cu130` |
+| `nvidia` (default) | `nvidia.com/gpu=all` | `docker.io/vllm/vllm-openai:v0.22.1-x86_64-cu129-ubuntu2404` | `docker.io/lmsysorg/sglang:v0.5.10.post1-cu130` |
 | `amd` | `amd.com/gpu=all` | `docker.io/vllm/vllm-openai-rocm:latest` (**placeholder -- verify current tag**) | `docker.io/lmsysorg/sglang:latest-rocm` (**placeholder -- verify current ROCm-tagged release**) |
 
 The AMD image tags in `devai-tools/cmd/devai-gpu-vendor/main.go`'s
