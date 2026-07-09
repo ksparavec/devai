@@ -52,10 +52,8 @@ import urllib.request
 from pathlib import Path
 
 from _contexts import (
+    binary_search_max_ctx,
     context_label,
-    effective_targets,
-    parse_context_list,
-    standard_contexts,
     vram_label,
 )
 from _probe_core import load_cache, now_iso, save_cache
@@ -64,14 +62,20 @@ from _probe_hf_common import (
     HEALTH_POLL_INTERVAL,
     STARTUP_TIMEOUT,
     BackendSpec,
+    _ledger_clear,
+    _ledger_record,
+    _ledger_reason,
+    _load_ledger,
     _post_chat,
     _resolve_plugins,
+    _save_ledger,
     assert_no_active_backends,
     classify_failure_logs,
     container_logs,
     container_remove,
     container_run_detached,
     container_state,
+    effective_position_limit,
     gpu_memory_used_mb,
     host_scaled_fraction,
     http_get,
@@ -722,8 +726,19 @@ def load_probe_one_cell(
 # ── Pass driver ──────────────────────────────────────────────────────────────
 
 def run_load_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
-    """Augment the fit cache with serving-time data, ascending tiers,
-    stopping at the first OOM per model.
+    """Binary-search the max SERVING ctx per model and collapse to ONE cell.
+
+    The FIT pass (run_probe_pass) left a single cell at the largest FITTING
+    ctx. Here we binary-search the largest ctx that actually SERVES a
+    near-full-context request (serving_ok), capped at that fit ctx and the
+    model's position_limit, then keep exactly one cell at the winning ctx:
+
+      - serves at the fit ctx  -> augment that cell in place with serving data.
+      - serves only lower       -> MOVE the single cell down to the serving ctx.
+      - serves nowhere          -> keep the fit cell, mark serving_ok=False, and
+                                    record an `oom` ledger exclusion.
+
+    Backend-agnostic: identical for vLLM and SGLang via their BackendSpec.
     """
     assert_no_active_backends(args.runtime)
 
@@ -739,18 +754,16 @@ def run_load_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
         sys.exit(f"error: models dir not found: {models_dir}")
 
     cache = load_cache(args.cache)
+    ledger = _load_ledger()
     corpus = load_corpus()
     band_gb = int(args.host_vram_gb)
-    ctxs = parse_context_list(args.ctx) if args.ctx else standard_contexts()
-    ctxs = sorted(set(ctxs))  # ASCENDING — start small, climb until OOM
-
     needle_depth = float(getattr(args, "needle_depth", 0.5))
 
     print(f"  load-prober:    probe-{spec.name} --load", file=sys.stderr)
     print(f"  cache:          {args.cache} ({len(cache)} entries)", file=sys.stderr)
     print(f"  vram band:      {vram_label(band_gb)} (host)", file=sys.stderr)
-    print(f"  ctx tiers:      {','.join(context_label(c) for c in ctxs)} "
-          f"(ascending, stop at OOM)", file=sys.stderr)
+    print(f"  search:         binary max serving ctx on the 32K grid, "
+          f"capped at the fit ctx", file=sys.stderr)
     print(f"  needle depth:   {needle_depth:.2f}", file=sys.stderr)
     print(f"  {spec.name} image:     {args.image}", file=sys.stderr)
     print(file=sys.stderr)
@@ -782,41 +795,44 @@ def run_load_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
             skipped += 1
             continue
 
+        # The FIT pass leaves ONE fitting cell (the largest fitting ctx).
+        fitting = {int(k): v for k, v in band.items()
+                   if isinstance(v, dict) and v.get("fits")}
+        if not fitting:
+            print(f"  [skip] {name}: no fitting cell to serve-probe",
+                  file=sys.stderr)
+            skipped += 1
+            continue
+        max_fit_ctx = max(fitting)
+        fit_cell = fitting[max_fit_ctx]
+
+        # Cached: the single cell already carries a serving verdict.
+        if fit_cell.get("serving_ok") is not None and not args.force:
+            print(f"    {context_label(max_fit_ctx):>4s}  cached "
+                  f"serving_ok={fit_cell.get('serving_ok')}", file=sys.stderr)
+            skipped += 1
+            continue
+
         row_parsers = (row.get("parsers") or {}).get(spec.name) or {}
-        # Serve with what the router will serve with: the entry's
-        # verified parsers (set by the fit prober), catalog hint as
-        # fallback. Matters because the parser plugins consume VRAM too.
+        # Serve with what the router will serve with: the entry's verified
+        # parsers (set by the fit prober), catalog hint as fallback.
         reasoning_parser = (entry.get("reasoning_parser")
                             or row_parsers.get("reasoning") or None)
         tool_parser = (entry.get("tool_parser")
                        or row_parsers.get("tool") or None)
         size_gb = model_size_gb_from_row(row)
-        targets = effective_targets(ctxs, entry.get("max_context") or 0) or ctxs
 
-        oom_hit = False
-        for ctx in targets:
-            cell = band.get(str(ctx))
-            if not cell or not cell.get("fits"):
-                continue  # fit prober didn't pass this tier; nothing to load
+        # Can't serve above what fits, nor above the model's as-delivered
+        # ceiling. binary_search_max_ctx instant-fails ctxs above this cap.
+        pos_limit = entry.get("position_limit") or effective_position_limit(
+            name, models_dir)
+        serving_cap = max_fit_ctx
+        if isinstance(pos_limit, int) and pos_limit > 0:
+            serving_cap = min(serving_cap, pos_limit)
 
-            if oom_hit:
-                # A lower tier already OOMed; a larger context cannot fit
-                # a transient that already overflowed. Mark, don't launch.
-                if cell.get("serving_ok") is not False:
-                    cell["serving_ok"] = False
-                    cell["serving_error"] = "implied_by_lower_tier_oom"
-                    if not args.no_cache_write:
-                        save_cache(args.cache, cache)
-                continue
+        probed_cells: dict[int, dict] = {}
 
-            if cell.get("serving_ok") is not None and not args.force:
-                ok = cell["serving_ok"]
-                print(f"    {context_label(ctx):>4s}  cached serving_ok={ok}",
-                      file=sys.stderr)
-                if not ok:
-                    oom_hit = True
-                continue
-
+        def _serving_works(ctx: int) -> bool:
             print(f"  {name} @ {vram_label(band_gb)} "
                   f"ctx={context_label(ctx)}: load-probing ...", file=sys.stderr)
             rec = load_probe_one_cell(
@@ -836,31 +852,64 @@ def run_load_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
                 corpus=corpus,
                 needle_depth=needle_depth,
             )
-            # Clear any stale serving-failure fields from a prior run
-            # before applying the fresh result: a --force re-probe that
-            # flips serving_ok false->true must not leave the old
-            # serving_error/serving_kind behind (the success record omits
-            # them). The fresh rec re-adds them if this run also failed.
-            for stale in ("serving_error", "serving_kind"):
-                cell.pop(stale, None)
-            cell.update(rec)
-            entry["last_load_probed_at"] = rec.get("serving_probed_at")
-            if not args.no_cache_write:
-                save_cache(args.cache, cache)
-            probed += 1
-
+            probed_cells[ctx] = rec
             ok = rec.get("serving_ok")
             print(f"    {context_label(ctx):>4s}  serving_ok={ok} "
                   f"peak={rec.get('serving_peak_gb')}G "
-                  f"transient={rec.get('transient_gb')}G "
                   f"needle={rec.get('needle_score')} "
-                  f"pred_logits={rec.get('predicted_logits_gb')}G "
-                  f"in={rec.get('serving_input_tokens')} "
                   f"{('[' + rec.get('serving_error', '') + ']') if not ok else ''}",
                   file=sys.stderr)
-            if not ok:
-                oom_hit = True
+            return bool(ok)
+
+        max_serving = binary_search_max_ctx(
+            _serving_works, position_limit=serving_cap)
+
+        if max_serving is not None:
+            load_rec = probed_cells[max_serving]
+            for stale in ("serving_error", "serving_kind"):
+                fit_cell.pop(stale, None)
+            if max_serving == max_fit_ctx:
+                # Serves at the fit ctx: augment the existing cell in place.
+                fit_cell.update(load_rec)
+            else:
+                # Serves only below the fit ctx: MOVE the single cell down,
+                # carrying the fit metadata (capability/parsers) + serving data.
+                moved = dict(fit_cell)
+                moved["ctx"] = max_serving
+                moved["actual_context"] = max_serving
+                base = load_rec.get("serving_baseline_gb")
+                if base:
+                    moved["actual_vram_gb"] = base
+                moved.update(load_rec)
+                band.clear()
+                band[str(max_serving)] = moved
+                # refresh_top_level_from_cells only grows/caps -- set the
+                # shrunk ceiling directly.
+                entry["max_context"] = max_serving
+            entry["last_load_probed_at"] = load_rec.get("serving_probed_at")
+            # A model that now serves clears a stale prober-owned oom exclusion.
+            if _ledger_reason(ledger, name, spec.name) == "oom":
+                _ledger_clear(ledger, name, spec.name)
+            probed += 1
+        elif probed_cells:
+            # Fits but serves nowhere (OOM at every probed ctx). Keep the fit
+            # cell, stamp the failing serving verdict, exclude with `oom`.
+            lo = min(probed_cells)
+            fit_cell.update(probed_cells[lo])
+            fit_cell["serving_ok"] = False
+            entry["last_load_probed_at"] = now_iso()
+            _ledger_record(
+                ledger, name, spec.name, "oom",
+                detail="serving OOM at every probed ctx (fits but cannot serve)",
+                repo=repo, host_vram=args.host_vram_gb, sha=sha)
+            probed += 1
+
+        if not args.no_cache_write:
+            save_cache(args.cache, cache)
+
+    if not args.no_cache_write:
+        _save_ledger(ledger, host_vram_gb=args.host_vram_gb)
 
     print(file=sys.stderr)
-    print(f"  load-probe done: {probed} cells probed, {skipped} models skipped",
+    print(f"  load-probe done: {probed} model(s) probed, {skipped} skipped",
           file=sys.stderr)

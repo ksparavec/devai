@@ -46,8 +46,8 @@ from typing import Callable
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 from _contexts import (  # noqa: E402  — local import after sys.path fix
+    binary_search_max_ctx,
     context_label,
-    effective_targets,
     parse_context_list,
     parse_vram_list,
     standard_contexts,
@@ -61,7 +61,6 @@ from _probe_core import (  # noqa: E402
     http_post,
     load_cache,
     now_iso,
-    propagate_implied_fail,
     save_cache,
     smallest_clean_probe,
 )
@@ -1754,40 +1753,23 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
             if arch_or_quant_seen:
                 break
             band = entry.setdefault("probes", {}).setdefault(str(vram_gb), {})
-            targets = effective_targets(ctxs, entry.get("max_context") or 0)
-            if not targets:
-                targets = sorted(set(ctxs))
-            # Don't probe past the HARD position limit: the engine would
-            # load (guard bypassed) and record a fits=true the model can't
-            # serve. Keep at least the smallest tier so the operator still
-            # sees one real outcome even for a sub-32K-limit model.
-            if isinstance(pos_limit, int) and pos_limit > 0:
-                within = [t for t in targets if t <= pos_limit]
-                targets = within or [min(targets)]
 
-            missing = [
-                t for t in targets
-                if str(t) not in band or (args.force and not args.no_cache_write)
-            ]
-            if not missing:
+            # Keep-one-cell: a populated band already holds the single
+            # binary-searched result from a prior run. Re-probe only under
+            # --force (which rewrites the cell, not appends).
+            if band and not (args.force and not args.no_cache_write):
                 fully_cached += 1
                 continue
+            band.clear()
 
             parser_label = (
                 f"R={row_reasoning_parser or '—'} "
                 f"T={row_tool_parser or '—'}"
             )
-            print(f"  {name} @ {vram_label(vram_gb)}: probing "
-                  f"{','.join(context_label(c) for c in missing)} "
-                  f"[{parser_label}] ...",
+            print(f"  {name} @ {vram_label(vram_gb)}: binary-searching max "
+                  f"fitting ctx on the 32K grid [{parser_label}] ...",
                   file=sys.stderr)
 
-            # Catalog MTP metadata for this row -- when present, the cell
-            # gets a second probe pass with --speculative-config enabled
-            # and the VRAM delta is folded into the baseline record. SGLang
-            # rows skip the second pass (its NVFP4 loader is broken
-            # upstream). --no-mtp at the driver-level disables the second
-            # pass globally for callers who only need fit data.
             row_mtp = row.get("mtp") if isinstance(row.get("mtp"), dict) else None
             mtp_should_probe = (
                 row_mtp is not None
@@ -1795,7 +1777,14 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
                 and not getattr(args, "no_mtp", False)
             )
 
-            for ctx in missing:
+            # Binary-search the 32K grid for the largest ctx that FITS
+            # (loads on the GPU). probe_one_cell is the per-tier predicate;
+            # every launched cell is stashed so we keep exactly the winning
+            # (largest fitting) one and discard the rest. Tiers above the
+            # model's position_limit are instant-failed with no launch.
+            probed_cells: dict[int, dict] = {}
+
+            def _fit_works(ctx: int) -> bool:
                 rec = probe_one_cell(
                     spec,
                     runtime=args.runtime,
@@ -1812,16 +1801,50 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
                     reasoning_parser=row_reasoning_parser,
                     tool_parser=row_tool_parser,
                 )
+                probed_cells[ctx] = rec
+                if rec.get("fits"):
+                    rp = rec.get("reasoning_parser") or "—"
+                    tp = rec.get("tool_parser") or "—"
+                    dv = "y" if rec.get("disable_verified") else "n"
+                    print(f"    {context_label(ctx):>4s} fits  "
+                          f"vram={rec.get('actual_vram_gb', '?')} "
+                          f"cap={rec.get('capability', '?')} R={rp} T={tp} dis={dv} "
+                          f"({rec.get('startup_seconds', 0):.1f}s start)",
+                          file=sys.stderr)
+                else:
+                    ev = rec.get("evidence") or {}
+                    print(f"    {context_label(ctx):>4s} FAIL  "
+                          f"kind={ev.get('kind', '?')}", file=sys.stderr)
+                return bool(rec.get("fits"))
 
-                # Second pass: MTP overhead measurement. Only when the
-                # baseline cell fit (otherwise there's no point) AND the
-                # catalog declared an MTP block AND we're on vLLM AND the
-                # operator didn't pass --no-mtp.
-                if mtp_should_probe and rec.get("fits"):
+            pos_cap = pos_limit if isinstance(pos_limit, int) and pos_limit > 0 else None
+            max_ctx = binary_search_max_ctx(_fit_works, position_limit=pos_cap)
+
+            # An architecture/quant rejection at any probed tier means the
+            # model cannot load at all -- keep it as evidence and stop the
+            # vram loop (drives the unsupported_arch ledger entry below).
+            arch_rec = next(
+                (r for r in probed_cells.values() if _is_arch_kind(r)), None
+            )
+
+            if arch_rec is not None:
+                band[str(arch_rec["ctx"])] = arch_rec
+                entry.setdefault("first_probed_at", arch_rec["probed_at"])
+                entry["last_probed_at"] = arch_rec["probed_at"]
+                print(f"    [stop] {name}: "
+                      f"{(arch_rec.get('evidence') or {}).get('kind')} — "
+                      f"unsupported arch", file=sys.stderr)
+                arch_or_quant_seen = True
+            elif max_ctx is not None:
+                winner = probed_cells[max_ctx]
+                # Second pass: MTP overhead measurement on the WINNING cell
+                # only (not every probed tier). Only when the catalog
+                # declared an MTP block AND we're on vLLM AND not --no-mtp.
+                if mtp_should_probe and winner.get("fits"):
                     mtp_method = (row_mtp or {}).get("method")
                     mtp_drafter = (row_mtp or {}).get("drafter")
                     mtp_k = (row_mtp or {}).get("num_speculative_tokens")
-                    print(f"    {context_label(ctx):>4s}   ... re-probing with "
+                    print(f"    {context_label(max_ctx):>4s}   ... re-probing with "
                           f"MTP ({mtp_method}, K={mtp_k}, drafter={mtp_drafter or 'built-in'})",
                           file=sys.stderr)
                     mtp_rec = probe_one_cell(
@@ -1834,7 +1857,7 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
                         probe_port=args.probe_port,
                         models_dir=str(models_dir),
                         model_name=name,
-                        requested_ctx=ctx,
+                        requested_ctx=max_ctx,
                         band_gb=vram_gb,
                         host_vram_gb=args.host_vram_gb,
                         model_size_gb=size_gb,
@@ -1845,98 +1868,35 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
                         mtp_drafter=mtp_drafter,
                         mtp_num_tokens=mtp_k,
                     )
-                    rec["mtp_method"] = mtp_method
+                    winner["mtp_method"] = mtp_method
                     if mtp_rec.get("fits"):
-                        base_vram = float(rec.get("actual_vram_gb", 0) or 0)
+                        base_vram = float(winner.get("actual_vram_gb", 0) or 0)
                         mtp_vram = float(mtp_rec.get("actual_vram_gb", 0) or 0)
-                        rec["mtp_fits"] = True
-                        rec["mtp_overhead_gb"] = round(max(0.0, mtp_vram - base_vram), 2)
-                        rec["mtp_actual_vram_gb"] = round(mtp_vram, 2)
+                        winner["mtp_fits"] = True
+                        winner["mtp_overhead_gb"] = round(max(0.0, mtp_vram - base_vram), 2)
+                        winner["mtp_actual_vram_gb"] = round(mtp_vram, 2)
                     else:
-                        rec["mtp_fits"] = False
-                        rec["mtp_evidence"] = mtp_rec.get("evidence", {})
-
-                band[str(ctx)] = rec
-                entry.setdefault("first_probed_at", rec["probed_at"])
-                entry["last_probed_at"] = rec["probed_at"]
+                        winner["mtp_fits"] = False
+                        winner["mtp_evidence"] = mtp_rec.get("evidence", {})
+                band[str(max_ctx)] = winner
+                entry.setdefault("first_probed_at", winner["probed_at"])
+                entry["last_probed_at"] = winner["probed_at"]
                 if first_seen_record is None:
-                    first_seen_record = rec
-                # Re-derive top-level capability + parser fields from
-                # the full corpus of recorded cells (not just this one).
-                # Idempotent — invariant: a successful classification at
-                # any (vram, ctx) tier is preserved even if a different
-                # tier later fails on oom/infra/clamped_ctx.
-                refresh_top_level_from_cells(entry)
+                    first_seen_record = winner
                 fresh_probes += 1
-                if not args.no_cache_write:
-                    save_cache(args.cache, cache)
+            elif probed_cells:
+                # Fits nowhere (OOM at every probed tier). Keep the smallest
+                # probed cell as the failing evidence so _entry_oom_everywhere
+                # records the `oom` ledger exclusion below.
+                lo = min(probed_cells)
+                band[str(lo)] = probed_cells[lo]
+                entry.setdefault("first_probed_at", probed_cells[lo]["probed_at"])
+                entry["last_probed_at"] = probed_cells[lo]["probed_at"]
+                fresh_probes += 1
 
-                cap_marker = rec.get("capability", "?")
-                if rec.get("fits"):
-                    rp = rec.get("reasoning_parser") or "—"
-                    tp = rec.get("tool_parser") or "—"
-                    dv = "y" if rec.get("disable_verified") else "n"
-                    print(f"    {context_label(ctx):>4s} fits  "
-                          f"vram={rec.get('actual_vram_gb', '?')} "
-                          f"cap={cap_marker} R={rp} T={tp} dis={dv} "
-                          f"({rec.get('startup_seconds', 0):.1f}s start)",
-                          file=sys.stderr)
-                else:
-                    ev = rec.get("evidence") or {}
-                    print(f"    {context_label(ctx):>4s} FAIL  "
-                          f"kind={ev.get('kind', '?')}",
-                          file=sys.stderr)
-
-                if _is_arch_kind(rec):
-                    print(f"    [stop] {name}: "
-                          f"{(rec.get('evidence') or {}).get('kind')} — "
-                          f"skipping remaining cells", file=sys.stderr)
-                    arch_or_quant_seen = True
-                    if not args.no_cache_write:
-                        save_cache(args.cache, cache)
-                    break
-
-                if _is_oom_kind(rec):
-                    def build_implied(
-                        larger: int,
-                        _ctx=ctx,
-                        _vram=vram_gb,
-                        _at=rec["probed_at"],
-                        _ev_kind=(rec.get("evidence") or {}).get("kind"),
-                    ) -> dict:
-                        return {
-                            "ctx": larger,
-                            "vram_gb": _vram,
-                            "fits": False,
-                            "actual_context": larger,
-                            "capability": Capability.ERROR,
-                            "evidence": {
-                                "kind": "implied_spill",
-                                "implied_from_ctx": _ctx,
-                                "source_kind": _ev_kind,
-                                "error": (
-                                    f"implied fail: {context_label(_ctx)} "
-                                    f"at {vram_label(_vram)} already "
-                                    f"{_ev_kind}"
-                                ),
-                            },
-                            "probed_at": _at,
-                            "probe_seconds": 0.0,
-                            "implied": True,
-                        }
-
-                    new_implied = propagate_implied_fail(
-                        vram_band=band,
-                        targets=targets,
-                        failed_ctx=ctx,
-                        force_set=set() if not args.force else set(targets),
-                        build_implied_record=build_implied,
-                    )
-                    if new_implied:
-                        entry["last_probed_at"] = rec["probed_at"]
-                    if not args.no_cache_write:
-                        save_cache(args.cache, cache)
-                    break
+            refresh_top_level_from_cells(entry)
+            if not args.no_cache_write:
+                save_cache(args.cache, cache)
 
         # Top-level capability is re-derived from the full cell corpus
         # via refresh_top_level_from_cells after each cell write. Final

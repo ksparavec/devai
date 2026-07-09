@@ -343,20 +343,22 @@ class TestDetectServingFailure(unittest.TestCase):
 
 
 class TestRunLoadProbePassWriteLogic(unittest.TestCase):
-    """GPU-free coverage of run_load_probe_pass's cache-write logic:
-    additive augmentation, ascending stop-at-OOM with implied marking,
-    and stale-error clearing. The container-launching load_probe_one_cell
-    is replaced with a scripted fake.
+    """GPU-free coverage of run_load_probe_pass's single-cell binary-search
+    write logic: augment-in-place, MOVE-down when serving caps below the fit
+    ctx, serves-nowhere -> serving_ok=False + `oom` ledger, and stale-error
+    clearing. The container-launching load_probe_one_cell is replaced with a
+    scripted fake.
     """
 
     def _run(self, *, cells, scripted, force=False):
-        """Drive run_load_probe_pass against a synthetic cache. `cells`
-        is the initial probes['24'] map; `scripted` maps ctx-int ->
-        serving rec returned by the fake probe. Returns (cache, calls).
+        """Drive run_load_probe_pass against a synthetic cache. `cells` is the
+        initial probes['24'] map; `scripted` maps ctx-int -> serving rec.
+        Returns (cache, calls, ledger_records).
         """
         import argparse
 
         calls: list[int] = []
+        ledger_records: list[tuple] = []
         cache = {
             "vendor/m@sha1": {
                 "schema_version": 2,
@@ -378,6 +380,12 @@ class TestRunLoadProbePassWriteLogic(unittest.TestCase):
             "load_cache": L.load_cache,
             "save_cache": L.save_cache,
             "load_probe_one_cell": L.load_probe_one_cell,
+            "_load_ledger": L._load_ledger,
+            "_save_ledger": L._save_ledger,
+            "_ledger_reason": L._ledger_reason,
+            "_ledger_record": L._ledger_record,
+            "_ledger_clear": L._ledger_clear,
+            "effective_position_limit": L.effective_position_limit,
         }
         L.assert_no_active_backends = lambda runtime: None
         L.load_catalog_hf_rows = lambda catalog, name: [
@@ -388,6 +396,15 @@ class TestRunLoadProbePassWriteLogic(unittest.TestCase):
         L.model_size_gb_from_row = lambda row: 5.0
         L.load_cache = lambda path: cache
         L.save_cache = lambda path, c: None
+        L._load_ledger = lambda: {}
+        L._save_ledger = lambda ledger, host_vram_gb=None: None
+        L._ledger_reason = lambda ledger, name, backend: None
+        L._ledger_record = lambda ledger, name, backend, reason, **kw: (
+            ledger_records.append((name, backend, reason)))
+        L._ledger_clear = lambda ledger, name, backend: None
+        # No config.json in the temp models_dir -> no position_limit cap; the
+        # serving search is bounded only by the fit ctx.
+        L.effective_position_limit = lambda name, models_dir: None
 
         def fake_probe(spec, *, requested_ctx, **kw):
             calls.append(requested_ctx)
@@ -399,7 +416,7 @@ class TestRunLoadProbePassWriteLogic(unittest.TestCase):
             args = argparse.Namespace(
                 runtime="podman", repo="", catalog=Path(td) / "models.yaml",
                 cache=Path(td) / "cache.json",
-                models_dir=td, host_vram_gb=24, ctx="32K,64K,128K",
+                models_dir=td, host_vram_gb=24, ctx=None,
                 image="img", container_name="c", probe_port=18000,
                 force=force, no_cache_write=False, needle_depth=0.5,
             )
@@ -410,45 +427,58 @@ class TestRunLoadProbePassWriteLogic(unittest.TestCase):
             finally:
                 for k, v in saved.items():
                     setattr(L, k, v)
-        return cache, calls
+        return cache, calls, ledger_records
 
     def test_additive_augment_keeps_fit_keys(self) -> None:
+        # Fits and serves at the same ctx: augment the one cell in place.
         cells = {
             "32768": {"ctx": 32768, "fits": True, "actual_vram_gb": 20.0,
                       "capability": "inline"},
         }
         scripted = {32768: {"serving_ok": True, "serving_peak_gb": 21.0,
                             "transient_gb": 1.0, "needle_score": 1.0}}
-        cache, calls = self._run(cells=cells, scripted=scripted)
+        cache, calls, _ = self._run(cells=cells, scripted=scripted)
         cell = cache["vendor/m@sha1"]["probes"]["24"]["32768"]
-        # Original fit fields survive...
         self.assertTrue(cell["fits"])
         self.assertEqual(cell["actual_vram_gb"], 20.0)
         self.assertEqual(cell["capability"], "inline")
-        # ...and the serving fields are added.
         self.assertTrue(cell["serving_ok"])
         self.assertEqual(cell["transient_gb"], 1.0)
         self.assertEqual(calls, [32768])
 
-    def test_ascending_stop_marks_higher_tiers_implied(self) -> None:
-        cells = {
-            "32768":  {"ctx": 32768, "fits": True},
-            "65536":  {"ctx": 65536, "fits": True},
-            "131072": {"ctx": 131072, "fits": True},
-        }
+    def test_serving_below_fit_moves_single_cell_down(self) -> None:
+        # Fits at 128K but serves only at 64K: the one cell MOVES to 64K,
+        # carries the fit capability, and max_context shrinks.
+        cells = {"131072": {"ctx": 131072, "fits": True, "capability": "inline",
+                            "actual_vram_gb": 22.0}}
         scripted = {
-            32768: {"serving_ok": True, "serving_peak_gb": 20.0},
-            65536: {"serving_ok": False, "serving_error": "oom_marker: x"},
+            131072: {"serving_ok": False, "serving_error": "oom"},
+            65536:  {"serving_ok": True, "serving_peak_gb": 21.0,
+                     "serving_baseline_gb": 19.0, "needle_score": 1.0},
+            98304:  {"serving_ok": False, "serving_error": "oom"},
         }
-        cache, calls = self._run(cells=cells, scripted=scripted)
-        band = cache["vendor/m@sha1"]["probes"]["24"]
-        self.assertTrue(band["32768"]["serving_ok"])
-        self.assertFalse(band["65536"]["serving_ok"])
-        # 131072 must be marked implied WITHOUT launching a probe for it.
-        self.assertFalse(band["131072"]["serving_ok"])
-        self.assertEqual(band["131072"]["serving_error"],
-                         "implied_by_lower_tier_oom")
-        self.assertEqual(calls, [32768, 65536])  # 131072 never probed
+        cache, calls, _ = self._run(cells=cells, scripted=scripted)
+        entry = cache["vendor/m@sha1"]
+        band = entry["probes"]["24"]
+        self.assertEqual(set(band), {"65536"})            # exactly one cell, moved
+        self.assertEqual(band["65536"]["ctx"], 65536)
+        self.assertTrue(band["65536"]["serving_ok"])
+        self.assertTrue(band["65536"]["fits"])             # carried from fit cell
+        self.assertEqual(band["65536"]["capability"], "inline")
+        self.assertEqual(band["65536"]["actual_vram_gb"], 19.0)  # served baseline
+        self.assertEqual(entry["max_context"], 65536)      # ceiling shrunk
+        self.assertEqual(calls, [131072, 65536, 98304])    # top-then-bisect
+
+    def test_serving_nowhere_marks_fail_and_excludes(self) -> None:
+        # Fits at 32K but OOMs when actually serving -> serving_ok=False + oom.
+        cells = {"32768": {"ctx": 32768, "fits": True, "capability": "inline"}}
+        scripted = {32768: {"serving_ok": False, "serving_error": "oom"}}
+        cache, calls, ledger_records = self._run(cells=cells, scripted=scripted)
+        cell = cache["vendor/m@sha1"]["probes"]["24"]["32768"]
+        self.assertTrue(cell["fits"])                      # still fits...
+        self.assertFalse(cell["serving_ok"])               # ...but cannot serve
+        self.assertEqual(calls, [32768])
+        self.assertIn(("m", "vllm", "oom"), ledger_records)
 
     def test_force_clears_stale_serving_error(self) -> None:
         cells = {
@@ -456,7 +486,7 @@ class TestRunLoadProbePassWriteLogic(unittest.TestCase):
                       "serving_error": "old: container_state=exited"},
         }
         scripted = {32768: {"serving_ok": True, "serving_peak_gb": 20.0}}
-        cache, calls = self._run(cells=cells, scripted=scripted, force=True)
+        cache, calls, _ = self._run(cells=cells, scripted=scripted, force=True)
         cell = cache["vendor/m@sha1"]["probes"]["24"]["32768"]
         self.assertTrue(cell["serving_ok"])
         self.assertNotIn("serving_error", cell)  # stale error cleared

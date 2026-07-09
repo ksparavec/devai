@@ -15,6 +15,7 @@ Errors propagate verbatim; nothing in this module talks to the network.
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 
 # Default tier arrays. Drive every loop in the probe and diagnostics.
 # Adding a new tier is a one-line edit here — no Python flow changes.
@@ -24,6 +25,64 @@ STANDARD_VRAM_GB: tuple[int, ...] = (16, 24)
 # Back-compat: the old-name constant resolves to context tokens for any
 # caller that expected raw token counts.
 STANDARD_CONTEXTS: tuple[int, ...] = tuple(k * 1024 for k in STANDARD_CONTEXTS_K)
+
+# Binary-search grid: every multiple of 32K up to 256K (256/8 = 32K step).
+# The probe keeps ONE ctx per (model, backend) -- the largest that serves --
+# and finds it on this finer grid so the result is precise (160K, not just
+# "128K or 256K"). Every result is one of these 8 tiers, hence a multiple of
+# 32K. Widen/narrow by editing this one line.
+BINARY_SEARCH_CONTEXTS_K: tuple[int, ...] = (32, 64, 96, 128, 160, 192, 224, 256)
+BINARY_SEARCH_CONTEXTS: tuple[int, ...] = tuple(
+    k * 1024 for k in BINARY_SEARCH_CONTEXTS_K
+)
+
+
+def binary_search_max_ctx(
+    works: Callable[[int], bool],
+    *,
+    position_limit: int | None = None,
+    grid: tuple[int, ...] = BINARY_SEARCH_CONTEXTS,
+) -> int | None:
+    """Return the largest ``grid`` context where ``works(ctx)`` is True.
+
+    Implements the "test the top, then bisect" tree: probe the highest tier
+    first (the common case is a model that fits its full ceiling, resolved in
+    one probe); on failure, binary-search the remainder. Over the 8-tier grid
+    that is at most 4 ``works`` calls (1 top probe + <=3 bisections).
+
+    ``position_limit`` (a model's as-delivered max context) short-circuits any
+    tier above it to False **without** calling ``works`` -- the engine would
+    device-assert past its trained ceiling, so there is nothing to launch.
+
+    Monotonic-fit assumption: if a model serves ctx X it serves every smaller
+    ctx (KV memory only shrinks). Returns None when even the smallest tier
+    fails (the model fits nowhere on this grid -> caller should exclude it).
+    """
+    if not grid:
+        return None
+    ordered = sorted(set(grid))
+
+    def ok(ctx: int) -> bool:
+        if position_limit is not None and ctx > position_limit:
+            return False  # past the model's ceiling; instant fail, no launch
+        return works(ctx)
+
+    hi = len(ordered) - 1
+    # Fast path: try the ceiling first.
+    if ok(ordered[hi]):
+        return ordered[hi]
+
+    # Ceiling failed -- binary-search [0, hi-1] for the largest working tier.
+    lo, hi = 0, hi - 1
+    best: int | None = None
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if ok(ordered[mid]):
+            best = ordered[mid]
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best
 
 
 def parse_context_token(raw: str) -> int:
