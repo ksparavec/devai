@@ -67,9 +67,12 @@ def main() -> int:
     stale_any = False
     print(f"probe-check: runtime={runtime}\n")
     for backend, rel_cache, img_env, img_default in BACKENDS:
-        cache_path = repo_root / os.environ.get(
-            f"{backend.upper()}_PROBE_CACHE_PATH", rel_cache)
-        image_ref = os.environ.get(img_env, img_default)
+        cache_path = repo_root / (os.environ.get(
+            f"{backend.upper()}_PROBE_CACHE_PATH") or rel_cache)
+        # `or img_default` (not a get() default): the Makefile may export the
+        # var as an empty string when it's unset in .env, which would
+        # otherwise override the fallback and report a false IMAGE-ABSENT.
+        image_ref = os.environ.get(img_env) or img_default
 
         probed = _probed_digest(cache_path)
         running = image_digest_via_cli(runtime, image_ref)

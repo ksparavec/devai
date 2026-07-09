@@ -128,7 +128,7 @@ preflight test report.
 |-------|---------|----------|---------------------------------|
 | 11434 | Ollama  | always live  | GGUF only                   |
 | 11435 | vLLM    | recreated on demand | NVFP4, FP8, AWQ, BF16 safetensors |
-| 11436 | SGLang  | recreated on demand | NVFP4 (broken), BF16 safetensors |
+| 11436 | SGLang  | recreated on demand | NVFP4 (arch-dependent), BF16 safetensors |
 
 The router is internal to `devai-net`. It is **not** published to the
 host. Reach it from sibling containers (`devai-open-webui`,

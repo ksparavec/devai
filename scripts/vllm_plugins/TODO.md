@@ -79,7 +79,8 @@ the per-model behavioural difference (5-token vs 525-token call latency).
   the only wiring path; the bake step from the original plan was
   misaligned with how the stack is actually deployed.
 - **SGLang plugin equivalent.** Different plugin model (Python import,
-  not file path). Out of scope until SGLang's NVFP4 path is unbroken.
+  not file path). No longer gated on NVFP4 (unblocked via
+  `--disable-piecewise-cuda-graph`); still optional.
 
 ## Adding a new plugin later
 

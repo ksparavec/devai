@@ -72,15 +72,15 @@ def sglang_command_args(
     in the signature for parity with vllm_command_args so the shared
     probe driver can call both backends through the same kwargs shape.
 
-    ``speculative_config`` is accepted but **discarded** for SGLang on
-    day 1: SGLang's NVFP4 path is broken upstream (see
-    scripts/model-families.yaml:60-72 — every NVFP4 cell fails at
-    modelopt_quant.py:1482), and probing MTP through it would only
-    produce noise. The kwarg lives in the signature so the shared probe
-    driver can call both backends through the same kwargs shape. When
-    SGLang's NVFP4 loader is repaired upstream, swap this for an actual
-    flag emission (the SGLang equivalent is the --speculative-* family,
-    pinned in deploy/backend-flags.yaml).
+    ``speculative_config`` is accepted but **discarded** for SGLang.
+    NVFP4 loading itself is no longer broken: --disable-piecewise-cuda-graph
+    (added to the launch args below) unblocks it -- before that flag every
+    NVFP4 cell crashed a Dynamo graph break at modelopt_quant.py:1482 during
+    piecewise CUDA-graph warmup. But the SGLang MTP / --speculative-* path is
+    not yet validated on this fleet, so emitting it now would only produce
+    noise. The kwarg stays in the signature for parity with vllm_command_args.
+    To enable SGLang MTP probing later, emit the --speculative-* family
+    (pinned in deploy/backend-flags.yaml).
     """
     del reasoning_parser_plugin, tool_parser_plugin, speculative_config
     args = [

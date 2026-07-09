@@ -910,8 +910,9 @@ def probe_one_cell(
     )
     # Multi-token-prediction launch flag. Built JSON-side so the same
     # blob ends up in both probe-time and serve-time (router) launches.
-    # SGLang ignores this on day 1 (its NVFP4 path is broken upstream);
-    # vLLM appends `--speculative-config <json>` when present.
+    # SGLang discards this (its MTP path is unvalidated on this fleet -- NVFP4
+    # loading itself is fixed via --disable-piecewise-cuda-graph); vLLM
+    # appends `--speculative-config <json>` when present.
     speculative_config_json: str | None = None
     if mtp_method:
         spec_payload: dict[str, object] = {

@@ -39,7 +39,7 @@
 - [x] `<name>@<ctx>` per-session context binding for HF backends
 - [x] HF rows synthesized into router from probe caches; `tool_parser` plumbed through launchConfig
 - [x] CI flag-drift guard: `deploy/backend-flags.yaml` + `make verify-backend-flags`
-- [x] SGLang validated — NVFP4 broken upstream in `v0.5.10.post1-cu130` at `modelopt_quant.py:1482`; picker auto-hides via `kind=infra`
+- [x] SGLang NVFP4 unblocked in `v0.5.10.post1-cu130` via `--disable-piecewise-cuda-graph` (the piecewise CUDA-graph warmup torch.compiled the forward, and Dynamo choked on flashinfer's FP4 JIT at `modelopt_quant.py:1482`). 8 SGLang models now serve (Qwen3-8B/14B, Llama-3.1-8B, Nemotron-Nano-9B, gpt-oss-20b, DeepSeek distills, Qwen3-14B-FP8); genuine arch/quant gaps remain for Gemma-4 family, Qwen3.5/3.6 MoE, diffusiongemma (those serve on vLLM)
 - [x] vLLM parser plugin registry (`deploy/vllm-plugins.json` + `scripts/vllm_plugins/`); prober and router both consume it. `deepseek_string` plugin wired for `deepseek-r1-distill` family. Adding new plugins = drop file + one JSON entry.
 - [x] Two-phase tool probe (auto + forced fallback) so reasoning models verify tool parsers; cache row carries `tool_mode`. Router promotes single-tool auto requests, rejects multi-tool auto with HTTP 400 + actionable error. End-to-end verified on R1-Distill-Qwen-7B and R1-Distill-Llama-8B.
 - [x] `refresh_top_level_from_cells` now picks parser fields (tool_parser, reasoning_parser, tool_mode, disable_verified) from the **most-recent clean cell that has them populated** rather than the smallest-tier cell. Fresh `--force` re-probes of a single cell now propagate to the top-level row without requiring a full matrix re-probe; old cells with stale `None`s no longer shadow new evidence.
@@ -71,9 +71,9 @@
 ## Open Items
 
 - [ ] Family-level `engine_flags` field (e.g. `--enforce-eager`) so OOM-prone NVFP4 MoE variants like `Nemotron-3-Nano-30B-A3B-NVFP4` can free the CUDA-graph budget and re-enter `hf_repos`.
-- [ ] Re-evaluate SGLang NVFP4 once upstream fixes `modelopt_quant.py:1482 fp4_quantize`.
+- [x] Re-evaluated SGLang NVFP4: the blocker was the piecewise CUDA-graph default (Dynamo tracing flashinfer's FP4 JIT at `modelopt_quant.py:1482`), not `fp4_quantize` itself. Fixed with `--disable-piecewise-cuda-graph` (always-on); no upstream fix needed. Drop the flag when a future SGLang image can trace the FP4 path.
 - [ ] Probe context tiers above the model's native rope: 128K/256K cells of R1-Distill-Qwen-7B failed `kind=infra` because Qwen-2 base has 32K positional encodings without rope_scaling. Either skip those tiers in the prober when `max_position_embeddings < requested_ctx`, or extend implied-spill to `infra` failures of the right shape. Today they leave noisy red entries in the cache.
-- [ ] Optional: SGLang `deepseek_string` analogue. SGLang's tool-parser plugin model is Python-import based (a registered class, not a file path); requires a separate implementation against SGLang's detector framework. Out of scope until SGLang's NVFP4 path is unbroken.
+- [ ] Optional: SGLang `deepseek_string` analogue. SGLang's tool-parser plugin model is Python-import based (a registered class, not a file path); requires a separate implementation against SGLang's detector framework. No longer gated on NVFP4 (now unblocked) -- still optional.
 
 ### pipelock egress lockdown (network fail-closed)
 - [ ] **MCP search for all agents.** opencode has Exa web search (`OPENCODE_ENABLE_EXA=1`); the other agents' built-in search is cloud-provider-coupled and doesn't work against the local router. Give them all search uniformly via the MCP gateway's `duckduckgo` server (or self-hosted SearXNG) -- connect each agent's MCP config to the gateway. Provider-agnostic, works on local models. (Decision: opencode-only for now, 2026-06-16.)

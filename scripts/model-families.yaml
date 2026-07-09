@@ -84,19 +84,19 @@
 #
 # To add a family: add a block below, then run `make catalog-regen`.
 #
-# ── SGLang NVFP4 status (verified 2026-05-01) ────────────────────────────
-# Image `lmsysorg/sglang:v0.5.10.post1-cu130` cannot serve any NVFP4
-# checkpoint. Every probe of an NVFP4 repo (Qwen3*, Llama-3.1-NVFP4,
-# Nemotron-Nano-NVFP4, Gemma-NVFP4) fails at
-#   /sgl-workspace/sglang/python/sglang/srt/layers/quantization/modelopt_quant.py:1482
-#   in fp4_quantize(x, layer.input_scale_inv)
-# vLLM at the same NVFP4 weights loads fine — this is a SGLang-side bug,
-# probably a missing kernel for the cu130 / Blackwell path. Workaround
-# until upstream fixes it: route NVFP4 traffic to vLLM only. The probe
-# cache records `kind=infra` for every SGLang/NVFP4 cell so the picker
-# auto-hides them; no per-family workaround needed below.
-# Tracking: file an issue at https://github.com/sgl-project/sglang/issues
-# referencing the modelopt_quant trace if not already reported.
+# ── SGLang NVFP4 status (updated 2026-07-09) ─────────────────────────────
+# Image `lmsysorg/sglang:v0.5.10.post1-cu130` DOES serve NVFP4 now. The
+# earlier "every NVFP4 cell fails at modelopt_quant.py:1482 in fp4_quantize"
+# was a symptom of the piecewise CUDA-graph default: it torch.compiles the
+# forward, and Dynamo cannot trace flashinfer's FP4 JIT-compile path (a
+# subprocess/threading.Lock call), so warmup crashes. The router + prober
+# now always pass `--disable-piecewise-cuda-graph`, which runs FP4 eagerly.
+# With it, 8 models serve on SGLang (Qwen3-8B/14B, Llama-3.1-8B,
+# Nemotron-Nano-9B, gpt-oss-20b, DeepSeek distills, Qwen3-14B-FP8).
+# Genuine arch/quant gaps still fail on SGLang (Gemma-4 family, Qwen3.5/3.6
+# MoE, diffusiongemma, Qwen3-Coder-30B, Nemotron-3-Nano-30B) -- those serve
+# on vLLM, and the probe cache marks them error/unsupported so the picker
+# hides them. Drop the flag when a future SGLang image traces the FP4 path.
 
 families:
   - name: gemma4
@@ -247,11 +247,9 @@ families:
       sglang:
         reasoning: qwen3
         # SGLang has no qwen3_xml parser — `qwen` covers the same
-        # XML-shape via the Qwen25 detector. NVFP4 weights fail at
-        # SGLang's modelopt_quant in v0.5.10.post1-cu130 anyway, so
-        # this parser never gets exercised on the NVFP4 variants
-        # currently in this family. Re-evaluate when SGLang ships
-        # an NVFP4-capable image.
+        # XML-shape via the Qwen25 detector. Exercised on SGLang now that
+        # --disable-piecewise-cuda-graph unblocks NVFP4 (Qwen3-8B/14B serve
+        # with R=qwen3 T=qwen); see the SGLang NVFP4 status block above.
         tool: qwen
     gguf_repos:
       # 27B dense — Q4_K_M from registry spills hard at 24G; sub-Q4

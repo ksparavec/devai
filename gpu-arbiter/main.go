@@ -1125,14 +1125,14 @@ func sglangEntrypoint(modelName string, lc launchConfig) []string {
 	if lc.ToolParser != "" {
 		args = append(args, "--tool-call-parser", lc.ToolParser)
 	}
-	// MTP launch flags. SGLang's NVFP4 path is broken upstream (per
-	// scripts/model-families.yaml:60-72) so this branch rarely fires
-	// in practice -- but emitting the flags keeps the entrypoint
-	// forward-compatible for the day SGLang's NVFP4 loader is repaired.
+	// MTP launch flags. NVFP4 loading itself is unblocked (see the
+	// --disable-piecewise-cuda-graph note above), but the SGLang MTP /
+	// --speculative-* path is not yet validated on this fleet, so the
+	// prober never records a spec block for SGLang and this branch rarely
+	// fires. Emitting the flags keeps the entrypoint forward-compatible.
 	args = append(args, sglangSpeculativeArgs(lc.Speculative)...)
-	// Per-model recovery flags (mirrors vllmEntrypoint). SGLang's NVFP4
-	// loader path is currently broken upstream so this branch rarely
-	// fires today, but the symmetry keeps the behaviour predictable.
+	// Per-model recovery flags (mirrors vllmEntrypoint). Appended last so a
+	// per-model override wins over the base flags.
 	args = append(args, lc.RecoveryFlags...)
 	return args
 }
