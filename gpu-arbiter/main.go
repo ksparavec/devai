@@ -601,8 +601,12 @@ func loadHFCache(
 		return nil
 	}
 	rows := synthesizeHFFromCache(cache, backendName, hostVRAMGB, operatorMaxCtx, mtpRegistry)
+	entryCount := len(cache)
+	if _, ok := cache["_meta"]; ok {
+		entryCount-- // _meta is a Phase C drift-stamp block, not a model entry
+	}
 	log.Printf("probe cache: %s loaded (%d entries → %d %s serving rows)",
-		path, len(cache), len(rows), backendName)
+		path, entryCount, len(rows), backendName)
 	return rows
 }
 
@@ -648,6 +652,17 @@ type backendState struct {
 	pendingModel   string
 	pendingContext int
 	recreateCond   *sync.Cond
+	// imageStale is set once at startup (Phase C) when the backend's running
+	// image digest differs from the digest its probe cache was captured
+	// against (_meta.current_image_digest). The fit/serving/parser data was
+	// measured on a different image, so it may be unreliable. The router
+	// still serves -- a genuine crash is failed hard by Phase A's
+	// crash-detection -- but flags every response with X-DevAI-Warning and
+	// surfaces the drift in /health. Immutable after startup; Ollama (empty
+	// Image, no _meta stamp) never goes stale.
+	imageStale         bool
+	probedImageDigest  string
+	runningImageDigest string
 }
 
 type arbiter struct {
@@ -745,11 +760,19 @@ func newProxy(target *url.URL) *httputil.ReverseProxy {
 	return p
 }
 
-func newSmartProxy(target *url.URL) *httputil.ReverseProxy {
+func newSmartProxy(target *url.URL, imageStale bool) *httputil.ReverseProxy {
 	p := httputil.NewSingleHostReverseProxy(target)
 	p.FlushInterval = -1
 	p.Transport = noKeepAliveTransport()
 	p.ModifyResponse = func(resp *http.Response) error {
+		if imageStale {
+			// Phase C: advisory drift warning. Non-blocking -- the response
+			// is served as-is; the header just tells clients the probe data
+			// behind this backend was captured on a different image.
+			resp.Header.Set("X-DevAI-Warning",
+				"backend image drifted from probe baseline; fit/serving data may "+
+					"be unreliable -- re-run make probe-vllm / probe-sglang")
+		}
 		if resp.StatusCode == http.StatusInternalServerError {
 			body, err := io.ReadAll(resp.Body)
 			resp.Body.Close()
@@ -1235,7 +1258,7 @@ func main() {
 			ListenPort:    envInt("VLLM_PORT", 11435),
 			BackendURL:    vllmURL,
 			ContainerName: env("VLLM_CONTAINER", "devai-vllm"),
-			Image:         env("VLLM_IMAGE", "docker.io/vllm/vllm-openai:latest-x86_64-cu129-ubuntu2404"),
+			Image:         env("VLLM_IMAGE", "docker.io/vllm/vllm-openai:v0.22.1-x86_64-cu129-ubuntu2404"),
 			ModelsDir:     env("VLLM_MODELS_DIR", "/var/cache/devai/ollama/models/vllm"),
 			Network:       network,
 			HealthPath:    "/health",
@@ -1398,18 +1421,37 @@ func main() {
 		healthClient:         &http.Client{Timeout: 2 * time.Second},
 	}
 
+	// Image-drift detection (Phase C): compare each HF backend's running
+	// image digest against the digest its probe cache was captured with. A
+	// moved tag silently invalidates fit/serving/parser data; we serve
+	// anyway but warn (loud log here + X-DevAI-Warning per response + a
+	// /health flag). Ollama (empty Image, no _meta stamp) never goes stale.
+	backendCachePath := map[string]string{
+		"vllm":   vllmCachePath,
+		"sglang": sglangCachePath,
+	}
 	for _, bc := range backends {
+		probed := readProbedImageDigest(backendCachePath[bc.Name])
+		running := a.imageDigestFromLibpod(bc.Image)
+		stale := probed != "" && running != "" && probed != running
+		if stale {
+			log.Printf("WARNING: %s image drift -- probe cache captured on %s but running image %s is %s; serving with X-DevAI-Warning. Re-run `make probe-%s`.",
+				bc.Name, probed, bc.Image, running, bc.Name)
+		}
 		var proxy *httputil.ReverseProxy
 		if bc.Name == "ollama" {
 			proxy = newProxy(bc.BackendURL)
 		} else {
-			proxy = newSmartProxy(bc.BackendURL)
+			proxy = newSmartProxy(bc.BackendURL, stale)
 		}
 		a.backends[bc.Name] = &backendState{
-			config:       bc,
-			proxy:        proxy,
-			modelNames:   modelsForBackend(cfg.Models, bc.Name),
-			recreateCond: sync.NewCond(&a.mu),
+			config:             bc,
+			proxy:              proxy,
+			modelNames:         modelsForBackend(cfg.Models, bc.Name),
+			recreateCond:       sync.NewCond(&a.mu),
+			imageStale:         stale,
+			probedImageDigest:  probed,
+			runningImageDigest: running,
 		}
 	}
 
@@ -1524,6 +1566,82 @@ func (a *arbiter) containerState(name string) (status string, exitCode int, ok b
 		return "", 0, false
 	}
 	return info.State.Status, info.State.ExitCode, true
+}
+
+// imageDigestFromLibpod returns the manifest digest of a local image via the
+// libpod image-inspect API, matching what scripts/_probe_core.image_digest_via_cli
+// records at probe time (`podman image inspect --format {{.Digest}}`, falling
+// back to the first RepoDigests entry). Returns "" on any error -- image-drift
+// detection fails open, so a missing image or unreachable podman never
+// produces a false "stale" verdict. The libpod route is `/images/{name:.*}/json`,
+// whose greedy matcher accepts an unescaped registry/repo:tag ref.
+func (a *arbiter) imageDigestFromLibpod(imageRef string) string {
+	if a.podmanClient == nil || imageRef == "" {
+		return ""
+	}
+	reqURL := fmt.Sprintf("http://d/v4.0.0/libpod/images/%s/json", imageRef)
+	resp, err := a.podmanClient.Get(reqURL)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+	var info struct {
+		Digest      string   `json:"Digest"`
+		RepoDigests []string `json:"RepoDigests"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		return ""
+	}
+	return normalizeImageDigest(info.Digest, info.RepoDigests)
+}
+
+// normalizeImageDigest reduces a libpod image-inspect result to a bare
+// `sha256:...` manifest digest, byte-matching what the prober records at stamp
+// time (scripts/_probe_core.image_digest_via_cli): prefer the top-level
+// `.Digest`, else fall back to the FIRST `.RepoDigests` entry's `@sha256:...`
+// tail. The index-0 choice is deliberate -- the Python stamper uses
+// `{{index .RepoDigests 0}}`, so both sides must select the same entry for the
+// drift comparison to be exact (an any-match here would diverge and could flag
+// a spurious drift). Returns "" when neither field carries a sha256.
+func normalizeImageDigest(digest string, repoDigests []string) string {
+	if strings.Contains(digest, "sha256:") {
+		return digest
+	}
+	if len(repoDigests) > 0 && strings.Contains(repoDigests[0], "sha256:") {
+		rd := repoDigests[0]
+		if i := strings.LastIndex(rd, "@"); i >= 0 {
+			return rd[i+1:]
+		}
+		return rd
+	}
+	return ""
+}
+
+// readProbedImageDigest extracts _meta.current_image_digest from an HF probe
+// cache (stamped by scripts/_probe_core.stamp_image_digest). Returns "" when
+// the file is absent, unparseable, or predates Phase C (no _meta) -- callers
+// treat "" as "no baseline to compare", so drift detection is skipped rather
+// than firing a false warning.
+func readProbedImageDigest(path string) string {
+	if path == "" {
+		return ""
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	var meta struct {
+		Meta struct {
+			CurrentImageDigest string `json:"current_image_digest"`
+		} `json:"_meta"`
+	}
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return ""
+	}
+	return meta.Meta.CurrentImageDigest
 }
 
 // terminalLaunchErrors are log substrings that unambiguously mean the
@@ -3291,6 +3409,12 @@ func (a *arbiter) makeHealthHandler(backendName string) http.HandlerFunc {
 			"running":       running,
 			"current_model": model,
 			"active_reqs":   active,
+			// imageStale/probed/running digests are set once in main() before
+			// any listener goroutine starts, so this lock-free read is safe.
+			// If these ever become runtime-mutable, move them under a.mu above.
+			"image_stale":          bs.imageStale,
+			"probed_image_digest":  bs.probedImageDigest,
+			"running_image_digest": bs.runningImageDigest,
 		})
 	}
 }

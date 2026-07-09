@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -351,6 +353,42 @@ func TestSynthesizeHFFromCache_FilteringAndShape(t *testing.T) {
 	}
 	if r.Reasoning == nil || r.Reasoning.Capability != CapInline {
 		t.Errorf("Reasoning=%+v want capability=inline", r.Reasoning)
+	}
+}
+
+// TestSynthesizeHFFromCache_SkipsMetaBlock locks in the Phase C invariant:
+// the top-level `_meta` drift-stamp block must never become a serving row.
+// Exercises the real decode path (JSON -> map[string]*hfCacheEntry -> synth)
+// that loadHFCache uses, since `_meta` decodes into an aliasless zero entry.
+func TestSynthesizeHFFromCache_SkipsMetaBlock(t *testing.T) {
+	raw := `{
+      "_meta": {
+        "current_image_digest": "sha256:abc",
+        "current_image_ref": "docker.io/vllm/vllm-openai:v0.22.1",
+        "image_history": {"sha256:abc": {"image_ref": "docker.io/vllm/vllm-openai:v0.22.1", "first_seen": "2026-07-09T00:00:00+00:00"}}
+      },
+      "nvidia/Llama-3.1-8B@bdb54e242984": {
+        "schema_version": 2,
+        "repo": "nvidia/Llama-3.1-8B-Instruct-NVFP4",
+        "sha": "bdb54e242984",
+        "aliases": ["Llama-3.1-8B-Instruct-NVFP4"],
+        "size_gb": 5.61,
+        "max_context": 131072,
+        "capability": "inline",
+        "tool_parser": "qwen3_coder",
+        "probes": {"24": {"32768": {"ctx": 32768, "vram_gb": 24, "fits": true, "actual_vram_gb": 22.49, "actual_context": 32768}}}
+      }
+    }`
+	var cache map[string]*hfCacheEntry
+	if err := json.Unmarshal([]byte(raw), &cache); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+	rows := synthesizeHFFromCache(cache, "vllm", 24, 131072, nil)
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row (model only, _meta skipped), got %d: %+v", len(rows), rows)
+	}
+	if rows[0].Name != "Llama-3.1-8B-Instruct-NVFP4" {
+		t.Errorf("Name=%q want Llama-3.1-8B-Instruct-NVFP4", rows[0].Name)
 	}
 }
 
@@ -835,7 +873,7 @@ func TestSmartProxy_RewritesContextOverflow(t *testing.T) {
 	defer backend.Close()
 
 	u, _ := url.Parse(backend.URL)
-	proxy := newSmartProxy(u)
+	proxy := newSmartProxy(u, false)
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
 	w := httptest.NewRecorder()
@@ -854,7 +892,7 @@ func TestSmartProxy_PassesThroughOtherErrors(t *testing.T) {
 	defer backend.Close()
 
 	u, _ := url.Parse(backend.URL)
-	proxy := newSmartProxy(u)
+	proxy := newSmartProxy(u, false)
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
 	w := httptest.NewRecorder()
@@ -862,6 +900,94 @@ func TestSmartProxy_PassesThroughOtherErrors(t *testing.T) {
 
 	if w.Code != http.StatusInternalServerError {
 		t.Errorf("expected 500, got %d", w.Code)
+	}
+}
+
+// TestSmartProxy_ImageStaleSetsWarningHeader verifies the Phase C drift
+// signal: when a backend's image has drifted from its probe baseline, every
+// proxied response carries X-DevAI-Warning (advisory, non-blocking).
+func TestSmartProxy_ImageStaleSetsWarningHeader(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"ok":true}`)
+	}))
+	defer backend.Close()
+
+	u, _ := url.Parse(backend.URL)
+
+	// Not stale -> no header.
+	fresh := newSmartProxy(u, false)
+	wf := httptest.NewRecorder()
+	fresh.ServeHTTP(wf, httptest.NewRequest("POST", "/v1/chat/completions", nil))
+	if got := wf.Header().Get("X-DevAI-Warning"); got != "" {
+		t.Errorf("fresh backend set X-DevAI-Warning=%q, want empty", got)
+	}
+
+	// Stale -> header present.
+	stale := newSmartProxy(u, true)
+	ws := httptest.NewRecorder()
+	stale.ServeHTTP(ws, httptest.NewRequest("POST", "/v1/chat/completions", nil))
+	if got := ws.Header().Get("X-DevAI-Warning"); got == "" {
+		t.Error("stale backend did not set X-DevAI-Warning")
+	}
+	if ws.Code != http.StatusOK {
+		t.Errorf("stale backend altered status: got %d, want 200", ws.Code)
+	}
+}
+
+// TestNormalizeImageDigest covers the pure libpod-inspect -> bare-digest
+// reducer that decides `probed != running`. It must byte-match the prober's
+// image_digest_via_cli fallback ordering (.Digest first, then RepoDigests[0]
+// tail) or every backend would flip to a false "stale" advisory.
+func TestNormalizeImageDigest(t *testing.T) {
+	tests := []struct {
+		name        string
+		digest      string
+		repoDigests []string
+		want        string
+	}{
+		{"digest populated wins", "sha256:aaa", []string{"repo@sha256:bbb"}, "sha256:aaa"},
+		{"fallback to repodigest tail", "", []string{"docker.io/vllm/vllm-openai@sha256:bbb"}, "sha256:bbb"},
+		{"repodigest without at-sign", "", []string{"sha256:ccc"}, "sha256:ccc"},
+		{"neither present", "", nil, ""},
+		{"empty repodigests slice", "", []string{}, ""},
+		{"garbage digest, no sha", "not-a-digest", []string{"also-garbage"}, ""},
+		{"first repodigest chosen over later", "", []string{"a@sha256:first", "b@sha256:second"}, "sha256:first"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := normalizeImageDigest(tt.digest, tt.repoDigests); got != tt.want {
+				t.Errorf("normalizeImageDigest(%q, %v) = %q, want %q",
+					tt.digest, tt.repoDigests, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestReadProbedImageDigest covers the _meta digest extractor: a stamped
+// cache returns its digest, a pre-Phase-C cache (no _meta) and a missing file
+// both fail open to "".
+func TestReadProbedImageDigest(t *testing.T) {
+	dir := t.TempDir()
+
+	stamped := filepath.Join(dir, "stamped.json")
+	os.WriteFile(stamped, []byte(`{"_meta":{"current_image_digest":"sha256:abc123"},`+
+		`"repo@sha":{"schema_version":2}}`), 0o644)
+	if got := readProbedImageDigest(stamped); got != "sha256:abc123" {
+		t.Errorf("stamped cache: got %q, want sha256:abc123", got)
+	}
+
+	legacy := filepath.Join(dir, "legacy.json")
+	os.WriteFile(legacy, []byte(`{"repo@sha":{"schema_version":2}}`), 0o644)
+	if got := readProbedImageDigest(legacy); got != "" {
+		t.Errorf("legacy cache: got %q, want empty", got)
+	}
+
+	if got := readProbedImageDigest(filepath.Join(dir, "nope.json")); got != "" {
+		t.Errorf("missing file: got %q, want empty", got)
+	}
+	if got := readProbedImageDigest(""); got != "" {
+		t.Errorf("empty path: got %q, want empty", got)
 	}
 }
 

@@ -493,6 +493,26 @@ A missing probe cache is non-fatal: the corresponding backend exposes
 zero models. Run `make probe` (Ollama) or `make probe-vllm` /
 `make probe-sglang` (HF) to populate.
 
+**`_meta` image-digest block (vLLM/SGLang).** Each HF cache carries a
+top-level `_meta` key (NOT a model row) written by the prober:
+
+```json
+"_meta": {
+  "current_image_digest": "sha256:...",
+  "current_image_ref": "docker.io/vllm/vllm-openai:v0.22.1-...",
+  "image_history": { "sha256:...": { "image_ref": "...", "first_seen": "..." } }
+}
+```
+
+At boot the router reads `_meta.current_image_digest` (via
+`readProbedImageDigest`) and compares it against the digest of the
+running backend image (`imageDigestFromLibpod`, a libpod
+`/images/{name}/json` query). A mismatch means the cache's fit /
+`serving_ok` / parser data was measured on a **different image** -- see
+"Backend image drift" under Failure modes. Every consumer skips the
+`_meta` key (the Go synthesizer filters it via the schema-version /
+aliases guards; Python readers skip `_`-prefixed keys).
+
 ---
 
 ## Configuration (env vars)
@@ -596,6 +616,42 @@ consumer GPUs; sometimes longer on first-ever load (kernel
 JIT-compilation cached afterwards). Fix: bump
 `HEALTH_TIMEOUT_SECONDS=900` and retry, or rerun the request -- the
 second attempt usually hits warm caches.
+
+### Backend image drift (serve-with-warning)
+
+```
+WARNING: vllm image drift -- probe cache captured on sha256:AAA but running
+image docker.io/vllm/vllm-openai:... is sha256:BBB; serving with
+X-DevAI-Warning. Re-run `make probe-vllm`.
+```
+
+Cause: the backend image tag moved (e.g. a floating `latest`, or an
+operator `podman pull`) after the probe cache was captured, so the
+cache's fit / `serving_ok` / parser data no longer describes the image
+that will actually serve. This is the exact rot that made a
+previously-working NVFP4 model start crashing at load.
+
+Behaviour (Phase C, decided policy -- "serve anyway, it probably
+works"): the router does **not** refuse the model. It still launches it
+(a genuine crash is then failed hard and fast by the crash-detection in
+`waitForHealthy`), but:
+
+- logs the loud WARNING above once at boot per drifted backend;
+- sets an `X-DevAI-Warning` response header on every response from that
+  backend (advisory, non-blocking -- the body and status are untouched);
+- reports `image_stale: true` plus `probed_image_digest` /
+  `running_image_digest` in that backend's `/health`.
+
+Detection fails **open**: an unreachable podman, an absent image, or a
+pre-Phase-C cache with no `_meta` all yield "no baseline" and no
+warning (never a false positive). Ollama is exempt -- it runs an
+unmodified upstream image with no PyTorch cold-start surface, so its
+cache is not stamped and never flagged.
+
+Fix: refresh the cache against the running image --
+`make cache-down && make probe-vllm && make probe-load-vllm` (or the
+`sglang` equivalents). Preview which backends are stale without
+restarting anything: `make probe-check`.
 
 ### Recreate race on concurrent requests
 

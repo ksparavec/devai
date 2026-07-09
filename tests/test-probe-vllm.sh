@@ -113,8 +113,10 @@ ctx = int(sys.argv[3])
 with open(cache_path) as fh:
     cache = json.load(fh)
 assert isinstance(cache, dict) and cache, f"cache is empty or non-dict: {type(cache).__name__}"
-# Pick the first entry — the smoke test runs against one model.
-key = next(iter(cache))
+# Pick the first MODEL entry — the smoke test runs against one model. Skip
+# the reserved `_meta` drift-stamp block (Phase C), which sort_keys=True
+# places ahead of any lowercase-owner repo key.
+key = next(k for k in cache if not k.startswith("_"))
 entry = cache[key]
 assert "@" in key, f"top-level key not <repo>@<sha>: {key!r}"
 sv = entry.get("schema_version")

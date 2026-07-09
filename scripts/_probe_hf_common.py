@@ -59,10 +59,12 @@ from _probe_core import (  # noqa: E402
     has_inline_think_markers,
     http_get,
     http_post,
+    image_digest_via_cli,
     load_cache,
     now_iso,
     save_cache,
     smallest_clean_probe,
+    stamp_image_digest,
 )
 from _vllm_plugins import PluginEntry, PluginRegistry, get_registry  # noqa: E402
 from _model_status import (  # noqa: E402
@@ -1664,6 +1666,14 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
         sys.exit("error: --vram or --ctx produced an empty list")
 
     cache = load_cache(args.cache)
+    # Phase C: record the backend image digest this cache is being probed
+    # against so the router can detect a moved tag (drift) that silently
+    # invalidates it. Guarded save lands `_meta` even on an all-cached run.
+    stamp_image_digest(
+        cache, digest=image_digest_via_cli(args.runtime, args.image),
+        image_ref=args.image)
+    if not args.no_cache_write:
+        save_cache(args.cache, cache)
     ledger = _load_ledger()
 
     print(f"  prober:         probe-{spec.name}-reasoning", file=sys.stderr)
@@ -1940,8 +1950,8 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
 
     print(file=sys.stderr)
     by_cap: dict[str, int] = {}
-    for entry in cache.values():
-        if not isinstance(entry, dict):
+    for k, entry in cache.items():
+        if k.startswith("_") or not isinstance(entry, dict):
             continue
         c = entry.get("capability") or Capability.UNKNOWN
         by_cap[c] = by_cap.get(c, 0) + 1

@@ -56,7 +56,13 @@ from _contexts import (
     context_label,
     vram_label,
 )
-from _probe_core import load_cache, now_iso, save_cache
+from _probe_core import (
+    image_digest_via_cli,
+    load_cache,
+    now_iso,
+    save_cache,
+    stamp_image_digest,
+)
 from _probe_hf_common import (
     CHAT_TIMEOUT,
     HEALTH_POLL_INTERVAL,
@@ -754,6 +760,13 @@ def run_load_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
         sys.exit(f"error: models dir not found: {models_dir}")
 
     cache = load_cache(args.cache)
+    # Phase C: idempotent re-stamp of the image digest (the load pass may run
+    # without a fresh fit pass; keep _meta current for the router's drift check).
+    stamp_image_digest(
+        cache, digest=image_digest_via_cli(args.runtime, args.image),
+        image_ref=args.image)
+    if not args.no_cache_write:
+        save_cache(args.cache, cache)
     ledger = _load_ledger()
     corpus = load_corpus()
     band_gb = int(args.host_vram_gb)

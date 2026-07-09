@@ -91,6 +91,20 @@ The picker hides any model that lacks a `fits=true` probe at the host
 VRAM band. The router synthesizes `/v1/models` rows from these caches.
 Without probes, models are invisible.
 
+**Single-cell binary search (vLLM/SGLang).** The HF probers no longer
+scan a fixed 32K/64K/128K/256K grid and store a cell per tier. They
+**binary-search** the largest context that both fits AND serves under a
+near-full-context request, on the 32K-multiple grid up to
+`min(MAX_CONTEXT_LEN, position_limit)`, and keep exactly **one** cell
+per `(model, backend)` -- the winner. Any candidate above the model's
+as-shipped `position_limit` fails instantly with no launch; if even 32K
+fails to serve, no cell is written and the model is recorded in the
+exclusion ledger (`oom`). Consumers treat the single winner cell as
+covering every ctx `<=` it (KV monotonicity): the picker reads the
+actual recorded cell keys, and `select-models.hf_probe_at_context`
+resolves a sub-winner query to the winner. Ollama still records
+multiple tiers (it is not part of this change).
+
 ### Exclusion ledger (`deploy/.model-status.json`)
 
 A host-local overlay (gitignored, schema v1) recording models the host
@@ -361,6 +375,29 @@ The HF probe cache is keyed on `<repo>@<sha>` where `sha` is the first
 Old entries persist until manually pruned. The router synthesizes only
 from the latest catalog sha -- old entries don't affect serving.
 
+### vLLM / SGLang -- re-probe when the backend image drifts
+
+Each HF probe run stamps the backend image digest it measured against
+into a top-level `_meta` block (`current_image_digest` +
+`image_history`). A vLLM/SGLang image tag that moves after probing (a
+floating `latest`, or an operator `podman pull`) silently invalidates
+the cache: fit, `serving_ok`, and parser values were measured on a
+different engine build. This is the rot that made a previously-working
+NVFP4 model start crashing at load, which is why the image is now
+**pinned** (`VLLM_IMAGE`, `SGLANG_IMAGE` in `.env` / compose).
+
+- Preview drift without touching the stack: `make probe-check` compares
+  each cache's `_meta.current_image_digest` against the locally
+  available image and exits non-zero if any backend is stale.
+- The router does the same check at boot and, for a drifted backend,
+  serves anyway but logs a loud warning, sets an `X-DevAI-Warning`
+  header, and reports `image_stale` in `/health` (see docs/router.md,
+  "Backend image drift").
+- Refresh after an intentional image bump:
+  `make cache-down && make probe-vllm && make probe-load-vllm`
+  (or the `sglang` equivalents). Then re-run `make verify-backend-flags`
+  if the engine version changed.
+
 ### Ollama -- re-probe when digest changes
 
 Ollama models are identified by their manifest digest. Pulling a new
@@ -379,7 +416,7 @@ When a probe records `fits: false`, `evidence.kind` tells you why:
 | `oom_chat` | Container started but failed on the first chat round-trip -- typically CUDA-graph capture OOM. | Same as `oom_startup`; the budget is too tight for the model + ctx. |
 | `clamped_ctx` | Backend silently capped `actual_max_model_len` below the requested ctx -- typically a model with a hard architectural ceiling lower than the operator-requested tier. | Lower the requested ctx tier or accept the cap. |
 | `infra` | Container failed for non-model reasons -- image missing nvcc, network error, tokenizer download stall, podman issue. The log excerpt usually shows what. | Fix the environment; this is not a model-fitness signal. |
-| `implied_spill` | Larger ctx tier filled in by the prober without launching -- set when a smaller ctx at the same VRAM band already failed. | Skip; smaller ctx fit is the actionable upper bound. |
+| `implied_spill` | Larger ctx tier filled in by the prober without launching -- set when a smaller ctx at the same VRAM band already failed. Legacy (multi-cell) only: the single-cell binary search never writes these, since it keeps one winner cell and excludes rather than filling failed tiers. | Skip; smaller ctx fit is the actionable upper bound. |
 
 The `evidence.matched_pattern` field (when present) names the substring
 that triggered the classification -- useful for auditing why a particular

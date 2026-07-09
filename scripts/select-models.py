@@ -490,7 +490,8 @@ def load_probe_cache() -> ProbeCache:
     by_digest: dict
     if all(
         isinstance(v, dict) and v.get("schema_version") == 3
-        for v in raw.values()
+        for k, v in raw.items()
+        if not k.startswith("_")  # reserved keys (e.g. _meta) are not model rows
     ):
         by_digest = {
             (entry.get("digest") or k): entry
@@ -608,6 +609,13 @@ def hf_probe_at_context(
     Mirrors probe_at_context for the schema v1 shape: cells live under
     `entry["probes"][<vram>][<ctx>]` and carry `fits` instead of
     `fully_on_gpu`. The effective ctx is min(context, max_context).
+
+    Single-cell (Phase B): the vLLM/SGLang cache keeps exactly one
+    binary-searched winner cell = the max serving ctx (== max_context). By
+    KV monotonicity the model serves at every ctx <= the winner, so a
+    sub-winner query (a tier the old fixed 32K/64K/128K/256K scan would have
+    recorded separately) resolves to that single cell instead of missing. A
+    request above the winner clamps down to it (the design-ceiling rule).
     """
     if not entry:
         return None
@@ -617,7 +625,16 @@ def hf_probe_at_context(
     if not isinstance(band, dict):
         return None
     rec = band.get(str(eff_ctx))
-    return rec if isinstance(rec, dict) else None
+    if isinstance(rec, dict):
+        return rec
+    # Single-cell fallback: the sole winner cell covers every ctx <= its
+    # max_context. Only fires when the exact tier is absent (legacy
+    # multi-cell rows still hit their exact tier above).
+    if max_ctx:
+        rec = band.get(str(max_ctx))
+        if isinstance(rec, dict):
+            return rec
+    return None
 
 
 def probe_at_context(entry: dict, vram_gb: int, context: int) -> dict | None:

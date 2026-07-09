@@ -229,7 +229,8 @@ def _load_probe_records() -> dict[str, dict]:
             return {}
         if not all(
             isinstance(v, dict) and v.get("schema_version") == 3
-            for v in data.values()
+            for k, v in data.items()
+            if not k.startswith("_")  # reserved keys (e.g. _meta) are not model rows
         ):
             data = _migrate_in_memory(data)
         records: dict[str, dict] = {}
@@ -1609,23 +1610,31 @@ def _score(m: dict) -> float:
 
 
 def _max_fitting_ctx_info(m: dict) -> dict | None:
-    """Largest probe-confirmed context tier that fits fully on GPU at the
-    picker's VRAM band. Returns the _vram_info_at-style dict (with an
-    extra `_picker_ctx` key) or None if nothing fits.
+    """Largest probe-confirmed context that fits fully on GPU at the picker's
+    VRAM band. Returns the _vram_info_at-style dict (with an extra
+    `_picker_ctx` key) or None if nothing fits.
+
+    Iterates the ctxs ACTUALLY recorded for this model (largest first), not
+    the fixed 32K/64K/128K/256K display tiers: the single-cell probe keeps one
+    binary-searched winner that may land off that grid (e.g. 160K), and the
+    Ollama prober still records multiple tiers -- both are handled by reading
+    the real cell keys.
     """
     v = m.get("vram") or {}
-    if not v:
+    probes = v.get("probes")
+    if not isinstance(probes, dict):
         return None
-    for ctx in sorted(_CONTEXT_CHOICES, reverse=True):
+    band = probes.get(str(int(_VRAM_BUDGET)))
+    if not isinstance(band, dict) or not band:
+        return None
+    for ctx in sorted((int(k) for k in band if str(k).isdigit()), reverse=True):
         info = _vram_info_at(v, ctx)
-        if info is None:
-            continue
-        if not info.get("fully_on_gpu", False):
+        if info is None or not info.get("fully_on_gpu", False):
             continue
         if int(info.get("context") or 0) < ctx:
             continue
         info = dict(info)
-        info["_picker_ctx"] = ctx
+        info["_picker_ctx"] = int(info.get("context") or ctx)
         return info
     return None
 

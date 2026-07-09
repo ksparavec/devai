@@ -37,6 +37,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import subprocess
 import sys
 import urllib.request
 from pathlib import Path
@@ -114,6 +115,49 @@ def save_cache(path: Path, cache: dict) -> None:
     payload = json.dumps(cache, indent=2, sort_keys=True) + "\n"
     tmp.write_text(payload)
     os.replace(tmp, path)
+
+
+# ── Image-digest drift (Phase C) ─────────────────────────────────────────────
+
+def image_digest_via_cli(runtime: str, image_ref: str) -> str | None:
+    """Return the sha256 digest of a local image via `<runtime> image inspect`.
+
+    Tries `.Digest` (manifest digest) first, falling back to the first entry
+    of `.RepoDigests` (`repo@sha256:...`, from which we keep only the digest).
+    Returns None on any error (image absent, runtime missing) -- image-drift
+    detection fails open.
+    """
+    for fmt in ("{{.Digest}}", "{{index .RepoDigests 0}}"):
+        try:
+            out = subprocess.run(
+                [runtime, "image", "inspect", "--format", fmt, image_ref],
+                capture_output=True, text=True, check=False, timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        val = (out.stdout or "").strip()
+        if out.returncode == 0 and "sha256:" in val:
+            return val.split("@")[-1] if "@" in val else val
+    return None
+
+
+def stamp_image_digest(cache: dict, *, digest: str, image_ref: str) -> None:
+    """Record, in a top-level `_meta` block, the backend image digest the cache
+    was probed against. Mirrors the bench cache's host-env stamping:
+    `_meta.image_history[<digest>]` accumulates every image seen and
+    `_meta.current_image_digest` points at the one this run used. The router
+    compares current_image_digest against the running image to detect drift (a
+    moved tag that silently invalidates the probe data). No-op on a falsy digest
+    so a failed inspect never corrupts the block.
+    """
+    if not digest:
+        return
+    meta = cache.setdefault("_meta", {})
+    history = meta.setdefault("image_history", {})
+    if digest not in history:
+        history[digest] = {"image_ref": image_ref, "first_seen": now_iso()}
+    meta["current_image_digest"] = digest
+    meta["current_image_ref"] = image_ref
 
 
 # ── Alias selection ──────────────────────────────────────────────────────────

@@ -95,7 +95,9 @@ ctx = int(sys.argv[3])
 with open(cache_path) as fh:
     cache = json.load(fh)
 assert isinstance(cache, dict) and cache, f"cache empty or non-dict: {type(cache).__name__}"
-key = next(iter(cache))
+# Skip the reserved `_meta` drift-stamp block (Phase C); sort_keys=True
+# places it ahead of any lowercase-owner repo key.
+key = next(k for k in cache if not k.startswith("_"))
 entry = cache[key]
 assert "@" in key, f"top-level key not <repo>@<sha>: {key!r}"
 sv = entry.get("schema_version")
