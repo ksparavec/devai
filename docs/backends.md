@@ -53,9 +53,12 @@ router:
    `deploy/recovery-flags.json` keyed by the canonical model name are
    appended (e.g. `--enforce-eager` for Nemotron-3-Nano at 128K --
    see docs/router.md "Per-model recovery flags").
-4. Polls `/health` until the container becomes ready (default 600s for
-   NVFP4 cold-start with CUDA graph compilation, override via
-   `HEALTH_TIMEOUT_SECONDS` env on the router).
+4. Polls `/health` until the container becomes ready (default 600s,
+   override via `HEALTH_TIMEOUT_SECONDS`). The poll fails fast: if the
+   container exits or its logs show a terminal error (`detectLaunchFailure`
+   with signatures ported from the probe classifier), the router aborts
+   immediately with that error instead of waiting the full timeout on a
+   crashed engine.
 5. Applies the reasoning policy and tool-stripping rules to the request.
 6. Proxies the original request through.
 

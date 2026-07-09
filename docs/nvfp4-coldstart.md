@@ -100,14 +100,18 @@ vLLM container -- neither has been done here.
 **Why phase 9 is the longest pole.** NVFP4 GEMMs run via specialized
 cutlass kernels that are JIT-compiled and autotuned the first time the
 runtime encounters a given `(GPU SM, kernel, shape)` triple. vLLM and
-SGLang both cache the resulting binaries in
-`~/.cache/{vllm,sglang}/torch_compile/` (mounted into the container via
-the `cache_root` volume). The first cold start on a freshly built image
-pays the full JIT cost; subsequent starts of the same model+context
-+batch envelope reuse the cache and complete faster (the 45.6 s above
-already benefits from a warm torch_compile cache for this model). The
-cache is keyed on SM version, so moving the same image to a different
-Blackwell card invalidates it.
+SGLang write the resulting binaries to `~/.cache/{vllm,sglang}/` inside
+the container. NOTE: that cache is NOT persisted -- the router recreates
+the backend container (stop + rm + create) on every model/ctx switch and
+binds no host volume to `~/.cache`, so the compile cache is discarded each
+time and the full JIT/torch.compile cost is re-paid on every cold start.
+(Persisting it via a bound `VLLM_CACHE_ROOT` volume is a known
+optimization deferred as fragile -- it helps only same-image,
+same-(model,ctx,flags) restarts and is invalidated whenever the image tag
+moves; see the router load-latency investigation.) The keep-warm default
+(`IDLE_TIMEOUT=0`) is what actually removes the repeated cost: a loaded
+model is not torn down on idle, so the JIT is paid once per model rather
+than after every idle gap.
 
 **This is why `HEALTH_TIMEOUT_SECONDS` defaults to 600 s.** The
 measured 45.6 s for an 8B-class NVFP4 with a warm compile cache is

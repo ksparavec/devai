@@ -101,10 +101,12 @@ services:
       - SGLANG_IMAGE=${SGLANG_IMAGE:-docker.io/lmsysorg/sglang:v0.5.10.post1-cu130}
       - SGLANG_MODELS_DIR=/var/cache/devai/ollama/models/vllm
       - NETWORK=devai-net
-      - IDLE_TIMEOUT=${IDLE_TIMEOUT:-300}
+      - IDLE_TIMEOUT=${IDLE_TIMEOUT:-0}
       - DRAIN_TIMEOUT=${DRAIN_TIMEOUT:-30}
+      - HEALTH_TIMEOUT_SECONDS=${HEALTH_TIMEOUT_SECONDS:-600}
+      - MAX_CONCURRENT_REQUESTS=${MAX_CONCURRENT_REQUESTS:-32}
       - GPU_MEMORY_GB=${GPU_MEMORY_GB:-24}
-      - MAX_CONTEXT_LEN=${MAX_CONTEXT_LEN:-131072}
+      - MAX_CONTEXT_LEN=${MAX_CONTEXT_LEN:-262144}
       - DEVAI_REASONING=${DEVAI_REASONING:-auto}
       - PODMAN_SOCKET=/run/podman/podman.sock
       # vLLM parser-plugin registry. The router reads the JSON map at

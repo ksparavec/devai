@@ -24,8 +24,10 @@
 //	SGLANG_CONTAINER  SGLang container name (default devai-sglang)
 //	SGLANG_IMAGE      SGLang container image
 //	SGLANG_MODELS_DIR host path to SGLang models
-//	IDLE_TIMEOUT      seconds before idle backend is stopped (default 300)
+//	IDLE_TIMEOUT      seconds before an idle backend is auto-unloaded; 0 = never (default 0, keep-warm)
 //	DRAIN_TIMEOUT     seconds to wait for in-flight requests before stopping (default 30)
+//	HEALTH_TIMEOUT_SECONDS  seconds to wait for a backend to become healthy after launch (default 600)
+//	MAX_CONCURRENT_REQUESTS max in-flight requests per backend before HTTP 429; 0 = unlimited (default 32)
 //	PODMAN_SOCKET     path to Podman API socket (default /run/podman/podman.sock)
 //	CONFIG_FILE       path to models.yaml (default /etc/devai/models.yaml)
 //	NETWORK           Podman network name (default devai-net)
@@ -37,7 +39,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -191,8 +195,14 @@ type configSpeculative struct {
 
 // launchConfig holds computed GPU parameters passed to backend entrypoints.
 type launchConfig struct {
-	MemFraction     float64
-	MaxContext      int
+	MemFraction float64
+	MaxContext  int
+	// MaxNumSeqs bounds the engine's concurrent-sequence batch (vLLM
+	// --max-num-seqs / SGLang --max-running-requests). 0 omits the flag
+	// (engine default). Set from the router's MAX_CONCURRENT_REQUESTS so
+	// CUDA-graph capture only spans batch sizes we actually admit; a
+	// per-model recovery flag still overrides it (appended last).
+	MaxNumSeqs      int
 	ToolParser      string // empty omits backend-specific tool flags
 	ReasoningParser string // empty omits --reasoning-parser
 	// Plugin paths are populated when ToolParser / ReasoningParser
@@ -647,7 +657,12 @@ type arbiter struct {
 	podmanClient  *http.Client
 	idleTimeout   time.Duration
 	drainTimeout  time.Duration
-	healthTimeout time.Duration      // configurable per HEALTH_TIMEOUT_SECONDS env (default 600s — vLLM/SGLang cold-start with NVFP4 weights + CUDA graph compilation can exceed 5 min on consumer GPUs)
+	healthTimeout time.Duration // configurable per HEALTH_TIMEOUT_SECONDS env (default 600s — vLLM/SGLang cold-start with NVFP4 weights + CUDA graph compilation can take minutes; waitForHealthy's crash-detection bails early on a dead engine, so this only bounds a genuinely-hung or slow-but-healthy load)
+	// maxConcurrent bounds in-flight requests per backend; over it the
+	// request handler returns HTTP 429. 0 = unlimited. Also drives the
+	// engines' --max-num-seqs / --max-running-requests so CUDA-graph
+	// capture covers exactly the batch sizes we admit.
+	maxConcurrent int64
 	modelSizes    map[string]float64 // model name → weight size in GB
 	modelContexts map[string]int     // model name → declared max context (from models.yaml)
 	// Capability and disable-verified are backend-specific for the same
@@ -927,6 +942,12 @@ func vllmEntrypoint(modelName string, lc launchConfig) []string {
 		"--trust-remote-code",
 		"--served-model-name", modelName,
 	}
+	// Cap concurrent sequences at the router's admission limit so CUDA-
+	// graph capture only spans batch sizes we serve. Before the parser /
+	// recovery flags so a per-model --max-num-seqs still wins last.
+	if lc.MaxNumSeqs > 0 {
+		args = append(args, "--max-num-seqs", fmt.Sprintf("%d", lc.MaxNumSeqs))
+	}
 	// Parser flags are per-model and read from the probe cache. Omit
 	// when unverified so a non-matching parser doesn't crash the launch.
 	// See deploy/backend-flags.yaml for the verified flag names.
@@ -1054,6 +1075,12 @@ func sglangEntrypoint(modelName string, lc launchConfig) []string {
 		"--mem-fraction-static", fmt.Sprintf("%.2f", lc.MemFraction),
 		"--context-length", fmt.Sprintf("%d", lc.MaxContext),
 		"--trust-remote-code",
+	}
+	// SGLang's --max-running-requests is the analogue of vLLM's
+	// --max-num-seqs (verified against v0.5.10.post1-cu130). Before the
+	// recovery flags so a per-model override still wins last.
+	if lc.MaxNumSeqs > 0 {
+		args = append(args, "--max-running-requests", fmt.Sprintf("%d", lc.MaxNumSeqs))
 	}
 	// SGLang flags verified against v0.5.10.post1-cu130 — see
 	// deploy/backend-flags.yaml. SGLang accepts --tool-call-parser
@@ -1349,9 +1376,10 @@ func main() {
 		backends:             make(map[string]*backendState),
 		ollamaURL:            ollamaURL,
 		podmanClient:         podmanClient,
-		idleTimeout:          time.Duration(envInt("IDLE_TIMEOUT", 300)) * time.Second,
+		idleTimeout:          time.Duration(envInt("IDLE_TIMEOUT", 0)) * time.Second,
 		drainTimeout:         time.Duration(envInt("DRAIN_TIMEOUT", 30)) * time.Second,
 		healthTimeout:        time.Duration(envInt("HEALTH_TIMEOUT_SECONDS", 600)) * time.Second,
+		maxConcurrent:        int64(envInt("MAX_CONCURRENT_REQUESTS", 32)),
 		modelSizes:           modelSizes,
 		modelContexts:        modelContexts,
 		modelCapability:      modelCapability,
@@ -1413,8 +1441,12 @@ func main() {
 		}(addr, mux)
 	}
 
-	log.Printf("gpu-arbiter started: idle=%ds drain=%ds",
-		int(a.idleTimeout.Seconds()), int(a.drainTimeout.Seconds()))
+	idleDesc := fmt.Sprintf("%ds", int(a.idleTimeout.Seconds()))
+	if a.idleTimeout == 0 {
+		idleDesc = "never(keep-warm)"
+	}
+	log.Printf("gpu-arbiter started: idle=%s drain=%ds health=%ds max_concurrent=%d",
+		idleDesc, int(a.drainTimeout.Seconds()), int(a.healthTimeout.Seconds()), a.maxConcurrent)
 
 	select {} // block forever
 }
@@ -1462,29 +1494,163 @@ func (a *arbiter) containerRemove(name string) {
 }
 
 func (a *arbiter) containerIsRunning(name string) bool {
+	status, _, ok := a.containerState(name)
+	return ok && status == "running"
+}
+
+// containerState returns the container's libpod State.Status (e.g.
+// "running", "exited", "created") and ExitCode. ok=false when the podman
+// API is unreachable or the body can't be decoded -- callers treat that as
+// "unknown", not "crashed", so a podman blip never triggers a spurious
+// recreate or a false fail-fast.
+func (a *arbiter) containerState(name string) (status string, exitCode int, ok bool) {
 	if a.podmanClient == nil {
-		return false
+		return "", 0, false
 	}
 	reqURL := fmt.Sprintf("http://d/v4.0.0/libpod/containers/%s/json", name)
 	resp, err := a.podmanClient.Get(reqURL)
 	if err != nil {
-		return false
+		return "", 0, false
 	}
 	defer resp.Body.Close()
 	var info struct {
 		State struct {
-			Status string `json:"Status"`
+			Status   string `json:"Status"`
+			ExitCode int    `json:"ExitCode"`
 		} `json:"State"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
-		// A malformed body would otherwise leave info.State.Status == ""
-		// and we'd return false -- triggering an unnecessary recreate of
-		// a backend that may be perfectly healthy. Treat decode failure
-		// as "unknown" but log so operators can spot a podman API regression.
-		log.Printf("warning: containerIsRunning %s: decode failed: %v", name, err)
-		return false
+		log.Printf("warning: containerState %s: decode failed: %v", name, err)
+		return "", 0, false
 	}
-	return info.State.Status == "running"
+	return info.State.Status, info.State.ExitCode, true
+}
+
+// terminalLaunchErrors are log substrings that unambiguously mean the
+// engine has crashed and will never answer /health. Conservative on
+// purpose: these are checked even while the container still reports
+// "running" (some crashes hang before exiting), so anything that could
+// appear in a healthy-but-slow startup is excluded. Sourced from the probe
+// failure classifier (scripts/_probe_hf_common.py).
+var terminalLaunchErrors = []string{
+	"Engine core initialization failed",
+	"torch.cuda.OutOfMemoryError",
+	"CUDA out of memory",
+	"No available memory for the cache blocks",
+	"quantization is not supported",
+	"Model architectures", // "Model architectures ['X'] are not supported" -- specific anchor; the bare "are not supported" tail can hit benign startup warnings (see scripts/_probe_hf_common.py:722-732)
+	"is not a supported model type",
+}
+
+// failureAnchors mark the root-cause line of a crash. Trusted only once the
+// container has already EXITED (where any error line is by definition
+// fatal), to pull a useful message out of a long traceback instead of the
+// generic wrapper. Mirrors _FAILURE_ANCHORS in the probe classifier.
+var failureAnchors = []string{
+	"NotImplementedError", "ValueError", "RuntimeError", "AssertionError",
+	"KeyError", "ImportError", "OSError", "Error:",
+}
+
+// containerRecentLogs fetches the last tailLines of a container's combined
+// stdout+stderr via the libpod logs endpoint (follow=false, returns
+// immediately). The stream is Docker-multiplexed for non-TTY containers;
+// demuxDockerStream strips the frame headers. Returns "" on any error.
+func (a *arbiter) containerRecentLogs(name string, tailLines int) string {
+	if a.podmanClient == nil {
+		return ""
+	}
+	reqURL := fmt.Sprintf(
+		"http://d/v4.0.0/libpod/containers/%s/logs?stdout=true&stderr=true&follow=false&tail=%d",
+		name, tailLines)
+	resp, err := a.podmanClient.Get(reqURL)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 256<<10))
+	if err != nil {
+		return ""
+	}
+	return demuxDockerStream(raw)
+}
+
+// demuxDockerStream strips Docker/libpod multiplexed stream frame headers (1
+// byte stream type, 3 zero bytes, uint32 big-endian payload size) and
+// returns the concatenated payloads. Non-framed (raw TTY) data is returned
+// unchanged.
+func demuxDockerStream(raw []byte) string {
+	framed := func(p []byte) bool {
+		return len(p) >= 8 && p[0] <= 2 && p[1] == 0 && p[2] == 0 && p[3] == 0
+	}
+	if !framed(raw) {
+		return string(raw)
+	}
+	var b strings.Builder
+	for framed(raw) {
+		size := int(binary.BigEndian.Uint32(raw[4:8]))
+		raw = raw[8:]
+		if size > len(raw) {
+			size = len(raw)
+		}
+		b.Write(raw[:size])
+		raw = raw[size:]
+	}
+	b.Write(raw) // trailing non-framed remainder, if any
+	return b.String()
+}
+
+// lastErrorLine returns the last (trimmed) log line containing any of the
+// substrings, or "". Last-match wins so a traceback yields its final
+// exception line (the root cause) rather than the "Traceback" header.
+func lastErrorLine(logs string, sigs []string) string {
+	if logs == "" {
+		return ""
+	}
+	lines := strings.Split(logs, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		for _, sig := range sigs {
+			if strings.Contains(lines[i], sig) {
+				return strings.TrimSpace(lines[i])
+			}
+		}
+	}
+	return ""
+}
+
+// launchFailure marks a backend that failed to come up. crashed=true means
+// the engine died (or logged a terminal error) -- a hard, permanent condition
+// for the current image, surfaced to clients as a non-retryable 400 so they
+// stop re-requesting a doomed reload. crashed=false is a plain health-wait
+// timeout (a genuinely-slow or hung load) which stays a retryable 503.
+type launchFailure struct {
+	crashed bool
+	msg     string
+}
+
+func (e *launchFailure) Error() string { return e.msg }
+
+// detectLaunchFailure returns a non-nil *launchFailure the moment the backend
+// container has demonstrably failed to start -- it exited/died, or its logs
+// already carry a terminal error signature -- so waitForHealthy can bail in
+// seconds instead of polling to the full HEALTH_TIMEOUT. Returns nil while
+// the container is still legitimately starting.
+func (a *arbiter) detectLaunchFailure(containerName string) error {
+	status, exitCode, ok := a.containerState(containerName)
+	crashed := ok && (status == "exited" || status == "dead" || status == "stopped")
+	logs := a.containerRecentLogs(containerName, 200)
+
+	if crashed {
+		if line := lastErrorLine(logs, failureAnchors); line != "" {
+			return &launchFailure{crashed: true, msg: fmt.Sprintf("engine crashed (exit %d): %s", exitCode, line)}
+		}
+		return &launchFailure{crashed: true, msg: fmt.Sprintf("engine container %s (exit %d) before becoming healthy", status, exitCode)}
+	}
+	// Still running (or state unknown): only a strong, unambiguous fatal
+	// signature aborts the wait -- a healthy slow load never prints these.
+	if line := lastErrorLine(logs, terminalLaunchErrors); line != "" {
+		return &launchFailure{crashed: true, msg: fmt.Sprintf("engine reported a fatal error: %s", line)}
+	}
+	return nil
 }
 
 // backendIsServing checks whether the backend container is not just
@@ -1666,6 +1832,11 @@ func (a *arbiter) containerRecreate(bs *backendState, modelName string, desiredC
 		lc.MaxContext, requestedCtx,
 		a.modelProbedMaxCtx[cfg.Name][modelName],
 	)
+	// Bound the engine's concurrent-sequence batch to the router's
+	// admission cap so CUDA-graph capture only covers batch sizes we
+	// actually serve. Emitted before RecoveryFlags, so a per-model
+	// --max-num-seqs (VRAM rescue) still wins last.
+	lc.MaxNumSeqs = int(a.maxConcurrent)
 	if parser := a.modelToolParser[cfg.Name][modelName]; parser != "" {
 		lc.ToolParser = parser
 	}
@@ -1755,9 +1926,45 @@ func (a *arbiter) waitForHealthy(bs *backendState, timeout time.Duration) error 
 				return nil
 			}
 		}
+		// Fail fast: a crashed engine will never answer /health, so don't
+		// burn the full timeout waiting for a corpse. Only the router-
+		// launched backends (vLLM/SGLang) are crash-checked. Ollama has a
+		// non-empty ContainerName too, but is exempt because it never reaches
+		// waitForHealthy (ensureBackendRunning returns early for it) -- gate
+		// on the name so a future refactor can't silently start crash-checking
+		// a persistent service the router doesn't recreate.
+		if bs.config.Name != "ollama" {
+			if failErr := a.detectLaunchFailure(bs.config.ContainerName); failErr != nil {
+				return fmt.Errorf("%s %w", bs.config.Name, failErr)
+			}
+		}
 		time.Sleep(2 * time.Second)
 	}
-	return fmt.Errorf("%s did not become ready within %s", bs.config.Name, timeout)
+	return &launchFailure{crashed: false, msg: fmt.Sprintf("%s did not become ready within %s", bs.config.Name, timeout)}
+}
+
+// writeLaunchError translates a backend-launch failure into an HTTP response.
+// A crashed engine (launchFailure.crashed) is a hard, permanent condition for
+// the current image, so it returns 400 invalid_request_error with
+// x-should-retry:false -- OpenAI/litellm clients treat that as non-retryable
+// and stop hammering the router with a doomed reload. A plain health-wait
+// timeout (or any other error) stays 503, which clients may legitimately retry.
+func (a *arbiter) writeLaunchError(w http.ResponseWriter, err error) {
+	log.Printf("error: %v", err)
+	status := http.StatusServiceUnavailable
+	errType := "server_error"
+	var lf *launchFailure
+	if errors.As(err, &lf) && lf.crashed {
+		status = http.StatusBadRequest
+		errType = "invalid_request_error"
+		w.Header().Set("x-should-retry", "false")
+	}
+	body, _ := json.Marshal(map[string]any{
+		"error": map[string]any{"type": errType, "message": err.Error()},
+	})
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	w.Write(body)
 }
 
 // --- GPU exclusion and lifecycle ---
@@ -1987,8 +2194,18 @@ func (a *arbiter) ensureBackendRunning(bs *backendState, modelName string, desir
 func (a *arbiter) makeRequestHandler(backendName string) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
 		bs := a.backends[backendName]
-		atomic.AddInt64(&bs.activeReqs, 1)
+		// Admission control: bound in-flight requests per backend. Increment
+		// first (single source of truth, race-free) and always defer the
+		// decrement, so an over-cap request still accounts correctly on the
+		// way out. maxConcurrent==0 disables the cap.
+		inflight := atomic.AddInt64(&bs.activeReqs, 1)
 		defer atomic.AddInt64(&bs.activeReqs, -1)
+		if a.maxConcurrent > 0 && inflight > a.maxConcurrent {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			fmt.Fprintf(w, `{"error":{"type":"rate_limit_error","code":"max_concurrent_requests","message":"router at capacity: more than MAX_CONCURRENT_REQUESTS=%d requests in flight for backend %q; retry shortly"}}`, a.maxConcurrent, backendName)
+			return
+		}
 
 		// Read body for any POST so we can (a) extract the model name
 		// for backend lifecycle decisions and (b) apply the reasoning
@@ -2195,8 +2412,7 @@ func (a *arbiter) makeRequestHandler(backendName string) http.HandlerFunc {
 		bs.lastRequest = time.Now()
 		if err := a.ensureBackendRunning(bs, modelName, numCtx, desiredSpec); err != nil {
 			a.mu.Unlock()
-			log.Printf("error: %v", err)
-			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err), http.StatusServiceUnavailable)
+			a.writeLaunchError(w, err)
 			return
 		}
 		a.mu.Unlock()
@@ -3084,29 +3300,40 @@ func (a *arbiter) makeHealthHandler(backendName string) http.HandlerFunc {
 func (a *arbiter) idleWatcher() {
 	for {
 		time.Sleep(30 * time.Second)
-		a.mu.Lock()
-		for _, bs := range a.backends {
-			if !bs.running || bs.lastRequest.IsZero() {
-				continue
-			}
-			if time.Since(bs.lastRequest) <= a.idleTimeout {
-				continue
-			}
-			if atomic.LoadInt64(&bs.activeReqs) > 0 {
-				continue
-			}
-			log.Printf("%s idle for %s, stopping",
-				bs.config.Name, time.Since(bs.lastRequest).Round(time.Second))
-			if bs.config.Name == "ollama" {
-				a.unloadOllama()
-			} else {
-				if err := a.containerStop(bs.config.ContainerName); err != nil {
-					log.Printf("warning: failed to stop %s: %v", bs.config.Name, err)
-				}
-			}
-			bs.running = false
-			bs.currentModel = ""
+		a.idleSweepOnce()
+	}
+}
+
+// idleSweepOnce stops any backend idle longer than idleTimeout. A zero
+// idleTimeout means keep-warm (never auto-unload): the model stays resident
+// until a different model is requested. Extracted from idleWatcher so the
+// policy is unit-testable without the 30s loop.
+func (a *arbiter) idleSweepOnce() {
+	if a.idleTimeout == 0 {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, bs := range a.backends {
+		if !bs.running || bs.lastRequest.IsZero() {
+			continue
 		}
-		a.mu.Unlock()
+		if time.Since(bs.lastRequest) <= a.idleTimeout {
+			continue
+		}
+		if atomic.LoadInt64(&bs.activeReqs) > 0 {
+			continue
+		}
+		log.Printf("%s idle for %s, stopping",
+			bs.config.Name, time.Since(bs.lastRequest).Round(time.Second))
+		if bs.config.Name == "ollama" {
+			a.unloadOllama()
+		} else {
+			if err := a.containerStop(bs.config.ContainerName); err != nil {
+				log.Printf("warning: failed to stop %s: %v", bs.config.Name, err)
+			}
+		}
+		bs.running = false
+		bs.currentModel = ""
 	}
 }

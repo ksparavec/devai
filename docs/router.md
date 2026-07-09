@@ -168,7 +168,9 @@ agent --> router (port 11435 or 11436)
               |   +- apply probe-verified ctx ceiling
               +- stop + remove placeholder container
               +- podman libpod create + start with full launch flags
-              +- poll /health (HEALTH_TIMEOUT_SECONDS, default 600s)
+              +- poll /health (HEALTH_TIMEOUT_SECONDS, default 600s);
+              |   fail fast if the container exits or its logs show a
+              |   terminal error (no more full-timeout waits on a crash)
               +- proxy the original request through
 ```
 
@@ -188,9 +190,13 @@ one container start happens.
 
 ### Idle
 
-`idleWatcher` polls every 30s. A backend whose `lastRequest` is older
-than `IDLE_TIMEOUT` (default 300s) gets stopped and replaced with the
-`sleep infinity` placeholder. The next request triggers a cold start.
+`idleWatcher` polls every 30s and delegates to `idleSweepOnce`. With
+`IDLE_TIMEOUT=0` (the default -- keep-warm) it never auto-unloads: a
+loaded model stays resident until a *different* model is requested, so a
+cold start is paid once per model, not again after every idle gap. Set
+`IDLE_TIMEOUT` to a positive value to restore time-based unloading, where
+a backend idle longer than the timeout is stopped and replaced with the
+`sleep infinity` placeholder.
 
 ### Backend switch (GPU exclusion)
 
@@ -517,9 +523,10 @@ the shell when invoking compose.
 
 | Variable                  | Default | Purpose                                                            |
 |---------------------------|---------|--------------------------------------------------------------------|
-| `IDLE_TIMEOUT`            | `300`   | seconds before idle backend is replaced with placeholder           |
+| `IDLE_TIMEOUT`            | `0`     | seconds before an idle backend is auto-unloaded; `0` = never (keep-warm) |
 | `DRAIN_TIMEOUT`           | `30`    | seconds to wait for in-flight requests when switching backends     |
-| `HEALTH_TIMEOUT_SECONDS`  | `600`   | cold-start health-poll deadline (NVFP4 + CUDA graph can need 5min) |
+| `HEALTH_TIMEOUT_SECONDS`  | `600`   | health-poll deadline for a *hung* load; a crashed engine fails fast via log/exit detection |
+| `MAX_CONCURRENT_REQUESTS`| `32`    | max in-flight requests per backend before HTTP 429; `0` = unlimited. Also sets the engine's `--max-num-seqs` / `--max-running-requests` |
 
 ### Memory and context
 
