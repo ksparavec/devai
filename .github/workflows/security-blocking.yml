@@ -77,7 +77,7 @@ jobs:
             install-mode: goinstall
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: ${{ matrix.go-version }}
       - name: Run golangci-lint
