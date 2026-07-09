@@ -896,8 +896,10 @@ def run_load_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
                 moved.update(load_rec)
                 band.clear()
                 band[str(max_serving)] = moved
-                # refresh_top_level_from_cells only grows/caps -- set the
-                # shrunk ceiling directly.
+                # The load pass owns max_context maintenance directly (it does
+                # not call refresh_top_level_from_cells); set the shrunk ceiling
+                # to the serving winner so the router advertises exactly what
+                # served.
                 entry["max_context"] = max_serving
             entry["last_load_probed_at"] = load_rec.get("serving_probed_at")
             # A model that now serves clears a stale prober-owned oom exclusion.
