@@ -92,6 +92,14 @@ def sglang_command_args(
         "--mem-fraction-static", f"{host_frac:.4f}",
         "--context-length", str(max_ctx),
         "--trust-remote-code",
+        # SGLang v0.5.10 enables piecewise CUDA graph by default, which
+        # torch.compiles the forward; Dynamo then can't trace flashinfer's
+        # FP4 JIT path (modelopt_quant.py:1482 -> fp4_quantize -> a
+        # subprocess/threading.Lock) and every NVFP4 load crashes with a
+        # graph break. Disabling it runs FP4 eager (JITs fine) -- the
+        # engine's documented workaround. Must match gpu-arbiter
+        # sglangEntrypoint so probe and serve launch identically.
+        "--disable-piecewise-cuda-graph",
     ]
     if reasoning_parser:
         args.extend(["--reasoning-parser", reasoning_parser])

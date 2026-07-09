@@ -52,6 +52,12 @@ sglang:
   trust_remote_code:    "--trust-remote-code"
   tool_call_parser:     "--tool-call-parser"
   reasoning_parser:     "--reasoning-parser"
+  # Piecewise CUDA graph is enabled by default in v0.5.10 and torch.compiles
+  # the forward, which makes Dynamo choke on flashinfer's FP4 JIT path
+  # (modelopt_quant.py:1482) -- every NVFP4 load crashes. The router and
+  # prober always pass this to run FP4 eagerly. Drop when a future SGLang
+  # image can trace the FP4 path.
+  disable_piecewise_cuda_graph: "--disable-piecewise-cuda-graph"
   # Multi-token-prediction launch flags (pinned for forward-compat;
   # the probe driver doesn't exercise them today since SGLang's NVFP4
   # path is broken upstream -- see scripts/model-families.yaml:60-72).

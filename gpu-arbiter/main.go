@@ -1098,6 +1098,16 @@ func sglangEntrypoint(modelName string, lc launchConfig) []string {
 		"--mem-fraction-static", fmt.Sprintf("%.2f", lc.MemFraction),
 		"--context-length", fmt.Sprintf("%d", lc.MaxContext),
 		"--trust-remote-code",
+		// SGLang v0.5.10 enables piecewise CUDA graph by default, which
+		// torch.compiles the model forward. Dynamo then cannot trace
+		// flashinfer's FP4 JIT-compile path (modelopt_quant.py:1482 ->
+		// fp4_quantize -> a subprocess/threading.Lock call), so every NVFP4
+		// load crashes with a Dynamo graph break during warmup_compile.
+		// Disabling piecewise capture runs the FP4 quantize eagerly (it JIT-
+		// compiles fine outside a compile context) -- the engine's own
+		// documented workaround. Drop this when a future SGLang image can
+		// trace the FP4 path. Pinned in deploy/backend-flags.yaml.
+		"--disable-piecewise-cuda-graph",
 	}
 	// SGLang's --max-running-requests is the analogue of vLLM's
 	// --max-num-seqs (verified against v0.5.10.post1-cu130). Before the
