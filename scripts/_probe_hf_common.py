@@ -1543,14 +1543,20 @@ def refresh_top_level_from_cells(entry: dict) -> None:
         # the model asserts on any prompt that long at serve time -- so
         # max_context must not advertise it. position_limit is stamped on
         # the entry by run_probe_pass from config.json (see
-        # effective_position_limit). This also SHRINKS a value a prior
-        # (pre-cap) probe run recorded as an over-promise.
+        # effective_position_limit).
         pos_limit = entry.get("position_limit")
         if isinstance(pos_limit, int) and pos_limit > 0:
             largest_ctx = min(largest_ctx, pos_limit)
-        cur = entry.get("max_context") or 0
-        capped_down = isinstance(pos_limit, int) and 0 < pos_limit < cur
-        if largest_ctx and (cur < largest_ctx or capped_down):
+        # max_context tracks the largest clean probed actual_context (capped
+        # at the position limit). Sync on ANY difference: it GROWS when a
+        # higher tier is verified, SHRINKS when the position limit caps an
+        # over-promise, and -- crucially for the single-cell binary search --
+        # SHRINKS when a full re-probe replaces a multi-cell entry whose stale
+        # max exceeded the new lone winner (e.g. 40960 -> 32768). The cell
+        # loop above already spans every remaining cell, so largest_ctx is the
+        # true max across the current set; a shrink is never a partial-probe
+        # artefact. Guard on truthiness so a fits-nowhere entry keeps its max.
+        if largest_ctx and largest_ctx != (entry.get("max_context") or 0):
             entry["max_context"] = largest_ctx
         return
 
