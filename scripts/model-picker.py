@@ -868,6 +868,13 @@ def _discover_models() -> list[dict]:
     recomputed here.
     """
     catalog = _load_catalog()
+    # Ollama canonicalizes a k-quant tag's case on `ollama create` (e.g. a
+    # catalog `ornith:9b-q4_k_m` is stored on disk as `ornith:9b-q4_K_M`),
+    # while generate-catalog lowercases every gguf-derived tag. Ollama tags
+    # are case-insensitive, so also index the catalog by lowercased name and
+    # fall back to it -- otherwise gguf_repos k-quant rows would lose their
+    # family/purpose metadata (and show a blank family column) in the picker.
+    catalog_ci = {k.lower(): v for k, v in catalog.items()}
     probes = _load_probe_records()
     out: list[dict] = []
 
@@ -887,7 +894,7 @@ def _discover_models() -> list[dict]:
                 if _ctx_tag.search(tag_file.name):
                     continue
                 name = f"{lib_dir.name}:{tag_file.name}"
-                meta = catalog.get(name, {})
+                meta = catalog.get(name) or catalog_ci.get(name.lower(), {})
                 disk_gb = _ollama_disk_size_gb(lib_dir.name, tag_file.name)
                 probe = probes.get(name) or {}
                 cap = _capability_from_probe(probe, Capability.UNKNOWN)
