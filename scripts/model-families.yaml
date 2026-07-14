@@ -343,6 +343,62 @@ families:
   #   * SGLang fixes its NVFP4 path (bug noted at the top of this
   #     file) so we can fall back to SGLang's loader.
 
+  - name: ornith
+    # Ornith-1.0 (deepreinforce-ai) -- an agentic-coding LLM family, RL
+    # self-improving, MIT licensed. Only the 9B is catalogued here (the 35B
+    # and 397B are handled below / out of scope for the 24G card).
+    #
+    # The 9B is DENSE qwen3_5 arch (Qwen3_5ForConditionalGeneration; 32L,
+    # 16 attn / 4 KV heads, head_dim 256, vocab 248320, native 256K ctx,
+    # bf16), post-trained on Gemma 4 + Qwen 3.5. Its model card prescribes
+    # exactly the qwen3.5-family parsers (--reasoning-parser qwen3
+    # --tool-call-parser qwen3_xml; opens with a <think>...</think> block) --
+    # verified against chat_template.jinja + the model card 2026-07-14. These
+    # are hints; the probe drivers confirm them per variant.
+    #
+    # VRAM on the 24G card (fit-math estimate -- confirm with `make probe` /
+    # `make probe-vllm` before relying on it):
+    #   9B GGUF (Ollama, F16 KV): Q4_K_M 5.2 / Q5_K_M 6.0 / Q6_K 6.9 /
+    #     Q8_0 8.9 / bf16 16.7 GB -- all fit; Q4_K_M reaches ~128K ctx,
+    #     bf16 ~32K.
+    #   9B bf16 safetensors (vLLM/SGLang): ~18.8 GB on disk (~17.5 GiB
+    #     weights). Fits ONLY because of the always-on FP8 KV cache -- serve
+    #     @32K (64K is borderline, ~1 GiB spare). The card's "single 80GB
+    #     GPU" note assumes bf16 KV; FP8 KV is what lands it on 24G.
+    #
+    # Deliberately NO `mtp:` block, even though config.json carries
+    # mtp_num_hidden_layers=1: the qwen3_5_mtp draft lm_head is vocab-sized,
+    # and this vocab (248320) is ~1.6x the usual, so the draft head would OOM
+    # at model load on 24G -- the same failure class documented in the
+    # qwen3.6 family above. The base model serves fine without it (vLLM skips
+    # the unused nextn weights).
+    #
+    # 35B (qwen3_5_moe, multimodal) is intentionally NOT catalogued: BF16
+    # (~70 GB) and FP8 (~35 GB) exceed 24G outright, only GGUF Q4_K_M
+    # (~20 GiB) would fit at all, and llama.cpp / vLLM / SGLang support for
+    # the qwen3_5_moe + vision arch is unverified. Probe arch support first
+    # with scripts/probe-ornith-arch.sh before adding any 35B row.
+    hf_repos:
+      - deepreinforce-ai/Ornith-1.0-9B
+    gguf_repos:
+      - repo: deepreinforce-ai/Ornith-1.0-9B-GGUF
+        tag_prefix: 9b
+        include:
+          - Q4_K_M
+          - Q5_K_M
+          - Q6_K
+          - Q8_0
+          - bf16
+    parsers:
+      vllm:
+        reasoning: qwen3
+        tool: qwen3_xml
+      sglang:
+        reasoning: qwen3
+        tool: qwen
+    arch_ref: deepreinforce-ai/Ornith-1.0-9B
+    thinking: true
+
   - name: llama3.2
     # Ollama-only — NVIDIA hasn't published an NVFP4 quant for the
     # Llama-3.2 1B/3B line (too small for the Blackwell tensor-core
