@@ -183,7 +183,7 @@ endif
 .PHONY: vllm-list vllm-rm vllm-status vllm-df
 .PHONY: clean clean-cpu clean-gpu clean-router prune
 .PHONY: fetch-cli pull-images install install-systemd uninstall test test-router test-ollama test-agents test-models test-probe-vllm test-probe-sglang test-probe-ollama-idempotent test-vllm test-sglang test-e2e test-full help
-.PHONY: catalog-regen catalog-suggest catalog-discover catalog-discover-add probe probe-vllm probe-sglang probe-load-vllm probe-load-sglang probe-check model-fit model-pull model-status model-sync vram-fit verify-backend-flags ollama-cleanup-ctx-variants
+.PHONY: catalog-regen catalog-suggest catalog-discover catalog-discover-add probe probe-vllm probe-sglang probe-load-vllm probe-load-sglang probe-check probe-ornith-arch model-fit model-pull model-status model-sync vram-fit verify-backend-flags ollama-cleanup-ctx-variants
 .PHONY: bench bench-vllm bench-sglang bench-ollama bench-report test-bench-smoke
 .PHONY: secrets-tmpfs secrets-edit secrets-render secrets-rotate age-keygen-host test-python
 .PHONY: build-backup-tool build-gpu-vendor-tool build-mcp-modelstatus build-mcp-modelstatus-image build-devai-tools test-devai-tools
@@ -1332,6 +1332,9 @@ probe-check: ## Report backend image drift: compare running vLLM/SGLang image di
 	@CONTAINER_RUNTIME=$(CONTAINER_RUNTIME) \
 	  VLLM_IMAGE="$(VLLM_IMAGE)" SGLANG_IMAGE="$(SGLANG_IMAGE)" \
 	  python3 scripts/probe-check.py
+
+probe-ornith-arch: ## Tier-1 arch-support probe for the Ornith-1.0 35B (qwen3_5_moe). Cheap: introspects the running vLLM/SGLang images, no weight download.
+	@CONTAINER_RUNTIME=$(CONTAINER_RUNTIME) bash scripts/probe-ornith-arch.sh
 
 verify-backend-flags: ## Assert pinned vLLM/SGLang images expose every flag in deploy/backend-flags.yaml (run after image bump)
 	python3 scripts/verify-backend-flags.py
