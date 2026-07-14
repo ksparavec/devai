@@ -2,7 +2,7 @@
 #
 # Regenerate with: make catalog-regen
 # Source of truth:  scripts/model-families.yaml
-# Generated at:     2026-07-14T15:28:44+00:00
+# Generated at:     2026-07-14T16:10:01+00:00
 #
 # Every 'size' and 'arch' below was fetched live from the
 # upstream provider at generation time. Do not hand-edit.
@@ -1263,25 +1263,6 @@ models:
         tool: qwen3_coder
       sglang:
         tool: qwen3_coder
-
-  - name: "Ornith-1.0-9B"
-    family: ornith
-    backend: [vllm, sglang]
-    repo: "deepreinforce-ai/Ornith-1.0-9B"
-    source: hf
-    sha: "83dc1f5e24ef"
-    size: "17.53 GB"
-    arch: { layers: 32, kv_heads: 4, head_dim: 256, k_eq_v: false }
-    arch_source: "deepreinforce-ai/Ornith-1.0-9B/config.json"
-    purpose: "ornith · 17.5 GB · 32L/4kv/256h"
-    conversational: true
-    parsers:
-      vllm:
-        reasoning: qwen3
-        tool: qwen3_xml
-      sglang:
-        reasoning: qwen3
-        tool: qwen
 
   - name: "ornith:9b-q4_k_m"
     family: ornith

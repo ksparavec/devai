@@ -88,16 +88,23 @@ def _ornith_family() -> dict:
 
 
 class TestOrnithFamily(unittest.TestCase):
-    """Guard the hand-maintained 9B Ornith entry against accidental drift."""
+    """Guard the hand-maintained 9B Ornith entry against accidental drift.
+
+    GGUF-only on a 24G card: the bf16 safetensors OOMs at vLLM model load
+    (measured 2026-07-14), so there is no hf_repos row and no parsers block.
+    """
 
     def test_arch_ref_and_thinking(self) -> None:
         fam = _ornith_family()
         self.assertEqual(fam["arch_ref"], "deepreinforce-ai/Ornith-1.0-9B")
         self.assertTrue(fam["thinking"])
 
-    def test_hf_bf16_safetensors_row(self) -> None:
+    def test_gguf_only_no_hf_or_parsers(self) -> None:
+        # bf16 safetensors OOMs on 24G -> no hf_repos; Ollama parses GGUF
+        # natively -> no parsers block.
         fam = _ornith_family()
-        self.assertIn("deepreinforce-ai/Ornith-1.0-9B", fam["hf_repos"])
+        self.assertNotIn("hf_repos", fam)
+        self.assertNotIn("parsers", fam)
 
     def test_gguf_repo_and_include_ladder(self) -> None:
         fam = _ornith_family()
@@ -110,21 +117,12 @@ class TestOrnithFamily(unittest.TestCase):
             entry["include"], ["Q4_K_M", "Q5_K_M", "Q6_K", "Q8_0", "bf16"]
         )
 
-    def test_parsers_match_qwen3_5_arch(self) -> None:
-        # Model-card-prescribed parsers for the qwen3_5 arch.
-        fam = _ornith_family()
-        self.assertEqual(fam["parsers"]["vllm"]["reasoning"], "qwen3")
-        self.assertEqual(fam["parsers"]["vllm"]["tool"], "qwen3_xml")
-        self.assertEqual(fam["parsers"]["sglang"]["reasoning"], "qwen3")
-        self.assertEqual(fam["parsers"]["sglang"]["tool"], "qwen")
-
     def test_no_speculative_mtp_block(self) -> None:
         # Intentionally MTP-less: the vocab-248320 draft lm_head would OOM
-        # at load on 24G. Assert no mtp block sneaks onto the hf entry.
+        # at load on 24G. No gguf_repos entry should carry an mtp block.
         fam = _ornith_family()
-        for spec in fam["hf_repos"]:
-            if isinstance(spec, dict):
-                self.assertNotIn("mtp", spec)
+        for entry in fam["gguf_repos"]:
+            self.assertNotIn("mtp", entry)
 
 
 if __name__ == "__main__":
