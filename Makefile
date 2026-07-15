@@ -1339,6 +1339,42 @@ probe-ornith-arch: ## Tier-1 arch-support probe for the Ornith-1.0 35B (qwen3_5_
 verify-backend-flags: ## Assert pinned vLLM/SGLang images expose every flag in deploy/backend-flags.yaml (run after image bump)
 	python3 scripts/verify-backend-flags.py
 
+# --- NVFP4 cloud quantization on HF Jobs (scripts/quant/) --------------------
+# Ladder: quant-smoke (tiny, ~$0.25, plumbing) -> quant-9b (dense qwen3_5, real
+# arch + a 24G-servable NVFP4) -> quant-35b (the real MoE+vision run). One
+# reusable driver; only model/recipe/timeout differ. Needs HF_TOKEN exported;
+# the 9b/35b push targets also need HF_NAMESPACE=<your-hf-user-or-org>.
+QUANT_SCRIPT := scripts/quant/quant_smoke.py
+QUANT_FLAVOR ?= rtx-pro-6000
+QUANT_IMAGE  ?= vllm/vllm-openai:latest
+SMOKE_MODEL  ?= Qwen/Qwen2.5-1.5B-Instruct
+HF_NAMESPACE ?=
+
+.PHONY: quant-smoke quant-9b quant-35b
+
+quant-smoke: ## NVFP4 pipeline smoke test on HF Jobs: quantize SMOKE_MODEL -> reload on GPU -> generate (~5min, ~$0.25). Needs HF_TOKEN.
+	@test -n "$$HF_TOKEN" || { echo "ERROR: export HF_TOKEN (huggingface.co/settings/tokens) first"; exit 1; }
+	hf jobs uv run --flavor $(QUANT_FLAVOR) --image $(QUANT_IMAGE) --timeout 20m \
+	    --secrets HF_TOKEN=$$HF_TOKEN \
+	    $(QUANT_SCRIPT) --model $(SMOKE_MODEL) --calib-samples 128
+
+quant-9b: ## NVFP4 quantize Ornith-1.0-9B (dense qwen3_5) on HF Jobs + push. Validates the real arch; yields a 24G-servable NVFP4. Needs HF_TOKEN + HF_NAMESPACE.
+	@test -n "$$HF_TOKEN" || { echo "ERROR: export HF_TOKEN first"; exit 1; }
+	@test -n "$(HF_NAMESPACE)" || { echo "ERROR: set HF_NAMESPACE=<your-hf-user-or-org>"; exit 1; }
+	hf jobs uv run --flavor $(QUANT_FLAVOR) --image $(QUANT_IMAGE) --timeout 1h \
+	    --secrets HF_TOKEN=$$HF_TOKEN \
+	    $(QUANT_SCRIPT) --model deepreinforce-ai/Ornith-1.0-9B \
+	      --calib-samples 512 --out $(HF_NAMESPACE)/Ornith-1.0-9B-NVFP4
+
+quant-35b: ## NVFP4 quantize Ornith-1.0-35B (MoE+vision, text-only) on HF Jobs + push (~1-3h). Run quant-smoke + quant-9b FIRST. Needs HF_TOKEN + HF_NAMESPACE.
+	@test -n "$$HF_TOKEN" || { echo "ERROR: export HF_TOKEN first"; exit 1; }
+	@test -n "$(HF_NAMESPACE)" || { echo "ERROR: set HF_NAMESPACE=<your-hf-user-or-org>"; exit 1; }
+	hf jobs uv run --flavor $(QUANT_FLAVOR) --image $(QUANT_IMAGE) --timeout 4h \
+	    --secrets HF_TOKEN=$$HF_TOKEN \
+	    $(QUANT_SCRIPT) --model deepreinforce-ai/Ornith-1.0-35B \
+	      --recipe-preset ornith-moe --moe-all-experts \
+	      --calib-samples 512 --out $(HF_NAMESPACE)/Ornith-1.0-35B-NVFP4
+
 ollama-cleanup-ctx-variants: ## Remove every derived `-ctx<N>` tag from Ollama. Safe — they share weight blobs with parents; only Modelfile metadata is freed.
 	@$(CONTAINER_RUNTIME) exec devai-ollama sh -c 'ollama list | awk "NR>1 && \$$1 ~ /-ctx[0-9]+\$$/ {print \$$1}"' | \
 	  while IFS= read -r tag; do \
