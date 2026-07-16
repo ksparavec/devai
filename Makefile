@@ -1344,8 +1344,8 @@ verify-backend-flags: ## Assert pinned vLLM/SGLang images expose every flag in d
 # then `make quant-local` (podman on the local GPU) or `make quant-cloud`
 # (HF Jobs). The SAME vars drive both. The ladder is just an .env edit:
 #   smoke : QUANT_MODEL=Qwen/Qwen2.5-1.5B-Instruct
-#   9B    : QUANT_MODEL=deepreinforce-ai/Ornith-1.0-9B  QUANT_OUT_NAME=Ornith-1.0-9B-NVFP4
-#   35B   : QUANT_MODEL=deepreinforce-ai/Ornith-1.0-35B QUANT_PRESET=ornith-moe QUANT_MOE_ALL_EXPERTS=1
+#   9B    : QUANT_MODEL=deepreinforce-ai/Ornith-1.0-9B  QUANT_PRESET=ornith QUANT_OUT_NAME=Ornith-1.0-9B-NVFP4
+#   35B   : QUANT_MODEL=deepreinforce-ai/Ornith-1.0-35B QUANT_PRESET=ornith QUANT_MOE_ALL_EXPERTS=1
 QUANT_SCRIPT          := scripts/quant/quant_smoke.py
 QUANT_MODEL           ?= Qwen/Qwen2.5-1.5B-Instruct
 QUANT_PRESET          ?= dense

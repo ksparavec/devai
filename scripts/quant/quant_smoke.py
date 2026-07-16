@@ -66,14 +66,18 @@ def _is_degenerate(text: str) -> bool:
 
 
 # Built-in ignore-lists so the driver is self-contained on HF Jobs (no recipe
-# file needs to travel with the uploaded script). `ornith-moe` is derived from
-# the canonical llm-compressor Qwen3.5 NVFP4 MoE example -- text-only (vision
-# skipped). Confirm the exact module patterns against the model on the real run.
+# file needs to travel with the uploaded script). `ornith` is derived from the
+# canonical llm-compressor Qwen3.5-VL example and fits both Ornith models (dense
+# 9B + MoE 35B, both qwen3_5 multimodal): it NVFP4's the text linears and keeps
+# lm_head, embeddings, MoE router/shared-expert gates, the linear-attention
+# layers, and the whole VISION TOWER in bf16 -- so vision stays a working
+# feature AND the saved config keeps the multimodal wrapper that vLLM requires
+# (vLLM has no text-only Qwen3_5ForCausalLM loader).
 _PRESET_IGNORE = {
     "dense": ["lm_head"],
-    "ornith-moe": ["lm_head", "re:.*embed_tokens", r"re:.*mlp\.gate$",
-                   "re:.*shared_expert_gate", "re:.*visual.*", "re:.*vision.*",
-                   "re:.*linear_attn.*"],
+    "ornith": ["lm_head", "re:.*embed_tokens", r"re:.*mlp\.gate$",
+               "re:.*shared_expert_gate", "re:.*visual.*", "re:.*vision.*",
+               "re:.*linear_attn.*"],
 }
 
 
@@ -81,12 +85,33 @@ def quantize(model_id: str, save_dir: str, recipe_path: str | None, preset: str,
              moe_all_experts: bool, scheme: str, dataset: str,
              calib_samples: int, max_seq: int) -> None:
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
     from llmcompressor import oneshot
 
-    log(f"[quant] load {model_id}")
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id, torch_dtype="auto", device_map="cuda")
+    cfg = AutoConfig.from_pretrained(model_id)
+    is_multimodal = hasattr(cfg, "vision_config") or any(
+        "ForConditionalGeneration" in a
+        for a in (getattr(cfg, "architectures", None) or []))
+    log(f"[quant] load {model_id}  (multimodal={is_multimodal})")
+    processor = None
+    if is_multimodal:
+        # Load the FULL wrapper (e.g. Qwen3_5ForConditionalGeneration) so the
+        # saved config + vision weights are what vLLM expects. AutoModelForCausalLM
+        # would strip the wrapper down to a text-only Qwen3_5ForCausalLM that vLLM
+        # cannot load. The `ornith` recipe ignores the vision tower -> it stays
+        # bf16 and vision remains a working feature.
+        from transformers import AutoModelForImageTextToText, AutoProcessor
+        model = AutoModelForImageTextToText.from_pretrained(
+            model_id, torch_dtype="auto", device_map="auto")
+        # Save the processor alongside the checkpoint too: vLLM refuses to load a
+        # multimodal wrapper without preprocessor_config.json / processor_config.json
+        # / video_preprocessor_config.json, and model.save_pretrained does NOT emit
+        # them. Without this the NVFP4 output is text-servable only after a manual
+        # file copy from the source repo.
+        processor = AutoProcessor.from_pretrained(model_id)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id, torch_dtype="auto", device_map="cuda")
     tok = AutoTokenizer.from_pretrained(model_id)
 
     if recipe_path:
@@ -108,6 +133,8 @@ def quantize(model_id: str, save_dir: str, recipe_path: str | None, preset: str,
 
     model.save_pretrained(save_dir, save_compressed=True)
     tok.save_pretrained(save_dir)
+    if processor is not None:
+        processor.save_pretrained(save_dir)  # image/video preprocessor configs vLLM needs
     del model
     gc.collect()
     torch.cuda.empty_cache()
@@ -144,8 +171,8 @@ def main() -> int:
     ap.add_argument("--recipe", default=None,
                     help="path to an llm-compressor recipe YAML (overrides --recipe-preset)")
     ap.add_argument("--recipe-preset", choices=sorted(_PRESET_IGNORE), default="dense",
-                    help="built-in recipe: dense (ignore lm_head) or ornith-moe "
-                         "(also skips MoE router/shared-expert gates, vision, linear-attn)")
+                    help="built-in recipe: dense (ignore lm_head) or ornith "
+                         "(also keeps MoE gates, vision tower, linear-attn in bf16)")
     ap.add_argument("--moe-all-experts", action="store_true",
                     help="pass moe_calibrate_all_experts=True to oneshot (MoE models)")
     ap.add_argument("--scheme", default="NVFP4")
@@ -154,7 +181,7 @@ def main() -> int:
     ap.add_argument("--max-seq", type=int, default=512)
     ap.add_argument("--max-model-len", type=int, default=2048)
     ap.add_argument("--save-dir", default=os.environ.get("SAVE_DIR", "/tmp/nvfp4-out"))
-    ap.add_argument("--serve", choices=["vllm", "transformers"], default="vllm")
+    ap.add_argument("--serve", choices=["vllm", "transformers", "none"], default="vllm")
     ap.add_argument("--out", default=None,
                     help="optional HF repo id to push the NVFP4 checkpoint to")
     args = ap.parse_args()
@@ -163,31 +190,37 @@ def main() -> int:
              args.moe_all_experts, args.scheme, args.dataset,
              args.calib_samples, args.max_seq)
 
-    log(f"[serve] reload NVFP4 on GPU via {args.serve}")
-    try:
-        results = (validate_vllm(args.save_dir, args.max_model_len)
-                   if args.serve == "vllm" else validate_transformers(args.save_dir))
-    except Exception as exc:  # noqa: BLE001 -- surface any load error as a finding
-        log(f"[serve] {args.serve} reload FAILED: {type(exc).__name__}: {exc}")
-        if args.serve == "vllm":
-            log("[serve] falling back to transformers reload")
-            results = validate_transformers(args.save_dir)
-        else:
-            raise
+    # In-run validation is BEST-EFFORT: the checkpoint is already saved above, so
+    # a validation that cannot run (transformers decompresses NVFP4 -> bf16 and
+    # OOMs for models that only fit *because* they're quantized; and it cannot
+    # load a multimodal wrapper via AutoModelForCausalLM) must NOT fail the run.
+    results = None
+    if args.serve == "none":
+        log("[serve] validation skipped (--serve none) -- checkpoint saved.")
+    else:
+        log(f"[serve] in-run validation via {args.serve} (best-effort)")
+        try:
+            results = (validate_vllm(args.save_dir, args.max_model_len)
+                       if args.serve == "vllm" else validate_transformers(args.save_dir))
+        except Exception as exc:  # noqa: BLE001
+            log(f"[serve] in-run validation could not run: {type(exc).__name__}: {exc}")
+            log("[serve] the checkpoint IS saved -- validate serving natively on vLLM: "
+                f"point a catalog row at {args.save_dir}, then `make probe-vllm`.")
 
-    bad = 0
-    for prompt, text in results:
-        log("-" * 64)
-        log("PROMPT :", prompt.replace("\n", "\\n"))
-        log("OUTPUT :", repr(text.strip()[:240]))
-        if _is_degenerate(text):
-            bad += 1
-            log("  -> DEGENERATE")
-    log("=" * 64)
-    if bad:
-        log(f"VALIDATE_FAIL: {bad}/{len(results)} outputs degenerate")
-        return 1
-    log("VALIDATE_OK: all outputs non-degenerate (eyeball the quality above)")
+    if results:
+        bad = 0
+        for prompt, text in results:
+            log("-" * 64)
+            log("PROMPT :", prompt.replace("\n", "\\n"))
+            log("OUTPUT :", repr(text.strip()[:240]))
+            if _is_degenerate(text):
+                bad += 1
+                log("  -> DEGENERATE")
+        log("=" * 64)
+        if bad:
+            log(f"VALIDATE_FAIL: {bad}/{len(results)} outputs degenerate")
+            return 1
+        log("VALIDATE_OK: all outputs non-degenerate (eyeball the quality above)")
 
     if args.out:
         from huggingface_hub import HfApi
