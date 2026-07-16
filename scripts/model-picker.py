@@ -596,13 +596,19 @@ def _hf_format_label(model_dir: Path) -> str:
     """Short data-format label for an HF model on disk.
 
     Priority:
-      1. `quantization_config.quant_algo` / `quant_method` — most reliable
-         when populated.
-      2. Quantization token in the directory name (NVFP4, FP8, AWQ, …) —
+      1. `quantization_config.quant_algo` — ModelOpt checkpoints (NVIDIA
+         NVFP4/FP8) put the format here directly (e.g. "NVFP4").
+      2. `quantization_config.quant_method` — but `compressed-tensors`
+         (llm-compressor output) is the LIBRARY name, not a format: the
+         real format lives in `quantization_config.format` (e.g.
+         "nvfp4-pack-quantized"). Extract the quant token from there so
+         the column shows "NVFP4", not "COMPRESSED-TENSORS". Other methods
+         (awq/gptq/fp8) are themselves the short format.
+      3. Quantization token in the directory name (NVFP4, FP8, AWQ, …) —
          some NVIDIA NVFP4 checkpoints (e.g., Nemotron) ship without a
          `quantization_config` block; the convention is the token in
          the repo/dir name.
-      3. `torch_dtype` / `dtype` mapped to BF16 / FP16 / FP32 — the native
+      4. `torch_dtype` / `dtype` mapped to BF16 / FP16 / FP32 — the native
          precision when no quantization is applied.
     Returns "?" only when config.json is unreadable. Probe caches don't
     record this for vLLM/SGLang (schema-v2), so config.json + name are
@@ -614,7 +620,15 @@ def _hf_format_label(model_dir: Path) -> str:
     except (OSError, json.JSONDecodeError):
         return "?"
     qc = cfg.get("quantization_config") or {}
-    algo = qc.get("quant_algo") or qc.get("quant_method")
+    algo = qc.get("quant_algo")
+    if not algo:
+        method = str(qc.get("quant_method") or "").strip()
+        if method.lower() == "compressed-tensors":
+            # Library wrapper -- resolve the real format from `format`.
+            fmt = str(qc.get("format") or "").upper()
+            algo = next((t for t in _NAME_QUANT_TOKENS if t in fmt), None)
+        elif method:
+            algo = method
     if algo:
         return str(algo).upper()
     upper_name = model_dir.name.upper()
