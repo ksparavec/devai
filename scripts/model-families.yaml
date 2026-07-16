@@ -345,8 +345,9 @@ families:
 
   - name: ornith
     # Ornith-1.0 (deepreinforce-ai) -- an agentic-coding LLM family, RL
-    # self-improving, MIT licensed. GGUF-only on a 24G card (see MEASURED
-    # below); the 35B / 397B are out of scope for 24G.
+    # self-improving, MIT licensed. On a 24G card the 9B fits as GGUF (Ollama)
+    # or as an in-house NVFP4 safetensors quant on vLLM (see MEASURED below);
+    # the 35B / 397B are out of scope for 24G.
     #
     # The 9B is DENSE qwen3_5 arch (Qwen3_5ForConditionalGeneration; 32L,
     # 16 attn / 4 KV heads, head_dim 256, vocab 248320, native 256K ctx,
@@ -365,10 +366,18 @@ families:
     #     tier incl. 32K -- NOT catalogued. The fit-math estimate (~17.5 GiB
     #     weights + FP8 KV -> fits @32K) was optimistic: the vocab-248320
     #     embed + lm_head, the MTP nextn layer vLLM loads, and CUDA workspace
-    #     push the load past 24 GiB (GPU confirmed clear). Re-add an NVFP4/FP8
-    #     quant (with the qwen3/qwen3_xml parsers above) when published, or
-    #     try the nemotron-3-nano recovery-flag playbook (expandable_segments
-    #     + --enforce-eager) -- low value vs the near-lossless GGUF Q8.
+    #     push the load past 24 GiB (GPU confirmed clear).
+    #   9B NVFP4 safetensors (vLLM): the fix. Quantized IN-HOUSE from the bf16
+    #     source via `make quant-local` (scripts/quant/quant_smoke.py preset
+    #     ornith) -> ksparavec/Ornith-1.0-9B-NVFP4 (hf_repos below). Text linears
+    #     W4A4 NVFP4; lm_head / embeddings / MoE gates / linear-attn AND the
+    #     whole vision tower kept bf16 -- so vision stays a working feature and
+    #     the multimodal Qwen3_5ForConditionalGeneration wrapper is preserved
+    #     (vLLM has no text-only Qwen3_5ForCausalLM loader; a text-only quant
+    #     will not load). PROBED 2026-07-16 (probe-vllm) on the 24G card: the
+    #     FULL native 256K context fits at 20.61 GB (FlashInfer NVFP4 GEMM),
+    #     capability=structured (qwen3 <think> reasoning), tool parser qwen3_xml
+    #     verified, ~122s cold start. The ONLY safetensors path onto 24G.
     #
     # No `mtp:` block: the qwen3_5_mtp draft lm_head is vocab-sized, and this
     # vocab (248320) is ~1.6x the usual, so it would OOM at load on 24G (same
@@ -389,6 +398,20 @@ families:
           - Q6_K
           - Q8_0
           - bf16
+    hf_repos:
+      # In-house NVFP4 quant of the 9B (see the 9B NVFP4 MEASURED note above).
+      - ksparavec/Ornith-1.0-9B-NVFP4
+    parsers:
+      # Model card prescribes --reasoning-parser qwen3 --tool-call-parser
+      # qwen3_xml. SGLang loadability of the multimodal qwen3_5 wrapper is
+      # UNVERIFIED (only vLLM is proven); the sglang parser names stay inert
+      # until an SGLang probe produces a fit cell.
+      vllm:
+        reasoning: qwen3
+        tool: qwen3_xml
+      sglang:
+        reasoning: qwen3
+        tool: qwen
     arch_ref: deepreinforce-ai/Ornith-1.0-9B
     thinking: true
 

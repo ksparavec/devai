@@ -2,7 +2,7 @@
 #
 # Regenerate with: make catalog-regen
 # Source of truth:  scripts/model-families.yaml
-# Generated at:     2026-07-14T16:10:01+00:00
+# Generated at:     2026-07-16T14:04:45+00:00
 #
 # Every 'size' and 'arch' below was fetched live from the
 # upstream provider at generation time. Do not hand-edit.
@@ -13,7 +13,7 @@ models:
     backend: [vllm, sglang]
     repo: "google/gemma-4-e2b-it"
     source: hf
-    sha: "9dbdf8a839e4"
+    sha: "179516f0c449"
     size: "9.54 GB"
     arch: { layers: 35, kv_heads: 1, head_dim: 256, k_eq_v: false }
     arch_source: "google/gemma-4-e2b-it/config.json"
@@ -25,7 +25,7 @@ models:
     backend: [vllm, sglang]
     repo: "google/gemma-4-e4b-it"
     source: hf
-    sha: "a4c2d58be94d"
+    sha: "fa62d88df2e6"
     size: "14.89 GB"
     arch: { layers: 42, kv_heads: 2, head_dim: 256, k_eq_v: false }
     arch_source: "google/gemma-4-e4b-it/config.json"
@@ -37,7 +37,7 @@ models:
     backend: [vllm, sglang]
     repo: "google/gemma-4-26b-a4b-it"
     source: hf
-    sha: "5305c1e72ea2"
+    sha: "01e5b3ee840d"
     size: "48.07 GB"
     arch: { layers: 30, kv_heads: 8, head_dim: 256, k_eq_v: true }
     arch_source: "google/gemma-4-26b-a4b-it/config.json"
@@ -49,7 +49,7 @@ models:
     backend: [vllm, sglang]
     repo: "google/gemma-4-31b-it"
     source: hf
-    sha: "518276fb130d"
+    sha: "b9ea41a2887d"
     size: "58.25 GB"
     arch: { layers: 60, kv_heads: 16, head_dim: 256, k_eq_v: true }
     arch_source: "google/gemma-4-31b-it/config.json"
@@ -105,7 +105,7 @@ models:
     backend: [vllm, sglang]
     repo: "google/gemma-4-12B-it"
     source: hf
-    sha: "0e2b10585412"
+    sha: "12ace6d648d7"
     size: "22.28 GB"
     arch: { layers: 48, kv_heads: 8, head_dim: 256, k_eq_v: true }
     arch_source: "google/gemma-4-12B-it/config.json"
@@ -1263,6 +1263,25 @@ models:
         tool: qwen3_coder
       sglang:
         tool: qwen3_coder
+
+  - name: "Ornith-1.0-9B-NVFP4"
+    family: ornith
+    backend: [vllm, sglang]
+    repo: "ksparavec/Ornith-1.0-9B-NVFP4"
+    source: hf
+    sha: "e6b618246f78"
+    size: "10.43 GB"
+    arch: { layers: 32, kv_heads: 4, head_dim: 256, k_eq_v: false }
+    arch_source: "ksparavec/Ornith-1.0-9B-NVFP4/config.json"
+    purpose: "ornith · 10.4 GB · 32L/4kv/256h"
+    conversational: false
+    parsers:
+      vllm:
+        reasoning: qwen3
+        tool: qwen3_xml
+      sglang:
+        reasoning: qwen3
+        tool: qwen
 
   - name: "ornith:9b-q4_k_m"
     family: ornith
