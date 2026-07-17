@@ -29,6 +29,7 @@ Current snapshot (as of 2026-05-15):
 | [pi-coding-agent](./pi-coding-agent.md)                             | Draft       |
 | [kv-cache-quantization](./kv-cache-quantization.md)                 | Draft       |
 | [model-lifecycle-ledger](./model-lifecycle-ledger.md)               | In Progress |
+| [odysseus-borrowed-ideas](./odysseus-borrowed-ideas.md)             | Draft       |
 
 ## Dependency graph
 
