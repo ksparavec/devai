@@ -375,7 +375,7 @@ and downloaded). A pure-NVIDIA MTP pair will require either
 NVIDIA shipping a Nemotron-Nano MTP variant in a future release,
 or the project training its own EAGLE3 head against
 `Llama-3.1-Nemotron-Nano-8B-v1` or `Llama-3.1-8B-Instruct-NVFP4`
-(both already on disk per `ls /var/cache/devai/ollama/models/vllm/`).
+(both already on disk per `ls /var/cache/devai/vllm/`).
 
 ### 5.7 Summary table -- what runs on 24 GB
 
@@ -733,8 +733,8 @@ this project:
 
 ```
     # 1. Make sure drafter is on disk next to the target
-    ls /var/cache/devai/ollama/models/vllm/Gemma-4-26B-A4B-NVFP4
-    ls /var/cache/devai/ollama/models/vllm/gemma-4-26B-A4B-it-assistant
+    ls /var/cache/devai/vllm/Gemma-4-26B-A4B-NVFP4
+    ls /var/cache/devai/vllm/gemma-4-26B-A4B-it-assistant
 
     # 2. Add an entry to deploy/recovery-flags.json:
     #    {

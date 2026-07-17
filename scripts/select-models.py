@@ -59,7 +59,7 @@ OLLAMA_MANIFESTS = Path(
 )
 VLLM_MODELS = Path(
     os.environ.get("VLLM_MODELS_DIR",
-                   "/var/cache/devai/ollama/models/vllm")
+                   "/var/cache/devai/vllm")
 )
 OLLAMA_CONTAINER = os.environ.get("OLLAMA_CONTAINER", "devai-ollama")
 CONTAINER_RUNTIME = os.environ.get("CONTAINER_RUNTIME", "podman")

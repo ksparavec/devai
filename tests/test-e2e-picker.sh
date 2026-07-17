@@ -82,7 +82,7 @@ info "  host vram:         ${HOST_VRAM_GB}G"
 picked_row=$(
     cd "$REPO_ROOT" && \
     VRAM="$HOST_VRAM_GB" \
-    VLLM_MODELS_DIR="${VLLM_MODELS_DIR:-/var/cache/devai/ollama/models/vllm}" \
+    VLLM_MODELS_DIR="${VLLM_MODELS_DIR:-/var/cache/devai/vllm}" \
     OLLAMA_MANIFESTS_DIR="${OLLAMA_MANIFESTS_DIR:-/var/cache/devai/ollama/models/manifests/registry.ollama.ai/library}" \
     python3 - <<'PY'
 import sys, importlib.util

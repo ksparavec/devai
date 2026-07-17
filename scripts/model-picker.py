@@ -76,7 +76,7 @@ _BENCH_CACHE_PATHS = [
 ]
 
 _ROUTER = os.environ.get("DEVAI_ROUTER_HOST", "devai-router")
-_VLLM_DIR = os.environ.get("VLLM_MODELS_DIR", "/var/cache/devai/ollama/models/vllm")
+_VLLM_DIR = os.environ.get("VLLM_MODELS_DIR", "/var/cache/devai/vllm")
 _OLLAMA_MANIFESTS = os.environ.get(
     "OLLAMA_MANIFESTS_DIR",
     "/var/cache/devai/ollama/models/manifests/registry.ollama.ai/library",

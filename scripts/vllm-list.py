@@ -4,7 +4,7 @@ import os
 import yaml
 
 config_path = os.environ.get('INFERENCE_CONFIG', 'deploy/models.yaml')
-models_dir = os.environ.get('VLLM_MODELS_DIR', '/var/cache/devai/ollama/models/vllm')
+models_dir = os.environ.get('VLLM_MODELS_DIR', '/var/cache/devai/vllm')
 
 cfg = yaml.safe_load(open(config_path))
 models = [m for m in cfg.get('models', []) if 'vllm' in m.get('backend', [])]

@@ -81,7 +81,7 @@ from _model_status import (  # noqa: E402
 
 DEFAULT_CATALOG = REPO_ROOT / "deploy" / "models.yaml"
 DEFAULT_MODELS_DIR = os.environ.get(
-    "VLLM_MODELS_DIR", "/var/cache/devai/ollama/models/vllm"
+    "VLLM_MODELS_DIR", "/var/cache/devai/vllm"
 )
 DEFAULT_PROMPT = (
     "Solve this step by step. Show your reasoning, then state the final number. "

@@ -52,7 +52,12 @@ export VLLM_IMAGE
 CACHE_COMPOSE = $(CURDIR)/deploy/docker-compose.yaml
 INFERENCE_CONFIG = deploy/models.yaml
 HF_CLI = hf
-VLLM_MODELS_DIR = $(CACHE_DIR)/ollama/models/vllm
+# vLLM and SGLang safetensors live on their OWN external volumes
+# (/dev/mapper/vgais-cache_vllm, -cache_sglang), NOT under the Ollama tree.
+# Keeping them out of ollama/ is deliberate: an Ollama cache cleanup must
+# never be able to reach non-Ollama weights (see the ollama-clean note).
+VLLM_MODELS_DIR = $(CACHE_DIR)/vllm
+SGLANG_MODELS_DIR = $(CACHE_DIR)/sglang
 # Absolute host path to scripts/vllm_plugins. The router (running in
 # its own container) bind-mounts this into the recreated vLLM
 # container so models that resolve to a custom tool/reasoning parser
@@ -131,7 +136,15 @@ RUN_FLAGS =
 
 # Read-only mount of the model cache so the in-container picker can do
 # disk-based "is downloaded?" detection (ollama manifests + vllm/sglang dirs).
-MODEL_CACHE_MOUNT = $(if $(wildcard $(CACHE_DIR)/ollama),-v $(CACHE_DIR)/ollama:/var/cache/devai/ollama:ro)
+# vLLM/SGLang weights are on their OWN volumes now (see the mount-point
+# convention in CLAUDE.md), no longer under ollama/, so each must be mounted
+# in separately. The -e VLLM_MODELS_DIR/SGLANG_MODELS_DIR point the picker at
+# the new container paths so even a not-yet-rebuilt image (whose baked default
+# is the old ollama/models/vllm path) resolves them.
+MODEL_CACHE_MOUNT = $(if $(wildcard $(CACHE_DIR)/ollama),-v $(CACHE_DIR)/ollama:/var/cache/devai/ollama:ro) \
+	$(if $(wildcard $(VLLM_MODELS_DIR)),-v $(VLLM_MODELS_DIR):/var/cache/devai/vllm:ro) \
+	$(if $(wildcard $(SGLANG_MODELS_DIR)),-v $(SGLANG_MODELS_DIR):/var/cache/devai/sglang:ro) \
+	-e VLLM_MODELS_DIR=/var/cache/devai/vllm -e SGLANG_MODELS_DIR=/var/cache/devai/sglang
 
 # Read-only mount of the probe caches so the in-container picker can
 # render the per-tier menu for every backend and the router can build
@@ -1084,8 +1097,14 @@ ollama-clean: ## Remove partial downloads and orphaned blobs from Ollama cache
 			rm -v "$$b"; \
 		fi; \
 	done
-	@echo "Removing orphaned gguf/vllm caches..."
-	@for dir in $(CACHE_DIR)/ollama/models/gguf/* $(CACHE_DIR)/ollama/models/vllm/*; do \
+	@# GGUF staging dirs only. Do NOT add vllm/sglang here: those weights
+	@# now live on their own volumes ($(VLLM_MODELS_DIR), $(SGLANG_MODELS_DIR)),
+	@# outside the ollama tree. This loop keys "orphaned" off the Ollama
+	@# manifests, so including a non-Ollama dir would delete every HF model
+	@# whose name isn't an Ollama tag -- the exact bug that once wiped the
+	@# entire vLLM store. Keep this scoped to ollama's own gguf/ staging.
+	@echo "Removing orphaned gguf caches..."
+	@for dir in $(CACHE_DIR)/ollama/models/gguf/*; do \
 		[ -d "$$dir" ] || continue; \
 		model=$$(basename "$$dir"); \
 		if ! find $(CACHE_DIR)/ollama/models/manifests/ -path "*$$model*" -print -quit 2>/dev/null | grep -q .; then \
@@ -1101,7 +1120,8 @@ ollama-df: ## Show Ollama cache disk usage breakdown
 	@echo "=== Breakdown ==="
 	@du -sh $(CACHE_DIR)/ollama/models/blobs/ 2>/dev/null || true
 	@du -sh $(CACHE_DIR)/ollama/models/gguf/ 2>/dev/null || true
-	@du -sh $(CACHE_DIR)/ollama/models/vllm/ 2>/dev/null || true
+	@du -sh $(VLLM_MODELS_DIR)/ 2>/dev/null || true
+	@du -sh $(SGLANG_MODELS_DIR)/ 2>/dev/null || true
 	@echo ""
 	@partials=$$(ls $(CACHE_DIR)/ollama/models/blobs/*-partial 2>/dev/null | wc -l); \
 	if [ "$$partials" -gt 0 ]; then \
@@ -1189,6 +1209,7 @@ probe-vllm: ## Probe every downloaded vLLM/HF model per (VRAM, CONTEXT) cell.
 	@#   PROBE_FORCE_ARCH=1          re-probe top-level capability/arch
 	python3 scripts/probe-vllm-reasoning.py \
 	    --host-vram-gb $(GPU_MEMORY_GB) \
+	    --models-dir $(VLLM_MODELS_DIR) \
 	    $(if $(PROBE_VRAMS_VLLM),--vram $(PROBE_VRAMS_VLLM),) \
 	    $(if $(PROBE_CONTEXTS),--ctx $(PROBE_CONTEXTS),) \
 	    $(if $(PROBE_REPO),--repo $(PROBE_REPO),) \
@@ -1205,6 +1226,7 @@ probe-sglang: ## Probe every downloaded SGLang/HF model per (VRAM, CONTEXT) cell
 	@#   PROBE_FORCE_ARCH=1          re-probe top-level capability/arch
 	python3 scripts/probe-sglang-reasoning.py \
 	    --host-vram-gb $(GPU_MEMORY_GB) \
+	    --models-dir $(SGLANG_MODELS_DIR) \
 	    $(if $(PROBE_VRAMS_SGLANG),--vram $(PROBE_VRAMS_SGLANG),) \
 	    $(if $(PROBE_CONTEXTS),--ctx $(PROBE_CONTEXTS),) \
 	    $(if $(PROBE_REPO),--repo $(PROBE_REPO),) \
@@ -1222,6 +1244,7 @@ probe-load-vllm: ## Serving-time LOAD probe for vLLM: augment fit cache with ser
 	@#   PROBE_NEEDLE_DEPTH=0.5      needle insertion depth (0.0 top, 1.0 bottom)
 	python3 scripts/probe-vllm-reasoning.py --load \
 	    --host-vram-gb $(GPU_MEMORY_GB) \
+	    --models-dir $(VLLM_MODELS_DIR) \
 	    $(if $(PROBE_CONTEXTS),--ctx $(PROBE_CONTEXTS),) \
 	    $(if $(PROBE_REPO),--repo $(PROBE_REPO),) \
 	    $(if $(PROBE_FORCE),--force,) \
@@ -1232,6 +1255,7 @@ probe-load-sglang: ## Serving-time LOAD probe for SGLang: same as probe-load-vll
 	@# first. Same precondition + knobs as probe-load-vllm.
 	python3 scripts/probe-sglang-reasoning.py --load \
 	    --host-vram-gb $(GPU_MEMORY_GB) \
+	    --models-dir $(SGLANG_MODELS_DIR) \
 	    $(if $(PROBE_CONTEXTS),--ctx $(PROBE_CONTEXTS),) \
 	    $(if $(PROBE_REPO),--repo $(PROBE_REPO),) \
 	    $(if $(PROBE_FORCE),--force,) \
