@@ -112,6 +112,10 @@ from _probe_core import (  # noqa: E402  — local import after sys.path fix
 DEFAULT_CACHE = REPO_ROOT / "deploy" / ".ollama-reasoning-cache.json"
 DEFAULT_PROMPT = "Answer with only the final number: What is 17 + 25?"
 SCHEMA_VERSION = 3
+# Ollama's num_gpu = number of layers to force onto the GPU. A value far
+# above any model's layer count means "all layers on GPU, or fail". Mirrors
+# the router's serve-time warm-load so probe fit == serve fit (no CPU spill).
+PROBE_NUM_GPU_FORCE_FULL = 999
 
 
 # ── Live model lookups (/api/tags, /api/show, /api/ps) ───────────────────────
@@ -248,6 +252,13 @@ def chat_probe(
             "temperature": 0,
             "num_predict": num_predict,
             "num_ctx": num_ctx,
+            # Force full-GPU offload so the probe measures exactly what the
+            # router serves: ensureOllamaRunning warm-loads with num_gpu=999
+            # (no CPU spill). A ctx that only "fits" via CPU offload then
+            # fails fast here (OOM -> Capability.ERROR -> not-fitting) instead
+            # of loading slowly off system RAM and being misjudged. The
+            # fully_on_gpu=size_vram>=size check stays as belt-and-suspenders.
+            "num_gpu": PROBE_NUM_GPU_FORCE_FULL,
         },
     }
     try:
