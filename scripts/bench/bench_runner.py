@@ -431,6 +431,7 @@ def run_for_target(
     n_gsm8k: int,
     n_humaneval: int,
     n_tools: int,
+    n_mmlu_pro: int,
     n_leak_prompts: int,
     n_longctx_fraction: float,
     n_longctx_max_tokens: int,
@@ -534,6 +535,52 @@ def run_for_target(
             except Exception as e:  # noqa: BLE001
                 print(f"    !! humaneval failed: {e}", file=sys.stderr)
                 task_results["humaneval_error"] = {"error": str(e), "ran_at": _now_iso()}
+
+        if "humaneval_plus" in tasks and (force or "humaneval_plus" not in [_strip_subset(t) for t in existing_tasks]):
+            from bench.tasks.humaneval_plus import humaneval_plus_task
+            print(f"  [humaneval+] running n={n_humaneval} ...", file=sys.stderr)
+            try:
+                eval_log = _invoke_inspect_task(
+                    task_obj=humaneval_plus_task(n=n_humaneval),
+                    served_model=served,
+                    router_url=router_url,
+                    log_dir=log_dir,
+                    timeout_s=900.0,
+                )
+                score, n = _aggregate_score(eval_log)
+                task_results[f"humaneval_plus_subset_{n}"] = {
+                    "pass@1": round(score, 4),
+                    "n": n,
+                    "ran_at": _now_iso(),
+                    "inspect_log_dir": str(log_dir),
+                }
+                print(f"    pass@1: {score:.4f} (n={n})", file=sys.stderr)
+            except Exception as e:  # noqa: BLE001
+                print(f"    !! humaneval_plus failed: {e}", file=sys.stderr)
+                task_results["humaneval_plus_error"] = {"error": str(e), "ran_at": _now_iso()}
+
+        if "mmlu_pro" in tasks and (force or "mmlu_pro" not in [_strip_subset(t) for t in existing_tasks]):
+            from bench.tasks.mmlu_pro import mmlu_pro_task
+            print(f"  [mmlu_pro] running n={n_mmlu_pro} ...", file=sys.stderr)
+            try:
+                eval_log = _invoke_inspect_task(
+                    task_obj=mmlu_pro_task(n=n_mmlu_pro),
+                    served_model=served,
+                    router_url=router_url,
+                    log_dir=log_dir,
+                    timeout_s=900.0,
+                )
+                score, n = _aggregate_score(eval_log)
+                task_results[f"mmlu_pro_subset_{n}"] = {
+                    "score": round(score, 4),
+                    "n": n,
+                    "ran_at": _now_iso(),
+                    "inspect_log_dir": str(log_dir),
+                }
+                print(f"    score: {score:.4f} (n={n})", file=sys.stderr)
+            except Exception as e:  # noqa: BLE001
+                print(f"    !! mmlu_pro failed: {e}", file=sys.stderr)
+                task_results["mmlu_pro_error"] = {"error": str(e), "ran_at": _now_iso()}
 
         if "tools" in tasks and (force or "tools" not in [_strip_subset(t) for t in existing_tasks]):
             from bench.tasks.tools_use import tools_use_task
@@ -690,8 +737,14 @@ def _strip_subset(task_name: str) -> str:
     """
     if task_name.startswith("gsm8k_"):
         return "gsm8k"
+    # humaneval_plus MUST be checked before humaneval -- both share the
+    # "humaneval" prefix and a naive check would mis-bucket the plus rows.
+    if task_name.startswith("humaneval_plus_"):
+        return "humaneval_plus"
     if task_name.startswith("humaneval_"):
         return "humaneval"
+    if task_name.startswith("mmlu_pro_"):
+        return "mmlu_pro"
     if task_name.startswith("tools_use"):
         return "tools"
     if task_name == "leak_probe":
@@ -739,6 +792,7 @@ def main() -> None:
     ap.add_argument("--n-gsm8k", type=int, default=int(os.environ.get("BENCH_N_GSM8K", "100")))
     ap.add_argument("--n-humaneval", type=int, default=int(os.environ.get("BENCH_N_HUMANEVAL", "50")))
     ap.add_argument("--n-tools", type=int, default=int(os.environ.get("BENCH_N_TOOLS", "20")))
+    ap.add_argument("--n-mmlu-pro", type=int, default=int(os.environ.get("BENCH_N_MMLU_PRO", "100")))
     ap.add_argument("--n-leak-prompts", type=int,
                     default=int(os.environ.get("BENCH_N_LEAK_PROMPTS", "40")))
     ap.add_argument(
@@ -769,7 +823,8 @@ def main() -> None:
     args = ap.parse_args()
 
     tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
-    invalid = [t for t in tasks if t not in {"gsm8k", "humaneval", "tools", "leak", "longctx"}]
+    invalid = [t for t in tasks if t not in {
+        "gsm8k", "humaneval", "humaneval_plus", "mmlu_pro", "tools", "leak", "longctx"}]
     if invalid:
         sys.exit(f"unknown task(s): {invalid}")
 
@@ -834,6 +889,7 @@ def main() -> None:
             n_gsm8k=args.n_gsm8k,
             n_humaneval=args.n_humaneval,
             n_tools=args.n_tools,
+            n_mmlu_pro=args.n_mmlu_pro,
             n_leak_prompts=args.n_leak_prompts,
             n_longctx_fraction=args.n_longctx_fraction,
             n_longctx_max_tokens=args.n_longctx_max_tokens,
