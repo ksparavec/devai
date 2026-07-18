@@ -304,6 +304,7 @@ def update_row(
     task_results: dict[str, dict] | None = None,
     metrics: dict | None = None,
     host_env_id: str | None = None,
+    drop_recommendation: dict | None = None,
 ) -> dict:
     """Merge a single bench result into the cache.
 
@@ -358,6 +359,12 @@ def update_row(
         row["metrics"].update(metrics)
     if host_env_id is not None:
         row["host_env_id"] = host_env_id
+    # Early-drop recommendation (leak / low-score disqualifier). A flag only --
+    # readers/operators act on it; it never deletes weights. A force re-bench
+    # clears any stale flag via reset_row_for_force before this runs, so a
+    # now-passing model doesn't retain an old recommendation.
+    if drop_recommendation is not None:
+        row["drop_recommendation"] = drop_recommendation
     row["last_benched_at"] = now
     cache[key] = row
     return row
@@ -378,6 +385,9 @@ def reset_row_for_force(cache: dict, key: str) -> None:
         return
     row["tasks"] = {}
     row["metrics"] = {}
+    # Drop the early-drop recommendation too: a force re-bench re-derives it
+    # from scratch, so a now-passing model must not keep a stale flag.
+    row.pop("drop_recommendation", None)
 
 
 # ── Host environment capture ────────────────────────────────────────────────

@@ -422,6 +422,49 @@ def _by_subcase_breakdown(eval_log) -> dict[str, float]:
 
 # --- Main loop ---
 
+# Metrics that gate an early drop. Tools is intentionally excluded: it is a
+# saturated 20-sample microbench and a low/zero score there usually reflects a
+# parser-curation gap (a missing tool-call parser), not model quality.
+_DROP_SCORE_METRICS = (
+    ("gsm8k_subset_", "score", "gsm8k"),
+    ("humaneval_subset_", "pass@1", "humaneval"),
+)
+
+
+def _evaluate_drop_trigger(task_results: dict, threshold: float) -> dict | None:
+    """Return a drop-recommendation dict when the results so far disqualify
+    the model, else None.
+
+    Triggers: any leak (leak_rate > 0), or gsm8k / humaneval below
+    ``threshold``. Safe to call incrementally after each task -- it only
+    inspects the metrics currently present in ``task_results``.
+    """
+    leak = task_results.get("leak_probe")
+    if leak is not None:
+        rate = leak.get("leak_rate") or 0
+        if rate > 0:
+            return {
+                "reason": "leak",
+                "metric": "leak_rate",
+                "value": rate,
+                "threshold": 0,
+                "detail": f"leak_rate={rate} > 0",
+            }
+    for prefix, field, label in _DROP_SCORE_METRICS:
+        for tname, tresult in task_results.items():
+            if tname.startswith(prefix) and isinstance(tresult, dict) and field in tresult:
+                val = tresult[field]
+                if isinstance(val, (int, float)) and val < threshold:
+                    return {
+                        "reason": "low_score",
+                        "metric": label,
+                        "value": val,
+                        "threshold": threshold,
+                        "detail": f"{label}={val} < {threshold}",
+                    }
+    return None
+
+
 def run_for_target(
     target: dict,
     *,
@@ -441,6 +484,8 @@ def run_for_target(
     cache_path: Path,
     force: bool,
     host_env_id: str | None = None,
+    drop_threshold: float = 0.70,
+    early_drop: bool = True,
 ) -> None:
     """Run all requested tasks against one model and persist results."""
     served = serving_alias_with_ctx(target["alias"], target["ctx"], backend)
@@ -461,6 +506,25 @@ def run_for_target(
     sampler.start()
     started = time.time()
     task_results: dict[str, dict] = {}
+    # Early-drop: once a disqualifier trips (leak, or gsm8k/humaneval below
+    # drop_threshold), skip this model's remaining tasks and flag it for drop.
+    # The flag is recorded on the row; it never deletes weights or edits the
+    # exclusion ledger -- that stays an explicit operator action.
+    drop_flag: dict | None = None
+
+    def _check_drop() -> None:
+        nonlocal drop_flag
+        if not early_drop or drop_flag is not None:
+            return
+        flag = _evaluate_drop_trigger(task_results, drop_threshold)
+        if flag:
+            flag["ran_at"] = _now_iso()
+            drop_flag = flag
+            print(
+                f"  !! DROP-FLAG: {flag['detail']} -- skipping remaining "
+                f"tasks for {target['alias']}",
+                file=sys.stderr,
+            )
 
     try:
         if "leak" in tasks and (force or "leak_probe" not in existing_tasks):
@@ -486,8 +550,9 @@ def run_for_target(
                 _print_latency_summary(latency)
             except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
                 print(f"    !! leak/latency failed: {e}", file=sys.stderr)
+        _check_drop()
 
-        if "gsm8k" in tasks and (force or "gsm8k" not in [_strip_subset(t) for t in existing_tasks]):
+        if drop_flag is None and "gsm8k" in tasks and (force or "gsm8k" not in [_strip_subset(t) for t in existing_tasks]):
             from bench.tasks.gsm8k import gsm8k_task
             print(f"  [gsm8k]   running n={n_gsm8k} ...", file=sys.stderr)
             try:
@@ -513,8 +578,9 @@ def run_for_target(
                 # latter silently re-runs the same broken combo or omits
                 # the row from the leaderboard.
                 task_results["gsm8k_error"] = {"error": str(e), "ran_at": _now_iso()}
+        _check_drop()
 
-        if "humaneval" in tasks and (force or "humaneval" not in [_strip_subset(t) for t in existing_tasks]):
+        if drop_flag is None and "humaneval" in tasks and (force or "humaneval" not in [_strip_subset(t) for t in existing_tasks]):
             from bench.tasks.humaneval import humaneval_task
             print(f"  [humaneval] running n={n_humaneval} ...", file=sys.stderr)
             try:
@@ -536,8 +602,9 @@ def run_for_target(
             except Exception as e:  # noqa: BLE001
                 print(f"    !! humaneval failed: {e}", file=sys.stderr)
                 task_results["humaneval_error"] = {"error": str(e), "ran_at": _now_iso()}
+        _check_drop()
 
-        if "humaneval_plus" in tasks and (force or "humaneval_plus" not in [_strip_subset(t) for t in existing_tasks]):
+        if drop_flag is None and "humaneval_plus" in tasks and (force or "humaneval_plus" not in [_strip_subset(t) for t in existing_tasks]):
             from bench.tasks.humaneval_plus import humaneval_plus_task
             print(f"  [humaneval+] running n={n_humaneval} ...", file=sys.stderr)
             try:
@@ -560,7 +627,7 @@ def run_for_target(
                 print(f"    !! humaneval_plus failed: {e}", file=sys.stderr)
                 task_results["humaneval_plus_error"] = {"error": str(e), "ran_at": _now_iso()}
 
-        if "mmlu_pro" in tasks and (force or "mmlu_pro" not in [_strip_subset(t) for t in existing_tasks]):
+        if drop_flag is None and "mmlu_pro" in tasks and (force or "mmlu_pro" not in [_strip_subset(t) for t in existing_tasks]):
             from bench.tasks.mmlu_pro import mmlu_pro_task
             print(f"  [mmlu_pro] running n={n_mmlu_pro} ...", file=sys.stderr)
             try:
@@ -583,7 +650,7 @@ def run_for_target(
                 print(f"    !! mmlu_pro failed: {e}", file=sys.stderr)
                 task_results["mmlu_pro_error"] = {"error": str(e), "ran_at": _now_iso()}
 
-        if "gpqa" in tasks and (force or "gpqa" not in [_strip_subset(t) for t in existing_tasks]):
+        if drop_flag is None and "gpqa" in tasks and (force or "gpqa" not in [_strip_subset(t) for t in existing_tasks]):
             from bench.tasks.gpqa import gpqa_task
             print(f"  [gpqa]    running n={n_gpqa} ...", file=sys.stderr)
             try:
@@ -606,7 +673,7 @@ def run_for_target(
                 print(f"    !! gpqa failed: {e}", file=sys.stderr)
                 task_results["gpqa_error"] = {"error": str(e), "ran_at": _now_iso()}
 
-        if "tools" in tasks and (force or "tools" not in [_strip_subset(t) for t in existing_tasks]):
+        if drop_flag is None and "tools" in tasks and (force or "tools" not in [_strip_subset(t) for t in existing_tasks]):
             from bench.tasks.tools_use import tools_use_task
             print(f"  [tools]   running n={n_tools} ...", file=sys.stderr)
             try:
@@ -639,7 +706,7 @@ def run_for_target(
                 print(f"    !! tools_use failed: {e}", file=sys.stderr)
                 task_results["tools_use_error"] = {"error": str(e), "ran_at": _now_iso()}
 
-        if "longctx" in tasks and (force or "longctx_probe" not in existing_tasks):
+        if drop_flag is None and "longctx" in tasks and (force or "longctx_probe" not in existing_tasks):
             from bench import bench_longctx
             print(
                 f"  [longctx] one prompt at {n_longctx_fraction:g}x ctx="
@@ -710,6 +777,7 @@ def run_for_target(
         task_results=task_results,
         metrics=metrics,
         host_env_id=host_env_id,
+        drop_recommendation=drop_flag,
     )
     save_cache(cache_path, cache)
 
@@ -820,6 +888,18 @@ def main() -> None:
     ap.add_argument("--n-tools", type=int, default=int(os.environ.get("BENCH_N_TOOLS", "20")))
     ap.add_argument("--n-mmlu-pro", type=int, default=int(os.environ.get("BENCH_N_MMLU_PRO", "100")))
     ap.add_argument("--n-gpqa", type=int, default=int(os.environ.get("BENCH_N_GPQA", "100")))
+    ap.add_argument(
+        "--drop-threshold", type=float,
+        default=float(os.environ.get("BENCH_DROP_THRESHOLD", "0.70")),
+        help="early-drop floor: a model scoring below this on gsm8k or "
+             "humaneval (or with any leak) skips its remaining tasks and is "
+             "flagged for drop. Tools is excluded. Default 0.70.",
+    )
+    ap.add_argument(
+        "--no-early-drop", action="store_true",
+        help="disable early-drop -- run every task even when a model trips a "
+             "disqualifier (still records scores, no drop flag).",
+    )
     ap.add_argument("--n-leak-prompts", type=int,
                     default=int(os.environ.get("BENCH_N_LEAK_PROMPTS", "40")))
     ap.add_argument(
@@ -918,6 +998,8 @@ def main() -> None:
             n_tools=args.n_tools,
             n_mmlu_pro=args.n_mmlu_pro,
             n_gpqa=args.n_gpqa,
+            drop_threshold=args.drop_threshold,
+            early_drop=not args.no_early_drop,
             n_leak_prompts=args.n_leak_prompts,
             n_longctx_fraction=args.n_longctx_fraction,
             n_longctx_max_tokens=args.n_longctx_max_tokens,
