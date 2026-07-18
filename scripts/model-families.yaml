@@ -140,6 +140,18 @@ families:
       - repo: google/gemma-4-26B-A4B-it-qat-q4_0-gguf
         tag_prefix: 26b-a4b
         include: []   # TODO: quant allowlist e.g. UD-Q3_K_XL ([] emits nothing)
+    parsers:
+      # Gemma-4 emits the `gemma4` tool-call format -- verified on the
+      # sibling diffusiongemma family (same 26B-A4B MoE backbone, probe
+      # recorded tool_parser=gemma4 verified=true). Without this block the
+      # probe never attempts a tool parser, so the router strips
+      # tools/tool_choice and the model scored 0 on the tools bench despite
+      # tool-calling fine (its Ollama GGUF twin scored tools=1.00). vLLM
+      # only: Gemma-4 NVFP4 does not serve on SGLang (arch/quant gap).
+      # Reasoning deliberately omitted -- the -it instruct variants probe as
+      # capability=none (non-reasoning); revisit if a thinking variant lands.
+      vllm:
+        tool: gemma4
     arch_ref: google/gemma-4-26b-a4b-it
     thinking: true        # hint; runtime probe shows e2b/e4b are unsupported
 
