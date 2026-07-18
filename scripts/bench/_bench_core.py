@@ -684,9 +684,15 @@ def serving_alias(entry: dict) -> str | None:
 def serving_alias_with_ctx(alias: str, ctx: int, backend: str) -> str:
     """Build the picker-style ``<name>@<ctx>`` suffix for HF backends.
 
-    Ollama doesn't honour the suffix on the OpenAI-compat path, so it
-    sends the bare alias. HF backends need the suffix so the router
-    recreates with the right ``--max-model-len``.
+    Ollama takes the bare alias: the ``@<ctx>`` suffix is not a valid
+    Ollama tag, and Ollama ignores ``options.num_ctx`` on the OpenAI-compat
+    path the bench uses. The router instead recreates the Ollama container
+    per model with ``OLLAMA_CONTEXT_LENGTH`` baked from the probe-verified
+    ctx (see ensureOllamaRunning in gpu-arbiter), so the bare alias is
+    served at exactly the probed context this bench row records -- the same
+    single fits=true cell discover_models selects. HF backends need the
+    suffix so the router bakes the matching ``--max-model-len`` /
+    ``--context-length`` at recreate time.
     """
     if backend == "ollama" or ctx <= 0:
         return alias
