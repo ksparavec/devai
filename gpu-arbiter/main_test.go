@@ -1041,6 +1041,75 @@ func TestVLLMEntrypoint_EmitsBothParserFlags(t *testing.T) {
 	}
 }
 
+func TestOllamaEntrypoint_ServeRegardlessOfModel(t *testing.T) {
+	args := ollamaEntrypoint("qwen3.6:27b-q4_K_M", launchConfig{MaxContext: 65536})
+	if len(args) != 2 || args[0] != "/bin/ollama" || args[1] != "serve" {
+		t.Fatalf("ollamaEntrypoint = %v, want [/bin/ollama serve]", args)
+	}
+}
+
+func TestBuildContainerSpec_OllamaBakesContextAndRWMount(t *testing.T) {
+	cfg := backendConfig{
+		Name:          "ollama",
+		ContainerName: "devai-ollama",
+		Image:         "docker.io/ollama/ollama:latest",
+		ModelsDir:     "/var/cache/devai/ollama",
+		MountDest:     "/root/.ollama",
+		MountRW:       true,
+		Network:       "devai-net",
+		Entrypoint:    ollamaEntrypoint,
+		EnvVars:       map[string]string{"OLLAMA_MAX_LOADED_MODELS": "1"},
+		DynamicEnv: func(lc launchConfig) map[string]string {
+			return map[string]string{"OLLAMA_CONTEXT_LENGTH": fmt.Sprintf("%d", lc.MaxContext)}
+		},
+	}
+	spec := buildContainerSpec(cfg, "qwen3.6:27b-q4_K_M", launchConfig{MaxContext: 65536}, nil, nil)
+
+	mounts, ok := spec["mounts"].([]map[string]any)
+	if !ok || len(mounts) == 0 {
+		t.Fatalf("spec mounts missing/wrong type: %#v", spec["mounts"])
+	}
+	if mounts[0]["destination"] != "/root/.ollama" {
+		t.Errorf("mount destination = %v, want /root/.ollama", mounts[0]["destination"])
+	}
+	if opts, _ := mounts[0]["options"].([]string); len(opts) != 1 || opts[0] != "rw" {
+		t.Errorf("mount options = %v, want [rw]", mounts[0]["options"])
+	}
+
+	envMap, ok := spec["env"].(map[string]string)
+	if !ok {
+		t.Fatalf("spec env missing/wrong type: %#v", spec["env"])
+	}
+	if envMap["OLLAMA_CONTEXT_LENGTH"] != "65536" {
+		t.Errorf("OLLAMA_CONTEXT_LENGTH = %q, want 65536", envMap["OLLAMA_CONTEXT_LENGTH"])
+	}
+	if envMap["OLLAMA_MAX_LOADED_MODELS"] != "1" {
+		t.Errorf("static env dropped: %v", envMap)
+	}
+
+	if ep, _ := spec["entrypoint"].([]string); len(ep) != 2 || ep[0] != "/bin/ollama" || ep[1] != "serve" {
+		t.Errorf("entrypoint = %v, want [/bin/ollama serve]", spec["entrypoint"])
+	}
+}
+
+func TestBuildContainerSpec_DefaultMountIsModelsReadOnly(t *testing.T) {
+	cfg := backendConfig{
+		Name:          "vllm",
+		ContainerName: "devai-vllm",
+		Image:         "img",
+		ModelsDir:     "/var/cache/devai/vllm",
+		Entrypoint:    func(string, launchConfig) []string { return []string{"x"} },
+	}
+	spec := buildContainerSpec(cfg, "m", launchConfig{MaxContext: 32768}, nil, nil)
+	mounts := spec["mounts"].([]map[string]any)
+	if mounts[0]["destination"] != "/models" {
+		t.Errorf("default mount destination = %v, want /models", mounts[0]["destination"])
+	}
+	if opts, _ := mounts[0]["options"].([]string); len(opts) != 1 || opts[0] != "ro" {
+		t.Errorf("default mount options = %v, want [ro]", mounts[0]["options"])
+	}
+}
+
 func TestSGLangEntrypoint_OmitsParserFlagsWhenEmpty(t *testing.T) {
 	args := sglangEntrypoint("Qwen3.5-9B-NVFP4", launchConfig{
 		MemFraction: 0.85, MaxContext: 32768,

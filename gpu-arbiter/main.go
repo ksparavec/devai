@@ -103,6 +103,15 @@ type backendConfig struct {
 	HealthPath    string
 	Entrypoint    func(modelName string, lc launchConfig) []string
 	EnvVars       map[string]string
+	// MountDest is the in-container path for the ModelsDir bind mount.
+	// Empty defaults to "/models" (vLLM/SGLang). Ollama uses
+	// "/root/.ollama" and needs it read-write (MountRW).
+	MountDest string
+	MountRW   bool
+	// DynamicEnv contributes per-recreate env vars computed from the
+	// launch config (e.g. Ollama's OLLAMA_CONTEXT_LENGTH baked from the
+	// probed ctx). Merged over EnvVars at buildContainerSpec time.
+	DynamicEnv func(lc launchConfig) map[string]string
 }
 
 type configModel struct {
@@ -946,6 +955,13 @@ func computeLaunchConfig(modelSizeGB, totalVRAMGB float64, backend string, desir
 
 // --- Entrypoint builders ---
 
+// ollamaEntrypoint runs `ollama serve`. Context is not a CLI flag for
+// Ollama -- it is baked via the OLLAMA_CONTEXT_LENGTH env (see the
+// backendConfig DynamicEnv), so the entrypoint is model-independent.
+func ollamaEntrypoint(modelName string, lc launchConfig) []string {
+	return []string{"/bin/ollama", "serve"}
+}
+
 func vllmEntrypoint(modelName string, lc launchConfig) []string {
 	args := []string{
 		"python3", "-m", "vllm.entrypoints.openai.api_server",
@@ -1261,7 +1277,28 @@ func main() {
 			ListenPort:    envInt("OLLAMA_PORT", 11434),
 			BackendURL:    ollamaURL,
 			ContainerName: env("OLLAMA_CONTAINER", "devai-ollama"),
+			Image:         env("OLLAMA_IMAGE", "docker.io/ollama/ollama:latest"),
+			ModelsDir:     env("OLLAMA_DATA_DIR", "/var/cache/devai/ollama"),
+			MountDest:     "/root/.ollama",
+			MountRW:       true,
+			Network:       network,
 			HealthPath:    "/",
+			Entrypoint:    ollamaEntrypoint,
+			EnvVars: map[string]string{
+				"OLLAMA_KEEP_ALIVE":        env("OLLAMA_KEEP_ALIVE", "300s"),
+				"OLLAMA_MAX_LOADED_MODELS": "1",
+				"OLLAMA_GPU_OVERHEAD":      env("OLLAMA_GPU_OVERHEAD", "0"),
+			},
+			// Bake the probed context into the container env. Unlike
+			// options.num_ctx (which Ollama ignores on /v1), OLLAMA_CONTEXT_LENGTH
+			// is honored on every request surface -- so recreating per model
+			// with the probed ctx keeps /v1 clients from silently loading at
+			// 256K and spilling to CPU.
+			DynamicEnv: func(lc launchConfig) map[string]string {
+				return map[string]string{
+					"OLLAMA_CONTEXT_LENGTH": fmt.Sprintf("%d", lc.MaxContext),
+				}
+			},
 		},
 		{
 			Name:          "vllm",
@@ -1876,11 +1913,19 @@ func buildContainerSpec(
 	pluginVolume map[string]any,
 	recoveryEnv map[string]string,
 ) map[string]any {
+	mountDest := cfg.MountDest
+	if mountDest == "" {
+		mountDest = "/models"
+	}
+	mountOpts := []string{"ro"}
+	if cfg.MountRW {
+		mountOpts = []string{"rw"}
+	}
 	mounts := []map[string]any{{
-		"destination": "/models",
+		"destination": mountDest,
 		"source":      cfg.ModelsDir,
 		"type":        "bind",
-		"options":     []string{"ro"},
+		"options":     mountOpts,
 	}}
 	if pluginVolume != nil {
 		mounts = append(mounts, pluginVolume)
@@ -1918,6 +1963,13 @@ func buildContainerSpec(
 	}
 	for k, v := range recoveryEnv {
 		envMap[k] = v
+	}
+	// Per-recreate dynamic env (e.g. Ollama's OLLAMA_CONTEXT_LENGTH baked
+	// from the probed ctx). Applied last so it can override statics.
+	if cfg.DynamicEnv != nil {
+		for k, v := range cfg.DynamicEnv(lc) {
+			envMap[k] = v
+		}
 	}
 	if len(envMap) > 0 {
 		spec["env"] = envMap
@@ -2055,12 +2107,12 @@ func (a *arbiter) waitForHealthy(bs *backendState, timeout time.Duration) error 
 			}
 		}
 		// Fail fast: a crashed engine will never answer /health, so don't
-		// burn the full timeout waiting for a corpse. Only the router-
-		// launched backends (vLLM/SGLang) are crash-checked. Ollama has a
-		// non-empty ContainerName too, but is exempt because it never reaches
-		// waitForHealthy (ensureBackendRunning returns early for it) -- gate
-		// on the name so a future refactor can't silently start crash-checking
-		// a persistent service the router doesn't recreate.
+		// burn the full timeout waiting for a corpse. Only the vLLM/SGLang
+		// backends are crash-checked: detectLaunchFailure keys off their
+		// container-exit / engine-log signatures. Ollama now also reaches
+		// waitForHealthy (recreate-per-model), but its misfit signal is the
+		// warm-load 500 in warmLoadOllama, not an engine crash log -- so it
+		// stays exempt from detectLaunchFailure here.
 		if bs.config.Name != "ollama" {
 			if failErr := a.detectLaunchFailure(bs.config.ContainerName); failErr != nil {
 				return fmt.Errorf("%s %w", bs.config.Name, failErr)
@@ -2186,18 +2238,15 @@ func (a *arbiter) stopOtherBackends(targetName string) {
 // model and context. Called with the arbiter mutex held.
 //
 // `desiredCtx` is the per-request context cap resolved upstream (picker
-// "@<int>" override or registered modelContexts cap). For Ollama it is
-// passed only to the backend via the request body — Ollama doesn't bake
-// max-ctx into the container. For vLLM and SGLang the context is baked
-// into the entrypoint at startup, so a context change requires a full
-// recreate even when the model is unchanged.
+// "@<int>" override or registered modelContexts cap) for vLLM/SGLang, where
+// the context is baked into the entrypoint at startup so a context change
+// requires a full recreate even when the model is unchanged. Ollama ignores
+// this argument and is handled by ensureOllamaRunning, which recreates the
+// container per model at the probe-verified context (baked into
+// OLLAMA_CONTEXT_LENGTH) and warm-loads it fully on GPU.
 func (a *arbiter) ensureBackendRunning(bs *backendState, modelName string, desiredCtx int, desiredSpec *configSpeculative) error {
 	if bs.config.Name == "ollama" {
-		if !bs.running {
-			a.stopOtherBackends("ollama")
-			bs.running = true
-		}
-		return nil
+		return a.ensureOllamaRunning(bs, modelName)
 	}
 
 	// Recreate coalescing. If a recreate is already in flight on this
@@ -2317,6 +2366,135 @@ func (a *arbiter) ensureBackendRunning(bs *backendState, modelName string, desir
 	return nil
 }
 
+// ensureOllamaRunning brings the Ollama backend up with `modelName` loaded
+// at its probed context, recreating the container when the model or context
+// changes -- mirroring the vLLM/SGLang recreate-per-model lifecycle. The
+// context is baked into OLLAMA_CONTEXT_LENGTH at launch (honored on /v1,
+// unlike options.num_ctx), and a warm-load with num_gpu forced to full GPU
+// makes a misfit fail hard instead of silently spilling to CPU. Called with
+// the arbiter mutex held.
+func (a *arbiter) ensureOllamaRunning(bs *backendState, modelName string) error {
+	// Model-less surfaces (/api/tags, /api/ps, /v1/models): just make sure
+	// the GPU is ours; there is nothing to load or recreate.
+	if modelName == "" {
+		if !bs.running {
+			a.stopOtherBackends("ollama")
+			bs.running = true
+		}
+		return nil
+	}
+
+	// Resolve the probed context: the single fits=true ctx the Ollama probe
+	// verified fully-on-GPU. Fall back to the catalog cap, then MAX_CONTEXT_LEN.
+	// This is the hard ceiling -- Ollama is never loaded above it.
+	probedCtx := a.modelProbedMaxCtx["ollama"][modelName]
+	if probedCtx <= 0 {
+		probedCtx = a.modelContexts[modelName]
+	}
+	if probedCtx <= 0 {
+		probedCtx = a.maxContextLen
+	}
+
+	// Coalesce with any in-flight recreate on this backend.
+	for bs.recreating {
+		bs.recreateCond.Wait()
+	}
+
+	// Drop stale state if the container vanished or a placeholder replaced it.
+	if bs.running && a.podmanClient != nil &&
+		(!a.containerIsRunning(bs.config.ContainerName) || !a.backendIsServing(bs)) {
+		log.Printf("ollama not serving (container gone or placeholder up), resetting state")
+		bs.running = false
+		bs.currentModel = ""
+		bs.currentContext = 0
+	}
+
+	modelChanged := bs.currentModel != modelName
+	ctxChanged := bs.currentContext != probedCtx
+	if bs.running && !modelChanged && !ctxChanged {
+		return nil
+	}
+
+	a.stopOtherBackends("ollama")
+	if bs.currentModel != "" && modelChanged {
+		log.Printf("switching ollama model: %s → %s", bs.currentModel, modelName)
+	}
+	log.Printf("starting ollama with model %s (ctx=%d)...", modelName, probedCtx)
+
+	bs.recreating = true
+	bs.pendingModel = modelName
+	bs.pendingContext = probedCtx
+	defer func() {
+		bs.recreating = false
+		bs.pendingModel = ""
+		bs.pendingContext = 0
+		bs.recreateCond.Broadcast()
+	}()
+
+	if err := a.containerRecreate(bs, modelName, probedCtx, nil); err != nil {
+		return fmt.Errorf("failed to start ollama: %w", err)
+	}
+
+	// Release the lock for the network-bound health wait + warm-load so
+	// concurrent requests park on recreateCond instead of the mutex.
+	if err := func() error {
+		a.mu.Unlock()
+		defer a.mu.Lock()
+		if err := a.waitForHealthy(bs, a.healthTimeout); err != nil {
+			return err
+		}
+		return a.warmLoadOllama(modelName, probedCtx)
+	}(); err != nil {
+		return err
+	}
+
+	bs.running = true
+	bs.currentModel = modelName
+	bs.currentContext = probedCtx
+	return nil
+}
+
+// warmLoadOllama preloads `modelName` at `numCtx` with num_gpu forced high so
+// Ollama either loads the model 100% on the GPU or errors. This is the "no
+// silent CPU spill" enforcement: at the probed ctx the model fits fully, so
+// this succeeds and leaves the model GPU-resident (keep_alive holds it so the
+// following real request reuses the same runner); if VRAM regressed or the
+// probe is stale it fails hard here -- surfaced as a non-retryable 400 by
+// writeLaunchError -- instead of serving at single-digit tok/s off system RAM.
+func (a *arbiter) warmLoadOllama(modelName string, numCtx int) error {
+	body, _ := json.Marshal(map[string]any{
+		"model":    modelName,
+		"messages": []map[string]string{{"role": "user", "content": "ok"}},
+		"stream":   false,
+		// Integer -1 = keep resident indefinitely. Must be a JSON number:
+		// Ollama parses a *string* keep_alive as a Go duration, so "-1"
+		// fails with `missing unit in duration "-1"`.
+		"keep_alive": -1,
+		"options": map[string]any{
+			"num_ctx":     numCtx,
+			"num_gpu":     999,
+			"num_predict": 1,
+		},
+	})
+	client := &http.Client{Timeout: a.healthTimeout}
+	resp, err := client.Post(a.ollamaURL.String()+"/api/chat", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return &launchFailure{crashed: true, msg: fmt.Sprintf("ollama warm-load %s failed: %v", modelName, err)}
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		excerpt := string(respBody)
+		if len(excerpt) > 300 {
+			excerpt = excerpt[:300]
+		}
+		return &launchFailure{crashed: true, msg: fmt.Sprintf(
+			"ollama model %s does not fit fully on GPU at ctx=%d (num_gpu forced full): %s",
+			modelName, numCtx, excerpt)}
+	}
+	return nil
+}
+
 // --- HTTP handlers ---
 
 func (a *arbiter) makeRequestHandler(backendName string) http.HandlerFunc {
@@ -2425,6 +2603,18 @@ func (a *arbiter) makeRequestHandler(backendName string) http.HandlerFunc {
 			if numCtx == 0 {
 				if ctxCap, ok := a.modelContexts[cleanName]; ok && ctxCap > 0 {
 					numCtx = ctxCap
+				}
+			}
+			// Ollama is launched per-model at its probed context (baked into
+			// OLLAMA_CONTEXT_LENGTH and warm-loaded 100% on GPU). Cap any
+			// native-path num_ctx at that ceiling so an /api/chat request can't
+			// force a larger-context reload that spills to CPU; matching the
+			// container env also lets the request reuse the resident GPU
+			// runner. A smaller client-requested ctx is left alone (it fits).
+			if backendName == "ollama" {
+				if pc := a.modelProbedMaxCtx["ollama"][cleanName]; pc > 0 && (numCtx == 0 || numCtx > pc) {
+					numCtx = pc
+					force = true
 				}
 			}
 			if cleanName != parsed.Model {

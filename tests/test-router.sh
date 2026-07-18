@@ -209,7 +209,11 @@ info "=== Test 9: Streaming (SSE via Ollama port) ==="
 if [ -z "$TEST_MODEL" ]; then
     fail "Ollama SSE streaming" "no Ollama tags downloaded"
 else
-    resp=$($RUNTIME exec devai-open-webui curl -s --max-time 30 \
+    # Timeout must cover a cold per-model recreate: since the router now
+    # recreates the Ollama container per model at its probed ctx (like
+    # vLLM/SGLang), the first request for a model pays ~40s of container
+    # recreate + warm-load before the first SSE chunk. 120s leaves headroom.
+    resp=$($RUNTIME exec devai-open-webui curl -s --max-time 120 -N \
         -H "Content-Type: application/json" \
         "http://router:11434/v1/chat/completions" \
         -d "{\"model\":\"$TEST_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Count to 3\"}],\"max_tokens\":20,\"stream\":true}" 2>&1)
