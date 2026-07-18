@@ -1604,6 +1604,7 @@ bench-vllm: ## Bench every loaded vLLM/HF model via devai-router:11435
 		$(BENCH_CACHE_MOUNTS) \
 		$(GPU_FLAGS) \
 		-e GPU_MEMORY_GB=$(GPU_MEMORY_GB) \
+		-e HF_TOKEN -e HUGGING_FACE_HUB_TOKEN \
 		--entrypoint python3 \
 		$(IMAGE_NAME_GPU) \
 		/scripts/bench/bench_runner.py --backend vllm \
@@ -1616,6 +1617,7 @@ bench-sglang: ## Bench every loaded SGLang model via devai-router:11436
 		$(BENCH_CACHE_MOUNTS) \
 		$(GPU_FLAGS) \
 		-e GPU_MEMORY_GB=$(GPU_MEMORY_GB) \
+		-e HF_TOKEN -e HUGGING_FACE_HUB_TOKEN \
 		--entrypoint python3 \
 		$(IMAGE_NAME_GPU) \
 		/scripts/bench/bench_runner.py --backend sglang \
@@ -1628,6 +1630,7 @@ bench-ollama: ## Bench every loaded Ollama model via devai-router:11434
 		$(BENCH_CACHE_MOUNTS) \
 		$(GPU_FLAGS) \
 		-e GPU_MEMORY_GB=$(GPU_MEMORY_GB) \
+		-e HF_TOKEN -e HUGGING_FACE_HUB_TOKEN \
 		--entrypoint python3 \
 		$(IMAGE_NAME_GPU) \
 		/scripts/bench/bench_runner.py --backend ollama \
@@ -1638,6 +1641,7 @@ bench-report: ## Print a Markdown leaderboard from .bench-cache.json
 		-v $(CURDIR)/scripts:/scripts:ro \
 		-v $(CURDIR)/deploy:/deploy:ro \
 		-e GPU_MEMORY_GB=$(GPU_MEMORY_GB) \
+		-e HF_TOKEN -e HUGGING_FACE_HUB_TOKEN \
 		--entrypoint python3 \
 		$(IMAGE_NAME) \
 		/scripts/bench/bench_report.py \
@@ -1653,6 +1657,7 @@ test-bench-smoke: ## 1-model tiny-subset smoke test (CI / sanity)
 		$(BENCH_CACHE_MOUNTS) \
 		$(GPU_FLAGS) \
 		-e GPU_MEMORY_GB=$(GPU_MEMORY_GB) \
+		-e HF_TOKEN -e HUGGING_FACE_HUB_TOKEN \
 		--entrypoint python3 \
 		$(IMAGE_NAME_GPU) \
 		/scripts/bench/bench_runner.py --backend vllm \
