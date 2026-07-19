@@ -1212,7 +1212,7 @@ probe-vllm: ## Probe every downloaded vLLM/HF model per (VRAM, CONTEXT) cell.
 	    --models-dir $(VLLM_MODELS_DIR) \
 	    $(if $(PROBE_VRAMS_VLLM),--vram $(PROBE_VRAMS_VLLM),) \
 	    $(if $(PROBE_CONTEXTS),--ctx $(PROBE_CONTEXTS),) \
-	    $(if $(PROBE_REPO),--repo $(PROBE_REPO),) \
+	    $(if $(PROBE_REPO),--repo '$(PROBE_REPO)',) \
 	    $(if $(PROBE_FORCE),--force,) \
 	    $(if $(PROBE_FORCE_ARCH),--force-arch,)
 
@@ -1229,7 +1229,7 @@ probe-sglang: ## Probe every downloaded SGLang/HF model per (VRAM, CONTEXT) cell
 	    --models-dir $(SGLANG_MODELS_DIR) \
 	    $(if $(PROBE_VRAMS_SGLANG),--vram $(PROBE_VRAMS_SGLANG),) \
 	    $(if $(PROBE_CONTEXTS),--ctx $(PROBE_CONTEXTS),) \
-	    $(if $(PROBE_REPO),--repo $(PROBE_REPO),) \
+	    $(if $(PROBE_REPO),--repo '$(PROBE_REPO)',) \
 	    $(if $(PROBE_FORCE),--force,) \
 	    $(if $(PROBE_FORCE_ARCH),--force-arch,)
 
@@ -1246,7 +1246,7 @@ probe-load-vllm: ## Serving-time LOAD probe for vLLM: augment fit cache with ser
 	    --host-vram-gb $(GPU_MEMORY_GB) \
 	    --models-dir $(VLLM_MODELS_DIR) \
 	    $(if $(PROBE_CONTEXTS),--ctx $(PROBE_CONTEXTS),) \
-	    $(if $(PROBE_REPO),--repo $(PROBE_REPO),) \
+	    $(if $(PROBE_REPO),--repo '$(PROBE_REPO)',) \
 	    $(if $(PROBE_FORCE),--force,) \
 	    $(if $(PROBE_NEEDLE_DEPTH),--needle-depth $(PROBE_NEEDLE_DEPTH),)
 
@@ -1257,7 +1257,7 @@ probe-load-sglang: ## Serving-time LOAD probe for SGLang: same as probe-load-vll
 	    --host-vram-gb $(GPU_MEMORY_GB) \
 	    --models-dir $(SGLANG_MODELS_DIR) \
 	    $(if $(PROBE_CONTEXTS),--ctx $(PROBE_CONTEXTS),) \
-	    $(if $(PROBE_REPO),--repo $(PROBE_REPO),) \
+	    $(if $(PROBE_REPO),--repo '$(PROBE_REPO)',) \
 	    $(if $(PROBE_FORCE),--force,) \
 	    $(if $(PROBE_NEEDLE_DEPTH),--needle-depth $(PROBE_NEEDLE_DEPTH),)
 
