@@ -83,6 +83,9 @@ models:
     arch_source: "bg-digitalservices/Gemma-4-26B-A4B-it-NVFP4/config.json"
     purpose: "gemma4 · 15.3 GB · 30L/8kv/256h · k=v"
     conversational: true
+    parsers:
+      vllm:
+        tool: gemma4
 
   - name: "Gemma-4-31B-IT-NVFP4"
     family: gemma4
