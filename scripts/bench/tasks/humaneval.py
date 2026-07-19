@@ -162,8 +162,13 @@ def _run_check_in_subprocess(program: str) -> tuple[bool, str]:
     """)
     full = wrapper + "\n" + program
     try:
+        # Feed the program on stdin (`python -`), NOT as `-c <program>`:
+        # EvalPlus's hardened test strings are hundreds of KB and overflow
+        # the OS argv limit (ARG_MAX) as a `-c` argument, raising
+        # OSError(7, 'Argument list too long') and aborting the whole eval.
         r = subprocess.run(
-            [sys.executable, "-c", full],
+            [sys.executable, "-"],
+            input=full,
             capture_output=True,
             text=True,
             timeout=_RUN_TIMEOUT_S + 2,
