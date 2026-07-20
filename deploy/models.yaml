@@ -2710,6 +2710,9 @@ models:
     arch_source: "nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4/config.json"
     purpose: "nemotron-nano-v2 · 7.3 GB · 56L/8kv/128h"
     conversational: true
+    parsers:
+      vllm:
+        reasoning: nemotron_v3
 
   - name: "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"
     family: nemotron-3-nano

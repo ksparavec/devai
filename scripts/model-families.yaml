@@ -458,19 +458,32 @@ families:
   - name: nemotron-nano-v2
     hf_repos:
       - nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4
+    parsers:
+      vllm:
+        reasoning: nemotron_v3
+    # Reasoning parser nemotron_v3 is NOT registered in the pinned vLLM
+    # v0.22.1 image (passing it crashes the engine at startup, container
+    # exits before /health). It IS registered in vLLM v0.25.1, to which
+    # this model is pinned via the per-model image override in
+    # deploy/recovery-flags.json. That override also supplies the two
+    # flags the hybrid Mamba-Transformer checkpoint requires:
+    # --mamba-ssm-cache-dtype float32 and --trust-remote-code. Verified by
+    # direct podman launch on v0.25.1: <think> traces separate cleanly
+    # into the reasoning field, content carries clean executable code (no
+    # </think> leak). This is what lifts HumanEval off its ~0.10 floor.
+    # NOTE: v0.25.1 loops on greedy (temp 0) reasoning for this model --
+    # serve/bench at temp>=0.6 (NVIDIA's recommended Nemotron sampling),
+    # else the reasoning trace runs away and no answer is emitted.
+    #
     # Tool parser intentionally not curated. The 9B-v2 chat template uses
     # NVIDIA's custom uppercase `<TOOLCALL>[...]</TOOLCALL>` /
-    # `<AVAILABLE_TOOLS>` / `<TOOL_RESPONSE>` format — no shipped vLLM
+    # `<AVAILABLE_TOOLS>` / `<TOOL_RESPONSE>` format -- no shipped vLLM
     # or SGLang parser matches it (all stock parsers expect lowercase
     # `<tool_call>` Hermes-style or family-specific tokens). Without a
     # custom parser, the router strips `tools`/`tool_choice` for this
-    # model: agentic tool calls are silently absent, plain chat works.
-    # Reasoning parser also uncurated: nemotron_v3 (suggested by NVIDIA docs
-    # for the 9B-v2 line) is NOT a registered --reasoning-parser in the
-    # pinned vLLM v0.22.1 image -- passing it crashes the engine at startup
-    # (container exits before /health). So the </think> leak + HumanEval
-    # cleaner artifact stay until a parser valid for this image is found
-    # (candidate: deepseek_r1, the generic R1-style parser -- untried).
+    # model: agentic tool calls are silently absent, plain chat +
+    # reasoning work. (NVIDIA ships a nemotron_json tool-parser plugin;
+    # wiring it is a separate follow-up.)
     arch_ref: nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4
     thinking: true        # hint; vLLM/SGLang variants probed separately later
 
