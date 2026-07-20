@@ -678,9 +678,13 @@ def run_for_target(
                 # Pass the model's probed tool_mode so the task drives
                 # auto-mode models with tool_choice="auto" (pinning breaks
                 # non-standard formats like Nemotron's <TOOLCALL>) and keeps
-                # pinning forced-mode models. Ollama rows have no tool_mode
-                # -> default "forced" preserves their historical behaviour.
-                _tool_mode = (target.get("entry") or {}).get("tool_mode") or "forced"
+                # pinning forced-mode models. vLLM/SGLang: probed tool_mode
+                # (auto|forced). Ollama has no probed tool_mode -- it
+                # negotiates tools natively via /api/chat, which is an auto
+                # flow -- so default Ollama to "auto"; only vLLM/SGLang rows
+                # without a probed mode fall back to "forced".
+                _tool_mode = (target.get("entry") or {}).get("tool_mode") or (
+                    "auto" if backend == "ollama" else "forced")
                 eval_log = _invoke_inspect_task(
                     task_obj=tools_use_task(n=n_tools, tool_mode=_tool_mode),
                     served_model=served,
