@@ -400,24 +400,22 @@ def _bench_score(tasks: dict, prefix: str, key: str) -> float | None:
 def _picker_scores(bench_row: dict | None) -> dict[str, float | None]:
     """Extract the four picker-sort scores from a bench cache row.
 
-    Returns ``{"tps": float|None, "code": float|None, "reas": float|None,
-    "total": float|None}``. Each value is ``None`` when the underlying
-    bench task hasn't been recorded yet (so the picker can sort
-    unbenched rows to the bottom rather than treating them as zeros).
+    Returns ``{"tps", "code", "hevp", "mmlu", "gpqa"}`` (float|None each).
+    A value is ``None`` when that bench task hasn't been recorded yet, so
+    the picker sorts unbenched rows to the bottom rather than as zeros.
 
-    Definitions:
-      * ``tps``   = ``metrics.tps_sustained_p50``
-                    (steady-state decode tokens/sec)
-      * ``code``  = ``tasks.humaneval_subset_*.pass@1``
-      * ``reas``  = ``2/3 * tools_use_score + 1/3 * gsm8k_score``
-                    (weighted blend of agentic-tool correctness and
-                    multi-step math reasoning)
-      * ``total`` = ``mean(gsm8k, humaneval, tools_use)``
-                    (equal-weight quality average; latency-only rows
-                    have ``None``)
+    Definitions (the saturated composites REAS/TOTAL were retired in favour
+    of sharper, contamination-resistant discriminators):
+      * ``tps``   = ``metrics.tps_sustained_p50`` (steady-state tok/s)
+      * ``code``  = ``tasks.humaneval_subset_*.pass@1`` (HumanEval)
+      * ``hevp``  = ``tasks.humaneval_plus_subset_*.pass@1`` (HumanEval+,
+                    EvalPlus hardened tests -- catches overfit code)
+      * ``mmlu``  = ``tasks.mmlu_pro_subset_*.score`` (MMLU-Pro, knowledge)
+      * ``gpqa``  = ``tasks.gpqa_subset_*.score`` (GPQA-Diamond, graduate
+                    reasoning -- the strongest top-model discriminator)
     """
     if bench_row is None:
-        return {"tps": None, "code": None, "reas": None, "total": None}
+        return {"tps": None, "code": None, "hevp": None, "mmlu": None, "gpqa": None}
     tasks = bench_row.get("tasks") or {}
     metrics = bench_row.get("metrics") or {}
     tps_raw = metrics.get("tps_sustained_p50")
@@ -425,19 +423,15 @@ def _picker_scores(bench_row: dict | None) -> dict[str, float | None]:
         tps = float(tps_raw) if tps_raw is not None else None
     except (TypeError, ValueError):
         tps = None
-    code = _bench_score(tasks, "humaneval_", "pass@1")
-    gsm = _bench_score(tasks, "gsm8k_", "score")
-    tools = _bench_score(tasks, "tools_use", "score")
-    # Reasoning blend: tools-use dominates because agentic workflows
-    # care more about tool-call correctness than abstract math, but
-    # GSM8K stays in the mix as a multi-step-thinking signal.
-    if tools is not None and gsm is not None:
-        reas = (2.0 / 3.0) * tools + (1.0 / 3.0) * gsm
-    else:
-        reas = None
-    quality_parts = [v for v in (gsm, code, tools) if v is not None]
-    total = sum(quality_parts) / len(quality_parts) if quality_parts else None
-    return {"tps": tps, "code": code, "reas": reas, "total": total}
+    # "humaneval_subset_" is specific: it does NOT match "humaneval_plus_
+    # subset_", so code and hevp stay separate.
+    return {
+        "tps": tps,
+        "code": _bench_score(tasks, "humaneval_subset_", "pass@1"),
+        "hevp": _bench_score(tasks, "humaneval_plus_subset_", "pass@1"),
+        "mmlu": _bench_score(tasks, "mmlu_pro_subset_", "score"),
+        "gpqa": _bench_score(tasks, "gpqa_subset_", "score"),
+    }
 
 
 def _is_production_agentic(model: dict, bench_row: dict | None) -> bool:
@@ -489,13 +483,14 @@ def _build_comparison_ctx(candidates: list[dict]) -> dict:
     benched: list[tuple[dict, dict]] = []
     for m in candidates:
         s = m.get("_picker_scores") or {}
-        if s.get("total") is not None:
+        # Benched = has at least one quality score (any of code/hevp/mmlu/gpqa).
+        if any(s.get(k) is not None for k in ("code", "hevp", "mmlu", "gpqa")):
             benched.append((m, s))
     ctx: dict = {"n_benched": len(benched), "n_total": len(candidates)}
     if not benched:
         return ctx
     ranks: dict[str, dict[int, int]] = {}
-    for metric in ("tps", "code", "reas", "total"):
+    for metric in ("tps", "code", "hevp", "mmlu", "gpqa"):
         rmap: dict[int, int] = {}
         for m, s in benched:
             v = s.get(metric)
@@ -1437,14 +1432,15 @@ def _format_model_row(m: dict, idx: int = 0) -> str:
     # downstream effect, so gate them together.
     mtp_col = ("Yes" if _has_mtp(m) else "No") if _MTP_PREVIEW else ""
 
-    # Bench scores -- four columns the user requested. Unbenched rows
-    # render '-' so they sort to the bottom but still appear (with all
-    # the format/parser/tier metadata visible in the preview pane).
+    # Bench columns: TPS, CODE% (HumanEval), CODE+% (HumanEval+), MMLU%,
+    # GPQA%. Unbenched cells render '-' so they sort to the bottom but the
+    # row still appears (format/parser/tier metadata shows in the preview).
     scores = m.get("_picker_scores") or {}
     tps_col = _fmt_tps(scores.get("tps"))
     code_col = _fmt_score_pct(scores.get("code"))
-    reas_col = _fmt_score_pct(scores.get("reas"))
-    total_col = _fmt_score_pct(scores.get("total"))
+    codep_col = _fmt_score_pct(scores.get("hevp"))
+    mmlu_col = _fmt_score_pct(scores.get("mmlu"))
+    gpqa_col = _fmt_score_pct(scores.get("gpqa"))
     leak_col = _fmt_leak_pct(m)
 
     # Line number reflects position in the current sort order, so
@@ -1465,8 +1461,9 @@ def _format_model_row(m: dict, idx: int = 0) -> str:
         f"{mtp_segment}"
         f"{tps_col:>7s}  "
         f"{code_col:>7s}  "
-        f"{reas_col:>7s}  "
-        f"{total_col:>7s}  "
+        f"{codep_col:>7s}  "
+        f"{mmlu_col:>7s}  "
+        f"{gpqa_col:>7s}  "
         f"{leak_col:>5s}  "
         f"{vram_num:>6s}"
     )
@@ -1963,7 +1960,9 @@ def _format_model_properties(m: dict, comparison: dict | None) -> str:
     """
     scores = m.get("_picker_scores") or {}
     bench_row = m.get("_picker_bench_row") or {}
-    if scores.get("total") is None or not bench_row:
+    if not bench_row or all(
+        scores.get(k) is None for k in ("code", "hevp", "mmlu", "gpqa")
+    ):
         # No bench data for this (model, backend, ctx). Distinguish
         # "model has bench rows at other ctxs but not this one" from
         # "model never benched at all" -- the former is fixable with a
@@ -2002,13 +2001,16 @@ def _format_model_properties(m: dict, comparison: dict | None) -> str:
         lines.append(f"  TPS:    {tps:>6.1f} tok/s{_rank_str('tps')}")
     code = scores.get("code")
     if code is not None:
-        lines.append(f"  CODE:   {code * 100:>5.1f}%{_rank_str('code')}")
-    reas = scores.get("reas")
-    if reas is not None:
-        lines.append(f"  REAS:   {reas * 100:>5.1f}%{_rank_str('reas')}")
-    total = scores.get("total")
-    if total is not None:
-        lines.append(f"  TOTAL:  {total * 100:>5.1f}%{_rank_str('total')}")
+        lines.append(f"  CODE:   {code * 100:>5.1f}%{_rank_str('code')}  (HumanEval)")
+    hevp = scores.get("hevp")
+    if hevp is not None:
+        lines.append(f"  CODE+:  {hevp * 100:>5.1f}%{_rank_str('hevp')}  (HumanEval+, hardened)")
+    mmlu = scores.get("mmlu")
+    if mmlu is not None:
+        lines.append(f"  MMLU:   {mmlu * 100:>5.1f}%{_rank_str('mmlu')}  (MMLU-Pro)")
+    gpqa = scores.get("gpqa")
+    if gpqa is not None:
+        lines.append(f"  GPQA:   {gpqa * 100:>5.1f}%{_rank_str('gpqa')}  (GPQA-Diamond, reasoning)")
     metrics = bench_row.get("metrics") or {}
     peak = metrics.get("peak_vram_gb")
     if peak is not None:
@@ -2049,27 +2051,32 @@ def _extra_use_case_lines(m: dict, comparison: dict | None) -> list[str]:
     if not comparison:
         return out
     scores = m.get("_picker_scores") or {}
-    if scores.get("total") is None:
+    if all(scores.get(k) is None for k in ("code", "hevp", "mmlu", "gpqa")):
         return out
     ranks = comparison.get("ranks") or {}
     rid = id(m)
-    rt = ranks.get("total", {}).get(rid)
+    rgpqa = ranks.get("gpqa", {}).get(rid)
     rtps = ranks.get("tps", {}).get(rid)
     rcode = ranks.get("code", {}).get(rid)
-    rreas = ranks.get("reas", {}).get(rid)
+    rhevp = ranks.get("hevp", {}).get(rid)
+    rmmlu = ranks.get("mmlu", {}).get(rid)
     n = comparison.get("n_benched", 0)
 
-    if rt == 1:
+    if rgpqa == 1 and scores.get("gpqa") is not None:
         out.append(
-            f"Top-scoring model in this picker on the equally-weighted "
-            f"GSM8K + HumanEval + tools_use blend "
-            f"(TOTAL = {scores['total'] * 100:.1f}% across {n} benched models); "
-            f"safe default agentic pick on this hardware."
+            f"Strongest reasoner in this picker "
+            f"(GPQA-Diamond = {scores['gpqa'] * 100:.1f}% across {n} benched "
+            f"models) -- best pick for hard multi-step reasoning."
         )
     elif rcode == 1 and rtps == 1:
         out.append(
             "Highest HumanEval pass@1 *and* highest decode TPS in this "
             "picker -- the strongest default for code-heavy workflows."
+        )
+    elif rmmlu == 1 and scores.get("mmlu") is not None:
+        out.append(
+            f"Top MMLU-Pro in this picker "
+            f"({scores['mmlu'] * 100:.1f}%) -- broadest knowledge + reasoning."
         )
     elif rtps == 1:
         out.append(
@@ -2077,16 +2084,15 @@ def _extra_use_case_lines(m: dict, comparison: dict | None) -> list[str]:
             f"({scores['tps']:.1f} tok/s steady-state); pick when latency or "
             f"throughput matters more than peak quality."
         )
+    elif rhevp == 1 and scores.get("hevp") is not None:
+        out.append(
+            f"Best HumanEval+ (hardened tests) in this picker "
+            f"({scores['hevp'] * 100:.1f}%) -- most robust code, not overfit."
+        )
     elif rcode == 1:
         out.append(
             f"Best HumanEval pass@1 in this picker "
             f"({scores['code'] * 100:.1f}%) -- strong code-completion default."
-        )
-    elif rreas == 1:
-        out.append(
-            f"Strongest tools+reasoning blend in this picker "
-            f"(REAS = {scores['reas'] * 100:.1f}%); good fit for agentic flows "
-            f"that combine tool calls with multi-step thinking."
         )
 
     bench_row = m.get("_picker_bench_row") or {}
@@ -2105,12 +2111,13 @@ def _extra_use_case_lines(m: dict, comparison: dict | None) -> list[str]:
 # largest probe-confirmed context tier that fits at the picker's VRAM
 # band -- useful when the user cares about long-context capacity over
 # raw quality scores.
-_SORT_MODES: tuple[str, ...] = ("total", "tps", "code", "reas", "ctx")
+_SORT_MODES: tuple[str, ...] = ("gpqa", "tps", "code", "hevp", "mmlu", "ctx")
 _SORT_LABELS: dict[str, str] = {
-    "total": "TOTAL",
+    "gpqa": "GPQA",
     "tps": "TPS",
     "code": "CODE",
-    "reas": "REAS",
+    "hevp": "CODE+",
+    "mmlu": "MMLU",
     "ctx": "CTX",
 }
 
@@ -2214,7 +2221,7 @@ def _build_candidates(
 def _build_menu(
     models: list[dict],
     bench_records: dict[tuple[str, str, int], dict] | None = None,
-    sort_mode: str = "total",
+    sort_mode: str = "gpqa",
     sort_dir: str = "desc",
     *,
     _candidates: list[dict] | None = None,
@@ -2238,7 +2245,7 @@ def _build_menu(
         hidden = _hidden or {"missing_capability": 0, "no_fitting_ctx": 0}
 
     if sort_mode not in _SORT_MODES:
-        sort_mode = "total"
+        sort_mode = "gpqa"
     if sort_dir not in _SORT_DIRS:
         sort_dir = "desc"
     candidates.sort(key=_sort_key_for_mode(sort_mode, sort_dir))
@@ -2269,8 +2276,9 @@ def _build_menu(
         f"{mtp_header_segment}"
         f"{_hdr('TPS', 'tps'):>7s}  "
         f"{_hdr('CODE%', 'code'):>7s}  "
-        f"{_hdr('REAS%', 'reas'):>7s}  "
-        f"{_hdr('TOTAL%', 'total'):>7s}  "
+        f"{_hdr('CODE+%', 'hevp'):>7s}  "
+        f"{_hdr('MMLU%', 'mmlu'):>7s}  "
+        f"{_hdr('GPQA%', 'gpqa'):>7s}  "
         f"{'LEAK%':>5s}  "
         f"{'VRAM':>6s}"
     )
@@ -2675,7 +2683,7 @@ def main() -> None:
                 sort_mode=mode, sort_dir=direction,
                 _candidates=candidates, _hidden=hidden,
             )
-    lines, selectable, item_models = menus[("total", "desc")]
+    lines, selectable, item_models = menus[("gpqa", "desc")]
     if not any(selectable):
         sys.exit(
             f"error: no usable model/context rows on disk for "
@@ -2700,7 +2708,7 @@ def main() -> None:
     # so the per-model preview can describe each row's rank against
     # its peers (TPS / CODE / REAS / TOTAL).
     comparison_ctx = _build_comparison_ctx(candidates)
-    # Preview content is keyed off the original (TOTAL-mode) item index,
+    # Preview content is keyed off the original (GPQA-mode) item index,
     # which equals the tag fzf carries for each line. All four sort
     # modes share the same item_models list (only the row order changes
     # within each pre-rendered file), so previews stay correct after
@@ -2809,7 +2817,7 @@ def main() -> None:
             # showed every model's details unprompted on launch.
             preview_window="right:42%:wrap:hidden",
             extra_bindings=bindings,
-            input_text=sort_files[("total", "desc")].read_text(),
+            input_text=sort_files[("gpqa", "desc")].read_text(),
             # Column header + sort note + formula note. _build_menu
             # always emits exactly these three at the top; if that
             # ever changes, update this constant in lockstep.
