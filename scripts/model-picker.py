@@ -416,10 +416,15 @@ def _picker_scores(bench_row: dict | None) -> dict[str, float | None]:
       * ``tools`` = ``tasks.tools_use_*.score`` (agentic tool-calling: right
                     tool, exact args, no fabrication; benched in the model's
                     native tool_choice mode)
+
+    Two auxiliary metrics are also returned for the use-case recommender
+    (not displayed as columns): ``gsm`` = ``tasks.gsm8k_subset_*.score``
+    (arithmetic word problems) and ``leak`` = ``tasks.leak_probe.leak_rate``
+    (token-leak rate; lower is better).
     """
     if bench_row is None:
         return {"tps": None, "code": None, "hevp": None, "mmlu": None,
-                "gpqa": None, "tools": None}
+                "gpqa": None, "tools": None, "gsm": None, "leak": None}
     tasks = bench_row.get("tasks") or {}
     metrics = bench_row.get("metrics") or {}
     tps_raw = metrics.get("tps_sustained_p50")
@@ -436,6 +441,8 @@ def _picker_scores(bench_row: dict | None) -> dict[str, float | None]:
         "mmlu": _bench_score(tasks, "mmlu_pro_subset_", "score"),
         "gpqa": _bench_score(tasks, "gpqa_subset_", "score"),
         "tools": _bench_score(tasks, "tools_use", "score"),
+        "gsm": _bench_score(tasks, "gsm8k_subset_", "score"),
+        "leak": (tasks.get("leak_probe") or {}).get("leak_rate"),
     }
 
 
@@ -1866,6 +1873,79 @@ _FAMILY_USE_CASES: dict[str, str] = {
 }
 
 
+_USE_CASE_LABELS: dict[str, str] = {
+    "coding": "Coding",
+    "math": "Math / analysis",
+    "reasoning": "Gen. reasoning",
+    "summary": "Doc summary",
+    "doc_qa": "Doc Q&A",
+}
+
+
+def _use_case_ratings(m: dict) -> list[tuple[str, float]] | None:
+    """Score five typical use cases (0-100) from the model's bench metrics
+    and return them ranked best-first, or ``None`` when the model lacks the
+    core bench data (gpqa / mmlu / hevp) needed to score them.
+
+    ``coding`` / ``math`` / ``reasoning`` map onto direct benchmarks.
+    ``summary`` and ``doc_qa`` have NO direct benchmark in this harness, so
+    they are proxied: context dominates (fitting the document is the hard
+    constraint for long-doc work), plus comprehension (MMLU), reasoning
+    (GPQA, for Q&A) and faithfulness (1 - leak_rate). Weights are the ones
+    validated against the fleet; tune here if doc lengths differ.
+    """
+    s = m.get("_picker_scores") or {}
+    hevp, code = s.get("hevp"), s.get("code")
+    gpqa, mmlu = s.get("gpqa"), s.get("mmlu")
+    if None in (gpqa, mmlu, hevp):
+        return None
+
+    def z(x: object) -> float:
+        return float(x) if isinstance(x, (int, float)) else 0.0
+
+    gsm, tps, leak = z(s.get("gsm")), z(s.get("tps")), z(s.get("leak"))
+    ctx = int(m.get("_picker_context") or 0)
+    ctx_n = min(ctx / 262144.0, 1.0) if ctx else 0.0   # 256K=1.0, 128K=0.5
+    tps_n = min(tps / 150.0, 1.0)
+    faith = 1.0 - min(leak, 1.0)
+    vals = {
+        "coding":    0.70 * z(hevp) + 0.30 * z(code),
+        "math":      0.55 * z(gpqa) + 0.30 * gsm + 0.15 * z(mmlu),
+        "reasoning": 0.60 * z(gpqa) + 0.40 * z(mmlu),
+        "summary":   0.45 * ctx_n + 0.30 * z(mmlu) + 0.15 * faith + 0.10 * tps_n,
+        "doc_qa":    0.40 * ctx_n + 0.30 * z(mmlu) + 0.20 * z(gpqa) + 0.10 * faith,
+    }
+    return sorted(((k, v * 100.0) for k, v in vals.items()), key=lambda kv: -kv[1])
+
+
+def _use_case_tier(score: float) -> str:
+    """Absolute quality band for a use-case score (0-100)."""
+    if score >= 80:
+        return "Excellent"
+    if score >= 65:
+        return "Strong"
+    if score >= 50:
+        return "Good"
+    if score >= 35:
+        return "Fair"
+    return "Weak"
+
+
+def _format_use_case_recommendations(m: dict) -> str:
+    """Render the "Recommended for:" preview section (five use cases ranked
+    best-first with score + tier), or '' when the model isn't benched."""
+    ranked = _use_case_ratings(m)
+    if not ranked:
+        return ""
+    lines = ["Recommended for:"]
+    for key, score in ranked:
+        label = _USE_CASE_LABELS.get(key, key)
+        lines.append(f"  {label:<16s}{score:>4.0f}  {_use_case_tier(score)}")
+    lines.append("  (summary / doc-Q&A are context-weighted estimates --")
+    lines.append("   no direct benchmark; coding/math/reasoning are measured)")
+    return "\n".join(lines)
+
+
 def _capability_summary_text(
     m: dict,
     reasoning_mode: str = "default",
@@ -1941,6 +2021,9 @@ def _capability_summary_text(
     parts = [head]
     if properties_section:
         parts.append("\n" + properties_section)
+    rec_section = _format_use_case_recommendations(m)
+    if rec_section:
+        parts.append("\n\n" + rec_section)
     use_cases_body = blurb
     if extra_use_case_lines:
         # Bench-derived sentences sit in their own paragraph: a blank
