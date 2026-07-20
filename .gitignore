@@ -134,8 +134,13 @@ graphify-out/
 deploy/pipelock-ca.crt
 deploy/*-ca-key.pem
 
-# understand-anything: keep the graph (knowledge-graph.json, meta.json,
-# fingerprints.json, config.json, .understandignore) but never commit scratch
+# understand-anything: config stays tracked (config.json, .understandignore);
+# the generated graph artifacts are rebuildable (/understand-anything:understand)
+# and no longer committed -- they regenerated on every code change and churned git.
+.understand-anything/knowledge-graph.json
+.understand-anything/meta.json
+.understand-anything/fingerprints.json
+.understand-anything/intermediate/
 .understand-anything/.trash-*/
 .understand-anything/tmp/
 
