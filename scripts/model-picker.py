@@ -400,9 +400,9 @@ def _bench_score(tasks: dict, prefix: str, key: str) -> float | None:
 def _picker_scores(bench_row: dict | None) -> dict[str, float | None]:
     """Extract the four picker-sort scores from a bench cache row.
 
-    Returns ``{"tps", "code", "hevp", "mmlu", "gpqa"}`` (float|None each).
-    A value is ``None`` when that bench task hasn't been recorded yet, so
-    the picker sorts unbenched rows to the bottom rather than as zeros.
+    Returns ``{"tps", "code", "hevp", "mmlu", "gpqa", "tools"}`` (float|None
+    each). A value is ``None`` when that bench task hasn't been recorded yet,
+    so the picker sorts unbenched rows to the bottom rather than as zeros.
 
     Definitions (the saturated composites REAS/TOTAL were retired in favour
     of sharper, contamination-resistant discriminators):
@@ -413,9 +413,13 @@ def _picker_scores(bench_row: dict | None) -> dict[str, float | None]:
       * ``mmlu``  = ``tasks.mmlu_pro_subset_*.score`` (MMLU-Pro, knowledge)
       * ``gpqa``  = ``tasks.gpqa_subset_*.score`` (GPQA-Diamond, graduate
                     reasoning -- the strongest top-model discriminator)
+      * ``tools`` = ``tasks.tools_use_*.score`` (agentic tool-calling: right
+                    tool, exact args, no fabrication; benched in the model's
+                    native tool_choice mode)
     """
     if bench_row is None:
-        return {"tps": None, "code": None, "hevp": None, "mmlu": None, "gpqa": None}
+        return {"tps": None, "code": None, "hevp": None, "mmlu": None,
+                "gpqa": None, "tools": None}
     tasks = bench_row.get("tasks") or {}
     metrics = bench_row.get("metrics") or {}
     tps_raw = metrics.get("tps_sustained_p50")
@@ -431,6 +435,7 @@ def _picker_scores(bench_row: dict | None) -> dict[str, float | None]:
         "hevp": _bench_score(tasks, "humaneval_plus_subset_", "pass@1"),
         "mmlu": _bench_score(tasks, "mmlu_pro_subset_", "score"),
         "gpqa": _bench_score(tasks, "gpqa_subset_", "score"),
+        "tools": _bench_score(tasks, "tools_use", "score"),
     }
 
 
@@ -1425,7 +1430,6 @@ def _format_model_row(m: dict, idx: int = 0) -> str:
     backend_col = str(m.get("backend") or "?")
     fmt_col = str(details.get("quantization") or "?")
     type_col = "MoE" if _is_moe(m) else "Dense"
-    tools_col = "Yes" if _has_tools(m) else "No"
     # MTP column is only rendered when the preview flag is on; until
     # the router's parseMTPOverride wiring lands in Phase 5 the column
     # would be informational-only and the sub-modal would have no
@@ -1442,6 +1446,13 @@ def _format_model_row(m: dict, idx: int = 0) -> str:
     mmlu_col = _fmt_score_pct(scores.get("mmlu"))
     gpqa_col = _fmt_score_pct(scores.get("gpqa"))
     leak_col = _fmt_leak_pct(m)
+    # TOOLS shows the agentic tools_use bench score (0-100) when benched --
+    # right tool, exact args, no fabrication, in the model's native
+    # tool_choice mode. Falls back to Yes/No parser-presence when unbenched
+    # (a model can have a tool parser but no measured score yet).
+    _ts = scores.get("tools")
+    tools_col = (f"{_ts * 100:.0f}" if isinstance(_ts, (int, float))
+                 else ("Yes" if _has_tools(m) else "No"))
 
     # Line number reflects position in the current sort order, so
     # ctrl-s renumbers the list. Caller passes 1-based ``idx``;
@@ -1457,7 +1468,7 @@ def _format_model_row(m: dict, idx: int = 0) -> str:
         f"{params_col:>10s}  "
         f"{type_col:>6s}  "
         f"{fmt_col:>7s}  "
-        f"{tools_col:>5s}  "
+        f"{tools_col:>6s}  "
         f"{mtp_segment}"
         f"{tps_col:>7s}  "
         f"{code_col:>7s}  "
@@ -2111,13 +2122,14 @@ def _extra_use_case_lines(m: dict, comparison: dict | None) -> list[str]:
 # largest probe-confirmed context tier that fits at the picker's VRAM
 # band -- useful when the user cares about long-context capacity over
 # raw quality scores.
-_SORT_MODES: tuple[str, ...] = ("gpqa", "tps", "code", "hevp", "mmlu", "ctx")
+_SORT_MODES: tuple[str, ...] = ("gpqa", "tps", "code", "hevp", "mmlu", "tools", "ctx")
 _SORT_LABELS: dict[str, str] = {
     "gpqa": "GPQA",
     "tps": "TPS",
     "code": "CODE",
     "hevp": "CODE+",
     "mmlu": "MMLU",
+    "tools": "TOOLS",
     "ctx": "CTX",
 }
 
@@ -2272,7 +2284,7 @@ def _build_menu(
         f"{'PARAMS':>10s}  "
         f"{'TYPE':>6s}  "
         f"{'FORMAT':>7s}  "
-        f"{'TOOLS':>5s}  "
+        f"{_hdr('TOOLS', 'tools'):>6s}  "
         f"{mtp_header_segment}"
         f"{_hdr('TPS', 'tps'):>7s}  "
         f"{_hdr('CODE%', 'code'):>7s}  "
