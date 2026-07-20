@@ -675,8 +675,14 @@ def run_for_target(
             from bench.tasks.tools_use import tools_use_task
             print(f"  [tools]   running n={n_tools} ...", file=sys.stderr)
             try:
+                # Pass the model's probed tool_mode so the task drives
+                # auto-mode models with tool_choice="auto" (pinning breaks
+                # non-standard formats like Nemotron's <TOOLCALL>) and keeps
+                # pinning forced-mode models. Ollama rows have no tool_mode
+                # -> default "forced" preserves their historical behaviour.
+                _tool_mode = (target.get("entry") or {}).get("tool_mode") or "forced"
                 eval_log = _invoke_inspect_task(
-                    task_obj=tools_use_task(n=n_tools),
+                    task_obj=tools_use_task(n=n_tools, tool_mode=_tool_mode),
                     served_model=served,
                     router_url=router_url,
                     log_dir=log_dir,
