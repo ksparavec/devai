@@ -360,34 +360,14 @@ def update_row(
     if host_env_id is not None:
         row["host_env_id"] = host_env_id
     # Early-drop recommendation (leak / low-score disqualifier). A flag only --
-    # readers/operators act on it; it never deletes weights. A force re-bench
-    # clears any stale flag via reset_row_for_force before this runs, so a
-    # now-passing model doesn't retain an old recommendation.
+    # readers/operators act on it; it never deletes weights. Written only when
+    # a run actually triggers it (non-None); the immutable cache never wipes a
+    # row, so a prior flag persists until a triggering run overwrites it.
     if drop_recommendation is not None:
         row["drop_recommendation"] = drop_recommendation
     row["last_benched_at"] = now
     cache[key] = row
     return row
-
-
-def reset_row_for_force(cache: dict, key: str) -> None:
-    """Clear ``tasks`` and ``metrics`` for a force re-bench, preserving
-    provenance (``first_benched_at``, ``model``, ``backend``,
-    ``router_endpoint``). No-op when the row doesn't exist yet.
-
-    Without this, ``--force`` re-runs the tasks but leaves stale
-    metric fields (e.g. an old ``ttft_ms_first`` from a prior driver
-    version) sitting next to the new run -- and the leaderboard can't
-    tell which is which.
-    """
-    row = cache.get(key)
-    if not isinstance(row, dict):
-        return
-    row["tasks"] = {}
-    row["metrics"] = {}
-    # Drop the early-drop recommendation too: a force re-bench re-derives it
-    # from scratch, so a now-passing model must not keep a stale flag.
-    row.pop("drop_recommendation", None)
 
 
 # ── Host environment capture ────────────────────────────────────────────────

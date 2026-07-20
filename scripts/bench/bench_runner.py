@@ -46,7 +46,6 @@ from bench._bench_core import (  # noqa: E402
     cache_key_for_entry,
     capture_host_env,
     migrate_bench_cache_keys,
-    reset_row_for_force,
     router_url_for,
     serving_alias,
     serving_alias_with_ctx,
@@ -487,13 +486,18 @@ def run_for_target(
     drop_threshold: float = 0.70,
     early_drop: bool = True,
 ) -> None:
-    """Run all requested tasks against one model and persist results."""
+    """Run all requested tasks against one model and persist results.
+
+    Cache data is immutable: a task result, once written, is never deleted
+    or modified -- with exactly one exception, ``--force``, which re-runs a
+    task and overwrites its entry ONLY when the new run succeeds. A failed
+    task writes nothing (the prior value, if any, stands). Without --force,
+    a task that already has a result is skipped entirely. So `--force` never
+    wipes the row upfront: unrelated tasks (e.g. the sharper benches) survive
+    a forced re-run of the default tasks.
+    """
     served = serving_alias_with_ctx(target["alias"], target["ctx"], backend)
     key = target["key"]
-    if force:
-        # Wipe stale tasks/metrics so the new run's numbers stand alone.
-        # Provenance (first_benched_at) is preserved by reset_row_for_force.
-        reset_row_for_force(cache, key)
     existing = cache.get(key) or {}
     existing_tasks = (existing.get("tasks") or {})
 
@@ -573,11 +577,9 @@ def run_for_target(
                 print(f"    score: {score:.4f} (n={n})", file=sys.stderr)
             except Exception as e:  # noqa: BLE001 — inspect_ai surfaces many error shapes
                 print(f"    !! gsm8k failed: {e}", file=sys.stderr)
-                # Stamp the failure into the cache so a later non-`--force`
-                # run sees "errored once" instead of "never ran" -- the
-                # latter silently re-runs the same broken combo or omits
-                # the row from the leaderboard.
-                task_results["gsm8k_error"] = {"error": str(e), "ran_at": _now_iso()}
+                # Immutable-on-failure: write nothing. A failed task leaves the
+                # cache untouched (prior value, if any, stands; absent stays
+                # absent so a later run retries it).
         _check_drop()
 
         if drop_flag is None and "humaneval" in tasks and (force or "humaneval" not in [_strip_subset(t) for t in existing_tasks]):
@@ -601,7 +603,6 @@ def run_for_target(
                 print(f"    pass@1: {score:.4f} (n={n})", file=sys.stderr)
             except Exception as e:  # noqa: BLE001
                 print(f"    !! humaneval failed: {e}", file=sys.stderr)
-                task_results["humaneval_error"] = {"error": str(e), "ran_at": _now_iso()}
         _check_drop()
 
         if drop_flag is None and "humaneval_plus" in tasks and (force or "humaneval_plus" not in [_strip_subset(t) for t in existing_tasks]):
@@ -625,7 +626,6 @@ def run_for_target(
                 print(f"    pass@1: {score:.4f} (n={n})", file=sys.stderr)
             except Exception as e:  # noqa: BLE001
                 print(f"    !! humaneval_plus failed: {e}", file=sys.stderr)
-                task_results["humaneval_plus_error"] = {"error": str(e), "ran_at": _now_iso()}
 
         if drop_flag is None and "mmlu_pro" in tasks and (force or "mmlu_pro" not in [_strip_subset(t) for t in existing_tasks]):
             from bench.tasks.mmlu_pro import mmlu_pro_task
@@ -648,7 +648,6 @@ def run_for_target(
                 print(f"    score: {score:.4f} (n={n})", file=sys.stderr)
             except Exception as e:  # noqa: BLE001
                 print(f"    !! mmlu_pro failed: {e}", file=sys.stderr)
-                task_results["mmlu_pro_error"] = {"error": str(e), "ran_at": _now_iso()}
 
         if drop_flag is None and "gpqa" in tasks and (force or "gpqa" not in [_strip_subset(t) for t in existing_tasks]):
             from bench.tasks.gpqa import gpqa_task
@@ -671,7 +670,6 @@ def run_for_target(
                 print(f"    score: {score:.4f} (n={n})", file=sys.stderr)
             except Exception as e:  # noqa: BLE001
                 print(f"    !! gpqa failed: {e}", file=sys.stderr)
-                task_results["gpqa_error"] = {"error": str(e), "ran_at": _now_iso()}
 
         if drop_flag is None and "tools" in tasks and (force or "tools" not in [_strip_subset(t) for t in existing_tasks]):
             from bench.tasks.tools_use import tools_use_task
@@ -704,7 +702,6 @@ def run_for_target(
                     print(f"    by_subcase: {by_sub}", file=sys.stderr)
             except Exception as e:  # noqa: BLE001
                 print(f"    !! tools_use failed: {e}", file=sys.stderr)
-                task_results["tools_use_error"] = {"error": str(e), "ran_at": _now_iso()}
 
         if drop_flag is None and "longctx" in tasks and (force or "longctx_probe" not in existing_tasks):
             from bench import bench_longctx
@@ -739,7 +736,6 @@ def run_for_target(
                     )
             except Exception as e:  # noqa: BLE001
                 print(f"    !! longctx failed: {e}", file=sys.stderr)
-                task_results["longctx_error"] = {"error": str(e), "ran_at": _now_iso()}
 
     finally:
         vram = sampler.stop()
