@@ -461,6 +461,7 @@ families:
     parsers:
       vllm:
         reasoning: nemotron_v3
+        tool: nemotron_json
     # Reasoning parser nemotron_v3 is NOT registered in the pinned vLLM
     # v0.22.1 image (passing it crashes the engine at startup, container
     # exits before /health). It IS registered in vLLM v0.25.1, to which
@@ -475,15 +476,16 @@ families:
     # serve/bench at temp>=0.6 (NVIDIA's recommended Nemotron sampling),
     # else the reasoning trace runs away and no answer is emitted.
     #
-    # Tool parser intentionally not curated. The 9B-v2 chat template uses
-    # NVIDIA's custom uppercase `<TOOLCALL>[...]</TOOLCALL>` /
-    # `<AVAILABLE_TOOLS>` / `<TOOL_RESPONSE>` format -- no shipped vLLM
-    # or SGLang parser matches it (all stock parsers expect lowercase
-    # `<tool_call>` Hermes-style or family-specific tokens). Without a
-    # custom parser, the router strips `tools`/`tool_choice` for this
-    # model: agentic tool calls are silently absent, plain chat +
-    # reasoning work. (NVIDIA ships a nemotron_json tool-parser plugin;
-    # wiring it is a separate follow-up.)
+    # Tool parser: the 9B-v2 chat template uses NVIDIA's custom uppercase
+    # `<TOOLCALL>[...]</TOOLCALL>` format, which no stock vLLM parser
+    # matches. We wire NVIDIA's own nemotron_json tool parser as a plugin
+    # (scripts/vllm_plugins/nemotron_json_tool_parser.py, registered in
+    # deploy/vllm-plugins.json) -- its import paths are ported to the
+    # v0.25.1 module layout this model runs on; the logic is upstream's.
+    # The prober/router emit --tool-parser-plugin <file> +
+    # --tool-call-parser nemotron_json. vLLM only (SGLang has no plugin
+    # analogue). If the probe fails to verify tool round-trips, the router
+    # falls back to stripping tools -- plain chat + reasoning still work.
     arch_ref: nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4
     thinking: true        # hint; vLLM/SGLang variants probed separately later
 

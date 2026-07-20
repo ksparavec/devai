@@ -2713,6 +2713,7 @@ models:
     parsers:
       vllm:
         reasoning: nemotron_v3
+        tool: nemotron_json
 
   - name: "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"
     family: nemotron-3-nano

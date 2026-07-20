@@ -26,6 +26,10 @@
     "nano_v3": {
       "kind": "reasoning",
       "file": "nano_v3_reasoning_parser.py"
+    },
+    "nemotron_json": {
+      "kind": "tool",
+      "file": "nemotron_json_tool_parser.py"
     }
   }
 }
