@@ -151,6 +151,12 @@ type configModel struct {
 	// a model even when the catalog declares `mtp:`, serving baseline.
 	// False when MTP fit was verified OR never probed (prior behaviour).
 	MTPProbedUnfit bool `yaml:"-"`
+	// KVByCtx maps each fully-on-GPU probed ctx tier at the host band to
+	// the KV-cache dtype the cell was measured under ("" / "f16" = daemon
+	// default). A tier probed with kv_cache_type=q8_0 only fits WITH
+	// quantized KV, so the router must reproduce that dtype when serving
+	// any ctx the tier covers (see resolveKVCacheType). Ollama only.
+	KVByCtx map[int]string `yaml:"-"`
 }
 
 // configReasoning records what the runtime probe observed for this model.
@@ -214,6 +220,11 @@ type launchConfig struct {
 	MaxNumSeqs      int
 	ToolParser      string // empty omits backend-specific tool flags
 	ReasoningParser string // empty omits --reasoning-parser
+	// KVCacheType is the KV dtype the probe measured the serving ctx's
+	// covering tier under. Ollama's DynamicEnv bakes it into the
+	// recreated container (plus OLLAMA_FLASH_ATTENTION=1, which KV
+	// quantization requires); ""/"f16" emits nothing (daemon default).
+	KVCacheType string
 	// Plugin paths are populated when ToolParser / ReasoningParser
 	// resolve through the vllm-plugins registry. Each holds the
 	// in-container absolute path to a plugin .py file. Empty values
@@ -260,6 +271,10 @@ type cacheProbe struct {
 	ActualTotalGB float64 `json:"actual_total_gb"`
 	FullyOnGPU    bool    `json:"fully_on_gpu"`
 	Capability    string  `json:"capability"`
+	// KVCacheType is the KV dtype the daemon served this cell under
+	// (stamped by the prober from OLLAMA_KV_CACHE_TYPE; "" on cells
+	// probed before the field existed = f16).
+	KVCacheType string `json:"kv_cache_type"`
 }
 
 // cacheEntry mirrors the per-digest record in
@@ -297,6 +312,7 @@ func synthesizeFromCache(
 		}
 		bestCtx := 0
 		var bestProbe cacheProbe
+		kvByCtx := make(map[int]string)
 		for ctxStr, probe := range band {
 			c, err := strconv.Atoi(ctxStr)
 			if err != nil {
@@ -308,6 +324,7 @@ func synthesizeFromCache(
 			if !probe.FullyOnGPU {
 				continue
 			}
+			kvByCtx[c] = probe.KVCacheType
 			if c >= bestCtx {
 				bestCtx = c
 				bestProbe = probe
@@ -340,6 +357,7 @@ func synthesizeFromCache(
 			Size:         fmt.Sprintf("%.2f GB", bestProbe.ActualTotalGB),
 			Context:      effCtx,
 			ProbedMaxCtx: bestCtx,
+			KVByCtx:      kvByCtx,
 			Reasoning: &configReasoning{
 				Capability:      capability,
 				DisableVerified: entry.DisableVerified,
@@ -720,6 +738,13 @@ type arbiter struct {
 	// is conservative for MoE/GQA models — when we have a fits=true cell
 	// at hostKey, we trust it over the heuristic at launch time.
 	modelProbedMaxCtx map[string]map[string]int // backend → model name → highest fits=true ctx
+	// modelKVByCtx maps each fully-on-GPU probed ctx tier to the KV-cache
+	// dtype it was measured under (""/"f16" = daemon default). A tier that
+	// only fits with quantized KV (e.g. q8_0 at 128K on a model whose f16
+	// KV spills there) must be served with that same dtype — the launch
+	// path resolves the covering tier via resolveKVCacheType and bakes
+	// OLLAMA_KV_CACHE_TYPE into the recreated container. Ollama only.
+	modelKVByCtx map[string]map[string]map[int]string // backend → model → ctx tier → kv dtype
 	// modelMTP holds the catalog-declared multi-token-prediction launch
 	// params per (backend, model). Populated at startup from
 	// configModel.MTP (which the catalog metadata side-table in
@@ -926,6 +951,59 @@ func applyProbeCeiling(heuristicCtx, requestedCtx, probedMax int) int {
 		ctx = probedMax
 	}
 	return ctx
+}
+
+// resolveKVCacheType returns the KV-cache dtype for serving `ctx`, from the
+// per-tier map the probe cache recorded (kvByCtx: probed ctx tier → dtype
+// the cell was measured under). The covering tier is the SMALLEST probed
+// tier >= ctx: a fit at tier T validates every ctx <= T only under T's own
+// KV dtype, and picking the smallest cover keeps low-ctx sessions on the
+// highest-fidelity dtype that provably fits (e.g. 64K stays f16 even when
+// a q8_0-only 128K tier exists above it). Returns "" (daemon default /
+// f16) when no tier covers ctx or the map is empty.
+func resolveKVCacheType(kvByCtx map[int]string, ctx int) string {
+	best := 0
+	kv := ""
+	for tier, dtype := range kvByCtx {
+		if tier >= ctx && (best == 0 || tier < best) {
+			best = tier
+			kv = dtype
+		}
+	}
+	if kv == "f16" {
+		// Explicit f16 stamp = daemon default; emit nothing so the
+		// container spec stays byte-identical to pre-KV-field launches.
+		return ""
+	}
+	return kv
+}
+
+// ollamaLaunchCtx resolves the context an ollama container is launched at:
+// the probed ceiling by default, clamped down by a per-request `@<ctx>`
+// override (desired <= 0 = no override). The override is how mixed-KV
+// models pin their full-quality f16 tier instead of the largest
+// (quantized) one; it never raises the ceiling.
+func ollamaLaunchCtx(probed, desired int) int {
+	if desired > 0 && desired < probed {
+		return desired
+	}
+	return probed
+}
+
+// ollamaDynamicEnv is the per-recreate env for the ollama backend: the
+// probed context ceiling always, plus the KV dtype when the serving ctx's
+// covering probe tier was measured under a non-default dtype. Flash
+// attention is a hard prerequisite for quantized KV in ollama, so the two
+// travel together.
+func ollamaDynamicEnv(lc launchConfig) map[string]string {
+	env := map[string]string{
+		"OLLAMA_CONTEXT_LENGTH": fmt.Sprintf("%d", lc.MaxContext),
+	}
+	if lc.KVCacheType != "" {
+		env["OLLAMA_KV_CACHE_TYPE"] = lc.KVCacheType
+		env["OLLAMA_FLASH_ATTENTION"] = "1"
+	}
+	return env
 }
 
 // computeLaunchConfig builds a launchConfig for the given model and backend.
@@ -1294,11 +1372,7 @@ func main() {
 			// is honored on every request surface -- so recreating per model
 			// with the probed ctx keeps /v1 clients from silently loading at
 			// 256K and spilling to CPU.
-			DynamicEnv: func(lc launchConfig) map[string]string {
-				return map[string]string{
-					"OLLAMA_CONTEXT_LENGTH": fmt.Sprintf("%d", lc.MaxContext),
-				}
-			},
+			DynamicEnv: ollamaDynamicEnv,
 		},
 		{
 			Name:          "vllm",
@@ -1342,6 +1416,7 @@ func main() {
 	modelReasoningParser := make(map[string]map[string]string) // backend → model → --reasoning-parser
 	modelToolMode := make(map[string]map[string]string)        // backend → model → "auto" | "forced"
 	modelProbedMaxCtx := make(map[string]map[string]int)       // backend → model → highest fits=true ctx
+	modelKVByCtx := make(map[string]map[string]map[int]string) // backend → model → ctx tier → kv dtype
 	modelMTP := make(map[string]map[string]*configSpeculative) // backend → model → catalog MTP block
 	modelMTPUnfit := make(map[string]map[string]bool)          // backend → model → probe recorded mtp_fits=false
 	capCounts := make(map[string]int)
@@ -1404,6 +1479,12 @@ func main() {
 					}
 					modelProbedMaxCtx[backend][name] = m.ProbedMaxCtx
 				}
+				if len(m.KVByCtx) > 0 {
+					if modelKVByCtx[backend] == nil {
+						modelKVByCtx[backend] = make(map[string]map[int]string)
+					}
+					modelKVByCtx[backend][name] = m.KVByCtx
+				}
 				if m.MTP != nil {
 					if modelMTP[backend] == nil {
 						modelMTP[backend] = make(map[string]*configSpeculative)
@@ -1458,6 +1539,7 @@ func main() {
 		modelReasoningParser: modelReasoningParser,
 		modelToolMode:        modelToolMode,
 		modelProbedMaxCtx:    modelProbedMaxCtx,
+		modelKVByCtx:         modelKVByCtx,
 		modelMTP:             modelMTP,
 		modelMTPUnfit:        modelMTPUnfit,
 		defaultPolicy:        policy,
@@ -1965,9 +2047,17 @@ func buildContainerSpec(
 		envMap[k] = v
 	}
 	// Per-recreate dynamic env (e.g. Ollama's OLLAMA_CONTEXT_LENGTH baked
-	// from the probed ctx). Applied last so it can override statics.
+	// from the probed ctx). Applied last so it can override statics --
+	// but never a recovery-env key: recovery entries exist precisely to
+	// let an operator override defaults for borderline checkpoints, and
+	// that must hold for probe-derived keys (OLLAMA_KV_CACHE_TYPE /
+	// OLLAMA_FLASH_ATTENTION) the same way it does for CLI flags
+	// (last-flag-wins).
 	if cfg.DynamicEnv != nil {
 		for k, v := range cfg.DynamicEnv(lc) {
+			if _, ok := recoveryEnv[k]; ok {
+				continue
+			}
 			envMap[k] = v
 		}
 	}
@@ -2011,6 +2101,12 @@ func (a *arbiter) containerRecreate(bs *backendState, modelName string, desiredC
 	lc.MaxContext = applyProbeCeiling(
 		lc.MaxContext, requestedCtx,
 		a.modelProbedMaxCtx[cfg.Name][modelName],
+	)
+	// Reproduce the KV-cache dtype the probe measured the serving ctx
+	// under (q8_0-only tiers OOM at f16 and vice-versa would waste
+	// quality; see resolveKVCacheType).
+	lc.KVCacheType = resolveKVCacheType(
+		a.modelKVByCtx[cfg.Name][modelName], lc.MaxContext,
 	)
 	// Bound the engine's concurrent-sequence batch to the router's
 	// admission cap so CUDA-graph capture only covers batch sizes we
@@ -2238,15 +2334,16 @@ func (a *arbiter) stopOtherBackends(targetName string) {
 // model and context. Called with the arbiter mutex held.
 //
 // `desiredCtx` is the per-request context cap resolved upstream (picker
-// "@<int>" override or registered modelContexts cap) for vLLM/SGLang, where
-// the context is baked into the entrypoint at startup so a context change
-// requires a full recreate even when the model is unchanged. Ollama ignores
-// this argument and is handled by ensureOllamaRunning, which recreates the
-// container per model at the probe-verified context (baked into
-// OLLAMA_CONTEXT_LENGTH) and warm-loads it fully on GPU.
+// "@<int>" override or registered modelContexts cap). For vLLM/SGLang the
+// context is baked into the entrypoint at startup so a context change
+// requires a full recreate even when the model is unchanged. For Ollama,
+// ensureOllamaRunning launches at min(desiredCtx, probed ceiling) -- a
+// `@<ctx>` override below the ceiling pins a smaller tier, which is how
+// mixed-KV models select their full-quality f16 tier instead of the
+// largest (quantized) one (see resolveKVCacheType).
 func (a *arbiter) ensureBackendRunning(bs *backendState, modelName string, desiredCtx int, desiredSpec *configSpeculative) error {
 	if bs.config.Name == "ollama" {
-		return a.ensureOllamaRunning(bs, modelName)
+		return a.ensureOllamaRunning(bs, modelName, desiredCtx)
 	}
 
 	// Recreate coalescing. If a recreate is already in flight on this
@@ -2367,13 +2464,14 @@ func (a *arbiter) ensureBackendRunning(bs *backendState, modelName string, desir
 }
 
 // ensureOllamaRunning brings the Ollama backend up with `modelName` loaded
-// at its probed context, recreating the container when the model or context
-// changes -- mirroring the vLLM/SGLang recreate-per-model lifecycle. The
-// context is baked into OLLAMA_CONTEXT_LENGTH at launch (honored on /v1,
-// unlike options.num_ctx), and a warm-load with num_gpu forced to full GPU
-// makes a misfit fail hard instead of silently spilling to CPU. Called with
-// the arbiter mutex held.
-func (a *arbiter) ensureOllamaRunning(bs *backendState, modelName string) error {
+// at min(desiredCtx, probed ceiling), recreating the container when the
+// model or context changes -- mirroring the vLLM/SGLang recreate-per-model
+// lifecycle. The context is baked into OLLAMA_CONTEXT_LENGTH at launch
+// (honored on /v1, unlike options.num_ctx), and a warm-load with num_gpu
+// forced to full GPU makes a misfit fail hard instead of silently spilling
+// to CPU. desiredCtx <= 0 means "no override" (launch at the ceiling).
+// Called with the arbiter mutex held.
+func (a *arbiter) ensureOllamaRunning(bs *backendState, modelName string, desiredCtx int) error {
 	// Model-less surfaces (/api/tags, /api/ps, /v1/models): just make sure
 	// the GPU is ours; there is nothing to load or recreate.
 	if modelName == "" {
@@ -2386,7 +2484,9 @@ func (a *arbiter) ensureOllamaRunning(bs *backendState, modelName string) error 
 
 	// Resolve the probed context: the single fits=true ctx the Ollama probe
 	// verified fully-on-GPU. Fall back to the catalog cap, then MAX_CONTEXT_LEN.
-	// This is the hard ceiling -- Ollama is never loaded above it.
+	// This is the hard ceiling -- Ollama is never loaded above it. A
+	// per-request `@<ctx>` override below the ceiling pins a smaller tier
+	// (mixed-KV models use this to stay on their f16 tier).
 	probedCtx := a.modelProbedMaxCtx["ollama"][modelName]
 	if probedCtx <= 0 {
 		probedCtx = a.modelContexts[modelName]
@@ -2394,6 +2494,7 @@ func (a *arbiter) ensureOllamaRunning(bs *backendState, modelName string) error 
 	if probedCtx <= 0 {
 		probedCtx = a.maxContextLen
 	}
+	probedCtx = ollamaLaunchCtx(probedCtx, desiredCtx)
 
 	// Coalesce with any in-flight recreate on this backend.
 	for bs.recreating {

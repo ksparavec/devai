@@ -338,6 +338,11 @@ def probe_one_context(
         "capability": cap,
         "evidence": evidence,
         "probed_at": now_iso(),
+        # KV-cache dtype the daemon served this cell under (from the probe
+        # pass env; empty/absent env = daemon default f16). Fit is only
+        # valid under the same dtype, so the router reproduces it at
+        # serve time for any ctx this cell covers.
+        "kv_cache_type": os.environ.get("OLLAMA_KV_CACHE_TYPE") or "f16",
     }
     if think_rejected_note and cap != Capability.ERROR:
         record["think_param_rejected"] = True

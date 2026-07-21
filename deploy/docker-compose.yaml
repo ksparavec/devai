@@ -34,6 +34,15 @@ services:
       # to simulate a smaller GPU during probing (so a 24G host can produce
       # cache cells valid for a 16G target). 0 = no constraint.
       - OLLAMA_GPU_OVERHEAD=${OLLAMA_GPU_OVERHEAD:-0}
+      # KV-cache dtype pass-through for probe passes (empty = f16 default).
+      # `make probe PROBE_KV_CACHE_TYPE=q8_0` sets these for the daemon so
+      # the probed cell reflects quantized-KV memory; the cell is stamped
+      # kv_cache_type and the router reproduces the dtype at serve time
+      # per covered ctx tier. Do NOT set globally in .env without a
+      # long-reasoning re-bench: q8_0 measurably degrades GPQA (see
+      # deploy/.bench-cache.json row ...::ollama::131072).
+      - OLLAMA_KV_CACHE_TYPE=${OLLAMA_KV_CACHE_TYPE:-}
+      - OLLAMA_FLASH_ATTENTION=${OLLAMA_FLASH_ATTENTION:-}
     volumes:
       - /var/cache/devai/ollama:/root/.ollama
     devices:

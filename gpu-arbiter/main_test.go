@@ -1317,6 +1317,150 @@ func TestApplyProbeCeiling_NoProbeData_FallsBackToHeuristic(t *testing.T) {
 	}
 }
 
+// --- resolveKVCacheType ---
+
+func TestResolveKVCacheType(t *testing.T) {
+	// qwen3.6:35b-a3b-mtp @ 24G: 32K/64K probed under f16 (one legacy
+	// cell with no stamp), 128K only fits under q8_0.
+	mixed := map[int]string{32768: "", 65536: "f16", 131072: "q8_0"}
+	cases := []struct {
+		name    string
+		kvByCtx map[int]string
+		ctx     int
+		want    string
+	}{
+		{"covering tier is f16-stamped 64K", mixed, 65536, ""},
+		{"legacy unstamped 32K cell means default", mixed, 32768, ""},
+		{"128K resolves to q8_0", mixed, 131072, "q8_0"},
+		{"off-grid ctx picks smallest covering tier", mixed, 100000, "q8_0"},
+		{"off-grid ctx under 64K stays f16", mixed, 40000, ""},
+		{"no covering tier means default", mixed, 262144, ""},
+		{"nil map means default", nil, 65536, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolveKVCacheType(tc.kvByCtx, tc.ctx); got != tc.want {
+				t.Fatalf("resolveKVCacheType(%v, %d) = %q, want %q",
+					tc.kvByCtx, tc.ctx, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestOllamaLaunchCtx(t *testing.T) {
+	cases := []struct {
+		name            string
+		probed, desired int
+		want            int
+	}{
+		{"no override launches at ceiling", 131072, 0, 131072},
+		{"override below ceiling pins smaller tier", 131072, 65536, 65536},
+		{"override equal to ceiling is a no-op", 131072, 131072, 131072},
+		{"override above ceiling clamps to ceiling", 131072, 262144, 131072},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ollamaLaunchCtx(tc.probed, tc.desired); got != tc.want {
+				t.Fatalf("ollamaLaunchCtx(%d, %d) = %d, want %d",
+					tc.probed, tc.desired, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSynthesizeFromCache_KVByCtx(t *testing.T) {
+	// Mixed-KV band: 64K f16-stamped, 128K q8_0, 256K q8_0 but NOT fully
+	// on GPU. KVByCtx must contain only the fully-on-GPU tiers -- a
+	// non-fitting cell's dtype must never influence launch env.
+	tr := true
+	cache := map[string]*cacheEntry{
+		"digest1": {
+			SchemaVersion:   3,
+			Digest:          "digest1",
+			Aliases:         []string{"mixed:latest"},
+			MaxContext:      262144,
+			Capability:      CapStructured,
+			DisableVerified: &tr,
+			Probes: map[string]map[string]cacheProbe{
+				"24": {
+					"65536":  {Ctx: 65536, VramGB: 24, ActualTotalGB: 20.7, FullyOnGPU: true, KVCacheType: "f16"},
+					"131072": {Ctx: 131072, VramGB: 24, ActualTotalGB: 20.7, FullyOnGPU: true, KVCacheType: "q8_0"},
+					"262144": {Ctx: 262144, VramGB: 24, FullyOnGPU: false, KVCacheType: "q8_0"},
+				},
+			},
+		},
+	}
+	models := synthesizeFromCache(cache, 24, 262144)
+	if len(models) != 1 {
+		t.Fatalf("expected 1 synthesized model, got %d", len(models))
+	}
+	m := models[0]
+	if m.ProbedMaxCtx != 131072 {
+		t.Fatalf("ProbedMaxCtx = %d, want 131072 (non-fitting 256K excluded)", m.ProbedMaxCtx)
+	}
+	want := map[int]string{65536: "f16", 131072: "q8_0"}
+	if len(m.KVByCtx) != len(want) {
+		t.Fatalf("KVByCtx = %v, want %v", m.KVByCtx, want)
+	}
+	for ctx, kv := range want {
+		if m.KVByCtx[ctx] != kv {
+			t.Fatalf("KVByCtx[%d] = %q, want %q", ctx, m.KVByCtx[ctx], kv)
+		}
+	}
+	if _, ok := m.KVByCtx[262144]; ok {
+		t.Fatalf("non-fitting 256K cell leaked into KVByCtx: %v", m.KVByCtx)
+	}
+}
+
+func TestBuildContainerSpec_RecoveryEnvWinsOverDynamicEnv(t *testing.T) {
+	// Recovery env exists to override defaults for borderline checkpoints;
+	// probe-derived DynamicEnv keys must not clobber it (same convention
+	// as last-flag-wins for recovery CLI flags).
+	cfg := backendConfig{
+		Name:          "ollama",
+		ContainerName: "devai-ollama",
+		Image:         "docker.io/ollama/ollama:latest",
+		ModelsDir:     "/var/cache/devai/ollama",
+		MountDest:     "/root/.ollama",
+		Network:       "devai-net",
+		Entrypoint:    ollamaEntrypoint,
+		DynamicEnv:    ollamaDynamicEnv,
+	}
+	lc := launchConfig{MaxContext: 131072, KVCacheType: "q8_0"}
+	recovery := map[string]string{"OLLAMA_KV_CACHE_TYPE": "f16"}
+	spec := buildContainerSpec(cfg, "mixed:latest", lc, nil, recovery)
+	envMap, ok := spec["env"].(map[string]string)
+	if !ok {
+		t.Fatalf("spec env missing/wrong type: %#v", spec["env"])
+	}
+	if envMap["OLLAMA_KV_CACHE_TYPE"] != "f16" {
+		t.Fatalf("recovery env must win over DynamicEnv, got %q", envMap["OLLAMA_KV_CACHE_TYPE"])
+	}
+	if envMap["OLLAMA_CONTEXT_LENGTH"] != "131072" {
+		t.Fatalf("non-colliding DynamicEnv keys must still apply, got %v", envMap)
+	}
+}
+
+func TestOllamaDynamicEnv_KVCacheType(t *testing.T) {
+	// The ollama DynamicEnv must bake the resolved KV dtype (plus flash
+	// attention, its prerequisite) into the recreated container — and
+	// stay byte-identical to the legacy env when the dtype is default.
+	got := ollamaDynamicEnv(launchConfig{MaxContext: 131072, KVCacheType: "q8_0"})
+	if got["OLLAMA_KV_CACHE_TYPE"] != "q8_0" || got["OLLAMA_FLASH_ATTENTION"] != "1" {
+		t.Fatalf("q8_0 launch must set KV type + flash attention, got %v", got)
+	}
+	got = ollamaDynamicEnv(launchConfig{MaxContext: 65536})
+	if got["OLLAMA_CONTEXT_LENGTH"] != "65536" {
+		t.Fatalf("context env must always be present, got %v", got)
+	}
+	if _, ok := got["OLLAMA_KV_CACHE_TYPE"]; ok {
+		t.Fatalf("default-dtype launch must not set OLLAMA_KV_CACHE_TYPE: %v", got)
+	}
+	if _, ok := got["OLLAMA_FLASH_ATTENTION"]; ok {
+		t.Fatalf("default-dtype launch must not set OLLAMA_FLASH_ATTENTION: %v", got)
+	}
+}
+
 // --- TestEnvFloat ---
 
 func TestEnvFloat(t *testing.T) {

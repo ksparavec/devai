@@ -1675,6 +1675,49 @@ def _max_fitting_ctx_info(m: dict) -> dict | None:
     return None
 
 
+def _kv_cells(m: dict) -> dict[int, str]:
+    """ctx tier -> KV-cache dtype for every fully-on-GPU probed cell at the
+    picker's VRAM band. Cells probed before the ``kv_cache_type`` field
+    existed (or explicitly stamped f16) report "f16". Ollama rows only --
+    HF probe caches carry no KV field, so HF rows return {}.
+    """
+    band = ((m.get("vram") or {}).get("probes") or {}).get(str(int(_VRAM_BUDGET)))
+    out: dict[int, str] = {}
+    if not isinstance(band, dict):
+        return out
+    for key, cell in band.items():
+        if not str(key).isdigit() or not isinstance(cell, dict):
+            continue
+        if not cell.get("fully_on_gpu"):
+            continue
+        out[int(key)] = str(cell.get("kv_cache_type") or "f16")
+    return out
+
+
+def _kv_mixed(m: dict) -> bool:
+    """True when the model's fitting tiers span more than one KV dtype
+    (e.g. 64K probed under f16, 128K only fits under q8_0). Such models
+    get a context sub-modal so the user chooses tier + quality tradeoff,
+    and the emitted name pins ``@<ctx>`` so the router reproduces the
+    probed dtype for that tier.
+    """
+    kinds = {t for t in _kv_cells(m).values()}
+    return len(kinds) > 1
+
+
+def _kv_for_ctx(m: dict, ctx: int) -> str:
+    """KV dtype of the smallest probed tier covering ``ctx`` (the tier the
+    router will reproduce at serve time -- mirror of the arbiter's
+    resolveKVCacheType). "f16" when no tier covers ctx.
+    """
+    best = 0
+    kv = "f16"
+    for tier, dtype in _kv_cells(m).items():
+        if tier >= ctx and (best == 0 or tier < best):
+            best, kv = tier, dtype
+    return kv or "f16"
+
+
 def _dedup_hf_by_name(models: list[dict]) -> list[dict]:
     """When the same model name has rows for multiple HF backends, keep
     the highest-priority one. vLLM > SGLang. Ollama tag names never
@@ -2006,12 +2049,33 @@ def _capability_summary_text(
         )
     else:
         mtp_line = "MTP:       not available\n"
+    kv_line = ""
+    if _kv_mixed(m):
+        cells = _kv_cells(m)
+        quant = {t: k for t, k in cells.items() if k not in ("", "f16")}
+        f16_tiers = sorted(t for t, k in cells.items() if k in ("", "f16"))
+        quant_label = "/".join(
+            f"{_context_label(t)} ({quant[t]})" for t in sorted(quant)
+        )
+        f16_max = _context_label(max(f16_tiers)) if f16_tiers else "?"
+        gpqa_note = (
+            " (GPQA drops\n           ~10 points measured for q8_0)"
+            if "q8_0" in quant.values()
+            else ""
+        )
+        kv_line = (
+            f"KV cache:  {quant_label} serves with quantized KV --\n"
+            f"           reasoning is WEAKER on long chains{gpqa_note};\n"
+            f"           up to {f16_max} serves f16 (full quality).\n"
+            f"           Pick the tier at launch.\n"
+        )
     head = (
         f"Model:     {name}\n"
         f"Backend:   {backend}\n"
         f"{fmt_block}"
         f"Params:    {params}    Type: {type_label}\n"
         f"Context:   {_context_label(ctx)} (max fit at {_VRAM_BUDGET:g} GB)\n"
+        f"{kv_line}"
         f"VRAM:      {vram_str}\n"
         f"\n"
         f"Reasoning: {reason_label}\n"
@@ -2621,6 +2685,38 @@ def _apply_aiagent_gpu(agent_id: str) -> bool:
     return True
 
 
+def _resolve_kv_tier(model: dict) -> tuple[int, bool] | None:
+    """Context-tier sub-modal for mixed-KV models (some tiers only fit
+    with quantized KV). Returns (selected_ctx, pinned) -- pinned=True
+    means the emitted name must carry ``@<ctx>`` so the router serves the
+    probed dtype for exactly that tier. Non-mixed models return the
+    default max-fit context unpinned without showing a modal. None =
+    user pressed Esc, caller re-enters the model list.
+    """
+    default_ctx = int(model.get("_picker_context") or _DEFAULT_CONTEXT)
+    if model.get("backend") != "ollama" or not _kv_mixed(model):
+        return (default_ctx, False)
+    tiers = sorted(_kv_cells(model), reverse=True)
+    lines = []
+    for t in tiers:
+        kv = _kv_for_ctx(model, t)
+        if kv not in ("", "f16"):
+            note = f"KV {kv} -- weaker long-form reasoning"
+            if kv == "q8_0":
+                note += " (GPQA ~-10 pts)"
+        else:
+            note = "KV f16 -- full quality"
+        lines.append(f"  {_context_label(t):>5s}  {_DIM}({note}){_RESET}")
+    header = (
+        f"Context tier  ▸  {_BOLD}{_strip_latest(model['name'])}{_RESET}"
+        f"   {_DIM}(tier sets KV dtype; Esc → back to model list){_RESET}"
+    )
+    idx = _fzf(lines, header)
+    if idx is None:
+        return None
+    return (tiers[idx], True)
+
+
 def _resolve_agent(agent_filter: str | None, model: dict) -> tuple[str, str, str] | None:
     """Drive reasoning toggle (inline-reasoning only) → MTP toggle (when
     catalog declares it AND DEVAI_MTP_PREVIEW is on) → agent picker.
@@ -2927,13 +3023,17 @@ def main() -> None:
         if model is None:  # defensive — _fzf already filters headers
             continue
 
+        kv_choice = _resolve_kv_tier(model)
+        if kv_choice is None:
+            # Backed out of the context-tier modal. Re-enter the model list.
+            continue
+        selected_context, ctx_pinned = kv_choice
+
         decision = _resolve_agent(agent_filter, model)
         if decision is None:
             # Backed out of the info / agent modal. Re-enter the model list.
             continue
         agent_id, reasoning_mode, mtp_mode = decision
-
-        selected_context = int(model.get("_picker_context") or _DEFAULT_CONTEXT)
         os.environ["CONTEXT"] = str(selected_context)
         base_name = _strip_latest(model["name"])
         # `::nothink` rides on the model name only when the user explicitly
@@ -2949,9 +3049,13 @@ def main() -> None:
         # reasoning) lines up cleanly.
         mtp_suffix = "::mtp" if (_MTP_PREVIEW and mtp_mode == "on") else ""
         if model["backend"] == "ollama":
-            # Ollama: KV is dynamic per request; only the suffixes ride
-            # on the model name.
-            serving_name = f"{base_name}{reasoning_suffix}{mtp_suffix}"
+            # Ollama: KV allocation is dynamic per request, so the name
+            # normally rides bare. EXCEPTION: mixed-KV models (some tiers
+            # only fit with quantized KV) pin `@<ctx>` so the router
+            # launches the chosen tier with its probed KV dtype instead
+            # of defaulting to the largest (quantized) tier.
+            ctx_suffix = f"@{selected_context}" if ctx_pinned else ""
+            serving_name = f"{base_name}{reasoning_suffix}{mtp_suffix}{ctx_suffix}"
         else:
             # vLLM / SGLang: order is `<name>::<reasoning>::<mtp>@<ctx>`.
             serving_name = f"{base_name}{reasoning_suffix}{mtp_suffix}@{selected_context}"

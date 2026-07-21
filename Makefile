@@ -1161,6 +1161,13 @@ vram-fit: ## Show which models from the full catalog fit in VRAM (planning aid; 
 
 PROBE_VRAMS    ?= 16G,24G
 PROBE_CONTEXTS ?= 32K,64K,128K,256K
+# KV-cache dtype for THIS probe pass (empty = daemon default f16). Cells
+# probed with PROBE_KV_CACHE_TYPE=q8_0 are stamped kv_cache_type=q8_0 in
+# the cache; the router then reproduces that dtype when serving a ctx the
+# cell covers. Typical use: force just the tier that only fits quantized,
+# e.g. PROBE_FORCE_CTX=128K PROBE_KV_CACHE_TYPE=q8_0 PROBE_FLASH_ATTENTION=1.
+PROBE_KV_CACHE_TYPE   ?=
+PROBE_FLASH_ATTENTION ?=
 
 probe: ## Probe every downloaded ollama digest at every (VRAM, CONTEXT) tier.
 	@# Loops over PROBE_VRAMS, recreating devai-ollama with
@@ -1175,6 +1182,8 @@ probe: ## Probe every downloaded ollama digest at every (VRAM, CONTEXT) tier.
 	    echo ">>> probing at VRAM=$$vram (host=$(GPU_MEMORY_GB)G, OLLAMA_GPU_OVERHEAD=$$overhead_bytes bytes)"; \
 	    $(CONTAINER_RUNTIME) rm -f $(OLLAMA_CONTAINER) >/dev/null 2>&1 || true; \
 	    OLLAMA_GPU_OVERHEAD=$$overhead_bytes \
+	    OLLAMA_KV_CACHE_TYPE="$(PROBE_KV_CACHE_TYPE)" \
+	    OLLAMA_FLASH_ATTENTION="$(PROBE_FLASH_ATTENTION)" \
 	      $(COMPOSE) -f $(CACHE_COMPOSE) up -d ollama; \
 	    until $(CONTAINER_RUNTIME) exec $(OLLAMA_CONTAINER) ollama list >/dev/null 2>&1; do sleep 1; done; \
 	    $(CONTAINER_RUNTIME) run --rm \
@@ -1183,6 +1192,7 @@ probe: ## Probe every downloaded ollama digest at every (VRAM, CONTEXT) tier.
 	        -v $(CURDIR)/deploy:/deploy \
 	        -e OLLAMA_HOST=http://devai-ollama:11434 \
 	        -e PROBE_CONTEXTS=$(PROBE_CONTEXTS) \
+	        -e OLLAMA_KV_CACHE_TYPE="$(PROBE_KV_CACHE_TYPE)" \
 	        --entrypoint python3 \
 	        $(IMAGE_NAME) \
 	        /scripts/probe-ollama-reasoning.py \
