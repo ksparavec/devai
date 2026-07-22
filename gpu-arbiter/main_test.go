@@ -1329,13 +1329,13 @@ func TestResolveKVCacheType(t *testing.T) {
 		ctx     int
 		want    string
 	}{
-		{"covering tier is f16-stamped 64K", mixed, 65536, ""},
-		{"legacy unstamped 32K cell means default", mixed, 32768, ""},
+		{"covering tier returns its raw f16 stamp", mixed, 65536, "f16"},
+		{"legacy unstamped 32K cell stays empty", mixed, 32768, ""},
 		{"128K resolves to q8_0", mixed, 131072, "q8_0"},
 		{"off-grid ctx picks smallest covering tier", mixed, 100000, "q8_0"},
-		{"off-grid ctx under 64K stays f16", mixed, 40000, ""},
-		{"no covering tier means default", mixed, 262144, ""},
-		{"nil map means default", nil, 65536, ""},
+		{"off-grid ctx under 64K covers to f16 tier", mixed, 40000, "f16"},
+		{"no covering tier means empty", mixed, 262144, ""},
+		{"nil map means empty", nil, 65536, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1458,6 +1458,93 @@ func TestOllamaDynamicEnv_KVCacheType(t *testing.T) {
 	}
 	if _, ok := got["OLLAMA_FLASH_ATTENTION"]; ok {
 		t.Fatalf("default-dtype launch must not set OLLAMA_FLASH_ATTENTION: %v", got)
+	}
+	// A raw "f16" stamp is the daemon default too — flagless.
+	got = ollamaDynamicEnv(launchConfig{MaxContext: 65536, KVCacheType: "f16"})
+	if _, ok := got["OLLAMA_KV_CACHE_TYPE"]; ok {
+		t.Fatalf("f16-stamped launch must not set OLLAMA_KV_CACHE_TYPE: %v", got)
+	}
+}
+
+func TestVllmEntrypoint_KVCacheDtype(t *testing.T) {
+	// Legacy rows (no stamp) must keep the historical fp8 — every
+	// pre-field fit cell was measured under it.
+	args := vllmEntrypoint("m", launchConfig{MaxContext: 32768})
+	if !hasFlagValue(args, "--kv-cache-dtype", "fp8") {
+		t.Fatalf("unstamped launch must default to fp8: %v", args)
+	}
+	// A model re-probed under auto (unquantized KV) serves auto.
+	args = vllmEntrypoint("m", launchConfig{MaxContext: 32768, KVCacheType: "auto"})
+	if !hasFlagValue(args, "--kv-cache-dtype", "auto") {
+		t.Fatalf("auto-stamped launch must serve auto: %v", args)
+	}
+}
+
+func TestSglangEntrypoint_KVCacheDtype(t *testing.T) {
+	// Legacy rows (no stamp) ran the engine default — no flag at all.
+	args := sglangEntrypoint("m", launchConfig{MaxContext: 32768})
+	for _, a := range args {
+		if a == "--kv-cache-dtype" {
+			t.Fatalf("unstamped sglang launch must not emit --kv-cache-dtype: %v", args)
+		}
+	}
+	// An enforced-dtype stamp is reproduced.
+	args = sglangEntrypoint("m", launchConfig{MaxContext: 32768, KVCacheType: "fp8_e5m2"})
+	if !hasFlagValue(args, "--kv-cache-dtype", "fp8_e5m2") {
+		t.Fatalf("stamped sglang launch must reproduce dtype: %v", args)
+	}
+}
+
+// hasFlagValue reports whether args contains `flag` immediately followed
+// by `value`.
+func hasFlagValue(args []string, flag, value string) bool {
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == flag && args[i+1] == value {
+			return true
+		}
+	}
+	return false
+}
+
+func TestSynthesizeHFFromCache_KVByCtx(t *testing.T) {
+	// vLLM legacy cells (no stamp) decode to fp8 — the dtype they were
+	// factually measured under; stamped cells keep their stamp; sglang
+	// legacy cells stay "" (engine default).
+	tool := "qwen3_xml"
+	entry := func() *hfCacheEntry {
+		return &hfCacheEntry{
+			SchemaVersion: 2,
+			Repo:          "org/model",
+			Aliases:       []string{"model"},
+			SizeGB:        10,
+			MaxContext:    262144,
+			Capability:    CapStructured,
+			ToolParser:    &tool,
+			Probes: map[string]map[string]hfCacheProbe{
+				"24": {
+					"65536":  {Ctx: 65536, VramGB: 24, Fits: true, ActualVRAMGB: 20},
+					"131072": {Ctx: 131072, VramGB: 24, Fits: true, ActualVRAMGB: 21, KVCacheType: "auto"},
+				},
+			},
+		}
+	}
+	vllmRows := synthesizeHFFromCache(
+		map[string]*hfCacheEntry{"k": entry()}, "vllm", 24, 262144, nil,
+	)
+	if len(vllmRows) != 1 {
+		t.Fatalf("expected 1 vllm row, got %d", len(vllmRows))
+	}
+	if got := vllmRows[0].KVByCtx[65536]; got != "fp8" {
+		t.Fatalf("legacy vllm cell must decode to fp8, got %q", got)
+	}
+	if got := vllmRows[0].KVByCtx[131072]; got != "auto" {
+		t.Fatalf("stamped vllm cell must keep its stamp, got %q", got)
+	}
+	sglangRows := synthesizeHFFromCache(
+		map[string]*hfCacheEntry{"k": entry()}, "sglang", 24, 262144, nil,
+	)
+	if got := sglangRows[0].KVByCtx[65536]; got != "" {
+		t.Fatalf("legacy sglang cell must stay engine-default, got %q", got)
 	}
 }
 

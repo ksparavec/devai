@@ -74,13 +74,14 @@ def vllm_command_args(
         "--port", "11434",
         "--tensor-parallel-size", "1",
         "--max-model-len", str(max_ctx),
-        # FP8 KV cache halves KV memory vs the default fp16. On a 24 GiB
-        # GPU the difference is what makes 128K+ contexts on 18 GiB NVFP4
-        # weights fit (KV at 128K drops from ~7 GiB to ~3.5 GiB). Blackwell
-        # has native fp8; older GPUs use vLLM's fp8 emulation. Match the
-        # router's vllmEntrypoint in gpu-arbiter/main.go so probe-time and
-        # serve-time launches use identical memory math.
-        "--kv-cache-dtype", "fp8",
+        # KV-cache dtype for THIS probe pass (default fp8: halves KV
+        # memory vs fp16 -- on 24 GiB that's what makes 128K+ contexts
+        # on 18 GiB NVFP4 weights fit). Overridable per pass via
+        # PROBE_KV_CACHE_TYPE (e.g. `auto` to measure unquantized KV);
+        # each probed cell is stamped kv_cache_type so the router
+        # reproduces the measured dtype at serve time -- fit is only
+        # valid under the dtype it was measured with.
+        "--kv-cache-dtype", KV_CACHE_DTYPE,
         "--gpu-memory-utilization", f"{host_frac:.4f}",
         "--enable-prefix-caching",
         "--trust-remote-code",
@@ -99,6 +100,12 @@ def vllm_command_args(
     return args
 
 
+# KV dtype this probe pass launches every cell with. Historical default
+# is fp8 (all pre-field cache cells were measured under it); a
+# PROBE_KV_CACHE_TYPE=auto pass measures unquantized KV for models with
+# VRAM slack.
+KV_CACHE_DTYPE = os.environ.get("PROBE_KV_CACHE_TYPE") or "fp8"
+
 SPEC = BackendSpec(
     name="vllm",
     image=DEFAULT_VLLM_IMAGE,
@@ -109,6 +116,7 @@ SPEC = BackendSpec(
     entrypoint="python3",
     build_args=vllm_command_args,
     supports_plugins=True,
+    kv_cache_dtype=KV_CACHE_DTYPE,
 )
 
 

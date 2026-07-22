@@ -1217,6 +1217,10 @@ probe-vllm: ## Probe every downloaded vLLM/HF model per (VRAM, CONTEXT) cell.
 	@#   PROBE_REPO=<regex>          filter catalog rows by repo
 	@#   PROBE_FORCE=1               re-probe every cell
 	@#   PROBE_FORCE_ARCH=1          re-probe top-level capability/arch
+	@#   PROBE_KV_CACHE_TYPE=auto    KV dtype for this pass (default fp8);
+	@#                               cells are stamped so serve time
+	@#                               reproduces the measured dtype
+	PROBE_KV_CACHE_TYPE="$(PROBE_KV_CACHE_TYPE)" \
 	python3 scripts/probe-vllm-reasoning.py \
 	    --host-vram-gb $(GPU_MEMORY_GB) \
 	    --models-dir $(VLLM_MODELS_DIR) \
@@ -1234,6 +1238,11 @@ probe-sglang: ## Probe every downloaded SGLang/HF model per (VRAM, CONTEXT) cell
 	@#   PROBE_REPO=<regex>          filter catalog rows by repo
 	@#   PROBE_FORCE=1               re-probe every cell
 	@#   PROBE_FORCE_ARCH=1          re-probe top-level capability/arch
+	@#   PROBE_KV_CACHE_TYPE=fp8_e5m2  enforce a KV dtype for this pass
+	@#                               (default: none = engine default);
+	@#                               cells are stamped so serve time
+	@#                               reproduces the measured dtype
+	PROBE_KV_CACHE_TYPE="$(PROBE_KV_CACHE_TYPE)" \
 	python3 scripts/probe-sglang-reasoning.py \
 	    --host-vram-gb $(GPU_MEMORY_GB) \
 	    --models-dir $(SGLANG_MODELS_DIR) \

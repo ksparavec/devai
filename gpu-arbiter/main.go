@@ -398,6 +398,13 @@ type hfCacheProbe struct {
 	// suppresses ::mtp for a model whose cells recorded mtp_fits=false so a
 	// speculative launch that would 503 falls back to baseline instead.
 	MtpFits *bool `json:"mtp_fits,omitempty"`
+	// KVCacheType is the KV dtype the prober launched this cell with
+	// (stamped from the pass's PROBE_KV_CACHE_TYPE). "" on legacy cells:
+	// for vLLM that factually means fp8 (the prober always passed
+	// --kv-cache-dtype fp8 before the field existed); for SGLang it
+	// means the engine default (no flag). synthesizeHFFromCache encodes
+	// that asymmetry.
+	KVCacheType string `json:"kv_cache_type"`
 }
 
 // hfCacheEntry mirrors the per-(repo, sha) record in the HF probe caches.
@@ -483,6 +490,7 @@ func synthesizeHFFromCache(
 		}
 		bestCtx := 0
 		var bestProbe hfCacheProbe
+		kvByCtx := make(map[int]string)
 		for ctxStr, probe := range band {
 			c, err := strconv.Atoi(ctxStr)
 			if err != nil {
@@ -502,6 +510,15 @@ func synthesizeHFFromCache(
 			if probe.ServingOk != nil && !*probe.ServingOk {
 				continue
 			}
+			// Per-tier KV dtype. Legacy unstamped vLLM cells were all
+			// measured under --kv-cache-dtype fp8 (the prober's
+			// historical hardcode), so "" decodes to fp8 there; SGLang
+			// legacy cells ran the engine default (no flag) and stay "".
+			kv := probe.KVCacheType
+			if kv == "" && backendName == "vllm" {
+				kv = "fp8"
+			}
+			kvByCtx[c] = kv
 			if c >= bestCtx {
 				bestCtx = c
 				bestProbe = probe
@@ -590,6 +607,7 @@ func synthesizeHFFromCache(
 			Size:            fmt.Sprintf("%.2f GB", sizeGB),
 			Context:         effCtx,
 			ProbedMaxCtx:    bestCtx,
+			KVByCtx:         kvByCtx,
 			ToolParser:      toolParser,
 			ReasoningParser: reasoningParser,
 			ToolMode:        toolMode,
@@ -959,8 +977,10 @@ func applyProbeCeiling(heuristicCtx, requestedCtx, probedMax int) int {
 // tier >= ctx: a fit at tier T validates every ctx <= T only under T's own
 // KV dtype, and picking the smallest cover keeps low-ctx sessions on the
 // highest-fidelity dtype that provably fits (e.g. 64K stays f16 even when
-// a q8_0-only 128K tier exists above it). Returns "" (daemon default /
-// f16) when no tier covers ctx or the map is empty.
+// a q8_0-only 128K tier exists above it). Returns the raw stamp — each
+// backend's launch builder decides what its engine default means
+// (ollamaDynamicEnv treats ""/"f16" as flagless; vllmEntrypoint treats
+// "" as the legacy fp8). "" when no tier covers ctx or the map is empty.
 func resolveKVCacheType(kvByCtx map[int]string, ctx int) string {
 	best := 0
 	kv := ""
@@ -969,11 +989,6 @@ func resolveKVCacheType(kvByCtx map[int]string, ctx int) string {
 			best = tier
 			kv = dtype
 		}
-	}
-	if kv == "f16" {
-		// Explicit f16 stamp = daemon default; emit nothing so the
-		// container spec stays byte-identical to pre-KV-field launches.
-		return ""
 	}
 	return kv
 }
@@ -999,7 +1014,9 @@ func ollamaDynamicEnv(lc launchConfig) map[string]string {
 	env := map[string]string{
 		"OLLAMA_CONTEXT_LENGTH": fmt.Sprintf("%d", lc.MaxContext),
 	}
-	if lc.KVCacheType != "" {
+	// ""/"f16" = daemon default: emit nothing so the container spec
+	// stays byte-identical to pre-KV-field launches.
+	if lc.KVCacheType != "" && lc.KVCacheType != "f16" {
 		env["OLLAMA_KV_CACHE_TYPE"] = lc.KVCacheType
 		env["OLLAMA_FLASH_ATTENTION"] = "1"
 	}
@@ -1041,6 +1058,16 @@ func ollamaEntrypoint(modelName string, lc launchConfig) []string {
 }
 
 func vllmEntrypoint(modelName string, lc launchConfig) []string {
+	// Per-model KV dtype from the probe cache (resolveKVCacheType over
+	// the covering tier's stamp). "" = legacy unstamped cells, which
+	// were all measured under fp8 (the historical hardcode) — serving
+	// must reproduce the measured dtype or fit data is invalid. A model
+	// re-probed with PROBE_KV_CACHE_TYPE=auto serves unquantized KV.
+	// Must match vllm_command_args in scripts/probe-vllm-reasoning.py.
+	kvDtype := lc.KVCacheType
+	if kvDtype == "" {
+		kvDtype = "fp8"
+	}
 	args := []string{
 		"python3", "-m", "vllm.entrypoints.openai.api_server",
 		"--model", "/models/" + modelName,
@@ -1048,12 +1075,7 @@ func vllmEntrypoint(modelName string, lc launchConfig) []string {
 		"--port", "11434",
 		"--tensor-parallel-size", "1",
 		"--max-model-len", fmt.Sprintf("%d", lc.MaxContext),
-		// FP8 KV cache halves KV memory vs the default fp16. On a 24 GiB
-		// GPU this is what makes 128K+ contexts on 18 GiB NVFP4 weights
-		// fit (KV at 128K drops from ~7 GiB to ~3.5 GiB). Must match
-		// vllm_command_args in scripts/probe-vllm-reasoning.py so probe-
-		// time fit data is consistent with serve-time launches.
-		"--kv-cache-dtype", "fp8",
+		"--kv-cache-dtype", kvDtype,
 		"--gpu-memory-utilization", fmt.Sprintf("%.2f", lc.MemFraction),
 		"--enable-prefix-caching",
 		"--trust-remote-code",
@@ -1202,6 +1224,15 @@ func sglangEntrypoint(modelName string, lc launchConfig) []string {
 		// documented workaround. Drop this when a future SGLang image can
 		// trace the FP4 path. Pinned in deploy/backend-flags.yaml.
 		"--disable-piecewise-cuda-graph",
+	}
+	// Per-model KV dtype from the probe cache. SGLang's legacy cells ran
+	// the engine default (no flag), decoded as "" — emit nothing so those
+	// launches stay byte-identical. A cell probed under an enforced dtype
+	// (PROBE_KV_CACHE_TYPE=fp8_e5m2/...) carries the stamp and serving
+	// reproduces it. Must match sglang_command_args in
+	// scripts/probe-sglang-reasoning.py.
+	if lc.KVCacheType != "" && lc.KVCacheType != "f16" && lc.KVCacheType != "auto" {
+		args = append(args, "--kv-cache-dtype", lc.KVCacheType)
 	}
 	// SGLang's --max-running-requests is the analogue of vLLM's
 	// --max-num-seqs (verified against v0.5.10.post1-cu130). Before the

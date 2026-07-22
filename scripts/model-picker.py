@@ -1675,22 +1675,39 @@ def _max_fitting_ctx_info(m: dict) -> dict | None:
     return None
 
 
+# KV dtypes that mean "unquantized / engine default" for label purposes.
+# Anything else (q8_0, fp8, fp8_e5m2, ...) is a quantized-KV tier and
+# carries the weaker-long-form-reasoning caveat.
+_KV_FULL_QUALITY = ("", "f16", "auto")
+
+
+def _kv_legacy_default(m: dict) -> str:
+    """Dtype an UNSTAMPED (pre-field) cell was factually measured under.
+
+    vLLM: the prober always passed --kv-cache-dtype fp8 before the field
+    existed, so legacy vllm cells mean fp8 (mirrors the router's
+    synthesizeHFFromCache decode). Ollama/SGLang legacy cells ran the
+    engine default (f16/auto).
+    """
+    return "fp8" if str(m.get("backend") or "") == "vllm" else "f16"
+
+
 def _kv_cells(m: dict) -> dict[int, str]:
-    """ctx tier -> KV-cache dtype for every fully-on-GPU probed cell at the
-    picker's VRAM band. Cells probed before the ``kv_cache_type`` field
-    existed (or explicitly stamped f16) report "f16". Ollama rows only --
-    HF probe caches carry no KV field, so HF rows return {}.
+    """ctx tier -> KV-cache dtype for every fully-on-GPU probed cell at
+    the picker's VRAM band. Unstamped cells decode per
+    ``_kv_legacy_default``.
     """
     band = ((m.get("vram") or {}).get("probes") or {}).get(str(int(_VRAM_BUDGET)))
     out: dict[int, str] = {}
     if not isinstance(band, dict):
         return out
+    default = _kv_legacy_default(m)
     for key, cell in band.items():
         if not str(key).isdigit() or not isinstance(cell, dict):
             continue
         if not cell.get("fully_on_gpu"):
             continue
-        out[int(key)] = str(cell.get("kv_cache_type") or "f16")
+        out[int(key)] = str(cell.get("kv_cache_type") or default)
     return out
 
 
@@ -1699,9 +1716,13 @@ def _kv_mixed(m: dict) -> bool:
     (e.g. 64K probed under f16, 128K only fits under q8_0). Such models
     get a context sub-modal so the user chooses tier + quality tradeoff,
     and the emitted name pins ``@<ctx>`` so the router reproduces the
-    probed dtype for that tier.
+    probed dtype for that tier. f16/auto both mean "unquantized" and
+    count as one kind.
     """
-    kinds = {t for t in _kv_cells(m).values()}
+    kinds = {
+        "default" if t in _KV_FULL_QUALITY else t
+        for t in _kv_cells(m).values()
+    }
     return len(kinds) > 1
 
 
@@ -1711,11 +1732,11 @@ def _kv_for_ctx(m: dict, ctx: int) -> str:
     resolveKVCacheType). "f16" when no tier covers ctx.
     """
     best = 0
-    kv = "f16"
+    kv = _kv_legacy_default(m)
     for tier, dtype in _kv_cells(m).items():
         if tier >= ctx and (best == 0 or tier < best):
             best, kv = tier, dtype
-    return kv or "f16"
+    return kv or _kv_legacy_default(m)
 
 
 def _dedup_hf_by_name(models: list[dict]) -> list[dict]:
@@ -2052,8 +2073,8 @@ def _capability_summary_text(
     kv_line = ""
     if _kv_mixed(m):
         cells = _kv_cells(m)
-        quant = {t: k for t, k in cells.items() if k not in ("", "f16")}
-        f16_tiers = sorted(t for t, k in cells.items() if k in ("", "f16"))
+        quant = {t: k for t, k in cells.items() if k not in _KV_FULL_QUALITY}
+        f16_tiers = sorted(t for t, k in cells.items() if k in _KV_FULL_QUALITY)
         quant_label = "/".join(
             f"{_context_label(t)} ({quant[t]})" for t in sorted(quant)
         )
@@ -2694,18 +2715,18 @@ def _resolve_kv_tier(model: dict) -> tuple[int, bool] | None:
     user pressed Esc, caller re-enters the model list.
     """
     default_ctx = int(model.get("_picker_context") or _DEFAULT_CONTEXT)
-    if model.get("backend") != "ollama" or not _kv_mixed(model):
+    if not _kv_mixed(model):
         return (default_ctx, False)
     tiers = sorted(_kv_cells(model), reverse=True)
     lines = []
     for t in tiers:
         kv = _kv_for_ctx(model, t)
-        if kv not in ("", "f16"):
+        if kv not in _KV_FULL_QUALITY:
             note = f"KV {kv} -- weaker long-form reasoning"
             if kv == "q8_0":
                 note += " (GPQA ~-10 pts)"
         else:
-            note = "KV f16 -- full quality"
+            note = f"KV {kv or 'f16'} -- full quality"
         lines.append(f"  {_context_label(t):>5s}  {_DIM}({note}){_RESET}")
     header = (
         f"Context tier  ▸  {_BOLD}{_strip_latest(model['name'])}{_RESET}"

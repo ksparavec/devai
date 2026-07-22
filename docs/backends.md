@@ -273,7 +273,7 @@ The probe is vLLM/SGLang only today (the BackendSpec path). Ollama
 allocates KV per-request from `num_ctx` via llama.cpp and has no LOAD
 pass yet.
 
-### Per-tier KV-cache dtype (Ollama, additive field)
+### Per-tier KV-cache dtype (all backends, additive field)
 
 Ollama probe cells carry a `kv_cache_type` field: the KV dtype the
 daemon served the cell under, stamped by the prober from the
@@ -308,6 +308,35 @@ then spills, gets rewritten `fully_on_gpu=false`, and disappears from
 the picker/router until the targeted `PROBE_KV_CACHE_TYPE=q8_0` pass
 is re-run. After any full-force re-probe of a mixed-KV model, re-run
 the quantized-tier pass to restore its cell.
+
+The same per-cell dtype contract covers vLLM and SGLang -- there is no
+global KV dtype policy:
+
+- **vLLM**: the prober launches every cell with `--kv-cache-dtype
+  $PROBE_KV_CACHE_TYPE` (default fp8) and stamps it; serve time
+  (`vllmEntrypoint`) reproduces the covering cell's stamp. UNSTAMPED
+  legacy cells decode to fp8 on both sides -- that is the dtype they
+  were factually measured under (the pre-field hardcode), so behaviour
+  is byte-identical until a model is deliberately re-probed. A model
+  with VRAM slack can be re-probed `make probe-vllm
+  PROBE_KV_CACHE_TYPE=auto PROBE_REPO=<repo> PROBE_FORCE=1` to serve
+  unquantized KV; fit cells are dtype-scoped, so never edit the stamp
+  by hand.
+- **SGLang**: legacy cells ran the engine default (no flag) and stay
+  unstamped; `PROBE_KV_CACHE_TYPE=fp8_e5m2` (etc.) enforces + stamps a
+  dtype, and `sglangEntrypoint` emits the flag only for stamped,
+  non-default cells.
+- **picker**: `_kv_cells` decodes unstamped cells per backend (vllm ->
+  fp8, others -> f16) and the mixed-KV sub-modal/warning generalizes:
+  f16/auto count as "full quality", any other dtype carries the
+  weaker-long-form-reasoning caveat (with the measured GPQA numbers
+  cited only for q8_0, the dtype they were measured on).
+
+Nothing has measured vLLM's fp8-vs-auto quality delta on this fleet
+yet -- every existing vLLM bench row (including GPQA) was measured
+under fp8 KV, so displayed scores are honest for what serves today.
+An fp8-vs-auto A/B on a slack model (fit + LOAD probe + full bench
+with GPQA both ways) is the open follow-up.
 
 ### Custom vLLM parser plugins
 
