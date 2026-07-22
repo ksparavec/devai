@@ -1261,6 +1261,11 @@ probe-load-vllm: ## Serving-time LOAD probe for vLLM: augment fit cache with ser
 	@#   PROBE_REPO=<regex>          filter catalog rows by repo
 	@#   PROBE_FORCE=1               re-run cells that already have serving_ok
 	@#   PROBE_NEEDLE_DEPTH=0.5      needle insertion depth (0.0 top, 1.0 bottom)
+	@#   PROBE_KV_CACHE_TYPE=auto    KV dtype for the relaunches -- MUST match
+	@#                               the dtype the target cells were fit-probed
+	@#                               with (default fp8), or serving numbers are
+	@#                               measured under the wrong dtype
+	PROBE_KV_CACHE_TYPE="$(PROBE_KV_CACHE_TYPE)" \
 	python3 scripts/probe-vllm-reasoning.py --load \
 	    --host-vram-gb $(GPU_MEMORY_GB) \
 	    --models-dir $(VLLM_MODELS_DIR) \
@@ -1272,6 +1277,7 @@ probe-load-vllm: ## Serving-time LOAD probe for vLLM: augment fit cache with ser
 probe-load-sglang: ## Serving-time LOAD probe for SGLang: same as probe-load-vllm against the SGLang cache.
 	@# Layers onto deploy/.sglang-reasoning-cache.json — run `make probe-sglang`
 	@# first. Same precondition + knobs as probe-load-vllm.
+	PROBE_KV_CACHE_TYPE="$(PROBE_KV_CACHE_TYPE)" \
 	python3 scripts/probe-sglang-reasoning.py --load \
 	    --host-vram-gb $(GPU_MEMORY_GB) \
 	    --models-dir $(SGLANG_MODELS_DIR) \
