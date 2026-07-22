@@ -2,7 +2,7 @@
 #
 # Regenerate with: make catalog-regen
 # Source of truth:  scripts/model-families.yaml
-# Generated at:     2026-06-23T22:07:09+00:00
+# Generated at:     2026-07-16T14:04:45+00:00
 #
 # Every 'size' and 'arch' below was fetched live from the
 # upstream provider at generation time. Do not hand-edit.
@@ -13,7 +13,7 @@ models:
     backend: [vllm, sglang]
     repo: "google/gemma-4-e2b-it"
     source: hf
-    sha: "70af34e20bd4"
+    sha: "179516f0c449"
     size: "9.54 GB"
     arch: { layers: 35, kv_heads: 1, head_dim: 256, k_eq_v: false }
     arch_source: "google/gemma-4-e2b-it/config.json"
@@ -25,7 +25,7 @@ models:
     backend: [vllm, sglang]
     repo: "google/gemma-4-e4b-it"
     source: hf
-    sha: "fee6332c1aba"
+    sha: "fa62d88df2e6"
     size: "14.89 GB"
     arch: { layers: 42, kv_heads: 2, head_dim: 256, k_eq_v: false }
     arch_source: "google/gemma-4-e4b-it/config.json"
@@ -37,7 +37,7 @@ models:
     backend: [vllm, sglang]
     repo: "google/gemma-4-26b-a4b-it"
     source: hf
-    sha: "20da991ab4af"
+    sha: "01e5b3ee840d"
     size: "48.07 GB"
     arch: { layers: 30, kv_heads: 8, head_dim: 256, k_eq_v: true }
     arch_source: "google/gemma-4-26b-a4b-it/config.json"
@@ -49,7 +49,7 @@ models:
     backend: [vllm, sglang]
     repo: "google/gemma-4-31b-it"
     source: hf
-    sha: "3548789868c5"
+    sha: "b9ea41a2887d"
     size: "58.25 GB"
     arch: { layers: 60, kv_heads: 16, head_dim: 256, k_eq_v: true }
     arch_source: "google/gemma-4-31b-it/config.json"
@@ -83,13 +83,16 @@ models:
     arch_source: "bg-digitalservices/Gemma-4-26B-A4B-it-NVFP4/config.json"
     purpose: "gemma4 · 15.3 GB · 30L/8kv/256h · k=v"
     conversational: true
+    parsers:
+      vllm:
+        tool: gemma4
 
   - name: "Gemma-4-31B-IT-NVFP4"
     family: gemma4
     backend: [vllm, sglang]
     repo: "nvidia/Gemma-4-31B-IT-NVFP4"
     source: hf
-    sha: "e5ef03afa233"
+    sha: "4135a98a9b72"
     size: "30.39 GB"
     arch: { layers: 60, kv_heads: 16, head_dim: 256, k_eq_v: true }
     arch_source: "nvidia/Gemma-4-31B-IT-NVFP4/config.json"
@@ -105,7 +108,7 @@ models:
     backend: [vllm, sglang]
     repo: "google/gemma-4-12B-it"
     source: hf
-    sha: "5926caa4ec0c"
+    sha: "12ace6d648d7"
     size: "22.28 GB"
     arch: { layers: 48, kv_heads: 8, head_dim: 256, k_eq_v: true }
     arch_source: "google/gemma-4-12B-it/config.json"
@@ -309,7 +312,7 @@ models:
     backend: [vllm, sglang]
     repo: "nvidia/diffusiongemma-26B-A4B-it-NVFP4"
     source: hf
-    sha: "2ea837236295"
+    sha: "ec4ff3df2050"
     size: "17.53 GB"
     arch: { layers: 30, kv_heads: 8, head_dim: 256, k_eq_v: false }
     arch_source: "nvidia/diffusiongemma-26B-A4B-it-NVFP4/config.json"
@@ -334,6 +337,7 @@ models:
     parsers:
       vllm:
         reasoning: qwen3
+        tool: qwen3_xml
     mtp:
       method: qwen3_5_mtp
       num_speculative_tokens: 3
@@ -352,21 +356,23 @@ models:
     parsers:
       vllm:
         reasoning: qwen3
+        tool: qwen3_xml
 
   - name: "Qwen3.6-27B-NVFP4"
     family: qwen3.6
     backend: [vllm, sglang]
     repo: "unsloth/Qwen3.6-27B-NVFP4"
     source: hf
-    sha: "890bdef7a42f"
-    size: "24.57 GB"
+    sha: "ccdaab7e68af"
+    size: "21.81 GB"
     arch: { layers: 64, kv_heads: 4, head_dim: 256, k_eq_v: false }
     arch_source: "unsloth/Qwen3.6-27B-NVFP4/config.json"
-    purpose: "qwen3.6 · 24.6 GB · 64L/4kv/256h"
+    purpose: "qwen3.6 · 21.8 GB · 64L/4kv/256h"
     conversational: true
     parsers:
       vllm:
         reasoning: qwen3
+        tool: qwen3_xml
 
   - name: "Qwen3.6-27B-MTP-pi-tune-NVFP4"
     family: qwen3.6
@@ -1260,6 +1266,80 @@ models:
         tool: qwen3_coder
       sglang:
         tool: qwen3_coder
+
+  - name: "Ornith-1.0-9B-NVFP4"
+    family: ornith
+    backend: [vllm, sglang]
+    repo: "ksparavec/Ornith-1.0-9B-NVFP4"
+    source: hf
+    sha: "e6b618246f78"
+    size: "10.43 GB"
+    arch: { layers: 32, kv_heads: 4, head_dim: 256, k_eq_v: false }
+    arch_source: "ksparavec/Ornith-1.0-9B-NVFP4/config.json"
+    purpose: "ornith · 10.4 GB · 32L/4kv/256h"
+    conversational: false
+    parsers:
+      vllm:
+        reasoning: qwen3
+        tool: qwen3_xml
+      sglang:
+        reasoning: qwen3
+        tool: qwen
+
+  - name: "ornith:9b-q4_k_m"
+    family: ornith
+    backend: [ollama]
+    repo: "deepreinforce-ai/Ornith-1.0-9B-GGUF"
+    source: gguf
+    gguf_filename: "ornith-1.0-9b-Q4_K_M.gguf"
+    size: "5.24 GB"
+    arch: { layers: 32, kv_heads: 4, head_dim: 256, k_eq_v: false }
+    arch_source: "deepreinforce-ai/Ornith-1.0-9B/config.json"
+    purpose: "ornith · 5.2 GB · 32L/4kv/256h"
+
+  - name: "ornith:9b-q5_k_m"
+    family: ornith
+    backend: [ollama]
+    repo: "deepreinforce-ai/Ornith-1.0-9B-GGUF"
+    source: gguf
+    gguf_filename: "ornith-1.0-9b-Q5_K_M.gguf"
+    size: "6.02 GB"
+    arch: { layers: 32, kv_heads: 4, head_dim: 256, k_eq_v: false }
+    arch_source: "deepreinforce-ai/Ornith-1.0-9B/config.json"
+    purpose: "ornith · 6.0 GB · 32L/4kv/256h"
+
+  - name: "ornith:9b-q6_k"
+    family: ornith
+    backend: [ollama]
+    repo: "deepreinforce-ai/Ornith-1.0-9B-GGUF"
+    source: gguf
+    gguf_filename: "ornith-1.0-9b-Q6_K.gguf"
+    size: "6.85 GB"
+    arch: { layers: 32, kv_heads: 4, head_dim: 256, k_eq_v: false }
+    arch_source: "deepreinforce-ai/Ornith-1.0-9B/config.json"
+    purpose: "ornith · 6.9 GB · 32L/4kv/256h"
+
+  - name: "ornith:9b-q8_0"
+    family: ornith
+    backend: [ollama]
+    repo: "deepreinforce-ai/Ornith-1.0-9B-GGUF"
+    source: gguf
+    gguf_filename: "ornith-1.0-9b-Q8_0.gguf"
+    size: "8.87 GB"
+    arch: { layers: 32, kv_heads: 4, head_dim: 256, k_eq_v: false }
+    arch_source: "deepreinforce-ai/Ornith-1.0-9B/config.json"
+    purpose: "ornith · 8.9 GB · 32L/4kv/256h"
+
+  - name: "ornith:9b-bf16"
+    family: ornith
+    backend: [ollama]
+    repo: "deepreinforce-ai/Ornith-1.0-9B-GGUF"
+    source: gguf
+    gguf_filename: "ornith-1.0-9b-bf16.gguf"
+    size: "16.69 GB"
+    arch: { layers: 32, kv_heads: 4, head_dim: 256, k_eq_v: false }
+    arch_source: "deepreinforce-ai/Ornith-1.0-9B/config.json"
+    purpose: "ornith · 16.7 GB · 32L/4kv/256h"
 
   - name: "llama3.2:1b-instruct-q2_K"
     family: llama3.2
@@ -2630,6 +2710,10 @@ models:
     arch_source: "nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4/config.json"
     purpose: "nemotron-nano-v2 · 7.3 GB · 56L/8kv/128h"
     conversational: true
+    parsers:
+      vllm:
+        reasoning: nemotron_v3
+        tool: nemotron_json
 
   - name: "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"
     family: nemotron-3-nano

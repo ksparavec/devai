@@ -263,10 +263,16 @@ def optional_mounts() -> list[str]:
         out += ["-v", f"{home / '.gitconfig'}:/tmp/host-config/.gitconfig:ro"]
     if (home / ".ssh").is_dir():
         out += ["-v", f"{home / '.ssh'}:/tmp/host-config/.ssh:ro"]
-    # Read-only model cache so the picker can do disk-based "is downloaded?"
-    # checks. Skip silently if absent — the user may not have that volume.
-    if Path("/var/cache/devai/ollama").is_dir():
-        out += ["-v", "/var/cache/devai/ollama:/var/cache/devai/ollama:ro"]
+    # Read-only model caches so the picker can do disk-based "is downloaded?"
+    # checks. vLLM/SGLang weights live on their OWN volumes now (no longer
+    # under ollama/), so each is mounted separately. Skip any that are absent.
+    for host_path in (
+        "/var/cache/devai/ollama",
+        "/var/cache/devai/vllm",
+        "/var/cache/devai/sglang",
+    ):
+        if Path(host_path).is_dir():
+            out += ["-v", f"{host_path}:{host_path}:ro"]
     return out
 
 
@@ -299,6 +305,11 @@ def build_run_cmd(
         "-e", f"CONTEXT={prefs['context']}",
         "-e", f"VRAM={prefs['vram']}",
         "-e", f"CONTAINER_USER={CONTAINER_USER}",
+        # Point the picker at the vLLM/SGLang volumes (mounted by
+        # optional_mounts). Overrides the baked image default, which still
+        # points at the retired ollama/models/vllm path.
+        "-e", "VLLM_MODELS_DIR=/var/cache/devai/vllm",
+        "-e", "SGLANG_MODELS_DIR=/var/cache/devai/sglang",
     ]
 
     if prompt is not None:

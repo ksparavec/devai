@@ -76,7 +76,7 @@ _BENCH_CACHE_PATHS = [
 ]
 
 _ROUTER = os.environ.get("DEVAI_ROUTER_HOST", "devai-router")
-_VLLM_DIR = os.environ.get("VLLM_MODELS_DIR", "/var/cache/devai/ollama/models/vllm")
+_VLLM_DIR = os.environ.get("VLLM_MODELS_DIR", "/var/cache/devai/vllm")
 _OLLAMA_MANIFESTS = os.environ.get(
     "OLLAMA_MANIFESTS_DIR",
     "/var/cache/devai/ollama/models/manifests/registry.ollama.ai/library",
@@ -400,24 +400,31 @@ def _bench_score(tasks: dict, prefix: str, key: str) -> float | None:
 def _picker_scores(bench_row: dict | None) -> dict[str, float | None]:
     """Extract the four picker-sort scores from a bench cache row.
 
-    Returns ``{"tps": float|None, "code": float|None, "reas": float|None,
-    "total": float|None}``. Each value is ``None`` when the underlying
-    bench task hasn't been recorded yet (so the picker can sort
-    unbenched rows to the bottom rather than treating them as zeros).
+    Returns ``{"tps", "code", "hevp", "mmlu", "gpqa", "tools"}`` (float|None
+    each). A value is ``None`` when that bench task hasn't been recorded yet,
+    so the picker sorts unbenched rows to the bottom rather than as zeros.
 
-    Definitions:
-      * ``tps``   = ``metrics.tps_sustained_p50``
-                    (steady-state decode tokens/sec)
-      * ``code``  = ``tasks.humaneval_subset_*.pass@1``
-      * ``reas``  = ``2/3 * tools_use_score + 1/3 * gsm8k_score``
-                    (weighted blend of agentic-tool correctness and
-                    multi-step math reasoning)
-      * ``total`` = ``mean(gsm8k, humaneval, tools_use)``
-                    (equal-weight quality average; latency-only rows
-                    have ``None``)
+    Definitions (the saturated composites REAS/TOTAL were retired in favour
+    of sharper, contamination-resistant discriminators):
+      * ``tps``   = ``metrics.tps_sustained_p50`` (steady-state tok/s)
+      * ``code``  = ``tasks.humaneval_subset_*.pass@1`` (HumanEval)
+      * ``hevp``  = ``tasks.humaneval_plus_subset_*.pass@1`` (HumanEval+,
+                    EvalPlus hardened tests -- catches overfit code)
+      * ``mmlu``  = ``tasks.mmlu_pro_subset_*.score`` (MMLU-Pro, knowledge)
+      * ``gpqa``  = ``tasks.gpqa_subset_*.score`` (GPQA-Diamond, graduate
+                    reasoning -- the strongest top-model discriminator)
+      * ``tools`` = ``tasks.tools_use_*.score`` (agentic tool-calling: right
+                    tool, exact args, no fabrication; benched in the model's
+                    native tool_choice mode)
+
+    Two auxiliary metrics are also returned for the use-case recommender
+    (not displayed as columns): ``gsm`` = ``tasks.gsm8k_subset_*.score``
+    (arithmetic word problems) and ``leak`` = ``tasks.leak_probe.leak_rate``
+    (token-leak rate; lower is better).
     """
     if bench_row is None:
-        return {"tps": None, "code": None, "reas": None, "total": None}
+        return {"tps": None, "code": None, "hevp": None, "mmlu": None,
+                "gpqa": None, "tools": None, "gsm": None, "leak": None}
     tasks = bench_row.get("tasks") or {}
     metrics = bench_row.get("metrics") or {}
     tps_raw = metrics.get("tps_sustained_p50")
@@ -425,19 +432,18 @@ def _picker_scores(bench_row: dict | None) -> dict[str, float | None]:
         tps = float(tps_raw) if tps_raw is not None else None
     except (TypeError, ValueError):
         tps = None
-    code = _bench_score(tasks, "humaneval_", "pass@1")
-    gsm = _bench_score(tasks, "gsm8k_", "score")
-    tools = _bench_score(tasks, "tools_use", "score")
-    # Reasoning blend: tools-use dominates because agentic workflows
-    # care more about tool-call correctness than abstract math, but
-    # GSM8K stays in the mix as a multi-step-thinking signal.
-    if tools is not None and gsm is not None:
-        reas = (2.0 / 3.0) * tools + (1.0 / 3.0) * gsm
-    else:
-        reas = None
-    quality_parts = [v for v in (gsm, code, tools) if v is not None]
-    total = sum(quality_parts) / len(quality_parts) if quality_parts else None
-    return {"tps": tps, "code": code, "reas": reas, "total": total}
+    # "humaneval_subset_" is specific: it does NOT match "humaneval_plus_
+    # subset_", so code and hevp stay separate.
+    return {
+        "tps": tps,
+        "code": _bench_score(tasks, "humaneval_subset_", "pass@1"),
+        "hevp": _bench_score(tasks, "humaneval_plus_subset_", "pass@1"),
+        "mmlu": _bench_score(tasks, "mmlu_pro_subset_", "score"),
+        "gpqa": _bench_score(tasks, "gpqa_subset_", "score"),
+        "tools": _bench_score(tasks, "tools_use", "score"),
+        "gsm": _bench_score(tasks, "gsm8k_subset_", "score"),
+        "leak": (tasks.get("leak_probe") or {}).get("leak_rate"),
+    }
 
 
 def _is_production_agentic(model: dict, bench_row: dict | None) -> bool:
@@ -489,13 +495,14 @@ def _build_comparison_ctx(candidates: list[dict]) -> dict:
     benched: list[tuple[dict, dict]] = []
     for m in candidates:
         s = m.get("_picker_scores") or {}
-        if s.get("total") is not None:
+        # Benched = has at least one quality score (any of code/hevp/mmlu/gpqa).
+        if any(s.get(k) is not None for k in ("code", "hevp", "mmlu", "gpqa")):
             benched.append((m, s))
     ctx: dict = {"n_benched": len(benched), "n_total": len(candidates)}
     if not benched:
         return ctx
     ranks: dict[str, dict[int, int]] = {}
-    for metric in ("tps", "code", "reas", "total"):
+    for metric in ("tps", "code", "hevp", "mmlu", "gpqa"):
         rmap: dict[int, int] = {}
         for m, s in benched:
             v = s.get(metric)
@@ -596,13 +603,19 @@ def _hf_format_label(model_dir: Path) -> str:
     """Short data-format label for an HF model on disk.
 
     Priority:
-      1. `quantization_config.quant_algo` / `quant_method` — most reliable
-         when populated.
-      2. Quantization token in the directory name (NVFP4, FP8, AWQ, …) —
+      1. `quantization_config.quant_algo` — ModelOpt checkpoints (NVIDIA
+         NVFP4/FP8) put the format here directly (e.g. "NVFP4").
+      2. `quantization_config.quant_method` — but `compressed-tensors`
+         (llm-compressor output) is the LIBRARY name, not a format: the
+         real format lives in `quantization_config.format` (e.g.
+         "nvfp4-pack-quantized"). Extract the quant token from there so
+         the column shows "NVFP4", not "COMPRESSED-TENSORS". Other methods
+         (awq/gptq/fp8) are themselves the short format.
+      3. Quantization token in the directory name (NVFP4, FP8, AWQ, …) —
          some NVIDIA NVFP4 checkpoints (e.g., Nemotron) ship without a
          `quantization_config` block; the convention is the token in
          the repo/dir name.
-      3. `torch_dtype` / `dtype` mapped to BF16 / FP16 / FP32 — the native
+      4. `torch_dtype` / `dtype` mapped to BF16 / FP16 / FP32 — the native
          precision when no quantization is applied.
     Returns "?" only when config.json is unreadable. Probe caches don't
     record this for vLLM/SGLang (schema-v2), so config.json + name are
@@ -614,7 +627,15 @@ def _hf_format_label(model_dir: Path) -> str:
     except (OSError, json.JSONDecodeError):
         return "?"
     qc = cfg.get("quantization_config") or {}
-    algo = qc.get("quant_algo") or qc.get("quant_method")
+    algo = qc.get("quant_algo")
+    if not algo:
+        method = str(qc.get("quant_method") or "").strip()
+        if method.lower() == "compressed-tensors":
+            # Library wrapper -- resolve the real format from `format`.
+            fmt = str(qc.get("format") or "").upper()
+            algo = next((t for t in _NAME_QUANT_TOKENS if t in fmt), None)
+        elif method:
+            algo = method
     if algo:
         return str(algo).upper()
     upper_name = model_dir.name.upper()
@@ -868,6 +889,13 @@ def _discover_models() -> list[dict]:
     recomputed here.
     """
     catalog = _load_catalog()
+    # Ollama canonicalizes a k-quant tag's case on `ollama create` (e.g. a
+    # catalog `ornith:9b-q4_k_m` is stored on disk as `ornith:9b-q4_K_M`),
+    # while generate-catalog lowercases every gguf-derived tag. Ollama tags
+    # are case-insensitive, so also index the catalog by lowercased name and
+    # fall back to it -- otherwise gguf_repos k-quant rows would lose their
+    # family/purpose metadata (and show a blank family column) in the picker.
+    catalog_ci = {k.lower(): v for k, v in catalog.items()}
     probes = _load_probe_records()
     out: list[dict] = []
 
@@ -887,7 +915,7 @@ def _discover_models() -> list[dict]:
                 if _ctx_tag.search(tag_file.name):
                     continue
                 name = f"{lib_dir.name}:{tag_file.name}"
-                meta = catalog.get(name, {})
+                meta = catalog.get(name) or catalog_ci.get(name.lower(), {})
                 disk_gb = _ollama_disk_size_gb(lib_dir.name, tag_file.name)
                 probe = probes.get(name) or {}
                 cap = _capability_from_probe(probe, Capability.UNKNOWN)
@@ -1409,22 +1437,29 @@ def _format_model_row(m: dict, idx: int = 0) -> str:
     backend_col = str(m.get("backend") or "?")
     fmt_col = str(details.get("quantization") or "?")
     type_col = "MoE" if _is_moe(m) else "Dense"
-    tools_col = "Yes" if _has_tools(m) else "No"
     # MTP column is only rendered when the preview flag is on; until
     # the router's parseMTPOverride wiring lands in Phase 5 the column
     # would be informational-only and the sub-modal would have no
     # downstream effect, so gate them together.
     mtp_col = ("Yes" if _has_mtp(m) else "No") if _MTP_PREVIEW else ""
 
-    # Bench scores -- four columns the user requested. Unbenched rows
-    # render '-' so they sort to the bottom but still appear (with all
-    # the format/parser/tier metadata visible in the preview pane).
+    # Bench columns: TPS, CODE% (HumanEval), CODE+% (HumanEval+), MMLU%,
+    # GPQA%. Unbenched cells render '-' so they sort to the bottom but the
+    # row still appears (format/parser/tier metadata shows in the preview).
     scores = m.get("_picker_scores") or {}
     tps_col = _fmt_tps(scores.get("tps"))
     code_col = _fmt_score_pct(scores.get("code"))
-    reas_col = _fmt_score_pct(scores.get("reas"))
-    total_col = _fmt_score_pct(scores.get("total"))
+    codep_col = _fmt_score_pct(scores.get("hevp"))
+    mmlu_col = _fmt_score_pct(scores.get("mmlu"))
+    gpqa_col = _fmt_score_pct(scores.get("gpqa"))
     leak_col = _fmt_leak_pct(m)
+    # TOOLS shows the agentic tools_use bench score (0-100) when benched --
+    # right tool, exact args, no fabrication, in the model's native
+    # tool_choice mode. Falls back to Yes/No parser-presence when unbenched
+    # (a model can have a tool parser but no measured score yet).
+    _ts = scores.get("tools")
+    tools_col = (f"{_ts * 100:.0f}" if isinstance(_ts, (int, float))
+                 else ("Yes" if _has_tools(m) else "No"))
 
     # Line number reflects position in the current sort order, so
     # ctrl-s renumbers the list. Caller passes 1-based ``idx``;
@@ -1440,12 +1475,13 @@ def _format_model_row(m: dict, idx: int = 0) -> str:
         f"{params_col:>10s}  "
         f"{type_col:>6s}  "
         f"{fmt_col:>7s}  "
-        f"{tools_col:>5s}  "
+        f"{tools_col:>6s}  "
         f"{mtp_segment}"
         f"{tps_col:>7s}  "
         f"{code_col:>7s}  "
-        f"{reas_col:>7s}  "
-        f"{total_col:>7s}  "
+        f"{codep_col:>7s}  "
+        f"{mmlu_col:>7s}  "
+        f"{gpqa_col:>7s}  "
         f"{leak_col:>5s}  "
         f"{vram_num:>6s}"
     )
@@ -1639,6 +1675,70 @@ def _max_fitting_ctx_info(m: dict) -> dict | None:
     return None
 
 
+# KV dtypes that mean "unquantized / engine default" for label purposes.
+# Anything else (q8_0, fp8, fp8_e5m2, ...) is a quantized-KV tier and
+# carries the weaker-long-form-reasoning caveat.
+_KV_FULL_QUALITY = ("", "f16", "auto")
+
+
+def _kv_legacy_default(m: dict) -> str:
+    """Dtype an UNSTAMPED (pre-field) cell was factually measured under.
+
+    vLLM: the prober always passed --kv-cache-dtype fp8 before the field
+    existed, so legacy vllm cells mean fp8 (mirrors the router's
+    synthesizeHFFromCache decode). Ollama/SGLang legacy cells ran the
+    engine default (f16/auto).
+    """
+    return "fp8" if str(m.get("backend") or "") == "vllm" else "f16"
+
+
+def _kv_cells(m: dict) -> dict[int, str]:
+    """ctx tier -> KV-cache dtype for every fully-on-GPU probed cell at
+    the picker's VRAM band. Unstamped cells decode per
+    ``_kv_legacy_default``.
+    """
+    band = ((m.get("vram") or {}).get("probes") or {}).get(str(int(_VRAM_BUDGET)))
+    out: dict[int, str] = {}
+    if not isinstance(band, dict):
+        return out
+    default = _kv_legacy_default(m)
+    for key, cell in band.items():
+        if not str(key).isdigit() or not isinstance(cell, dict):
+            continue
+        if not cell.get("fully_on_gpu"):
+            continue
+        out[int(key)] = str(cell.get("kv_cache_type") or default)
+    return out
+
+
+def _kv_mixed(m: dict) -> bool:
+    """True when the model's fitting tiers span more than one KV dtype
+    (e.g. 64K probed under f16, 128K only fits under q8_0). Such models
+    get a context sub-modal so the user chooses tier + quality tradeoff,
+    and the emitted name pins ``@<ctx>`` so the router reproduces the
+    probed dtype for that tier. f16/auto both mean "unquantized" and
+    count as one kind.
+    """
+    kinds = {
+        "default" if t in _KV_FULL_QUALITY else t
+        for t in _kv_cells(m).values()
+    }
+    return len(kinds) > 1
+
+
+def _kv_for_ctx(m: dict, ctx: int) -> str:
+    """KV dtype of the smallest probed tier covering ``ctx`` (the tier the
+    router will reproduce at serve time -- mirror of the arbiter's
+    resolveKVCacheType). "f16" when no tier covers ctx.
+    """
+    best = 0
+    kv = _kv_legacy_default(m)
+    for tier, dtype in _kv_cells(m).items():
+        if tier >= ctx and (best == 0 or tier < best):
+            best, kv = tier, dtype
+    return kv or _kv_legacy_default(m)
+
+
 def _dedup_hf_by_name(models: list[dict]) -> list[dict]:
     """When the same model name has rows for multiple HF backends, keep
     the highest-priority one. vLLM > SGLang. Ollama tag names never
@@ -1773,6 +1873,35 @@ def _format_quant_note(fmt: str, indent_cols: int = 11, wrap_cols: int = 50) -> 
     return "\n".join(f"{pad}{ln}" for ln in wrapped)
 
 
+# ── Per-model keep/niche arguments (info modal copy) ─────────────────────────
+#
+# Curated one-liner per catalog model name: WHY this model earns its slot
+# in the fleet, especially when a headline number (TPS, a bench column)
+# makes it look droppable. Written whenever a model survives a keep/drop
+# review -- cite the bench evidence so the argument stays checkable
+# against the picker's own columns. Keyed by the exact cache alias
+# (m["name"], pre-display-stripping). Models without an entry render no
+# Niche line.
+
+_MODEL_NICHE: dict[str, str] = {
+    "NVIDIA-Nemotron-Nano-9B-v2-NVFP4": (
+        "Best vLLM tool-caller (tools 1.00 benched, nemotron_json parser) "
+        "with GSM8K 0.98 + GPQA 0.65 -- keep for agent loops where call "
+        "reliability beats decode TPS."
+    ),
+    "Ornith-1.0-9B-NVFP4": (
+        "Only fleet model pairing top-tier code (HE+ 0.90, ~gpt-oss level) "
+        "with 256K fully-on-GPU -- keep for whole-repo / long-document "
+        "coding work no fast model can cover."
+    ),
+    "Qwen3.5-9B-NVFP4": (
+        "Fleet-best deep reasoning at long context (GPQA 0.78, MMLU-Pro "
+        "0.83 at 256K) -- keep as the hard-questions-over-long-documents "
+        "specialist; code/tools are not its job."
+    ),
+}
+
+
 # ── Per-family use-case blurbs (info modal copy) ─────────────────────────────
 
 _FAMILY_USE_CASES: dict[str, str] = {
@@ -1837,6 +1966,79 @@ _FAMILY_USE_CASES: dict[str, str] = {
 }
 
 
+_USE_CASE_LABELS: dict[str, str] = {
+    "coding": "Coding",
+    "math": "Math / analysis",
+    "reasoning": "Gen. reasoning",
+    "summary": "Doc summary",
+    "doc_qa": "Doc Q&A",
+}
+
+
+def _use_case_ratings(m: dict) -> list[tuple[str, float]] | None:
+    """Score five typical use cases (0-100) from the model's bench metrics
+    and return them ranked best-first, or ``None`` when the model lacks the
+    core bench data (gpqa / mmlu / hevp) needed to score them.
+
+    ``coding`` / ``math`` / ``reasoning`` map onto direct benchmarks.
+    ``summary`` and ``doc_qa`` have NO direct benchmark in this harness, so
+    they are proxied: context dominates (fitting the document is the hard
+    constraint for long-doc work), plus comprehension (MMLU), reasoning
+    (GPQA, for Q&A) and faithfulness (1 - leak_rate). Weights are the ones
+    validated against the fleet; tune here if doc lengths differ.
+    """
+    s = m.get("_picker_scores") or {}
+    hevp, code = s.get("hevp"), s.get("code")
+    gpqa, mmlu = s.get("gpqa"), s.get("mmlu")
+    if None in (gpqa, mmlu, hevp):
+        return None
+
+    def z(x: object) -> float:
+        return float(x) if isinstance(x, (int, float)) else 0.0
+
+    gsm, tps, leak = z(s.get("gsm")), z(s.get("tps")), z(s.get("leak"))
+    ctx = int(m.get("_picker_context") or 0)
+    ctx_n = min(ctx / 262144.0, 1.0) if ctx else 0.0   # 256K=1.0, 128K=0.5
+    tps_n = min(tps / 150.0, 1.0)
+    faith = 1.0 - min(leak, 1.0)
+    vals = {
+        "coding":    0.70 * z(hevp) + 0.30 * z(code),
+        "math":      0.55 * z(gpqa) + 0.30 * gsm + 0.15 * z(mmlu),
+        "reasoning": 0.60 * z(gpqa) + 0.40 * z(mmlu),
+        "summary":   0.45 * ctx_n + 0.30 * z(mmlu) + 0.15 * faith + 0.10 * tps_n,
+        "doc_qa":    0.40 * ctx_n + 0.30 * z(mmlu) + 0.20 * z(gpqa) + 0.10 * faith,
+    }
+    return sorted(((k, v * 100.0) for k, v in vals.items()), key=lambda kv: -kv[1])
+
+
+def _use_case_tier(score: float) -> str:
+    """Absolute quality band for a use-case score (0-100)."""
+    if score >= 80:
+        return "Excellent"
+    if score >= 65:
+        return "Strong"
+    if score >= 50:
+        return "Good"
+    if score >= 35:
+        return "Fair"
+    return "Weak"
+
+
+def _format_use_case_recommendations(m: dict) -> str:
+    """Render the "Recommended for:" preview section (five use cases ranked
+    best-first with score + tier), or '' when the model isn't benched."""
+    ranked = _use_case_ratings(m)
+    if not ranked:
+        return ""
+    lines = ["Recommended for:"]
+    for key, score in ranked:
+        label = _USE_CASE_LABELS.get(key, key)
+        lines.append(f"  {label:<16s}{score:>4.0f}  {_use_case_tier(score)}")
+    lines.append("  (summary / doc-Q&A are context-weighted estimates --")
+    lines.append("   no direct benchmark; coding/math/reasoning are measured)")
+    return "\n".join(lines)
+
+
 def _capability_summary_text(
     m: dict,
     reasoning_mode: str = "default",
@@ -1897,13 +2099,40 @@ def _capability_summary_text(
         )
     else:
         mtp_line = "MTP:       not available\n"
+    kv_line = ""
+    if _kv_mixed(m):
+        cells = _kv_cells(m)
+        quant = {t: k for t, k in cells.items() if k not in _KV_FULL_QUALITY}
+        f16_tiers = sorted(t for t, k in cells.items() if k in _KV_FULL_QUALITY)
+        quant_label = "/".join(
+            f"{_context_label(t)} ({quant[t]})" for t in sorted(quant)
+        )
+        f16_max = _context_label(max(f16_tiers)) if f16_tiers else "?"
+        gpqa_note = (
+            " (GPQA drops\n           ~10 points measured for q8_0)"
+            if "q8_0" in quant.values()
+            else ""
+        )
+        kv_line = (
+            f"KV cache:  {quant_label} serves with quantized KV --\n"
+            f"           reasoning is WEAKER on long chains{gpqa_note};\n"
+            f"           up to {f16_max} serves f16 (full quality).\n"
+            f"           Pick the tier at launch.\n"
+        )
+    niche = _MODEL_NICHE.get(str(m.get("name") or ""))
+    niche_line = ""
+    if niche:
+        wrapped = textwrap.wrap(niche, width=60)
+        niche_line = "Niche:     " + "\n           ".join(wrapped) + "\n"
     head = (
         f"Model:     {name}\n"
         f"Backend:   {backend}\n"
         f"{fmt_block}"
         f"Params:    {params}    Type: {type_label}\n"
         f"Context:   {_context_label(ctx)} (max fit at {_VRAM_BUDGET:g} GB)\n"
+        f"{kv_line}"
         f"VRAM:      {vram_str}\n"
+        f"{niche_line}"
         f"\n"
         f"Reasoning: {reason_label}\n"
         f"Tools:     {tools_label}    (parser: {parser})\n"
@@ -1912,6 +2141,9 @@ def _capability_summary_text(
     parts = [head]
     if properties_section:
         parts.append("\n" + properties_section)
+    rec_section = _format_use_case_recommendations(m)
+    if rec_section:
+        parts.append("\n\n" + rec_section)
     use_cases_body = blurb
     if extra_use_case_lines:
         # Bench-derived sentences sit in their own paragraph: a blank
@@ -1942,7 +2174,9 @@ def _format_model_properties(m: dict, comparison: dict | None) -> str:
     """
     scores = m.get("_picker_scores") or {}
     bench_row = m.get("_picker_bench_row") or {}
-    if scores.get("total") is None or not bench_row:
+    if not bench_row or all(
+        scores.get(k) is None for k in ("code", "hevp", "mmlu", "gpqa")
+    ):
         # No bench data for this (model, backend, ctx). Distinguish
         # "model has bench rows at other ctxs but not this one" from
         # "model never benched at all" -- the former is fixable with a
@@ -1981,13 +2215,16 @@ def _format_model_properties(m: dict, comparison: dict | None) -> str:
         lines.append(f"  TPS:    {tps:>6.1f} tok/s{_rank_str('tps')}")
     code = scores.get("code")
     if code is not None:
-        lines.append(f"  CODE:   {code * 100:>5.1f}%{_rank_str('code')}")
-    reas = scores.get("reas")
-    if reas is not None:
-        lines.append(f"  REAS:   {reas * 100:>5.1f}%{_rank_str('reas')}")
-    total = scores.get("total")
-    if total is not None:
-        lines.append(f"  TOTAL:  {total * 100:>5.1f}%{_rank_str('total')}")
+        lines.append(f"  CODE:   {code * 100:>5.1f}%{_rank_str('code')}  (HumanEval)")
+    hevp = scores.get("hevp")
+    if hevp is not None:
+        lines.append(f"  CODE+:  {hevp * 100:>5.1f}%{_rank_str('hevp')}  (HumanEval+, hardened)")
+    mmlu = scores.get("mmlu")
+    if mmlu is not None:
+        lines.append(f"  MMLU:   {mmlu * 100:>5.1f}%{_rank_str('mmlu')}  (MMLU-Pro)")
+    gpqa = scores.get("gpqa")
+    if gpqa is not None:
+        lines.append(f"  GPQA:   {gpqa * 100:>5.1f}%{_rank_str('gpqa')}  (GPQA-Diamond, reasoning)")
     metrics = bench_row.get("metrics") or {}
     peak = metrics.get("peak_vram_gb")
     if peak is not None:
@@ -2028,27 +2265,32 @@ def _extra_use_case_lines(m: dict, comparison: dict | None) -> list[str]:
     if not comparison:
         return out
     scores = m.get("_picker_scores") or {}
-    if scores.get("total") is None:
+    if all(scores.get(k) is None for k in ("code", "hevp", "mmlu", "gpqa")):
         return out
     ranks = comparison.get("ranks") or {}
     rid = id(m)
-    rt = ranks.get("total", {}).get(rid)
+    rgpqa = ranks.get("gpqa", {}).get(rid)
     rtps = ranks.get("tps", {}).get(rid)
     rcode = ranks.get("code", {}).get(rid)
-    rreas = ranks.get("reas", {}).get(rid)
+    rhevp = ranks.get("hevp", {}).get(rid)
+    rmmlu = ranks.get("mmlu", {}).get(rid)
     n = comparison.get("n_benched", 0)
 
-    if rt == 1:
+    if rgpqa == 1 and scores.get("gpqa") is not None:
         out.append(
-            f"Top-scoring model in this picker on the equally-weighted "
-            f"GSM8K + HumanEval + tools_use blend "
-            f"(TOTAL = {scores['total'] * 100:.1f}% across {n} benched models); "
-            f"safe default agentic pick on this hardware."
+            f"Strongest reasoner in this picker "
+            f"(GPQA-Diamond = {scores['gpqa'] * 100:.1f}% across {n} benched "
+            f"models) -- best pick for hard multi-step reasoning."
         )
     elif rcode == 1 and rtps == 1:
         out.append(
             "Highest HumanEval pass@1 *and* highest decode TPS in this "
             "picker -- the strongest default for code-heavy workflows."
+        )
+    elif rmmlu == 1 and scores.get("mmlu") is not None:
+        out.append(
+            f"Top MMLU-Pro in this picker "
+            f"({scores['mmlu'] * 100:.1f}%) -- broadest knowledge + reasoning."
         )
     elif rtps == 1:
         out.append(
@@ -2056,16 +2298,15 @@ def _extra_use_case_lines(m: dict, comparison: dict | None) -> list[str]:
             f"({scores['tps']:.1f} tok/s steady-state); pick when latency or "
             f"throughput matters more than peak quality."
         )
+    elif rhevp == 1 and scores.get("hevp") is not None:
+        out.append(
+            f"Best HumanEval+ (hardened tests) in this picker "
+            f"({scores['hevp'] * 100:.1f}%) -- most robust code, not overfit."
+        )
     elif rcode == 1:
         out.append(
             f"Best HumanEval pass@1 in this picker "
             f"({scores['code'] * 100:.1f}%) -- strong code-completion default."
-        )
-    elif rreas == 1:
-        out.append(
-            f"Strongest tools+reasoning blend in this picker "
-            f"(REAS = {scores['reas'] * 100:.1f}%); good fit for agentic flows "
-            f"that combine tool calls with multi-step thinking."
         )
 
     bench_row = m.get("_picker_bench_row") or {}
@@ -2084,12 +2325,14 @@ def _extra_use_case_lines(m: dict, comparison: dict | None) -> list[str]:
 # largest probe-confirmed context tier that fits at the picker's VRAM
 # band -- useful when the user cares about long-context capacity over
 # raw quality scores.
-_SORT_MODES: tuple[str, ...] = ("total", "tps", "code", "reas", "ctx")
+_SORT_MODES: tuple[str, ...] = ("gpqa", "tps", "code", "hevp", "mmlu", "tools", "ctx")
 _SORT_LABELS: dict[str, str] = {
-    "total": "TOTAL",
+    "gpqa": "GPQA",
     "tps": "TPS",
     "code": "CODE",
-    "reas": "REAS",
+    "hevp": "CODE+",
+    "mmlu": "MMLU",
+    "tools": "TOOLS",
     "ctx": "CTX",
 }
 
@@ -2193,7 +2436,7 @@ def _build_candidates(
 def _build_menu(
     models: list[dict],
     bench_records: dict[tuple[str, str, int], dict] | None = None,
-    sort_mode: str = "total",
+    sort_mode: str = "gpqa",
     sort_dir: str = "desc",
     *,
     _candidates: list[dict] | None = None,
@@ -2217,7 +2460,7 @@ def _build_menu(
         hidden = _hidden or {"missing_capability": 0, "no_fitting_ctx": 0}
 
     if sort_mode not in _SORT_MODES:
-        sort_mode = "total"
+        sort_mode = "gpqa"
     if sort_dir not in _SORT_DIRS:
         sort_dir = "desc"
     candidates.sort(key=_sort_key_for_mode(sort_mode, sort_dir))
@@ -2244,12 +2487,13 @@ def _build_menu(
         f"{'PARAMS':>10s}  "
         f"{'TYPE':>6s}  "
         f"{'FORMAT':>7s}  "
-        f"{'TOOLS':>5s}  "
+        f"{_hdr('TOOLS', 'tools'):>6s}  "
         f"{mtp_header_segment}"
         f"{_hdr('TPS', 'tps'):>7s}  "
         f"{_hdr('CODE%', 'code'):>7s}  "
-        f"{_hdr('REAS%', 'reas'):>7s}  "
-        f"{_hdr('TOTAL%', 'total'):>7s}  "
+        f"{_hdr('CODE+%', 'hevp'):>7s}  "
+        f"{_hdr('MMLU%', 'mmlu'):>7s}  "
+        f"{_hdr('GPQA%', 'gpqa'):>7s}  "
         f"{'LEAK%':>5s}  "
         f"{'VRAM':>6s}"
     )
@@ -2497,6 +2741,38 @@ def _apply_aiagent_gpu(agent_id: str) -> bool:
     return True
 
 
+def _resolve_kv_tier(model: dict) -> tuple[int, bool] | None:
+    """Context-tier sub-modal for mixed-KV models (some tiers only fit
+    with quantized KV). Returns (selected_ctx, pinned) -- pinned=True
+    means the emitted name must carry ``@<ctx>`` so the router serves the
+    probed dtype for exactly that tier. Non-mixed models return the
+    default max-fit context unpinned without showing a modal. None =
+    user pressed Esc, caller re-enters the model list.
+    """
+    default_ctx = int(model.get("_picker_context") or _DEFAULT_CONTEXT)
+    if not _kv_mixed(model):
+        return (default_ctx, False)
+    tiers = sorted(_kv_cells(model), reverse=True)
+    lines = []
+    for t in tiers:
+        kv = _kv_for_ctx(model, t)
+        if kv not in _KV_FULL_QUALITY:
+            note = f"KV {kv} -- weaker long-form reasoning"
+            if kv == "q8_0":
+                note += " (GPQA ~-10 pts)"
+        else:
+            note = f"KV {kv or 'f16'} -- full quality"
+        lines.append(f"  {_context_label(t):>5s}  {_DIM}({note}){_RESET}")
+    header = (
+        f"Context tier  ▸  {_BOLD}{_strip_latest(model['name'])}{_RESET}"
+        f"   {_DIM}(tier sets KV dtype; Esc → back to model list){_RESET}"
+    )
+    idx = _fzf(lines, header)
+    if idx is None:
+        return None
+    return (tiers[idx], True)
+
+
 def _resolve_agent(agent_filter: str | None, model: dict) -> tuple[str, str, str] | None:
     """Drive reasoning toggle (inline-reasoning only) → MTP toggle (when
     catalog declares it AND DEVAI_MTP_PREVIEW is on) → agent picker.
@@ -2654,7 +2930,7 @@ def main() -> None:
                 sort_mode=mode, sort_dir=direction,
                 _candidates=candidates, _hidden=hidden,
             )
-    lines, selectable, item_models = menus[("total", "desc")]
+    lines, selectable, item_models = menus[("gpqa", "desc")]
     if not any(selectable):
         sys.exit(
             f"error: no usable model/context rows on disk for "
@@ -2666,7 +2942,7 @@ def main() -> None:
 
     header = (
         f"DevAI  ▸  Pick a model  "
-        f"(≤ {_VRAM_BUDGET:g} GB · ctrl-s sort · ctrl-r dir · ? preview)"
+        f"(≤ {_VRAM_BUDGET:g} GB · ctrl-s sort · ctrl-r dir · ? info)"
     )
 
     # Materialise per-row info files for fzf's preview pane. Each
@@ -2679,7 +2955,7 @@ def main() -> None:
     # so the per-model preview can describe each row's rank against
     # its peers (TPS / CODE / REAS / TOTAL).
     comparison_ctx = _build_comparison_ctx(candidates)
-    # Preview content is keyed off the original (TOTAL-mode) item index,
+    # Preview content is keyed off the original (GPQA-mode) item index,
     # which equals the tag fzf carries for each line. All four sort
     # modes share the same item_models list (only the row order changes
     # within each pre-rendered file), so previews stay correct after
@@ -2690,7 +2966,6 @@ def main() -> None:
         Path(preview_dir, f"{i}.txt").write_text(
             _capability_summary_text(m, comparison=comparison_ctx)
         )
-    preview_cmd = f"cat {preview_dir}/{{1}}.txt 2>/dev/null"
 
     # Pre-render every (mode, dir) combination's tag-prefixed input
     # stream. Each render references items via their *original*
@@ -2754,17 +3029,18 @@ def main() -> None:
     )
     cycle_dir_path.chmod(0o755)
 
+    preview_cmd = f"cat {preview_dir}/{{1}}.txt 2>/dev/null"
+
     # Bindings:
     #   ctrl-s   -- cycle bench-score sort mode (TOTAL > TPS > CODE >
     #               REAS > CTX). Direction is preserved across cycles.
     #   ctrl-r   -- flip sort direction (desc <-> asc). Mode is
     #               preserved across flips.
     #   ?        -- toggle the model-details preview pane on/off. The
-    #               pane starts HIDDEN (see preview_window below): the
-    #               picker no longer shoves details in the operator's
-    #               face on launch -- they opt in by pressing '?'.
-    #               Single-char fzf action; reliable across terminals.
-    #               Cost: '?' can no longer be typed into the search.
+    #               pane starts HIDDEN (see preview_window below); the
+    #               operator opts in by pressing '?'. Single-char fzf
+    #               action; reliable across terminals. Cost: '?' can
+    #               no longer be typed into the search.
     #   ctrl-p   -- alias for ?:toggle-preview.
     # Non-selectable rows (column header / sort note / formula note)
     # are made un-focusable via `--header-lines=3` below, so the
@@ -2781,14 +3057,17 @@ def main() -> None:
             lines, header,
             selectable=selectable,
             preview_cmd=preview_cmd,
-            # Start the details pane hidden: the `:hidden` flag makes
-            # fzf launch with the preview collapsed, and `?` / ctrl-p
-            # toggle-preview reveals it at the same right:42% geometry
-            # on demand. Previously the pane defaulted to visible and
-            # showed every model's details unprompted on launch.
-            preview_window="right:42%:wrap:hidden",
+            # Start the details pane hidden; `?` / ctrl-p toggles it.
+            # Geometry: top-docked, 80% of the window height, full
+            # width. fzf's preview pane cannot float centered (the
+            # only positions are up/down/left/right -- `center` is
+            # rejected by 0.44, and an execute() child-fzf modal was
+            # tried and rejected because it replaces the list instead
+            # of overlaying it). up:80% is the closest native shape
+            # to a large centered panel: the list stays visible below.
+            preview_window="up:80%:wrap:hidden",
             extra_bindings=bindings,
-            input_text=sort_files[("total", "desc")].read_text(),
+            input_text=sort_files[("gpqa", "desc")].read_text(),
             # Column header + sort note + formula note. _build_menu
             # always emits exactly these three at the top; if that
             # ever changes, update this constant in lockstep.
@@ -2803,13 +3082,17 @@ def main() -> None:
         if model is None:  # defensive — _fzf already filters headers
             continue
 
+        kv_choice = _resolve_kv_tier(model)
+        if kv_choice is None:
+            # Backed out of the context-tier modal. Re-enter the model list.
+            continue
+        selected_context, ctx_pinned = kv_choice
+
         decision = _resolve_agent(agent_filter, model)
         if decision is None:
             # Backed out of the info / agent modal. Re-enter the model list.
             continue
         agent_id, reasoning_mode, mtp_mode = decision
-
-        selected_context = int(model.get("_picker_context") or _DEFAULT_CONTEXT)
         os.environ["CONTEXT"] = str(selected_context)
         base_name = _strip_latest(model["name"])
         # `::nothink` rides on the model name only when the user explicitly
@@ -2825,9 +3108,13 @@ def main() -> None:
         # reasoning) lines up cleanly.
         mtp_suffix = "::mtp" if (_MTP_PREVIEW and mtp_mode == "on") else ""
         if model["backend"] == "ollama":
-            # Ollama: KV is dynamic per request; only the suffixes ride
-            # on the model name.
-            serving_name = f"{base_name}{reasoning_suffix}{mtp_suffix}"
+            # Ollama: KV allocation is dynamic per request, so the name
+            # normally rides bare. EXCEPTION: mixed-KV models (some tiers
+            # only fit with quantized KV) pin `@<ctx>` so the router
+            # launches the chosen tier with its probed KV dtype instead
+            # of defaulting to the largest (quantized) tier.
+            ctx_suffix = f"@{selected_context}" if ctx_pinned else ""
+            serving_name = f"{base_name}{reasoning_suffix}{mtp_suffix}{ctx_suffix}"
         else:
             # vLLM / SGLang: order is `<name>::<reasoning>::<mtp>@<ctx>`.
             serving_name = f"{base_name}{reasoning_suffix}{mtp_suffix}@{selected_context}"

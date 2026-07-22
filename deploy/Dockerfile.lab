@@ -21,6 +21,13 @@ ENV OLLAMA_DEFAULT_MODEL=${OLLAMA_DEFAULT_MODEL}
 ENV ANTHROPIC_BASE_URL=${OLLAMA_HOST}
 ENV ANTHROPIC_AUTH_TOKEN=ollama
 ENV ANTHROPIC_API_KEY=""
+# The image ships claude at /usr/local/bin/claude (on PATH). Claude Code's
+# auto-updater otherwise runs migrate-installer on first launch and drops a
+# versioned copy into ~/.local/bin/claude -- which, because ~ is the persistent
+# home volume appended LAST on PATH (see below), no longer shadows the baked
+# binary, but would still pin a stale copy if invoked directly. Disable it so
+# the baked, reproducible version is always what runs.
+ENV DISABLE_AUTOUPDATER=1
 # Codex reads config from $CODEX_HOME (default ~/.codex). Pin it to the
 # devai user's home so codex finds the entrypoint-seeded config.toml
 # regardless of the runtime user (root or devai) and without per-shell
@@ -35,7 +42,11 @@ ENV OPENAI_API_KEY=local
 ENV OPENCODE_ENABLE_EXA=1
 ENV UV_BREAK_SYSTEM_PACKAGES=1
 ENV PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1
-ENV PATH="/home/devai/.local/bin:${PATH}"
+# Append (not prepend) ~/.local/bin: it lives on the persistent home volume, so
+# a file dropped there at runtime (auto-updater, `pip install --user`, ...) must
+# NOT be able to shadow the image's baked /usr/local/bin tools. Kept on PATH for
+# genuine user-installed CLIs, but system binaries always win.
+ENV PATH="${PATH}:/home/devai/.local/bin"
 
 # --- Dependencies for coding agents ---
 # libxcb1 is needed by Open Interpreter — it imports cv2 at startup which
@@ -231,14 +242,6 @@ RUN set -eu; \
         useradd -u 1000 -g 1000 -d /home/devai -s /bin/bash devai; \
     fi; \
     mkdir -p /home/devai/work /home/devai/.local/bin; \
-    ln -s /usr/local/bin/claude      /home/devai/.local/bin/claude; \
-    ln -s /usr/local/bin/codex       /home/devai/.local/bin/codex; \
-    ln -s /usr/local/bin/opencode    /home/devai/.local/bin/opencode; \
-    ln -s /usr/local/bin/gemini      /home/devai/.local/bin/gemini; \
-    ln -s /usr/local/bin/late        /home/devai/.local/bin/late; \
-    ln -s /usr/local/bin/ollama      /home/devai/.local/bin/ollama; \
-    ln -s /usr/local/bin/code-server /home/devai/.local/bin/code-server; \
-    { [ -e /usr/local/bin/aiagent ] && ln -s /usr/local/bin/aiagent /home/devai/.local/bin/aiagent || true; }; \
     chown -R 1000:1000 /home/devai
 
 # Seed config files for coding agents (copied to $HOME by entrypoint if absent)

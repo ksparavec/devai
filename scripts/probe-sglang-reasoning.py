@@ -101,12 +101,22 @@ def sglang_command_args(
         # sglangEntrypoint so probe and serve launch identically.
         "--disable-piecewise-cuda-graph",
     ]
+    # KV-cache dtype for THIS probe pass. SGLang's default is auto (no
+    # flag, unquantized); a PROBE_KV_CACHE_TYPE=fp8_e5m2/fp8_e4m3 pass
+    # measures quantized-KV fit and stamps the cell so serve time
+    # reproduces it. Empty env = no flag = engine default (unchanged).
+    if KV_CACHE_DTYPE:
+        args.extend(["--kv-cache-dtype", KV_CACHE_DTYPE])
     if reasoning_parser:
         args.extend(["--reasoning-parser", reasoning_parser])
     if tool_parser:
         args.extend(["--tool-call-parser", tool_parser])
     return args
 
+
+# KV dtype this probe pass enforces; empty = SGLang engine default
+# (auto/unquantized), matching every pre-field cache cell.
+KV_CACHE_DTYPE = os.environ.get("PROBE_KV_CACHE_TYPE") or ""
 
 SPEC = BackendSpec(
     name="sglang",
@@ -117,6 +127,7 @@ SPEC = BackendSpec(
     reserve_gb=SGLANG_RESERVE_GB,
     entrypoint="python3",
     build_args=sglang_command_args,
+    kv_cache_dtype=KV_CACHE_DTYPE,
 )
 
 

@@ -46,7 +46,6 @@ from bench._bench_core import (  # noqa: E402
     cache_key_for_entry,
     capture_host_env,
     migrate_bench_cache_keys,
-    reset_row_for_force,
     router_url_for,
     serving_alias,
     serving_alias_with_ctx,
@@ -422,6 +421,49 @@ def _by_subcase_breakdown(eval_log) -> dict[str, float]:
 
 # --- Main loop ---
 
+# Metrics that gate an early drop. Tools is intentionally excluded: it is a
+# saturated 20-sample microbench and a low/zero score there usually reflects a
+# parser-curation gap (a missing tool-call parser), not model quality.
+_DROP_SCORE_METRICS = (
+    ("gsm8k_subset_", "score", "gsm8k"),
+    ("humaneval_subset_", "pass@1", "humaneval"),
+)
+
+
+def _evaluate_drop_trigger(task_results: dict, threshold: float) -> dict | None:
+    """Return a drop-recommendation dict when the results so far disqualify
+    the model, else None.
+
+    Triggers: any leak (leak_rate > 0), or gsm8k / humaneval below
+    ``threshold``. Safe to call incrementally after each task -- it only
+    inspects the metrics currently present in ``task_results``.
+    """
+    leak = task_results.get("leak_probe")
+    if leak is not None:
+        rate = leak.get("leak_rate") or 0
+        if rate > 0:
+            return {
+                "reason": "leak",
+                "metric": "leak_rate",
+                "value": rate,
+                "threshold": 0,
+                "detail": f"leak_rate={rate} > 0",
+            }
+    for prefix, field, label in _DROP_SCORE_METRICS:
+        for tname, tresult in task_results.items():
+            if tname.startswith(prefix) and isinstance(tresult, dict) and field in tresult:
+                val = tresult[field]
+                if isinstance(val, (int, float)) and val < threshold:
+                    return {
+                        "reason": "low_score",
+                        "metric": label,
+                        "value": val,
+                        "threshold": threshold,
+                        "detail": f"{label}={val} < {threshold}",
+                    }
+    return None
+
+
 def run_for_target(
     target: dict,
     *,
@@ -431,6 +473,8 @@ def run_for_target(
     n_gsm8k: int,
     n_humaneval: int,
     n_tools: int,
+    n_mmlu_pro: int,
+    n_gpqa: int,
     n_leak_prompts: int,
     n_longctx_fraction: float,
     n_longctx_max_tokens: int,
@@ -439,14 +483,21 @@ def run_for_target(
     cache_path: Path,
     force: bool,
     host_env_id: str | None = None,
+    drop_threshold: float = 0.70,
+    early_drop: bool = True,
 ) -> None:
-    """Run all requested tasks against one model and persist results."""
+    """Run all requested tasks against one model and persist results.
+
+    Cache data is immutable: a task result, once written, is never deleted
+    or modified -- with exactly one exception, ``--force``, which re-runs a
+    task and overwrites its entry ONLY when the new run succeeds. A failed
+    task writes nothing (the prior value, if any, stands). Without --force,
+    a task that already has a result is skipped entirely. So `--force` never
+    wipes the row upfront: unrelated tasks (e.g. the sharper benches) survive
+    a forced re-run of the default tasks.
+    """
     served = serving_alias_with_ctx(target["alias"], target["ctx"], backend)
     key = target["key"]
-    if force:
-        # Wipe stale tasks/metrics so the new run's numbers stand alone.
-        # Provenance (first_benched_at) is preserved by reset_row_for_force.
-        reset_row_for_force(cache, key)
     existing = cache.get(key) or {}
     existing_tasks = (existing.get("tasks") or {})
 
@@ -459,6 +510,25 @@ def run_for_target(
     sampler.start()
     started = time.time()
     task_results: dict[str, dict] = {}
+    # Early-drop: once a disqualifier trips (leak, or gsm8k/humaneval below
+    # drop_threshold), skip this model's remaining tasks and flag it for drop.
+    # The flag is recorded on the row; it never deletes weights or edits the
+    # exclusion ledger -- that stays an explicit operator action.
+    drop_flag: dict | None = None
+
+    def _check_drop() -> None:
+        nonlocal drop_flag
+        if not early_drop or drop_flag is not None:
+            return
+        flag = _evaluate_drop_trigger(task_results, drop_threshold)
+        if flag:
+            flag["ran_at"] = _now_iso()
+            drop_flag = flag
+            print(
+                f"  !! DROP-FLAG: {flag['detail']} -- skipping remaining "
+                f"tasks for {target['alias']}",
+                file=sys.stderr,
+            )
 
     try:
         if "leak" in tasks and (force or "leak_probe" not in existing_tasks):
@@ -484,8 +554,9 @@ def run_for_target(
                 _print_latency_summary(latency)
             except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
                 print(f"    !! leak/latency failed: {e}", file=sys.stderr)
+        _check_drop()
 
-        if "gsm8k" in tasks and (force or "gsm8k" not in [_strip_subset(t) for t in existing_tasks]):
+        if drop_flag is None and "gsm8k" in tasks and (force or "gsm8k" not in [_strip_subset(t) for t in existing_tasks]):
             from bench.tasks.gsm8k import gsm8k_task
             print(f"  [gsm8k]   running n={n_gsm8k} ...", file=sys.stderr)
             try:
@@ -506,13 +577,12 @@ def run_for_target(
                 print(f"    score: {score:.4f} (n={n})", file=sys.stderr)
             except Exception as e:  # noqa: BLE001 — inspect_ai surfaces many error shapes
                 print(f"    !! gsm8k failed: {e}", file=sys.stderr)
-                # Stamp the failure into the cache so a later non-`--force`
-                # run sees "errored once" instead of "never ran" -- the
-                # latter silently re-runs the same broken combo or omits
-                # the row from the leaderboard.
-                task_results["gsm8k_error"] = {"error": str(e), "ran_at": _now_iso()}
+                # Immutable-on-failure: write nothing. A failed task leaves the
+                # cache untouched (prior value, if any, stands; absent stays
+                # absent so a later run retries it).
+        _check_drop()
 
-        if "humaneval" in tasks and (force or "humaneval" not in [_strip_subset(t) for t in existing_tasks]):
+        if drop_flag is None and "humaneval" in tasks and (force or "humaneval" not in [_strip_subset(t) for t in existing_tasks]):
             from bench.tasks.humaneval import humaneval_task
             print(f"  [humaneval] running n={n_humaneval} ...", file=sys.stderr)
             try:
@@ -533,14 +603,90 @@ def run_for_target(
                 print(f"    pass@1: {score:.4f} (n={n})", file=sys.stderr)
             except Exception as e:  # noqa: BLE001
                 print(f"    !! humaneval failed: {e}", file=sys.stderr)
-                task_results["humaneval_error"] = {"error": str(e), "ran_at": _now_iso()}
+        _check_drop()
 
-        if "tools" in tasks and (force or "tools" not in [_strip_subset(t) for t in existing_tasks]):
+        if drop_flag is None and "humaneval_plus" in tasks and (force or "humaneval_plus" not in [_strip_subset(t) for t in existing_tasks]):
+            from bench.tasks.humaneval_plus import humaneval_plus_task
+            print(f"  [humaneval+] running n={n_humaneval} ...", file=sys.stderr)
+            try:
+                eval_log = _invoke_inspect_task(
+                    task_obj=humaneval_plus_task(n=n_humaneval),
+                    served_model=served,
+                    router_url=router_url,
+                    log_dir=log_dir,
+                    timeout_s=900.0,
+                )
+                score, n = _aggregate_score(eval_log)
+                task_results[f"humaneval_plus_subset_{n}"] = {
+                    "pass@1": round(score, 4),
+                    "n": n,
+                    "ran_at": _now_iso(),
+                    "inspect_log_dir": str(log_dir),
+                }
+                print(f"    pass@1: {score:.4f} (n={n})", file=sys.stderr)
+            except Exception as e:  # noqa: BLE001
+                print(f"    !! humaneval_plus failed: {e}", file=sys.stderr)
+
+        if drop_flag is None and "mmlu_pro" in tasks and (force or "mmlu_pro" not in [_strip_subset(t) for t in existing_tasks]):
+            from bench.tasks.mmlu_pro import mmlu_pro_task
+            print(f"  [mmlu_pro] running n={n_mmlu_pro} ...", file=sys.stderr)
+            try:
+                eval_log = _invoke_inspect_task(
+                    task_obj=mmlu_pro_task(n=n_mmlu_pro),
+                    served_model=served,
+                    router_url=router_url,
+                    log_dir=log_dir,
+                    timeout_s=900.0,
+                )
+                score, n = _aggregate_score(eval_log)
+                task_results[f"mmlu_pro_subset_{n}"] = {
+                    "score": round(score, 4),
+                    "n": n,
+                    "ran_at": _now_iso(),
+                    "inspect_log_dir": str(log_dir),
+                }
+                print(f"    score: {score:.4f} (n={n})", file=sys.stderr)
+            except Exception as e:  # noqa: BLE001
+                print(f"    !! mmlu_pro failed: {e}", file=sys.stderr)
+
+        if drop_flag is None and "gpqa" in tasks and (force or "gpqa" not in [_strip_subset(t) for t in existing_tasks]):
+            from bench.tasks.gpqa import gpqa_task
+            print(f"  [gpqa]    running n={n_gpqa} ...", file=sys.stderr)
+            try:
+                eval_log = _invoke_inspect_task(
+                    task_obj=gpqa_task(n=n_gpqa),
+                    served_model=served,
+                    router_url=router_url,
+                    log_dir=log_dir,
+                    timeout_s=900.0,
+                )
+                score, n = _aggregate_score(eval_log)
+                task_results[f"gpqa_subset_{n}"] = {
+                    "score": round(score, 4),
+                    "n": n,
+                    "ran_at": _now_iso(),
+                    "inspect_log_dir": str(log_dir),
+                }
+                print(f"    score: {score:.4f} (n={n})", file=sys.stderr)
+            except Exception as e:  # noqa: BLE001
+                print(f"    !! gpqa failed: {e}", file=sys.stderr)
+
+        if drop_flag is None and "tools" in tasks and (force or "tools" not in [_strip_subset(t) for t in existing_tasks]):
             from bench.tasks.tools_use import tools_use_task
             print(f"  [tools]   running n={n_tools} ...", file=sys.stderr)
             try:
+                # Pass the model's probed tool_mode so the task drives
+                # auto-mode models with tool_choice="auto" (pinning breaks
+                # non-standard formats like Nemotron's <TOOLCALL>) and keeps
+                # pinning forced-mode models. vLLM/SGLang: probed tool_mode
+                # (auto|forced). Ollama has no probed tool_mode -- it
+                # negotiates tools natively via /api/chat, which is an auto
+                # flow -- so default Ollama to "auto"; only vLLM/SGLang rows
+                # without a probed mode fall back to "forced".
+                _tool_mode = (target.get("entry") or {}).get("tool_mode") or (
+                    "auto" if backend == "ollama" else "forced")
                 eval_log = _invoke_inspect_task(
-                    task_obj=tools_use_task(n=n_tools),
+                    task_obj=tools_use_task(n=n_tools, tool_mode=_tool_mode),
                     served_model=served,
                     router_url=router_url,
                     log_dir=log_dir,
@@ -566,9 +712,8 @@ def run_for_target(
                     print(f"    by_subcase: {by_sub}", file=sys.stderr)
             except Exception as e:  # noqa: BLE001
                 print(f"    !! tools_use failed: {e}", file=sys.stderr)
-                task_results["tools_use_error"] = {"error": str(e), "ran_at": _now_iso()}
 
-        if "longctx" in tasks and (force or "longctx_probe" not in existing_tasks):
+        if drop_flag is None and "longctx" in tasks and (force or "longctx_probe" not in existing_tasks):
             from bench import bench_longctx
             print(
                 f"  [longctx] one prompt at {n_longctx_fraction:g}x ctx="
@@ -601,7 +746,6 @@ def run_for_target(
                     )
             except Exception as e:  # noqa: BLE001
                 print(f"    !! longctx failed: {e}", file=sys.stderr)
-                task_results["longctx_error"] = {"error": str(e), "ran_at": _now_iso()}
 
     finally:
         vram = sampler.stop()
@@ -639,6 +783,7 @@ def run_for_target(
         task_results=task_results,
         metrics=metrics,
         host_env_id=host_env_id,
+        drop_recommendation=drop_flag,
     )
     save_cache(cache_path, cache)
 
@@ -690,8 +835,16 @@ def _strip_subset(task_name: str) -> str:
     """
     if task_name.startswith("gsm8k_"):
         return "gsm8k"
+    # humaneval_plus MUST be checked before humaneval -- both share the
+    # "humaneval" prefix and a naive check would mis-bucket the plus rows.
+    if task_name.startswith("humaneval_plus_"):
+        return "humaneval_plus"
     if task_name.startswith("humaneval_"):
         return "humaneval"
+    if task_name.startswith("mmlu_pro_"):
+        return "mmlu_pro"
+    if task_name.startswith("gpqa_"):
+        return "gpqa"
     if task_name.startswith("tools_use"):
         return "tools"
     if task_name == "leak_probe":
@@ -739,6 +892,20 @@ def main() -> None:
     ap.add_argument("--n-gsm8k", type=int, default=int(os.environ.get("BENCH_N_GSM8K", "100")))
     ap.add_argument("--n-humaneval", type=int, default=int(os.environ.get("BENCH_N_HUMANEVAL", "50")))
     ap.add_argument("--n-tools", type=int, default=int(os.environ.get("BENCH_N_TOOLS", "20")))
+    ap.add_argument("--n-mmlu-pro", type=int, default=int(os.environ.get("BENCH_N_MMLU_PRO", "100")))
+    ap.add_argument("--n-gpqa", type=int, default=int(os.environ.get("BENCH_N_GPQA", "100")))
+    ap.add_argument(
+        "--drop-threshold", type=float,
+        default=float(os.environ.get("BENCH_DROP_THRESHOLD", "0.70")),
+        help="early-drop floor: a model scoring below this on gsm8k or "
+             "humaneval (or with any leak) skips its remaining tasks and is "
+             "flagged for drop. Tools is excluded. Default 0.70.",
+    )
+    ap.add_argument(
+        "--no-early-drop", action="store_true",
+        help="disable early-drop -- run every task even when a model trips a "
+             "disqualifier (still records scores, no drop flag).",
+    )
     ap.add_argument("--n-leak-prompts", type=int,
                     default=int(os.environ.get("BENCH_N_LEAK_PROMPTS", "40")))
     ap.add_argument(
@@ -769,7 +936,8 @@ def main() -> None:
     args = ap.parse_args()
 
     tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
-    invalid = [t for t in tasks if t not in {"gsm8k", "humaneval", "tools", "leak", "longctx"}]
+    invalid = [t for t in tasks if t not in {
+        "gsm8k", "humaneval", "humaneval_plus", "mmlu_pro", "gpqa", "tools", "leak", "longctx"}]
     if invalid:
         sys.exit(f"unknown task(s): {invalid}")
 
@@ -834,6 +1002,10 @@ def main() -> None:
             n_gsm8k=args.n_gsm8k,
             n_humaneval=args.n_humaneval,
             n_tools=args.n_tools,
+            n_mmlu_pro=args.n_mmlu_pro,
+            n_gpqa=args.n_gpqa,
+            drop_threshold=args.drop_threshold,
+            early_drop=not args.no_early_drop,
             n_leak_prompts=args.n_leak_prompts,
             n_longctx_fraction=args.n_longctx_fraction,
             n_longctx_max_tokens=args.n_longctx_max_tokens,

@@ -178,7 +178,7 @@ def main() -> None:
     ap.add_argument("--kv-dtype", choices=list(KV_BYTES), default="fp16")
     ap.add_argument("--family", default="")
     ap.add_argument("--models-yaml", default="deploy/models.yaml")
-    ap.add_argument("--vllm-dir", default=os.environ.get("VLLM_MODELS_DIR", "/var/cache/devai/ollama/models/vllm"))
+    ap.add_argument("--vllm-dir", default=os.environ.get("VLLM_MODELS_DIR", "/var/cache/devai/vllm"))
     ap.add_argument("--fits-only", action="store_true")
     args = ap.parse_args()
 

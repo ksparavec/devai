@@ -52,7 +52,12 @@ export VLLM_IMAGE
 CACHE_COMPOSE = $(CURDIR)/deploy/docker-compose.yaml
 INFERENCE_CONFIG = deploy/models.yaml
 HF_CLI = hf
-VLLM_MODELS_DIR = $(CACHE_DIR)/ollama/models/vllm
+# vLLM and SGLang safetensors live on their OWN external volumes
+# (/dev/mapper/vgais-cache_vllm, -cache_sglang), NOT under the Ollama tree.
+# Keeping them out of ollama/ is deliberate: an Ollama cache cleanup must
+# never be able to reach non-Ollama weights (see the ollama-clean note).
+VLLM_MODELS_DIR = $(CACHE_DIR)/vllm
+SGLANG_MODELS_DIR = $(CACHE_DIR)/sglang
 # Absolute host path to scripts/vllm_plugins. The router (running in
 # its own container) bind-mounts this into the recreated vLLM
 # container so models that resolve to a custom tool/reasoning parser
@@ -131,7 +136,15 @@ RUN_FLAGS =
 
 # Read-only mount of the model cache so the in-container picker can do
 # disk-based "is downloaded?" detection (ollama manifests + vllm/sglang dirs).
-MODEL_CACHE_MOUNT = $(if $(wildcard $(CACHE_DIR)/ollama),-v $(CACHE_DIR)/ollama:/var/cache/devai/ollama:ro)
+# vLLM/SGLang weights are on their OWN volumes now (see the mount-point
+# convention in CLAUDE.md), no longer under ollama/, so each must be mounted
+# in separately. The -e VLLM_MODELS_DIR/SGLANG_MODELS_DIR point the picker at
+# the new container paths so even a not-yet-rebuilt image (whose baked default
+# is the old ollama/models/vllm path) resolves them.
+MODEL_CACHE_MOUNT = $(if $(wildcard $(CACHE_DIR)/ollama),-v $(CACHE_DIR)/ollama:/var/cache/devai/ollama:ro) \
+	$(if $(wildcard $(VLLM_MODELS_DIR)),-v $(VLLM_MODELS_DIR):/var/cache/devai/vllm:ro) \
+	$(if $(wildcard $(SGLANG_MODELS_DIR)),-v $(SGLANG_MODELS_DIR):/var/cache/devai/sglang:ro) \
+	-e VLLM_MODELS_DIR=/var/cache/devai/vllm -e SGLANG_MODELS_DIR=/var/cache/devai/sglang
 
 # Read-only mount of the probe caches so the in-container picker can
 # render the per-tier menu for every backend and the router can build
@@ -183,7 +196,7 @@ endif
 .PHONY: vllm-list vllm-rm vllm-status vllm-df
 .PHONY: clean clean-cpu clean-gpu clean-router prune
 .PHONY: fetch-cli pull-images install install-systemd uninstall test test-router test-ollama test-agents test-models test-probe-vllm test-probe-sglang test-probe-ollama-idempotent test-vllm test-sglang test-e2e test-full help
-.PHONY: catalog-regen catalog-suggest catalog-discover catalog-discover-add probe probe-vllm probe-sglang probe-load-vllm probe-load-sglang probe-check model-fit model-pull model-status model-sync vram-fit verify-backend-flags ollama-cleanup-ctx-variants
+.PHONY: catalog-regen catalog-suggest catalog-discover catalog-discover-add probe probe-vllm probe-sglang probe-load-vllm probe-load-sglang probe-check probe-ornith-arch model-fit model-pull model-status model-sync vram-fit verify-backend-flags ollama-cleanup-ctx-variants
 .PHONY: bench bench-vllm bench-sglang bench-ollama bench-report test-bench-smoke
 .PHONY: secrets-tmpfs secrets-edit secrets-render secrets-rotate age-keygen-host test-python
 .PHONY: build-backup-tool build-gpu-vendor-tool build-mcp-modelstatus build-mcp-modelstatus-image build-devai-tools test-devai-tools
@@ -1084,8 +1097,14 @@ ollama-clean: ## Remove partial downloads and orphaned blobs from Ollama cache
 			rm -v "$$b"; \
 		fi; \
 	done
-	@echo "Removing orphaned gguf/vllm caches..."
-	@for dir in $(CACHE_DIR)/ollama/models/gguf/* $(CACHE_DIR)/ollama/models/vllm/*; do \
+	@# GGUF staging dirs only. Do NOT add vllm/sglang here: those weights
+	@# now live on their own volumes ($(VLLM_MODELS_DIR), $(SGLANG_MODELS_DIR)),
+	@# outside the ollama tree. This loop keys "orphaned" off the Ollama
+	@# manifests, so including a non-Ollama dir would delete every HF model
+	@# whose name isn't an Ollama tag -- the exact bug that once wiped the
+	@# entire vLLM store. Keep this scoped to ollama's own gguf/ staging.
+	@echo "Removing orphaned gguf caches..."
+	@for dir in $(CACHE_DIR)/ollama/models/gguf/*; do \
 		[ -d "$$dir" ] || continue; \
 		model=$$(basename "$$dir"); \
 		if ! find $(CACHE_DIR)/ollama/models/manifests/ -path "*$$model*" -print -quit 2>/dev/null | grep -q .; then \
@@ -1101,7 +1120,8 @@ ollama-df: ## Show Ollama cache disk usage breakdown
 	@echo "=== Breakdown ==="
 	@du -sh $(CACHE_DIR)/ollama/models/blobs/ 2>/dev/null || true
 	@du -sh $(CACHE_DIR)/ollama/models/gguf/ 2>/dev/null || true
-	@du -sh $(CACHE_DIR)/ollama/models/vllm/ 2>/dev/null || true
+	@du -sh $(VLLM_MODELS_DIR)/ 2>/dev/null || true
+	@du -sh $(SGLANG_MODELS_DIR)/ 2>/dev/null || true
 	@echo ""
 	@partials=$$(ls $(CACHE_DIR)/ollama/models/blobs/*-partial 2>/dev/null | wc -l); \
 	if [ "$$partials" -gt 0 ]; then \
@@ -1141,6 +1161,13 @@ vram-fit: ## Show which models from the full catalog fit in VRAM (planning aid; 
 
 PROBE_VRAMS    ?= 16G,24G
 PROBE_CONTEXTS ?= 32K,64K,128K,256K
+# KV-cache dtype for THIS probe pass (empty = daemon default f16). Cells
+# probed with PROBE_KV_CACHE_TYPE=q8_0 are stamped kv_cache_type=q8_0 in
+# the cache; the router then reproduces that dtype when serving a ctx the
+# cell covers. Typical use: force just the tier that only fits quantized,
+# e.g. PROBE_FORCE_CTX=128K PROBE_KV_CACHE_TYPE=q8_0 PROBE_FLASH_ATTENTION=1.
+PROBE_KV_CACHE_TYPE   ?=
+PROBE_FLASH_ATTENTION ?=
 
 probe: ## Probe every downloaded ollama digest at every (VRAM, CONTEXT) tier.
 	@# Loops over PROBE_VRAMS, recreating devai-ollama with
@@ -1155,6 +1182,8 @@ probe: ## Probe every downloaded ollama digest at every (VRAM, CONTEXT) tier.
 	    echo ">>> probing at VRAM=$$vram (host=$(GPU_MEMORY_GB)G, OLLAMA_GPU_OVERHEAD=$$overhead_bytes bytes)"; \
 	    $(CONTAINER_RUNTIME) rm -f $(OLLAMA_CONTAINER) >/dev/null 2>&1 || true; \
 	    OLLAMA_GPU_OVERHEAD=$$overhead_bytes \
+	    OLLAMA_KV_CACHE_TYPE="$(PROBE_KV_CACHE_TYPE)" \
+	    OLLAMA_FLASH_ATTENTION="$(PROBE_FLASH_ATTENTION)" \
 	      $(COMPOSE) -f $(CACHE_COMPOSE) up -d ollama; \
 	    until $(CONTAINER_RUNTIME) exec $(OLLAMA_CONTAINER) ollama list >/dev/null 2>&1; do sleep 1; done; \
 	    $(CONTAINER_RUNTIME) run --rm \
@@ -1163,6 +1192,7 @@ probe: ## Probe every downloaded ollama digest at every (VRAM, CONTEXT) tier.
 	        -v $(CURDIR)/deploy:/deploy \
 	        -e OLLAMA_HOST=http://devai-ollama:11434 \
 	        -e PROBE_CONTEXTS=$(PROBE_CONTEXTS) \
+	        -e OLLAMA_KV_CACHE_TYPE="$(PROBE_KV_CACHE_TYPE)" \
 	        --entrypoint python3 \
 	        $(IMAGE_NAME) \
 	        /scripts/probe-ollama-reasoning.py \
@@ -1187,11 +1217,16 @@ probe-vllm: ## Probe every downloaded vLLM/HF model per (VRAM, CONTEXT) cell.
 	@#   PROBE_REPO=<regex>          filter catalog rows by repo
 	@#   PROBE_FORCE=1               re-probe every cell
 	@#   PROBE_FORCE_ARCH=1          re-probe top-level capability/arch
+	@#   PROBE_KV_CACHE_TYPE=auto    KV dtype for this pass (default fp8);
+	@#                               cells are stamped so serve time
+	@#                               reproduces the measured dtype
+	PROBE_KV_CACHE_TYPE="$(PROBE_KV_CACHE_TYPE)" \
 	python3 scripts/probe-vllm-reasoning.py \
 	    --host-vram-gb $(GPU_MEMORY_GB) \
+	    --models-dir $(VLLM_MODELS_DIR) \
 	    $(if $(PROBE_VRAMS_VLLM),--vram $(PROBE_VRAMS_VLLM),) \
 	    $(if $(PROBE_CONTEXTS),--ctx $(PROBE_CONTEXTS),) \
-	    $(if $(PROBE_REPO),--repo $(PROBE_REPO),) \
+	    $(if $(PROBE_REPO),--repo '$(PROBE_REPO)',) \
 	    $(if $(PROBE_FORCE),--force,) \
 	    $(if $(PROBE_FORCE_ARCH),--force-arch,)
 
@@ -1203,11 +1238,17 @@ probe-sglang: ## Probe every downloaded SGLang/HF model per (VRAM, CONTEXT) cell
 	@#   PROBE_REPO=<regex>          filter catalog rows by repo
 	@#   PROBE_FORCE=1               re-probe every cell
 	@#   PROBE_FORCE_ARCH=1          re-probe top-level capability/arch
+	@#   PROBE_KV_CACHE_TYPE=fp8_e5m2  enforce a KV dtype for this pass
+	@#                               (default: none = engine default);
+	@#                               cells are stamped so serve time
+	@#                               reproduces the measured dtype
+	PROBE_KV_CACHE_TYPE="$(PROBE_KV_CACHE_TYPE)" \
 	python3 scripts/probe-sglang-reasoning.py \
 	    --host-vram-gb $(GPU_MEMORY_GB) \
+	    --models-dir $(SGLANG_MODELS_DIR) \
 	    $(if $(PROBE_VRAMS_SGLANG),--vram $(PROBE_VRAMS_SGLANG),) \
 	    $(if $(PROBE_CONTEXTS),--ctx $(PROBE_CONTEXTS),) \
-	    $(if $(PROBE_REPO),--repo $(PROBE_REPO),) \
+	    $(if $(PROBE_REPO),--repo '$(PROBE_REPO)',) \
 	    $(if $(PROBE_FORCE),--force,) \
 	    $(if $(PROBE_FORCE_ARCH),--force-arch,)
 
@@ -1220,20 +1261,28 @@ probe-load-vllm: ## Serving-time LOAD probe for vLLM: augment fit cache with ser
 	@#   PROBE_REPO=<regex>          filter catalog rows by repo
 	@#   PROBE_FORCE=1               re-run cells that already have serving_ok
 	@#   PROBE_NEEDLE_DEPTH=0.5      needle insertion depth (0.0 top, 1.0 bottom)
+	@#   PROBE_KV_CACHE_TYPE=auto    KV dtype for the relaunches -- MUST match
+	@#                               the dtype the target cells were fit-probed
+	@#                               with (default fp8), or serving numbers are
+	@#                               measured under the wrong dtype
+	PROBE_KV_CACHE_TYPE="$(PROBE_KV_CACHE_TYPE)" \
 	python3 scripts/probe-vllm-reasoning.py --load \
 	    --host-vram-gb $(GPU_MEMORY_GB) \
+	    --models-dir $(VLLM_MODELS_DIR) \
 	    $(if $(PROBE_CONTEXTS),--ctx $(PROBE_CONTEXTS),) \
-	    $(if $(PROBE_REPO),--repo $(PROBE_REPO),) \
+	    $(if $(PROBE_REPO),--repo '$(PROBE_REPO)',) \
 	    $(if $(PROBE_FORCE),--force,) \
 	    $(if $(PROBE_NEEDLE_DEPTH),--needle-depth $(PROBE_NEEDLE_DEPTH),)
 
 probe-load-sglang: ## Serving-time LOAD probe for SGLang: same as probe-load-vllm against the SGLang cache.
 	@# Layers onto deploy/.sglang-reasoning-cache.json — run `make probe-sglang`
 	@# first. Same precondition + knobs as probe-load-vllm.
+	PROBE_KV_CACHE_TYPE="$(PROBE_KV_CACHE_TYPE)" \
 	python3 scripts/probe-sglang-reasoning.py --load \
 	    --host-vram-gb $(GPU_MEMORY_GB) \
+	    --models-dir $(SGLANG_MODELS_DIR) \
 	    $(if $(PROBE_CONTEXTS),--ctx $(PROBE_CONTEXTS),) \
-	    $(if $(PROBE_REPO),--repo $(PROBE_REPO),) \
+	    $(if $(PROBE_REPO),--repo '$(PROBE_REPO)',) \
 	    $(if $(PROBE_FORCE),--force,) \
 	    $(if $(PROBE_NEEDLE_DEPTH),--needle-depth $(PROBE_NEEDLE_DEPTH),)
 
@@ -1333,8 +1382,53 @@ probe-check: ## Report backend image drift: compare running vLLM/SGLang image di
 	  VLLM_IMAGE="$(VLLM_IMAGE)" SGLANG_IMAGE="$(SGLANG_IMAGE)" \
 	  python3 scripts/probe-check.py
 
+probe-ornith-arch: ## Tier-1 arch-support probe for the Ornith-1.0 35B (qwen3_5_moe). Cheap: introspects the running vLLM/SGLang images, no weight download.
+	@CONTAINER_RUNTIME=$(CONTAINER_RUNTIME) bash scripts/probe-ornith-arch.sh
+
 verify-backend-flags: ## Assert pinned vLLM/SGLang images expose every flag in deploy/backend-flags.yaml (run after image bump)
 	python3 scripts/verify-backend-flags.py
+
+# --- NVFP4 quantization (scripts/quant/) ------------------------------------
+# Generic + config-driven: set the model + params in .env (see .env.example),
+# then `make quant-local` (podman on the local GPU) or `make quant-cloud`
+# (HF Jobs). The SAME vars drive both. The ladder is just an .env edit:
+#   smoke : QUANT_MODEL=Qwen/Qwen2.5-1.5B-Instruct
+#   9B    : QUANT_MODEL=deepreinforce-ai/Ornith-1.0-9B  QUANT_PRESET=ornith QUANT_OUT_NAME=Ornith-1.0-9B-NVFP4
+#   35B   : QUANT_MODEL=deepreinforce-ai/Ornith-1.0-35B QUANT_PRESET=ornith QUANT_MOE_ALL_EXPERTS=1
+QUANT_SCRIPT          := scripts/quant/quant_smoke.py
+QUANT_MODEL           ?= Qwen/Qwen2.5-1.5B-Instruct
+QUANT_PRESET          ?= dense
+QUANT_SCHEME          ?= NVFP4
+QUANT_CALIB_SAMPLES   ?= 128
+QUANT_MAX_SEQ         ?= 512
+QUANT_DATASET         ?= open_platypus
+QUANT_SERVE           ?= transformers
+QUANT_MOE_ALL_EXPERTS ?= 0
+QUANT_OUT_NAME        ?=
+QUANT_PUSH_REPO       ?=
+QUANT_IMAGE           ?= docker.io/vllm/vllm-openai:v0.22.1-x86_64-cu129-ubuntu2404
+QUANT_FLAVOR          ?= rtx-pro-6000
+QUANT_TIMEOUT         ?= 1h
+QUANT_HF_CACHE        ?= $(HOME)/.cache/huggingface
+QUANT_SAVE_DIR         = $(if $(QUANT_OUT_NAME),$(VLLM_MODELS_DIR)/$(QUANT_OUT_NAME),/root/nvfp4-out)
+_QUANT_ARGS = --model $(QUANT_MODEL) --recipe-preset $(QUANT_PRESET) --scheme $(QUANT_SCHEME) --dataset $(QUANT_DATASET) --calib-samples $(QUANT_CALIB_SAMPLES) --max-seq $(QUANT_MAX_SEQ) --serve $(QUANT_SERVE) $(if $(filter 1,$(QUANT_MOE_ALL_EXPERTS)),--moe-all-experts,) $(if $(QUANT_PUSH_REPO),--out $(QUANT_PUSH_REPO),)
+
+.PHONY: quant-local quant-cloud
+
+quant-local: ## NVFP4 quantize on the LOCAL GPU (podman + QUANT_IMAGE); params from .env. Stop the stack first (make cache-down) for VRAM. QUANT_OUT_NAME -> saved under VLLM_MODELS_DIR.
+	@echo ">>> local NVFP4: model=$(QUANT_MODEL) preset=$(QUANT_PRESET) scheme=$(QUANT_SCHEME) serve=$(QUANT_SERVE) save=$(QUANT_SAVE_DIR)"
+	@mkdir -p $(QUANT_HF_CACHE)
+	$(CONTAINER_RUNTIME) run --rm $(GPU_FLAGS) --entrypoint bash \
+	    -v $(CURDIR)/scripts/quant:/quant:ro \
+	    -v $(VLLM_MODELS_DIR):$(VLLM_MODELS_DIR) \
+	    -v $(QUANT_HF_CACHE):/root/.cache/huggingface \
+	    -e HF_HUB_ENABLE_HF_TRANSFER=0 -e PYTHONUNBUFFERED=1 \
+	    $(if $(QUANT_PUSH_REPO),-e HF_TOKEN=$$HF_TOKEN,) \
+	    $(QUANT_IMAGE) -lc 'set -e; pip install --quiet --root-user-action=ignore llmcompressor datasets 2>&1 | tail -1; python3 -u /quant/quant_smoke.py $(_QUANT_ARGS) --save-dir $(QUANT_SAVE_DIR)'
+
+quant-cloud: ## NVFP4 quantize on HF Jobs (QUANT_FLAVOR); params from .env. Needs HF_TOKEN; set QUANT_PUSH_REPO to keep the result.
+	@test -n "$$HF_TOKEN" || { echo "ERROR: export HF_TOKEN (huggingface.co/settings/tokens) first"; exit 1; }
+	hf jobs uv run --flavor $(QUANT_FLAVOR) --image $(QUANT_IMAGE) --timeout $(QUANT_TIMEOUT) --secrets HF_TOKEN=$$HF_TOKEN $(QUANT_SCRIPT) $(_QUANT_ARGS)
 
 ollama-cleanup-ctx-variants: ## Remove every derived `-ctx<N>` tag from Ollama. Safe — they share weight blobs with parents; only Modelfile metadata is freed.
 	@$(CONTAINER_RUNTIME) exec devai-ollama sh -c 'ollama list | awk "NR>1 && \$$1 ~ /-ctx[0-9]+\$$/ {print \$$1}"' | \
@@ -1513,6 +1607,10 @@ BENCH_RUN_FLAGS = \
 	$(if $(BENCH_N_GSM8K),--n-gsm8k $(BENCH_N_GSM8K),) \
 	$(if $(BENCH_N_HUMANEVAL),--n-humaneval $(BENCH_N_HUMANEVAL),) \
 	$(if $(BENCH_N_TOOLS),--n-tools $(BENCH_N_TOOLS),) \
+	$(if $(BENCH_N_MMLU_PRO),--n-mmlu-pro $(BENCH_N_MMLU_PRO),) \
+	$(if $(BENCH_N_GPQA),--n-gpqa $(BENCH_N_GPQA),) \
+	$(if $(BENCH_DROP_THRESHOLD),--drop-threshold $(BENCH_DROP_THRESHOLD),) \
+	$(if $(BENCH_NO_EARLY_DROP),--no-early-drop,) \
 	$(if $(BENCH_N_LEAK_PROMPTS),--n-leak-prompts $(BENCH_N_LEAK_PROMPTS),) \
 	$(if $(BENCH_N_LONGCTX_FRACTION),--n-longctx-fraction $(BENCH_N_LONGCTX_FRACTION),) \
 	$(if $(BENCH_N_LONGCTX_MAX_TOKENS),--n-longctx-max-tokens $(BENCH_N_LONGCTX_MAX_TOKENS),)
@@ -1531,6 +1629,7 @@ bench-vllm: ## Bench every loaded vLLM/HF model via devai-router:11435
 		$(BENCH_CACHE_MOUNTS) \
 		$(GPU_FLAGS) \
 		-e GPU_MEMORY_GB=$(GPU_MEMORY_GB) \
+		-e HF_TOKEN -e HUGGING_FACE_HUB_TOKEN \
 		--entrypoint python3 \
 		$(IMAGE_NAME_GPU) \
 		/scripts/bench/bench_runner.py --backend vllm \
@@ -1543,6 +1642,7 @@ bench-sglang: ## Bench every loaded SGLang model via devai-router:11436
 		$(BENCH_CACHE_MOUNTS) \
 		$(GPU_FLAGS) \
 		-e GPU_MEMORY_GB=$(GPU_MEMORY_GB) \
+		-e HF_TOKEN -e HUGGING_FACE_HUB_TOKEN \
 		--entrypoint python3 \
 		$(IMAGE_NAME_GPU) \
 		/scripts/bench/bench_runner.py --backend sglang \
@@ -1555,6 +1655,7 @@ bench-ollama: ## Bench every loaded Ollama model via devai-router:11434
 		$(BENCH_CACHE_MOUNTS) \
 		$(GPU_FLAGS) \
 		-e GPU_MEMORY_GB=$(GPU_MEMORY_GB) \
+		-e HF_TOKEN -e HUGGING_FACE_HUB_TOKEN \
 		--entrypoint python3 \
 		$(IMAGE_NAME_GPU) \
 		/scripts/bench/bench_runner.py --backend ollama \
@@ -1565,6 +1666,7 @@ bench-report: ## Print a Markdown leaderboard from .bench-cache.json
 		-v $(CURDIR)/scripts:/scripts:ro \
 		-v $(CURDIR)/deploy:/deploy:ro \
 		-e GPU_MEMORY_GB=$(GPU_MEMORY_GB) \
+		-e HF_TOKEN -e HUGGING_FACE_HUB_TOKEN \
 		--entrypoint python3 \
 		$(IMAGE_NAME) \
 		/scripts/bench/bench_report.py \
@@ -1580,6 +1682,7 @@ test-bench-smoke: ## 1-model tiny-subset smoke test (CI / sanity)
 		$(BENCH_CACHE_MOUNTS) \
 		$(GPU_FLAGS) \
 		-e GPU_MEMORY_GB=$(GPU_MEMORY_GB) \
+		-e HF_TOKEN -e HUGGING_FACE_HUB_TOKEN \
 		--entrypoint python3 \
 		$(IMAGE_NAME_GPU) \
 		/scripts/bench/bench_runner.py --backend vllm \

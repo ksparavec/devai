@@ -233,5 +233,79 @@ class TestFormatModelPropertiesNotAvailable(unittest.TestCase):
         self.assertIn("make bench --ctx 128K", out)
 
 
+class UseCaseRecommenderTests(unittest.TestCase):
+    """The per-model use-case recommender (_use_case_ratings / tiers /
+    _format_use_case_recommendations) and the auxiliary gsm/leak metrics."""
+
+    def _model(self, *, ctx, gpqa, mmlu, hevp, code=0.8, gsm=0.95,
+               tps=80.0, leak=0.0):
+        return {
+            "name": "m",
+            "_picker_context": ctx,
+            "_picker_scores": {
+                "tps": tps, "code": code, "hevp": hevp, "mmlu": mmlu,
+                "gpqa": gpqa, "tools": 1.0, "gsm": gsm, "leak": leak,
+            },
+        }
+
+    def test_picker_scores_includes_gsm_and_leak(self):
+        row = {
+            "tasks": {
+                "gsm8k_subset_100": {"score": 0.9},
+                "leak_probe": {"leak_rate": 0.05},
+            },
+            "metrics": {},
+        }
+        s = PICKER._picker_scores(row)
+        self.assertEqual(s["gsm"], 0.9)
+        self.assertEqual(s["leak"], 0.05)
+        # None-row still carries the keys (so consumers never KeyError).
+        self.assertIsNone(PICKER._picker_scores(None)["gsm"])
+
+    def test_unbenched_returns_none(self):
+        m = {"_picker_context": 262144, "_picker_scores": {"gpqa": None,
+             "mmlu": None, "hevp": None}}
+        self.assertIsNone(PICKER._use_case_ratings(m))
+
+    def test_tiers_boundaries(self):
+        self.assertEqual(PICKER._use_case_tier(80), "Excellent")
+        self.assertEqual(PICKER._use_case_tier(79.9), "Strong")
+        self.assertEqual(PICKER._use_case_tier(65), "Strong")
+        self.assertEqual(PICKER._use_case_tier(50), "Good")
+        self.assertEqual(PICKER._use_case_tier(35), "Fair")
+        self.assertEqual(PICKER._use_case_tier(34.9), "Weak")
+
+    def test_long_ctx_reasoner_tops_doc_tasks(self):
+        # 256K + strong MMLU/GPQA, mediocre coder -> doc_qa/summary rank first.
+        m = self._model(ctx=262144, gpqa=0.78, mmlu=0.83, hevp=0.66, code=0.68)
+        ranked = PICKER._use_case_ratings(m)
+        top2 = {k for k, _ in ranked[:2]}
+        self.assertEqual(top2, {"doc_qa", "summary"})
+
+    def test_short_ctx_coder_tops_coding_not_docs(self):
+        # 64K + strong coding -> coding first; short ctx pushes docs down.
+        m = self._model(ctx=65536, gpqa=0.87, mmlu=0.82, hevp=0.98, code=0.96)
+        ranked = PICKER._use_case_ratings(m)
+        self.assertEqual(ranked[0][0], "coding")
+        order = [k for k, _ in ranked]
+        self.assertLess(order.index("coding"), order.index("summary"))
+        self.assertLess(order.index("coding"), order.index("doc_qa"))
+
+    def test_format_lists_all_five_use_cases(self):
+        m = self._model(ctx=262144, gpqa=0.78, mmlu=0.83, hevp=0.66)
+        out = PICKER._format_use_case_recommendations(m)
+        self.assertIn("Recommended for:", out)
+        for label in ("Coding", "Math / analysis", "Gen. reasoning",
+                      "Doc summary", "Doc Q&A"):
+            self.assertIn(label, out)
+        # honesty note about the proxied doc scores
+        self.assertIn("estimate", out.lower())
+
+    def test_format_empty_when_unbenched(self):
+        m = {"_picker_context": 0, "_picker_scores": {"gpqa": None,
+             "mmlu": None, "hevp": None}}
+        self.assertEqual(PICKER._format_use_case_recommendations(m), "")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

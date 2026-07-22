@@ -34,6 +34,15 @@ services:
       # to simulate a smaller GPU during probing (so a 24G host can produce
       # cache cells valid for a 16G target). 0 = no constraint.
       - OLLAMA_GPU_OVERHEAD=${OLLAMA_GPU_OVERHEAD:-0}
+      # KV-cache dtype pass-through for probe passes (empty = f16 default).
+      # `make probe PROBE_KV_CACHE_TYPE=q8_0` sets these for the daemon so
+      # the probed cell reflects quantized-KV memory; the cell is stamped
+      # kv_cache_type and the router reproduces the dtype at serve time
+      # per covered ctx tier. Do NOT set globally in .env without a
+      # long-reasoning re-bench: q8_0 measurably degrades GPQA (see
+      # deploy/.bench-cache.json row ...::ollama::131072).
+      - OLLAMA_KV_CACHE_TYPE=${OLLAMA_KV_CACHE_TYPE:-}
+      - OLLAMA_FLASH_ATTENTION=${OLLAMA_FLASH_ATTENTION:-}
     volumes:
       - /var/cache/devai/ollama:/root/.ollama
     devices:
@@ -54,7 +63,7 @@ services:
     container_name: devai-vllm
     hostname: vllm
     volumes:
-      - /var/cache/devai/ollama/models/vllm:/models:ro
+      - /var/cache/devai/vllm:/models:ro
     entrypoint: ["sleep", "infinity"]
     devices:
       - ${DEVAI_GPU_DEVICE:-nvidia.com/gpu=all}
@@ -67,7 +76,7 @@ services:
     container_name: devai-sglang
     hostname: sglang
     volumes:
-      - /var/cache/devai/ollama/models/vllm:/models:ro
+      - /var/cache/devai/sglang:/models:ro
     entrypoint: ["sleep", "infinity"]
     devices:
       - ${DEVAI_GPU_DEVICE:-nvidia.com/gpu=all}
@@ -94,12 +103,12 @@ services:
       - VLLM_PORT=11435
       - VLLM_CONTAINER=devai-vllm
       - VLLM_IMAGE=${VLLM_IMAGE:-docker.io/vllm/vllm-openai:v0.22.1-x86_64-cu129-ubuntu2404}
-      - VLLM_MODELS_DIR=/var/cache/devai/ollama/models/vllm
+      - VLLM_MODELS_DIR=/var/cache/devai/vllm
       - SGLANG_URL=http://sglang:11434
       - SGLANG_PORT=11436
       - SGLANG_CONTAINER=devai-sglang
       - SGLANG_IMAGE=${SGLANG_IMAGE:-docker.io/lmsysorg/sglang:v0.5.10.post1-cu130}
-      - SGLANG_MODELS_DIR=/var/cache/devai/ollama/models/vllm
+      - SGLANG_MODELS_DIR=/var/cache/devai/sglang
       - NETWORK=devai-net
       - IDLE_TIMEOUT=${IDLE_TIMEOUT:-0}
       - DRAIN_TIMEOUT=${DRAIN_TIMEOUT:-30}

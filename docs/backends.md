@@ -273,6 +273,71 @@ The probe is vLLM/SGLang only today (the BackendSpec path). Ollama
 allocates KV per-request from `num_ctx` via llama.cpp and has no LOAD
 pass yet.
 
+### Per-tier KV-cache dtype (all backends, additive field)
+
+Ollama probe cells carry a `kv_cache_type` field: the KV dtype the
+daemon served the cell under, stamped by the prober from the
+`OLLAMA_KV_CACHE_TYPE` env of the probe pass (absent/empty = `f16`,
+which is also what pre-field legacy cells mean). A cell probed under
+`q8_0` only fits WITH quantized KV, so fit is dtype-scoped:
+
+- **prober**: `make probe PROBE_KV_CACHE_TYPE=q8_0 PROBE_FLASH_ATTENTION=1
+  PROBE_FORCE_CTX=128K PROBE_MODELS=<tag>` re-probes one tier under
+  quantized KV and stamps it; unforced tiers keep their f16 cells.
+- **router** (`resolveKVCacheType`): at launch, the smallest probed tier
+  covering the serving ctx supplies the dtype; the ollama `DynamicEnv`
+  bakes `OLLAMA_KV_CACHE_TYPE` (+ `OLLAMA_FLASH_ATTENTION=1`, a hard
+  prerequisite) into the recreated container. f16/unstamped tiers emit
+  nothing -- the container spec is byte-identical to pre-field builds.
+- **picker** (`_kv_cells` / `_kv_mixed`): a model whose fitting tiers
+  span both dtypes gets a context-tier sub-modal (tier choice = quality
+  choice) and pins `@<ctx>` on the emitted name so the router serves
+  exactly the chosen tier; the preview pane warns that quantized tiers
+  have measurably weaker long-form reasoning (qwen3.6:35b-a3b-mtp:
+  GPQA 0.8667 at 64K/f16 vs 0.75-0.77 at 128K/q8_0, two runs; all
+  short-chain metrics unaffected -- see `.bench-cache.json` row
+  `...::ollama::131072`).
+
+Do NOT set `OLLAMA_KV_CACHE_TYPE` globally in `.env`: fit cells are
+dtype-scoped, and a global flip silently invalidates every f16 cell.
+The per-tier probe flow above is the only supported path.
+
+Force-wipe hazard: a plain `make probe PROBE_FORCE=1` re-measures every
+tier under the DEFAULT f16 env -- a quantized-only tier (q8_0 128K)
+then spills, gets rewritten `fully_on_gpu=false`, and disappears from
+the picker/router until the targeted `PROBE_KV_CACHE_TYPE=q8_0` pass
+is re-run. After any full-force re-probe of a mixed-KV model, re-run
+the quantized-tier pass to restore its cell.
+
+The same per-cell dtype contract covers vLLM and SGLang -- there is no
+global KV dtype policy:
+
+- **vLLM**: the prober launches every cell with `--kv-cache-dtype
+  $PROBE_KV_CACHE_TYPE` (default fp8) and stamps it; serve time
+  (`vllmEntrypoint`) reproduces the covering cell's stamp. UNSTAMPED
+  legacy cells decode to fp8 on both sides -- that is the dtype they
+  were factually measured under (the pre-field hardcode), so behaviour
+  is byte-identical until a model is deliberately re-probed. A model
+  with VRAM slack can be re-probed `make probe-vllm
+  PROBE_KV_CACHE_TYPE=auto PROBE_REPO=<repo> PROBE_FORCE=1` to serve
+  unquantized KV; fit cells are dtype-scoped, so never edit the stamp
+  by hand.
+- **SGLang**: legacy cells ran the engine default (no flag) and stay
+  unstamped; `PROBE_KV_CACHE_TYPE=fp8_e5m2` (etc.) enforces + stamps a
+  dtype, and `sglangEntrypoint` emits the flag only for stamped,
+  non-default cells.
+- **picker**: `_kv_cells` decodes unstamped cells per backend (vllm ->
+  fp8, others -> f16) and the mixed-KV sub-modal/warning generalizes:
+  f16/auto count as "full quality", any other dtype carries the
+  weaker-long-form-reasoning caveat (with the measured GPQA numbers
+  cited only for q8_0, the dtype they were measured on).
+
+Nothing has measured vLLM's fp8-vs-auto quality delta on this fleet
+yet -- every existing vLLM bench row (including GPQA) was measured
+under fp8 KV, so displayed scores are honest for what serves today.
+An fp8-vs-auto A/B on a slack model (fit + LOAD probe + full bench
+with GPQA both ways) is the open follow-up.
+
 ### Custom vLLM parser plugins
 
 Some models emit tool calls or reasoning in a format that no built-in

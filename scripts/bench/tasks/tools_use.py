@@ -275,7 +275,7 @@ def tools_use_scorer():
 
 
 @solver
-def tool_loop_with_pin():
+def tool_loop_with_pin(tool_mode: str = "forced"):
     """Custom tool-call loop that pins ``tool_choice`` per-sample.
 
     Replaces inspect_ai's default ``generate()`` solver chain for this
@@ -318,7 +318,22 @@ def tool_loop_with_pin():
         subcase = str(meta.get("subcase") or "")
 
         model = get_model()
-        first_choice = ToolFunction(name=expect_tool) if expect_tool else "auto"
+        # tool_choice depends on the model's probed tool_mode:
+        #   - forced-mode models (R1-Distill, Llama-3.1-8B): pin to the
+        #     expected ToolFunction. The router 400s these on
+        #     tool_choice="auto" against multiple tools, and they only
+        #     round-trip a call when pinned.
+        #   - auto-mode models (Gemma-4, Qwen3, gpt-oss, Nemotron-9B-v2):
+        #     drive with "auto". Pinning breaks non-standard formats --
+        #     Nemotron's <TOOLCALL>[...] wrapper lands verbatim as the first
+        #     argument value because vLLM's forced/guided path bypasses the
+        #     tool parser. "auto" is also how real agents call them, so it
+        #     is the more faithful test (and exercises tool routing on
+        #     multi_tool_pick instead of handing over the answer).
+        if tool_mode == "auto":
+            first_choice = "auto"
+        else:
+            first_choice = ToolFunction(name=expect_tool) if expect_tool else "auto"
 
         state.output = await model.generate(
             input=state.messages,
@@ -346,29 +361,34 @@ def tool_loop_with_pin():
     return solve
 
 
-def _build_solver(samples: list[Sample]):
+def _build_solver(samples: list[Sample], tool_mode: str = "forced"):
     """Build a solver chain that exposes the union of all tools to every
     sample, then drives a per-sample tool-call loop via
     ``tool_loop_with_pin``. See that solver for why we don't use
-    inspect_ai's stock ``generate()``.
+    inspect_ai's stock ``generate()``. ``tool_mode`` (the model's probed
+    tool mode) selects pinned vs. ``auto`` tool_choice.
     """
     all_tools = [task_list(), get_weather(), get_time()]
     return [
         system_message(SYSTEM_PROMPT),
         use_tools(all_tools),
-        tool_loop_with_pin(),
+        tool_loop_with_pin(tool_mode),
     ]
 
 
 @task
-def tools_use_task(n: int = 20) -> Task:
+def tools_use_task(n: int = 20, tool_mode: str = "forced") -> Task:
     """Build the tools-use Task. ``n`` caps the prompt count; default
-    20 = full set (5 per subcase × 4 subcases).
+    20 = full set (5 per subcase × 4 subcases). ``tool_mode`` is the
+    model's probed tool mode (``"auto"`` or ``"forced"``); it selects
+    whether the loop pins tool_choice or drives it as ``"auto"``. Defaults
+    to ``"forced"`` so callers that don't know the mode (or models without
+    a probed mode, e.g. Ollama) keep the historical pinned behaviour.
     """
     items = _load_prompts()[:n]
     samples = [_record_to_sample(item) for item in items]
     return Task(
         dataset=MemoryDataset(samples=samples, name="tools_use"),
-        solver=_build_solver(samples),
+        solver=_build_solver(samples, tool_mode),
         scorer=tools_use_scorer(),
     )

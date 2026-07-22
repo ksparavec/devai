@@ -1,0 +1,32 @@
+# NVFP4 recipe for deepreinforce-ai/Ornith-1.0-35B (qwen3_5_moe, MoE + vision),
+# quantized TEXT-ONLY for agentic coding on a 24G serve target.
+#
+# BASE THIS ON THE CANONICAL llm-compressor Qwen3.5 NVFP4 MoE example -- confirm
+# the exact module-name patterns against Ornith's config before the real run:
+#   https://docs.vllm.ai/projects/llm-compressor/en/latest/key-models/qwen3.5/nvfp4-moe-example/
+#
+# The dense 9B (quant-9b) does NOT need this file -- it uses the driver's default
+# (ignore lm_head). Only the 35B MoE+vision run passes --recipe <this>.
+#
+# UNVERIFIED: the ignore patterns + moe_calibrate_all_experts flag below are
+# assembled from the docs; the quant-smoke / quant-9b rungs exist to validate the
+# API shape before this recipe is trusted on the 35B.
+quant_stage:
+  quant_modifiers:
+    QuantizationModifier:
+      targets: ["Linear"]
+      scheme: NVFP4          # W4A4 FP4; needs calibration data for activation scales
+      # Skip everything that must stay high-precision on a qwen3_5_moe + vision
+      # checkpoint: the LM head + embeddings, the MoE router/gate + shared-expert
+      # gates, the linear-attention layers, and the whole vision tower (text-only).
+      ignore:
+        - "lm_head"
+        - "re:.*embed_tokens"
+        - "re:.*mlp\\.gate$"
+        - "re:.*shared_expert_gate"
+        - "re:.*visual.*"
+        - "re:.*vision.*"
+        - "re:.*linear_attn.*"
+      # Ensure every one of the 256 experts receives calibration data (else some
+      # experts export with no scale). Key name to confirm against the example.
+      moe_calibrate_all_experts: true

@@ -270,5 +270,56 @@ class TestDiscoverModels(unittest.TestCase):
         )
 
 
+class TestEvaluateDropTrigger(unittest.TestCase):
+    """Early-drop disqualifier logic: leak or low gsm8k/humaneval trips a
+    drop; tools is excluded; passing results and partial results don't."""
+
+    def test_leak_triggers(self) -> None:
+        flag = bench_runner._evaluate_drop_trigger(
+            {"leak_probe": {"leak_rate": 0.1}}, 0.70)
+        self.assertIsNotNone(flag)
+        self.assertEqual(flag["reason"], "leak")
+
+    def test_low_gsm8k_triggers(self) -> None:
+        flag = bench_runner._evaluate_drop_trigger(
+            {"gsm8k_subset_100": {"score": 0.60}}, 0.70)
+        self.assertIsNotNone(flag)
+        self.assertEqual(flag["metric"], "gsm8k")
+        self.assertEqual(flag["value"], 0.60)
+
+    def test_low_humaneval_triggers(self) -> None:
+        flag = bench_runner._evaluate_drop_trigger(
+            {"humaneval_subset_50": {"pass@1": 0.56}}, 0.70)
+        self.assertIsNotNone(flag)
+        self.assertEqual(flag["metric"], "humaneval")
+
+    def test_passing_scores_do_not_trigger(self) -> None:
+        flag = bench_runner._evaluate_drop_trigger(
+            {
+                "leak_probe": {"leak_rate": 0.0},
+                "gsm8k_subset_100": {"score": 0.96},
+                "humaneval_subset_50": {"pass@1": 1.0},
+            },
+            0.70,
+        )
+        self.assertIsNone(flag)
+
+    def test_low_tools_is_not_a_trigger(self) -> None:
+        # tools is a saturated microbench + parser-artifact prone; a 0.00
+        # there must not disqualify a model.
+        flag = bench_runner._evaluate_drop_trigger(
+            {"tools_use_20": {"score": 0.0}}, 0.70)
+        self.assertIsNone(flag)
+
+    def test_at_threshold_does_not_trigger(self) -> None:
+        # Strictly-below only: exactly 0.70 is a keep.
+        flag = bench_runner._evaluate_drop_trigger(
+            {"gsm8k_subset_100": {"score": 0.70}}, 0.70)
+        self.assertIsNone(flag)
+
+    def test_empty_results_do_not_trigger(self) -> None:
+        self.assertIsNone(bench_runner._evaluate_drop_trigger({}, 0.70))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

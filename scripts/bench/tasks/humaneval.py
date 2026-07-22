@@ -22,6 +22,7 @@ not to be malicious; we don't trust it not to fork-bomb).
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -43,9 +44,23 @@ SYSTEM_PROMPT = (
 # Subprocess time budget per sample. HumanEval problems are tiny;
 # anything taking >10s is a model bug or an infinite loop.
 _RUN_TIMEOUT_S = 10.0
-# 256 MB cap on the child process. Far above what any HumanEval
-# test needs; protects the host if the model writes a runaway list.
-_MEM_LIMIT_MB = 256
+# 2 GB address-space cap on the child process -- still a runaway-list
+# guard, but high enough for numpy/OpenBLAS. HumanEval+ (EvalPlus) tests
+# are numpy-heavy; at the old 256 MB cap OpenBLAS failed every allocation
+# ("Memory allocation still failed after 10 retries") and every sample
+# scored 0. We also pin BLAS to a single thread below (see _BLAS_ENV) so
+# OpenBLAS doesn't reserve a per-core buffer that scales with CPU count.
+_MEM_LIMIT_MB = 2048
+
+# Force single-threaded BLAS in the test subprocess: OpenBLAS otherwise
+# allocates thread-local buffers sized to the host core count, which both
+# wastes the RLIMIT_AS budget and makes execution nondeterministic.
+_BLAS_ENV = {
+    "OPENBLAS_NUM_THREADS": "1",
+    "OMP_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "NUMEXPR_NUM_THREADS": "1",
+}
 
 # Match any fenced code block (with optional ``python|py`` info-string)
 # anywhere in the text. Non-greedy body so multiple fences round-trip
@@ -147,11 +162,17 @@ def _run_check_in_subprocess(program: str) -> tuple[bool, str]:
     """)
     full = wrapper + "\n" + program
     try:
+        # Feed the program on stdin (`python -`), NOT as `-c <program>`:
+        # EvalPlus's hardened test strings are hundreds of KB and overflow
+        # the OS argv limit (ARG_MAX) as a `-c` argument, raising
+        # OSError(7, 'Argument list too long') and aborting the whole eval.
         r = subprocess.run(
-            [sys.executable, "-c", full],
+            [sys.executable, "-"],
+            input=full,
             capture_output=True,
             text=True,
             timeout=_RUN_TIMEOUT_S + 2,
+            env={**os.environ, **_BLAS_ENV},
         )
     except subprocess.TimeoutExpired:
         return False, "subprocess timeout"

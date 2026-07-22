@@ -81,7 +81,7 @@ from _model_status import (  # noqa: E402
 
 DEFAULT_CATALOG = REPO_ROOT / "deploy" / "models.yaml"
 DEFAULT_MODELS_DIR = os.environ.get(
-    "VLLM_MODELS_DIR", "/var/cache/devai/ollama/models/vllm"
+    "VLLM_MODELS_DIR", "/var/cache/devai/vllm"
 )
 DEFAULT_PROMPT = (
     "Solve this step by step. Show your reasoning, then state the final number. "
@@ -224,6 +224,13 @@ class BackendSpec:
     # flag. Only vLLM supports this today — SGLang's plugin model uses
     # Python registry imports rather than a file-path arg.
     supports_plugins: bool = False
+    # KV-cache dtype the build_args launch enforces for this pass
+    # (e.g. "fp8" for vLLM's default pass, "auto" for an unquantized
+    # measurement). Stamped as `kv_cache_type` on every successful cell
+    # so serve time reproduces the measured dtype — fit is only valid
+    # under the dtype it was measured with. "" = engine default, cell
+    # left unstamped (legacy shape).
+    kv_cache_dtype: str = ""
     # schema_version v2 added reasoning_parser, tool_parser (populated),
     # disable_verified, and per-cell tool/disable verdicts. v1 readers
     # backfill defaults on first read.
@@ -1181,6 +1188,10 @@ def probe_one_cell(
         "probed_at": now_iso(),
         "evidence": cap_evidence,
     }
+    if spec.kv_cache_dtype:
+        # Fit is dtype-scoped: the router reproduces this dtype when
+        # serving any ctx this cell covers (gpu-arbiter resolveKVCacheType).
+        rec["kv_cache_type"] = spec.kv_cache_dtype
     if tool_evidence is not None:
         rec["evidence"]["tool"] = tool_evidence
     if disable_evidence is not None:

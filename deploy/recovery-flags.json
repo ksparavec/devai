@@ -231,6 +231,32 @@
         "a context extension -- consistent with the as-delivered policy."
       ]
     },
+    "NVIDIA-Nemotron-Nano-9B-v2-NVFP4": {
+      "image": "docker.io/vllm/vllm-openai:v0.25.1-x86_64-cu129-ubuntu2404",
+      "engine_flags": [
+        "--mamba-ssm-cache-dtype", "float32"
+      ],
+      "_image_comment": [
+        "Hybrid Mamba-Transformer reasoning model. Pinned to vLLM v0.25.1",
+        "(NOT the global v0.22.1) because v0.22.1 does NOT register the",
+        "nemotron_v3 --reasoning-parser -- passing it crashes the engine at",
+        "startup (container exits before /health). v0.25.1 registers it; the",
+        "router injects --reasoning-parser nemotron_v3 from the probe cache",
+        "(curated in scripts/model-families.yaml). Remove this override once",
+        "the global VLLM_IMAGE reaches >=0.25.1."
+      ],
+      "_engine_flags_comment": [
+        "--mamba-ssm-cache-dtype float32 is REQUIRED by this checkpoint: the",
+        "model card warns accuracy degrades without it (the Mamba-2 SSM state",
+        "cache otherwise defaults to a lower precision). --trust-remote-code",
+        "is already a router default, so it is not repeated here.",
+        "Verified by direct podman launch on v0.25.1: <think> traces separate",
+        "into the reasoning field and content is clean executable code, which",
+        "lifts HumanEval off its ~0.10 floor. NOTE: bench/serve at temp>=0.6",
+        "-- v0.25.1 loops on greedy (temp 0) reasoning for this model.",
+        "Verify: make probe-vllm PROBE_REPO=NVIDIA-Nemotron-Nano-9B-v2-NVFP4 PROBE_FORCE=1"
+      ]
+    },
     "diffusiongemma-26B-A4B-it-NVFP4": {
       "image": "docker.io/vllm/vllm-openai:gemma-x86_64-cu130",
       "engine_flags": [

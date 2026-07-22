@@ -459,6 +459,12 @@ def _gguf_tag_token(filename: str) -> str:
       `gemma-4-26B-A4B-it-UD-Q3_K_XL.gguf`     → `it-ud-q3_k_xl`
       `NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-UD-Q3_K_XL.gguf`
                                                → `reasoning-ud-q3_k_xl`
+      `ornith-1.0-9b-Q4_K_M.gguf`              → `q4_k_m`  (lowercase `9b`)
+
+    The trailing size letter is matched case-insensitively (`B` or `b`):
+    unsloth ships uppercase `27B`, but some publishers (e.g. deepreinforce-ai
+    Ornith) ship lowercase `9b`. Without the lowercase branch the size token
+    is never stripped and the whole stem leaks into the tag.
     """
     import re
     stem = filename
@@ -466,7 +472,7 @@ def _gguf_tag_token(filename: str) -> str:
         stem = stem[: -len(".gguf")]
     # `[A-Z]?` makes the optional letter prefix recognise A4B / A3B / etc.
     matches = list(re.finditer(
-        r"(?<![A-Za-z0-9])([A-Z]?\d+(?:\.\d+)?B)(?=[-_]|$)", stem,
+        r"(?<![A-Za-z0-9])([A-Z]?\d+(?:\.\d+)?[Bb])(?=[-_]|$)", stem,
     ))
     if matches:
         stem = stem[matches[-1].end():].lstrip("-_")

@@ -304,6 +304,7 @@ def update_row(
     task_results: dict[str, dict] | None = None,
     metrics: dict | None = None,
     host_env_id: str | None = None,
+    drop_recommendation: dict | None = None,
 ) -> dict:
     """Merge a single bench result into the cache.
 
@@ -358,26 +359,15 @@ def update_row(
         row["metrics"].update(metrics)
     if host_env_id is not None:
         row["host_env_id"] = host_env_id
+    # Early-drop recommendation (leak / low-score disqualifier). A flag only --
+    # readers/operators act on it; it never deletes weights. Written only when
+    # a run actually triggers it (non-None); the immutable cache never wipes a
+    # row, so a prior flag persists until a triggering run overwrites it.
+    if drop_recommendation is not None:
+        row["drop_recommendation"] = drop_recommendation
     row["last_benched_at"] = now
     cache[key] = row
     return row
-
-
-def reset_row_for_force(cache: dict, key: str) -> None:
-    """Clear ``tasks`` and ``metrics`` for a force re-bench, preserving
-    provenance (``first_benched_at``, ``model``, ``backend``,
-    ``router_endpoint``). No-op when the row doesn't exist yet.
-
-    Without this, ``--force`` re-runs the tasks but leaves stale
-    metric fields (e.g. an old ``ttft_ms_first`` from a prior driver
-    version) sitting next to the new run -- and the leaderboard can't
-    tell which is which.
-    """
-    row = cache.get(key)
-    if not isinstance(row, dict):
-        return
-    row["tasks"] = {}
-    row["metrics"] = {}
 
 
 # ── Host environment capture ────────────────────────────────────────────────
@@ -684,9 +674,15 @@ def serving_alias(entry: dict) -> str | None:
 def serving_alias_with_ctx(alias: str, ctx: int, backend: str) -> str:
     """Build the picker-style ``<name>@<ctx>`` suffix for HF backends.
 
-    Ollama doesn't honour the suffix on the OpenAI-compat path, so it
-    sends the bare alias. HF backends need the suffix so the router
-    recreates with the right ``--max-model-len``.
+    Ollama takes the bare alias: the ``@<ctx>`` suffix is not a valid
+    Ollama tag, and Ollama ignores ``options.num_ctx`` on the OpenAI-compat
+    path the bench uses. The router instead recreates the Ollama container
+    per model with ``OLLAMA_CONTEXT_LENGTH`` baked from the probe-verified
+    ctx (see ensureOllamaRunning in gpu-arbiter), so the bare alias is
+    served at exactly the probed context this bench row records -- the same
+    single fits=true cell discover_models selects. HF backends need the
+    suffix so the router bakes the matching ``--max-model-len`` /
+    ``--context-length`` at recreate time.
     """
     if backend == "ollama" or ctx <= 0:
         return alias

@@ -140,6 +140,18 @@ families:
       - repo: google/gemma-4-26B-A4B-it-qat-q4_0-gguf
         tag_prefix: 26b-a4b
         include: []   # TODO: quant allowlist e.g. UD-Q3_K_XL ([] emits nothing)
+    parsers:
+      # Gemma-4 emits the `gemma4` tool-call format -- verified on the
+      # sibling diffusiongemma family (same 26B-A4B MoE backbone, probe
+      # recorded tool_parser=gemma4 verified=true). Without this block the
+      # probe never attempts a tool parser, so the router strips
+      # tools/tool_choice and the model scored 0 on the tools bench despite
+      # tool-calling fine (its Ollama GGUF twin scored tools=1.00). vLLM
+      # only: Gemma-4 NVFP4 does not serve on SGLang (arch/quant gap).
+      # Reasoning deliberately omitted -- the -it instruct variants probe as
+      # capability=none (non-reasoning); revisit if a thinking variant lands.
+      vllm:
+        tool: gemma4
     arch_ref: google/gemma-4-26b-a4b-it
     thinking: true        # hint; runtime probe shows e2b/e4b are unsupported
 
@@ -343,6 +355,78 @@ families:
   #   * SGLang fixes its NVFP4 path (bug noted at the top of this
   #     file) so we can fall back to SGLang's loader.
 
+  - name: ornith
+    # Ornith-1.0 (deepreinforce-ai) -- an agentic-coding LLM family, RL
+    # self-improving, MIT licensed. On a 24G card the 9B fits as GGUF (Ollama)
+    # or as an in-house NVFP4 safetensors quant on vLLM (see MEASURED below);
+    # the 35B / 397B are out of scope for 24G.
+    #
+    # The 9B is DENSE qwen3_5 arch (Qwen3_5ForConditionalGeneration; 32L,
+    # 16 attn / 4 KV heads, head_dim 256, vocab 248320, native 256K ctx,
+    # bf16), post-trained on Gemma 4 + Qwen 3.5. Opens with a <think> block;
+    # tool calls are qwen3_xml. The model card prescribes --reasoning-parser
+    # qwen3 --tool-call-parser qwen3_xml (sglang: qwen) -- recorded here for
+    # when a 24G-fitting NVFP4/FP8 quant is published; Ollama parses natively,
+    # so no `parsers:` block is needed for the GGUF rows.
+    #
+    # MEASURED on the 24G card (RTX PRO 4000 Blackwell), 2026-07-14:
+    #   9B GGUF (Ollama): Q4_K_M loads + generates, <think> reasoning works
+    #     (probe capability=structured), ~13.4 GB resident at load (5.2 GB
+    #     weights). Q5_K_M / Q6_K / Q8_0 / bf16 are the same arch at larger
+    #     sizes and fit too. This is the ONLY 9B path that fits 24G.
+    #   9B bf16 safetensors (vLLM): OOMs at model load (oom_startup) at EVERY
+    #     tier incl. 32K -- NOT catalogued. The fit-math estimate (~17.5 GiB
+    #     weights + FP8 KV -> fits @32K) was optimistic: the vocab-248320
+    #     embed + lm_head, the MTP nextn layer vLLM loads, and CUDA workspace
+    #     push the load past 24 GiB (GPU confirmed clear).
+    #   9B NVFP4 safetensors (vLLM): the fix. Quantized IN-HOUSE from the bf16
+    #     source via `make quant-local` (scripts/quant/quant_smoke.py preset
+    #     ornith) -> ksparavec/Ornith-1.0-9B-NVFP4 (hf_repos below). Text linears
+    #     W4A4 NVFP4; lm_head / embeddings / MoE gates / linear-attn AND the
+    #     whole vision tower kept bf16 -- so vision stays a working feature and
+    #     the multimodal Qwen3_5ForConditionalGeneration wrapper is preserved
+    #     (vLLM has no text-only Qwen3_5ForCausalLM loader; a text-only quant
+    #     will not load). PROBED 2026-07-16 (probe-vllm) on the 24G card: the
+    #     FULL native 256K context fits at 20.61 GB (FlashInfer NVFP4 GEMM),
+    #     capability=structured (qwen3 <think> reasoning), tool parser qwen3_xml
+    #     verified, ~122s cold start. The ONLY safetensors path onto 24G.
+    #
+    # No `mtp:` block: the qwen3_5_mtp draft lm_head is vocab-sized, and this
+    # vocab (248320) is ~1.6x the usual, so it would OOM at load on 24G (same
+    # class as the bf16 OOM above and the qwen3.6 family note).
+    #
+    # 35B (qwen3_5_moe, multimodal): the arch IS supported by vLLM + SGLang
+    # (probe-verified via scripts/probe-ornith-arch.sh -- Qwen3_5MoeFor-
+    # ConditionalGeneration is registered), but bf16 (~70 GB) and FP8
+    # (~35 GB) exceed 24G outright, GGUF Q4_K_M (~20 GiB) needs llama.cpp
+    # qwen3_5_moe support (absent), and no NVFP4 quant is published. NOT
+    # catalogued; a ~19-20 GiB NVFP4 quant is the only route onto a 24G card.
+    gguf_repos:
+      - repo: deepreinforce-ai/Ornith-1.0-9B-GGUF
+        tag_prefix: 9b
+        include:
+          - Q4_K_M
+          - Q5_K_M
+          - Q6_K
+          - Q8_0
+          - bf16
+    hf_repos:
+      # In-house NVFP4 quant of the 9B (see the 9B NVFP4 MEASURED note above).
+      - ksparavec/Ornith-1.0-9B-NVFP4
+    parsers:
+      # Model card prescribes --reasoning-parser qwen3 --tool-call-parser
+      # qwen3_xml. SGLang loadability of the multimodal qwen3_5 wrapper is
+      # UNVERIFIED (only vLLM is proven); the sglang parser names stay inert
+      # until an SGLang probe produces a fit cell.
+      vllm:
+        reasoning: qwen3
+        tool: qwen3_xml
+      sglang:
+        reasoning: qwen3
+        tool: qwen
+    arch_ref: deepreinforce-ai/Ornith-1.0-9B
+    thinking: true
+
   - name: llama3.2
     # Ollama-only — NVIDIA hasn't published an NVFP4 quant for the
     # Llama-3.2 1B/3B line (too small for the Blackwell tensor-core
@@ -374,13 +458,34 @@ families:
   - name: nemotron-nano-v2
     hf_repos:
       - nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4
-    # Tool parser intentionally not curated. The 9B-v2 chat template uses
-    # NVIDIA's custom uppercase `<TOOLCALL>[...]</TOOLCALL>` /
-    # `<AVAILABLE_TOOLS>` / `<TOOL_RESPONSE>` format — no shipped vLLM
-    # or SGLang parser matches it (all stock parsers expect lowercase
-    # `<tool_call>` Hermes-style or family-specific tokens). Without a
-    # custom parser, the router strips `tools`/`tool_choice` for this
-    # model: agentic tool calls are silently absent, plain chat works.
+    parsers:
+      vllm:
+        reasoning: nemotron_v3
+        tool: nemotron_json
+    # Reasoning parser nemotron_v3 is NOT registered in the pinned vLLM
+    # v0.22.1 image (passing it crashes the engine at startup, container
+    # exits before /health). It IS registered in vLLM v0.25.1, to which
+    # this model is pinned via the per-model image override in
+    # deploy/recovery-flags.json. That override also supplies the two
+    # flags the hybrid Mamba-Transformer checkpoint requires:
+    # --mamba-ssm-cache-dtype float32 and --trust-remote-code. Verified by
+    # direct podman launch on v0.25.1: <think> traces separate cleanly
+    # into the reasoning field, content carries clean executable code (no
+    # </think> leak). This is what lifts HumanEval off its ~0.10 floor.
+    # NOTE: v0.25.1 loops on greedy (temp 0) reasoning for this model --
+    # serve/bench at temp>=0.6 (NVIDIA's recommended Nemotron sampling),
+    # else the reasoning trace runs away and no answer is emitted.
+    #
+    # Tool parser: the 9B-v2 chat template uses NVIDIA's custom uppercase
+    # `<TOOLCALL>[...]</TOOLCALL>` format, which no stock vLLM parser
+    # matches. We wire NVIDIA's own nemotron_json tool parser as a plugin
+    # (scripts/vllm_plugins/nemotron_json_tool_parser.py, registered in
+    # deploy/vllm-plugins.json) -- its import paths are ported to the
+    # v0.25.1 module layout this model runs on; the logic is upstream's.
+    # The prober/router emit --tool-parser-plugin <file> +
+    # --tool-call-parser nemotron_json. vLLM only (SGLang has no plugin
+    # analogue). If the probe fails to verify tool round-trips, the router
+    # falls back to stripping tools -- plain chat + reasoning still work.
     arch_ref: nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4
     thinking: true        # hint; vLLM/SGLang variants probed separately later
 

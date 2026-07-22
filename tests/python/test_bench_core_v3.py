@@ -258,6 +258,35 @@ class TestUpdateRowStampsContext(unittest.TestCase):
         self.assertEqual(row["metrics"]["peak_vram_gb"], 22.4)
         self.assertEqual(row["metrics"]["tps_sustained_p50"], 139.2)
 
+    def test_update_is_immutable_merge_never_wipes_other_tasks(self) -> None:
+        # Immutability foundation: writing one task must never drop the others.
+        # This is what a --force re-bench of the default tasks relies on to
+        # leave the sharper benches (mmlu_pro/gpqa) untouched.
+        key = "bg/Gemma-4-26B-A4B-it-NVFP4@a1::vllm::262144"
+        cache: dict = {}
+        update_row(cache, key, model="Gemma-4-26B-A4B-it-NVFP4", backend="vllm",
+                   router_endpoint="http://r", context=262144,
+                   task_results={"mmlu_pro_subset_100": {"score": 0.82},
+                                 "gpqa_subset_100": {"score": 0.70}})
+        # A later (forced) run overwrites only gsm8k -- the sharper benches stay.
+        update_row(cache, key, model="Gemma-4-26B-A4B-it-NVFP4", backend="vllm",
+                   router_endpoint="http://r", context=262144,
+                   task_results={"gsm8k_subset_100": {"score": 0.96}})
+        tasks = cache[key]["tasks"]
+        self.assertEqual(tasks["mmlu_pro_subset_100"]["score"], 0.82)
+        self.assertEqual(tasks["gpqa_subset_100"]["score"], 0.70)
+        self.assertEqual(tasks["gsm8k_subset_100"]["score"], 0.96)
+
+    def test_force_success_overwrites_same_task(self) -> None:
+        # The one allowed mutation: a successful re-run overwrites its own entry.
+        key = "m@a1::vllm::32768"
+        cache: dict = {}
+        update_row(cache, key, model="m", backend="vllm", router_endpoint="http://r",
+                   context=32768, task_results={"gsm8k_subset_100": {"score": 0.60}})
+        update_row(cache, key, model="m", backend="vllm", router_endpoint="http://r",
+                   context=32768, task_results={"gsm8k_subset_100": {"score": 0.97}})
+        self.assertEqual(cache[key]["tasks"]["gsm8k_subset_100"]["score"], 0.97)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

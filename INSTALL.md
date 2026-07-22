@@ -1708,7 +1708,7 @@ only the router ports (`11434/11435/11436`).
 | `/var/cache/devai/registry/docker/` | regenerable mirror cache | yes |
 | `/var/cache/devai/apt/` / `pip/` / `npm/` | regenerable build caches | yes (forces full rebuild) |
 | `/var/cache/devai/ollama/models/blobs/` | downloaded GGUFs | costly to re-pull |
-| `/var/cache/devai/ollama/models/vllm/` | downloaded NVFP4 weights | costly to re-pull |
+| `/var/cache/devai/vllm/` and `/var/cache/devai/sglang/` | downloaded NVFP4 weights | costly to re-pull |
 | `/var/cache/devai/open-webui/` | chat history & users | preserve unless intentional reset |
 | `/var/cache/devai/logs/` | container stdout logs | yes |
 | `${REPO_DIR}/deploy/.*-reasoning-cache.json` | probe results | yes (next probe regenerates) |
