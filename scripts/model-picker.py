@@ -1873,6 +1873,35 @@ def _format_quant_note(fmt: str, indent_cols: int = 11, wrap_cols: int = 50) -> 
     return "\n".join(f"{pad}{ln}" for ln in wrapped)
 
 
+# ── Per-model keep/niche arguments (info modal copy) ─────────────────────────
+#
+# Curated one-liner per catalog model name: WHY this model earns its slot
+# in the fleet, especially when a headline number (TPS, a bench column)
+# makes it look droppable. Written whenever a model survives a keep/drop
+# review -- cite the bench evidence so the argument stays checkable
+# against the picker's own columns. Keyed by the exact cache alias
+# (m["name"], pre-display-stripping). Models without an entry render no
+# Niche line.
+
+_MODEL_NICHE: dict[str, str] = {
+    "NVIDIA-Nemotron-Nano-9B-v2-NVFP4": (
+        "Best vLLM tool-caller (tools 1.00 benched, nemotron_json parser) "
+        "with GSM8K 0.98 + GPQA 0.65 -- keep for agent loops where call "
+        "reliability beats decode TPS."
+    ),
+    "Ornith-1.0-9B-NVFP4": (
+        "Only fleet model pairing top-tier code (HE+ 0.90, ~gpt-oss level) "
+        "with 256K fully-on-GPU -- keep for whole-repo / long-document "
+        "coding work no fast model can cover."
+    ),
+    "Qwen3.5-9B-NVFP4": (
+        "Fleet-best deep reasoning at long context (GPQA 0.78, MMLU-Pro "
+        "0.83 at 256K) -- keep as the hard-questions-over-long-documents "
+        "specialist; code/tools are not its job."
+    ),
+}
+
+
 # ── Per-family use-case blurbs (info modal copy) ─────────────────────────────
 
 _FAMILY_USE_CASES: dict[str, str] = {
@@ -2090,6 +2119,11 @@ def _capability_summary_text(
             f"           up to {f16_max} serves f16 (full quality).\n"
             f"           Pick the tier at launch.\n"
         )
+    niche = _MODEL_NICHE.get(str(m.get("name") or ""))
+    niche_line = ""
+    if niche:
+        wrapped = textwrap.wrap(niche, width=60)
+        niche_line = "Niche:     " + "\n           ".join(wrapped) + "\n"
     head = (
         f"Model:     {name}\n"
         f"Backend:   {backend}\n"
@@ -2098,6 +2132,7 @@ def _capability_summary_text(
         f"Context:   {_context_label(ctx)} (max fit at {_VRAM_BUDGET:g} GB)\n"
         f"{kv_line}"
         f"VRAM:      {vram_str}\n"
+        f"{niche_line}"
         f"\n"
         f"Reasoning: {reason_label}\n"
         f"Tools:     {tools_label}    (parser: {parser})\n"
@@ -2907,7 +2942,7 @@ def main() -> None:
 
     header = (
         f"DevAI  ▸  Pick a model  "
-        f"(≤ {_VRAM_BUDGET:g} GB · ctrl-s sort · ctrl-r dir · ? preview)"
+        f"(≤ {_VRAM_BUDGET:g} GB · ctrl-s sort · ctrl-r dir · ? info)"
     )
 
     # Materialise per-row info files for fzf's preview pane. Each
@@ -2931,7 +2966,6 @@ def main() -> None:
         Path(preview_dir, f"{i}.txt").write_text(
             _capability_summary_text(m, comparison=comparison_ctx)
         )
-    preview_cmd = f"cat {preview_dir}/{{1}}.txt 2>/dev/null"
 
     # Pre-render every (mode, dir) combination's tag-prefixed input
     # stream. Each render references items via their *original*
@@ -2995,17 +3029,18 @@ def main() -> None:
     )
     cycle_dir_path.chmod(0o755)
 
+    preview_cmd = f"cat {preview_dir}/{{1}}.txt 2>/dev/null"
+
     # Bindings:
     #   ctrl-s   -- cycle bench-score sort mode (TOTAL > TPS > CODE >
     #               REAS > CTX). Direction is preserved across cycles.
     #   ctrl-r   -- flip sort direction (desc <-> asc). Mode is
     #               preserved across flips.
     #   ?        -- toggle the model-details preview pane on/off. The
-    #               pane starts HIDDEN (see preview_window below): the
-    #               picker no longer shoves details in the operator's
-    #               face on launch -- they opt in by pressing '?'.
-    #               Single-char fzf action; reliable across terminals.
-    #               Cost: '?' can no longer be typed into the search.
+    #               pane starts HIDDEN (see preview_window below); the
+    #               operator opts in by pressing '?'. Single-char fzf
+    #               action; reliable across terminals. Cost: '?' can
+    #               no longer be typed into the search.
     #   ctrl-p   -- alias for ?:toggle-preview.
     # Non-selectable rows (column header / sort note / formula note)
     # are made un-focusable via `--header-lines=3` below, so the
@@ -3022,12 +3057,15 @@ def main() -> None:
             lines, header,
             selectable=selectable,
             preview_cmd=preview_cmd,
-            # Start the details pane hidden: the `:hidden` flag makes
-            # fzf launch with the preview collapsed, and `?` / ctrl-p
-            # toggle-preview reveals it at the same right:42% geometry
-            # on demand. Previously the pane defaulted to visible and
-            # showed every model's details unprompted on launch.
-            preview_window="right:42%:wrap:hidden",
+            # Start the details pane hidden; `?` / ctrl-p toggles it.
+            # Geometry: top-docked, 80% of the window height, full
+            # width. fzf's preview pane cannot float centered (the
+            # only positions are up/down/left/right -- `center` is
+            # rejected by 0.44, and an execute() child-fzf modal was
+            # tried and rejected because it replaces the list instead
+            # of overlaying it). up:80% is the closest native shape
+            # to a large centered panel: the list stays visible below.
+            preview_window="up:80%:wrap:hidden",
             extra_bindings=bindings,
             input_text=sort_files[("gpqa", "desc")].read_text(),
             # Column header + sort note + formula note. _build_menu
