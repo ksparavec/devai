@@ -90,8 +90,11 @@ def _ornith_family() -> dict:
 class TestOrnithFamily(unittest.TestCase):
     """Guard the hand-maintained 9B Ornith entry against accidental drift.
 
-    GGUF-only on a 24G card: the bf16 safetensors OOMs at vLLM model load
-    (measured 2026-07-14), so there is no hf_repos row and no parsers block.
+    GGUF via Ollama plus ONE curated HF repo: the upstream bf16
+    safetensors OOMs at vLLM model load on a 24G card (measured
+    2026-07-14, dropped in d729033), but the in-house NVFP4 quant
+    (ksparavec/Ornith-1.0-9B-NVFP4) fits and serves at 256K, so it is
+    the only hf_repos row and carries the qwen3-family parsers.
     """
 
     def test_arch_ref_and_thinking(self) -> None:
@@ -99,12 +102,19 @@ class TestOrnithFamily(unittest.TestCase):
         self.assertEqual(fam["arch_ref"], "deepreinforce-ai/Ornith-1.0-9B")
         self.assertTrue(fam["thinking"])
 
-    def test_gguf_only_no_hf_or_parsers(self) -> None:
-        # bf16 safetensors OOMs on 24G -> no hf_repos; Ollama parses GGUF
-        # natively -> no parsers block.
+    def test_nvfp4_is_only_hf_repo_with_parsers(self) -> None:
+        # Upstream bf16 safetensors OOMs on 24G (dropped in d729033);
+        # the in-house NVFP4 quant is the single HF row and needs the
+        # qwen3-family parsers for vLLM/SGLang serving.
         fam = _ornith_family()
-        self.assertNotIn("hf_repos", fam)
-        self.assertNotIn("parsers", fam)
+        self.assertEqual(fam["hf_repos"], ["ksparavec/Ornith-1.0-9B-NVFP4"])
+        parsers = fam["parsers"]
+        self.assertEqual(
+            parsers["vllm"], {"reasoning": "qwen3", "tool": "qwen3_xml"}
+        )
+        self.assertEqual(
+            parsers["sglang"], {"reasoning": "qwen3", "tool": "qwen"}
+        )
 
     def test_gguf_repo_and_include_ladder(self) -> None:
         fam = _ornith_family()
