@@ -160,9 +160,10 @@
 
       <h3 id="full-coldstart-triggers">What triggers a full cold start</h3>
       <p>
-        The router tracks <code>currentModel</code>, <code>currentContext</code>, and
-        <code>currentReasoningOverride</code> per backend. <strong>Any</strong> of these
-        changing recreates the container and walks phases 1–11 again:
+        The router tracks <code>currentModel</code>, <code>currentContext</code> and
+        <code>currentSpec</code> per backend. <strong>Any</strong> of these
+        changing recreates the container and walks phases 1–11 again. A reasoning
+        override does <strong>not</strong> — it is a per-request body rewrite:
       </p>
       <ul>
         <li>Switching model (e.g. <code>Qwen3-8B-NVFP4</code> → <code>Qwen3-14B-NVFP4</code>).</li>

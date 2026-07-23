@@ -193,7 +193,12 @@ scripts/
 ### Detailed steps
 
 1. **Extend `Makefile:fetch-cli`** (around line 149) with a
-   SkyPilot block following the existing pattern:
+   SkyPilot block following the existing pattern. The snippet below is
+   the design sketch, not the shipped recipe: the Makefile uses
+   `python3 -m pip download` (not `uv pip download`) and downloads into
+   a `.skypilot.tmp` directory that is swapped into place only on
+   success, instead of `rm -rf`-ing the good cache up front. Read the
+   Makefile for current truth.
    ```makefile
    @LATEST=$$(curl -fsSL "https://pypi.org/pypi/skypilot/json" \
                 | python3 -c "import sys,json; print(json.load(sys.stdin)['info']['version'])") \

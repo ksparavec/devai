@@ -134,8 +134,12 @@ func (c *SkyPilotClient) Status(ctx context.Context) ([]SkyClusterStatus, error)
 	return out, nil
 }
 
-// Down tears down a cluster. Idempotent on the upstream side -- a
-// repeat call against an already-down cluster returns 200.
+// Down tears down a cluster. Idempotent: "the cluster is already gone"
+// is success, not an error. Upstream signals that either with 200 (the
+// record still exists but is already down) or with 404/410 (the record
+// itself is gone) depending on how far the previous teardown got, so
+// both are reported as success. Anything else is a real failure the
+// teardown coordinator retries.
 func (c *SkyPilotClient) Down(ctx context.Context, clusterName string) error {
 	if !c.IsConfigured() {
 		return errors.New("SkyPilotClient not configured")
@@ -150,11 +154,18 @@ func (c *SkyPilotClient) Down(ctx context.Context, clusterName string) error {
 	}
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
-		return fmt.Errorf("down %s: HTTP %d: %s",
-			clusterName, resp.StatusCode, string(respBody))
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusAccepted:
+		return nil
+	case http.StatusNotFound, http.StatusGone:
+		// Already gone. Returning an error here would make the
+		// coordinator retry a cluster that no longer exists until it
+		// hit its attempt bound, and log an ERROR about a VM that is
+		// not billing anything.
+		return nil
 	}
-	return nil
+	return fmt.Errorf("down %s: HTTP %d: %s",
+		clusterName, resp.StatusCode, string(respBody))
 }
 
 // do is the shared HTTP plumbing. Reads the bearer token on every

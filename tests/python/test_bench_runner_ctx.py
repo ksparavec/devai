@@ -270,6 +270,23 @@ class TestDiscoverModels(unittest.TestCase):
         )
 
 
+class TestDefaultTasks(unittest.TestCase):
+    """A plain `make bench` must populate every benchmark column the
+    picker renders -- GPQA is its default sort column."""
+
+    def test_default_task_set_covers_picker_columns(self) -> None:
+        tasks = bench_runner.DEFAULT_TASKS.split(",")
+        for name in (
+            "gsm8k", "humaneval", "humaneval_plus",
+            "mmlu_pro", "gpqa", "tools", "leak",
+        ):
+            self.assertIn(name, tasks)
+
+    def test_longctx_stays_opt_in(self) -> None:
+        # longctx is a per-context probe, not a leaderboard score.
+        self.assertNotIn("longctx", bench_runner.DEFAULT_TASKS.split(","))
+
+
 class TestEvaluateDropTrigger(unittest.TestCase):
     """Early-drop disqualifier logic: leak or low gsm8k/humaneval trips a
     drop; tools is excluded; passing results and partial results don't."""

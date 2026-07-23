@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -354,5 +355,112 @@ func TestFloat64Bits_RoundTrip(t *testing.T) {
 		if got := bitsToFloat64(float64ToBits(v)); got != v {
 			t.Errorf("round trip lost %v -> %v", v, got)
 		}
+	}
+}
+
+// --- Re-registration after the head forgets the worker (410 Gone) ---
+
+// goneThenOKHead answers the first `gone` heartbeats with 410 (the
+// head's "I do not know this worker_id; re-register" contract) and
+// mints a fresh worker_id on every registration.
+type goneThenOKHead struct {
+	remainingGone atomic.Int32
+	nRegister     atomic.Int32
+	nHeartbeat    atomic.Int32
+}
+
+func (s *goneThenOKHead) handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/cluster/register", func(w http.ResponseWriter, _ *http.Request) {
+		n := s.nRegister.Add(1)
+		_ = json.NewEncoder(w).Encode(RegisterResponse{
+			WorkerID: "wid-" + strconv.Itoa(int(n)),
+		})
+	})
+	mux.HandleFunc("/v1/cluster/heartbeat", func(w http.ResponseWriter, _ *http.Request) {
+		s.nHeartbeat.Add(1)
+		if s.remainingGone.Add(-1) >= 0 {
+			http.Error(w, "unknown worker_id; please re-register", http.StatusGone)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(HeartbeatResponse{})
+	})
+	return mux
+}
+
+func TestHeartbeatOnce_410IsErrHeadUnknownWorker(t *testing.T) {
+	stub := &goneThenOKHead{}
+	stub.remainingGone.Store(1)
+	srv := httptest.NewServer(stub.handler())
+	defer srv.Close()
+
+	w, _, _ := newWorkerWithToken(t)
+	w.Config.HeadURL = srv.URL
+	w.Config.HTTPClient = http.DefaultClient
+
+	_, err := w.HeartbeatOnce(context.Background(), "stale-id")
+	if !errors.Is(err, ErrHeadUnknownWorker) {
+		t.Fatalf("410 produced %v, want ErrHeadUnknownWorker", err)
+	}
+}
+
+func TestWorkerTick_ReregistersAfterHeadForgetsWorker(t *testing.T) {
+	// The head restarted: its fleet map is in-memory only, so the
+	// worker's id is gone. Without re-registration the worker
+	// heartbeats into a 410 forever and never rejoins the fleet.
+	stub := &goneThenOKHead{}
+	stub.remainingGone.Store(1)
+	srv := httptest.NewServer(stub.handler())
+	defer srv.Close()
+
+	w, _, _ := newWorkerWithToken(t)
+	w.Config.HeadURL = srv.URL
+	w.Config.HTTPClient = http.DefaultClient
+	w.Executor = &fakeExecutor{}
+	stale := "stale-id"
+	w.State.WorkerID.Store(&stale)
+
+	w.tick(context.Background())
+
+	if stub.nRegister.Load() != 1 {
+		t.Fatalf("register called %d times after 410, want 1", stub.nRegister.Load())
+	}
+	id := w.State.WorkerID.Load()
+	if id == nil || *id != "wid-1" {
+		t.Fatalf("worker_id after re-register = %v, want wid-1", id)
+	}
+
+	// The next tick must heartbeat normally under the new id.
+	w.tick(context.Background())
+	if stub.nHeartbeat.Load() != 2 {
+		t.Errorf("heartbeats: got %d, want 2", stub.nHeartbeat.Load())
+	}
+	if stub.nRegister.Load() != 1 {
+		t.Errorf("re-registered again on a healthy heartbeat (%d registers)",
+			stub.nRegister.Load())
+	}
+}
+
+func TestWorkerTick_OtherHeartbeatFailuresDoNotReregister(t *testing.T) {
+	stub := &stubHead{t: t, expectedToken: "the-token", registerWorkerID: "wid-001"}
+	stub.failNHeartbeats.Store(1)
+	srv := httptest.NewServer(stub.handler())
+	defer srv.Close()
+
+	w, _, _ := newWorkerWithToken(t)
+	w.Config.HeadURL = srv.URL
+	w.Config.HTTPClient = http.DefaultClient
+	w.Executor = &fakeExecutor{}
+	id := "wid-001"
+	w.State.WorkerID.Store(&id)
+
+	w.tick(context.Background())
+
+	if stub.nReceivedRegister.Load() != 0 {
+		t.Fatalf("a 500 heartbeat must not trigger re-registration (%d registers)",
+			stub.nReceivedRegister.Load())
+	}
+	if got := w.State.WorkerID.Load(); got == nil || *got != "wid-001" {
+		t.Fatalf("worker_id changed on a transient failure: %v", got)
 	}
 }

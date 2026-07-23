@@ -7,7 +7,7 @@
 # every regression we've actually hit is covered:
 #
 #   basic   simple chat round-trip                            → HTTP 200 + content
-#   ctx     ctx-variant tag loads at exactly num_ctx          → /api/ps cross-check
+#   ctx     options.num_ctx loads at exactly that context     → /api/ps cross-check
 #   tools   tool definition accepted                          → HTTP 200 (no
 #                                                                "does not support
 #                                                                tools" 400)
@@ -38,7 +38,7 @@ ROUTER="${ROUTER:-devai-router:11434}"
 OLLAMA="${OLLAMA:-devai-ollama:11434}"
 PROBE_CACHE="${PROBE_CACHE:-deploy/.ollama-reasoning-cache.json}"
 HOST_VRAM="${HOST_VRAM:-24}"
-TEST_CTX="${TEST_CTX:-32768}"     # ctx variant created/used for ctx scenario
+TEST_CTX="${TEST_CTX:-32768}"     # per-session ctx the ctx scenario asserts
 LOAD_TIMEOUT="${LOAD_TIMEOUT:-180}"
 
 PASS=0; FAIL=0; SKIP=0
@@ -145,7 +145,7 @@ hdr "matrix: ${#MODELS[@]} model(s) × 3 protocol(s) × up to 5 scenarios"
 echo "  models ($HOST_VRAM GB band, exhaustive over fitting digests):"
 for m in "${MODELS[@]}"; do echo "    - $m"; done
 echo "  router:  $ROUTER"
-echo "  ctx:     $TEST_CTX (per-session via Modelfile-derived tag)"
+echo "  ctx:     $TEST_CTX (per-session via options.num_ctx on /api/chat)"
 echo "  expect:  ~30-60 min for a full sweep; pin TEST_MODELS=... to subset"
 
 # Capability lookup helpers (read from cache).
@@ -164,27 +164,20 @@ disable_verified_of() {
     ' "$PROBE_CACHE" | head -1
 }
 
-# Materialise the ctx-variant tag if it doesn't exist (the picker creates
-# these on launch; we replicate inline so the test stands alone).
-ensure_ctx_variant() {
-    local parent="$1" ctx="$2"
-    local lib="${parent%%:*}" tag="${parent#*:}"
-    local derived="${lib}:${tag}-ctx${ctx}"
-    local show_body
-    show_body=$(printf '{"name":"%s"}' "$derived")
-    if curl_via /api/show "$show_body" 5 "" "$OLLAMA" \
-       | http_body | jq -e .capabilities >/dev/null 2>&1; then
-        echo "$derived"
-        return 0
-    fi
-    local body
-    body=$(printf '{"model":"%s","from":"%s","parameters":{"num_ctx":%d}}' \
-                  "$derived" "$parent" "$ctx")
-    if ! curl_via /api/create "$body" 60 "" "$OLLAMA" >/dev/null 2>&1; then
-        return 1
-    fi
-    echo "$derived"
-}
+# NOTE: this file used to carry an ensure_ctx_variant() helper that minted
+# `<parent>-ctx<N>` Modelfile siblings via /api/create, with a comment saying
+# "the picker creates these on launch". That stopped being true at 3a98ed0.
+# CLAUDE.md is explicit: derived ctx tags are inert leftovers -- the prober
+# skips them (_CTX_VARIANT_RE) and the picker filters them (_ctx_tag), so
+# they carry no probe row, hence no per-tier KV-cache dtype. Serving one is
+# actively broken for a mixed-KV model: with no tier to resolve, the router
+# falls back to the declared max (221184) at f16 KV and the load OOMs.
+# Measured on the reference host, qwen3.6:35b-a3b-mtp-q4_K_M:
+#   parent, no num_ctx           -> loaded ctx=131072 (its q8_0 tier), HTTP 200
+#   parent + options.num_ctx=32K -> loaded ctx=32768,                 HTTP 200
+#   derived -ctx32768 tag        -> launch at 221184 f16 -> cudaMalloc OOM, 400
+# Per-session context is therefore driven the documented way: the parent tag
+# plus options.num_ctx on /api/chat, which the router's setNumCtx honours.
 
 # ── Scenarios ───────────────────────────────────────────────────────────────
 
@@ -244,30 +237,34 @@ scenario_tools() {
 }
 
 scenario_ctx() {
-    local model_with_ctx="$1"
+    local model="$1"
     # Force a fresh load so /api/ps reflects this model.
     $RUNTIME rm -f devai-ollama >/dev/null 2>&1 && \
       $COMPOSE_UP_OLLAMA >/dev/null 2>&1 || true
     until $RUNTIME exec devai-ollama ollama list >/dev/null 2>&1; do sleep 1; done
-    local out code body_text
+    local out code
     local req
-    req=$(printf '{"model":"%s","messages":[{"role":"user","content":"hi"}],"stream":false,"options":{"num_predict":2}}' "$model_with_ctx")
+    # options.num_ctx IS the per-session context mechanism on /api/chat: the
+    # router's setNumCtx clamps it to the probed ceiling and otherwise passes
+    # it through, so a value below the ceiling is what actually gets loaded.
+    req=$(printf '{"model":"%s","messages":[{"role":"user","content":"hi"}],"stream":false,"options":{"num_predict":2,"num_ctx":%d}}' \
+                 "$model" "$TEST_CTX")
     out=$(curl_via /api/chat "$req" "$LOAD_TIMEOUT")
     code=$(http_code "$out")
     if [ "$code" != "200" ]; then
-        cell_fail "$model_with_ctx" "ctx /api/chat" "HTTP $code"
+        cell_fail "$model" "ctx /api/chat" "HTTP $code"
         return
     fi
     local ps_out actual
     ps_out=$(curl_get /api/ps 5 "$OLLAMA")
-    actual=$(http_body "$ps_out" | jq -r --arg n "$model_with_ctx" '
+    actual=$(http_body "$ps_out" | jq -r --arg n "$model" '
         .models[]? | select(.name == $n)
         | (.context_length // .details.context_length // 0)
     ' 2>/dev/null || echo "")
     if [ "$actual" = "$TEST_CTX" ]; then
-        cell_pass "$model_with_ctx" "ctx /api/chat" "loaded ctx=$actual"
+        cell_pass "$model" "ctx /api/chat" "loaded ctx=$actual"
     else
-        cell_fail "$model_with_ctx" "ctx /api/chat" "expected ctx=$TEST_CTX, got $actual"
+        cell_fail "$model" "ctx /api/chat" "expected ctx=$TEST_CTX, got $actual"
     fi
 }
 
@@ -363,19 +360,16 @@ COMPOSE_UP_OLLAMA="$RUNTIME compose -f deploy/docker-compose.yaml up -d ollama"
 for parent in "${MODELS[@]}"; do
     hdr "── $parent ──"
 
-    derived=$(ensure_ctx_variant "$parent" "$TEST_CTX") || {
-        cell_fail "$parent" "ensure_ctx_variant" "/api/create failed"
-        continue
-    }
-
+    # The parent tag, NOT a derived -ctx sibling: only the parent has a probe
+    # row, and that row is what supplies the per-tier KV-cache dtype.
     for path in "${PROTOCOLS[@]}"; do
-        scenario_basic "$derived" "$path"
-        scenario_tools "$derived" "$path"
-        scenario_think "$derived" "$path" "auto"
-        scenario_think "$derived" "$path" "off"
+        scenario_basic "$parent" "$path"
+        scenario_tools "$parent" "$path"
+        scenario_think "$parent" "$path" "auto"
+        scenario_think "$parent" "$path" "off"
     done
 
-    scenario_ctx "$derived"
+    scenario_ctx "$parent"
 done
 
 # ── Summary ────────────────────────────────────────────────────────────────

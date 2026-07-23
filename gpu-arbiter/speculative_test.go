@@ -224,9 +224,9 @@ func TestVLLMEntrypoint_NoSpecWhenNil(t *testing.T) {
 // parser flags and RecoveryFlags.
 func TestSGLangEntrypoint_EmitsSpeculativeFlags(t *testing.T) {
 	lc := launchConfig{
-		MemFraction:  0.9,
-		MaxContext:   32768,
-		ToolParser:   "qwen",
+		MemFraction: 0.9,
+		MaxContext:  32768,
+		ToolParser:  "qwen",
 		Speculative: &configSpeculative{
 			Method:               "mtp",
 			Drafter:              "google/gemma-4-26B-A4B-it-assistant",

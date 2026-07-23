@@ -52,8 +52,11 @@ import urllib.request
 from pathlib import Path
 
 from _contexts import (
+    BINARY_SEARCH_CONTEXTS,
     binary_search_max_ctx,
     context_label,
+    parse_context_list,
+    standard_contexts,
     vram_label,
 )
 from _probe_core import (
@@ -86,6 +89,7 @@ from _probe_hf_common import (
     host_scaled_fraction,
     http_get,
     http_post,
+    install_probe_cleanup,
     is_downloaded,
     load_catalog_hf_rows,
     model_size_gb_from_row,
@@ -514,12 +518,17 @@ def load_probe_one_cell(
     tool_parser: str | None,
     corpus: str,
     needle_depth: float,
+    kv_cache_dtype: str | None = None,
 ) -> dict:
     """Launch the backend at ``requested_ctx`` exactly as the router
-    would (same parsers, recovery flags, image override), send ONE
-    near-full-context completion under a 0.1s VRAM sampler, and return
-    the serving-* augmentation dict for the cell. Always tears the
+    would (same parsers, KV dtype, recovery flags, image override), send
+    ONE near-full-context completion under a 0.1s VRAM sampler, and
+    return the serving-* augmentation dict for the cell. Always tears the
     container down before returning.
+
+    ``kv_cache_dtype`` is the dtype the target cell was FIT-probed under
+    (its stamped ``kv_cache_type``), not this pass's default -- see
+    run_load_probe_pass.
     """
     started = time.time()
     host_frac = host_scaled_fraction(
@@ -534,14 +543,17 @@ def load_probe_one_cell(
         reasoning_parser_plugin=reasoning_plugin_path,
         tool_parser_plugin=tool_plugin_path,
         speculative_config=None,
+        kv_cache_dtype=kv_cache_dtype,
     )
     env_vars = {"VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1"}
-    extra_flags, extra_env = recovery_overrides(model_name)
+    # Backend-scoped (contract C2): a vLLM-only recovery entry must not be
+    # applied verbatim to an SGLang launch.
+    extra_flags, extra_env = recovery_overrides(model_name, spec.name)
     if extra_flags:
         cmd_args = list(cmd_args) + extra_flags
     if extra_env:
         env_vars = {**env_vars, **extra_env}
-    image_override = recovery_image(model_name)
+    image_override = recovery_image(model_name, spec.name)
     if image_override and image_override != image:
         print(f"    [recovery] {model_name}: load-probing on pinned image "
               f"{image_override}", file=sys.stderr)
@@ -560,176 +572,204 @@ def load_probe_one_cell(
     # at load time ("container exited before /health"). Block until the
     # GPU drops near-idle (or a short timeout) so each launch starts clean.
     _wait_for_vram_settle()
+    # Guarantee teardown: a Ctrl-C during the health poll or the
+    # multi-minute full-context request would otherwise leave a
+    # GPU-holding container behind. assert_no_active_backends does not
+    # look for probe containers, so the leftover silently contaminates
+    # every later cell with false OOMs. install_probe_cleanup covers
+    # the signal paths this finally cannot.
     try:
-        container_run_detached(
-            runtime, container_name, image, probe_port, models_dir, env_vars,
-            spec.entrypoint, cmd_args, extra_volumes=extra_volumes,
-        )
-    except RuntimeError as e:
-        return {
-            "serving_ok": False,
-            "serving_error": f"launch_failed: {e}",
-            "serving_kind": "infra",
-            "predicted_logits_gb": pred_logits,
-            "serving_probed_at": now_iso(),
+        try:
+            container_run_detached(
+                runtime, container_name, image, probe_port, models_dir, env_vars,
+                spec.entrypoint, cmd_args, extra_volumes=extra_volumes,
+            )
+        except RuntimeError as e:
+            return {
+                "serving_ok": False,
+                "serving_error": f"launch_failed: {e}",
+                "serving_kind": "infra",
+                "predicted_logits_gb": pred_logits,
+                "serving_probed_at": now_iso(),
+            }
+
+        base_url = f"http://127.0.0.1:{probe_port}"
+        health_deadline = time.time() + STARTUP_TIMEOUT
+        healthy = False
+        last_err: str | None = None
+        while time.time() < health_deadline:
+            try:
+                http_get(f"{base_url}/health", timeout=5.0)
+                healthy = True
+                break
+            except urllib.error.URLError as e:
+                last_err = f"URLError: {e}"
+            except (TimeoutError, OSError) as e:
+                last_err = f"{type(e).__name__}: {e}"
+            except json.JSONDecodeError:
+                healthy = True
+                break
+            state = container_state(runtime, container_name)
+            if state in ("exited", "stopped", "absent"):
+                last_err = f"container {state} before /health"
+                break
+            time.sleep(HEALTH_POLL_INTERVAL)
+
+        if not healthy:
+            logs = container_logs(runtime, container_name)
+            ev = classify_failure_logs(logs)
+            rec = {
+                "serving_ok": False,
+                "serving_error": last_err or "no /health",
+                "serving_kind": ev.get("kind", "infra"),
+                "predicted_logits_gb": pred_logits,
+                "serving_probed_at": now_iso(),
+                "serving_seconds": round(time.time() - started, 1),
+            }
+            # A container that loaded fine at a lower tier but died at a
+            # higher one is usually leftover VRAM from the prior cell OOMing
+            # this launch (see the _wait_for_vram_settle guard) -- capture the
+            # log tail so the re-probe can confirm OOM vs a genuine load bug.
+            if logs:
+                rec["serving_log_excerpt"] = logs[-_LOG_EXCERPT_CHARS:]
+            return rec
+
+        # Baseline: model loaded + KV pool reserved, idle, before the big
+        # request. transient = peak - baseline isolates the per-step buffers.
+        baseline_gb = round(gpu_memory_used_mb() / 1024, 2)
+
+        # Tokenizer-verified fill to ~99% of the window so the KV pool is
+        # exercised near its true ceiling (where real OOMs happen), not the
+        # ~88% a static char estimate reaches. max_tokens stays well under the
+        # headroom so prompt+output can't exceed --max-model-len.
+        prompt, fill_tokens, fill_method = build_full_window_prompt(
+            base_url, model_name, corpus, requested_ctx, needle_depth)
+        body = {
+            "model": model_name,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.0,
+            "max_tokens": _MAX_OUTPUT_TOKENS,
+            "stream": False,
         }
 
-    base_url = f"http://127.0.0.1:{probe_port}"
-    health_deadline = time.time() + STARTUP_TIMEOUT
-    healthy = False
-    last_err: str | None = None
-    while time.time() < health_deadline:
-        try:
-            http_get(f"{base_url}/health", timeout=5.0)
-            healthy = True
-            break
-        except urllib.error.URLError as e:
-            last_err = f"URLError: {e}"
-        except (TimeoutError, OSError) as e:
-            last_err = f"{type(e).__name__}: {e}"
-        except json.JSONDecodeError:
-            healthy = True
-            break
-        state = container_state(runtime, container_name)
-        if state in ("exited", "stopped", "absent"):
-            last_err = f"container {state} before /health"
-            break
-        time.sleep(HEALTH_POLL_INTERVAL)
+        # Near-full-context prefill needs far longer than the fit probe's
+        # 60s CHAT_TIMEOUT: a 254K-token prefill on a 26B model is minutes,
+        # not seconds. Scale with ctx so small tiers still fail fast on a
+        # genuine hang while large tiers get the time a real prefill needs
+        # (~400 tok/s conservative prefill floor + 120s slack). Without this,
+        # every 256K cell mis-classifies a still-progressing prefill as a
+        # serving OOM.
+        chat_timeout = max(CHAT_TIMEOUT, 120.0 + requested_ctx / 400.0)
 
-    if not healthy:
-        logs = container_logs(runtime, container_name)
-        ev = classify_failure_logs(logs)
-        container_remove(runtime, container_name)
-        rec = {
-            "serving_ok": False,
-            "serving_error": last_err or "no /health",
-            "serving_kind": ev.get("kind", "infra"),
+        sampler = VramSampler(interval=0.1)
+        request_error: str | None = None
+        chat_resp: dict | None = None
+        sampler.start()
+        try:
+            chat_resp = _post_chat(base_url, body, timeout=chat_timeout)
+            # HTTP 400 = the char-estimated prompt overshot THIS tokenizer's
+            # max-model-len budget (chars/token varies per tokenizer). That's
+            # a prompt-sizing artifact, not a serving verdict -- trim to ~85%
+            # of ctx and retry once. Still a near-full-context stress test.
+            if (isinstance(chat_resp, dict)
+                    and "HTTP 400" in str(chat_resp.get("error", ""))):
+                body["messages"][0]["content"] = build_haystack_prompt(
+                    corpus, int(requested_ctx * 0.85), depth=needle_depth)
+                chat_resp = _post_chat(base_url, body, timeout=chat_timeout)
+        except (urllib.error.URLError, TimeoutError, OSError,
+                json.JSONDecodeError) as e:
+            # The request error IS the OOM signal we are here to measure.
+            request_error = f"{type(e).__name__}: {e}"
+        finally:
+            snap = sampler.stop()
+
+        peak_gb = round(float(snap.get("peak_vram_gb", 0.0) or 0.0), 2)
+        logs_tail = container_logs(runtime, container_name)
+        failed, reason = _detect_serving_failure(
+            runtime, container_name, chat_resp, request_error, logs_tail,
+        )
+
+        content = ""
+        reasoning_text = ""
+        input_tokens = output_tokens = 0
+        if isinstance(chat_resp, dict):
+            try:
+                msg = ((chat_resp.get("choices") or [{}])[0].get("message") or {})
+                content = msg.get("content") or ""
+                # Reasoning models (R1-Distill, Qwen3 thinking) may emit the
+                # answer in reasoning_content, or burn the output budget on
+                # the <think> trace before reaching content. Score both so a
+                # genuine recall in the reasoning isn't logged as needle=0.
+                reasoning_text = msg.get("reasoning_content") or ""
+            except (AttributeError, IndexError, TypeError):
+                content = ""
+            usage = chat_resp.get("usage") or {}
+            input_tokens = int(usage.get("prompt_tokens") or 0)
+            output_tokens = int(usage.get("completion_tokens") or 0)
+
+        needle = 0.0 if failed else max(
+            score_needle(content), score_needle(reasoning_text))
+        transient = round(max(0.0, peak_gb - baseline_gb), 2) if peak_gb else 0.0
+
+        rec: dict = {
+            "serving_ok": not failed,
+            "serving_peak_gb": peak_gb,
+            "serving_baseline_gb": baseline_gb,
+            "transient_gb": transient,
+            "needle_score": needle,
+            "serving_input_tokens": input_tokens,
+            "serving_output_tokens": output_tokens,
+            # How full the KV pool actually got: input_tokens / ctx, from the
+            # engine's own usage count. ~0.99 means the window was genuinely
+            # exercised; a low value (char-estimate fallback) means the OOM
+            # ceiling at full fill was NOT tested -- surfaced for auditing.
+            "serving_fill_ratio": (round(input_tokens / requested_ctx, 3)
+                                   if input_tokens else None),
+            "serving_fill_method": fill_method,
             "predicted_logits_gb": pred_logits,
+            "serving_chat_timeout_s": round(chat_timeout, 1),
             "serving_probed_at": now_iso(),
             "serving_seconds": round(time.time() - started, 1),
         }
-        # A container that loaded fine at a lower tier but died at a
-        # higher one is usually leftover VRAM from the prior cell OOMing
-        # this launch (see the _wait_for_vram_settle guard) -- capture the
-        # log tail so the re-probe can confirm OOM vs a genuine load bug.
-        if logs:
-            rec["serving_log_excerpt"] = logs[-_LOG_EXCERPT_CHARS:]
+        if failed:
+            rec["serving_error"] = reason
+            # Capture diagnostics so a failure is explainable without
+            # relaunching: vLLM/SGLang put the real exception in the HTTP
+            # error body, and the container-log tail shows OOM vs a transient
+            # 500 vs a real engine bug. A single bare "HTTP 500" is too weak
+            # to condemn a model's serveable ctx -- this is the evidence.
+            if isinstance(chat_resp, dict) and chat_resp.get("body"):
+                rec["serving_error_body"] = str(chat_resp["body"])[:500]
+            if logs_tail:
+                rec["serving_log_excerpt"] = logs_tail[-_LOG_EXCERPT_CHARS:]
         return rec
-
-    # Baseline: model loaded + KV pool reserved, idle, before the big
-    # request. transient = peak - baseline isolates the per-step buffers.
-    baseline_gb = round(gpu_memory_used_mb() / 1024, 2)
-
-    # Tokenizer-verified fill to ~99% of the window so the KV pool is
-    # exercised near its true ceiling (where real OOMs happen), not the
-    # ~88% a static char estimate reaches. max_tokens stays well under the
-    # headroom so prompt+output can't exceed --max-model-len.
-    prompt, fill_tokens, fill_method = build_full_window_prompt(
-        base_url, model_name, corpus, requested_ctx, needle_depth)
-    body = {
-        "model": model_name,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.0,
-        "max_tokens": _MAX_OUTPUT_TOKENS,
-        "stream": False,
-    }
-
-    # Near-full-context prefill needs far longer than the fit probe's
-    # 60s CHAT_TIMEOUT: a 254K-token prefill on a 26B model is minutes,
-    # not seconds. Scale with ctx so small tiers still fail fast on a
-    # genuine hang while large tiers get the time a real prefill needs
-    # (~400 tok/s conservative prefill floor + 120s slack). Without this,
-    # every 256K cell mis-classifies a still-progressing prefill as a
-    # serving OOM.
-    chat_timeout = max(CHAT_TIMEOUT, 120.0 + requested_ctx / 400.0)
-
-    sampler = VramSampler(interval=0.1)
-    request_error: str | None = None
-    chat_resp: dict | None = None
-    sampler.start()
-    try:
-        chat_resp = _post_chat(base_url, body, timeout=chat_timeout)
-        # HTTP 400 = the char-estimated prompt overshot THIS tokenizer's
-        # max-model-len budget (chars/token varies per tokenizer). That's
-        # a prompt-sizing artifact, not a serving verdict -- trim to ~85%
-        # of ctx and retry once. Still a near-full-context stress test.
-        if (isinstance(chat_resp, dict)
-                and "HTTP 400" in str(chat_resp.get("error", ""))):
-            body["messages"][0]["content"] = build_haystack_prompt(
-                corpus, int(requested_ctx * 0.85), depth=needle_depth)
-            chat_resp = _post_chat(base_url, body, timeout=chat_timeout)
-    except (urllib.error.URLError, TimeoutError, OSError,
-            json.JSONDecodeError) as e:
-        # The request error IS the OOM signal we are here to measure.
-        request_error = f"{type(e).__name__}: {e}"
     finally:
-        snap = sampler.stop()
-
-    peak_gb = round(float(snap.get("peak_vram_gb", 0.0) or 0.0), 2)
-    logs_tail = container_logs(runtime, container_name)
-    failed, reason = _detect_serving_failure(
-        runtime, container_name, chat_resp, request_error, logs_tail,
-    )
-
-    content = ""
-    reasoning_text = ""
-    input_tokens = output_tokens = 0
-    if isinstance(chat_resp, dict):
-        try:
-            msg = ((chat_resp.get("choices") or [{}])[0].get("message") or {})
-            content = msg.get("content") or ""
-            # Reasoning models (R1-Distill, Qwen3 thinking) may emit the
-            # answer in reasoning_content, or burn the output budget on
-            # the <think> trace before reaching content. Score both so a
-            # genuine recall in the reasoning isn't logged as needle=0.
-            reasoning_text = msg.get("reasoning_content") or ""
-        except (AttributeError, IndexError, TypeError):
-            content = ""
-        usage = chat_resp.get("usage") or {}
-        input_tokens = int(usage.get("prompt_tokens") or 0)
-        output_tokens = int(usage.get("completion_tokens") or 0)
-
-    needle = 0.0 if failed else max(
-        score_needle(content), score_needle(reasoning_text))
-    transient = round(max(0.0, peak_gb - baseline_gb), 2) if peak_gb else 0.0
-
-    container_remove(runtime, container_name)
-
-    rec: dict = {
-        "serving_ok": not failed,
-        "serving_peak_gb": peak_gb,
-        "serving_baseline_gb": baseline_gb,
-        "transient_gb": transient,
-        "needle_score": needle,
-        "serving_input_tokens": input_tokens,
-        "serving_output_tokens": output_tokens,
-        # How full the KV pool actually got: input_tokens / ctx, from the
-        # engine's own usage count. ~0.99 means the window was genuinely
-        # exercised; a low value (char-estimate fallback) means the OOM
-        # ceiling at full fill was NOT tested -- surfaced for auditing.
-        "serving_fill_ratio": (round(input_tokens / requested_ctx, 3)
-                               if input_tokens else None),
-        "serving_fill_method": fill_method,
-        "predicted_logits_gb": pred_logits,
-        "serving_chat_timeout_s": round(chat_timeout, 1),
-        "serving_probed_at": now_iso(),
-        "serving_seconds": round(time.time() - started, 1),
-    }
-    if failed:
-        rec["serving_error"] = reason
-        # Capture diagnostics so a failure is explainable without
-        # relaunching: vLLM/SGLang put the real exception in the HTTP
-        # error body, and the container-log tail shows OOM vs a transient
-        # 500 vs a real engine bug. A single bare "HTTP 500" is too weak
-        # to condemn a model's serveable ctx -- this is the evidence.
-        if isinstance(chat_resp, dict) and chat_resp.get("body"):
-            rec["serving_error_body"] = str(chat_resp["body"])[:500]
-        if logs_tail:
-            rec["serving_log_excerpt"] = logs_tail[-_LOG_EXCERPT_CHARS:]
-    return rec
+        container_remove(runtime, container_name)
 
 
 # ── Pass driver ──────────────────────────────────────────────────────────────
+
+def _cell_kv_cache_dtype(cell: dict, backend: str) -> str:
+    """KV dtype the fit prober MEASURED this cell under.
+
+    The load probe must relaunch under the cell's stamped dtype, not under
+    whatever PROBE_KV_CACHE_TYPE this pass happens to carry: a model
+    fit-probed with `auto` stamps kv_cache_type="auto", and a later
+    fleet-wide `make probe-load-vllm` (the documented normal workflow) would
+    otherwise relaunch it under the pass-global fp8 default. The resulting
+    serving_ok / serving_peak_gb / predicted_logits_gb would then describe a
+    dtype the cell does not advertise, while the router serves under the
+    STAMPED one (gpu-arbiter resolveKVCacheType).
+
+    Unstamped legacy cells decode exactly as synthesizeHFFromCache does:
+    fp8 on vLLM (the prober's historical hardcode) and the engine default
+    ("" = no flag) on SGLang.
+    """
+    stamped = cell.get("kv_cache_type")
+    if isinstance(stamped, str) and stamped:
+        return stamped
+    return "fp8" if backend == "vllm" else ""
+
 
 def run_load_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
     """Binary-search the max SERVING ctx per model and collapse to ONE cell.
@@ -744,9 +784,18 @@ def run_load_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
       - serves nowhere          -> keep the fit cell, mark serving_ok=False, and
                                     record an `oom` ledger exclusion.
 
+    The search grid is capped by ``--ctx`` / ``PROBE_CONTEXTS`` exactly as
+    in the fit pass, so `--ctx 32K` launches one tier instead of walking
+    the whole 32K..256K grid.
+
+    Each relaunch reproduces the KV dtype the target cell was FIT-probed
+    under (its stamped ``kv_cache_type``), not this pass's
+    PROBE_KV_CACHE_TYPE default -- see `_cell_kv_cache_dtype`.
+
     Backend-agnostic: identical for vLLM and SGLang via their BackendSpec.
     """
     assert_no_active_backends(args.runtime)
+    install_probe_cleanup()
 
     catalog_rows = load_catalog_hf_rows(args.catalog, spec.name)
     if args.repo:
@@ -758,6 +807,23 @@ def run_load_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
     models_dir = Path(args.models_dir)
     if not models_dir.is_dir():
         sys.exit(f"error: models dir not found: {models_dir}")
+
+    # The requested tiers CAP the binary search -- identical construction to
+    # the fit pass (_probe_hf_common.run_probe_pass). Without it the serving
+    # search walked the full 32K-multiple grid up to 256K regardless of
+    # --ctx / PROBE_CONTEXTS, launching (and OOM-killing) containers at tiers
+    # the operator explicitly excluded, which costs real GPU minutes. Keeping
+    # the fine grid *below* the requested ceiling preserves the documented
+    # 32K-multiple precision on a default run; requested tiers that are not
+    # grid multiples are unioned in so an odd explicit tier is still probed.
+    ctxs = parse_context_list(args.ctx) if getattr(args, "ctx", "") else \
+        standard_contexts()
+    if not ctxs:
+        sys.exit("error: --ctx produced an empty list")
+    ctx_ceiling = max(ctxs)
+    search_grid = tuple(sorted(
+        {c for c in BINARY_SEARCH_CONTEXTS if c <= ctx_ceiling} | set(ctxs)
+    ))
 
     cache = load_cache(args.cache)
     # Phase C: idempotent re-stamp of the image digest (the load pass may run
@@ -777,6 +843,8 @@ def run_load_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
     print(f"  vram band:      {vram_label(band_gb)} (host)", file=sys.stderr)
     print(f"  search:         binary max serving ctx on the 32K grid, "
           f"capped at the fit ctx", file=sys.stderr)
+    print(f"  ctx search grid:{','.join(context_label(c) for c in search_grid)}",
+          file=sys.stderr)
     print(f"  needle depth:   {needle_depth:.2f}", file=sys.stderr)
     print(f"  {spec.name} image:     {args.image}", file=sys.stderr)
     print(file=sys.stderr)
@@ -843,11 +911,16 @@ def run_load_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
         if isinstance(pos_limit, int) and pos_limit > 0:
             serving_cap = min(serving_cap, pos_limit)
 
+        # Reproduce the dtype the fit cell was MEASURED under, not this
+        # pass's PROBE_KV_CACHE_TYPE default (see _cell_kv_cache_dtype).
+        cell_kv = _cell_kv_cache_dtype(fit_cell, spec.name)
+
         probed_cells: dict[int, dict] = {}
 
         def _serving_works(ctx: int) -> bool:
             print(f"  {name} @ {vram_label(band_gb)} "
-                  f"ctx={context_label(ctx)}: load-probing ...", file=sys.stderr)
+                  f"ctx={context_label(ctx)} kv={cell_kv or 'engine-default'}: "
+                  f"load-probing ...", file=sys.stderr)
             rec = load_probe_one_cell(
                 spec,
                 runtime=args.runtime,
@@ -864,6 +937,7 @@ def run_load_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
                 tool_parser=tool_parser,
                 corpus=corpus,
                 needle_depth=needle_depth,
+                kv_cache_dtype=cell_kv,
             )
             probed_cells[ctx] = rec
             ok = rec.get("serving_ok")
@@ -875,7 +949,7 @@ def run_load_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
             return bool(ok)
 
         max_serving = binary_search_max_ctx(
-            _serving_works, position_limit=serving_cap)
+            _serving_works, position_limit=serving_cap, grid=search_grid)
 
         if max_serving is not None:
             load_rec = probed_cells[max_serving]

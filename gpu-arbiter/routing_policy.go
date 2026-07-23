@@ -15,6 +15,7 @@ package main
 
 import (
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 )
@@ -26,6 +27,12 @@ type RoutingDecision struct {
 	WorkerID    string
 	Score       int
 	NoFitReason string
+
+	// Degraded is set when the only candidates left were draining
+	// workers, i.e. the request was routed to a worker that is on its
+	// way to idle rather than 503'd. Callers may log it; it is not an
+	// error.
+	Degraded bool
 }
 
 // RoutingPolicy holds the tunable knobs (queue depth threshold,
@@ -64,25 +71,33 @@ func (p *RoutingPolicy) RouteDecision(
 		return RoutingDecision{NoFitReason: "no workers registered"}
 	}
 
-	type candidate struct {
-		entry WorkerEntry
-		score int
+	cands, skipped := p.eligible(workers, model, ctx, backend, false)
+
+	// Degraded fallback: the healthy pass found nothing, but some
+	// workers were skipped only because they are DRAINING. Prefer a
+	// slow response over a 503.
+	//
+	// Why draining is safe to fall back to and shutting_down is not: a
+	// drain waits out the requests already in flight while holding the
+	// arbiter mutex, so a newly forwarded request parks on that mutex
+	// and is served once the drain returns -- bounded by DRAIN_TIMEOUT
+	// (30s default). A shutting-down worker exits the process at the
+	// end of its drain, so the same request would die with it. Hence
+	// the fallback admits HealthDraining and never HealthShuttingDown.
+	degraded := false
+	if len(cands) == 0 && skipped.draining > 0 {
+		cands, _ = p.eligible(workers, model, ctx, backend, true)
+		degraded = len(cands) > 0
 	}
-	cands := make([]candidate, 0, len(workers))
-	for _, w := range workers {
-		if !backendSupported(w, backend) {
-			continue
-		}
-		if p.QueueDepthThreshold > 0 && w.QueueDepth >= p.QueueDepthThreshold {
-			continue
-		}
-		cands = append(cands, candidate{entry: w, score: scoreWorker(w, model, ctx)})
-	}
+
 	if len(cands) == 0 {
-		return RoutingDecision{
-			NoFitReason: "no worker advertises backend " + backend +
-				" within the queue-depth threshold",
+		reason := "no worker advertises backend " + backend +
+			" within the queue-depth threshold"
+		if n := skipped.draining + skipped.shuttingDown; n > 0 {
+			reason += " (" + strconv.Itoa(n) +
+				" worker(s) skipped: draining or shutting down)"
 		}
+		return RoutingDecision{NoFitReason: reason}
 	}
 
 	// Top score wins; ties round-robined per bucket.
@@ -98,7 +113,58 @@ func (p *RoutingPolicy) RouteDecision(
 	}
 	pick := p.roundRobin(top, len(tied))
 	chosen := tied[pick]
-	return RoutingDecision{WorkerID: chosen.entry.WorkerID, Score: chosen.score}
+	return RoutingDecision{
+		WorkerID: chosen.entry.WorkerID,
+		Score:    chosen.score,
+		Degraded: degraded,
+	}
+}
+
+// candidate pairs a worker with its 4-tier score.
+type candidate struct {
+	entry WorkerEntry
+	score int
+}
+
+// skipCounts records why workers were filtered out, for the no-fit
+// message.
+type skipCounts struct {
+	draining     int
+	shuttingDown int
+}
+
+// eligible applies the health / backend / queue-depth filters and
+// scores whatever survives. With includeDraining set, workers whose
+// last-reported status is HealthDraining are admitted anyway (the
+// degraded fallback); HealthShuttingDown is excluded in both modes
+// because that worker's process is about to exit.
+func (p *RoutingPolicy) eligible(
+	workers []WorkerEntry, model string, ctx int, backend string,
+	includeDraining bool,
+) ([]candidate, skipCounts) {
+	cands := make([]candidate, 0, len(workers))
+	var skipped skipCounts
+	for _, w := range workers {
+		if !workerAvailable(w) {
+			if w.HealthStatus == HealthShuttingDown {
+				// Terminal: the process exits at the end of its drain.
+				skipped.shuttingDown++
+				continue
+			}
+			skipped.draining++
+			if !includeDraining {
+				continue
+			}
+		}
+		if !backendSupported(w, backend) {
+			continue
+		}
+		if p.QueueDepthThreshold > 0 && w.QueueDepth >= p.QueueDepthThreshold {
+			continue
+		}
+		cands = append(cands, candidate{entry: w, score: scoreWorker(w, model, ctx)})
+	}
+	return cands, skipped
 }
 
 // scoreWorker applies the 4-tier policy to one candidate.
@@ -113,6 +179,20 @@ func scoreWorker(w WorkerEntry, model string, ctx int) int {
 		return ScoreIdle
 	}
 	return ScoreDifferentModel
+}
+
+// workerAvailable reports whether the worker's last-reported health
+// status allows NEW work. Only the two "on the way out" states are
+// excluded; every other value (including "registered" from a worker
+// that has not heartbeated yet, and "" from an older worker build)
+// counts as available, so an unknown status never silently removes a
+// worker from the fleet.
+func workerAvailable(w WorkerEntry) bool {
+	switch w.HealthStatus {
+	case HealthDraining, HealthShuttingDown:
+		return false
+	}
+	return true
 }
 
 // backendSupported reports whether `backend` appears in the worker's

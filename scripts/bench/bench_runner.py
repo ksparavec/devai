@@ -65,6 +65,12 @@ DEFAULT_HOST_VRAM_GB = int(os.environ.get("GPU_MEMORY_GB", "24"))
 DEFAULT_INSPECT_LOG_DIR = Path(
     os.environ.get("BENCH_INSPECT_LOG_DIR", "/var/cache/devai/bench/inspect-logs")
 )
+# Tasks a plain `make bench` runs. Must cover every benchmark column the
+# picker renders: gpqa is its DEFAULT SORT column, and humaneval_plus /
+# mmlu_pro / gpqa used to be opt-in, so a default run left four of the
+# seven columns permanently blank. longctx stays out -- it is a
+# per-context probe, not a leaderboard score.
+DEFAULT_TASKS = "gsm8k,humaneval,humaneval_plus,mmlu_pro,gpqa,tools,leak"
 
 # Backend Prometheus /metrics endpoints reachable from the bench
 # runner's network (devai-net). vLLM exposes a Prometheus exporter on
@@ -496,7 +502,7 @@ def run_for_target(
     wipes the row upfront: unrelated tasks (e.g. the sharper benches) survive
     a forced re-run of the default tasks.
     """
-    served = serving_alias_with_ctx(target["alias"], target["ctx"], backend)
+    served = serving_alias_with_ctx(target["alias"], target["ctx"])
     key = target["key"]
     existing = cache.get(key) or {}
     existing_tasks = (existing.get("tasks") or {})
@@ -552,7 +558,7 @@ def run_for_target(
                     host_env_id=host_env_id,
                 )
                 _print_latency_summary(latency)
-            except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
+            except Exception as e:  # noqa: BLE001
                 print(f"    !! leak/latency failed: {e}", file=sys.stderr)
         _check_drop()
 
@@ -883,8 +889,12 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--backend", required=True, choices=["ollama", "vllm", "sglang"])
     ap.add_argument(
-        "--tasks", default="gsm8k,humaneval,tools,leak",
-        help="comma-separated subset",
+        "--tasks",
+        default=DEFAULT_TASKS,
+        help="comma-separated subset. The default covers every benchmark "
+             "column the picker renders (see DEFAULT_TASKS) and therefore "
+             "takes materially longer than the pre-2026-07 default; pass a "
+             "narrower list to trade coverage for wall time.",
     )
     ap.add_argument("--repo", default="", help="regex filter on probe-cache top-level key")
     ap.add_argument("--force", action="store_true", help="re-run tasks even if cached")

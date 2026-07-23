@@ -37,24 +37,38 @@ relying on them.
 left NVIDIA-only:
 
 ```
-gpu-arbiter/main.go:1597         <- backend container recreate (buildContainerSpec)
-deploy/docker-compose.yaml:40,60,73  <- ollama + vllm + sglang compose `devices:`
-Makefile GPU_FLAGS (~line 160)   <- lab-gpu, shell-gpu, + probe/test targets (7 call sites, one variable)
+gpu-arbiter/main.go:2193             <- backend container recreate (buildContainerSpec)
+deploy/docker-compose.yaml:60,80,93  <- ollama + vllm + sglang compose `devices:`
+Makefile GPU_FLAGS (~line 185)   <- lab-gpu, shell-gpu, + probe/test targets (7 call sites, one variable)
 bin/devai-agent gpu_flags()      <- the standalone devai-agent launcher
 --- left NVIDIA-only, not in scope this pass ---
-scripts/verify-backend-flags.py:44   <- probe/bench harness
-scripts/_probe_hf_common.py:499      <- probe/bench harness
+scripts/verify-backend-flags.py:45   <- probe/bench harness
+scripts/_probe_hf_common.py:614      <- probe/bench harness
 ```
+
+(Line anchors are from commit 57c4052 and drift with edits -- grep for
+`DEVAI_GPU_DEVICE` / `nvidia.com/gpu=all` rather than trusting them.)
 
 The last two are the probe/bench harness itself -- extending them to
 ROCm is real work (different flag surface, different failure modes)
 that needs a real ROCm host to develop against, not just to test
 against. Deferred until one exists.
 
-**`gpu-arbiter` and `deploy/docker-compose.yaml`** both read
-`DEVAI_GPU_DEVICE` with a fallback to the NVIDIA default -- no
-`DEVAI_GPU_VENDOR` awareness needed at that layer, just the one
-derived string.
+**`deploy/docker-compose.yaml`** substitutes `DEVAI_GPU_DEVICE` (with
+the NVIDIA default as fallback) into the three backend services'
+`devices:` lists -- no `DEVAI_GPU_VENDOR` awareness needed at that
+layer, just the one derived string.
+
+**`gpu-arbiter`** reads `DEVAI_GPU_DEVICE` in code, but the router
+service's `environment:` block in `deploy/docker-compose.yaml` does
+**not** pass it in. A composed router therefore always falls back to
+the built-in `nvidia.com/gpu=all` when it recreates a backend
+container, whatever `.env` says. Until that env line is added, the
+`amd` overlay only reaches the backends compose starts itself -- an
+on-demand vLLM/SGLang container recreated by the router still gets the
+NVIDIA device string. Passing `-e DEVAI_GPU_DEVICE=...` to a
+hand-started arbiter does work; that is the only path where the
+arbiter's own read is effective today.
 
 **`Makefile`'s `GPU_FLAGS`** reads the same `DEVAI_GPU_DEVICE` (via
 `.env`, which the Makefile already `-include`s) -- one variable change

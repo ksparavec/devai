@@ -39,11 +39,15 @@ func testBackend(name string, server *httptest.Server) *backendState {
 
 func testArbiter(backends ...*backendState) *arbiter {
 	a := &arbiter{
-		backends:      make(map[string]*backendState),
-		idleTimeout:   5 * time.Minute,
-		drainTimeout:  5 * time.Second,
-		modelSizes:    map[string]float64{"test-model": 7.4},
-		modelContexts: map[string]int{},
+		backends:     make(map[string]*backendState),
+		idleTimeout:  5 * time.Minute,
+		drainTimeout: 5 * time.Second,
+		modelSizes: map[string]map[string]float64{
+			"ollama": {"test-model": 7.4},
+			"vllm":   {"test-model": 7.4},
+			"sglang": {"test-model": 7.4},
+		},
+		modelContexts: map[string]map[string]int{},
 		totalVRAMGB:   24.0,
 		maxContextLen: 131072,
 		// Match production wiring so tests that exercise backendIsServing
@@ -412,7 +416,7 @@ func TestSynthesizeHFFromCache_V2FieldsPropagated(t *testing.T) {
 			Capability:      CapStructured,
 			ReasoningParser: &rp,
 			ToolParser:      &tp,
-			DisableVerified: &dv,
+			DisableVerified: tristateBool{v: &dv},
 			Probes: map[string]map[string]hfCacheProbe{
 				"24": {
 					"32768": {Ctx: 32768, VramGB: 24, Fits: true,
@@ -639,7 +643,7 @@ func TestEnsureBackendRunning_OllamaAlwaysSucceeds(t *testing.T) {
 	a := testArbiter(bs)
 
 	a.mu.Lock()
-	err := a.ensureBackendRunning(bs, "", 0, nil)
+	err := a.ensureBackendRunning(bs, "", 0, false, nil)
 	a.mu.Unlock()
 
 	if err != nil {
@@ -661,7 +665,7 @@ func TestEnsureBackendRunning_RequiresModelForNonOllama(t *testing.T) {
 	a := testArbiter(bs)
 
 	a.mu.Lock()
-	err := a.ensureBackendRunning(bs, "", 0, nil)
+	err := a.ensureBackendRunning(bs, "", 0, false, nil)
 	a.mu.Unlock()
 
 	if err == nil {
@@ -706,13 +710,13 @@ func TestEnsureBackendRunning_CoalescesConcurrentSameModelRecreates(t *testing.T
 	go func() {
 		defer wg.Done()
 		a.mu.Lock()
-		errA = a.ensureBackendRunning(bs, "test-model", 32768, nil)
+		errA = a.ensureBackendRunning(bs, "test-model", 32768, true, nil)
 		a.mu.Unlock()
 	}()
 	go func() {
 		defer wg.Done()
 		a.mu.Lock()
-		errB = a.ensureBackendRunning(bs, "test-model", 32768, nil)
+		errB = a.ensureBackendRunning(bs, "test-model", 32768, true, nil)
 		a.mu.Unlock()
 	}()
 
@@ -785,7 +789,7 @@ func TestEnsureBackendRunning_WaitersUnblockOnRecreateFailure(t *testing.T) {
 		// "model name required" check fires immediately and
 		// ensureBackendRunning returns without calling the real
 		// containerRecreate (which would touch podman).
-		_ = a.ensureBackendRunning(bs, "", 0, nil)
+		_ = a.ensureBackendRunning(bs, "", 0, false, nil)
 		a.mu.Unlock()
 		close(done)
 	}()
@@ -826,12 +830,14 @@ func TestDrainBackend_ReturnsImmediatelyWhenNoActiveRequests(t *testing.T) {
 
 func TestDrainBackend_WaitsForActiveRequests(t *testing.T) {
 	bs := &backendState{config: backendConfig{Name: "test"}}
-	atomic.StoreInt64(&bs.activeReqs, 1)
+	// upstreamReqs, not activeReqs: drain only waits on requests already
+	// proxied upstream (see drainBackend).
+	atomic.StoreInt64(&bs.upstreamReqs, 1)
 	a := &arbiter{drainTimeout: 2 * time.Second}
 
 	go func() {
 		time.Sleep(200 * time.Millisecond)
-		atomic.StoreInt64(&bs.activeReqs, 0)
+		atomic.StoreInt64(&bs.upstreamReqs, 0)
 	}()
 
 	start := time.Now()
@@ -848,7 +854,7 @@ func TestDrainBackend_WaitsForActiveRequests(t *testing.T) {
 
 func TestDrainBackend_TimesOut(t *testing.T) {
 	bs := &backendState{config: backendConfig{Name: "test"}}
-	atomic.StoreInt64(&bs.activeReqs, 1)
+	atomic.StoreInt64(&bs.upstreamReqs, 1)
 	a := &arbiter{drainTimeout: 200 * time.Millisecond}
 
 	start := time.Now()
@@ -1380,7 +1386,7 @@ func TestSynthesizeFromCache_KVByCtx(t *testing.T) {
 			Aliases:         []string{"mixed:latest"},
 			MaxContext:      262144,
 			Capability:      CapStructured,
-			DisableVerified: &tr,
+			DisableVerified: tristateBool{v: &tr},
 			Probes: map[string]map[string]cacheProbe{
 				"24": {
 					"65536":  {Ctx: 65536, VramGB: 24, ActualTotalGB: 20.7, FullyOnGPU: true, KVCacheType: "f16"},

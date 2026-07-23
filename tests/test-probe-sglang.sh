@@ -37,6 +37,18 @@ info "  vram:         $PROBE_VRAM"
 info "  ctx:          $PROBE_CTX"
 info "  cache file:   $CACHE_FILE"
 
+# See the equivalent block in tests/test-probe-vllm.sh. The SGLang store is
+# the sharper case: nothing currently populates SGLANG_MODELS_DIR (plan
+# review-fixes-2026-07 Phase 5 / HI-SW3), so on the reference host it holds 0
+# files while the cache advertises 8 fitting rows. The prober then skips every
+# model, writes no cell, and exits 0 -- a host data condition, so skip (77).
+MODELS_DIR="${SGLANG_MODELS_DIR:-/var/cache/devai/sglang}"
+if [ ! -d "$MODELS_DIR" ] || ! ls -1 "$MODELS_DIR" 2>/dev/null | grep -Eq "$PROBE_MODEL"; then
+    echo "SKIP: no downloaded model under $MODELS_DIR matches '$PROBE_MODEL'" >&2
+    echo "      nothing populates the SGLang store today; see docs/backends.md." >&2
+    exit 77
+fi
+
 backup=""
 if [ -f "$CACHE_FILE" ]; then
     backup="$(mktemp)"

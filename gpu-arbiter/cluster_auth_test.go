@@ -165,3 +165,64 @@ func TestTokenStore_AuthMiddleware(t *testing.T) {
 		t.Fatalf("next not invoked despite valid token")
 	}
 }
+
+// TestTokenStore_RotationAcrossProductionTTL exercises the real
+// rotation path: a DIFFERENT token value, observed across the
+// production 30s CacheTTL boundary. The clock is injected so the test
+// does not sleep -- see TokenStore.Now.
+func TestTokenStore_RotationAcrossProductionTTL(t *testing.T) {
+	const productionTTL = 30 * time.Second
+	p := writeTempToken(t, "old-token\n")
+	base := time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
+	fake := base
+	ts := NewTokenStore(p, productionTTL)
+	ts.Now = func() time.Time { return fake }
+
+	if v, err := ts.Read(); err != nil || v != "old-token" {
+		t.Fatalf("initial read: %q, %v", v, err)
+	}
+
+	// Operator rotates the secret on disk.
+	if err := os.WriteFile(p, []byte("new-token\n"), 0o600); err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+
+	// Just inside the TTL: the cached (now stale) value still wins.
+	fake = base.Add(productionTTL - time.Second)
+	if v, _ := ts.Read(); v != "old-token" {
+		t.Fatalf("inside TTL: got %q, want the cached old-token", v)
+	}
+
+	// Past the TTL: the new value must take effect with no restart.
+	fake = base.Add(productionTTL + time.Second)
+	if v, _ := ts.Read(); v != "new-token" {
+		t.Fatalf("past TTL: got %q, want new-token", v)
+	}
+
+	// Requests authenticate against the rotated value, and the old one
+	// is now rejected.
+	good := httptest.NewRequest(http.MethodGet, "/whatever", nil)
+	good.Header.Set("Authorization", "Bearer new-token")
+	if err := ts.Validate(good); err != nil {
+		t.Errorf("rotated token rejected: %v", err)
+	}
+	stale := httptest.NewRequest(http.MethodGet, "/whatever", nil)
+	stale.Header.Set("Authorization", "Bearer old-token")
+	if err := ts.Validate(stale); err == nil {
+		t.Error("pre-rotation token still accepted after the TTL elapsed")
+	}
+}
+
+func TestTokenStore_DefaultsToWallClock(t *testing.T) {
+	// Guards the zero-value Now field: production constructs the store
+	// via NewTokenStore and never sets it.
+	ts := NewTokenStore(writeTempToken(t, "tok"), 30*time.Second)
+	if ts.Now != nil {
+		t.Fatal("NewTokenStore must not install a clock")
+	}
+	before := time.Now()
+	got := ts.now()
+	if got.Before(before) || got.After(time.Now().Add(time.Second)) {
+		t.Fatalf("now() = %v, expected wall clock", got)
+	}
+}

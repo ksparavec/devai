@@ -263,11 +263,15 @@
 
       <h3 id="idle">3.5 Idle</h3>
       <p>
-        <code>idleWatcher</code> polls every 30s. A backend whose
-        <code>lastRequest</code> is older than <code>IDLE_TIMEOUT</code>
-        (default 300s) gets stopped and replaced with the
-        <code>sleep infinity</code> placeholder. The next request triggers a
-        cold start.
+        <code>idleWatcher</code> polls every 30s. With
+        <code>IDLE_TIMEOUT=0</code> &mdash; the default, keep-warm &mdash; it
+        never auto-unloads: a loaded model stays resident until a
+        <em>different</em> model is requested, so a cold start is paid once per
+        model, not again after every idle gap. Set <code>IDLE_TIMEOUT</code> to
+        a positive number of seconds to restore time-based unloading, where a
+        backend whose <code>lastRequest</code> is older than the timeout gets
+        stopped and replaced with the <code>sleep infinity</code> placeholder
+        and the next request triggers a cold start.
       </p>
 
       <h3 id="gpu-exclusion">3.6 Backend switch (GPU exclusion)</h3>
@@ -314,7 +318,7 @@
 
           <text x="380" y="175" text-anchor="middle" fill="var(--text-muted)" font-size="11" font-style="italic">drain &rarr; stop / unload &rarr; recreate target</text>
           <text x="380" y="195" text-anchor="middle" fill="var(--text-muted)" font-size="11">only one backend holds the GPU at any time</text>
-          <text x="380" y="220" text-anchor="middle" fill="var(--accent)" font-size="11" font-weight="600">idle &gt; IDLE_TIMEOUT &rarr; back to placeholder (sleep infinity)</text>
+          <text x="380" y="220" text-anchor="middle" fill="var(--accent)" font-size="11" font-weight="600">IDLE_TIMEOUT &gt; 0 and idle &gt; it &rarr; back to placeholder (default 0 = keep warm)</text>
         </svg>
       </figure>
 
@@ -431,7 +435,7 @@
           </thead>
           <tbody>
             <tr><td>Ollama <code>/api/chat</code>, <code>/api/generate</code></td><td>structured</td><td>inject <code>think: &lt;true|false&gt;</code></td></tr>
-            <tr><td>Ollama <code>/v1/chat/completions</code></td><td>structured</td><td>inject <code>reasoning: {enabled: ...}</code></td></tr>
+            <tr><td>Ollama <code>/v1/chat/completions</code></td><td>structured</td><td>inject <code>reasoning_effort</code> (<code>low</code>/<code>medium</code>/<code>high</code>, or <code>none</code> to disable)</td></tr>
             <tr><td>Ollama <code>/v1/messages</code></td><td>structured</td><td>inject <code>thinking.type</code></td></tr>
             <tr><td>vLLM <code>/v1/chat/completions</code></td><td>structured</td><td>inject <code>extra_body.chat_template_kwargs.enable_thinking</code> + <code>reasoning_effort</code></td></tr>
             <tr><td>SGLang <code>/v1/chat/completions</code></td><td>structured</td><td>inject <code>extra_body.chat_template_kwargs.enable_thinking</code> + <code>separate_reasoning</code></td></tr>
@@ -560,16 +564,27 @@
       </p>
 
       <p>
-        The vLLM entrypoint also always passes <code>--kv-cache-dtype fp8</code>.
-        On the project's 24 GiB reference GPU this is what lets NVFP4
-        checkpoints (~18 GiB weights) cohabit with 128K-context KV. Default
-        fp16 KV adds ~7 GiB at 128K &mdash; enough to push the total past
-        24 GiB. fp8 halves that to ~3.5 GiB, leaving room for activations and
-        the engine's CUDA graph workspace. Blackwell exposes native fp8 so
-        there is no throughput cost; older GPUs fall back to vLLM's fp8
-        emulation. The matching <code>--kv-cache-dtype fp8</code> is in
-        <code>scripts/probe-vllm-reasoning.py</code> so probe-time fit data
-        stays consistent with serve-time memory math.
+        The vLLM entrypoint also passes <code>--kv-cache-dtype</code>, but the
+        value is <strong>per-model, not a global hardcode</strong>. It is
+        resolved from the probe cell covering the launch context
+        (<code>resolveKVCacheType</code>): each cell is stamped with the KV
+        dtype it was measured under, and a legacy cell with no stamp decodes to
+        <code>fp8</code> &mdash; the historical hardcode it was factually probed
+        with. For SGLang an unstamped cell emits no flag at all (engine
+        default). Probe-time and serve-time therefore always agree, which is the
+        point: the fit data in the cache is only valid for the dtype it was
+        measured under.
+      </p>
+      <p>
+        fp8 KV is what lets NVFP4 checkpoints (~18 GiB weights) cohabit with
+        128K-context KV on the project's 24 GiB reference GPU. Default fp16 KV
+        adds ~7 GiB at 128K &mdash; enough to push the total past 24 GiB. fp8
+        halves that to ~3.5 GiB, leaving room for activations and the engine's
+        CUDA graph workspace. Blackwell exposes native fp8 so there is no
+        throughput cost; older GPUs fall back to vLLM's fp8 emulation. A model
+        with VRAM slack can be re-probed with
+        <code>PROBE_KV_CACHE_TYPE=auto</code> to serve unquantized KV instead
+        &mdash; there is no global dtype policy.
       </p>
 
       <!-- Per-model recovery flags -->
@@ -760,7 +775,7 @@
             <tr><th>Variable</th><th>Default</th><th>Purpose</th></tr>
           </thead>
           <tbody>
-            <tr><td><code>IDLE_TIMEOUT</code></td><td><code>300</code></td><td>seconds before idle backend is replaced with placeholder</td></tr>
+            <tr><td><code>IDLE_TIMEOUT</code></td><td><code>0</code></td><td>seconds before an idle backend is auto-unloaded; <code>0</code> (the default) = never, keep-warm</td></tr>
             <tr><td><code>DRAIN_TIMEOUT</code></td><td><code>30</code></td><td>seconds to wait for in-flight requests when switching backends</td></tr>
             <tr><td><code>HEALTH_TIMEOUT_SECONDS</code></td><td><code>600</code></td><td>cold-start health-poll deadline (NVFP4 + CUDA graph can need 5min)</td></tr>
           </tbody>
@@ -935,7 +950,7 @@ make logs SERVICE=devai-vllm LINES=120     # backend that's currently active</co
             <tr><td><code>vllm plugin registry: ... loaded</code></td><td>plugin map consumed</td></tr>
             <tr><td><code>vllm launch: model=X GB ... tool="Y" tool_plugin="Z"</code></td><td>recreate spec</td></tr>
             <tr><td><code>stopping &lt;other-backend&gt; (switching to &lt;target&gt;)</code></td><td>GPU mutex switch</td></tr>
-            <tr><td><code>draining &lt;backend&gt; (N active requests)</code></td><td>drain-on-switch</td></tr>
+            <tr><td><code>draining &lt;backend&gt; (N requests in flight upstream)</code></td><td>drain-on-switch (counts only requests already proxied upstream)</td></tr>
             <tr><td><code>&lt;backend&gt; idle, stopping</code></td><td>idle timeout fired</td></tr>
           </tbody>
         </table>

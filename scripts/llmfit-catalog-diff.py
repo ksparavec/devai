@@ -22,6 +22,17 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 FAMILIES_FILE = REPO_ROOT / "scripts" / "model-families.yaml"
 
 
+def entry_repo(entry) -> str:
+    """Return the repo string of a `gguf_repos:` / `hf_repos:` entry.
+
+    Both blocks accept either a bare string or a mapping carrying extra
+    per-repo config (`{repo: ..., mtp: {...}}`, `{repo: ..., tag_prefix: ...}`).
+    Anything else yields "".
+    """
+    r = entry.get("repo") if isinstance(entry, dict) else entry
+    return r.strip() if isinstance(r, str) else ""
+
+
 def load_existing_gguf_repos() -> set[str]:
     """Return lowercased set of every gguf repo already in the catalog."""
     if not FAMILIES_FILE.exists():
@@ -32,12 +43,9 @@ def load_existing_gguf_repos() -> set[str]:
     repos: set[str] = set()
     for fam in data.get("families", []) or []:
         for entry in fam.get("gguf_repos", []) or []:
-            if isinstance(entry, dict):
-                r = entry.get("repo")
-            else:
-                r = entry
+            r = entry_repo(entry)
             if r:
-                repos.add(r.strip().lower())
+                repos.add(r.lower())
     return repos
 
 
@@ -49,9 +57,10 @@ def load_existing_hf_repos() -> set[str]:
         data = yaml.safe_load(f)
     repos: set[str] = set()
     for fam in data.get("families", []) or []:
-        for r in fam.get("hf_repos", []) or []:
+        for entry in fam.get("hf_repos", []) or []:
+            r = entry_repo(entry)
             if r:
-                repos.add(r.strip().lower())
+                repos.add(r.lower())
     return repos
 
 
@@ -129,9 +138,14 @@ def main() -> int:
             "hf_already_tracked": (m.get("name") or "").lower() in existing_hf,
         })
 
+    # gpu_vram_gb is optional in llmfit's payload — a bare `:.2f` on the
+    # missing-value default (or an explicit null) raises.
+    vram = system.get("gpu_vram_gb")
+    vram_str = f"{vram:.2f}" if isinstance(vram, (int, float)) else "?"
+
     print(f"# llmfit catalog suggestions (read-only)")
     print(f"# system: {system.get('gpu_name','?')} "
-          f"{system.get('gpu_vram_gb','?'):.2f}GB VRAM, "
+          f"{vram_str}GB VRAM, "
           f"backend={system.get('backend','?')}")
     print(f"# llmfit returned {len(models)} ranked models; "
           f"{len(candidates)} have GGUF repos not in scripts/model-families.yaml")

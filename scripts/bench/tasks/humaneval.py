@@ -14,9 +14,10 @@ Why "local" (subprocess) instead of inspect_ai's docker sandbox: the
 bench harness already runs inside the lab container; running another
 container nested for each sample requires podman socket forwarding
 and adds 1-2 seconds of overhead per problem. A plain subprocess
-with ``resource.setrlimit`` + ``signal.alarm`` is sufficient
-isolation for trusted-but-buggy generated code (we trust the model
-not to be malicious; we don't trust it not to fork-bomb).
+with ``resource.setrlimit`` (RLIMIT_AS for memory, RLIMIT_NPROC for
+fork bombs) + ``signal.alarm`` is sufficient isolation for
+trusted-but-buggy generated code (we trust the model not to be
+malicious; we don't trust it not to fork-bomb).
 """
 
 from __future__ import annotations
@@ -51,6 +52,15 @@ _RUN_TIMEOUT_S = 10.0
 # scored 0. We also pin BLAS to a single thread below (see _BLAS_ENV) so
 # OpenBLAS doesn't reserve a per-core buffer that scales with CPU count.
 _MEM_LIMIT_MB = 2048
+
+# Fork-bomb guard headroom. RLIMIT_NPROC is a ceiling on the total
+# number of tasks (processes AND threads) the *real uid* may hold, not a
+# per-process quota, so it can only be set relative to what is already
+# running -- a fixed constant would either be uselessly high on a busy
+# host or make a legitimate `import` fail on a quiet one. The child needs
+# no subprocesses of its own; the headroom just covers interpreter
+# start-up and the odd helper thread an imported library spawns.
+_NPROC_HEADROOM = 32
 
 # Force single-threaded BLAS in the test subprocess: OpenBLAS otherwise
 # allocates thread-local buffers sized to the host core count, which both
@@ -140,19 +150,44 @@ def _run_check_in_subprocess(program: str) -> tuple[bool, str]:
     """Exec ``program`` in a fresh Python process. Returns
     ``(passed, stderr_excerpt)``.
 
-    The child sets a memory rlimit and an alarm before exec'ing the
-    code. ``passed`` is True iff the child exits 0. Stderr is captured
-    so failures get a readable explanation in the score record.
+    The child sets a memory rlimit, a process-count rlimit and an alarm
+    before exec'ing the code. ``passed`` is True iff the child exits 0.
+    Stderr is captured so failures get a readable explanation in the
+    score record.
     """
     # Embed the program in a wrapper that installs limits before
     # running. Keeps the subprocess invocation a single argv list.
     wrapper = textwrap.dedent(f"""
-        import resource, signal, sys
+        import os, resource, signal, sys
         try:
             resource.setrlimit(
                 resource.RLIMIT_AS,
                 ({_MEM_LIMIT_MB * 1024 * 1024}, {_MEM_LIMIT_MB * 1024 * 1024}),
             )
+        except (ValueError, OSError):
+            pass
+        # Fork-bomb guard: count the tasks this uid already holds, then
+        # cap RLIMIT_NPROC just above that. fork() past the cap fails
+        # with BlockingIOError instead of multiplying without bound.
+        # Best-effort -- if /proc is unreadable we leave the inherited
+        # limit rather than guessing a number that breaks imports.
+        try:
+            _uid = os.getuid()
+            _live = 0
+            for _e in os.scandir("/proc"):
+                if not _e.name.isdigit():
+                    continue
+                try:
+                    if _e.stat().st_uid != _uid:
+                        continue
+                    _live += len(os.listdir(_e.path + "/task"))
+                except OSError:
+                    continue
+            _hard = resource.getrlimit(resource.RLIMIT_NPROC)[1]
+            _cap = _live + {_NPROC_HEADROOM}
+            if _hard != resource.RLIM_INFINITY:
+                _cap = min(_cap, _hard)
+            resource.setrlimit(resource.RLIMIT_NPROC, (_cap, _hard))
         except (ValueError, OSError):
             pass
         def _timeout(signum, frame):

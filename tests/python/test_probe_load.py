@@ -342,6 +342,32 @@ class TestDetectServingFailure(unittest.TestCase):
         self.assertIn("oom_marker", reason)
 
 
+class TestCellKvCacheDtype(unittest.TestCase):
+    """The load probe must relaunch under the dtype the fit cell was
+    MEASURED with, not this pass's PROBE_KV_CACHE_TYPE default -- the
+    router serves under the STAMPED dtype (resolveKVCacheType), so serving
+    numbers taken under a different one describe nothing real."""
+
+    def test_stamp_wins_over_pass_default(self) -> None:
+        self.assertEqual(
+            L._cell_kv_cache_dtype({"kv_cache_type": "auto"}, "vllm"), "auto")
+        self.assertEqual(
+            L._cell_kv_cache_dtype({"kv_cache_type": "fp8_e5m2"}, "sglang"),
+            "fp8_e5m2")
+
+    def test_unstamped_legacy_cell_matches_the_router(self) -> None:
+        # gpu-arbiter synthesizeHFFromCache: "" decodes to fp8 on vLLM (the
+        # prober's historical hardcode) and to the engine default on SGLang.
+        self.assertEqual(L._cell_kv_cache_dtype({}, "vllm"), "fp8")
+        self.assertEqual(L._cell_kv_cache_dtype({}, "sglang"), "")
+        self.assertEqual(L._cell_kv_cache_dtype({"kv_cache_type": ""}, "vllm"),
+                         "fp8")
+
+    def test_non_string_stamp_falls_back(self) -> None:
+        self.assertEqual(L._cell_kv_cache_dtype({"kv_cache_type": 8}, "vllm"),
+                         "fp8")
+
+
 class TestRunLoadProbePassWriteLogic(unittest.TestCase):
     """GPU-free coverage of run_load_probe_pass's single-cell binary-search
     write logic: augment-in-place, MOVE-down when serving caps below the fit
@@ -350,7 +376,7 @@ class TestRunLoadProbePassWriteLogic(unittest.TestCase):
     scripted fake.
     """
 
-    def _run(self, *, cells, scripted, force=False):
+    def _run(self, *, cells, scripted, force=False, ctx=None):
         """Drive run_load_probe_pass against a synthetic cache. `cells` is the
         initial probes['24'] map; `scripted` maps ctx-int -> serving rec.
         Returns (cache, calls, ledger_records).
@@ -358,6 +384,7 @@ class TestRunLoadProbePassWriteLogic(unittest.TestCase):
         import argparse
 
         calls: list[int] = []
+        self.kv_seen: list[str | None] = []
         ledger_records: list[tuple] = []
         cache = {
             "vendor/m@sha1": {
@@ -408,6 +435,7 @@ class TestRunLoadProbePassWriteLogic(unittest.TestCase):
 
         def fake_probe(spec, *, requested_ctx, **kw):
             calls.append(requested_ctx)
+            self.kv_seen.append(kw.get("kv_cache_dtype"))
             return dict(scripted[requested_ctx])
 
         L.load_probe_one_cell = fake_probe
@@ -416,7 +444,7 @@ class TestRunLoadProbePassWriteLogic(unittest.TestCase):
             args = argparse.Namespace(
                 runtime="podman", repo="", catalog=Path(td) / "models.yaml",
                 cache=Path(td) / "cache.json",
-                models_dir=td, host_vram_gb=24, ctx=None,
+                models_dir=td, host_vram_gb=24, ctx=ctx,
                 image="img", container_name="c", probe_port=18000,
                 force=force, no_cache_write=False, needle_depth=0.5,
             )
@@ -479,6 +507,50 @@ class TestRunLoadProbePassWriteLogic(unittest.TestCase):
         self.assertFalse(cell["serving_ok"])               # ...but cannot serve
         self.assertEqual(calls, [32768])
         self.assertIn(("m", "vllm", "oom"), ledger_records)
+
+    def test_relaunches_under_the_cells_stamped_kv_dtype(self) -> None:
+        # Cell fit-probed with PROBE_KV_CACHE_TYPE=auto: a fleet-wide
+        # `make probe-load-vllm` (pass default fp8) must NOT silently
+        # relaunch it under fp8.
+        cells = {"32768": {"ctx": 32768, "fits": True, "kv_cache_type": "auto"}}
+        scripted = {32768: {"serving_ok": True, "serving_peak_gb": 20.0}}
+        self._run(cells=cells, scripted=scripted)
+        self.assertEqual(self.kv_seen, ["auto"])
+
+    def test_unstamped_cell_uses_the_router_fallback(self) -> None:
+        cells = {"32768": {"ctx": 32768, "fits": True}}
+        scripted = {32768: {"serving_ok": True, "serving_peak_gb": 20.0}}
+        self._run(cells=cells, scripted=scripted)
+        self.assertEqual(self.kv_seen, ["fp8"])   # spec.name == "vllm"
+
+    def test_ctx_caps_the_search_grid(self) -> None:
+        # --ctx / PROBE_CONTEXTS must CAP the serving search exactly as it
+        # caps the fit search. Before this was wired, the load prober parsed
+        # --ctx and discarded it, so `--ctx 32K` still launched (and
+        # OOM-killed) 256K/128K/... containers -- real GPU minutes at tiers
+        # the operator explicitly excluded.
+        cells = {"262144": {"ctx": 262144, "fits": True, "capability": "inline"}}
+        scripted = {32768: {"serving_ok": True, "serving_peak_gb": 20.0,
+                            "needle_score": 1.0}}
+        _, calls, _ = self._run(cells=cells, scripted=scripted, ctx="32K")
+        self.assertEqual(calls, [32768])
+
+    def test_multi_tier_ctx_grid_keeps_the_tiers_below_the_ceiling(self) -> None:
+        # `--ctx 32K,64K` -> ceiling 64K -> grid {32K, 64K}; the top tier is
+        # tried first (fast path), so a serving 64K resolves in one launch.
+        cells = {"262144": {"ctx": 262144, "fits": True, "capability": "inline"}}
+        scripted = {65536: {"serving_ok": True, "serving_peak_gb": 21.0},
+                    32768: {"serving_ok": True, "serving_peak_gb": 20.0}}
+        _, calls, _ = self._run(cells=cells, scripted=scripted, ctx="32K,64K")
+        self.assertEqual(calls, [65536])
+
+    def test_off_grid_ctx_tier_is_still_probed(self) -> None:
+        # An explicit non-grid tier is unioned into the grid (same as the
+        # fit pass) instead of being silently rounded away.
+        cells = {"262144": {"ctx": 262144, "fits": True, "capability": "inline"}}
+        scripted = {40960: {"serving_ok": True, "serving_peak_gb": 20.0}}
+        _, calls, _ = self._run(cells=cells, scripted=scripted, ctx="40K")
+        self.assertEqual(calls, [40960])
 
     def test_force_clears_stale_serving_error(self) -> None:
         cells = {

@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -67,12 +68,24 @@ def load_ledger(path: Path = LEDGER_PATH) -> dict:
 
 def save_ledger(ledger: dict, path: Path = LEDGER_PATH, *,
                 host_vram_gb: float | None = None) -> None:
+    """Write the ledger atomically (tmp file + os.replace).
+
+    Same idiom as the probe caches (_probe_core.save_cache): POSIX
+    guarantees os.replace is atomic on the same filesystem, so a crash
+    mid-write leaves either the old ledger intact or the new one fully
+    written -- never a truncated JSON document that load_ledger would
+    silently degrade to "nothing is excluded", re-opening every model
+    this host already rejected.
+    """
     meta = ledger.setdefault("_meta", {})
     meta["schema_version"] = SCHEMA_VERSION
     if host_vram_gb is not None:
         meta["host_vram_gb"] = float(host_vram_gb)
     meta["updated_at"] = _now()
-    Path(path).write_text(json.dumps(ledger, indent=2, sort_keys=True))
+    p = Path(path)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(json.dumps(ledger, indent=2, sort_keys=True))
+    os.replace(tmp, p)
 
 
 def record_exclusion(ledger: dict, name: str, backend: str, reason: str, *,

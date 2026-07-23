@@ -5,8 +5,11 @@ Verifies:
   - scripts/age-keygen-host.sh refuses to overwrite an existing key
     and parses the public key correctly.
   - scripts/render-secret.sh refuses to write to a non-tmpfs path
-    without DEVAI_RENDER_ALLOW_NON_TMPFS=1.
+    without DEVAI_RENDER_ALLOW_NON_TMPFS=1 -- including when the
+    destination directory does not exist yet.
   - scripts/render-secret.sh validates argument count.
+  - scripts/render-secret.sh renders atomically: a failed decrypt
+    leaves a previously rendered secret untouched.
   - deploy/setup-secrets-tmpfs.sh basic argument validation runs
     without requiring root (we only exercise the help/usage paths).
 
@@ -19,6 +22,7 @@ problem, not ours).
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -162,6 +166,128 @@ class TestRenderSecretScript(unittest.TestCase):
             self.assertNotEqual(r.returncode, 0)
             self.assertIn("not a tmpfs", r.stderr)
 
+    def test_refuses_non_tmpfs_destination_when_dir_absent(self) -> None:
+        # Regression: the tmpfs gate used to sit inside a
+        # `[[ -d "$dst_dir" ]]` test, so it was skipped entirely for a
+        # destination directory that did not exist yet -- exactly the
+        # case it exists to catch, since `mkdir -p` then created it on
+        # persistent storage and the plaintext landed on disk.
+        non_tmpfs_root = REPO_ROOT
+        fs_type = subprocess.check_output(
+            ["stat", "-f", "-c", "%T", str(non_tmpfs_root)], text=True
+        ).strip()
+        if fs_type in ("tmpfs", "ramfs"):
+            self.skipTest(f"REPO_ROOT is on {fs_type}; cannot test non-tmpfs gate")
+        with tempfile.TemporaryDirectory(dir=str(non_tmpfs_root)) as td:
+            src = Path(td) / "fake.sops.env"
+            src.write_text("fake=1\n")
+            missing_dir = Path(td) / "not-created-yet"
+            dst = missing_dir / "non-tmpfs.env"
+            r = subprocess.run(
+                [
+                    "bash",
+                    str(REPO_ROOT / "scripts" / "render-secret.sh"),
+                    str(src),
+                    str(dst),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                env={**os.environ, "DEVAI_RENDER_ALLOW_NON_TMPFS": "0"},
+            )
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("not a tmpfs", r.stderr)
+            self.assertFalse(
+                missing_dir.exists(),
+                msg="gate must abort before mkdir -p creates the directory",
+            )
+
+    @staticmethod
+    def _fake_sops_bin(td: str, *, exit_code: int, payload: str = "") -> str:
+        """Put a stub `sops` on PATH.
+
+        Lets us exercise render-secret.sh's success/failure control flow
+        without a real sops/age install (see the module docstring: real
+        binaries are out of scope here).
+        """
+        bin_dir = Path(td) / "bin"
+        bin_dir.mkdir()
+        stub = bin_dir / "sops"
+        stub.write_text(
+            "#!/usr/bin/env bash\n"
+            f"printf '%s' {shlex.quote(payload)}\n"
+            f"exit {exit_code}\n"
+        )
+        stub.chmod(0o755)
+        return str(bin_dir)
+
+    def test_failed_decrypt_leaves_existing_destination_intact(self) -> None:
+        # Regression: the script used to redirect sops straight into the
+        # destination, so a failed decrypt truncated a good rendered
+        # secret to 0 bytes and consumers read an empty .env.
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "fake.sops.env"
+            src.write_text("encrypted-blob\n")
+            dst = Path(td) / "out.env"
+            dst.write_text("GOOD=1\n")
+            bin_dir = self._fake_sops_bin(td, exit_code=1)
+            r = subprocess.run(
+                [
+                    "bash",
+                    str(REPO_ROOT / "scripts" / "render-secret.sh"),
+                    str(src),
+                    str(dst),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                env={
+                    **os.environ,
+                    "DEVAI_RENDER_ALLOW_NON_TMPFS": "1",
+                    "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+                },
+            )
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("left unchanged", r.stderr)
+            self.assertEqual(dst.read_text(), "GOOD=1\n")
+            leftovers = sorted(
+                p.name for p in Path(td).iterdir() if p.name.startswith(".out.env.")
+            )
+            self.assertEqual(leftovers, [], msg="temp file not cleaned up")
+
+    def test_successful_render_is_mode_0600_and_leaves_no_temp(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "fake.sops.env"
+            src.write_text("encrypted-blob\n")
+            dst = Path(td) / "out.env"
+            payload = "TOKEN=abc\n"
+            bin_dir = self._fake_sops_bin(td, exit_code=0, payload=payload)
+            r = subprocess.run(
+                [
+                    "bash",
+                    str(REPO_ROOT / "scripts" / "render-secret.sh"),
+                    str(src),
+                    str(dst),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                env={
+                    **os.environ,
+                    "DEVAI_RENDER_ALLOW_NON_TMPFS": "1",
+                    "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+                },
+            )
+            self.assertEqual(
+                r.returncode, 0, msg=f"stderr: {r.stderr}\nstdout: {r.stdout}"
+            )
+            self.assertEqual(dst.read_text(), payload)
+            self.assertEqual(dst.stat().st_mode & 0o777, 0o600)
+            leftovers = sorted(
+                p.name for p in Path(td).iterdir() if p.name.startswith(".out.env.")
+            )
+            self.assertEqual(leftovers, [], msg="temp file not cleaned up")
+
 
 class TestSetupSecretsTmpfsScript(unittest.TestCase):
     def test_script_executable_and_well_formed(self) -> None:
@@ -185,6 +311,15 @@ class TestSetupSecretsTmpfsScript(unittest.TestCase):
         self.assertIn("nodev", text)
         self.assertIn("nosuid", text)
         self.assertIn("noexec", text)
+
+    def test_mount_options_carry_owner_uid_gid(self) -> None:
+        # Static check only -- actually mounting needs CAP_SYS_ADMIN.
+        # Without uid=/gid= the tmpfs is root:root 0700 and every
+        # *-secrets-render target fails with EACCES.
+        text = (REPO_ROOT / "deploy" / "setup-secrets-tmpfs.sh").read_text()
+        self.assertIn("uid=${OWNER_UID},gid=${OWNER_GID}", text)
+        self.assertIn("mode=0700", text)
+        self.assertIn("SUDO_USER", text)
 
 
 class TestGitignoreCovers(unittest.TestCase):

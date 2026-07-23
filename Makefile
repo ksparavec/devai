@@ -347,15 +347,21 @@ fetch-cli: ## Download all external binaries and packages to local cache (uses E
 	       elif [ "$$LATEST" = "$$CACHED" ]; then echo "SkyPilot: up to date ($$CACHED)"; \
 	       else \
 	           echo "SkyPilot: fetching $$LATEST wheels..." \
-	           && rm -rf $(CACHE_DIR)/pip/wheels/skypilot \
-	           && mkdir -p $(CACHE_DIR)/pip/wheels/skypilot \
-	           && python3 -m pip download \
+	           && SKY_TMP=$(CACHE_DIR)/pip/wheels/.skypilot.tmp \
+	           && rm -rf "$$SKY_TMP" \
+	           && mkdir -p "$$SKY_TMP" \
+	           && if python3 -m pip download \
 	                  'skypilot[aws,gcp,azure,kubernetes,slurm,runpod,lambda]' \
 	                  --python-version 3.13 --only-binary=:all: \
-	                  --dest $(CACHE_DIR)/pip/wheels/skypilot \
-	           && echo "$$LATEST" > $(ETAG_DIR)/skypilot.version \
-	           && echo "SkyPilot: updated to $$LATEST" \
-	           || echo "SkyPilot: download failed (check network / pip); existing cache preserved"; fi
+	                  --dest "$$SKY_TMP"; then \
+	                  rm -rf $(CACHE_DIR)/pip/wheels/skypilot \
+	                  && mv "$$SKY_TMP" $(CACHE_DIR)/pip/wheels/skypilot \
+	                  && echo "$$LATEST" > $(ETAG_DIR)/skypilot.version \
+	                  && echo "SkyPilot: updated to $$LATEST"; \
+	              else \
+	                  rm -rf "$$SKY_TMP"; \
+	                  echo "SkyPilot: download failed (check network / pip); existing cache preserved"; \
+	              fi; fi
 	@# age + age-keygen ship in one tarball.
 	@ARCH=$$(dpkg --print-architecture) \
 		&& case "$$ARCH" in amd64) AGE_ARCH=amd64;; arm64) AGE_ARCH=arm64;; esac \
@@ -727,8 +733,59 @@ cluster-head-up: ## Start the head-mode router (cluster-mode Phase 2)
 cluster-head-down: ## Stop the head-mode router
 	$(COMPOSE) -f $(CACHE_COMPOSE) -f $(CURDIR)/deploy/compose.head.yaml stop router
 
+# Bearer token for the head's cluster control plane. /v1/cluster/status is
+# authenticated like /v1/cluster/{register,heartbeat} (it enumerates every
+# worker's endpoint, GPU type and loaded model), so cluster-status must
+# present the token. Path mirrors the arbiter's own default -- see
+# gpu-arbiter/cluster_head.go's DEVAI_HEAD_TOKEN_FILE lookup. ?= so an
+# .env value, an exported shell var, or `make DEVAI_HEAD_TOKEN_FILE=... `
+# all win.
+DEVAI_HEAD_TOKEN_FILE ?= /run/devai/cluster-token
+
+# Base URL of the head's cluster control plane. NOTE: this default is very
+# likely NOT reachable as-is -- neither the `router` service in
+# deploy/docker-compose.yaml nor the deploy/compose.head.yaml overlay
+# declares a `ports:` block, so :11444 is bound only inside the devai-net
+# container network (`podman compose -f deploy/docker-compose.yaml -f
+# deploy/compose.head.yaml config` renders the router with `ports: null`).
+# Override this to whatever your deployment actually exposes -- a published
+# port, an ssh -L tunnel, or a head reachable by hostname.
+DEVAI_HEAD_STATUS_URL ?= http://localhost:11444
+
 cluster-status: ## Pretty-print the head's /v1/cluster/status JSON
-	@curl -fsS http://localhost:11444/v1/cluster/status | python3 -m json.tool
+	@# The bearer is handed to curl over a PIPE (`-H @-`, curl >= 7.55), never
+	@# as a command-line argument: argv is world-readable via
+	@# /proc/<pid>/cmdline, so `-H "Authorization: Bearer $$tok"` would
+	@# disclose the token to every local user for the request's lifetime.
+	@# Piping keeps it in curl's memory only. No temp file, nothing to clean up.
+	@tok_file="$(DEVAI_HEAD_TOKEN_FILE)"; \
+	 if [ ! -r "$$tok_file" ]; then \
+	    echo "ERROR: cluster token not readable at $$tok_file" >&2; \
+	    echo "       /v1/cluster/status is bearer-authenticated. Render the token first:" >&2; \
+	    echo "         make secrets-tmpfs" >&2; \
+	    echo "         make secrets-render SOPS_FILE=deploy/cluster-token.sops.env DEST=$$tok_file" >&2; \
+	    echo "       ... or point DEVAI_HEAD_TOKEN_FILE at an existing token file." >&2; \
+	    exit 1; \
+	 fi; \
+	 tok=$$(tr -d '[:space:]' < "$$tok_file"); \
+	 if [ -z "$$tok" ]; then \
+	    echo "ERROR: cluster token file $$tok_file is empty -- refusing to send an empty bearer." >&2; \
+	    exit 1; \
+	 fi; \
+	 body=$$(printf 'Authorization: Bearer %s\n' "$$tok" \
+	         | curl -fsS -H @- "$(DEVAI_HEAD_STATUS_URL)/v1/cluster/status") || { \
+	    echo "ERROR: GET $(DEVAI_HEAD_STATUS_URL)/v1/cluster/status failed." >&2; \
+	    echo "       Most likely cause: the head's control plane is not published to" >&2; \
+	    echo "       the host. The 'router' service declares no 'ports:' block in" >&2; \
+	    echo "       deploy/docker-compose.yaml, and deploy/compose.head.yaml adds none," >&2; \
+	    echo "       so :11444 is reachable only from inside the devai-net network." >&2; \
+	    echo "       Fix by publishing 11444 on the router service, or set" >&2; \
+	    echo "         DEVAI_HEAD_STATUS_URL=<base-url-your-head-actually-exposes>" >&2; \
+	    echo "       Otherwise confirm 'make cluster-head-up' is running and that" >&2; \
+	    echo "       $$tok_file holds the token the head currently loads." >&2; \
+	    exit 1; \
+	 }; \
+	 printf '%s\n' "$$body" | python3 -m json.tool
 
 # SkyPilot fleet-provisioner Phase 1 (per
 # docs/plans/skypilot-fleet-provisioner.md). Long-lived API server
@@ -875,14 +932,24 @@ test: test-router test-devai-tools test-python test-backup-restore test-gpu-vend
 	@# ends in a known-good state. Failures from probe tests are
 	@# captured and re-emitted after `cache-up` so we never leave the
 	@# stack down.
+	@#
+	@# rc=77 is the repo-wide "skipped, precondition absent" convention, the
+	@# same one tests/test-mcp.sh and tests/test-gpu-vendor.sh use. Both probe
+	@# smoke tests exit 77 when the model they would probe has no weights on
+	@# disk -- a host data condition, not a failure. Anything else is real.
 	@set -u; \
 	echo ""; echo "=== Running cache-down probe tests (final phase) ==="; \
 	$(MAKE) cache-down >/dev/null 2>&1 || true; \
 	./tests/test-probe-vllm.sh;   vrc=$$?; \
 	./tests/test-probe-sglang.sh; src=$$?; \
 	$(MAKE) cache-up >/dev/null 2>&1 || true; \
-	if [ "$$vrc" -ne 0 ] || [ "$$src" -ne 0 ]; then \
-	    echo "probe-vllm rc=$$vrc, probe-sglang rc=$$src"; exit 1; \
+	for rc in "$$vrc" "$$src"; do \
+	    if [ "$$rc" -ne 0 ] && [ "$$rc" -ne 77 ]; then \
+	        echo "probe-vllm rc=$$vrc, probe-sglang rc=$$src"; exit 1; \
+	    fi; \
+	done; \
+	if [ "$$vrc" -eq 77 ] || [ "$$src" -eq 77 ]; then \
+	    echo "probe smoke tests: vllm rc=$$vrc, sglang rc=$$src (77 = skipped, no weights on disk)"; \
 	fi
 
 help: ## Show this help message
@@ -956,14 +1023,23 @@ cache-up: ## Start all infrastructure (caches + Ollama + router + Open WebUI; vL
 cache-down: ## Stop and remove ALL infrastructure services (running, stopped, orphaned)
 	@# -t 0 kills immediately; --remove-orphans catches containers no longer in compose.
 	-$(COMPOSE) -f $(CACHE_COMPOSE) down --remove-orphans -t 0
-	@# Force-remove devai-vllm and devai-sglang explicitly. Compose launches
-	@# both as `sleep infinity` placeholders, but the router (gpu-arbiter)
-	@# replaces them via libpod when a request arrives — the recreated
-	@# container drifts from compose's tracked spec (different entrypoint,
-	@# args, no compose labels), so `compose down` may leave it behind as
-	@# a zombie that blocks the next `cache-up` with "container name
-	@# already in use". Remove by name, ignoring missing-container errors.
-	@for name in devai-vllm devai-sglang; do \
+	@# Force-remove the three backend containers explicitly. Compose launches
+	@# vllm/sglang as `sleep infinity` placeholders, but the router
+	@# (gpu-arbiter) replaces them via libpod when a request arrives — the
+	@# recreated container drifts from compose's tracked spec (different
+	@# entrypoint, args, no compose labels), so `compose down` may leave it
+	@# behind as a zombie that blocks the next `cache-up` with "container
+	@# name already in use". Remove by name, ignoring missing-container errors.
+	@#
+	@# devai-ollama belongs in this list too: since the per-model KV-cache
+	@# dtype work the router ALSO recreates it (ensureOllamaRunning ->
+	@# containerRecreate, to bake in OLLAMA_KV_CACHE_TYPE /
+	@# OLLAMA_FLASH_ATTENTION for a mixed-KV tier), which strips the compose
+	@# labels exactly the same way. Verified on the reference host: after any
+	@# run that serves an Ollama model, `podman inspect devai-ollama` shows an
+	@# empty com.docker.compose.project while devai-router still shows
+	@# [deploy], and the next `cache-up` dies on the name collision.
+	@for name in devai-vllm devai-sglang devai-ollama; do \
 		$(CONTAINER_RUNTIME) rm -f $$name >/dev/null 2>&1 || true; \
 	done
 
@@ -1168,6 +1244,10 @@ PROBE_CONTEXTS ?= 32K,64K,128K,256K
 # e.g. PROBE_FORCE_CTX=128K PROBE_KV_CACHE_TYPE=q8_0 PROBE_FLASH_ATTENTION=1.
 PROBE_KV_CACHE_TYPE   ?=
 PROBE_FLASH_ATTENTION ?=
+# Seconds to wait for the recreated devai-ollama to answer `ollama list`
+# before `make probe` gives up. Bounded so a daemon that never comes up
+# fails loudly instead of hanging the probe run forever.
+PROBE_READY_TIMEOUT   ?= 180
 
 probe: ## Probe every downloaded ollama digest at every (VRAM, CONTEXT) tier.
 	@# Loops over PROBE_VRAMS, recreating devai-ollama with
@@ -1175,7 +1255,21 @@ probe: ## Probe every downloaded ollama digest at every (VRAM, CONTEXT) tier.
 	@# A 24G host can therefore produce cache entries valid for 16G targets.
 	@# Each probe pass is incremental: existing (vram, ctx) cells are
 	@# never overwritten unless PROBE_FORCE=1 or PROBE_FORCE_CTX=<list>.
+	@# The restore below runs from an EXIT trap so an aborted or failed
+	@# probe never leaves devai-ollama with the VRAM-crippling
+	@# OLLAMA_GPU_OVERHEAD still set (a later `make bench-ollama` against
+	@# such a container would record wrong numbers).
 	@set -e; \
+	 restore_ollama() { \
+	    rc=$$?; \
+	    echo; \
+	    echo ">>> restoring devai-ollama to host VRAM (no overhead)"; \
+	    $(CONTAINER_RUNTIME) rm -f $(OLLAMA_CONTAINER) >/dev/null 2>&1 || true; \
+	    OLLAMA_GPU_OVERHEAD=0 $(COMPOSE) -f $(CACHE_COMPOSE) up -d ollama || rc=$$?; \
+	    exit $$rc; \
+	 }; \
+	 trap restore_ollama EXIT; \
+	 trap 'exit 130' INT TERM; \
 	 for vram in $$(echo $(PROBE_VRAMS) | tr ',' ' '); do \
 	    overhead_bytes=$$(python3 -c "import sys; sys.path.insert(0, 'scripts'); from _contexts import parse_vram_token, vram_overhead_bytes; print(vram_overhead_bytes($(GPU_MEMORY_GB), parse_vram_token('$$vram')))"); \
 	    echo; \
@@ -1185,7 +1279,16 @@ probe: ## Probe every downloaded ollama digest at every (VRAM, CONTEXT) tier.
 	    OLLAMA_KV_CACHE_TYPE="$(PROBE_KV_CACHE_TYPE)" \
 	    OLLAMA_FLASH_ATTENTION="$(PROBE_FLASH_ATTENTION)" \
 	      $(COMPOSE) -f $(CACHE_COMPOSE) up -d ollama; \
-	    until $(CONTAINER_RUNTIME) exec $(OLLAMA_CONTAINER) ollama list >/dev/null 2>&1; do sleep 1; done; \
+	    waited=0; \
+	    until $(CONTAINER_RUNTIME) exec $(OLLAMA_CONTAINER) ollama list >/dev/null 2>&1; do \
+	        waited=$$((waited + 1)); \
+	        if [ $$waited -ge $(PROBE_READY_TIMEOUT) ]; then \
+	            echo "ERROR: $(OLLAMA_CONTAINER) did not answer 'ollama list' within $(PROBE_READY_TIMEOUT)s." >&2; \
+	            echo "       Inspect its log with: make logs SERVICE=$(OLLAMA_CONTAINER)" >&2; \
+	            exit 1; \
+	        fi; \
+	        sleep 1; \
+	    done; \
 	    $(CONTAINER_RUNTIME) run --rm \
 	        --network $(DEVAI_NETWORK) \
 	        -v $(CURDIR)/scripts:/scripts:ro \
@@ -1201,11 +1304,7 @@ probe: ## Probe every downloaded ollama digest at every (VRAM, CONTEXT) tier.
 	            $(if $(PROBE_FORCE),--force,) \
 	            $(if $(PROBE_FORCE_CTX),--force-ctx $(PROBE_FORCE_CTX),) \
 	            $(PROBE_MODELS); \
-	 done; \
-	 echo; \
-	 echo ">>> restoring devai-ollama to host VRAM (no overhead)"; \
-	 $(CONTAINER_RUNTIME) rm -f $(OLLAMA_CONTAINER) >/dev/null 2>&1 || true; \
-	 OLLAMA_GPU_OVERHEAD=0 $(COMPOSE) -f $(CACHE_COMPOSE) up -d ollama
+	 done
 
 probe-vllm: ## Probe every downloaded vLLM/HF model per (VRAM, CONTEXT) cell.
 	@# Pre-condition: devai-router, devai-vllm, and devai-sglang must
@@ -1288,7 +1387,8 @@ probe-load-sglang: ## Serving-time LOAD probe for SGLang: same as probe-load-vll
 
 model-fit: ## Print which models fit at the chosen (VRAM, CONTEXT) — diagnostic, no writes.
 	@OLLAMA_CONTAINER=$(OLLAMA_CONTAINER) CONTAINER_RUNTIME=$(CONTAINER_RUNTIME) \
-	 VLLM_MODELS_DIR=$(VLLM_MODELS_DIR) HF_CLI=$(HF_CLI) \
+	 VLLM_MODELS_DIR=$(VLLM_MODELS_DIR) SGLANG_MODELS_DIR=$(SGLANG_MODELS_DIR) \
+	 HF_CLI=$(HF_CLI) \
 	 GPU_MEMORY_GB=$${VRAM:-$(GPU_MEMORY_GB)} MAX_CONTEXT_LEN=$${CONTEXT:-$(MAX_CONTEXT_LEN)} \
 	 VERBOSE=$${VERBOSE:-0} \
 		python3 scripts/select-models.py \
@@ -1301,7 +1401,8 @@ model-fit: ## Print which models fit at the chosen (VRAM, CONTEXT) — diagnosti
 model-pull: ## Pull missing best-fit candidates from the catalog (catalog-driven downloads).
 	@set -e; \
 	 OLLAMA_CONTAINER=$(OLLAMA_CONTAINER) CONTAINER_RUNTIME=$(CONTAINER_RUNTIME) \
-	 VLLM_MODELS_DIR=$(VLLM_MODELS_DIR) HF_CLI=$(HF_CLI) \
+	 VLLM_MODELS_DIR=$(VLLM_MODELS_DIR) SGLANG_MODELS_DIR=$(SGLANG_MODELS_DIR) \
+	 HF_CLI=$(HF_CLI) \
 	 GPU_MEMORY_GB=$${VRAM:-$(GPU_MEMORY_GB)} MAX_CONTEXT_LEN=$${CONTEXT:-$(MAX_CONTEXT_LEN)} \
 	 VERBOSE=$${VERBOSE:-0} \
 		python3 scripts/select-models.py \
@@ -1371,7 +1472,7 @@ model-status: ## Show the host-local model exclusion ledger (too_big/too_small/u
 	@python3 scripts/_model_status.py $(if $(CLEAR),--clear $(CLEAR),)
 
 model-sync: ## Closed loop: diff catalog vs probed+excluded, auto download+probe genuinely-new rows. DRY_RUN=1, SYNC_MAX_DOWNLOADS=<n>, FAMILY=<f>, REGEN=1 (catalog-regen first).
-	@$(if $(REGEN),python3 scripts/generate-catalog.py;) true
+	@$(if $(REGEN),python3 scripts/generate-catalog.py)
 	python3 scripts/model-sync.py \
 	  $(if $(DRY_RUN),--dry-run,) \
 	  $(if $(SYNC_MAX_DOWNLOADS),--max-downloads $(SYNC_MAX_DOWNLOADS),) \
@@ -1556,6 +1657,11 @@ install-systemd: ## Install and enable systemd service for infrastructure
 	ln -sfn $(CURDIR)/deploy/logging.sh                    $(HOME)/.config/devai/logging.sh
 	ln -sfn $(CURDIR)/deploy/recovery-flags.json           $(HOME)/.config/devai/recovery-flags.json
 	ln -sfn $(CURDIR)/deploy/vllm-plugins.json             $(HOME)/.config/devai/vllm-plugins.json
+	@# models.yaml is mounted by the router service (MTP launch params).
+	@# Symlinked, not copied, so a `make catalog-regen` in the repo is
+	@# picked up without re-running install-systemd; unstaged it would be
+	@# bind-mounted as a DIRECTORY and the MTP registry would load empty.
+	ln -sfn $(CURDIR)/deploy/models.yaml                   $(HOME)/.config/devai/models.yaml
 	ln -sfn $(CURDIR)/deploy/.ollama-reasoning-cache.json  $(HOME)/.config/devai/.ollama-reasoning-cache.json
 	ln -sfn $(CURDIR)/deploy/.vllm-reasoning-cache.json    $(HOME)/.config/devai/.vllm-reasoning-cache.json
 	ln -sfn $(CURDIR)/deploy/.sglang-reasoning-cache.json  $(HOME)/.config/devai/.sglang-reasoning-cache.json
@@ -1575,6 +1681,7 @@ uninstall-systemd: ## Stop, disable and remove the systemd infrastructure unit
 	rm -f $(HOME)/.config/devai/logging.sh
 	rm -f $(HOME)/.config/devai/recovery-flags.json
 	rm -f $(HOME)/.config/devai/vllm-plugins.json
+	rm -f $(HOME)/.config/devai/models.yaml
 	rm -f $(HOME)/.config/devai/.ollama-reasoning-cache.json
 	rm -f $(HOME)/.config/devai/.vllm-reasoning-cache.json
 	rm -f $(HOME)/.config/devai/.sglang-reasoning-cache.json

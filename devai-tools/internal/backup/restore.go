@@ -117,12 +117,23 @@ func resolveTarget(roots map[string]string, name string) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("unknown archive root %q in entry %q", parts[0], name)
 	}
+	// A bare root name ("deploy") resolves to the root directory itself.
+	// Manifest never emits one -- every ArchivePath it declares has a
+	// "<root>/<leaf>" shape -- and honouring it would make Restore rename
+	// the whole deploy/ tree aside (taking every probe and bench cache
+	// with it) and write a single file in its place.
 	if len(parts) == 1 {
-		return root, nil
+		return "", fmt.Errorf("rejected: entry %q names archive root %q with no path under it", name, parts[0])
 	}
 	target := filepath.Join(root, parts[1])
-	if target != root && !strings.HasPrefix(target, root+string(os.PathSeparator)) {
+	// Strict containment: target must be strictly BELOW root. Equality is
+	// the same root-clobbering case as the bare-name check above, reached
+	// via a trailing slash ("deploy/") or a self-cancelling segment.
+	if !strings.HasPrefix(target, root+string(os.PathSeparator)) {
 		return "", fmt.Errorf("rejected: entry %q escapes root %q", name, root)
+	}
+	if err := validateNoSymlinkComponents(root, target); err != nil {
+		return "", err
 	}
 	return target, nil
 }

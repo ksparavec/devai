@@ -78,9 +78,14 @@
           <strong>Recreates it via libpod</strong> with a dynamic entrypoint that bakes in the chosen model path,
           <code>--max-model-len</code> / <code>--context-length</code>, and
           <code>--gpu-memory-utilization</code> / <code>--mem-fraction-static</code> derived from the probe cache
-          and <code>MAX_CONTEXT_LEN</code>. For vLLM the entrypoint also always passes
-          <code>--kv-cache-dtype fp8</code> — fp16 KV at 128K would push NVFP4 checkpoints past 24 GiB on the
-          reference card. If the model has probe-verified <code>reasoning_parser</code> and/or
+          and <code>MAX_CONTEXT_LEN</code>. For vLLM the entrypoint also passes
+          <code>--kv-cache-dtype</code>, with a <strong>per-model</strong> value resolved from the probe cell
+          covering the launch context — each cell is stamped with the dtype it was measured under, and an
+          unstamped legacy cell decodes to <code>fp8</code>, the historical hardcode it was factually probed
+          with. fp8 KV is what keeps NVFP4 checkpoints at 128K inside 24 GiB on the reference card; a model
+          with VRAM slack can be re-probed with <code>PROBE_KV_CACHE_TYPE=auto</code> to serve unquantized KV
+          instead. There is no global dtype policy. If the model has probe-verified
+          <code>reasoning_parser</code> and/or
           <code>tool_parser</code>, the router injects <code>--reasoning-parser &lt;value&gt;</code>
           (vLLM also adds <code>--enable-auto-tool-choice</code>) and
           <code>--tool-call-parser &lt;value&gt;</code>. Finally, any <code>engine_flags</code> /
@@ -94,7 +99,7 @@
       </ol>
 
       <p>
-        A second request that switches the <strong>model</strong>, <strong>context cap</strong>, or <strong>reasoning override</strong> triggers another recreate. The router tracks <code>currentModel</code>, <code>currentContext</code>, and <code>currentReasoningOverride</code> per backend; any change → recreate.
+        A second request that switches the <strong>model</strong> or the <strong>context cap</strong> triggers another recreate. The router tracks <code>currentModel</code>, <code>currentContext</code> and <code>currentSpec</code> (the speculative-decoding / MTP config) per backend; any of those changing → recreate. A <strong>reasoning override does NOT recreate anything</strong> — there is no <code>currentReasoningOverride</code> field. Reasoning is a per-request body rewrite, so it can change on every request against the same running container.
       </p>
 
       <figure>
@@ -156,7 +161,7 @@
             <rect x="550" y="180" width="220" height="80" rx="10" fill="rgba(126,231,135,0.15)" stroke="var(--good)" stroke-width="2"/>
             <text x="660" y="208" text-anchor="middle" fill="var(--good)" font-size="13" font-weight="700">Ready · serving</text>
             <text x="660" y="226" text-anchor="middle" fill="var(--text-muted)" font-size="11">currentModel</text>
-            <text x="660" y="241" text-anchor="middle" fill="var(--text-muted)" font-size="11">currentContext · currentReasoningOverride</text>
+            <text x="660" y="241" text-anchor="middle" fill="var(--text-muted)" font-size="11">currentContext · currentSpec</text>
           </g>
 
           <!-- Arrow back: same backend / same model -->
@@ -170,7 +175,7 @@
 
           <!-- Arrow down: idle timeout -->
           <path d="M 660 260 v 60" stroke="var(--text-muted)" stroke-width="2" fill="none" marker-end="url(#bArr)" stroke-dasharray="4 3"/>
-          <text x="720" y="295" fill="var(--text-muted)" font-size="11">IDLE_TIMEOUT_SECONDS</text>
+          <text x="720" y="295" fill="var(--text-muted)" font-size="11">IDLE_TIMEOUT</text>
 
           <!-- State 5: stopped / back to placeholder -->
           <g>
@@ -540,9 +545,9 @@ make cache-up</code></pre>
             strips <code>@&lt;ctx&gt;</code> first, then
             <code>parseReasoningOverride</code> strips <code>::&lt;reasoning&gt;</code>,
             rewrites the body's <code>model</code> field to the clean name, applies
-            the reasoning policy, and triggers a recreate when
-            <code>currentContext</code> or <code>currentReasoningOverride</code>
-            differs. No client-side tag materialization needed.
+            the reasoning policy per request, and triggers a recreate only when
+            <code>currentContext</code> (or <code>currentModel</code> /
+            <code>currentSpec</code>) differs. No client-side tag materialization needed.
           </p>
         </div>
       </div>

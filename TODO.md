@@ -1,6 +1,6 @@
 # TODO
 
-> Reconciled against `git log` on 2026-05-01 (covers commits afb7c59 → b77e42b).
+> Reconciled against `git log` on 2026-05-01 (covers commits afb7c59 -> b77e42b).
 
 ## Completed
 
@@ -12,9 +12,9 @@
 - [x] Dynamic GPU memory fraction + context length per model size
 
 ### Probe & catalog pipeline
-- [x] Upstream-driven catalog (`make catalog-regen` → `deploy/models.yaml`)
+- [x] Upstream-driven catalog (`make catalog-regen` -> `deploy/models.yaml`)
 - [x] Per-tier probe schema v3, digest-keyed cache (Ollama)
-- [x] 2-D probe matrix (VRAM × CONTEXT); `active-models.yaml` removed — cache IS the active set
+- [x] 2-D probe matrix (VRAM x CONTEXT); `active-models.yaml` removed -- cache IS the active set
 - [x] Disk-driven picker; rows hidden until `fully_on_gpu` / `fits`
 - [x] Implied-spill propagation: smaller-ctx spill short-circuits larger ctx
 - [x] gguf source kind: FROM + RENDERER + PARSER Modelfile, `ollama create`-driven
@@ -43,10 +43,10 @@
 - [x] vLLM parser plugin registry (`deploy/vllm-plugins.json` + `scripts/vllm_plugins/`); prober and router both consume it. `deepseek_string` plugin wired for `deepseek-r1-distill` family. Adding new plugins = drop file + one JSON entry.
 - [x] Two-phase tool probe (auto + forced fallback) so reasoning models verify tool parsers; cache row carries `tool_mode`. Router promotes single-tool auto requests, rejects multi-tool auto with HTTP 400 + actionable error. End-to-end verified on R1-Distill-Qwen-7B and R1-Distill-Llama-8B.
 - [x] `refresh_top_level_from_cells` now picks parser fields (tool_parser, reasoning_parser, tool_mode, disable_verified) from the **most-recent clean cell that has them populated** rather than the smallest-tier cell. Fresh `--force` re-probes of a single cell now propagate to the top-level row without requiring a full matrix re-probe; old cells with stale `None`s no longer shadow new evidence.
-- [x] `DeepSeek-R1-Distill-Llama-8B` weights downloaded and probed; cache shows `T=deepseek_string mode=forced`. End-to-end verified through router: single-tool auto → 5-token tool call (vs 525 tokens for Qwen-7B variant — see `docs/backends.md` operational note).
+- [x] `DeepSeek-R1-Distill-Llama-8B` weights downloaded and probed; cache shows `T=deepseek_string mode=forced`. End-to-end verified through router: single-tool auto -> 5-token tool call (vs 525 tokens for Qwen-7B variant -- see `docs/backends.md` operational note).
 
 ### Documentation
-- [x] `docs/router.md` — comprehensive router reference (architecture, ports, lifecycle, request rewrite chain, config, caches, failure modes, operator tasks). Linked from CLAUDE.md and README.md.
+- [x] `docs/router.md` -- comprehensive router reference (architecture, ports, lifecycle, request rewrite chain, config, caches, failure modes, operator tasks). Linked from CLAUDE.md and README.md.
 
 ### Standalone launcher
 - [x] `bin/devai-agent` (renamed from devai-shell): Python launcher, persisted prefs in `~/.devai/preferences.yaml`
@@ -61,8 +61,8 @@
 ### Tests
 - [x] Go unit tests (31+) covering parseSizeGB, memFraction, computeLaunchConfig, parseReasoningOverride, maybeStripTools, synthesizeHFFromCache
 - [x] Live integration per backend (`test-router-{vllm,sglang}.sh`)
-- [x] Exhaustive matrix: every probed digest × wire × scenario (`test-model-matrix.sh`)
-- [x] E2E picker → agent → live router round-trip (`test-e2e-picker.sh`)
+- [x] Exhaustive matrix: every probed digest x wire x scenario (`test-model-matrix.sh`)
+- [x] E2E picker -> agent -> live router round-trip (`test-e2e-picker.sh`)
 - [x] Probe smoke tests + Ollama-prober byte-identical regression check
 
 ### Docs

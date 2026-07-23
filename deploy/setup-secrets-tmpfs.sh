@@ -8,6 +8,10 @@
 #   - nodev,nosuid,noexec (defence in depth)
 #   - size=4M (enough for several .env files; tiny by tmpfs standards)
 #   - mode=0700 (only the owning user can list contents)
+#   - uid=/gid= of the invoking human (SUDO_USER, else USER). The mount
+#     needs root, but every *-secrets-render target that writes into it
+#     runs unprivileged; without these the tmpfs is root:root 0700 and
+#     each render fails with EACCES.
 #
 # Idempotency: if /run/devai is already a tmpfs mount, exit 0 with a
 # one-line confirmation. If it exists as a regular directory, mount
@@ -44,8 +48,30 @@ is_tmpfs() {
     return 1
 }
 
+# Resolve the human this mount belongs to. Under `sudo bash ...` that is
+# SUDO_USER; when already root in a login shell, USER. Fall back to the
+# current euid so the script still works in a container with neither set.
+OWNER_USER="${SUDO_USER:-${USER:-}}"
+if [[ -n "${OWNER_USER}" ]] && id -u "${OWNER_USER}" >/dev/null 2>&1; then
+    OWNER_UID="$(id -u "${OWNER_USER}")"
+    OWNER_GID="$(id -g "${OWNER_USER}")"
+else
+    OWNER_UID="$(id -u)"
+    OWNER_GID="$(id -g)"
+fi
+
 if is_tmpfs "${MOUNTPOINT}"; then
-    echo "${MOUNTPOINT}: already a tmpfs mount; nothing to do."
+    # A tmpfs left over from before uid=/gid= were passed is root:root
+    # 0700, so reporting "nothing to do" would leave every render
+    # failing with EACCES. Re-assert ownership when we can.
+    cur_uid="$(stat -c '%u' "${MOUNTPOINT}" 2>/dev/null || echo "")"
+    if [[ "${cur_uid}" != "${OWNER_UID}" ]] && [[ "$(id -u)" -eq 0 ]]; then
+        chown "${OWNER_UID}:${OWNER_GID}" "${MOUNTPOINT}"
+        chmod 0700 "${MOUNTPOINT}"
+        echo "${MOUNTPOINT}: already a tmpfs mount; ownership re-asserted to ${OWNER_UID}:${OWNER_GID}."
+    else
+        echo "${MOUNTPOINT}: already a tmpfs mount; nothing to do."
+    fi
     exit 0
 fi
 
@@ -61,5 +87,7 @@ if [[ -n "$(ls -A "${MOUNTPOINT}" 2>/dev/null)" ]]; then
     exit 1
 fi
 
-mount -t tmpfs -o "nodev,nosuid,noexec,size=${SIZE},mode=0700" tmpfs "${MOUNTPOINT}"
-echo "${MOUNTPOINT}: mounted tmpfs (size=${SIZE}, mode=0700, nodev,nosuid,noexec)."
+mount -t tmpfs \
+      -o "nodev,nosuid,noexec,size=${SIZE},mode=0700,uid=${OWNER_UID},gid=${OWNER_GID}" \
+      tmpfs "${MOUNTPOINT}"
+echo "${MOUNTPOINT}: mounted tmpfs (size=${SIZE}, mode=0700, uid=${OWNER_UID}, gid=${OWNER_GID}, nodev,nosuid,noexec)."

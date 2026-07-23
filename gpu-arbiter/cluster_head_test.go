@@ -16,13 +16,16 @@ import (
 // returns a canned 200/JSON response so the head's frontend handler
 // runs end-to-end without needing a real worker.
 type fakeForwarder struct {
-	choices []WorkerEntry
+	choices  []WorkerEntry
+	backends []string
 }
 
 func (f *fakeForwarder) Forward(
-	w http.ResponseWriter, _ *http.Request, worker WorkerEntry, _ MinimalRequest,
+	w http.ResponseWriter, _ *http.Request, worker WorkerEntry,
+	_ MinimalRequest, backend string,
 ) {
 	f.choices = append(f.choices, worker)
+	f.backends = append(f.backends, backend)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(`{"ok":true,"worker_id":"` + worker.WorkerID + `"}`))
@@ -136,7 +139,9 @@ func TestHandleHeartbeat_StaleReturnsEmpty(t *testing.T) {
 	}
 }
 
-func TestHandleStatus_NoAuthListsWorkers(t *testing.T) {
+// Handler-level shape check. The mounted (authenticated) surface is
+// covered by TestControlPlaneMux_StatusRequiresAuth.
+func TestHandleStatus_ListsWorkers(t *testing.T) {
 	h, _ := newHeadForTest(t)
 	h.Fleet.Register(mkReq("worker-a"), time.Now())
 	h.Fleet.Register(mkReq("worker-b"), time.Now())
@@ -261,5 +266,109 @@ func TestCommandsFor_PersistentNeverShutdown(t *testing.T) {
 	cmds := h.commandsFor(id, now)
 	if len(cmds) != 0 {
 		t.Errorf("persistent worker should never get shutdown, got %v", cmds)
+	}
+}
+
+// --- Control-plane surface: auth + body caps ---
+
+func TestControlPlaneMux_StatusRequiresAuth(t *testing.T) {
+	h, _ := newHeadForTest(t)
+	h.Fleet.Register(mkReq("worker-a"), time.Now())
+	mux := h.controlPlaneMux()
+
+	// Unauthenticated: fleet topology (endpoints, GPU types, loaded
+	// models) must not leak to anything that reaches the port.
+	req := httptest.NewRequest(http.MethodGet, "/v1/cluster/status", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated status: %d, want 401 (body: %s)", w.Code, w.Body.String())
+	}
+	if bytes.Contains(w.Body.Bytes(), []byte("worker-a")) {
+		t.Errorf("401 body leaked a worker name: %s", w.Body.String())
+	}
+
+	// Authenticated: unchanged behaviour.
+	req2 := httptest.NewRequest(http.MethodGet, "/v1/cluster/status", nil)
+	req2.Header.Set("Authorization", "Bearer the-token")
+	w2 := httptest.NewRecorder()
+	mux.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("authenticated status: %d, want 200", w2.Code)
+	}
+	var arr []StatusEntry
+	if err := json.Unmarshal(w2.Body.Bytes(), &arr); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(arr) != 1 {
+		t.Errorf("expected 1 entry, got %d", len(arr))
+	}
+}
+
+func TestControlPlaneMux_HealthStaysUnauthenticated(t *testing.T) {
+	h, _ := newHeadForTest(t)
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	w := httptest.NewRecorder()
+	h.controlPlaneMux().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("health: %d, want 200 (liveness probes carry no token)", w.Code)
+	}
+}
+
+// oversizedBody returns a JSON body larger than ClusterMaxBodyBytes.
+func oversizedBody() *bytes.Reader {
+	pad := bytes.Repeat([]byte("a"), ClusterMaxBodyBytes+1024)
+	return bytes.NewReader(append(append([]byte(`{"model":"`), pad...), []byte(`"}`)...))
+}
+
+func TestHandleRegister_RejectsOversizedBody(t *testing.T) {
+	h, _ := newHeadForTest(t)
+	req := httptest.NewRequest(http.MethodPost, "/v1/cluster/register", oversizedBody())
+	w := httptest.NewRecorder()
+	h.handleRegister(w, req)
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status: %d, want 413 -- an uncapped read lets one peer exhaust head RAM", w.Code)
+	}
+}
+
+func TestHandleHeartbeat_RejectsOversizedBody(t *testing.T) {
+	h, _ := newHeadForTest(t)
+	req := httptest.NewRequest(http.MethodPost, "/v1/cluster/heartbeat", oversizedBody())
+	w := httptest.NewRecorder()
+	h.handleHeartbeat(w, req)
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status: %d, want 413", w.Code)
+	}
+}
+
+func TestFrontendHandler_RejectsOversizedBody(t *testing.T) {
+	h, fake := newHeadForTest(t)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", oversizedBody())
+	w := httptest.NewRecorder()
+	h.makeFrontendHandler("vllm")(w, req)
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status: %d, want 413", w.Code)
+	}
+	if len(fake.choices) != 0 {
+		t.Errorf("oversized request reached the forwarder")
+	}
+}
+
+func TestFrontendHandler_PassesBackendToForwarder(t *testing.T) {
+	h, fake := newHeadForTest(t)
+	id := h.Fleet.Register(mkReq("w-1"), time.Now())
+	_ = h.Fleet.Heartbeat(HeartbeatRequest{
+		WorkerID: id, Counter: 1, LoadedModel: "Qwen3-8B-NVFP4",
+		LoadedCtx: 131072, HealthStatus: "ready",
+	}, time.Now())
+
+	body := []byte(`{"model":"Qwen3-8B-NVFP4","messages":[]}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	h.makeFrontendHandler("vllm")(w, req)
+
+	if len(fake.backends) != 1 || fake.backends[0] != "vllm" {
+		t.Fatalf("forwarder saw backends %v, want [vllm] -- the worker cannot "+
+			"infer the backend from the body", fake.backends)
 	}
 }

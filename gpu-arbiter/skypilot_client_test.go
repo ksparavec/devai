@@ -142,3 +142,44 @@ func TestSkyPilotClient_DownIdempotentOn200(t *testing.T) {
 		t.Fatalf("Down repeat: %v", err)
 	}
 }
+
+// --- B2: Down's idempotency claim has to be true ---
+
+// An already-gone cluster is a successful teardown. Reporting it as an
+// error made the teardown coordinator retry a cluster that no longer
+// exists until it hit its attempt bound, then log an ERROR about a VM
+// that is not billing anything.
+func TestSkyPilotClient_DownTreatsAlreadyGoneAsSuccess(t *testing.T) {
+	for _, status := range []int{
+		http.StatusOK, http.StatusAccepted,
+		http.StatusNotFound, http.StatusGone,
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(
+			func(w http.ResponseWriter, _ *http.Request) {
+				http.Error(w, "cluster my-cluster not found", status)
+			}))
+		c := NewSkyPilotClient(srv.URL, tokenStoreFor(t, "tok"))
+		if err := c.Down(context.Background(), "my-cluster"); err != nil {
+			t.Errorf("HTTP %d: Down returned %v, want nil", status, err)
+		}
+		srv.Close()
+	}
+}
+
+func TestSkyPilotClient_DownRealFailureStillErrors(t *testing.T) {
+	for _, status := range []int{
+		http.StatusForbidden, http.StatusInternalServerError,
+		http.StatusBadGateway,
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(
+			func(w http.ResponseWriter, _ *http.Request) {
+				http.Error(w, "boom", status)
+			}))
+		if err := NewSkyPilotClient(srv.URL, tokenStoreFor(t, "tok")).
+			Down(context.Background(), "my-cluster"); err == nil {
+			t.Errorf("HTTP %d: Down returned nil, want an error the "+
+				"coordinator can retry", status)
+		}
+		srv.Close()
+	}
+}

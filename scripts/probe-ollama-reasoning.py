@@ -31,7 +31,14 @@ Cache schema (v3, JSON, digest-keyed):
         "experts_used": <int>,                     # optional (MoE)
         "params_total": <int>,                     # optional
         "capability": "structured|inline|unsupported|error|unknown",
-        "disable_verified": true|false|"error",    # only for `structured`
+        "disable_verified": true|false,            # only for `structured`;
+                                                   # ABSENT on probe error
+                                                   # (never the string
+                                                   # "error" -- the router
+                                                   # decodes it as a *bool
+                                                   # and one string sentinel
+                                                   # fails the whole-file
+                                                   # unmarshal)
         "evidence_disable": {...},
         "probes": {
           "<vram_gb>": {
@@ -116,6 +123,13 @@ SCHEMA_VERSION = 3
 # above any model's layer count means "all layers on GPU, or fail". Mirrors
 # the router's serve-time warm-load so probe fit == serve fit (no CPU spill).
 PROBE_NUM_GPU_FORCE_FULL = 999
+
+
+def _env_flag(name: str) -> bool:
+    """Truthiness of an Ollama boolean env var, matching the daemon's own
+    parsing (`1`/`true`/`on`/`yes`, case-insensitive; anything else false)."""
+    return (os.environ.get(name) or "").strip().lower() in (
+        "1", "true", "on", "yes")
 
 
 # ── Live model lookups (/api/tags, /api/show, /api/ps) ───────────────────────
@@ -343,6 +357,12 @@ def probe_one_context(
         # valid under the same dtype, so the router reproduces it at
         # serve time for any ctx this cell covers.
         "kv_cache_type": os.environ.get("OLLAMA_KV_CACHE_TYPE") or "f16",
+        # Flash attention is the other half of the environment this fit was
+        # measured under -- Ollama only honours a quantized KV cache with it
+        # enabled, and the router pairs the two at serve time
+        # (resolveKVCacheType -> ollamaDynamicEnv). Recording only the dtype
+        # left serve time unable to reproduce the measured configuration.
+        "flash_attention": _env_flag("OLLAMA_FLASH_ATTENTION"),
     }
     if think_rejected_note and cap != Capability.ERROR:
         record["think_param_rejected"] = True
@@ -386,13 +406,26 @@ def maybe_probe_disable(
 
     Runs only when capability is `structured` and disable_verified isn't
     already recorded. Returns True iff a probe was issued.
+
+    On a probe ERROR, `disable_verified` is left ABSENT and only
+    `evidence_disable` records what happened. It must never be written as
+    the string "error": the router decodes the field as a *bool and
+    unmarshals the WHOLE cache file in one call, so a single string
+    sentinel fails the parse and registers ZERO Ollama models. The
+    absence also keeps the "already recorded" guard below from making the
+    failure sticky -- the next `make probe` retries it.
     """
     if entry.get("capability") != Capability.STRUCTURED:
         entry.pop("disable_verified", None)
         entry.pop("evidence_disable", None)
         return False
-    if "disable_verified" in entry:
+    if isinstance(entry.get("disable_verified"), bool):
         return False
+    # Any non-bool value is a legacy sentinel from before this prober
+    # stopped writing strings on probe failure. Drop it and re-probe --
+    # leaving it in place would both keep the failure sticky and keep the
+    # router's whole-file unmarshal broken.
+    entry.pop("disable_verified", None)
     smallest = smallest_clean_probe(entry)
     if not smallest:
         return False
@@ -404,7 +437,10 @@ def maybe_probe_disable(
         num_predict=num_predict, timeout=timeout, num_ctx=ctx,
     )
     if "error" in resp:
-        entry["disable_verified"] = "error"
+        # Leave disable_verified ABSENT (see docstring): a non-bool value
+        # breaks the router's whole-file unmarshal, and any value at all
+        # would be sticky forever via the `in entry` guard above.
+        entry.pop("disable_verified", None)
         entry["evidence_disable"] = {"error": resp["error"], "probed_ctx": ctx}
         return True
     msg = resp.get("message") or {}
@@ -446,7 +482,13 @@ def _migrate_one(entry: dict, old: dict) -> None:
     if "capability" not in entry:
         # If v1 flipped to "error" because of spill, recover the pre-spill cap.
         entry["capability"] = original_cap if v1_cap == Capability.ERROR else v1_cap
-    if "disable_verified" not in entry and "disable_verified" in old:
+    if "disable_verified" not in entry and isinstance(
+        old.get("disable_verified"), bool
+    ):
+        # Only a real boolean carries forward. A legacy v1 cache can hold the
+        # retired string sentinel "error" here; re-importing it would put a
+        # non-bool back into a field the router decodes as *bool. Dropping it
+        # leaves the field absent, which is exactly "not yet probed".
         entry["disable_verified"] = old["disable_verified"]
     if "evidence_disable" not in entry and "evidence_disable" in old:
         entry["evidence_disable"] = old["evidence_disable"]
@@ -952,10 +994,15 @@ def main() -> None:
                 marker = " (disable verified)"
             elif dv is False:
                 marker = " (disable not honored)"
-            elif dv == "error":
-                marker = " (disable probe failed)"
+            elif (entry.get("evidence_disable") or {}).get("error"):
+                # disable_verified deliberately left absent on a probe
+                # error so the next run retries (see maybe_probe_disable).
+                marker = " (disable probe failed; will retry)"
         if any(t > max_ctx for t in tiers):
-            marker += f" (capped at {context_label(max_ctx)})"
+            # effective_targets no longer clamps at the model's declared
+            # max_context -- tiers above it ARE probed so the operator sees
+            # the engine's real verdict rather than a pre-emptive skip.
+            marker += f" (probed past declared max {context_label(max_ctx)})"
         if ran_disable:
             marker += " +disable"
         if ctxs_implied:

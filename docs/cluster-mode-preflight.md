@@ -45,24 +45,35 @@ No GPU required. Stub backends are fine. Wall time: ~1 minute.
 - **Scenario 2**: 2 heartbeats in 12s -- one tick from the worker
   registered earliest, plus the 10s tick from the second worker.
   Counters were monotonic (`1, 2`) per worker.
-- **Scenario 3**: noopCommandExecutor's
-  `drain backend=vllm acknowledged` log line appeared within 12s
-  of the heartbeat issuing the command.
+- **Scenario 3**: the real command executor's
+  `drain backend=vllm` log line appeared within 12s of the heartbeat
+  issuing the command. This is the arbiter's own `drainBackend`, not a
+  stub -- the placeholder `noopCommandExecutor` no longer exists.
 - **Scenario 4**: inbound `/v1/cluster/inbound` returned 401
-  without `Authorization: Bearer the-token`, 503 with -- the 503
-  is the Phase 1 placeholder ("not_implemented"); Phase 2 wires
-  the real proxy.
-- **Scenario 5**: ephemeral worker exited 2s after the
-  `shutdown grace=2` command (matching `grace_seconds`); persistent
+  without `Authorization: Bearer the-token`. With the token and
+  `X-Devai-Backend: vllm` it returned **404 "unknown model"** from the
+  worker's own single-host request handler -- the request travelled
+  the whole chain rather than short-circuiting, and this worker has no
+  probe cache so its vLLM allowlist is empty. The stage now explicitly
+  fails if it sees the old Phase 1 placeholder (503 `not_implemented`).
+  A token-authenticated request with no `X-Devai-Backend` and no
+  resolvable model returned **400**.
+- **Scenario 5**: ephemeral worker logged
+  `shutdown grace=2s acknowledged`, then `drain complete; exiting`,
+  then exited -- well inside the stage's 4s wait. It does **not**
+  sleep out `grace_seconds`: that is the head's budget before it calls
+  `sky down`, and with no in-flight requests on this GPU-less host the
+  drain returns immediately. Persistent
   worker logged
   `[worker] refusing shutdown command: lifecycle=persistent`
   and stayed up indefinitely.
 - **Scenario 6**: workers logged `connection refused` while head
   was down, then resumed heartbeats within 12s of head restart.
-  No re-registration was needed -- workers reuse their assigned
-  worker_id across head bounces (Phase 2 may revisit if the head's
-  fleet-state cache forgets workers; today the in-memory map is
-  fine because the head is the bottleneck, not workers).
+  No re-registration was needed against the stub head, which keeps
+  accepting the old worker_id. A real head restarts with an empty
+  in-memory fleet map and answers the next heartbeat `410 Gone`; the
+  worker now treats that as "re-register" and does so on the next
+  cycle, so a head bounce no longer orphans workers permanently.
 - **Scenario 7**: rewriting the token file in place did NOT trigger
   a worker restart. Heartbeats continued; counter kept incrementing.
   TokenStore's 30s cache made the rewrite invisible to the worker
@@ -95,7 +106,9 @@ prior row -- keep history so a regression spot-check is easy.
   re-rendering, and confirming the worker picks up the new token
   on next heartbeat. Documented as the operator-side smoke check
   in [docs/secrets.md](secrets.md).
-- Scenarios 3-5 use the noopCommandExecutor, which acknowledges
-  but doesn't actually serve. Real request proxying lands in
-  Phase 2 -- re-test scenarios 3-5 against the real executor when
-  Phase 2 ships.
+- Scenarios 3-5 now run against the real command executor, which
+  drives the single-host scheduler's `drainBackend`; the shutdown
+  stage asserts `drain complete; exiting` before the ephemeral worker
+  exits. What they do NOT cover is a drain with actual in-flight
+  requests -- there is no GPU on the preflight host, so every drain
+  completes immediately with nothing to wait out.

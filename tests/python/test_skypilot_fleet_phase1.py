@@ -61,6 +61,18 @@ class TestComposeService(unittest.TestCase):
         ports = self.svc["ports"]
         self.assertTrue(any(":46580" in str(p) for p in ports))
 
+    def test_port_published_on_loopback_only(self) -> None:
+        # `sky api start --deploy` binds 0.0.0.0 inside the container and
+        # ships no authentication: POST /api/v1/launch is anonymous and
+        # spends real cloud money. Loopback bind is the only thing
+        # keeping it off the LAN.
+        for p in self.svc["ports"]:
+            with self.subTest(port=p):
+                self.assertTrue(
+                    str(p).startswith("127.0.0.1:"),
+                    msg=f"skypilot-api-server port not loopback-bound: {p}",
+                )
+
     def test_cluster_profile(self) -> None:
         self.assertIn("cluster", self.svc.get("profiles") or [])
 
@@ -69,10 +81,54 @@ class TestComposeService(unittest.TestCase):
         skypilot_state = [v for v in vols if v.startswith("skypilot-state:")]
         self.assertEqual(len(skypilot_state), 1)
 
-    def test_home_mount_for_creds(self) -> None:
+    def test_scoped_cred_mounts_present(self) -> None:
+        # Cloud creds still reach the container, but via narrowly-scoped
+        # paths rather than the whole host $HOME.
         vols = self.svc["volumes"]
-        home = [v for v in vols if "${HOME}:" in v or "/root" in v]
-        self.assertTrue(len(home) >= 1, "no $HOME mount for cloud creds")
+        for target in ("/root/.aws", "/root/.config/gcloud", "/root/.config/sky"):
+            with self.subTest(target=target):
+                self.assertTrue(
+                    any(f":{target}:" in v for v in vols),
+                    msg=f"no cred mount for {target} (volumes: {vols})",
+                )
+
+    def test_cred_mounts_are_read_only(self) -> None:
+        vols = self.svc["volumes"]
+        for v in vols:
+            if v.startswith("${HOME}"):
+                with self.subTest(volume=v):
+                    self.assertTrue(
+                        v.endswith(":ro"),
+                        msg=f"host-$HOME-derived mount is not read-only: {v}",
+                    )
+
+    def test_no_whole_home_mount(self) -> None:
+        # A `${HOME}:/root:rw` bind also exposed ~/.ssh and
+        # ~/.config/sops/age/keys.txt -- the age key that decrypts every
+        # deploy/*.sops.env.
+        vols = self.svc["volumes"]
+        self.assertNotIn(
+            "${HOME}:/root:rw", vols,
+            msg="whole-$HOME bind is back; it leaks ~/.ssh and the age key",
+        )
+        for v in vols:
+            with self.subTest(volume=v):
+                self.assertFalse(
+                    v.startswith("${HOME}:"),
+                    msg=f"whole-$HOME bind is back: {v}",
+                )
+
+    def test_ssh_and_sops_never_mounted(self) -> None:
+        # Hard constraint: docs/secrets.md's recovery posture depends on
+        # the age private key never entering a container.
+        forbidden = (".ssh", "/sops", "/age")
+        for v in self.svc["volumes"]:
+            for seg in forbidden:
+                with self.subTest(volume=v, segment=seg):
+                    self.assertNotIn(
+                        seg, v,
+                        msg=f"forbidden path segment {seg!r} in mount {v!r}",
+                    )
 
     def test_secrets_mount_with_dev_null_default(self) -> None:
         vols = self.svc["volumes"]

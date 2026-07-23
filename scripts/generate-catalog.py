@@ -18,10 +18,19 @@ every family, and writes deploy/models.yaml with:
 
 No hand-entered sizes. No hand-entered architectures. Run again any
 time; it is idempotent modulo upstream changes.
+
+If a TRANSIENT upstream fetch failure costs catalog rows, the run exits 1
+and leaves the existing deploy/models.yaml untouched rather than
+overwriting it with a silently smaller catalog (see the `_row_loss` rule
+below). A PERMANENT failure -- a repo that was removed, renamed or gated
+(HTTP 404/410/401/403) -- is a deterministic skip instead: it is reported
+loudly, its row is dropped, and the catalog is still written. Pass
+`--allow-partial` to write even when transient failures were seen.
 """
 
 from __future__ import annotations
 
+import argparse
 import datetime as dt
 import json
 import re
@@ -42,6 +51,74 @@ HF_RAW = "https://huggingface.co"
 OLLAMA_REGISTRY = "https://registry.ollama.ai/v2/library"
 OLLAMA_WEB = "https://ollama.com/library"
 USER_AGENT = "devai-catalog-generator/1.0"
+
+# ── Row-loss guard ───────────────────────────────────────────────────────────
+#
+# deploy/models.yaml is the single source of truth for every model in the
+# system, and this script REWRITES it whole. So a transient upstream failure
+# (HF or the Ollama registry timing out, 5xx-ing, or returning garbage) used
+# to silently shrink the catalog and still exit 0 -- rows vanished from the
+# picker, the probers, and model-sync's diff with no signal at all.
+#
+# Rule: a failure that costs us one or more rows AND MIGHT NOT REPEAT is
+# recorded in `_row_loss`; a run with a non-empty list refuses to write
+# models.yaml and exits 1, leaving the previous (complete, if stale) catalog
+# in place. Deterministic skips are NOT failures and still produce a
+# legitimately smaller catalog -- specifically:
+#   - HTTP 412 platform-gated Ollama tags (macOS-only builds)
+#   - upstream objects that are permanently gone or permanently closed to us:
+#     HTTP 404 / 410 (removed or renamed) and 401 / 403 (gated repo, no
+#     token). See `_PERMANENT_HTTP_CODES` -- these land in
+#     `_permanent_skips`, are reported loudly, and do NOT block the write.
+#   - repos whose weight-file list is genuinely empty / zero-sized
+#   - `include:` filters that match no .gguf file
+#   - malformed hf_repos / gguf_repos entries in model-families.yaml
+#   - unknown mtp.method (block dropped, row still emitted)
+# Per-repo metadata that degrades WITHOUT losing a row (config.json falling
+# back to the family arch_ref, a missing sha, missing HF tags) also stays a
+# warning: the row survives.
+#
+# The permanent/transient split matters because `make catalog-discover-add`
+# writes repos into scripts/model-families.yaml over time and upstream
+# authors delete or rename repos: without it, ONE dead repo would wedge
+# catalog regeneration (and `make model-sync REGEN=1`) forever with no way
+# out but hand-editing the script.
+_row_loss: list[str] = []
+_permanent_skips: list[str] = []
+
+# HTTP status codes that mean "retrying will not help": the object is gone
+# (404 Not Found, 410 Gone) or closed to this client (401 Unauthorized,
+# 403 Forbidden -- a gated repo with no token). Everything else that raises
+# -- 408, 429, any 5xx, socket timeouts, connection resets, DNS failures,
+# malformed JSON -- is treated as transient row loss and blocks the write.
+_PERMANENT_HTTP_CODES = frozenset({401, 403, 404, 410})
+
+
+def _permanent_http_code(exc: BaseException) -> int | None:
+    """Return the HTTP status when `exc` is a permanent fetch failure."""
+    if isinstance(exc, urllib.error.HTTPError) and exc.code in _PERMANENT_HTTP_CODES:
+        return exc.code
+    return None
+
+
+def _record_row_loss(what: str) -> None:
+    _row_loss.append(what)
+
+
+def _record_fetch_failure(what: str, exc: BaseException) -> None:
+    """Route one failed upstream fetch to a permanent skip or to row loss.
+
+    `what` describes the rows at stake WITHOUT the exception text; the
+    exception is appended here so both paths format identically.
+    """
+    code = _permanent_http_code(exc)
+    if code is None:
+        _row_loss.append(f"{what}: {exc}")
+        return
+    print(f"  [warn] GONE (HTTP {code}) -- {what}; dropping it and continuing. "
+          f"Remove it from {FAMILIES_YAML.name} if the removal is permanent.",
+          file=sys.stderr)
+    _permanent_skips.append(f"{what} (HTTP {code})")
 
 
 # ── HTTP ─────────────────────────────────────────────────────────────────────
@@ -323,6 +400,7 @@ def _entry_hf(repo: str, family: str, fallback_arch: Arch,
         size_bytes = hf_weight_bytes(repo)
     except Exception as e:
         print(f"  [warn] HF size: {repo}: {e}", file=sys.stderr)
+        _record_fetch_failure(f"HF size fetch failed: {repo}", e)
         return None
     if size_bytes == 0:
         print(f"  [warn] HF {repo}: no weight files — skipping", file=sys.stderr)
@@ -516,9 +594,11 @@ def _entry_ollama(library: str, tag: str, family: str, arch: Arch,
         if e.code == 412:
             return None  # platform-gated (macOS-only)
         print(f"  [warn] Ollama manifest {library}:{tag}: {e}", file=sys.stderr)
+        _record_fetch_failure(f"Ollama manifest fetch failed: {library}:{tag}", e)
         return None
     except Exception as e:
         print(f"  [warn] Ollama manifest {library}:{tag}: {e}", file=sys.stderr)
+        _record_fetch_failure(f"Ollama manifest fetch failed: {library}:{tag}", e)
         return None
     if size_bytes == 0:
         return None
@@ -536,7 +616,28 @@ def _entry_ollama(library: str, tag: str, family: str, arch: Arch,
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
-def main() -> None:
+def _parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="generate-catalog.py",
+        description="Regenerate deploy/models.yaml from upstream data.",
+    )
+    p.add_argument(
+        "--allow-partial",
+        action="store_true",
+        help="write deploy/models.yaml even when a transient upstream failure "
+             "cost rows. Escape hatch for the operator who has inspected the "
+             "reported losses and decided the smaller catalog is correct. "
+             "Permanently-gone repos (HTTP 404/410/401/403) are skipped "
+             "without this flag.",
+    )
+    return p.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv or [])
+    _row_loss.clear()
+    _permanent_skips.clear()
+
     with FAMILIES_YAML.open() as fh:
         fams = yaml.safe_load(fh)["families"]
 
@@ -554,6 +655,7 @@ def main() -> None:
         if not arch_ref:
             print(f"  [error] family {name} has no arch_ref — skipping",
                   file=sys.stderr)
+            _record_row_loss(f"family {name} has no arch_ref (every row lost)")
             continue
         print(f"  fetching arch from {arch_ref} ...")
         fam_arch = arch_from_config(hf_config(arch_ref),
@@ -596,6 +698,9 @@ def main() -> None:
                 tags = ollama_tags(lib)
             except Exception as e:
                 print(f"  [warn] Ollama tags for {lib}: {e}", file=sys.stderr)
+                _record_fetch_failure(
+                    f"Ollama tag list failed: {lib} "
+                    f"(every tag of this library lost)", e)
                 tags = []
             skipped = 0
             for tag in tags:
@@ -639,6 +744,9 @@ def main() -> None:
                 files = hf_gguf_files(repo)
             except Exception as e:
                 print(f"  [warn] HF GGUF list {repo}: {e}", file=sys.stderr)
+                _record_fetch_failure(
+                    f"HF GGUF listing failed: {repo} "
+                    f"(every quant of this repo lost)", e)
                 continue
             kept = 0
             for fmeta in files:
@@ -657,6 +765,35 @@ def main() -> None:
                 print(f"  [info] {repo}: filter matched 0 files (no entries)")
 
     # ── Write deploy/models.yaml ─────────────────────────────────────────
+    # ... unless rows were lost to a TRANSIENT upstream failure. models.yaml
+    # is rewritten whole, so writing a partial catalog silently deletes models
+    # from the system (see the _row_loss rule above). Keep the previous file
+    # and fail loudly. Permanently-gone upstream objects are reported here too
+    # but never block the write -- retrying them would wedge the catalog.
+    if _permanent_skips:
+        print(f"\n  [warn] {len(_permanent_skips)} upstream object(s) are "
+              f"permanently gone and were dropped from the catalog:",
+              file=sys.stderr)
+        for item in _permanent_skips:
+            print(f"    - {item}", file=sys.stderr)
+        print(f"  remove them from {FAMILIES_YAML} to silence this.",
+              file=sys.stderr)
+
+    if _row_loss:
+        verdict = ("writing anyway (--allow-partial)" if args.allow_partial
+                   else f"REFUSING to overwrite {OUTPUT_YAML}")
+        print(f"\n  [{'warn' if args.allow_partial else 'error'}] "
+              f"{len(_row_loss)} transient upstream failure(s) cost catalog "
+              f"row(s) -- {verdict}:", file=sys.stderr)
+        for item in _row_loss:
+            print(f"    - {item}", file=sys.stderr)
+        if not args.allow_partial:
+            print("  the existing catalog is left untouched; re-run "
+                  "`make catalog-regen` once upstream recovers, or pass "
+                  "--allow-partial if the smaller catalog is correct.",
+                  file=sys.stderr)
+            return 1
+
     lines: list[str] = []
     lines.append("# DevAI model catalog — AUTO-GENERATED.")
     lines.append("#")
@@ -731,7 +868,8 @@ def main() -> None:
 
     OUTPUT_YAML.write_text("\n".join(lines))
     print(f"\n  wrote {OUTPUT_YAML} with {len(all_entries)} entries")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main(sys.argv[1:]))

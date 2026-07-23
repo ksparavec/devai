@@ -25,6 +25,12 @@ ROUTER_INTERNAL="${TEST_ROUTER_HOST:-router}"
 SGLANG_CACHE="$REPO_ROOT/deploy/.sglang-reasoning-cache.json"
 OLLAMA_CACHE="$REPO_ROOT/deploy/.ollama-reasoning-cache.json"
 HOST_VRAM_GB="${HOST_VRAM_GB:-${GPU_MEMORY_GB:-24}}"
+# The probe cache records what FITS, not what is DOWNLOADED. Nothing
+# currently populates the SGLang store (see docs/plans/review-fixes-2026-07.md
+# Phase 5 / HI-SW3), so without this filter discovery hands back models whose
+# weights are absent and the run fails on the router's weights check instead
+# of skipping honestly.
+SGLANG_MODELS_DIR="${SGLANG_MODELS_DIR:-/var/cache/devai/sglang}"
 COLD_START_S=${COLD_START_S:-600}
 WARM_CHAT_S=${WARM_CHAT_S:-30}
 
@@ -52,9 +58,13 @@ skip() { ((SKIP++)); echo -e "  ${GRAY}SKIP${NC} $1: $2"; }
 info() { echo -e "${YELLOW}$1${NC}"; }
 
 discover_sglang_models() {
-    python3 - "$SGLANG_CACHE" "$HOST_VRAM_GB" <<'PY'
-import json, sys
+    python3 - "$SGLANG_CACHE" "$HOST_VRAM_GB" "$SGLANG_MODELS_DIR" <<'PY'
+import json, os, sys
 cache_path, vram = sys.argv[1], int(sys.argv[2])
+store = sys.argv[3] if len(sys.argv) > 3 else ""
+# Store not visible at all (CI, container without the bind) -> do not gate,
+# matching the router's checkModelWeights degradation.
+store_visible = bool(store) and os.path.isdir(store)
 try:
     with open(cache_path) as fh:
         cache = json.load(fh)
@@ -83,7 +93,10 @@ for entry in cache.values():
             smallest_ctx = ctx_val
             smallest_total = total
     if smallest_ctx:
-        fits.append((smallest_total or 0, entry["aliases"][0], smallest_ctx))
+        name = entry["aliases"][0]
+        if store_visible and not os.path.isdir(os.path.join(store, name)):
+            continue
+        fits.append((smallest_total or 0, name, smallest_ctx))
 fits.sort()
 for _, name, ctx in fits:
     print(f"{name}\t{ctx}")

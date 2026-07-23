@@ -32,6 +32,11 @@ ROUTER_INTERNAL="${TEST_ROUTER_HOST:-router}"
 VLLM_CACHE="$REPO_ROOT/deploy/.vllm-reasoning-cache.json"
 OLLAMA_CACHE="$REPO_ROOT/deploy/.ollama-reasoning-cache.json"
 HOST_VRAM_GB="${HOST_VRAM_GB:-${GPU_MEMORY_GB:-24}}"
+# The probe cache records what FITS, not what is DOWNLOADED -- on this host
+# it advertises 16 fitting models while 5 have weights. Selecting an absent
+# one tests the store, not the router, so discovery filters on the store the
+# router actually launches from.
+VLLM_MODELS_DIR="${VLLM_MODELS_DIR:-/var/cache/devai/vllm}"
 
 # Tunable timeouts. Cold vLLM start with CUDA-graph capture is usually
 # 30-90s on consumer NVFP4 weights, but the router's stopOtherBackends
@@ -75,9 +80,14 @@ info() { echo -e "${YELLOW}$1${NC}"; }
 # ones. Returns names one per line; empty stdout means nothing fits.
 
 discover_vllm_models() {
-    python3 - "$VLLM_CACHE" "$HOST_VRAM_GB" <<'PY'
-import json, sys
+    python3 - "$VLLM_CACHE" "$HOST_VRAM_GB" "$VLLM_MODELS_DIR" <<'PY'
+import json, os, sys
 cache_path, vram = sys.argv[1], int(sys.argv[2])
+store = sys.argv[3] if len(sys.argv) > 3 else ""
+# When the store is not visible at all (CI, a container without the bind),
+# fall back to the un-gated list rather than reporting "nothing fits" --
+# same degradation the router's checkModelWeights uses.
+store_visible = bool(store) and os.path.isdir(store)
 try:
     with open(cache_path) as fh:
         cache = json.load(fh)
@@ -103,6 +113,9 @@ for entry in cache.values():
         if smallest_ctx is None or ctx_val < smallest_ctx:
             smallest_ctx = ctx_val
     if smallest_ctx is not None:
+        name = entry["aliases"][0]
+        if store_visible and not os.path.isdir(os.path.join(store, name)):
+            continue
         # Sort key: weight bytes on disk, NOT actual_vram_gb (which is
         # the engine's pre-allocated pool — same across NVFP4 and BF16
         # models at fixed gpu_memory_utilization). Cold-start time

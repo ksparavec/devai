@@ -82,6 +82,11 @@ Sorted by aggregate (mean of GSM8K / HumanEval / tools_use). All
 rows from the 2026-05-05 sweep stamped with `host_env_id`
 `ea4fd7e7b668`.
 
+> **Frozen snapshot, not a live mirror.** This table is the 2026-05-05
+> sweep as run. `make bench-report` now emits more columns than it has
+> (HumanEval+, MMLU-Pro, GPQA landed in the default task set later),
+> so re-generate rather than compare column-for-column.
+
 | Model | GSM8K | HumanEval | tools_use | by_subcase (E/S/M/F) | Leak | Cold (s) | Warm p50/p95 (ms) | TPS (tok/s) | Peak VRAM | Aggregate |
 |---|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|
 | **NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4@131072** | 0.99 | 0.98 | **1.00** | 1.0/1.0/1.0/1.0 | 0.000 | 60.6 | 46.9/52.7 | **143.8** | 22.45 GB | **0.99** |
@@ -456,7 +461,8 @@ PRODUCTION_AGENTIC = (
     backend == "vllm"
     AND quantization in {"NVFP4", "MXFP4"}
     AND tools_use_score >= 0.9
-    AND humaneval >= 0.7
+    AND humaneval >= 0.7          # plain HumanEval (humaneval_subset_*),
+                                  # NOT HumanEval+ (humaneval_plus_subset_*)
     AND gsm8k >= 0.9
     AND leak_rate == 0
     AND peak_vram_gb < 23
@@ -505,8 +511,10 @@ These are derived from the cache, not hand-curated. The picker
 reads `deploy/.bench-cache.json` directly and surfaces the
 PRODUCTION_AGENTIC verdict via `_is_production_agentic` (formerly a
 TIER badge; the per-row score columns now make the verdict implicit
--- a row that's `Yes` in TOOLS, has `>= 0.9` in TOTAL%, and shows
-`0.0` in LEAK% is by definition AGENTIC).
+-- a row scoring high in TOOLS, strong across CODE% / CODE+% / MMLU% /
+GPQA%, and showing `0.0` in LEAK% is by definition AGENTIC). The
+`TOTAL%` composite that used to carry this verdict was retired from
+the picker along with `REAS%`; the per-metric columns replaced it.
 
 ## Followup work (ordered by impact)
 
@@ -596,8 +604,9 @@ TIER badge; the per-row score columns now make the verdict implicit
    and captures: prefill TTFT, decode-phase TPS, output_tokens,
    finish_reason, end-of-request `vllm:kv_cache_usage_perc`, and
    `vllm:num_preemptions_total` delta. Wired into `bench_runner` as
-   an opt-in `longctx` task (not in the default `gsm8k,humaneval,
-   tools,leak` set; enable with `BENCH_TASKS=longctx,...`). Knobs
+   an opt-in `longctx` task (not in the default task set -- which is
+   now `gsm8k,humaneval,humaneval_plus,mmlu_pro,gpqa,tools,leak`;
+   enable with `BENCH_TASKS=longctx,...`). Knobs
    `--n-longctx-fraction` and `--n-longctx-max-tokens` (env
    `BENCH_N_LONGCTX_FRACTION` / `BENCH_N_LONGCTX_MAX_TOKENS`).
    Filler prompt is a public-domain prose chunk repeated to size

@@ -53,9 +53,12 @@ type ClusterHead struct {
 
 // HeadForwarder is what the head calls to forward an OpenAI-compat
 // request to a chosen worker. The ClusterProxy below implements it.
-// Tests inject a fake.
+// Tests inject a fake. `backend` is the frontend the request arrived
+// on -- the worker cannot infer it from the body, so the head has to
+// say (see HeaderBackend).
 type HeadForwarder interface {
-	Forward(w http.ResponseWriter, r *http.Request, worker WorkerEntry, parsed MinimalRequest)
+	Forward(w http.ResponseWriter, r *http.Request, worker WorkerEntry,
+		parsed MinimalRequest, backend string)
 }
 
 // NewClusterHead returns a head with sane defaults.
@@ -113,19 +116,31 @@ func (h *ClusterHead) Run() {
 	log.Println("[head] context cancelled; exiting")
 }
 
-// startControlPlane mounts /v1/cluster/{register,heartbeat,status}
-// behind the bearer-token middleware.
-func (h *ClusterHead) startControlPlane(ctx context.Context) {
+// controlPlaneMux builds the control-plane routes. Split out of
+// startControlPlane so tests can exercise the mounted (authenticated)
+// surface rather than the bare handlers.
+func (h *ClusterHead) controlPlaneMux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.Handle("/v1/cluster/register",
 		h.Token.AuthMiddleware(http.HandlerFunc(h.handleRegister)))
 	mux.Handle("/v1/cluster/heartbeat",
 		h.Token.AuthMiddleware(http.HandlerFunc(h.handleHeartbeat)))
-	mux.HandleFunc("/v1/cluster/status", h.handleStatus)
+	// Status is read-only but it enumerates every worker's endpoint,
+	// GPU type and loaded model -- fleet topology. Authenticate it
+	// like the rest of the control plane.
+	mux.Handle("/v1/cluster/status",
+		h.Token.AuthMiddleware(http.HandlerFunc(h.handleStatus)))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("OK"))
 	})
+	return mux
+}
+
+// startControlPlane serves /v1/cluster/{register,heartbeat,status}
+// behind the bearer-token middleware.
+func (h *ClusterHead) startControlPlane(ctx context.Context) {
+	mux := h.controlPlaneMux()
 	srv := &http.Server{
 		Addr:              fmt.Sprintf(":%d", h.HeadListenPort),
 		Handler:           mux,
@@ -186,15 +201,31 @@ func (h *ClusterHead) idleSweepLoop(ctx context.Context) {
 	}
 }
 
+// readCappedBody reads r.Body under ClusterMaxBodyBytes and writes a
+// 413 response when the limit is exceeded (ok=false). Every head-side
+// handler goes through it: the control plane and the frontends are
+// mounted at "/" on ports any peer on the network can reach, so an
+// uncapped io.ReadAll lets one request exhaust head RAM. The
+// single-host request handler caps the same way.
+func readCappedBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, ClusterMaxBodyBytes))
+	if err != nil {
+		http.Error(w,
+			fmt.Sprintf("read body (limit %d bytes): %v", ClusterMaxBodyBytes, err),
+			http.StatusRequestEntityTooLarge)
+		return nil, false
+	}
+	return body, true
+}
+
 // handleRegister POST -> assigns worker_id, returns it.
 func (h *ClusterHead) handleRegister(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
+	body, ok := readCappedBody(w, r)
+	if !ok {
 		return
 	}
 	var req RegisterRequest
@@ -219,9 +250,8 @@ func (h *ClusterHead) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
+	body, ok := readCappedBody(w, r)
+	if !ok {
 		return
 	}
 	var hb HeartbeatRequest
@@ -274,9 +304,10 @@ func (h *ClusterHead) commandsFor(workerID string, now time.Time) []Command {
 	return []Command{{Type: CommandShutdown, GraceSeconds: 30}}
 }
 
-// handleStatus GET -> JSON array of WorkerEntry. No auth (read-only;
-// per cluster-mode plan v1; revisit if hostile networks become a
-// concern).
+// handleStatus GET -> JSON array of WorkerEntry. Mounted behind the
+// bearer-token middleware (see controlPlaneMux): the payload is fleet
+// topology, not something to hand to anything that can reach the
+// control-plane port.
 func (h *ClusterHead) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	entries := h.Fleet.Snapshot()
 	out := make([]StatusEntry, 0, len(entries))
@@ -308,9 +339,8 @@ func (h *ClusterHead) handleStatus(w http.ResponseWriter, _ *http.Request) {
 // hands off to the configured Forward implementation.
 func (h *ClusterHead) makeFrontendHandler(backend string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
+		body, ok := readCappedBody(w, r)
+		if !ok {
 			return
 		}
 		// Restore a fresh body for the proxy.
@@ -331,6 +361,16 @@ func (h *ClusterHead) makeFrontendHandler(backend string) http.HandlerFunc {
 			h.respondNoFit(w, parsed, backend, decision.NoFitReason)
 			return
 		}
+		if decision.Degraded {
+			// Every healthy worker was filtered out and we fell back to
+			// a draining one: the request will queue behind that drain
+			// rather than 503. Rare enough to log per-request, and the
+			// operator wants to know the fleet is in this state.
+			log.Printf("[head] degraded route: every non-draining worker for "+
+				"backend=%s was unavailable; forwarding model=%q to draining "+
+				"worker %s (expect added latency)",
+				backend, parsed.Model, decision.WorkerID)
+		}
 		entry, ok := h.Fleet.Get(decision.WorkerID)
 		if !ok {
 			// Worker expired between Snapshot and Get -- rare race;
@@ -339,7 +379,7 @@ func (h *ClusterHead) makeFrontendHandler(backend string) http.HandlerFunc {
 			http.Error(w, "selected worker disappeared; retry", http.StatusServiceUnavailable)
 			return
 		}
-		h.Forward.Forward(w, r, entry, parsed)
+		h.Forward.Forward(w, r, entry, parsed, backend)
 	}
 }
 

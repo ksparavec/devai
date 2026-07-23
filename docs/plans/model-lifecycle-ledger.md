@@ -292,7 +292,10 @@ Ledger shape (schema v1):
    (`:1560`), `if is_excluded(...)`: skip silently. When a probe yields a
    terminal verdict, `record_exclusion(...)`.
 4. `prune_to_catalog`: drop ledger rows no longer in the catalog (a model
-   removed from `model-families.yaml`).
+   removed from `model-families.yaml`). **Shipped in `scripts/model-sync.py:main()`**
+   (not in the probers), non-dry-run only, against the unfiltered
+   catalog, with two guards: an empty catalog is a no-op, and a prune
+   that would remove more than half the ledger is refused.
 5. Host-VRAM change invalidates the ledger: stamp `_meta.host_vram_gb`; if it
    differs from the current budget, treat the ledger as advisory (re-derive)
    rather than authoritative -- a 24 GB exclusion is wrong on an 80 GB host.

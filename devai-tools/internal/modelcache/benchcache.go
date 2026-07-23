@@ -61,17 +61,32 @@ func BenchKey(base, backend string, ctx int) string {
 	return fmt.Sprintf("%s::%s::%d", base, backend, ctx)
 }
 
-// Scores are the four picker-sort scores plus leak rate, computed exactly
-// per scripts/model-picker.py's _picker_scores: tps = metrics.
-// tps_sustained_p50; code = tasks.humaneval_*.pass@1; reas = 2/3*tools_use
-// + 1/3*gsm8k; total = mean(gsm8k, code, tools_use). A nil field means the
-// underlying task hasn't been recorded, not zero.
+// Task-key prefixes for the two HumanEval variants. These MUST stay
+// distinct: a bare "humaneval_" prefix also matches
+// "humaneval_plus_subset_*", so the max-ran_at tiebreak in bestTaskScore
+// would silently report HumanEval+ (EvalPlus-hardened, systematically
+// lower) as plain HumanEval. bench_runner.py writes both keys for the
+// same model/ctx, so the collision is the common case, not an edge case.
+const (
+	humanEvalPrefix     = "humaneval_subset_"
+	humanEvalPlusPrefix = "humaneval_plus_subset_"
+)
+
+// Scores are the bench scores this package surfaces: tps = metrics.
+// tps_sustained_p50; code = tasks.humaneval_subset_*.pass@1; codePlus =
+// tasks.humaneval_plus_subset_*.pass@1; leak = tasks.leak_probe.
+// leak_rate. A nil field means the underlying task hasn't been recorded,
+// not zero.
+//
+// The saturated REAS/TOTAL composites that used to live here were
+// retired: scripts/model-picker.py dropped them in favour of sharper
+// per-benchmark discriminators, so computing them here would report a
+// number no picker column shows.
 type Scores struct {
-	TPS   *float64
-	Code  *float64
-	Reas  *float64
-	Total *float64
-	Leak  *float64
+	TPS      *float64
+	Code     *float64
+	CodePlus *float64
+	Leak     *float64
 }
 
 // ComputeScores derives Scores from a bench row.
@@ -82,27 +97,8 @@ func ComputeScores(row BenchRow) Scores {
 			s.TPS = &f
 		}
 	}
-	s.Code = bestTaskScore(row.Tasks, "humaneval_", "pass@1")
-	gsm := bestTaskScore(row.Tasks, "gsm8k_", "score")
-	tools := bestTaskScore(row.Tasks, "tools_use", "score")
-	if tools != nil && gsm != nil {
-		r := (2.0/3.0)*(*tools) + (1.0/3.0)*(*gsm)
-		s.Reas = &r
-	}
-	var parts []float64
-	for _, p := range []*float64{gsm, s.Code, tools} {
-		if p != nil {
-			parts = append(parts, *p)
-		}
-	}
-	if len(parts) > 0 {
-		sum := 0.0
-		for _, p := range parts {
-			sum += p
-		}
-		t := sum / float64(len(parts))
-		s.Total = &t
-	}
+	s.Code = bestTaskScore(row.Tasks, humanEvalPrefix, "pass@1")
+	s.CodePlus = bestTaskScore(row.Tasks, humanEvalPlusPrefix, "pass@1")
 	if leakProbe, ok := row.Tasks["leak_probe"]; ok {
 		if v, ok2 := leakProbe["leak_rate"]; ok2 {
 			if f, ok3 := toFloat(v); ok3 {

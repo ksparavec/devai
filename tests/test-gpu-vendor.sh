@@ -34,7 +34,17 @@ echo ">>> test-gpu-vendor: building devai-gpu-vendor"
 (cd "${REPO_ROOT}/devai-tools" && go build -o "${BIN}" ./cmd/devai-gpu-vendor)
 
 render() {
-    "${RUNTIME}" compose --env-file "${ENV_FILE}" -f "${REPO_ROOT}/deploy/docker-compose.yaml" config
+    # env -u: compose resolves ${VAR} from the OS environment FIRST and only
+    # falls back to --env-file, so an inherited value silently wins over the
+    # file under test. The Makefile exports VLLM_IMAGE (see its comment at
+    # the VLLM_IMAGE ?= line -- host-run probers need it), which meant this
+    # test passed standalone and failed under `make test-gpu-vendor`,
+    # rendering .env's pinned image instead of the ROCm one just written.
+    # Unset exactly the four vars devai-gpu-vendor manages so ENV_FILE is
+    # authoritative for them and this asserts the .env -> compose path.
+    env -u DEVAI_GPU_VENDOR -u DEVAI_GPU_DEVICE -u VLLM_IMAGE -u SGLANG_IMAGE \
+        "${RUNTIME}" compose --env-file "${ENV_FILE}" \
+        -f "${REPO_ROOT}/deploy/docker-compose.yaml" config
 }
 
 echo ">>> flipping to amd"

@@ -307,5 +307,147 @@ class UseCaseRecommenderTests(unittest.TestCase):
         self.assertEqual(PICKER._format_use_case_recommendations(m), "")
 
 
+class UnmeasuredTermsAreNeutralTests(unittest.TestCase):
+    """An unmeasured leak probe used to score as PERFECT faithfulness while
+    an unmeasured TPS scored as ZERO throughput. Both now score neutral
+    (0.5) so missing data neither inflates nor deflates a use-case score.
+    """
+
+    def _model(self, *, tps, leak):
+        return {
+            "name": "m",
+            "_picker_context": 131072,
+            "_picker_scores": {
+                "tps": tps, "code": 0.8, "hevp": 0.7, "mmlu": 0.8,
+                "gpqa": 0.7, "tools": 1.0, "gsm": 0.9, "leak": leak,
+            },
+        }
+
+    def _score(self, ranked, key):
+        return dict(ranked)[key]
+
+    def test_missing_leak_is_not_perfect_faithfulness(self):
+        measured = PICKER._use_case_ratings(self._model(tps=80.0, leak=0.0))
+        missing = PICKER._use_case_ratings(self._model(tps=80.0, leak=None))
+        # summary weights faith at 0.15 -> 1.0 vs 0.5 == 7.5 points.
+        self.assertAlmostEqual(
+            self._score(missing, "summary"),
+            self._score(measured, "summary") - 7.5,
+            places=6,
+        )
+        # doc_qa weights faith at 0.10 -> 5.0 points.
+        self.assertAlmostEqual(
+            self._score(missing, "doc_qa"),
+            self._score(measured, "doc_qa") - 5.0,
+            places=6,
+        )
+
+    def test_missing_tps_is_not_zero_throughput(self):
+        measured_zero = PICKER._use_case_ratings(self._model(tps=0.0, leak=0.0))
+        missing = PICKER._use_case_ratings(self._model(tps=None, leak=0.0))
+        # summary weights tps at 0.10 -> 0.5 vs 0.0 == 5.0 points.
+        self.assertAlmostEqual(
+            self._score(missing, "summary"),
+            self._score(measured_zero, "summary") + 5.0,
+            places=6,
+        )
+
+    def test_measured_terms_keep_their_weights(self):
+        # Fully measured rows must be unchanged by the neutral rule.
+        m = self._model(tps=150.0, leak=0.0)
+        ranked = dict(PICKER._use_case_ratings(m))
+        expect = (0.45 * 0.5 + 0.30 * 0.8 + 0.15 * 1.0 + 0.10 * 1.0) * 100.0
+        self.assertAlmostEqual(ranked["summary"], expect, places=6)
+
+
+class ProductionAgenticHumanEvalPrefixTests(unittest.TestCase):
+    """The badge gate must read plain HumanEval, not HumanEval+.
+
+    A bare "humaneval_" prefix also matches "humaneval_plus_subset_*"; the
+    max-ran_at tiebreak then silently gates the badge on the hardened
+    EvalPlus variant.
+    """
+
+    def _row(self, he: float, hevp: float) -> dict:
+        return {
+            "tasks": {
+                "humaneval_subset_50": {
+                    "pass@1": he, "ran_at": "2026-05-05T10:00:00+00:00",
+                },
+                # Newer ran_at: wins the tiebreak under a bare prefix.
+                "humaneval_plus_subset_50": {
+                    "pass@1": hevp, "ran_at": "2026-06-01T10:00:00+00:00",
+                },
+                "gsm8k_subset_100": {
+                    "score": 0.95, "ran_at": "2026-05-05T10:00:00+00:00",
+                },
+                "tools_use_20": {
+                    "score": 0.95, "ran_at": "2026-05-05T10:00:00+00:00",
+                },
+                "leak_probe": {"leak_rate": 0.0},
+            },
+            "metrics": {"peak_vram_gb": 22.0},
+        }
+
+    def _model(self) -> dict:
+        return {
+            "backend": "vllm",
+            "details": {"quantization": "NVFP4"},
+        }
+
+    def test_plain_humaneval_decides_the_badge(self):
+        # HumanEval 0.75 (passes) but HumanEval+ 0.50 (would fail).
+        row = self._row(he=0.75, hevp=0.50)
+        self.assertTrue(PICKER._is_production_agentic(self._model(), row))
+
+    def test_failing_plain_humaneval_blocks_the_badge(self):
+        # HumanEval 0.50 (fails) even though HumanEval+ 0.95 would pass.
+        row = self._row(he=0.50, hevp=0.95)
+        self.assertFalse(PICKER._is_production_agentic(self._model(), row))
+
+    def test_picker_scores_keep_the_two_humanevals_separate(self):
+        s = PICKER._picker_scores(self._row(he=0.75, hevp=0.50))
+        self.assertEqual(s["code"], 0.75)
+        self.assertEqual(s["hevp"], 0.50)
+
+
+class ToolsScoreIsRankedAndShownTests(unittest.TestCase):
+    """TOOLS is a displayed column and a documented sort mode, so it must
+    also appear in the comparison ranks and the preview's properties."""
+
+    def _cand(self, tools):
+        return {
+            "name": f"m{tools}",
+            "_picker_scores": {
+                "tps": 80.0, "code": 0.8, "hevp": 0.7, "mmlu": 0.8,
+                "gpqa": 0.7, "tools": tools, "gsm": 0.9, "leak": 0.0,
+            },
+        }
+
+    def test_comparison_ctx_ranks_tools(self):
+        a, b, c = self._cand(0.95), self._cand(0.60), self._cand(0.95)
+        ctx = PICKER._build_comparison_ctx([a, b, c])
+        ranks = ctx["ranks"]["tools"]
+        self.assertEqual(ranks[id(a)], 1)
+        self.assertEqual(ranks[id(c)], 1)   # competition ranking: tie
+        self.assertEqual(ranks[id(b)], 3)
+
+    def test_properties_section_shows_tools_with_rank(self):
+        a, b = self._cand(0.95), self._cand(0.60)
+        comparison = PICKER._build_comparison_ctx([a, b])
+        a["_picker_bench_row"] = {"tasks": {}, "metrics": {}}
+        out = PICKER._format_model_properties(a, comparison)
+        self.assertIn("TOOLS:", out)
+        self.assertIn("95.0%", out)
+        self.assertIn("(rank 1/2)", out)
+
+    def test_properties_omits_tools_when_unbenched(self):
+        m = self._cand(0.9)
+        m["_picker_scores"]["tools"] = None
+        m["_picker_bench_row"] = {"tasks": {}, "metrics": {}}
+        out = PICKER._format_model_properties(m, comparison=None)
+        self.assertNotIn("TOOLS:", out)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -16,6 +16,16 @@ when the probe cache has confirmed values for the model.
 Backend launch-flag *names* are pinned in `deploy/backend-flags.yaml`.
 Run `make verify-backend-flags` after bumping either image -- it dumps
 `--help` from the pinned image and asserts every named flag is present.
+Matching is now **exact flag-token** matching, not substring: a removed
+flag whose name is a prefix of a surviving one (`--tp` vs `--tp-size`)
+no longer passes silently. `--kv-cache-dtype` is pinned for both
+backends. One known finding it now surfaces: SGLang's `--tp` reports
+`tp=--tp (not advertised; prefix of --tp-size)` -- the pinned image
+advertises only `--tensor-parallel-size` / `--tp-size`, and `--tp`
+works today solely because argparse accepts it as an unambiguous
+abbreviation. See the cross-unit note in the router/prober spelling
+discussion: both emitters should move to `--tp-size` before upstream
+adds a second `--tp*` option.
 
 All three are reachable via the router from inside the `devai-net` Podman
 network. Agents (Claude Code, Aider, Codex, LATE, Open WebUI) talk to the
@@ -44,15 +54,23 @@ router:
    chosen model path, `--max-model-len` / `--context-length`, and
    `--gpu-memory-utilization` / `--mem-fraction-static` derived from the
    probe cache and `MAX_CONTEXT_LEN`. For vLLM the entrypoint also
-   always passes `--kv-cache-dtype fp8` -- fp16 KV at 128K would push
-   NVFP4 checkpoints past 24 GiB on the reference card. If the model
+   passes `--kv-cache-dtype <per-model>`, resolved from the probe cell
+   covering the launch ctx -- there is no global KV dtype policy (see
+   "Per-tier KV-cache dtype" below). If the model
    has probe-verified `reasoning_parser` and/or `tool_parser`, the
    router injects `--reasoning-parser <value>` (vLLM also adds
    `--enable-auto-tool-choice`) and `--tool-call-parser <value>`.
    Finally, any `engine_flags` / `engine_env` from
    `deploy/recovery-flags.json` keyed by the canonical model name are
    appended (e.g. `--enforce-eager` for Nemotron-3-Nano at 128K --
-   see docs/router.md "Per-model recovery flags").
+   see docs/router.md "Per-model recovery flags"). An entry may carry
+   an optional `backends` allow-list: absent (or `null`) means "every
+   backend", `[]` means "no backend" (the operator disable switch),
+   a list means only those, and a non-list value warns naming the
+   model and is treated as absent. Decoding is per-entry, so one
+   malformed entry never discards the rest of the registry. Both the
+   Go router and the Python probers implement that contract, so probe
+   and serve-time launches agree.
 4. Polls `/health` until the container becomes ready (default 600s,
    override via `HEALTH_TIMEOUT_SECONDS`). The poll fails fast: if the
    container exits or its logs show a terminal error (`detectLaunchFailure`
@@ -62,9 +80,15 @@ router:
 5. Applies the reasoning policy and tool-stripping rules to the request.
 6. Proxies the original request through.
 
-A second request that switches the **model**, **context cap**, or **reasoning
-override** triggers another recreate. The router tracks `currentModel`,
-`currentContext`, and `currentReasoningOverride` per backend; any change -> recreate.
+A second request that switches the **model** or the **context cap**
+triggers another recreate. The router tracks `currentModel`,
+`currentContext` and `currentSpec` (the speculative-decoding / MTP
+config) per backend; any of those changing -> recreate. A **reasoning
+override does NOT recreate anything** -- there is no
+`currentReasoningOverride` field. Reasoning is a per-request body
+rewrite (`::<reasoning>` suffix -> injected `think` / `reasoning_effort`
+/ `enable_thinking`), so it can change on every request against the
+same running container.
 
 ## Probing -- building the cache
 
@@ -85,7 +109,12 @@ Schema v2 (vLLM/SGLang) added three top-level fields per entry:
   hint, or when the round-trip failed.
 - `disable_verified` -- true iff Probe C suppressed `reasoning_content`
   on a structured-capable model. Mirrors Ollama's `disable_verified`;
-  gates the router's "off" rewrite.
+  gates the router's "off" rewrite. When the disable probe itself
+  fails, the field is left **absent** (it is no longer written as the
+  string `"error"`), so the next `make probe` retries it; the summary
+  line reads `(disable probe failed; will retry)`. The router also
+  tolerates a legacy non-boolean value by degrading that one model to
+  "unknown" rather than failing the whole cache parse.
 
 The picker hides any model that lacks a `fits=true` probe at the host
 VRAM band. The router synthesizes `/v1/models` rows from these caches.
@@ -95,7 +124,7 @@ Without probes, models are invisible.
 scan a fixed 32K/64K/128K/256K grid and store a cell per tier. They
 **binary-search** the largest context that both fits AND serves under a
 near-full-context request, on the 32K-multiple grid up to
-`min(MAX_CONTEXT_LEN, position_limit)`, and keep exactly **one** cell
+`min(MAX_CONTEXT_LEN, position_limit, max(PROBE_CONTEXTS))`, and keep exactly **one** cell
 per `(model, backend)` -- the winner. Any candidate above the model's
 as-shipped `position_limit` fails instantly with no launch; if even 32K
 fails to serve, no cell is written and the model is recorded in the
@@ -103,7 +132,16 @@ exclusion ledger (`oom`). Consumers treat the single winner cell as
 covering every ctx `<=` it (KV monotonicity): the picker reads the
 actual recorded cell keys, and `select-models.hf_probe_at_context`
 resolves a sub-winner query to the winner. Ollama still records
-multiple tiers (it is not part of this change).
+multiple tiers (it is not part of this change), and its reader
+(`select-models.probe_at_context`) has **no** winner-cell fallback: a
+miss at the requested tier means that tier was never probed.
+
+Every consumer clamps the request to the entry's own `max_context`
+first (`eff = min(ctx, max_context)`) before looking a cell up, on both
+backends -- asking a 65K-ceiling model for 256K just asks it for 65K.
+`devai-model-status`'s `list_fitting_models` reproduces the same two
+readers; see
+[docs/mcp-model-status.md](mcp-model-status.md#list_fitting_models).
 
 ### Exclusion ledger (`deploy/.model-status.json`)
 
@@ -127,7 +165,16 @@ Reasons:
 
 Inspect with `make model-status`; clear an entry with
 `make model-status CLEAR=<name>[::<backend>]`. The ledger fails open: a
-missing or malformed file simply means "nothing excluded".
+missing or malformed file simply means "nothing excluded". Writes are
+atomic (temp file + `os.replace`), like the probe caches, so an
+interrupted run cannot truncate it.
+
+`make model-sync` prunes rows whose model is no longer in the catalog
+(non-dry-run only, against the unfiltered catalog). Two guards keep a
+bad catalog from emptying the ledger: an empty catalog is a no-op, and
+a prune that would remove more than half the ledger is refused --
+clear those by hand with `make model-status CLEAR=<name>` if the
+removal really is intended.
 
 ### Procedure
 
@@ -154,10 +201,90 @@ make probe-vllm                                     # all vLLM models, all cells
 make probe-sglang                                   # all SGLang models, all cells
 make probe-vllm PROBE_REPO=Llama                   # filter to matching models
 make probe-sglang PROBE_CONTEXTS=128K              # single context tier
+#    `make probe-sglang` can only probe weights that exist in
+#    SGLANG_MODELS_DIR (/var/cache/devai/sglang). `make model-pull`
+#    always downloads into the vLLM store, so SGLang weights are a
+#    separate, explicit copy:
+python3 scripts/select-models.py --name <n> --download --hf-store sglang
+#    An SGLang cell marked fits=true with no weights in that store is
+#    an advertised model the router cannot launch, so select-models.py
+#    flags it -- see "SGLang store gaps" below.
 
 # 4. Restart the stack -- router reloads all three caches at boot.
 make cache-up
 ```
+
+### SGLang store gaps (`--hf-store`, `--ignore-store-gaps`)
+
+`devai-sglang` mounts `SGLANG_MODELS_DIR` (`/var/cache/devai/sglang`),
+a different volume from `devai-vllm`'s `VLLM_MODELS_DIR`. `make
+model-pull` -- including `NAME=<row>` -- always downloads into the vLLM
+store, so weights are never implicitly visible to SGLang and copying
+them is a second full copy of the weights on a different filesystem
+(no hardlinks). The only way to populate the SGLang store is the
+explicit opt-in:
+
+```bash
+python3 scripts/select-models.py --name <n> --download --hf-store sglang
+```
+
+An SGLang probe cell marked `fits=true` whose weights are absent from
+that store is a **store gap**: the picker advertises the row and the
+router cannot launch it. `select-models.py` detects these
+(`sglang_weight_gaps`) and reports them on **stderr**, never stdout,
+so `make model-fit`'s table stays machine-readable. The rule in one
+sentence: **warn on every run that could be misled by a gap, and fail
+only when the run is about to act on a model that IS in the gap.**
+
+| Invocation                       | On a store gap                                    |
+| -------------------------------- | ------------------------------------------------- |
+| read-only (`make model-fit`, plain `select-models.py`) | Warning banner on stderr; the fit table still prints and exit status is unchanged. A read-only diagnostic must not be turned off by the condition it is diagnosing. |
+| enumerating `--download` (`make model-pull`, no `NAME=`) | Same banner as an error, then **exit 1**. That run picks its trial candidates off the very probe cache that is lying about the SGLang store, so every decision downstream of it is made on the wrong picture. |
+| `--name <X> --download` (`make model-pull NAME=`, `make model-sync`) | Same banner; **exit 1 only when `X` is itself a gap row**, since pulling `X` into the vLLM store cannot repair `X`'s own SGLang gap. When `X` is not a gap row the operator asked for a specific, unrelated model -- the banner is a warning and the pull proceeds. |
+
+The `--name` row matters because `make model-sync` is the one caller
+that downloads unattended: it shells out to `make model-pull
+NAME=<row>`, and the Makefile forwards `NAME` as `--name`. The check
+used to sit *after* `main()`'s `--name` short-circuit and was therefore
+unreachable on exactly that path; it now runs on both. The
+fatal-iff-requested rule cannot wedge that loop, for two independent
+reasons: structurally, a gap row is by definition already in the SGLang
+probe cache (that is what "advertised" means), so `plan_sync`
+classifies it `evaluated` and only `new` rows are ever pulled by name;
+and defensively, `model-sync`'s `execute()` logs a non-zero per-row rc
+and moves on rather than aborting the run.
+
+Override the abort with `--ignore-store-gaps`, or
+`IGNORE_STORE_GAPS=1` in the environment (the make targets expose no
+flag, so the env var is the way through them). The check is skipped
+entirely when the run already targets `--hf-store sglang` -- that path
+is the repair route, and blocking the repair with the condition it
+repairs would be circular.
+
+The other repair is to drop `sglang` from the row's backends and
+re-run `make probe-sglang` to clear the stale cells.
+
+### Catalog regeneration is all-or-nothing
+
+`scripts/generate-catalog.py` rewrites `deploy/models.yaml` **whole**,
+so an upstream fetch that transiently fails costs rows. It therefore
+compares the row count it is about to write against the existing file
+and refuses:
+
+- **Transient loss** (network error, 5xx, timeout): the write is
+  refused and the script exits **1** with
+  `REFUSING to overwrite deploy/models.yaml`. `make catalog-regen` and
+  `make model-sync REGEN=1` propagate that failure rather than
+  continuing against a truncated catalog. Re-run when upstream is
+  healthy.
+- **Permanent loss** (HTTP 404/410/401/403): reported as
+  `GONE (HTTP nnn)`, the row is dropped, and the catalog **is**
+  written -- a repo that no longer exists is not a transient failure.
+  Delete that repo from `scripts/model-families.yaml` so the next run
+  stops asking for it.
+- `--allow-partial` writes anyway, for the case where an operator has
+  inspected the transient losses and accepts the smaller catalog. It
+  is an opt-in, not a restored default.
 
 ### Curating parser hints
 
@@ -192,7 +319,8 @@ entry, and the router launches without the flag.
 | `PROBE_VRAMS=16G,24G` | Ollama target bands |
 | `PROBE_VRAMS_VLLM=24G` | vLLM target bands |
 | `PROBE_VRAMS_SGLANG=24G` | SGLang target bands |
-| `PROBE_CONTEXTS=32K,64K,128K,256K` | Context tiers (all backends) |
+| `PROBE_CONTEXTS=32K,64K,128K,256K` | Context tiers. For vLLM/SGLang this **caps the binary-search ceiling** (`max()` of the listed tiers) in BOTH the fit pass and the `--load` pass; the 32K-multiple grid below that ceiling is still searched, and any listed non-grid tier is unioned in. `PROBE_CONTEXTS=32K` therefore probes exactly one tier. For Ollama it is the literal list of tiers probed. **On the load pass the cap is not just a filter -- it can MOVE the winning cell down**: the load probe keeps exactly one cell at the largest ctx that actually serves within the cap, so re-running with a narrower `--ctx` shrinks that model's advertised `max_context`. Re-run at the full ceiling to restore it. |
+| `PROBE_READY_TIMEOUT=180` | Seconds `make probe` waits for the recreated `devai-ollama` to answer `ollama list` before giving up. The whole `probe` recipe is one `set -e` shell, so this `exit 1` aborts the **entire probe run**, not just the current VRAM band -- the remaining bands are not attempted. The EXIT trap still restores `OLLAMA_GPU_OVERHEAD`. |
 | `PROBE_REPO=Llama-3.1-8B` | Regex filter on catalog rows (HF probers only) |
 | `PROBE_FORCE=1` | Re-probe every cell even if cached |
 | `PROBE_FORCE_ARCH=1` | Re-probe top-level capability/arch fields |
@@ -228,7 +356,11 @@ tiers **ascending** (32K -> 64K -> 128K -> 256K) and, for every tier the
 fit probe already marked `fits=true`, it:
 
 1. relaunches the backend at that `--max-model-len` with the SAME
-   verified parsers + recovery flags the router serves with,
+   verified parsers + recovery flags the router serves with, and under
+   the KV dtype **that cell was fit-probed with** (its stamped
+   `kv_cache_type`) rather than the pass-global `PROBE_KV_CACHE_TYPE` --
+   an unstamped legacy cell decodes to fp8 on vLLM and to the engine
+   default on SGLang, matching `synthesizeHFFromCache` in the router,
 2. records a baseline VRAM reading once `/health` passes (idle),
 3. builds a haystack prompt that fills the KV pool to ~99% of the window
    (target `ctx - 512` tokens, so the pool is exercised near its true
@@ -275,20 +407,35 @@ pass yet.
 
 ### Per-tier KV-cache dtype (all backends, additive field)
 
-Ollama probe cells carry a `kv_cache_type` field: the KV dtype the
-daemon served the cell under, stamped by the prober from the
-`OLLAMA_KV_CACHE_TYPE` env of the probe pass (absent/empty = `f16`,
-which is also what pre-field legacy cells mean). A cell probed under
-`q8_0` only fits WITH quantized KV, so fit is dtype-scoped:
+Ollama probe cells carry TWO stamps describing the environment they
+were measured in:
+
+- `kv_cache_type` -- the KV dtype the daemon served the cell under,
+  from the `OLLAMA_KV_CACHE_TYPE` env of the probe pass (absent/empty
+  = `f16`, which is also what pre-field legacy cells mean).
+- `flash_attention` -- the `OLLAMA_FLASH_ATTENTION` setting of the same
+  pass. Absent on pre-stamp cells.
+
+Both are resolved at serve time from the **same** covering tier, so a
+launch always reproduces one probe cell rather than mixing two. A cell
+probed under `q8_0` only fits WITH quantized KV, so fit is
+dtype-scoped:
 
 - **prober**: `make probe PROBE_KV_CACHE_TYPE=q8_0 PROBE_FLASH_ATTENTION=1
   PROBE_FORCE_CTX=128K PROBE_MODELS=<tag>` re-probes one tier under
   quantized KV and stamps it; unforced tiers keep their f16 cells.
-- **router** (`resolveKVCacheType`): at launch, the smallest probed tier
-  covering the serving ctx supplies the dtype; the ollama `DynamicEnv`
-  bakes `OLLAMA_KV_CACHE_TYPE` (+ `OLLAMA_FLASH_ATTENTION=1`, a hard
-  prerequisite) into the recreated container. f16/unstamped tiers emit
-  nothing -- the container spec is byte-identical to pre-field builds.
+- **router** (`resolveKVCacheType` / `resolveFlashAttention`): at
+  launch, the smallest probed tier covering the serving ctx supplies
+  BOTH stamps -- same rule, same tier -- and the ollama `DynamicEnv`
+  bakes them into the recreated container. Flash attention comes from
+  the cell's own `flash_attention` stamp when present; only pre-stamp
+  cells fall back to deriving it from the dtype. That fallback is
+  one-directional: quantized KV requires flash attention, but a cell
+  can equally have been probed with flash attention ON under the
+  default `f16`, and deriving from the dtype alone would then serve it
+  without flash -- a different environment from the one its fit was
+  measured in. f16/unstamped tiers emit nothing -- the container spec
+  is byte-identical to pre-field builds.
 - **picker** (`_kv_cells` / `_kv_mixed`): a model whose fitting tiers
   span both dtypes gets a context-tier sub-modal (tier choice = quality
   choice) and pins `@<ctx>` on the emitted name so the router serves
@@ -511,8 +658,8 @@ probe driver refuses to run if `devai-router`, `devai-vllm`, or
 
 When the picker selects a model + context tier (+ reasoning override), each backend handles the binding differently:
 
-- **Ollama**: the picker emits the parent name (e.g., `qwen3.5:9b-q8_0`), or with a reasoning override suffix (e.g., `qwen3.5:9b-q8_0::nothink` to suppress thinking even if the model supports it). KV cache is allocated dynamically per request from the `OLLAMA_CONTEXT_LENGTH` global ceiling (default 256K). The `/api/chat` and `/api/generate` endpoints honour `options.num_ctx` injected by the router; the OpenAI- and Anthropic-compat layers ignore it and use the global ceiling.
-- **vLLM / SGLang**: the picker emits `<name>@<ctx>` (e.g., `Llama-3.1-8B-Instruct-NVFP4@32768`), or with a reasoning override prefix (e.g., `Llama-3.1-8B-Instruct-NVFP4::low@32768` to set reasoning effort to `low`). The router's `parseCtxOverride` strips `@<ctx>` first, then `parseReasoningOverride` strips `::<reasoning>`, rewrites the body's `model` field to the clean name, applies the reasoning policy, and triggers a recreate when `currentContext` or `currentReasoningOverride` differs. No client-side tag materialization needed.
+- **Ollama**: the picker emits the parent name (e.g., `qwen3.5:9b-q8_0`), or with a reasoning override suffix (e.g., `qwen3.5:9b-q8_0::nothink` to suppress thinking even if the model supports it). KV cache is allocated dynamically per request from the `OLLAMA_CONTEXT_LENGTH` global ceiling (default 256K). The `/api/chat` and `/api/generate` endpoints honour `options.num_ctx` injected by the router; the OpenAI- and Anthropic-compat layers ignore it and use the global ceiling. A bare `<name>` is served from whatever tier is currently loaded -- only an explicit `<name>@<ctx>` pin (which the picker emits for mixed-KV models) can force a tier switch and the container recreate that goes with it.
+- **vLLM / SGLang**: the picker emits `<name>@<ctx>` (e.g., `Llama-3.1-8B-Instruct-NVFP4@32768`), or with a reasoning override suffix (e.g., `Llama-3.1-8B-Instruct-NVFP4::low@32768` to set reasoning effort to `low`). The router's `peelControlSuffixes` strips `@<ctx>`, `::<mtp>` and `::<reasoning>` in whatever order they trail, rewrites the body's `model` field to the clean name, applies the reasoning policy, and triggers a recreate when `currentContext` (or the MTP spec) differs. A reasoning change alone never recreates the container. No client-side tag materialization needed.
 
 Valid reasoning suffixes: `::off`, `::auto`, `::low`, `::medium`, `::high`, `::nothink` (Ollama only; suppresses thinking).
 

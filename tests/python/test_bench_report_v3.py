@@ -48,12 +48,20 @@ def _row(
     gsm: float | None = None,
     he: float | None = None,
     tools: float | None = None,
+    hep: float | None = None,
 ) -> dict:
     tasks: dict = {}
     if gsm is not None:
         tasks["gsm8k_subset_100"] = {
             "score": gsm,
             "ran_at": "2026-05-05T10:00:00+00:00",
+        }
+    if hep is not None:
+        # Deliberately inserted BEFORE plain HumanEval: a bare
+        # "humaneval_" prefix match would return this one first.
+        tasks["humaneval_plus_subset_50"] = {
+            "pass@1": hep,
+            "ran_at": "2026-05-06T10:00:00+00:00",
         }
     if he is not None:
         tasks["humaneval_subset_50"] = {
@@ -148,6 +156,57 @@ class TestRenderV3(unittest.TestCase):
         # Header row + 1 data row + (no env header, _meta has no
         # host_env_history).
         self.assertEqual(out.count("| gpt-oss-20b |"), 1)
+
+    def test_humaneval_and_plus_are_separate_columns(self) -> None:
+        # Regression: a bare "humaneval_" prefix matched BOTH tasks and
+        # published the HumanEval+ score in the HumanEval column.
+        cache = {
+            "nvidia/Nemotron@x::vllm::163840": _row(
+                "Nemotron", "vllm", 163840, he=1.0, hep=0.84
+            ),
+        }
+        out = bench_report.render(cache, host_vram_gb=24.0)
+        self.assertIn("| HumanEval | HumanEval+ |", out)
+        data = [ln for ln in out.splitlines() if ln.startswith("| Nemotron |")]
+        self.assertEqual(len(data), 1)
+        cells = [c.strip() for c in data[0].split("|")]
+        # ... | Agg | GSM8K | HumanEval | HumanEval+ | ...
+        self.assertIn("1.000", cells)
+        self.assertIn("0.840", cells)
+        self.assertLess(cells.index("1.000"), cells.index("0.840"))
+
+    def test_aggregate_uses_plain_humaneval_only(self) -> None:
+        cache = {
+            "nvidia/Nemotron@x::vllm::163840": _row(
+                "Nemotron", "vllm", 163840,
+                gsm=1.0, he=1.0, hep=0.0, tools=1.0,
+            ),
+        }
+        row = cache["nvidia/Nemotron@x::vllm::163840"]
+        # gsm 1.0 + humaneval 1.0 + tools 1.0 -> 1.0; the 0.0 HumanEval+
+        # must not drag the composite down.
+        self.assertEqual(bench_report._aggregate(row), 1.0)
+
+    def test_env_column_lists_mixed_task_provenance(self) -> None:
+        row = _row("Nemotron", "vllm", 163840, he=1.0)
+        row["tasks"]["humaneval_subset_50"]["host_env_id"] = "abc12345"
+        row["tasks"]["gpqa_subset_100"] = {
+            "score": 0.7,
+            "host_env_id": "zz9999999",
+        }
+        out = bench_report.render(
+            {"nvidia/Nemotron@x::vllm::163840": row}, host_vram_gb=24.0
+        )
+        self.assertIn("abc12345, zz9999999", out)
+
+    def test_env_column_single_id_when_uniform(self) -> None:
+        row = _row("Nemotron", "vllm", 163840, he=1.0)
+        row["tasks"]["humaneval_subset_50"]["host_env_id"] = "abc12345"
+        out = bench_report.render(
+            {"nvidia/Nemotron@x::vllm::163840": row}, host_vram_gb=24.0
+        )
+        self.assertIn("| abc12345 |", out)
+        self.assertNotIn("abc12345,", out)
 
     def test_v3_footer_note_present(self) -> None:
         cache = {

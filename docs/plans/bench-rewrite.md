@@ -374,7 +374,7 @@ Six small commits, each green at HEAD. **All six phases (including
 Phase 6 backfill) are required for the plan to be Done.** Phase 6
 was originally drafted as optional; promoted to required on
 2026-05-14 because the load-bearing motivation in the Context
-section -- "the picker today would show 104 tok/s ... off by 17
+Section -- "the picker today would show 104 tok/s ... off by 17
 tok/s" -- is only resolved once each historical model has bench
 rows at the ctx tiers the picker actually offers, not just at
 one tier each. Without backfill, the picker continues to render
@@ -445,7 +445,7 @@ DEVAI_MTP_PREVIEW=0 devai-agent --model Qwen3.5-9B-NVFP4@32768 --show
 | Migration mismatches ctx for a row | Diff migrated row's `context` against the recovered router-log value | `RECOVERED_CTX_MAP` is hardcoded, reviewable, only 9 entries | Revert migration commit; re-run after fix |
 | Pre-migration v2 row not in `RECOVERED_CTX_MAP` (e.g. someone benched a 10th model that escaped my survey) | Migration warns + sets ctx=0 | Operator can re-bench at convenience; ctx=0 reader treats as "no data at this ctx" so no false bench numbers leak | Re-bench that one model |
 | Picker keyed by exact `(model, backend, ctx)` misses rows benched at slightly different ctx | Visual inspection during Phase 3 verification | Document that picker matches exact ctx; users opt-in to extra ctx coverage via `make bench --ctx <N>` | Revert picker commit |
-| Bench-cache file size grows due to task-data duplication across ctx rows | `du -h deploy/.bench-cache.json` | Task data is small (~700 bytes per row); 9 models × 4 ctx tiers = 36 rows ~= 25 KiB total | None needed -- minor cost vs the clarity gain |
+| Bench-cache file size grows due to task-data duplication across ctx rows | `du -h deploy/.bench-cache.json` | Task data is small (~700 bytes per row); 9 models x 4 ctx tiers = 36 rows ~= 25 KiB total | None needed -- minor cost vs the clarity gain |
 | `--all-ctx` explodes probe wall time | `time make bench --all-ctx` | Default stays as pick-largest; explicit opt-in required; documented | None -- behaviour is opt-in |
 | New `--ctx` flag fights with `--repo` or other existing filters | Argparser unit test, manual run | Specify intersection semantics: `--ctx` AND `--repo` AND `--vram` all apply | None -- it's a small param surface |
 | Picker preview pane gets cluttered with "not available" lines for unbenched models | Visual review | Only render the line when the model has at least one bench row at any ctx; suppress for fully-unbenched models | Revert picker commit |

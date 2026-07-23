@@ -10,7 +10,7 @@
 #   1. Two workers register; both visible.
 #   2. Heartbeat cadence + monotonic counter.
 #   3. drain command flow.
-#   4. serve command flow + token gating (401).
+#   4. serve command flow + token gating (401) + real inbound dispatch.
 #   5. shutdown lifecycle policy (ephemeral honours, persistent refuses).
 #   6. Failure recovery: kill stub head; worker retries.
 #   7. Token rotation: new token effective on next heartbeat.
@@ -216,8 +216,8 @@ PIDS=()
 
 # -------- Stage 3-5: command dispatch --------
 # Single stub-head session, three commands queued. Each stage
-# observes the worker's behaviour via its log file (the noop
-# executor logs to stderr per cluster_main.go).
+# observes the worker's behaviour via its log file (the arbiter
+# command executor logs to stderr per cluster_main.go).
 
 banner 3-5 "drain + serve + shutdown commands flow through dispatch"
 echo '[{"type":"drain","backend":"vllm"},{"type":"serve","request_id":"r1","target_model":"Qwen3-8B-NVFP4","target_ctx":131072},{"type":"shutdown","grace_seconds":2}]' > "$WORKDIR/cmds.json"
@@ -241,6 +241,19 @@ done
 grep -q "drain backend=vllm" "$LOG" || { echo "----- log dump -----"; cat "$LOG"; echo "----- head.stderr -----"; cat "$WORKDIR/head.stderr"; fail "no drain in worker log"; }
 grep -q "serve req=r1 model=Qwen3-8B-NVFP4 ctx=131072" "$LOG" || fail "no serve in worker log"
 grep -q "shutdown grace=2s acknowledged" "$LOG" || fail "no shutdown in worker log"
+# The executor must reach the scheduler's drain, not just log an ack:
+# the Phase 1 no-op hard-exited on `shutdown` with no drain at all, so
+# live requests died mid-stream. This line is emitted only after
+# arbiter.drainBackend has returned for every backend.
+#
+# The standalone `drain backend=vllm` in the same batch is NOT asserted
+# to completion here: its goroutine races the shutdown goroutine queued
+# behind it, and shutdown's own drain("") covers vllm anyway, so the
+# process can legitimately exit before the per-backend line prints. That
+# path is covered deterministically by the Go unit test
+# TestArbiterCommandExecutor_DrainDrainsNamedBackend.
+grep -q "drain complete; exiting" "$LOG" || \
+    { echo "----- log dump -----"; cat "$LOG"; fail "shutdown exited without draining first (executor is still a no-op)"; }
 ok "drain + serve + shutdown all dispatched"
 
 # Verify ephemeral worker actually exited (shutdown grace=2; wait a bit longer).
@@ -272,7 +285,7 @@ kill -TERM "$PID_P" 2>/dev/null || true
 
 # -------- Stage 4 token gating (separate curl; no full worker setup) --------
 
-banner 4 "inbound endpoint rejects requests without bearer token"
+banner 4 "inbound endpoint gates on the bearer token, then dispatches for real"
 sleep 1
 WORKER_F_PORT=$(free_port)
 start_worker worker-tok persistent "$WORKER_F_PORT"; PID_T="$LAST_WORKER_PID"
@@ -280,11 +293,43 @@ code=$(curl -sS -o /dev/null -w '%{http_code}' "http://localhost:$WORKER_F_PORT/
     -X POST -H 'Content-Type: application/json' -d '{"x":1}')
 [[ "$code" == "401" ]] || fail "inbound without token returned $code, want 401"
 ok "inbound rejected unauth (401)"
-code2=$(curl -sS -o /dev/null -w '%{http_code}' "http://localhost:$WORKER_F_PORT/v1/cluster/inbound" \
-    -X POST -H 'Content-Type: application/json' -H 'Authorization: Bearer the-token' -d '{"x":1}')
-# Phase 1's noop executor returns 503 on inbound (Phase 2 will wire real serving).
-[[ "$code2" == "503" ]] || fail "inbound with token returned $code2, want 503 (Phase 1 placeholder)"
-ok "inbound accepted token; Phase 1 placeholder 503 returned"
+
+# An authenticated request is dispatched through the worker's OWN
+# single-host request handler (cluster-mode decision 2) -- it is no
+# longer the Phase 1 placeholder that answered every request with 503.
+# This worker has no probe cache, so its vLLM model allowlist is empty
+# and the real handler answers 404 "unknown model": proof the request
+# travelled the whole chain instead of short-circuiting.
+code2=$(curl -sS -o "$WORKDIR/inbound.json" -w '%{http_code}' \
+    "http://localhost:$WORKER_F_PORT/v1/cluster/inbound" \
+    -X POST -H 'Content-Type: application/json' \
+    -H 'Authorization: Bearer the-token' \
+    -H 'X-Devai-Backend: vllm' \
+    -d '{"model":"no-such-model"}')
+if [[ "$code2" == "503" ]] && grep -q 'not_implemented' "$WORKDIR/inbound.json"; then
+    fail "inbound is still the Phase 1 placeholder (503 not_implemented)"
+fi
+[[ "$code2" == "404" ]] || {
+    echo "----- inbound body -----"; cat "$WORKDIR/inbound.json"
+    fail "inbound with token returned $code2, want 404 from the real request handler"
+}
+grep -q 'unknown model' "$WORKDIR/inbound.json" || {
+    echo "----- inbound body -----"; cat "$WORKDIR/inbound.json"
+    fail "inbound 404 did not come from the single-host allowlist check"
+}
+ok "inbound accepted token and dispatched into the real request handler"
+
+# Without X-Devai-Backend the worker falls back to a model-name lookup;
+# a body with no usable model is a 400, not a silent 503.
+code3=$(curl -sS -o "$WORKDIR/inbound-nobackend.json" -w '%{http_code}' \
+    "http://localhost:$WORKER_F_PORT/v1/cluster/inbound" \
+    -X POST -H 'Content-Type: application/json' \
+    -H 'Authorization: Bearer the-token' -d '{"x":1}')
+[[ "$code3" == "400" ]] || {
+    echo "----- inbound body -----"; cat "$WORKDIR/inbound-nobackend.json"
+    fail "inbound without a resolvable backend returned $code3, want 400"
+}
+ok "inbound without a resolvable backend returns a clear 400"
 
 echo
 echo "===== ALL PREFLIGHT STAGES PASSED ====="

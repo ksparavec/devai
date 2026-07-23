@@ -124,16 +124,20 @@ exact polling loop.
 
 ### What triggers a full cold start
 
-The router tracks `currentModel`, `currentContext`, and
-`currentReasoningOverride` per backend. **Any** of these changing
-recreates the container and walks phases 1-11 again:
+The router tracks `currentModel`, `currentContext` and `currentSpec`
+(the speculative-decoding / MTP config) per backend. **Any** of these
+changing recreates the container and walks phases 1-11 again:
 
 - Switching model (e.g. `Qwen3-8B-NVFP4` -> `Qwen3-14B-NVFP4`).
 - Changing context cap via the `@<ctx>` suffix
   (e.g. `...-NVFP4@32768` -> `...-NVFP4@131072`) -- this re-runs container
   creation with a different `--max-model-len` / `--context-length`.
-- Changing reasoning override (`::nothink`, `::high`, etc.) -- this
-  changes the entrypoint flags (`--reasoning-parser ...` injection).
+- Toggling MTP (`::mtp` / `::nomtp`) -- different speculative-decoding
+  launch flags.
+
+Changing the reasoning override (`::nothink`, `::high`, ...) does
+**not** recreate anything: reasoning is a per-request body rewrite, not
+a launch flag, so it costs nothing.
 
 A request that matches the currently loaded model on all three axes
 skips phases 1-10 entirely and goes straight to inference.

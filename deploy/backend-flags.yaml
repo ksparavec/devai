@@ -32,6 +32,11 @@ vllm:
   tensor_parallel_size: "--tensor-parallel-size"
   max_model_len:        "--max-model-len"
   gpu_memory_util:      "--gpu-memory-utilization"
+  # Per-model KV-cache dtype. Emitted by BOTH entrypoints (gpu-arbiter
+  # vllmEntrypoint / sglangEntrypoint and the two probers), and the fit
+  # cells are only valid under the dtype they were measured with -- an
+  # unnoticed rename here silently invalidates every cached fit verdict.
+  kv_cache_dtype:       "--kv-cache-dtype"
   enable_prefix_cache:  "--enable-prefix-caching"
   trust_remote_code:    "--trust-remote-code"
   enable_auto_tool:     "--enable-auto-tool-choice"
@@ -49,6 +54,11 @@ sglang:
   tp:                   "--tp"
   context_length:       "--context-length"
   mem_fraction_static:  "--mem-fraction-static"
+  # Same flag spelling as vLLM on the pinned image, but emitted only when
+  # a probe pass enforced a dtype (SGLang's default is the unquantized
+  # engine default, i.e. no flag). Pinned so an image bump that renames it
+  # fails the gate instead of silently dropping quantized-KV support.
+  kv_cache_dtype:       "--kv-cache-dtype"
   trust_remote_code:    "--trust-remote-code"
   tool_call_parser:     "--tool-call-parser"
   reasoning_parser:     "--reasoning-parser"

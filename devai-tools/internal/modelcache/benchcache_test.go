@@ -12,6 +12,7 @@ const sampleBenchCache = `{
     "tasks": {
       "gsm8k_subset_100": {"score": 0.9, "ran_at": "2026-06-01T00:00:00Z"},
       "humaneval_subset_50": {"pass@1": 0.8, "ran_at": "2026-06-01T00:00:00Z"},
+      "humaneval_plus_subset_50": {"pass@1": 0.7, "ran_at": "2026-06-02T00:00:00Z"},
       "tools_use_20": {"score": 1.0, "ran_at": "2026-06-01T00:00:00Z"},
       "leak_probe": {"leak_rate": 0.05, "n_prompts": 40}
     }
@@ -45,7 +46,7 @@ func TestBenchKeyMatchesConvention(t *testing.T) {
 	}
 }
 
-func TestComputeScoresMatchesPickerFormula(t *testing.T) {
+func TestComputeScores(t *testing.T) {
 	path := writeJSONFixture(t, "bench.json", sampleBenchCache)
 	cache, err := LoadBenchCache(path)
 	if err != nil {
@@ -57,26 +58,64 @@ func TestComputeScoresMatchesPickerFormula(t *testing.T) {
 	if scores.TPS == nil || *scores.TPS != 98.3 {
 		t.Errorf("TPS = %v, want 98.3", derefOrNil(scores.TPS))
 	}
+	// The fixture's HumanEval+ row carries a LATER ran_at than plain
+	// HumanEval, so a bare "humaneval_" prefix would let the max-ran_at
+	// tiebreak return 0.7 here -- HumanEval+ reported as HumanEval.
 	if scores.Code == nil || *scores.Code != 0.8 {
-		t.Errorf("Code = %v, want 0.8", derefOrNil(scores.Code))
+		t.Errorf("Code = %v, want 0.8 (humaneval_subset_50)", derefOrNil(scores.Code))
 	}
-	// reas = 2/3*tools + 1/3*gsm8k = 2/3*1.0 + 1/3*0.9 = 0.9666...
-	// Computed through float64 variables, not constant literals -- Go
-	// constant-folds an all-literal expression at arbitrary precision and
-	// rounds once, which differs in the last bit from the runtime
-	// (round-per-operation) arithmetic ComputeScores actually performs.
-	gsmVal, codeVal, toolsVal := 0.9, 0.8, 1.0
-	wantReas := (2.0/3.0)*toolsVal + (1.0/3.0)*gsmVal
-	if scores.Reas == nil || *scores.Reas != wantReas {
-		t.Errorf("Reas = %v, want %v", derefOrNil(scores.Reas), wantReas)
-	}
-	// total = mean(gsm8k, code, tools) = mean(0.9, 0.8, 1.0)
-	wantTotal := (gsmVal + codeVal + toolsVal) / 3.0
-	if scores.Total == nil || *scores.Total != wantTotal {
-		t.Errorf("Total = %v, want %v", derefOrNil(scores.Total), wantTotal)
+	if scores.CodePlus == nil || *scores.CodePlus != 0.7 {
+		t.Errorf("CodePlus = %v, want 0.7 (humaneval_plus_subset_50)", derefOrNil(scores.CodePlus))
 	}
 	if scores.Leak == nil || *scores.Leak != 0.05 {
 		t.Errorf("Leak = %v, want 0.05", derefOrNil(scores.Leak))
+	}
+}
+
+// A row benched before humaneval_plus existed must still report plain
+// HumanEval, with CodePlus simply absent -- the two prefixes are
+// independent lookups, not a fallback chain.
+func TestComputeScoresHumanEvalWithoutPlus(t *testing.T) {
+	const onlyPlain = `{
+  "base::vllm::32768": {
+    "context": 32768,
+    "metrics": {},
+    "tasks": {"humaneval_subset_50": {"pass@1": 0.62, "ran_at": "2026-05-01T00:00:00Z"}}
+  }
+}`
+	cache, err := LoadBenchCache(writeJSONFixture(t, "bench.json", onlyPlain))
+	if err != nil {
+		t.Fatal(err)
+	}
+	scores := ComputeScores(cache["base::vllm::32768"])
+	if scores.Code == nil || *scores.Code != 0.62 {
+		t.Errorf("Code = %v, want 0.62", derefOrNil(scores.Code))
+	}
+	if scores.CodePlus != nil {
+		t.Errorf("CodePlus = %v, want nil", derefOrNil(scores.CodePlus))
+	}
+}
+
+// The mirror case: a row with ONLY humaneval_plus must not have that
+// score leak into the plain HumanEval field.
+func TestComputeScoresPlusDoesNotFillPlainHumanEval(t *testing.T) {
+	const onlyPlus = `{
+  "base::vllm::32768": {
+    "context": 32768,
+    "metrics": {},
+    "tasks": {"humaneval_plus_subset_50": {"pass@1": 0.55, "ran_at": "2026-05-01T00:00:00Z"}}
+  }
+}`
+	cache, err := LoadBenchCache(writeJSONFixture(t, "bench.json", onlyPlus))
+	if err != nil {
+		t.Fatal(err)
+	}
+	scores := ComputeScores(cache["base::vllm::32768"])
+	if scores.Code != nil {
+		t.Errorf("Code = %v, want nil (only humaneval_plus recorded)", derefOrNil(scores.Code))
+	}
+	if scores.CodePlus == nil || *scores.CodePlus != 0.55 {
+		t.Errorf("CodePlus = %v, want 0.55", derefOrNil(scores.CodePlus))
 	}
 }
 
@@ -91,7 +130,7 @@ func TestComputeScoresEmptyTasksYieldsNils(t *testing.T) {
 	if scores.TPS == nil || *scores.TPS != 110.0 {
 		t.Errorf("TPS = %v, want 110.0", derefOrNil(scores.TPS))
 	}
-	if scores.Code != nil || scores.Reas != nil || scores.Total != nil || scores.Leak != nil {
+	if scores.Code != nil || scores.CodePlus != nil || scores.Leak != nil {
 		t.Errorf("expected all quality scores nil for a row with no tasks, got %+v", scores)
 	}
 }

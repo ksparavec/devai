@@ -13,6 +13,9 @@ Classification (pure, unit-tested):
   evaluated  -- already has a probe-cache entry (serving or rejected).
   new        -- neither: needs onboarding.
 
+Ledger hygiene: on a non-dry run the ledger is first pruned of models the
+catalog no longer carries (guarded -- see `prune_ledger`).
+
 Execution (composition of existing targets; needs a GPU + podman):
   make model-pull DOWNLOAD_LIMIT=<budget>   # pulls new best-fit, records
                                             # too_big/too_small to the ledger
@@ -128,6 +131,51 @@ def _print_plan(plan: dict, host_vram: float, max_downloads: int,
               f"max_downloads={max_downloads} budget this run")
 
 
+# A prune that drops more of the ledger than this looks like a truncated
+# catalog rather than a real removal -- refuse and let the operator decide.
+_PRUNE_MAX_FRACTION = 0.5
+
+
+def prune_ledger(catalog_rows: list[dict], ledger: dict, *,
+                 path: Path = MS.LEDGER_PATH) -> int:
+    """Drop ledger rows for models the catalog no longer carries.
+
+    model-sync is the right owner: it is the only tool that loads the FULL
+    catalog fresh from disk purely to reconcile it against host state (and
+    with REGEN=1 the catalog was just regenerated, or the target aborted).
+    Callers must pass the UNFILTERED catalog -- pruning against a
+    `--family`-scoped subset would drop every other family's verdicts.
+
+    A stale ledger row is harmless; a wrongly-pruned one silently
+    re-downloads and re-probes a model this host already rejected. So two
+    guards, either of which makes this a no-op:
+      - the catalog must have parsed at least one named row (a missing or
+        unreadable models.yaml loads as [] and would prune everything);
+      - never drop more than half the ledger in one run -- a truncated
+        catalog is indistinguishable from a mass removal.
+    Returns the number of rows dropped (0 when a guard fires).
+    """
+    catalog_names = {r.get("name") for r in catalog_rows if r.get("name")}
+    if not catalog_names:
+        print("  [warn] catalog has no named rows -- skipping ledger prune",
+              file=sys.stderr)
+        return 0
+    models = ledger.get("models") or {}
+    stale = sorted(n for n in models if n not in catalog_names)
+    if not stale:
+        return 0
+    if len(stale) > len(models) * _PRUNE_MAX_FRACTION:
+        print(f"  [warn] ledger prune would drop {len(stale)}/{len(models)} "
+              f"row(s) -- refusing (a truncated catalog looks exactly like "
+              f"this). Clear by hand: make model-status CLEAR=<name>",
+              file=sys.stderr)
+        return 0
+    n = MS.prune_to_catalog(ledger, catalog_names)
+    MS.save_ledger(ledger, path)
+    print(f"  pruned {n} stale ledger row(s): {', '.join(stale)}")
+    return n
+
+
 def _run(cmd: list[str]) -> int:
     print(f"\n$ {' '.join(cmd)}", flush=True)
     return subprocess.call(cmd, cwd=str(REPO_ROOT))
@@ -156,14 +204,34 @@ def execute(plan: dict, *, max_downloads: int) -> int:
     if pulled == 0:
         print("\nno rows downloaded; skipping probe phase.")
         return 1
-    for cmd in (["make", "cache-down"], ["make", "probe-vllm"],
-                ["make", "probe-sglang"], ["make", "cache-up"],
-                ["make", "probe"]):
-        rc = _run(cmd)
-        if rc != 0:
-            print(f"\nstep failed (rc={rc}): {' '.join(cmd)}", file=sys.stderr)
-            return rc
-    return 0
+    # The HF probers need GPU exclusivity, so the serving backends go DOWN
+    # first. Whatever happens in between -- a non-zero probe rc, a raised
+    # exception, Ctrl-C -- `make cache-up` MUST run in the finally, or a
+    # failed probe leaves the ENTIRE inference stack offline. The original
+    # failure (return code or exception) is preserved: the finally neither
+    # returns nor raises on the success path.
+    rc = 0
+    try:
+        for cmd in (["make", "cache-down"], ["make", "probe-vllm"],
+                    ["make", "probe-sglang"]):
+            rc = _run(cmd)
+            if rc != 0:
+                print(f"\nstep failed (rc={rc}): {' '.join(cmd)}",
+                      file=sys.stderr)
+                break
+    finally:
+        up_rc = _run(["make", "cache-up"])
+        if up_rc != 0:
+            print(f"\nstep failed (rc={up_rc}): make cache-up",
+                  file=sys.stderr)
+    if rc != 0:
+        return rc
+    if up_rc != 0:
+        return up_rc
+    rc = _run(["make", "probe"])
+    if rc != 0:
+        print(f"\nstep failed (rc={rc}): make probe", file=sys.stderr)
+    return rc
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -184,10 +252,14 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     catalog = load_catalog()
+    ledger = MS.load_ledger()
+    if not args.dry_run:
+        # Against the UNFILTERED catalog, before the --family scoping below.
+        prune_ledger(catalog, ledger)
     if args.family:
         catalog = [r for r in catalog if (r.get("family") or "") == args.family]
     plan = plan_sync(catalog, _read_json(OLLAMA_CACHE), _read_json(VLLM_CACHE),
-                     _read_json(SGLANG_CACHE), MS.load_ledger(),
+                     _read_json(SGLANG_CACHE), ledger,
                      host_vram=args.vram)
     _print_plan(plan, args.vram, args.max_downloads, args.family)
     if args.dry_run:

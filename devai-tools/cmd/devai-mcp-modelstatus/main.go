@@ -21,10 +21,11 @@ import (
 )
 
 type server struct {
-	catalog     []modelcache.CatalogEntry
-	probeCaches map[string]modelcache.ProbeCache // keyed by backend: ollama, vllm, sglang
-	benchCache  modelcache.BenchCache
-	httpClient  *http.Client
+	catalog      []modelcache.CatalogEntry
+	probeCaches  map[string]modelcache.ProbeCache // keyed by backend: ollama, vllm, sglang
+	weightStores modelcache.WeightStores          // keyed by backend: vllm, sglang
+	benchCache   modelcache.BenchCache
+	httpClient   *http.Client
 }
 
 // ── list_fitting_models ──────────────────────────────────────────────────
@@ -35,16 +36,23 @@ type listFittingModelsInput struct {
 	Backend string `json:"backend,omitempty" jsonschema:"optional: restrict to one backend (ollama, vllm, or sglang); omit for all three"`
 }
 
+// Notes carries the weights-on-disk caveats: vLLM/SGLang rows are normally
+// filtered down to models whose weights are actually in the backend's
+// store, but this server usually runs in a container that mounts no weight
+// volumes. When the gate could not be applied the rows are probe-cache-only
+// and the agent has to be told, rather than being handed a list of models
+// that may not be servable as if it were verified.
 type listFittingModelsOutput struct {
 	Models []modelcache.FitResult `json:"models"`
+	Notes  []string               `json:"notes,omitempty"`
 }
 
 func (s *server) listFittingModels(_ context.Context, _ *mcp.CallToolRequest, in listFittingModelsInput) (*mcp.CallToolResult, listFittingModelsOutput, error) {
-	models := modelcache.ListFitting(s.catalog, s.probeCaches, in.VRAMGB, in.Context, in.Backend)
+	models, notes := modelcache.ListFitting(s.catalog, s.probeCaches, in.VRAMGB, in.Context, in.Backend, s.weightStores)
 	if models == nil {
 		models = []modelcache.FitResult{}
 	}
-	return nil, listFittingModelsOutput{Models: models}, nil
+	return nil, listFittingModelsOutput{Models: models, Notes: notes}, nil
 }
 
 // ── get_model_bench ──────────────────────────────────────────────────────
@@ -55,13 +63,18 @@ type getModelBenchInput struct {
 	Context int    `json:"context" jsonschema:"context length in tokens the model would be served at"`
 }
 
+// getModelBenchOutput reports HumanEval and HumanEval+ as separate
+// fields -- they are separate bench tasks (humaneval_subset_* vs
+// humaneval_plus_subset_*) with systematically different scores. The
+// former reas_pct/total_pct composites are gone: model-picker.py retired
+// them as saturated, so reporting them here would surface a number no
+// picker column shows.
 type getModelBenchOutput struct {
-	TPS      *float64 `json:"tps,omitempty"`
-	CodePct  *float64 `json:"code_pct,omitempty"`
-	ReasPct  *float64 `json:"reas_pct,omitempty"`
-	TotalPct *float64 `json:"total_pct,omitempty"`
-	LeakPct  *float64 `json:"leak_pct,omitempty"`
-	Message  string   `json:"message,omitempty"`
+	TPS         *float64 `json:"tps,omitempty"`
+	CodePct     *float64 `json:"code_pct,omitempty"`
+	CodePlusPct *float64 `json:"code_plus_pct,omitempty"`
+	LeakPct     *float64 `json:"leak_pct,omitempty"`
+	Message     string   `json:"message,omitempty"`
 }
 
 func (s *server) getModelBench(_ context.Context, _ *mcp.CallToolRequest, in getModelBenchInput) (*mcp.CallToolResult, getModelBenchOutput, error) {
@@ -87,11 +100,10 @@ func (s *server) getModelBench(_ context.Context, _ *mcp.CallToolRequest, in get
 
 	scores := modelcache.ComputeScores(row)
 	return nil, getModelBenchOutput{
-		TPS:      scores.TPS,
-		CodePct:  asPercent(scores.Code),
-		ReasPct:  asPercent(scores.Reas),
-		TotalPct: asPercent(scores.Total),
-		LeakPct:  asPercent(scores.Leak),
+		TPS:         scores.TPS,
+		CodePct:     asPercent(scores.Code),
+		CodePlusPct: asPercent(scores.CodePlus),
+		LeakPct:     asPercent(scores.Leak),
 	}, nil
 }
 
@@ -152,22 +164,23 @@ func main() {
 	}
 
 	srv := &server{
-		catalog:     catalog,
-		probeCaches: probeCaches,
-		benchCache:  benchCache,
-		httpClient:  &http.Client{Timeout: 5 * time.Second},
+		catalog:      catalog,
+		probeCaches:  probeCaches,
+		weightStores: modelcache.DefaultWeightStores(),
+		benchCache:   benchCache,
+		httpClient:   &http.Client{Timeout: 5 * time.Second},
 	}
 
 	mcpServer := mcp.NewServer(&mcp.Implementation{Name: "devai-model-status", Version: "0.1.0"}, nil)
 
 	mcp.AddTool(mcpServer, &mcp.Tool{
 		Name:        "list_fitting_models",
-		Description: "List catalog models that fit at a given VRAM budget and context length, per devai's probe caches. No interpolation: a model is eligible only when the relevant probe cache has an exact (vram_gb, context) cell recorded as fitting.",
+		Description: "List catalog models that fit at a given VRAM budget and context length, per devai's probe caches. A model is eligible when the probe cache has a cell at that VRAM band recorded as fitting (and not proven unservable by the load probe). For vLLM/SGLang the single binary-searched winner cell covers every smaller context, and the model's weights must also be present in that backend's store (they are separate volumes, so a model pulled for vLLM is invisible to SGLang); for Ollama only the exact probed tier answers. Nothing recorded at or above the requested context means not fitting; there is no extrapolation upward. Check the `notes` field: when this server cannot see a backend's weight store it says so there, and those rows are probe-cache-only.",
 	}, srv.listFittingModels)
 
 	mcp.AddTool(mcpServer, &mcp.Tool{
 		Name:        "get_model_bench",
-		Description: "Look up bench scores (tps, code_pct, reas_pct, total_pct, leak_pct) for one model/backend/context. Returns a not-available message (naming any other benched contexts) when the exact triple hasn't been benched.",
+		Description: "Look up bench scores (tps, code_pct = HumanEval, code_plus_pct = HumanEval+, leak_pct) for one model/backend/context. Returns a not-available message (naming any other benched contexts) when the exact triple hasn't been benched.",
 	}, srv.getModelBench)
 
 	mcp.AddTool(mcpServer, &mcp.Tool{

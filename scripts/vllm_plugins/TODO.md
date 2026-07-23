@@ -1,10 +1,10 @@
-# `deepseek_string` plugin — wiring DONE + VERIFIED
+# `deepseek_string` plugin -- wiring DONE + VERIFIED
 
 Status: **wired, unit-tested, and verified end-to-end on both R1
 distill variants** as of 2026-05-01.
 
-- `DeepSeek-R1-Distill-Qwen-7B`  — Qwen-2 tokenizer  → `T=deepseek_string mode=forced` ✓
-- `DeepSeek-R1-Distill-Llama-8B` — Llama-3 tokenizer → `T=deepseek_string mode=forced` ✓
+- `DeepSeek-R1-Distill-Qwen-7B`  -- Qwen-2 tokenizer  -> `T=deepseek_string mode=forced` (confirmed)
+- `DeepSeek-R1-Distill-Llama-8B` -- Llama-3 tokenizer -> `T=deepseek_string mode=forced` (confirmed)
 
 Both verified through the live router at `http://devai-router:11435`:
 single-tool `tool_choice: "auto"` requests get promoted by the router
@@ -13,13 +13,13 @@ to a specific-function pin, vLLM loads the plugin via
 and the plugin extracts a clean `tool_calls: [get_time(...)]` from
 the model's full-width DeepSeek-V3 marker output. Multi-tool auto
 requests get rejected with HTTP 400 + `tool_choice_pinning_required`.
-See `docs/backends.md` "Operational notes — R1-Distill family" for
+See `docs/backends.md` "Operational notes -- R1-Distill family" for
 the per-model behavioural difference (5-token vs 525-token call latency).
 
 ## What's wired
 
-### Plugin registry — single source of truth
-- `deploy/vllm-plugins.json` — JSON map of `parser_name → {kind, file}`.
+### Plugin registry -- single source of truth
+- `deploy/vllm-plugins.json` -- JSON map of `parser_name -> {kind, file}`.
   Both Python (probe driver) and Go (router) read this file; adding a
   new plugin is one JSON entry plus a file in `scripts/vllm_plugins/`.
 - Container path: `/etc/devai/vllm-plugins/<file>`. The host directory
@@ -28,13 +28,13 @@ the per-model behavioural difference (5-token vs 525-token call latency).
 ### Probe driver (`scripts/_probe_hf_common.py` + `probe-vllm-reasoning.py`)
 - `BackendSpec` gained `supports_plugins` (vLLM=True, SGLang=False).
 - `_resolve_plugins` looks up parser names against the registry; when
-  matched it adds the host→container plugin volume and threads the
+  matched it adds the host->container plugin volume and threads the
   in-container plugin path into `build_args`.
 - `vllm_command_args` emits `--tool-parser-plugin <abs>` (or
   `--reasoning-parser-plugin <abs>`) immediately before the parser-name
   flag; vLLM resolves parser names at flag-parse time so the plugin
   module has to be loaded by then.
-- Built-in parsers pass through unchanged — no plugin flag, no mount,
+- Built-in parsers pass through unchanged -- no plugin flag, no mount,
   no behaviour change vs. pre-plugin builds.
 - SGLang accepts the plugin kwargs and drops them (it has no
   `--*-parser-plugin` analogue).
@@ -46,7 +46,7 @@ the per-model behavioural difference (5-token vs 525-token call latency).
 - `arbiter.resolvePluginLaunch` is called from `containerRecreate`. It
   populates `launchConfig.{Tool,Reasoning}ParserPlugin` and emits the
   libpod bind-mount spec when at least one plugin is required.
-- Empty `VLLM_PLUGINS_HOST_DIR` + a parser that needs a plugin → the
+- Empty `VLLM_PLUGINS_HOST_DIR` + a parser that needs a plugin -> the
   recreate fails loudly with an actionable error (rather than silently
   launching without the plugin file accessible).
 - Kind mismatch (e.g. a `kind=reasoning` entry used as a tool parser)
@@ -57,7 +57,7 @@ the per-model behavioural difference (5-token vs 525-token call latency).
 
 ### Family entry (`scripts/model-families.yaml`)
 - `deepseek-r1-distill` family now has `parsers.vllm.tool: deepseek_string`.
-- SGLang side intentionally left empty — see top-level TODO for the
+- SGLang side intentionally left empty -- see top-level TODO for the
   optional follow-up.
 
 ### Compose & Makefile
@@ -93,5 +93,5 @@ the per-model behavioural difference (5-token vs 525-token call latency).
    `parsers.vllm.reasoning`) in `scripts/model-families.yaml`.
 4. `make catalog-regen && make cache-down`.
 5. `python3 scripts/probe-vllm-reasoning.py --repo "<regex>" --force`
-   — expect `T=<parser_name> dis=y` in the output.
+   -- expect `T=<parser_name> dis=y` in the output.
 6. `make cache-up` and confirm a live tool-using chat through the router.

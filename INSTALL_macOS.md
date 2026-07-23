@@ -1,7 +1,7 @@
-# INSTALL_macOS.md — macOS bootstrap procedure for AI agents
+# INSTALL_macOS.md -- macOS bootstrap procedure for AI agents
 
 This document is the **macOS-only** companion to [`INSTALL.md`](INSTALL.md).
-Agents reach this file through the redirect in §0 of `INSTALL.md` after
+Agents reach this file through the redirect in section 0 of `INSTALL.md` after
 detecting `Darwin` from `uname -s`. Do not interleave this file with
 the Linux procedure; the architectural choices on macOS diverge enough
 that mixing the two will produce a broken stack.
@@ -20,16 +20,16 @@ reference platform:
    move tensors onto a GPU, and the GPU's working set can be a large
    fraction of total system RAM. A 64 GB M3 Max can hold a
    70B-parameter model entirely "on GPU" without copy overhead, which
-   is impossible on any consumer NVIDIA card. §11 below explains how
+   is impossible on any consumer NVIDIA card. section 11 below explains how
    to exploit this.
 2. **No CUDA, no NVIDIA Container Toolkit.** vLLM and SGLang are CUDA-
-   only. On macOS they are removed from the running stack — there is
+   only. On macOS they are removed from the running stack -- there is
    no Metal port and no plan from the upstream projects to add one.
    The fast inference paths on macOS are **Ollama** (llama.cpp + Metal)
    and **MLX-LM** (Apple's first-party ML framework, native to UMA).
 3. **Containers run inside a Linux VM.** `podman machine` ships a
    small Linux VM (Apple Virtualization framework on M-series, QEMU
-   on Intel). Anything inside that VM has no Metal access — the VM's
+   on Intel). Anything inside that VM has no Metal access -- the VM's
    "GPU" is virtual and uninteresting. This forces a hybrid topology:
    the inference engine runs **natively on the macOS host**, the
    developer-tooling lab runs **inside the VM**, and the two talk over
@@ -47,7 +47,7 @@ project's GPU-arbitration plumbing for nothing.
 ### 1.1 Goal
 
 Take a macOS 13+ host (Apple Silicon strongly preferred; Intel
-supported but degraded — see §2.2) with sudo and produce:
+supported but degraded -- see section 2.2) with sudo and produce:
 
 - **Ollama** running natively on the host with Metal acceleration,
   using unified memory directly.
@@ -68,7 +68,7 @@ The infrastructure subset that DOES NOT run on macOS:
 
 ### 1.2 Constraints
 
-Same as `INSTALL.md` §0.2: non-interactive, idempotent, verify before
+Same as `INSTALL.md` section 0.2: non-interactive, idempotent, verify before
 mutating, fail loudly, preserve user data. Re-stated here so this file
 is self-contained.
 
@@ -106,18 +106,18 @@ is self-contained.
 
 ---
 
-## 2. Phase 1 — Detect environment
+## 2. Phase 1 -- Detect environment
 
 ### 2.1 Confirm macOS
 
 ```bash
 [verify] $ uname -s                          # Darwin
-[verify] $ sw_vers -productVersion           # ≥ 13.0
+[verify] $ sw_vers -productVersion           # >= 13.0
 [verify] $ sw_vers -productName              # macOS
 ```
 
-Stop if `uname -s` is not `Darwin` — wrong document. Stop if macOS
-< 13 — `podman machine` and Homebrew dependencies require 13+.
+Stop if `uname -s` is not `Darwin` -- wrong document. Stop if macOS
+< 13 -- `podman machine` and Homebrew dependencies require 13+.
 
 ### 2.2 Architecture
 
@@ -134,20 +134,20 @@ macOS at all.
 **Intel (`x86_64`)** Macs are supported only for the developer-tools
 side (lab + agent CLIs). They lack:
 
-- Apple Silicon's unified memory — system RAM and any GPU memory are
+- Apple Silicon's unified memory -- system RAM and any GPU memory are
   separate pools.
-- A meaningful GPU for ML — recent Intel Macs use integrated Intel
+- A meaningful GPU for ML -- recent Intel Macs use integrated Intel
   GPUs that have no usable Metal-accelerated LLM stack. Discrete AMD
   GPUs in older iMacs/MBPs can run Metal Performance Shaders but
   llama.cpp's Metal backend is sized for Apple-Silicon-class GPUs;
-  expect 5–10x slower inference than even a modest M-series chip.
+  expect 5-10x slower inference than even a modest M-series chip.
 - eGPU NVIDIA support (Apple removed it in macOS 12).
 
 If `${OS_ARCH}=x86_64`, the agent should surface this to the operator
 with a recommendation: do the Linux path on a separate Linux box and
 use Ollama on the Mac only as a CPU-only secondary backend, OR
 proceed with the Apple Silicon procedure here knowing that the
-performance bullets in §11 will not apply. Do not silently downgrade.
+performance bullets in section 11 will not apply. Do not silently downgrade.
 
 ### 2.3 RAM and disk
 
@@ -159,11 +159,11 @@ performance bullets in §11 will not apply. Do not silently downgrade.
 
 Record:
 
-- `${HOST_RAM_GB}` — total physical RAM. Drives model-size
-  recommendations in §12 and §11.
-- `${HOST_FREE_GB}` — free disk on the boot volume. The `podman
+- `${HOST_RAM_GB}` -- total physical RAM. Drives model-size
+  recommendations in section 12 and section 11.
+- `${HOST_FREE_GB}` -- free disk on the boot volume. The `podman
   machine` VM disk lives here unless you point it elsewhere; budget
-  ≥ 100 GB free for a useful install (200 GB+ if pulling 70B-class
+  >= 100 GB free for a useful install (200 GB+ if pulling 70B-class
   models).
 
 ### 2.4 Tooling presence
@@ -187,12 +187,12 @@ install eagerly here.
 
 Expected line: `Metal Support: Metal 3` (or higher) on every supported
 M-series chip. If absent, Metal-accelerated Ollama will fall back to
-CPU and the entire premise of macOS-native inference is lost — surface
+CPU and the entire premise of macOS-native inference is lost -- surface
 to the operator.
 
 ---
 
-## 3. Phase 2 — Install Homebrew and base CLI tools
+## 3. Phase 2 -- Install Homebrew and base CLI tools
 
 ### 3.1 Install Homebrew if missing
 
@@ -219,7 +219,7 @@ $ brew install \
 
 Why each:
 
-- `coreutils gnu-sed gawk findutils` — the project's `Makefile`
+- `coreutils gnu-sed gawk findutils` -- the project's `Makefile`
   recipes assume GNU semantics (`stat -c`, `sed -i.tmp`, GNU `find`
   predicates). Without these, several Makefile targets silently
   produce wrong output. The agent must prepend their `gnubin`
@@ -229,18 +229,18 @@ Why each:
   export PATH="$(brew --prefix coreutils)/libexec/gnubin:$(brew --prefix gnu-sed)/libexec/gnubin:$(brew --prefix gawk)/libexec/gnubin:$(brew --prefix findutils)/libexec/gnubin:$PATH"
   ```
 
-- `python@3.13` — symlinked as `python3`. Used by `scripts/*.py`.
-- `podman podman-compose` — container engine + compose plugin.
+- `python@3.13` -- symlinked as `python3`. Used by `scripts/*.py`.
+- `podman podman-compose` -- container engine + compose plugin.
   `make cache-up` calls `podman compose` (subcommand), which
   `podman-compose` from Homebrew satisfies.
-- `mkcert` — optional, only needed if the operator wants trusted local
+- `mkcert` -- optional, only needed if the operator wants trusted local
   TLS certs for Open WebUI.
 
 ### 3.3 Verification
 
 ```bash
 [verify] $ brew --version
-[verify] $ podman --version          # ≥ 4.0 for host.containers.internal support
+[verify] $ podman --version          # >= 4.0 for host.containers.internal support
 [verify] $ podman compose version
 [verify] $ python3 --version         # 3.13.x
 [verify] $ make --version            # GNU Make
@@ -252,7 +252,7 @@ not applied. Re-export and retry.
 
 ---
 
-## 4. Phase 3 — Install Ollama natively
+## 4. Phase 3 -- Install Ollama natively
 
 This is the core of the macOS architecture. Ollama runs on the **host**
 with full Metal access, not inside the VM.
@@ -279,7 +279,7 @@ $ brew services start ollama
 ```
 
 Expected: `{"models":[]}` on a clean install. Anything else means the
-daemon failed to start — `brew services info ollama` and
+daemon failed to start -- `brew services info ollama` and
 `tail -f /opt/homebrew/var/log/ollama.log` for diagnostics.
 
 ### 4.3 Verification
@@ -291,7 +291,7 @@ daemon failed to start — `brew services info ollama` and
 
 ---
 
-## 5. Phase 4 — (optional) Install MLX-LM
+## 5. Phase 4 -- (optional) Install MLX-LM
 
 Skip unless the operator explicitly wants Apple's first-party ML
 framework alongside Ollama.
@@ -340,7 +340,7 @@ in the same way as host Ollama.
 
 ---
 
-## 6. Phase 5 — Configure host Ollama for cross-VM reach
+## 6. Phase 5 -- Configure host Ollama for cross-VM reach
 
 The lab container runs inside `podman machine`. To call host Ollama,
 it must reach the macOS host across the VM's network bridge. Two
@@ -348,8 +348,8 @@ things must be true:
 
 1. Ollama listens on `0.0.0.0`, not just `127.0.0.1`.
 2. The lab container's outbound DNS resolves `host.containers.internal`
-   to the host. Podman ≥ 4.0 sets this up automatically — verified
-   in §7.
+   to the host. Podman >= 4.0 sets this up automatically -- verified
+   in section 7.
 
 ### 6.1 Bind Ollama to all interfaces
 
@@ -385,15 +385,15 @@ agent:
 
 Save as `~/Library/LaunchAgents/io.devai.ollama-host.plist` and load
 with `launchctl load -w ~/Library/LaunchAgents/io.devai.ollama-host.plist`.
-The agent must NOT install this autonomously — surface to the
+The agent must NOT install this autonomously -- surface to the
 operator.
 
 ### 6.3 Firewall
 
 The macOS Application Firewall is OFF by default. If the operator has
-turned it on (`System Settings → Network → Firewall`), Ollama must be
+turned it on (`System Settings -> Network -> Firewall`), Ollama must be
 allowed. The brew binary lives at `$(brew --prefix)/bin/ollama`; add
-it explicitly via `Firewall Options → Add ollama → Allow incoming`.
+it explicitly via `Firewall Options -> Add ollama -> Allow incoming`.
 Do not disable the firewall globally.
 
 ### 6.4 Verification
@@ -403,31 +403,31 @@ Do not disable the firewall globally.
 [verify] $ HOST_IP=$(ipconfig getifaddr en0); curl -fsS http://${HOST_IP}:11434/api/tags
 ```
 
-Both must return `{"models":[]}` (or a populated list once §10 ran).
+Both must return `{"models":[]}` (or a populated list once section 10 ran).
 
 ---
 
-## 7. Phase 6 — `podman machine init`
+## 7. Phase 6 -- `podman machine init`
 
 ### 7.1 Sizing
 
 The VM disk holds the lab image, the router image, and any
-auxiliary container caches. It does **not** hold model weights —
+auxiliary container caches. It does **not** hold model weights --
 those live in `~/.ollama/models/` on the macOS host.
 
 | Resource | Minimum | Recommended |
 |---|---|---|
 | `--cpus` | 4 | 6 (M3+) or 8 (M3 Max+) |
-| `--memory` | 4096 MB | 8192–12288 MB |
+| `--memory` | 4096 MB | 8192-12288 MB |
 | `--disk-size` | 60 GB | 100 GB |
 
-The lab image is ~6–8 GB; the router is ~10 MB; PyTorch CPU adds ~2
+The lab image is ~6-8 GB; the router is ~10 MB; PyTorch CPU adds ~2
 GB if used. The rest is build cache and headroom for incremental
 rebuilds.
 
-> **Memory note.** Do not allocate more than 25–30 % of `${HOST_RAM_GB}`
+> **Memory note.** Do not allocate more than 25-30 % of `${HOST_RAM_GB}`
 > to the VM. The whole point of the macOS architecture is to keep RAM
-> available to host Ollama for unified-memory inference (§11). On a
+> available to host Ollama for unified-memory inference (section 11). On a
 > 32 GB Mac with `--memory 16384`, you starve Ollama.
 
 ### 7.2 Init + start
@@ -446,7 +446,7 @@ $ podman system connection default ${VM_NAME}
 Idempotency: if `podman machine list --format '{{.Name}}'` already
 contains `${VM_NAME}`, do NOT re-init. Verify the existing size with
 `podman machine inspect ${VM_NAME}`. If too small, surface to the
-operator — growing the disk or RAM requires destroying and recreating
+operator -- growing the disk or RAM requires destroying and recreating
 the VM, which loses container state and built images.
 
 ### 7.3 Verification
@@ -464,7 +464,7 @@ podman.
 
 ---
 
-## 8. Phase 7 — Clone repo, write `.env`, write compose override
+## 8. Phase 7 -- Clone repo, write `.env`, write compose override
 
 ### 8.1 Clone
 
@@ -493,7 +493,7 @@ CONTAINER_RUNTIME=podman
 HOST_HOME_DIR=$(HOME)
 HOME_VOLUME=$(HOME)/devai-home
 
-# Disable VRAM-band heuristics — host Ollama uses unified memory.
+# Disable VRAM-band heuristics -- host Ollama uses unified memory.
 GPU_MEMORY_GB=0
 MAX_CONTEXT_LEN=131072
 ```
@@ -501,7 +501,7 @@ MAX_CONTEXT_LEN=131072
 `GPU_MEMORY_GB=0` short-circuits the picker's VRAM-band filter so
 Ollama models the host can run are not hidden as "won't fit." The
 host's actual usable memory budget is whatever is left after macOS
-and other apps — see §11.
+and other apps -- see section 11.
 
 ### 8.3 Compose override
 
@@ -544,7 +544,7 @@ EOF
 ```
 
 `profiles: ["disabled"]` is a podman-compose idiom that registers the
-service but never starts it unless `--profile disabled` is passed —
+service but never starts it unless `--profile disabled` is passed --
 which the macOS procedure never does.
 
 ### 8.4 Verification
@@ -557,7 +557,7 @@ which the macOS procedure never does.
 
 ---
 
-## 9. Phase 8 — Build CPU lab + router images
+## 9. Phase 8 -- Build CPU lab + router images
 
 ### 9.1 Apple Silicon `arm64` build caveat
 
@@ -599,7 +599,7 @@ $ make build-cpu build-router
 
 **Do NOT run `make build-gpu` or `make build`.** Both target
 `devai-lab-gpu` and `devai-base-gpu`, which pull
-`docker.io/nvidia/cuda:*` — that image has no arm64 manifest and is
+`docker.io/nvidia/cuda:*` -- that image has no arm64 manifest and is
 useless without an NVIDIA GPU anyway.
 
 ### 9.3 Verification
@@ -612,7 +612,7 @@ Expected: three entries.
 
 ---
 
-## 10. Phase 9 — Start the macOS infra subset
+## 10. Phase 9 -- Start the macOS infra subset
 
 ### 10.1 Start
 
@@ -626,21 +626,21 @@ $ podman compose \
 
 This brings up:
 
-- `devai-apt-cache`, `devai-registry-cache` — build accelerators (kept).
-- `devai-router` — protocol bridge + reasoning policy + tool stripping.
+- `devai-apt-cache`, `devai-registry-cache` -- build accelerators (kept).
+- `devai-router` -- protocol bridge + reasoning policy + tool stripping.
   Pointed at host Ollama.
-- `devai-open-webui`, `devai-webui-proxy` — chat UI.
-- `devai-logger` — per-container stdout sink.
+- `devai-open-webui`, `devai-webui-proxy` -- chat UI.
+- `devai-logger` -- per-container stdout sink.
 
 NOT brought up: `devai-ollama`, `devai-vllm`, `devai-sglang`. That is
-correct — host-native Ollama is doing the inference.
+correct -- host-native Ollama is doing the inference.
 
 ### 10.2 Verification
 
 ```bash
 [verify] $ podman ps --format '{{.Names}}\t{{.Status}}' | grep -E '^devai-' | sort
 [verify] $ podman ps --format '{{.Names}}' | grep -E '^devai-(ollama|vllm|sglang)$' && echo SHOULD_BE_EMPTY || true
-[verify] $ curl -fsS http://localhost:11434/v1/models       # router → host ollama
+[verify] $ curl -fsS http://localhost:11434/v1/models       # router -> host ollama
 [verify] $ curl -k -fsS https://localhost:8443/             # webui-proxy
 ```
 
@@ -652,27 +652,27 @@ nothing. The third proves the router talks to host Ollama through
 
 | Symptom | Recovery |
 |---|---|
-| `curl http://localhost:11434/v1/models` returns connection refused | Router is not reaching host Ollama. From inside the VM: `podman machine ssh ${VM_NAME} 'curl -v http://host.containers.internal:11434/api/tags'`. If that fails, re-check §6.1 (`OLLAMA_HOST=0.0.0.0:11434`). |
-| Router container restarts repeatedly | `podman logs devai-router`. Most common: `OLLAMA_URL` resolved at compose time picked up the wrong value — confirm by inspecting `podman inspect devai-router | jq '.[].Config.Env'`. |
+| `curl http://localhost:11434/v1/models` returns connection refused | Router is not reaching host Ollama. From inside the VM: `podman machine ssh ${VM_NAME} 'curl -v http://host.containers.internal:11434/api/tags'`. If that fails, re-check section 6.1 (`OLLAMA_HOST=0.0.0.0:11434`). |
+| Router container restarts repeatedly | `podman logs devai-router`. Most common: `OLLAMA_URL` resolved at compose time picked up the wrong value -- confirm by inspecting `podman inspect devai-router | jq '.[].Config.Env'`. |
 | Open WebUI shows "no models" | Open WebUI caches the model list; click the refresh button in the model dropdown after Phase 10 pulls a model. |
 
 ---
 
-## 11. Phase 10 — Pull initial Ollama model on the host
+## 11. Phase 10 -- Pull initial Ollama model on the host
 
 ```bash
 $ ollama pull qwen3.5:9b-q8_0
 [verify] $ ollama list
 ```
 
-Use `ollama pull` directly on the macOS host — NOT `make model-pull`.
+Use `ollama pull` directly on the macOS host -- NOT `make model-pull`.
 The Makefile's `model-pull` target talks to the in-VM `devai-ollama`
 container, which on macOS has been disabled. Pulling on the host
 puts weights in `~/.ollama/models/` where Metal can mmap them.
 
 For arm64 Apple Silicon, prefer Q4_K_M / Q5_K_M / Q8_0 quantisations.
 F16 and BF16 have no Apple-specific advantage and double memory use
-without commensurate quality. See §13 for per-RAM-tier recommendations.
+without commensurate quality. See section 13 for per-RAM-tier recommendations.
 
 ### 11.1 Verification
 
@@ -685,12 +685,12 @@ without commensurate quality. See §13 for per-RAM-tier recommendations.
 ```
 
 Expected: a string containing `PONG`. First-call latency includes
-model load (Metal mmap of weights into unified memory) — typically
-2–10 s for an 8B model on M-series; subsequent calls are sub-second.
+model load (Metal mmap of weights into unified memory) -- typically
+2-10 s for an 8B model on M-series; subsequent calls are sub-second.
 
 ---
 
-## 12. Phase 11 — Install `devai-agent` launcher
+## 12. Phase 11 -- Install `devai-agent` launcher
 
 ```bash
 $ cd ${REPO_DIR}
@@ -703,7 +703,7 @@ $ devai-agent --init
 `make install` symlinks `${REPO_DIR}/bin/devai-agent` into
 `${HOME_DIR}/.local/bin/devai-agent` and stages config under
 `${HOME_DIR}/.devai/`. The launcher is a Python script that runs
-`podman run` — it works the same on macOS as on Linux.
+`podman run` -- it works the same on macOS as on Linux.
 
 ### 12.1 Patch `OLLAMA_HOST` for the lab container
 
@@ -726,7 +726,7 @@ anything. It must reference `devai-lab-cpu` (NOT `-gpu`).
 
 ---
 
-## 13. Phase 12 — End-to-end smoke test
+## 13. Phase 12 -- End-to-end smoke test
 
 ```bash
 [verify] $ curl -fsS http://localhost:11434/api/chat \
@@ -745,16 +745,16 @@ Inside the launched lab shell:
 
 The first `ollama list` reaches host Ollama through the router across
 `host.containers.internal`. The second invokes Claude Code with the
-default `ANTHROPIC_BASE_URL` pointing at the router → host Ollama.
+default `ANTHROPIC_BASE_URL` pointing at the router -> host Ollama.
 
 ---
 
 ## 14. Unified-memory tuning (advanced, operator decision)
 
 Apple Silicon's GPU normally gets a kernel-managed share of unified
-memory — roughly 67 % of total RAM, capped well below 100 % to leave
+memory -- roughly 67 % of total RAM, capped well below 100 % to leave
 room for the OS, page cache, and other apps. For very large models
-(70B Q4 ≈ 40 GB, 120B Q4 ≈ 65 GB) this default is the bottleneck.
+(70B Q4 ~ 40 GB, 120B Q4 ~ 65 GB) this default is the bottleneck.
 The kernel exposes a tunable that raises the GPU's wired-memory
 ceiling:
 
@@ -794,7 +794,7 @@ Recommended starting points (subject to operator confirmation):
 
 These are conservative ceilings; community-reported safe values run
 ~5 % higher. Validate by running the largest expected model for 10
-minutes and watching `Activity Monitor → Memory → Memory Pressure`
+minutes and watching `Activity Monitor -> Memory -> Memory Pressure`
 stay green.
 
 ---
@@ -808,7 +808,7 @@ ceiling minus the KV cache, yes." The KV cache for an 8B model at
 
 | RAM | Sweet-spot models | Largest practical | Notes |
 |---|---|---|---|
-| 8 GB | Llama-3.2-3B-Q4, Phi-3-mini-Q4 | 7B Q3 (degraded) | barely useful for serious work; lab + agent CLIs eat 1–2 GB |
+| 8 GB | Llama-3.2-3B-Q4, Phi-3-mini-Q4 | 7B Q3 (degraded) | barely useful for serious work; lab + agent CLIs eat 1-2 GB |
 | 16 GB | Llama-3.1-8B-Q4, Qwen3-8B-Q4_K_M, Mistral-7B-Q5 | 13B Q4 | the floor for "real" local inference |
 | 24 GB (M3 Pro base) | Qwen3-14B-Q4, Llama-3.1-8B-Q8 | 32B Q3 | comfortable single-user dev rig |
 | 32 GB | Qwen3-32B-Q4, Mixtral-8x7B-Q3 | 32B Q5 / 47B MoE Q3 | sweet spot for Q4 instruct models |
@@ -821,48 +821,48 @@ ceiling minus the KV cache, yes." The KV cache for an 8B model at
 
 Caveats:
 
-- These rows assume `iogpu.wired_limit_mb` raised per §11. Default
+- These rows assume `iogpu.wired_limit_mb` raised per section 11. Default
   ceilings drop one tier.
 - MoE active-vs-total parameters mean a 47B Mixtral runs at ~13B
   speed but takes 47B of RAM; budget by RAM, not by speed.
 - Long contexts inflate KV cache linearly. A 128K Qwen3-72B-Q4
-  context needs ~10 GB for KV alone — drop one row in the table.
+  context needs ~10 GB for KV alone -- drop one row in the table.
 
 ---
 
 ## 16. State-of-the-world reference
 
-Once Phases 1–13 succeed:
+Once Phases 1-13 succeed:
 
 ```
 macOS host
-├── /Applications/                          (untouched by this procedure)
-├── /opt/homebrew/                          (Homebrew prefix on Apple Silicon)
-│   ├── bin/podman, ollama, python3, ...
-│   └── var/log/ollama.log
-├── ~/.ollama/                              (Ollama state — REGULAR mac filesystem)
-│   ├── models/blobs/                       (GGUF weights; can be huge)
-│   └── models/manifests/
-├── ~/Library/LaunchAgents/                 (optional persistence agents)
-│   └── io.devai.ollama-host.plist          (only if §6.2 was applied)
-├── ~/.devai/                               (devai-agent state, same as Linux)
-│   ├── preferences.yaml
-│   ├── sessions/
-│   └── *.json (probe-cache symlinks)
-├── ~/.local/bin/devai-agent
-└── ${REPO_DIR}/                            (the cloned repo)
-    ├── .env
-    └── deploy/
-        ├── docker-compose.yaml             (Linux-default infra spec)
-        └── docker-compose.macos.yaml       (macOS override authored in §8.3)
++-- /Applications/                          (untouched by this procedure)
++-- /opt/homebrew/                          (Homebrew prefix on Apple Silicon)
+|   +-- bin/podman, ollama, python3, ...
+|   +-- var/log/ollama.log
++-- ~/.ollama/                              (Ollama state -- REGULAR mac filesystem)
+|   +-- models/blobs/                       (GGUF weights; can be huge)
+|   +-- models/manifests/
++-- ~/Library/LaunchAgents/                 (optional persistence agents)
+|   +-- io.devai.ollama-host.plist          (only if section 6.2 was applied)
++-- ~/.devai/                               (devai-agent state, same as Linux)
+|   +-- preferences.yaml
+|   +-- sessions/
+|   +-- *.json (probe-cache symlinks)
++-- ~/.local/bin/devai-agent
++-- ${REPO_DIR}/                            (the cloned repo)
+    +-- .env
+    +-- deploy/
+        +-- docker-compose.yaml             (Linux-default infra spec)
+        +-- docker-compose.macos.yaml       (macOS override authored in section 8.3)
 
 podman machine VM (${VM_NAME})
-├── /var/cache/devai/                       (build/log caches, VM-internal)
-│   ├── apt/, npm/, pip/, registry/, logs/
-│   └── (NO ollama/ — host-side instead)
-└── containers:
++-- /var/cache/devai/                       (build/log caches, VM-internal)
+|   +-- apt/, npm/, pip/, registry/, logs/
+|   +-- (NO ollama/ -- host-side instead)
++-- containers:
     devai-apt-cache, devai-registry-cache,
-    devai-router (→ host Ollama),
+    devai-router (-> host Ollama),
     devai-open-webui, devai-webui-proxy,
     devai-logger
 ```
@@ -870,12 +870,12 @@ podman machine VM (${VM_NAME})
 Network flow:
 
 ```
-Browser (8443)  ─►  devai-webui-proxy  ─►  devai-open-webui  ─►  devai-router
-Agent (lab)     ─►  devai-router (in VM)  ─►  host.containers.internal:11434
-                                            ─►  macOS host: ollama serve (Metal, UMA)
+Browser (8443)  ->  devai-webui-proxy  ->  devai-open-webui  ->  devai-router
+Agent (lab)     ->  devai-router (in VM)  ->  host.containers.internal:11434
+                                            ->  macOS host: ollama serve (Metal, UMA)
 ```
 
-Inference never crosses the VM boundary in the hot path — only the
+Inference never crosses the VM boundary in the hot path -- only the
 HTTP request and the streamed response do.
 
 ---
@@ -907,7 +907,7 @@ $ brew uninstall ollama
 $ rm -rf ~/.ollama
 ```
 
-To revert `iogpu.wired_limit_mb` if §14 was applied:
+To revert `iogpu.wired_limit_mb` if section 14 was applied:
 
 ```bash
 $ sudo sysctl iogpu.wired_limit_mb=0
@@ -923,28 +923,28 @@ confirmation.
 
 Surface and wait for explicit answer:
 
-1. **Apple Silicon vs Intel** (§2.2). On Intel, no UMA, no fast Metal
+1. **Apple Silicon vs Intel** (section 2.2). On Intel, no UMA, no fast Metal
    for LLMs. The operator should be told the unified-memory bullets
-   in §11–§15 do not apply.
-2. **VM resource sizing** (§7.1). The trade-off is direct: every GB
+   in sections 11-15 do not apply.
+2. **VM resource sizing** (section 7.1). The trade-off is direct: every GB
    given to the VM is taken away from host Ollama's memory budget.
-3. **`iogpu.wired_limit_mb`** (§14). System-stability sensitive; do
+3. **`iogpu.wired_limit_mb`** (section 14). System-stability sensitive; do
    not raise without operator approval. If approved, choose a value
-   from §14's table and validate under sustained load.
-4. **MLX-LM** (§5). Optional; only install if the operator wants a
+   from section 14's table and validate under sustained load.
+4. **MLX-LM** (section 5). Optional; only install if the operator wants a
    second native engine.
-5. **Persistent `OLLAMA_HOST` LaunchAgent** (§6.2). Reasonable to
+5. **Persistent `OLLAMA_HOST` LaunchAgent** (section 6.2). Reasonable to
    install for headless servers, optional for desktops.
-6. **Compose override editing** (§8.3) — confirm the operator wants
-   the documented "no in-VM ollama, router → host" architecture vs
+6. **Compose override editing** (section 8.3) -- confirm the operator wants
+   the documented "no in-VM ollama, router -> host" architecture vs
    the alternative of bypassing the router entirely (lighter; loses
    the reasoning policy and tool-stripping features).
-7. **arm64 Makefile patch vs amd64-via-Rosetta VM** (§9.1). Default to
+7. **arm64 Makefile patch vs amd64-via-Rosetta VM** (section 9.1). Default to
    the patch unless the operator has a reason to want amd64.
-8. **Public exposure** — no port listed in §16 should be exposed to
+8. **Public exposure** -- no port listed in section 16 should be exposed to
    the public internet without an explicit reverse-proxy + auth layer
    the operator owns.
-9. **Tear-down scope** (§17) — the VM, the host weights, and the
+9. **Tear-down scope** (section 17) -- the VM, the host weights, and the
    `iogpu` setting are independent; tear-down should ask which apply.
 
 ---
@@ -954,12 +954,12 @@ Surface and wait for explicit answer:
 This document tracks the repository at the time of writing. When the
 following change, regenerate the relevant section:
 
-- `deploy/docker-compose.yaml` service set (§8.3, §10.1, §16).
-- `Makefile` `fetch-cli` recipe arch handling (§9.1).
-- `bin/devai-agent` `OLLAMA_HOST` default (§12.1).
-- macOS unified-memory ceiling behaviour (§14) — re-check after each
+- `deploy/docker-compose.yaml` service set (section 8.3, section 10.1, section 16).
+- `Makefile` `fetch-cli` recipe arch handling (section 9.1).
+- `bin/devai-agent` `OLLAMA_HOST` default (section 12.1).
+- macOS unified-memory ceiling behaviour (section 14) -- re-check after each
   macOS major release.
-- Apple Silicon SoC introductions — extend §15 if a new tier ships.
+- Apple Silicon SoC introductions -- extend section 15 if a new tier ships.
 
 For runtime architecture details and protocol-level behaviour, defer
 to `docs/router.md`, `docs/backends.md`, and the in-repo `README.md`.

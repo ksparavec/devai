@@ -129,6 +129,31 @@ class TestDockerComposeMcpService(unittest.TestCase):
         # Default MCP_PORT=8088 mapped to container 8088.
         self.assertTrue(any(":8088" in str(p) for p in ports))
 
+    def test_port_published_on_loopback_only(self) -> None:
+        # The gateway holds a read-write podman socket, so an
+        # unauthenticated MCP call is equivalent to host-root
+        # container-create. Every published port must be bound to
+        # 127.0.0.1, never 0.0.0.0.
+        for p in self.svc["ports"]:
+            with self.subTest(port=p):
+                self.assertTrue(
+                    str(p).startswith("127.0.0.1:"),
+                    msg=f"mcp-gateway port not loopback-bound: {p}",
+                )
+
+    def test_podman_socket_mounted(self) -> None:
+        # Documents the reason the loopback bind above is the mitigation:
+        # the socket itself cannot be made :ro -- the gateway must create
+        # containers through it.
+        vols = self.svc["volumes"]
+        sock = [v for v in vols if "docker.sock" in v]
+        self.assertEqual(len(sock), 1)
+        self.assertFalse(
+            sock[0].endswith(":ro"),
+            msg="gateway needs a rw socket; if this ever becomes ro, "
+                "revisit the loopback-bind rationale",
+        )
+
     def test_catalog_mount_read_only(self) -> None:
         vols = self.svc["volumes"]
         catalog = [v for v in vols if "catalog.yaml" in v]

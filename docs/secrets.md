@@ -68,9 +68,17 @@ public keys to the `age:` list, one per line.
 make secrets-tmpfs   # one-time; idempotent
 ```
 
-Mounts `/run/devai` as a 4 MiB tmpfs with `nodev,nosuid,noexec`. Gone
-on reboot; re-mount via the same command, or install
-`deploy/systemd/run-devai.mount` for boot persistence.
+Mounts `/run/devai` as a 4 MiB tmpfs with `nodev,nosuid,noexec`, mode
+0700, **owned by the invoking human** (`SUDO_USER`, else `USER`) --
+the mount needs root but every `*-secrets-render` target that writes
+into it runs unprivileged, so a root-owned tmpfs would make each
+render fail with `EACCES`. Re-running on an already-mounted tmpfs
+re-asserts that ownership rather than reporting "nothing to do".
+
+The mount is gone on reboot; re-run the same command after each boot.
+(A `run-devai.mount` systemd unit would give boot persistence, but the
+repo does **not** ship one -- `deploy/systemd/` contains only
+`devai-infra.service`.)
 
 ## Editing a secrets file
 
@@ -95,6 +103,12 @@ The render script refuses to write to a non-tmpfs path unless the
 caller sets `DEVAI_RENDER_ALLOW_NON_TMPFS=1`, so a missing
 `make secrets-tmpfs` step fails loudly instead of silently leaking
 plaintext to a regular filesystem.
+
+The render is **atomic**: the decrypt lands in a temp file inside the
+same tmpfs directory and is renamed into place only on success. A
+failed decrypt (wrong key, corrupt file, missing age key) therefore
+leaves the previously rendered secret intact instead of truncating it
+to zero bytes and taking the running service down with it.
 
 ## Rotation
 

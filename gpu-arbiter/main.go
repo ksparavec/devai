@@ -81,6 +81,24 @@ func envInt(key string, fallback int) int {
 	return fallback
 }
 
+// envIntAllowZero is envInt for settings where 0 is a meaningful value
+// rather than "unset". envInt maps 0 back to the fallback, which silently
+// contradicts the documented `0 = unlimited` semantics of
+// MAX_CONCURRENT_REQUESTS. Only a well-formed non-negative integer is
+// accepted; anything else falls back.
+func envIntAllowZero(key string, fallback int) int {
+	s := os.Getenv(key)
+	if s == "" {
+		return fallback
+	}
+	v, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil || v < 0 {
+		log.Printf("warning: invalid %s=%q; falling back to %d", key, s, fallback)
+		return fallback
+	}
+	return v
+}
+
 func envFloat(key string, fallback float64) float64 {
 	if s := os.Getenv(key); s != "" {
 		if v, err := strconv.ParseFloat(s, 64); err == nil && v > 0 {
@@ -157,6 +175,10 @@ type configModel struct {
 	// quantized KV, so the router must reproduce that dtype when serving
 	// any ctx the tier covers (see resolveKVCacheType). Ollama only.
 	KVByCtx map[int]string `yaml:"-"`
+	// FlashByCtx is the KVByCtx sibling for OLLAMA_FLASH_ATTENTION: each
+	// probed ctx tier -> the flash-attention setting the cell was measured
+	// under (nil entry = the cell predates the stamp). Ollama only.
+	FlashByCtx map[int]*bool `yaml:"-"`
 }
 
 // configReasoning records what the runtime probe observed for this model.
@@ -225,6 +247,11 @@ type launchConfig struct {
 	// recreated container (plus OLLAMA_FLASH_ATTENTION=1, which KV
 	// quantization requires); ""/"f16" emits nothing (daemon default).
 	KVCacheType string
+	// FlashAttention is the OLLAMA_FLASH_ATTENTION setting the probe cell
+	// covering the serving ctx was measured under. nil = the cell predates
+	// the stamp, and ollamaDynamicEnv derives the value from KVCacheType
+	// instead (the behaviour those cells were probed under).
+	FlashAttention *bool
 	// Plugin paths are populated when ToolParser / ReasoningParser
 	// resolve through the vllm-plugins registry. Each holds the
 	// in-container absolute path to a plugin .py file. Empty values
@@ -275,6 +302,68 @@ type cacheProbe struct {
 	// (stamped by the prober from OLLAMA_KV_CACHE_TYPE; "" on cells
 	// probed before the field existed = f16).
 	KVCacheType string `json:"kv_cache_type"`
+	// FlashAttention is the OLLAMA_FLASH_ATTENTION setting the cell was
+	// measured under. Pointer so ABSENT (cells written before the prober
+	// stamped it) stays distinguishable from an explicit false: absent
+	// falls back to the dtype-derived value in ollamaDynamicEnv (quantized
+	// KV implies flash attention), which is exactly what those cells were
+	// probed with. Without reading it, a cell probed with flash attention
+	// ON under the default f16 dtype was SERVED with it off -- a different
+	// environment from the one the fit was measured in.
+	FlashAttention *bool `json:"flash_attention"`
+}
+
+// tristateBool decodes a probe cache's `disable_verified` field, whose
+// on-disk shape is NOT strictly boolean: the probers can record a string
+// sentinel (e.g. "error") for a model whose disable-probe never produced a
+// verdict. A plain *bool field would make encoding/json abort the WHOLE
+// file on the first such value -- and the router unmarshals each cache in
+// one call, so one malformed field on one model emptied the entire model
+// list for that backend. Accepted forms:
+//
+//	true / false  -> that value
+//	null, absent  -> unknown
+//	"true"/"false" (any case) -> that value
+//	any other string, or any other JSON type -> unknown, logged once
+//
+// "unknown" degrades exactly like a missing field: modelDisableOK gets no
+// entry for that model, so the reasoning policy declines to send the
+// protocol's disable field. Bad data costs one model its disable
+// optimisation instead of costing every model its existence.
+type tristateBool struct {
+	v *bool
+}
+
+// Value returns the decoded value, or nil when unknown.
+func (t tristateBool) Value() *bool { return t.v }
+
+func (t *tristateBool) UnmarshalJSON(data []byte) error {
+	s := strings.TrimSpace(string(data))
+	if s == "null" {
+		t.v = nil
+		return nil
+	}
+	var b bool
+	if err := json.Unmarshal(data, &b); err == nil {
+		t.v = &b
+		return nil
+	}
+	var str string
+	if err := json.Unmarshal(data, &str); err == nil {
+		switch strings.ToLower(strings.TrimSpace(str)) {
+		case "true":
+			yes := true
+			t.v = &yes
+			return nil
+		case "false":
+			no := false
+			t.v = &no
+			return nil
+		}
+	}
+	log.Printf("warning: probe cache disable_verified=%s is not a boolean; treating this model's disable-verified state as unknown (re-probe to fix)", s)
+	t.v = nil
+	return nil
 }
 
 // cacheEntry mirrors the per-digest record in
@@ -285,7 +374,7 @@ type cacheEntry struct {
 	Aliases         []string                         `json:"aliases"`
 	MaxContext      int                              `json:"max_context"`
 	Capability      string                           `json:"capability"`
-	DisableVerified *bool                            `json:"disable_verified,omitempty"`
+	DisableVerified tristateBool                     `json:"disable_verified,omitempty"`
 	Probes          map[string]map[string]cacheProbe `json:"probes"`
 }
 
@@ -313,6 +402,7 @@ func synthesizeFromCache(
 		bestCtx := 0
 		var bestProbe cacheProbe
 		kvByCtx := make(map[int]string)
+		flashByCtx := make(map[int]*bool)
 		for ctxStr, probe := range band {
 			c, err := strconv.Atoi(ctxStr)
 			if err != nil {
@@ -325,6 +415,9 @@ func synthesizeFromCache(
 				continue
 			}
 			kvByCtx[c] = probe.KVCacheType
+			if probe.FlashAttention != nil {
+				flashByCtx[c] = probe.FlashAttention
+			}
 			if c >= bestCtx {
 				bestCtx = c
 				bestProbe = probe
@@ -358,9 +451,10 @@ func synthesizeFromCache(
 			Context:      effCtx,
 			ProbedMaxCtx: bestCtx,
 			KVByCtx:      kvByCtx,
+			FlashByCtx:   flashByCtx,
 			Reasoning: &configReasoning{
 				Capability:      capability,
-				DisableVerified: entry.DisableVerified,
+				DisableVerified: entry.DisableVerified.Value(),
 			},
 		})
 	}
@@ -424,12 +518,12 @@ type hfCacheEntry struct {
 	// memFraction launch math — without it, ActualVRAMGB (post-load,
 	// weights + KV + CUDA graphs) would mistakenly be used as the
 	// weight size and clamp --max-model-len to a few thousand tokens.
-	SizeGB          float64 `json:"size_gb,omitempty"`
-	MaxContext      int     `json:"max_context"`
-	Capability      string  `json:"capability"`
-	ToolParser      *string `json:"tool_parser"`
-	ReasoningParser *string `json:"reasoning_parser,omitempty"`
-	DisableVerified *bool   `json:"disable_verified,omitempty"`
+	SizeGB          float64      `json:"size_gb,omitempty"`
+	MaxContext      int          `json:"max_context"`
+	Capability      string       `json:"capability"`
+	ToolParser      *string      `json:"tool_parser"`
+	ReasoningParser *string      `json:"reasoning_parser,omitempty"`
+	DisableVerified tristateBool `json:"disable_verified,omitempty"`
 	// ToolMode records HOW the tool parser was verified — `"auto"` if
 	// the model spontaneously called the tool with tool_choice="auto",
 	// `"forced"` if the call only round-tripped with explicit
@@ -613,7 +707,7 @@ func synthesizeHFFromCache(
 			ToolMode:        toolMode,
 			Reasoning: &configReasoning{
 				Capability:      capability,
-				DisableVerified: entry.DisableVerified,
+				DisableVerified: entry.DisableVerified.Value(),
 			},
 			MTP:            mtpBlock,
 			MTPProbedUnfit: mtpProbedUnfit,
@@ -642,7 +736,11 @@ func loadHFCache(
 	}
 	var cache map[string]*hfCacheEntry
 	if jerr := json.Unmarshal(data, &cache); jerr != nil {
-		log.Printf("warning: %s probe cache parse failed: %v", backendName, jerr)
+		// Same blast radius as the Ollama cache: the whole file is
+		// unmarshalled in one call, so a single malformed field takes
+		// every row on this backend with it.
+		log.Printf("ERROR: %s probe cache %s failed to parse: %v -- ZERO %s models registered; the router will 404 every %s request and the picker will list none. Fix the JSON or re-run `make probe-%s`, then restart devai-router.",
+			backendName, path, jerr, backendName, backendName, backendName)
 		return nil
 	}
 	rows := synthesizeHFFromCache(cache, backendName, hostVRAMGB, operatorMaxCtx, mtpRegistry)
@@ -671,12 +769,22 @@ func modelsForBackend(models []configModel, backend string) []string {
 // --- Backend state ---
 
 type backendState struct {
-	config         backendConfig
-	proxy          *httputil.ReverseProxy
-	modelNames     []string
-	running        bool
-	currentModel   string
-	currentContext int // baked --max-model-len / --context-length for vLLM/SGLang; 0 for Ollama
+	config     backendConfig
+	proxy      *httputil.ReverseProxy
+	modelNames []string
+	running    bool
+	// containerLaunched tracks CONTAINER LIVENESS, which is not the same
+	// thing as `running` (= "healthy and serving"). `podman start`
+	// succeeded but waitForHealthy then timed out (or detectLaunchFailure
+	// reported a crash)? `running` was never set, yet the container is
+	// alive and its engine is still pulling weights onto the GPU. Without
+	// this flag stopOtherBackends would skip that backend and the next one
+	// would launch against a card that is not free. Set right after
+	// `podman start` returns, cleared only after a successful stop (or once
+	// the container is observed gone).
+	containerLaunched bool
+	currentModel      string
+	currentContext    int // baked --max-model-len / --context-length for vLLM/SGLang; 0 for Ollama
 	// currentSpec is the speculative-decoding configuration baked into
 	// the running container, or nil when MTP is off. A toggle (nil <->
 	// non-nil, or any field-level change) triggers a recreate the same
@@ -685,6 +793,15 @@ type backendState struct {
 	currentSpec *configSpeculative
 	lastRequest time.Time
 	activeReqs  int64
+	// upstreamReqs counts only requests that are PAST the arbiter mutex
+	// and actually proxied to the backend. drainBackend must wait on this
+	// and not on activeReqs: activeReqs also counts requests parked on
+	// a.mu, and drainBackend itself runs with a.mu held -- so those can
+	// never drop off and every switch under load would stall for the full
+	// DRAIN_TIMEOUT. Incremented under a.mu (so a concurrent
+	// stopOtherBackends cannot observe zero for a request already cleared
+	// to proxy) and decremented after ServeHTTP returns.
+	upstreamReqs int64
 	// Recreate coalescing — without this, a second request that arrives
 	// during the 50–60s cold-start `waitForHealthy` window sees
 	// running=false, decides it needs its own recreate, and tears down
@@ -703,8 +820,11 @@ type backendState struct {
 	// measured on a different image, so it may be unreliable. The router
 	// still serves -- a genuine crash is failed hard by Phase A's
 	// crash-detection -- but flags every response with X-DevAI-Warning and
-	// surfaces the drift in /health. Immutable after startup; Ollama (empty
-	// Image, no _meta stamp) never goes stale.
+	// surfaces the drift in /health. Immutable after startup. Ollama never
+	// goes stale: the drift check looks the backend up in the
+	// backend-name -> probe-cache-path map, which has entries only for
+	// vllm and sglang, so readProbedImageDigest is called with "" and
+	// returns no baseline to compare against.
 	imageStale         bool
 	probedImageDigest  string
 	runningImageDigest string
@@ -723,8 +843,13 @@ type arbiter struct {
 	// engines' --max-num-seqs / --max-running-requests so CUDA-graph
 	// capture covers exactly the batch sizes we admit.
 	maxConcurrent int64
-	modelSizes    map[string]float64 // model name → weight size in GB
-	modelContexts map[string]int     // model name → declared max context (from models.yaml)
+	// Size and declared-context are keyed by (backend, model name) for the
+	// same reason every other lookup below is: a model probed on BOTH vLLM
+	// and SGLang has an independent row per backend, and a name-only map
+	// silently applied whichever row happened to be registered last (e.g.
+	// SGLang's context cap used to size a vLLM launch).
+	modelSizes    map[string]map[string]float64 // backend → model name → weight size in GB
+	modelContexts map[string]map[string]int     // backend → model name → declared max context
 	// Capability and disable-verified are backend-specific for the same
 	// reason the parser maps below are: a model that runs on both vLLM and
 	// SGLang can carry different reasoning classifications per engine.
@@ -763,6 +888,11 @@ type arbiter struct {
 	// path resolves the covering tier via resolveKVCacheType and bakes
 	// OLLAMA_KV_CACHE_TYPE into the recreated container. Ollama only.
 	modelKVByCtx map[string]map[string]map[int]string // backend → model → ctx tier → kv dtype
+	// modelFlashByCtx is the modelKVByCtx sibling for flash attention:
+	// the OLLAMA_FLASH_ATTENTION setting each probed tier was measured
+	// under. A missing tier entry means the probe cell predates the stamp,
+	// and ollamaDynamicEnv then derives the value from the KV dtype.
+	modelFlashByCtx map[string]map[string]map[int]*bool // backend → model → ctx tier → flash attention
 	// modelMTP holds the catalog-declared multi-token-prediction launch
 	// params per (backend, model). Populated at startup from
 	// configModel.MTP (which the catalog metadata side-table in
@@ -795,6 +925,13 @@ type arbiter struct {
 	// connection pool) every time -- hoisted here so successive probes
 	// reuse the same idle connection.
 	healthClient *http.Client
+	// weightWarned tracks which backends have already logged the
+	// "models dir not visible" degradation in checkModelWeights, so an
+	// unmounted store costs one log line rather than one per request.
+	// Guarded by its own mutex: checkModelWeights runs before a.mu is
+	// taken and must not reach for it.
+	weightWarnMu sync.Mutex
+	weightWarned map[string]bool
 }
 
 // --- Proxy factories ---
@@ -993,6 +1130,27 @@ func resolveKVCacheType(kvByCtx map[int]string, ctx int) string {
 	return kv
 }
 
+// resolveFlashAttention is resolveKVCacheType's sibling for the probed
+// OLLAMA_FLASH_ATTENTION stamp: same smallest-covering-tier rule, so the
+// dtype and the flash-attention setting always come from the SAME probe
+// cell and serve time reproduces one coherent measured environment.
+// Returns nil when no covering tier carries the stamp (pre-stamp cells),
+// which tells ollamaDynamicEnv to fall back to the dtype-derived value.
+func resolveFlashAttention(flashByCtx map[int]*bool, ctx int) *bool {
+	best := 0
+	var flash *bool
+	for tier, on := range flashByCtx {
+		if on == nil {
+			continue
+		}
+		if tier >= ctx && (best == 0 || tier < best) {
+			best = tier
+			flash = on
+		}
+	}
+	return flash
+}
+
 // ollamaLaunchCtx resolves the context an ollama container is launched at:
 // the probed ceiling by default, clamped down by a per-request `@<ctx>`
 // override (desired <= 0 = no override). The override is how mixed-KV
@@ -1006,18 +1164,32 @@ func ollamaLaunchCtx(probed, desired int) int {
 }
 
 // ollamaDynamicEnv is the per-recreate env for the ollama backend: the
-// probed context ceiling always, plus the KV dtype when the serving ctx's
-// covering probe tier was measured under a non-default dtype. Flash
-// attention is a hard prerequisite for quantized KV in ollama, so the two
-// travel together.
+// probed context ceiling always, plus the KV dtype and the flash-attention
+// setting the serving ctx's covering probe tier was measured under.
+//
+// Flash attention is a hard prerequisite for quantized KV in ollama, so a
+// quantized dtype implies it -- but the converse does not hold: a cell can
+// be probed with OLLAMA_FLASH_ATTENTION=1 under the DEFAULT f16 dtype, and
+// deriving the setting from the dtype alone served that model without
+// flash attention, i.e. in a different environment from the one its fit
+// was measured in. lc.FlashAttention carries the probe's own stamp and
+// wins whenever it is present; nil (pre-stamp cells) keeps the historical
+// dtype-derived value.
 func ollamaDynamicEnv(lc launchConfig) map[string]string {
 	env := map[string]string{
 		"OLLAMA_CONTEXT_LENGTH": fmt.Sprintf("%d", lc.MaxContext),
 	}
 	// ""/"f16" = daemon default: emit nothing so the container spec
 	// stays byte-identical to pre-KV-field launches.
-	if lc.KVCacheType != "" && lc.KVCacheType != "f16" {
+	quantizedKV := lc.KVCacheType != "" && lc.KVCacheType != "f16"
+	if quantizedKV {
 		env["OLLAMA_KV_CACHE_TYPE"] = lc.KVCacheType
+	}
+	flash := quantizedKV
+	if lc.FlashAttention != nil {
+		flash = *lc.FlashAttention
+	}
+	if flash {
 		env["OLLAMA_FLASH_ATTENTION"] = "1"
 	}
 	return env
@@ -1314,6 +1486,15 @@ func main() {
 		log.Fatalf("unknown --mode %q (want single|worker|head)", *arbiterMode)
 	}
 
+	runSingleHost(buildArbiter())
+}
+
+// buildArbiter constructs the single-host arbiter: probe caches,
+// per-backend config, the lookup maps, and the image-drift check.
+// Split out of main() (behaviour-identical) so cluster worker mode can
+// build the very same scheduler and dispatch head-forwarded requests
+// through it -- see makeInboundHandler in cluster_main.go.
+func buildArbiter() *arbiter {
 	ollamaURL, _ := url.Parse(env("OLLAMA_URL", "http://devai-ollama:11434"))
 	vllmURL, _ := url.Parse(env("VLLM_URL", "http://devai-vllm:11434"))
 	sglangURL, _ := url.Parse(env("SGLANG_URL", "http://devai-sglang:11434"))
@@ -1351,7 +1532,11 @@ func main() {
 			log.Printf("probe cache: %s loaded (%d v3 entries → %d serving rows)",
 				cachePath, len(cache), len(cfg.Models))
 		} else {
-			log.Printf("warning: probe cache parse failed: %v", jerr)
+			// This is not a warning: cfg.Models stays EMPTY, so every
+			// Ollama model disappears from the router AND from the picker
+			// until the file parses again. Say so explicitly.
+			log.Printf("ERROR: probe cache %s failed to parse: %v -- ZERO Ollama models registered; the router will 404 every Ollama request and the picker will list none. Fix the JSON or re-run `make probe`, then restart devai-router.",
+				cachePath, jerr)
 		}
 	} else if !os.IsNotExist(err) {
 		log.Printf("warning: probe cache read failed: %v", err)
@@ -1439,8 +1624,8 @@ func main() {
 	// users may issue requests with any registered alias). Each lookup map
 	// receives an entry per alias so a request for "qwen3.5:latest" finds
 	// the same context cap and capability as the canonical "qwen3.5:9b-q8_0".
-	modelSizes := make(map[string]float64)
-	modelContexts := make(map[string]int)
+	modelSizes := make(map[string]map[string]float64)          // backend → model → weight size GB
+	modelContexts := make(map[string]map[string]int)           // backend → model → declared max ctx
 	modelCapability := make(map[string]map[string]string)      // backend → model → reasoning.capability
 	modelDisableOK := make(map[string]map[string]bool)         // backend → model → disable_verified
 	modelToolParser := make(map[string]map[string]string)      // backend → model → --tool-call-parser
@@ -1448,6 +1633,7 @@ func main() {
 	modelToolMode := make(map[string]map[string]string)        // backend → model → "auto" | "forced"
 	modelProbedMaxCtx := make(map[string]map[string]int)       // backend → model → highest fits=true ctx
 	modelKVByCtx := make(map[string]map[string]map[int]string) // backend → model → ctx tier → kv dtype
+	modelFlashByCtx := make(map[string]map[string]map[int]*bool)
 	modelMTP := make(map[string]map[string]*configSpeculative) // backend → model → catalog MTP block
 	modelMTPUnfit := make(map[string]map[string]bool)          // backend → model → probe recorded mtp_fits=false
 	capCounts := make(map[string]int)
@@ -1465,17 +1651,23 @@ func main() {
 			if name == "" {
 				continue
 			}
-			if sz > 0 {
-				modelSizes[name] = sz
-			}
-			if m.Context > 0 {
-				modelContexts[name] = m.Context
-			}
-			// Capability, disable-verified, parser maps, and the
-			// probe-verified ctx ceiling are all keyed by backend so the
-			// same model name can carry different values on vLLM vs SGLang
-			// without one backend overwriting the other.
+			// Size, declared context, capability, disable-verified, parser
+			// maps, and the probe-verified ctx ceiling are all keyed by
+			// backend so the same model name can carry different values on
+			// vLLM vs SGLang without one backend overwriting the other.
 			for _, backend := range m.Backend {
+				if sz > 0 {
+					if modelSizes[backend] == nil {
+						modelSizes[backend] = make(map[string]float64)
+					}
+					modelSizes[backend][name] = sz
+				}
+				if m.Context > 0 {
+					if modelContexts[backend] == nil {
+						modelContexts[backend] = make(map[string]int)
+					}
+					modelContexts[backend][name] = m.Context
+				}
 				if modelCapability[backend] == nil {
 					modelCapability[backend] = make(map[string]string)
 				}
@@ -1515,6 +1707,12 @@ func main() {
 						modelKVByCtx[backend] = make(map[string]map[int]string)
 					}
 					modelKVByCtx[backend][name] = m.KVByCtx
+				}
+				if len(m.FlashByCtx) > 0 {
+					if modelFlashByCtx[backend] == nil {
+						modelFlashByCtx[backend] = make(map[string]map[int]*bool)
+					}
+					modelFlashByCtx[backend][name] = m.FlashByCtx
 				}
 				if m.MTP != nil {
 					if modelMTP[backend] == nil {
@@ -1561,7 +1759,7 @@ func main() {
 		idleTimeout:          time.Duration(envInt("IDLE_TIMEOUT", 0)) * time.Second,
 		drainTimeout:         time.Duration(envInt("DRAIN_TIMEOUT", 30)) * time.Second,
 		healthTimeout:        time.Duration(envInt("HEALTH_TIMEOUT_SECONDS", 600)) * time.Second,
-		maxConcurrent:        int64(envInt("MAX_CONCURRENT_REQUESTS", 32)),
+		maxConcurrent:        int64(envIntAllowZero("MAX_CONCURRENT_REQUESTS", 32)),
 		modelSizes:           modelSizes,
 		modelContexts:        modelContexts,
 		modelCapability:      modelCapability,
@@ -1571,6 +1769,7 @@ func main() {
 		modelToolMode:        modelToolMode,
 		modelProbedMaxCtx:    modelProbedMaxCtx,
 		modelKVByCtx:         modelKVByCtx,
+		modelFlashByCtx:      modelFlashByCtx,
 		modelMTP:             modelMTP,
 		modelMTPUnfit:        modelMTPUnfit,
 		defaultPolicy:        policy,
@@ -1615,6 +1814,12 @@ func main() {
 		}
 	}
 
+	return a
+}
+
+// runSingleHost starts the single-host serving path: idle watcher,
+// signal handler, one listener per backend. Blocks forever.
+func runSingleHost(a *arbiter) {
 	// Start idle watcher
 	go a.idleWatcher()
 
@@ -2098,6 +2303,43 @@ func buildContainerSpec(
 	return spec
 }
 
+// requestedContext resolves the context a launch ASKS for, before the
+// memory heuristic and the probe ceiling clamp it: the per-request
+// `@<ctx>` override when present, otherwise the registered per-backend
+// declared cap, otherwise MAX_CONTEXT_LEN. An override is itself capped
+// at MAX_CONTEXT_LEN.
+func (a *arbiter) requestedContext(backendName, modelName string, desiredCtx int) int {
+	declaredCtx := a.modelContexts[backendName][modelName]
+	if declaredCtx == 0 {
+		declaredCtx = a.maxContextLen
+	}
+	if desiredCtx <= 0 {
+		return declaredCtx
+	}
+	if a.maxContextLen > 0 && desiredCtx > a.maxContextLen {
+		return a.maxContextLen
+	}
+	return desiredCtx
+}
+
+// resolveLaunchContext returns the context a launch of `modelName` on
+// `backendName` would actually settle on for the given per-request
+// `desiredCtx` (0 = no override). Pure function of the (immutable after
+// startup) arbiter lookup maps, and it applies exactly the same clamps as
+// containerRecreate does.
+//
+// ensureBackendRunning compares this against bs.currentContext -- which now
+// holds a LAUNCHED context, not a requested one. Comparing a requested ctx
+// against a launched one is what made a bare `<name>` and a pinned
+// `<name>@<ctx>` recreate each other on every alternating request.
+func (a *arbiter) resolveLaunchContext(backendName, modelName string, desiredCtx int) int {
+	requestedCtx := a.requestedContext(backendName, modelName, desiredCtx)
+	lc := computeLaunchConfig(
+		a.modelSizes[backendName][modelName], a.totalVRAMGB, backendName, requestedCtx)
+	return applyProbeCeiling(
+		lc.MaxContext, requestedCtx, a.modelProbedMaxCtx[backendName][modelName])
+}
+
 // containerRecreate launches the backend container with the given model.
 // `desiredCtx > 0` overrides the catalog cap (used when a request carries a
 // "<model>@<ctx>" picker override); 0 falls back to the catalog cap. The
@@ -2111,23 +2353,18 @@ func buildContainerSpec(
 // entrypoint emits the appropriate launch flags. A spec change vs. the
 // running container triggers a recreate the same way model/context
 // changes do.
-func (a *arbiter) containerRecreate(bs *backendState, modelName string, desiredCtx int, desiredSpec *configSpeculative) error {
+//
+// Returns the context length actually baked into the launch (lc.MaxContext,
+// i.e. AFTER the MAX_CONTEXT_LEN clamp, the memory heuristic, and the probe
+// ceiling), so callers record what was launched rather than what was asked
+// for. Zero on error.
+func (a *arbiter) containerRecreate(bs *backendState, modelName string, desiredCtx int, desiredSpec *configSpeculative) (int, error) {
 	cfg := bs.config
 	a.containerStop(cfg.ContainerName)
 	a.containerRemove(cfg.ContainerName)
 
-	modelSizeGB := a.modelSizes[modelName]
-	declaredCtx := a.modelContexts[modelName]
-	if declaredCtx == 0 {
-		declaredCtx = a.maxContextLen
-	}
-	requestedCtx := declaredCtx
-	if desiredCtx > 0 {
-		requestedCtx = desiredCtx
-		if a.maxContextLen > 0 && requestedCtx > a.maxContextLen {
-			requestedCtx = a.maxContextLen
-		}
-	}
+	modelSizeGB := a.modelSizes[cfg.Name][modelName]
+	requestedCtx := a.requestedContext(cfg.Name, modelName, desiredCtx)
 	lc := computeLaunchConfig(modelSizeGB, a.totalVRAMGB, cfg.Name, requestedCtx)
 	lc.MaxContext = applyProbeCeiling(
 		lc.MaxContext, requestedCtx,
@@ -2138,6 +2375,11 @@ func (a *arbiter) containerRecreate(bs *backendState, modelName string, desiredC
 	// quality; see resolveKVCacheType).
 	lc.KVCacheType = resolveKVCacheType(
 		a.modelKVByCtx[cfg.Name][modelName], lc.MaxContext,
+	)
+	// Same covering tier, so the dtype and the flash-attention setting
+	// always describe one probe cell (see resolveFlashAttention).
+	lc.FlashAttention = resolveFlashAttention(
+		a.modelFlashByCtx[cfg.Name][modelName], lc.MaxContext,
 	)
 	// Bound the engine's concurrent-sequence batch to the router's
 	// admission cap so CUDA-graph capture only covers batch sizes we
@@ -2155,7 +2397,7 @@ func (a *arbiter) containerRecreate(bs *backendState, modelName string, desiredC
 	// via launchConfig and the spec envMap below. Single lookup keeps
 	// the two halves synced if the registry ever swaps mid-call.
 	var recoveryEnv map[string]string
-	if rec, ok := a.recoveryRegistry.Lookup(modelName); ok {
+	if rec, ok := a.recoveryRegistry.Lookup(cfg.Name, modelName); ok {
 		lc.RecoveryFlags = rec.Flags
 		recoveryEnv = rec.Env
 		lc.RecoveryImage = rec.Image
@@ -2172,7 +2414,7 @@ func (a *arbiter) containerRecreate(bs *backendState, modelName string, desiredC
 	// import based, so its launchConfig plugin fields stay empty.
 	pluginVolume, perr := a.resolvePluginLaunch(cfg.Name, &lc)
 	if perr != nil {
-		return perr
+		return 0, perr
 	}
 	log.Printf("  %s launch: model=%.1f GB, gpu=%.1f GB → fraction=%.2f, context=%dk, reasoning=%q tool=%q tool_plugin=%q",
 		cfg.Name, modelSizeGB, a.totalVRAMGB, lc.MemFraction, lc.MaxContext/1024,
@@ -2185,7 +2427,7 @@ func (a *arbiter) containerRecreate(bs *backendState, modelName string, desiredC
 		// A marshal failure would otherwise POST a nil body to libpod,
 		// which silently creates a container with no entrypoint -- the
 		// next request then 502s with no obvious cause. Fail loud.
-		return fmt.Errorf("marshal container spec for %s: %w", cfg.ContainerName, err)
+		return 0, fmt.Errorf("marshal container spec for %s: %w", cfg.ContainerName, err)
 	}
 	resp, err := a.podmanClient.Post(
 		"http://d/v4.0.0/libpod/containers/create",
@@ -2193,25 +2435,25 @@ func (a *arbiter) containerRecreate(bs *backendState, modelName string, desiredC
 		bytes.NewReader(body),
 	)
 	if err != nil {
-		return fmt.Errorf("podman create %s: %w", cfg.ContainerName, err)
+		return 0, fmt.Errorf("podman create %s: %w", cfg.ContainerName, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
 		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("podman create %s: %s %s", cfg.ContainerName, resp.Status, respBody)
+		return 0, fmt.Errorf("podman create %s: %s %s", cfg.ContainerName, resp.Status, respBody)
 	}
 
 	startURL := fmt.Sprintf("http://d/v4.0.0/libpod/containers/%s/start", cfg.ContainerName)
 	resp2, err := a.podmanClient.Post(startURL, "", nil)
 	if err != nil {
-		return fmt.Errorf("podman start %s: %w", cfg.ContainerName, err)
+		return 0, fmt.Errorf("podman start %s: %w", cfg.ContainerName, err)
 	}
 	defer resp2.Body.Close()
 	if resp2.StatusCode >= 300 && resp2.StatusCode != http.StatusNotModified {
 		respBody, _ := io.ReadAll(resp2.Body)
-		return fmt.Errorf("podman start %s: %s %s", cfg.ContainerName, resp2.Status, respBody)
+		return 0, fmt.Errorf("podman start %s: %s %s", cfg.ContainerName, resp2.Status, respBody)
 	}
-	return nil
+	return lc.MaxContext, nil
 }
 
 func (a *arbiter) waitForHealthy(bs *backendState, timeout time.Duration) error {
@@ -2276,8 +2518,17 @@ func (a *arbiter) writeLaunchError(w http.ResponseWriter, err error) {
 
 // --- GPU exclusion and lifecycle ---
 
+// unloadOllamaTimeout bounds each HTTP call unloadOllama makes to the
+// Ollama daemon. unloadOllama runs from stopOtherBackends with the
+// arbiter mutex HELD, so an unbounded call against a daemon that accepts
+// TCP but never answers would wedge every listener on all three ports
+// with no log line at all. 60s is far above a real unload (which only
+// has to free VRAM) while still guaranteeing the lock is released.
+const unloadOllamaTimeout = 60 * time.Second
+
 func (a *arbiter) unloadOllama() {
-	resp, err := http.Get(a.ollamaURL.String() + "/api/ps")
+	client := &http.Client{Timeout: unloadOllamaTimeout}
+	resp, err := client.Get(a.ollamaURL.String() + "/api/ps")
 	if err != nil {
 		log.Printf("warning: cannot reach ollama: %v", err)
 		return
@@ -2303,24 +2554,92 @@ func (a *arbiter) unloadOllama() {
 	for _, m := range ps.Models {
 		log.Printf("unloading ollama model: %s", m.Name)
 		b, _ := json.Marshal(map[string]any{"model": m.Name, "keep_alive": "0"})
-		if resp, err := http.Post(a.ollamaURL.String()+"/api/generate", "application/json", bytes.NewReader(b)); err == nil {
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
+		// Neither the transport error nor a non-2xx status may be
+		// discarded: both mean the model was probably NOT evicted, and
+		// the caller is about to hand the GPU to another backend. Log
+		// loudly so the operator sees a cause instead of an unexplained
+		// OOM on the next launch.
+		unloadResp, err := client.Post(
+			a.ollamaURL.String()+"/api/generate", "application/json", bytes.NewReader(b))
+		if err != nil {
+			log.Printf("error: unloadOllama: keep_alive=0 for %s failed: %v -- GPU may still be held by ollama", m.Name, err)
+			continue
+		}
+		io.Copy(io.Discard, unloadResp.Body)
+		unloadResp.Body.Close()
+		if unloadResp.StatusCode >= 300 {
+			log.Printf("error: unloadOllama: keep_alive=0 for %s returned %s -- GPU may still be held by ollama", m.Name, unloadResp.Status)
 		}
 	}
 	time.Sleep(2 * time.Second)
 }
 
-func (a *arbiter) drainBackend(bs *backendState) {
-	if atomic.LoadInt64(&bs.activeReqs) == 0 {
+// checkModelWeights fails fast when a directory-backed backend is asked
+// for a model whose weights are not on disk.
+//
+// Ollama is exempt: its store is a blob/manifest tree, not one directory
+// per catalog name, so a path test there would be wrong.
+//
+// The check is deliberately skipped when ModelsDir itself is not visible
+// from inside the router container. The store is bind-mounted read-only
+// by deploy/docker-compose.yaml, but an older compose (or a bare `go run`
+// on a dev box) will not have it, and degrading to the previous
+// behaviour is far better than refusing every model. That degradation is
+// logged once per backend so it is diagnosable rather than silent.
+func (a *arbiter) checkModelWeights(cfg backendConfig, modelName string) error {
+	if cfg.Name == "ollama" || cfg.ModelsDir == "" || modelName == "" {
+		return nil
+	}
+	if _, err := os.Stat(cfg.ModelsDir); err != nil {
+		a.weightCheckOnce(cfg.Name)
+		return nil
+	}
+	// path (not path/filepath): these are POSIX container paths, and
+	// modelName may legitimately carry a `/` (the HF repo form). The name
+	// is already allowlisted and `..`-checked by isSafeModelName upstream.
+	dir := path.Join(cfg.ModelsDir, modelName)
+	if _, err := os.Stat(dir); err == nil {
+		return nil
+	}
+	return fmt.Errorf(
+		"%s model %q has no weights on disk at %s -- the probe cache "+
+			"advertises it but the store was never populated; run "+
+			"`make model-pull NAME=%s` (see docs/backends.md)",
+		cfg.Name, modelName, dir, modelName,
+	)
+}
+
+// weightCheckOnce logs the "store not mounted" degradation a single time
+// per backend, so an unmounted store is visible in the log without
+// spamming a line per request.
+func (a *arbiter) weightCheckOnce(backend string) {
+	a.weightWarnMu.Lock()
+	defer a.weightWarnMu.Unlock()
+	if a.weightWarned == nil {
+		a.weightWarned = map[string]bool{}
+	}
+	if a.weightWarned[backend] {
 		return
 	}
-	log.Printf("draining %s (%d active requests)...", bs.config.Name, atomic.LoadInt64(&bs.activeReqs))
+	a.weightWarned[backend] = true
+	log.Printf("warning: %s models dir not visible to the router; "+
+		"skipping the weights-on-disk check (mount it read-only to enable)", backend)
+}
+
+// drainBackend waits for requests already proxied upstream to finish.
+// It deliberately watches upstreamReqs, not activeReqs: this runs with
+// a.mu held, so any request still parked on that mutex cannot make
+// progress while we wait and would keep the count permanently non-zero.
+func (a *arbiter) drainBackend(bs *backendState) {
+	if atomic.LoadInt64(&bs.upstreamReqs) == 0 {
+		return
+	}
+	log.Printf("draining %s (%d requests in flight upstream)...", bs.config.Name, atomic.LoadInt64(&bs.upstreamReqs))
 	deadline := time.Now().Add(a.drainTimeout)
-	for atomic.LoadInt64(&bs.activeReqs) > 0 && time.Now().Before(deadline) {
+	for atomic.LoadInt64(&bs.upstreamReqs) > 0 && time.Now().Before(deadline) {
 		time.Sleep(500 * time.Millisecond)
 	}
-	remaining := atomic.LoadInt64(&bs.activeReqs)
+	remaining := atomic.LoadInt64(&bs.upstreamReqs)
 	if remaining > 0 {
 		log.Printf("warning: %s drain timeout with %d requests still active", bs.config.Name, remaining)
 	}
@@ -2343,21 +2662,30 @@ func (a *arbiter) stopOtherBackends(targetName string) {
 		for bs.recreating {
 			bs.recreateCond.Wait()
 		}
-		if !bs.running {
+		// `running` alone is not enough: a launch whose health wait timed
+		// out (or whose engine crashed) left the container alive and still
+		// holding the GPU while `running` stayed false. containerLaunched
+		// covers exactly that window -- see backendState.containerLaunched.
+		if !bs.running && !bs.containerLaunched {
 			continue
 		}
 		log.Printf("stopping %s (switching to %s)", name, targetName)
 		a.drainBackend(bs)
+		stopped := true
 		if name == "ollama" {
 			a.unloadOllama()
 		} else {
 			if err := a.containerStop(bs.config.ContainerName); err != nil {
 				log.Printf("warning: failed to stop %s: %v", name, err)
+				stopped = false
 			}
 		}
 		bs.running = false
 		bs.currentModel = ""
 		bs.currentContext = 0
+		if stopped {
+			bs.containerLaunched = false
+		}
 	}
 }
 
@@ -2372,9 +2700,13 @@ func (a *arbiter) stopOtherBackends(targetName string) {
 // `@<ctx>` override below the ceiling pins a smaller tier, which is how
 // mixed-KV models select their full-quality f16 tier instead of the
 // largest (quantized) one (see resolveKVCacheType).
-func (a *arbiter) ensureBackendRunning(bs *backendState, modelName string, desiredCtx int, desiredSpec *configSpeculative) error {
+//
+// `ctxPinned` says whether the request name carried an explicit `@<ctx>`
+// suffix. Only Ollama's mixed-KV tier policy consults it -- see
+// ensureOllamaRunning.
+func (a *arbiter) ensureBackendRunning(bs *backendState, modelName string, desiredCtx int, ctxPinned bool, desiredSpec *configSpeculative) error {
 	if bs.config.Name == "ollama" {
-		return a.ensureOllamaRunning(bs, modelName, desiredCtx)
+		return a.ensureOllamaRunning(bs, modelName, desiredCtx, ctxPinned)
 	}
 
 	// Recreate coalescing. If a recreate is already in flight on this
@@ -2403,6 +2735,7 @@ func (a *arbiter) ensureBackendRunning(bs *backendState, modelName string, desir
 		log.Printf("%s not serving (container gone or placeholder up), resetting state",
 			bs.config.Name)
 		bs.running = false
+		bs.containerLaunched = false
 		bs.currentModel = ""
 		bs.currentContext = 0
 		bs.currentSpec = nil
@@ -2413,25 +2746,50 @@ func (a *arbiter) ensureBackendRunning(bs *backendState, modelName string, desir
 	// makes the `::mtp` / `::nomtp` per-request suffix work -- toggling
 	// MTP requires re-launching the backend container with (or without)
 	// --speculative-config, which only takes effect at startup.
+	//
+	// The context test compares LAUNCHED against LAUNCHED: bs.currentContext
+	// holds the ctx the running container was actually built with, so the
+	// candidate must be run through the same clamps before comparing.
 	modelChanged := modelName != "" && bs.currentModel != modelName
-	contextChanged := desiredCtx > 0 && bs.currentContext > 0 && bs.currentContext != desiredCtx
+	resolvedCtx := 0
+	if modelName != "" {
+		resolvedCtx = a.resolveLaunchContext(bs.config.Name, modelName, desiredCtx)
+	}
+	contextChanged := resolvedCtx > 0 && bs.currentContext > 0 && bs.currentContext != resolvedCtx
 	specChanged := !specEqual(bs.currentSpec, desiredSpec)
 	needRecreate := !bs.running || modelChanged || contextChanged || specChanged
 	if !needRecreate {
 		return nil
 	}
 
-	a.stopOtherBackends(bs.config.Name)
-
+	// Bail BEFORE touching the GPU. A vLLM/SGLang container can never be
+	// launched without a model, so releasing the card first buys nothing --
+	// and stopOtherBackends would drain Ollama and evict its resident model
+	// (keep_alive=0) only for this call to error out and serve 503. A bare
+	// `GET /` health/monitoring probe on an idle backend port lands here
+	// (the mux catch-all never runs the POST-body block, so modelName is
+	// ""), so that eviction was reachable from any liveness checker.
 	if modelName == "" {
 		return fmt.Errorf("model name required for %s", bs.config.Name)
 	}
+
+	// Same reasoning: fail before the GPU is touched. A model the probe
+	// cache advertises but whose weights are not on disk cannot launch --
+	// the engine would burn a full HEALTH_TIMEOUT_SECONDS cold start and
+	// then die with an opaque "repo not found". This is the live
+	// SGLANG_MODELS_DIR gap (nothing populates that store), so the check
+	// pays for itself there, but it is backend-agnostic.
+	if err := a.checkModelWeights(bs.config, modelName); err != nil {
+		return err
+	}
+
+	a.stopOtherBackends(bs.config.Name)
 
 	if bs.currentModel != "" && bs.currentModel != modelName {
 		log.Printf("switching %s model: %s → %s", bs.config.Name, bs.currentModel, modelName)
 	} else if contextChanged {
 		log.Printf("switching %s context (model %s): %d → %d",
-			bs.config.Name, modelName, bs.currentContext, desiredCtx)
+			bs.config.Name, modelName, bs.currentContext, resolvedCtx)
 	} else if specChanged {
 		log.Printf("switching %s MTP config (model %s): %s → %s",
 			bs.config.Name, modelName, specLabel(bs.currentSpec), specLabel(desiredSpec))
@@ -2456,9 +2814,15 @@ func (a *arbiter) ensureBackendRunning(bs *backendState, modelName string, desir
 		bs.recreateCond.Broadcast()
 	}()
 
-	if err := a.containerRecreate(bs, modelName, desiredCtx, desiredSpec); err != nil {
+	launchedCtx, err := a.containerRecreate(bs, modelName, desiredCtx, desiredSpec)
+	if err != nil {
 		return fmt.Errorf("failed to start %s: %w", bs.config.Name, err)
 	}
+	// `podman start` succeeded: the container is alive and consuming the
+	// GPU from here on, whatever the health wait below decides. Recorded
+	// before that wait so a health timeout still leaves stopOtherBackends
+	// able to reclaim the card.
+	bs.containerLaunched = true
 
 	// Release lock during health wait so concurrent /v1/* requests can
 	// queue / waiters can park on the cond. The recreating flag prevents
@@ -2467,7 +2831,7 @@ func (a *arbiter) ensureBackendRunning(bs *backendState, modelName string, desir
 	// this scope, even on a panic out of waitForHealthy. Without that,
 	// the outer recreate defer above would fire without the lock held
 	// and race on bs.recreating / bs.pendingModel / bs.pendingContext.
-	err := func() error {
+	err = func() error {
 		a.mu.Unlock()
 		defer a.mu.Lock()
 		return a.waitForHealthy(bs, a.healthTimeout)
@@ -2479,12 +2843,15 @@ func (a *arbiter) ensureBackendRunning(bs *backendState, modelName string, desir
 
 	bs.running = true
 	bs.currentModel = modelName
-	// Record the context the launch config actually settled on (after
-	// memory-driven clamping inside computeLaunchConfig). Without this the
-	// modelChanged-only check could miss legitimate ctx-only switches when
-	// the operator's MAX_CONTEXT_LEN clamps down a picker request.
-	if desiredCtx > 0 {
-		bs.currentContext = desiredCtx
+	// Record the context the launch config actually settled on (after the
+	// MAX_CONTEXT_LEN clamp, the memory heuristic in computeLaunchConfig,
+	// and the probe ceiling) -- NOT the requested one. The contextChanged
+	// test above resolves its candidate through the same clamps, so the
+	// two are directly comparable and a bare `<name>` no longer recreates
+	// a container that a pinned `<name>@<ctx>` just launched at the very
+	// same effective context.
+	if launchedCtx > 0 {
+		bs.currentContext = launchedCtx
 	}
 	// Spec is recorded unconditionally (even when nil) so the next
 	// request can compute specChanged correctly: a request that omits
@@ -2502,7 +2869,19 @@ func (a *arbiter) ensureBackendRunning(bs *backendState, modelName string, desir
 // forced to full GPU makes a misfit fail hard instead of silently spilling
 // to CPU. desiredCtx <= 0 means "no override" (launch at the ceiling).
 // Called with the arbiter mutex held.
-func (a *arbiter) ensureOllamaRunning(bs *backendState, modelName string, desiredCtx int) error {
+//
+// Mixed-KV tier policy (`ctxPinned`):
+//
+//   - `<name>@<ctx>` PINS that tier. A different loaded tier is recreated
+//     onto the pinned one -- an explicit pin is always honoured exactly,
+//     which the bench harness relies on to label its rows.
+//   - a BARE `<name>` while some tier is already loaded is served FROM THE
+//     LOADED TIER, with no recreate. Without this, a pinning client and a
+//     bare client alternating on the same model recreated the container on
+//     every single request.
+//   - a BARE `<name>` with nothing loaded picks the default tier (the
+//     probed ceiling, clamped by the registered cap).
+func (a *arbiter) ensureOllamaRunning(bs *backendState, modelName string, desiredCtx int, ctxPinned bool) error {
 	// Model-less surfaces (/api/tags, /api/ps, /v1/models): just make sure
 	// the GPU is ours; there is nothing to load or recreate.
 	if modelName == "" {
@@ -2520,7 +2899,7 @@ func (a *arbiter) ensureOllamaRunning(bs *backendState, modelName string, desire
 	// (mixed-KV models use this to stay on their f16 tier).
 	probedCtx := a.modelProbedMaxCtx["ollama"][modelName]
 	if probedCtx <= 0 {
-		probedCtx = a.modelContexts[modelName]
+		probedCtx = a.modelContexts["ollama"][modelName]
 	}
 	if probedCtx <= 0 {
 		probedCtx = a.maxContextLen
@@ -2537,12 +2916,24 @@ func (a *arbiter) ensureOllamaRunning(bs *backendState, modelName string, desire
 		(!a.containerIsRunning(bs.config.ContainerName) || !a.backendIsServing(bs)) {
 		log.Printf("ollama not serving (container gone or placeholder up), resetting state")
 		bs.running = false
+		bs.containerLaunched = false
 		bs.currentModel = ""
 		bs.currentContext = 0
 	}
 
+	// resolvedCtx is what a launch at probedCtx would ACTUALLY settle on --
+	// same clamp chain containerRecreate runs (requestedContext ->
+	// computeLaunchConfig -> applyProbeCeiling). bs.currentContext holds a
+	// LAUNCHED context, so comparing it against the requested probedCtx
+	// would be the same requested-vs-launched mismatch the vLLM/SGLang path
+	// fixed with resolveLaunchContext: whenever the two diverge, ctxChanged
+	// stays true forever and every pinned request recreates the container.
+	resolvedCtx := a.resolveLaunchContext("ollama", modelName, probedCtx)
+
 	modelChanged := bs.currentModel != modelName
-	ctxChanged := bs.currentContext != probedCtx
+	// Only an explicit `@<ctx>` pin may force a tier switch; a bare name is
+	// served from whatever tier is resident (see the policy note above).
+	ctxChanged := ctxPinned && bs.currentContext != resolvedCtx
 	if bs.running && !modelChanged && !ctxChanged {
 		return nil
 	}
@@ -2563,9 +2954,19 @@ func (a *arbiter) ensureOllamaRunning(bs *backendState, modelName string, desire
 		bs.recreateCond.Broadcast()
 	}()
 
-	if err := a.containerRecreate(bs, modelName, probedCtx, nil); err != nil {
+	// launchedCtx is what actually went into OLLAMA_CONTEXT_LENGTH (it can
+	// be below probedCtx when the memory heuristic clamps). Warm-load and
+	// the recorded currentContext both use it so the container env, the
+	// warm-load num_ctx, and the router's idea of the serving tier are one
+	// number.
+	launchedCtx, err := a.containerRecreate(bs, modelName, probedCtx, nil)
+	if err != nil {
 		return fmt.Errorf("failed to start ollama: %w", err)
 	}
+	// `podman start` succeeded -- the container is alive from here on, even
+	// if the health wait or the warm-load below fails. See
+	// backendState.containerLaunched.
+	bs.containerLaunched = true
 
 	// Release the lock for the network-bound health wait + warm-load so
 	// concurrent requests park on recreateCond instead of the mutex.
@@ -2575,14 +2976,14 @@ func (a *arbiter) ensureOllamaRunning(bs *backendState, modelName string, desire
 		if err := a.waitForHealthy(bs, a.healthTimeout); err != nil {
 			return err
 		}
-		return a.warmLoadOllama(modelName, probedCtx)
+		return a.warmLoadOllama(modelName, launchedCtx)
 	}(); err != nil {
 		return err
 	}
 
 	bs.running = true
 	bs.currentModel = modelName
-	bs.currentContext = probedCtx
+	bs.currentContext = launchedCtx
 	return nil
 }
 
@@ -2650,6 +3051,16 @@ func (a *arbiter) makeRequestHandler(backendName string) http.HandlerFunc {
 		// policy via the backend's native protocol field.
 		var modelName string
 		var numCtx int
+		// ctxPinned records whether the request name carried an explicit
+		// `@<ctx>` suffix. A pin is honoured exactly (it may force a tier
+		// switch); a bare name never does -- see ensureOllamaRunning.
+		var ctxPinned bool
+		// body / ollamaNativeCtx outlive the POST-body block: the
+		// Ollama-native options.num_ctx injection is deferred until AFTER
+		// the lifecycle decision so it can use the context the container
+		// is actually serving at.
+		var body []byte
+		var ollamaNativeCtx bool
 		// mtpOverride must outlive the POST-body block: the
 		// desiredSpec resolution below reads it for both POSTs and
 		// GETs. A GET leaves it at "" (no override → MTP off).
@@ -2662,7 +3073,8 @@ func (a *arbiter) makeRequestHandler(backendName string) http.HandlerFunc {
 			// any realistic chat-completion payload (huge multi-turn
 			// histories with base64 image content are well below this).
 			req.Body = http.MaxBytesReader(w, req.Body, 32<<20)
-			body, err := io.ReadAll(req.Body)
+			var err error
+			body, err = io.ReadAll(req.Body)
 			if err != nil {
 				// MaxBytesReader's error string is informative ("http:
 				// request body too large") but the HTTP status it has
@@ -2731,22 +3143,19 @@ func (a *arbiter) makeRequestHandler(backendName string) http.HandlerFunc {
 				}
 			}
 			numCtx = ctxOverride
-			force := ctxOverride > 0
+			ctxPinned = ctxOverride > 0
 			if numCtx == 0 {
-				if ctxCap, ok := a.modelContexts[cleanName]; ok && ctxCap > 0 {
+				if ctxCap, ok := a.modelContexts[backendName][cleanName]; ok && ctxCap > 0 {
 					numCtx = ctxCap
 				}
 			}
 			// Ollama is launched per-model at its probed context (baked into
-			// OLLAMA_CONTEXT_LENGTH and warm-loaded 100% on GPU). Cap any
-			// native-path num_ctx at that ceiling so an /api/chat request can't
-			// force a larger-context reload that spills to CPU; matching the
-			// container env also lets the request reuse the resident GPU
-			// runner. A smaller client-requested ctx is left alone (it fits).
+			// OLLAMA_CONTEXT_LENGTH and warm-loaded 100% on GPU). Cap the
+			// launch request at that ceiling so an /api/chat request can't
+			// force a larger-context reload that spills to CPU.
 			if backendName == "ollama" {
 				if pc := a.modelProbedMaxCtx["ollama"][cleanName]; pc > 0 && (numCtx == 0 || numCtx > pc) {
 					numCtx = pc
-					force = true
 				}
 			}
 			if cleanName != parsed.Model {
@@ -2760,11 +3169,10 @@ func (a *arbiter) makeRequestHandler(backendName string) http.HandlerFunc {
 			// `options` at all (ctx is baked into the container via
 			// --max-model-len / --context-length at recreate time, driven
 			// by the @<ctx> picker suffix). So this rewrite is meaningful
-			// only on /api/chat and /api/generate.
-			if backendName == "ollama" &&
-				(req.URL.Path == "/api/chat" || req.URL.Path == "/api/generate") {
-				body = setNumCtx(body, numCtx, force)
-			}
+			// only on /api/chat and /api/generate. The injection itself is
+			// deferred until after ensureBackendRunning -- see below.
+			ollamaNativeCtx = backendName == "ollama" &&
+				(req.URL.Path == "/api/chat" || req.URL.Path == "/api/generate")
 			modelName = cleanName
 
 			// Capability lookup must resolve picker-materialised
@@ -2860,12 +3268,41 @@ func (a *arbiter) makeRequestHandler(backendName string) http.HandlerFunc {
 
 		a.mu.Lock()
 		bs.lastRequest = time.Now()
-		if err := a.ensureBackendRunning(bs, modelName, numCtx, desiredSpec); err != nil {
+		if err := a.ensureBackendRunning(bs, modelName, numCtx, ctxPinned, desiredSpec); err != nil {
 			a.mu.Unlock()
 			a.writeLaunchError(w, err)
 			return
 		}
+		servedCtx := bs.currentContext
+		// Count as in-flight-upstream while still holding a.mu, so a
+		// stopOtherBackends that acquires the mutex right after we drop it
+		// sees this request in drainBackend instead of pulling the backend
+		// out from under it.
+		atomic.AddInt64(&bs.upstreamReqs, 1)
 		a.mu.Unlock()
+		defer atomic.AddInt64(&bs.upstreamReqs, -1)
+
+		// Ollama-native options.num_ctx, injected only now that the
+		// lifecycle decision is made: servedCtx is the context the running
+		// container was actually launched at, which for a BARE `<name>` may
+		// be a smaller pinned tier that a previous `<name>@<ctx>` request
+		// selected. Injecting the probed ceiling instead would make Ollama
+		// reload the runner at a context the pinned tier deliberately
+		// avoided (mixed-KV models) and spill to CPU.
+		if ollamaNativeCtx && servedCtx > 0 {
+			// force=true replaces any client-supplied value; that is right
+			// for an explicit `@<ctx>` pin, and also for a client value
+			// ABOVE the serving ceiling (which the probe never proved
+			// fits). A client value at or below the ceiling is left alone.
+			force := ctxPinned
+			if cn, ok := clientNumCtx(body); ok && cn > servedCtx {
+				force = true
+			}
+			body = setNumCtx(body, servedCtx, force)
+			req.Body = io.NopCloser(bytes.NewReader(body))
+			req.ContentLength = int64(len(body))
+			req.Header.Set("Content-Length", strconv.Itoa(len(body)))
+		}
 
 		bs.proxy.ServeHTTP(w, req)
 	}
@@ -3490,6 +3927,59 @@ func setTopJSONField(body []byte, key string, value any) []byte {
 	return out
 }
 
+// maxClientNumCtx bounds the value clientNumCtx reports. A float literal
+// larger than this (1e30) has no int representation, and Go's float->int
+// conversion is implementation-defined out of range; the caller only ever
+// compares the value against the serving ceiling and clamps down, so
+// saturating here is behaviourally identical and well-defined.
+const maxClientNumCtx = 1 << 31
+
+// clientNumCtx reads the client-supplied options.num_ctx out of an
+// Ollama-native request body. Returns (0, false) when the body is not a
+// JSON object, has no options block, or the value is not a positive
+// number. The caller uses it to decide whether a client value needs
+// clamping down to the context the backend is actually serving at.
+//
+// The value is decoded as json.Number rather than *int so EVERY JSON
+// numeric shape is recognised: `131072`, `131072.0` and `1.31072e5` all
+// report 131072. A *int field errors on the two float forms, which made
+// clientNumCtx return (0,false) and let an oversized context sail past the
+// clamp at the makeRequestHandler call site. Fractional values truncate
+// toward zero (0.5 -> 0 -> not a valid override).
+func clientNumCtx(body []byte) (int, bool) {
+	var doc struct {
+		Options struct {
+			NumCtx json.Number `json:"num_ctx"`
+		} `json:"options"`
+	}
+	// A non-numeric num_ctx (string, object, bool) fails this decode and
+	// is reported as absent -- the router then leaves the body alone
+	// rather than guessing, and Ollama itself rejects the request.
+	if json.Unmarshal(body, &doc) != nil {
+		return 0, false
+	}
+	if doc.Options.NumCtx.String() == "" {
+		return 0, false
+	}
+	if n, err := doc.Options.NumCtx.Int64(); err == nil {
+		if n <= 0 {
+			return 0, false
+		}
+		if n > maxClientNumCtx {
+			return maxClientNumCtx, true
+		}
+		return int(n), true
+	}
+	f, err := doc.Options.NumCtx.Float64()
+	if err != nil || f < 1 {
+		return 0, false
+	}
+	if f >= maxClientNumCtx {
+		return maxClientNumCtx, true
+	}
+	return int(f), true
+}
+
 // setNumCtx injects/overrides options.num_ctx in an Ollama-native
 // request body. `force=true` (picker @suffix override) replaces any
 // existing value; `force=false` (registered modelContexts cap as a
@@ -3771,7 +4261,14 @@ func (a *arbiter) idleSweepOnce() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	for _, bs := range a.backends {
-		if !bs.running || bs.lastRequest.IsZero() {
+		// Mirror stopOtherBackends' guard: `running` alone misses a
+		// backend whose health wait timed out AFTER `podman start`
+		// succeeded -- the container is alive and holding the GPU while
+		// running stayed false. That is precisely the state
+		// containerLaunched exists to describe, so the sweeper must be
+		// able to reclaim it too. lastRequest still gates: a backend that
+		// has never served has no idle clock to compare against.
+		if (!bs.running && !bs.containerLaunched) || bs.lastRequest.IsZero() {
 			continue
 		}
 		if time.Since(bs.lastRequest) <= a.idleTimeout {
@@ -3782,14 +4279,19 @@ func (a *arbiter) idleSweepOnce() {
 		}
 		log.Printf("%s idle for %s, stopping",
 			bs.config.Name, time.Since(bs.lastRequest).Round(time.Second))
+		stopped := true
 		if bs.config.Name == "ollama" {
 			a.unloadOllama()
 		} else {
 			if err := a.containerStop(bs.config.ContainerName); err != nil {
 				log.Printf("warning: failed to stop %s: %v", bs.config.Name, err)
+				stopped = false
 			}
 		}
 		bs.running = false
+		if stopped {
+			bs.containerLaunched = false
+		}
 		bs.currentModel = ""
 	}
 }

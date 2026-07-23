@@ -24,6 +24,7 @@ from bench._bench_core import (  # noqa: E402
     cache_key_for_entry,
     is_row_key,
     migrate_bench_cache_keys,
+    serving_alias_with_ctx,
     update_row,
 )
 
@@ -277,6 +278,47 @@ class TestUpdateRowStampsContext(unittest.TestCase):
         self.assertEqual(tasks["gpqa_subset_100"]["score"], 0.70)
         self.assertEqual(tasks["gsm8k_subset_100"]["score"], 0.96)
 
+    def test_task_results_carry_their_own_host_env_id(self) -> None:
+        # Provenance is per task, not per row: a partial re-bench under a
+        # new host env must not re-label the tasks it didn't run.
+        key = "m@a1::vllm::32768"
+        cache: dict = {}
+        update_row(cache, key, model="m", backend="vllm",
+                   router_endpoint="http://r", context=32768,
+                   task_results={"gpqa_subset_100": {"score": 0.70}},
+                   host_env_id="oldenv123456")
+        update_row(cache, key, model="m", backend="vllm",
+                   router_endpoint="http://r", context=32768,
+                   task_results={"gsm8k_subset_100": {"score": 0.96}},
+                   host_env_id="newenv654321")
+        tasks = cache[key]["tasks"]
+        self.assertEqual(tasks["gpqa_subset_100"]["host_env_id"], "oldenv123456")
+        self.assertEqual(tasks["gsm8k_subset_100"]["host_env_id"], "newenv654321")
+        # Row-level id still tracks the run that produced `metrics`.
+        self.assertEqual(cache[key]["host_env_id"], "newenv654321")
+
+    def test_task_stamp_does_not_mutate_caller_dict(self) -> None:
+        # The runner reuses its task_results dict for the row update; the
+        # stamp must not leak back into it (immutable update).
+        key = "m@a1::vllm::32768"
+        cache: dict = {}
+        payload = {"score": 0.96}
+        update_row(cache, key, model="m", backend="vllm",
+                   router_endpoint="http://r", context=32768,
+                   task_results={"gsm8k_subset_100": payload},
+                   host_env_id="envaaaaaaaaa")
+        self.assertNotIn("host_env_id", payload)
+
+    def test_no_host_env_id_leaves_tasks_unstamped(self) -> None:
+        key = "m@a1::vllm::32768"
+        cache: dict = {}
+        update_row(cache, key, model="m", backend="vllm",
+                   router_endpoint="http://r", context=32768,
+                   task_results={"gsm8k_subset_100": {"score": 0.96}})
+        self.assertNotIn(
+            "host_env_id", cache[key]["tasks"]["gsm8k_subset_100"]
+        )
+
     def test_force_success_overwrites_same_task(self) -> None:
         # The one allowed mutation: a successful re-run overwrites its own entry.
         key = "m@a1::vllm::32768"
@@ -286,6 +328,27 @@ class TestUpdateRowStampsContext(unittest.TestCase):
         update_row(cache, key, model="m", backend="vllm", router_endpoint="http://r",
                    context=32768, task_results={"gsm8k_subset_100": {"score": 0.97}})
         self.assertEqual(cache[key]["tasks"]["gsm8k_subset_100"]["score"], 0.97)
+
+
+class TestServingAliasWithCtx(unittest.TestCase):
+    """A bench row must never be stamped with a ctx it was not served at,
+    so the ``@<ctx>`` pin goes out for every backend -- Ollama included."""
+
+    def test_hf_backend_pins_ctx(self) -> None:
+        self.assertEqual(
+            serving_alias_with_ctx("Qwen3-8B-NVFP4", 32768),
+            "Qwen3-8B-NVFP4@32768",
+        )
+
+    def test_ollama_pins_ctx_too(self) -> None:
+        self.assertEqual(
+            serving_alias_with_ctx("qwen3.6:35b-a3b-mtp-q4_K_M", 131072),
+            "qwen3.6:35b-a3b-mtp-q4_K_M@131072",
+        )
+
+    def test_unknown_ctx_falls_back_to_bare_alias(self) -> None:
+        self.assertEqual(serving_alias_with_ctx("gpt-oss-20b", 0), "gpt-oss-20b")
+        self.assertEqual(serving_alias_with_ctx("gpt-oss-20b", -1), "gpt-oss-20b")
 
 
 if __name__ == "__main__":

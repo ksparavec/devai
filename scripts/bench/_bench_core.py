@@ -319,11 +319,17 @@ def update_row(
     Pass ``0`` only when the caller cannot determine the ctx (legacy
     callers, tests); readers treat ctx=0 as "pre-migration / unknown".
 
-    ``host_env_id`` (when supplied) is stamped on the row so the
-    leaderboard can join back to ``cache["_meta"]["host_env_history"]``
-    and prove which kernel + driver + GPU produced these numbers. Each
-    re-bench against a different host environment yields a distinct id
-    so consumers can spot mixed-provenance rows.
+    ``host_env_id`` (when supplied) is stamped on every task result
+    written by THIS call, and on the row itself (where it describes the
+    run that produced ``metrics``), so the leaderboard can join back to
+    ``cache["_meta"]["host_env_history"]`` and prove which kernel +
+    driver + GPU produced these numbers.
+
+    Per-task stamping is what keeps provenance honest across partial
+    re-benches: rows are an immutable merge, so a forced re-run of only
+    the default tasks leaves the sharper benches (mmlu_pro / gpqa) in
+    place -- and a row-level stamp alone would silently re-label those
+    survivors as having run under the new host environment.
     """
     now = _now_iso()
     row = cache.get(key) or {
@@ -354,6 +360,8 @@ def update_row(
     stamp_cache_schema(cache)
     if task_results:
         for tname, tresult in task_results.items():
+            if host_env_id is not None and isinstance(tresult, dict):
+                tresult = {**tresult, "host_env_id": host_env_id}
             row["tasks"][tname] = tresult
     if metrics:
         row["metrics"].update(metrics)
@@ -671,19 +679,26 @@ def serving_alias(entry: dict) -> str | None:
     return None
 
 
-def serving_alias_with_ctx(alias: str, ctx: int, backend: str) -> str:
-    """Build the picker-style ``<name>@<ctx>`` suffix for HF backends.
+def serving_alias_with_ctx(alias: str, ctx: int) -> str:
+    """Build the picker-style ``<name>@<ctx>`` pin for every backend.
 
-    Ollama takes the bare alias: the ``@<ctx>`` suffix is not a valid
-    Ollama tag, and Ollama ignores ``options.num_ctx`` on the OpenAI-compat
-    path the bench uses. The router instead recreates the Ollama container
-    per model with ``OLLAMA_CONTEXT_LENGTH`` baked from the probe-verified
-    ctx (see ensureOllamaRunning in gpu-arbiter), so the bare alias is
-    served at exactly the probed context this bench row records -- the same
-    single fits=true cell discover_models selects. HF backends need the
-    suffix so the router bakes the matching ``--max-model-len`` /
-    ``--context-length`` at recreate time.
+    The router peels ``@<ctx>`` off the model name and launches that
+    exact tier: ``--max-model-len`` / ``--context-length`` for the HF
+    backends, ``OLLAMA_CONTEXT_LENGTH`` for Ollama. An explicit pin is
+    authoritative -- only a BARE name rides whatever context happens to
+    be loaded.
+
+    Ollama used to be sent bare here, which silently served every
+    ``--ctx`` / ``--all-ctx`` row at whichever tier was loaded while the
+    v3 row key and the ``context`` field claimed 32K/64K/128K. Since
+    the picker joins bench data on (model, backend, ctx), that mislabels
+    the TPS/score columns of a context the model was never served at.
+    A row must never be stamped with a ctx it was not served at, so the
+    pin is emitted for Ollama too.
+
+    ``ctx <= 0`` means the caller could not determine a tier; the bare
+    alias is returned and the row is stamped ctx=0 ("unknown").
     """
-    if backend == "ollama" or ctx <= 0:
+    if ctx <= 0:
         return alias
     return f"{alias}@{ctx}"

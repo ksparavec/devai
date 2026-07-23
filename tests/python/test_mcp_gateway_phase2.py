@@ -113,8 +113,26 @@ class TestComposeSecretsMount(unittest.TestCase):
         cmd = self.svc["command"]
         secrets_flag = [c for c in cmd if "--secrets" in c]
         self.assertEqual(len(secrets_flag), 1)
-        # Must accept MCP_SECRETS_PATH override or default to /dev/null.
-        self.assertIn("MCP_SECRETS_PATH", secrets_flag[0])
+        # The flag must name the container-side path the secrets volume
+        # binds to. An env-var indirection here (the old
+        # `--secrets=${MCP_SECRETS_PATH:-/dev/null}`) silently kept the
+        # gateway pointed at /dev/null for any operator who followed
+        # docs/mcp.md and only set MCP_SECRETS_FILE.
+        self.assertEqual(secrets_flag[0], "--secrets=/secrets/.env")
+
+    def test_secrets_flag_target_matches_mount_target(self) -> None:
+        # Guards the exact drift F5 was: flag path and mount path must
+        # agree, whatever they are.
+        secrets_flag = [c for c in self.svc["command"] if "--secrets" in c][0]
+        flag_path = secrets_flag.split("=", 1)[1]
+        # Source sides carry `${VAR:-default}`, so ':'-splitting is
+        # unreliable; match the target as a ':'-delimited segment instead.
+        vols = self.svc["volumes"]
+        self.assertTrue(
+            any(f":{flag_path}:" in v or v.endswith(f":{flag_path}") for v in vols),
+            msg=f"--secrets={flag_path} names no bind-mount target "
+                f"(volumes: {vols})",
+        )
 
 
 class TestMakefileMcpSecretsRender(unittest.TestCase):

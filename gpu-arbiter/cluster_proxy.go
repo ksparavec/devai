@@ -25,25 +25,61 @@ type ClusterProxy struct {
 	Client *http.Client
 }
 
+// clusterResponseHeaderBudget bounds how long the head waits for a
+// worker to START answering, derived from the worker-side budget rather
+// than a hardcoded round number.
+//
+// The worst case a forwarded request can legitimately spend before the
+// first response byte, counted honestly against ensureBackendRunning:
+//
+//   - the target backend is already recreating for ANOTHER model, so
+//     this request parks on bs.recreateCond for up to one healthTimeout;
+//   - it then drains the backend it displaces (drainTimeout) and runs
+//     its OWN recreate, costing a second healthTimeout.
+//
+// Hence 2*health + drain (20.5 min at the defaults). A request queued
+// behind MORE than one unrelated recreate can still exceed this and get
+// a 502 -- that is a deliberate ceiling, not a bound the worker
+// promises to obey.
+//
+// The env is read from the HEAD's own process. Operators set these
+// fleet-wide by convention; a worker configured with a LARGER
+// HEALTH_TIMEOUT_SECONDS than its head will still be cut loose early.
+func clusterResponseHeaderBudget() time.Duration {
+	// envInt never returns <= 0: a missing or non-positive value falls
+	// back to the default, so the arithmetic below cannot go negative.
+	health := time.Duration(envInt("HEALTH_TIMEOUT_SECONDS", 600)) * time.Second
+	drain := time.Duration(envInt("DRAIN_TIMEOUT", 30)) * time.Second
+	return 2*health + drain
+}
+
 // NewClusterProxy returns a ClusterProxy with a sane default HTTP
 // client. Tests can replace Client to inject a fake transport.
 func NewClusterProxy(tokens *TokenStore) *ClusterProxy {
+	// Clone DefaultTransport rather than building one from scratch so
+	// proxy env vars, dialer defaults and HTTP/2 stay as configured.
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.ResponseHeaderTimeout = clusterResponseHeaderBudget()
 	return &ClusterProxy{
 		Token: tokens,
 		Client: &http.Client{
 			// No overall timeout: streaming responses can run
-			// arbitrarily long. The connection-level transport
-			// timeouts are inherited from http.DefaultTransport.
-			Timeout: 0,
+			// arbitrarily long. ResponseHeaderTimeout above cuts
+			// loose a worker that never starts answering at all.
+			Timeout:   0,
+			Transport: tr,
 		},
 	}
 }
 
 // Forward proxies the (already-read body) request from the head's
 // frontend to the chosen worker's inbound endpoint, then streams
-// the response back.
+// the response back. `backend` is the head frontend the request
+// arrived on; it travels as HeaderBackend so the worker dispatches
+// through the matching single-host request handler.
 func (p *ClusterProxy) Forward(
-	w http.ResponseWriter, r *http.Request, worker WorkerEntry, parsed MinimalRequest,
+	w http.ResponseWriter, r *http.Request, worker WorkerEntry,
+	parsed MinimalRequest, backend string,
 ) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -71,8 +107,9 @@ func (p *ClusterProxy) Forward(
 		}
 	}
 	upstream.Header.Set("Authorization", "Bearer "+tok)
-	upstream.Header.Set("X-Devai-Worker-Id", worker.WorkerID)
-	upstream.Header.Set("X-Devai-Original-Path", r.URL.Path)
+	upstream.Header.Set(HeaderWorkerID, worker.WorkerID)
+	upstream.Header.Set(HeaderOriginalPath, r.URL.Path)
+	upstream.Header.Set(HeaderBackend, backend)
 
 	start := time.Now()
 	resp, err := p.Client.Do(upstream)

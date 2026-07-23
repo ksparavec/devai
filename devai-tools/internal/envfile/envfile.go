@@ -16,9 +16,14 @@ var keyLineRE = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)=`)
 
 // SetKeys reads the .env file at path (an absent file is treated as
 // empty, not an error) and writes back a version where every key in
-// order has the value kv[key]: an existing uncommented "KEY=..." line is
-// replaced in place; a key with no existing line is appended at the end.
-// Every other line is preserved byte-for-byte.
+// order has the value kv[key]: EVERY existing uncommented "KEY=..." line
+// is replaced in place; a key with no existing line is appended at the
+// end. Every other line is preserved byte-for-byte.
+//
+// Rewriting every duplicate rather than just the first is load-bearing:
+// .env is last-line-wins, so rewriting only the first occurrence would
+// leave a later stale duplicate to win and the whole call would silently
+// have no effect on the value anything actually reads.
 func SetKeys(path string, order []string, kv map[string]string) error {
 	var lines []string
 	data, err := os.ReadFile(path)
@@ -34,10 +39,11 @@ func SetKeys(path string, order []string, kv map[string]string) error {
 		return err
 	}
 
-	pending := make(map[string]bool, len(order))
+	wanted := make(map[string]bool, len(order))
 	for _, k := range order {
-		pending[k] = true
+		wanted[k] = true
 	}
+	seen := make(map[string]bool, len(order))
 
 	for i, line := range lines {
 		m := keyLineRE.FindStringSubmatch(line)
@@ -45,14 +51,14 @@ func SetKeys(path string, order []string, kv map[string]string) error {
 			continue
 		}
 		key := m[1]
-		if pending[key] {
+		if wanted[key] {
 			lines[i] = fmt.Sprintf("%s=%s", key, kv[key])
-			delete(pending, key)
+			seen[key] = true
 		}
 	}
 
 	for _, k := range order {
-		if pending[k] {
+		if !seen[k] {
 			lines = append(lines, fmt.Sprintf("%s=%s", k, kv[k]))
 		}
 	}

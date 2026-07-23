@@ -1,8 +1,10 @@
 """Unit tests for the model-sync diff logic (Phase 4).
 
 Covers scripts/model-sync.py:plan_sync + is_probed -- classifying catalog
-rows into new / evaluated / excluded. The execution path (download + probe
-via subprocess) needs a GPU and is exercised by `make model-sync`, not here.
+rows into new / evaluated / excluded -- plus prune_ledger's guards and the
+try/finally that guarantees `make cache-up`. The execution path itself
+(download + probe via subprocess) needs a GPU and is exercised by
+`make model-sync`, not here: every _run below is stubbed.
 
     python3 -m unittest tests.python.test_model_sync
 """
@@ -11,6 +13,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -109,18 +112,141 @@ class TestExecuteBudget(unittest.TestCase):
         self.assertEqual({c[-1] for c in pulls}, {"NAME=M0", "NAME=M1"})
 
 
+class TestExecuteAlwaysRestoresTheStack(unittest.TestCase):
+    """`make cache-up` must run no matter how the probe phase ends -- a
+    failed probe used to leave the entire inference stack offline."""
+
+    ONE_NEW = {"new": [{"name": "M0", "backend": ["vllm"]}]}
+
+    def _spy(self, fake_run):
+        """(calls, spy) -- calls stays readable even when spy raises."""
+        calls: list[list[str]] = []
+
+        def spy(cmd):
+            calls.append(cmd)
+            return fake_run(cmd)
+
+        return calls, spy
+
+    def _execute(self, spy):
+        orig = ms._run
+        ms._run = spy
+        try:
+            return ms.execute(self.ONE_NEW, max_downloads=1)
+        finally:
+            ms._run = orig
+
+    def test_happy_path_order(self) -> None:
+        calls, spy = self._spy(lambda cmd: 0)
+        self.assertEqual(self._execute(spy), 0)
+        self.assertEqual(calls[1:], [["make", "cache-down"],
+                                     ["make", "probe-vllm"],
+                                     ["make", "probe-sglang"],
+                                     ["make", "cache-up"],
+                                     ["make", "probe"]])
+
+    def test_cache_up_runs_after_a_failing_probe(self) -> None:
+        calls, spy = self._spy(
+            lambda cmd: 2 if cmd == ["make", "probe-vllm"] else 0)
+        self.assertEqual(self._execute(spy), 2)       # original rc preserved
+        self.assertIn(["make", "cache-up"], calls)
+        self.assertNotIn(["make", "probe-sglang"], calls)  # aborted at failure
+        self.assertNotIn(["make", "probe"], calls)
+
+    def test_cache_up_runs_when_a_probe_raises(self) -> None:
+        def boom(cmd):
+            if cmd == ["make", "probe-sglang"]:
+                raise RuntimeError("podman vanished")
+            return 0
+
+        calls, spy = self._spy(boom)
+        with self.assertRaises(RuntimeError):        # original exception kept
+            self._execute(spy)
+        self.assertIn(["make", "cache-up"], calls)
+
+
+class TestPruneLedger(unittest.TestCase):
+    def _ledger(self, *names):
+        led = {"models": {}}
+        for n in names:
+            MS.record_exclusion(led, n, "vllm", "too_big", host_vram=24)
+        return led
+
+    def test_drops_only_rows_absent_from_the_catalog(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "ledger.json"
+            led = self._ledger("keep1", "keep2", "gone")
+            n = ms.prune_ledger([{"name": "keep1"}, {"name": "keep2"}], led,
+                                path=p)
+            self.assertEqual(n, 1)
+            self.assertEqual(set(led["models"]), {"keep1", "keep2"})
+            self.assertEqual(set(MS.load_ledger(p)["models"]),
+                             {"keep1", "keep2"})   # persisted
+
+    def test_nothing_stale_writes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "ledger.json"
+            led = self._ledger("a", "b")
+            self.assertEqual(ms.prune_ledger([{"name": "a"}, {"name": "b"}],
+                                             led, path=p), 0)
+            self.assertFalse(p.exists())
+
+    def test_empty_catalog_never_prunes(self) -> None:
+        # A missing / unreadable models.yaml loads as [] -- must be a no-op,
+        # not a wipe.
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "ledger.json"
+            led = self._ledger("a", "b")
+            self.assertEqual(ms.prune_ledger([], led, path=p), 0)
+            self.assertEqual(set(led["models"]), {"a", "b"})
+            self.assertFalse(p.exists())
+
+    def test_truncated_catalog_does_not_mass_prune(self) -> None:
+        # 3 of 4 rows suddenly "missing" looks like a truncated catalog, not
+        # a real removal -> refuse and leave the ledger alone.
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "ledger.json"
+            led = self._ledger("a", "b", "c", "d")
+            self.assertEqual(ms.prune_ledger([{"name": "a"}], led, path=p), 0)
+            self.assertEqual(set(led["models"]), {"a", "b", "c", "d"})
+            self.assertFalse(p.exists())
+
+
 class TestDryRunMain(unittest.TestCase):
     def test_dry_run_changes_nothing(self) -> None:
-        # --dry-run must never invoke execute(); patch it to detect a call.
+        # --dry-run must never invoke execute() or prune the ledger; patch
+        # both to detect a call.
         called = []
-        orig = ms.execute
-        ms.execute = lambda *a, **k: called.append(True) or 0
+        orig_exec, orig_prune = ms.execute, ms.prune_ledger
+        ms.execute = lambda *a, **k: called.append("execute") or 0
+        ms.prune_ledger = lambda *a, **k: called.append("prune") or 0
         try:
             rc = ms.main(["--dry-run", "--family", "nonexistent-family"])
         finally:
-            ms.execute = orig
+            ms.execute, ms.prune_ledger = orig_exec, orig_prune
         self.assertEqual(rc, 0)
-        self.assertEqual(called, [])  # execute never ran
+        self.assertEqual(called, [])
+
+    def test_prune_sees_the_unfiltered_catalog(self) -> None:
+        # --family scopes the PLAN, never the prune: pruning against a
+        # one-family subset would drop every other family's verdicts.
+        seen: dict = {}
+
+        def fake_prune(rows, ledger, **kw):
+            seen["names"] = [r["name"] for r in rows]
+            return 0
+
+        orig = (ms.load_catalog, ms.prune_ledger, ms.execute)
+        ms.load_catalog = lambda *a, **k: [
+            {"name": "A", "family": "f1", "backend": ["vllm"]},
+            {"name": "B", "family": "f2", "backend": ["vllm"]}]
+        ms.prune_ledger = fake_prune
+        ms.execute = lambda *a, **k: 0
+        try:
+            ms.main(["--family", "f1"])
+        finally:
+            ms.load_catalog, ms.prune_ledger, ms.execute = orig
+        self.assertEqual(seen["names"], ["A", "B"])
 
 
 if __name__ == "__main__":

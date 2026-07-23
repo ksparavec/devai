@@ -27,10 +27,23 @@ type TokenStore struct {
 	Path     string
 	CacheTTL time.Duration
 
+	// Now is the clock the cache TTL is measured against. nil means
+	// time.Now. Tests inject a fake so token rotation can be exercised
+	// across the production 30s TTL without sleeping 30 seconds.
+	Now func() time.Time
+
 	mu        sync.RWMutex
 	cached    string
 	lastRead  time.Time
 	lastError error
+}
+
+// now reads the injected clock, defaulting to time.Now.
+func (t *TokenStore) now() time.Time {
+	if t.Now != nil {
+		return t.Now()
+	}
+	return time.Now()
 }
 
 // NewTokenStore returns a store backed by `path`. CacheTTL caps how
@@ -43,8 +56,9 @@ func NewTokenStore(path string, cacheTTL time.Duration) *TokenStore {
 // Read returns the current token. Re-reads the file when the cached
 // value is older than CacheTTL, OR when CacheTTL == 0.
 func (t *TokenStore) Read() (string, error) {
+	now := t.now()
 	t.mu.RLock()
-	if t.CacheTTL > 0 && !t.lastRead.IsZero() && time.Since(t.lastRead) < t.CacheTTL && t.lastError == nil {
+	if t.CacheTTL > 0 && !t.lastRead.IsZero() && now.Sub(t.lastRead) < t.CacheTTL && t.lastError == nil {
 		v := t.cached
 		t.mu.RUnlock()
 		return v, nil
@@ -54,11 +68,11 @@ func (t *TokenStore) Read() (string, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	// Double-check after promotion to write lock.
-	if t.CacheTTL > 0 && !t.lastRead.IsZero() && time.Since(t.lastRead) < t.CacheTTL && t.lastError == nil {
+	if t.CacheTTL > 0 && !t.lastRead.IsZero() && now.Sub(t.lastRead) < t.CacheTTL && t.lastError == nil {
 		return t.cached, nil
 	}
 	data, err := os.ReadFile(t.Path)
-	t.lastRead = time.Now()
+	t.lastRead = now
 	if err != nil {
 		t.lastError = fmt.Errorf("read token at %s: %w", t.Path, err)
 		t.cached = ""

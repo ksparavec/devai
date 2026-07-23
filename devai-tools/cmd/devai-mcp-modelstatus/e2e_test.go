@@ -29,6 +29,15 @@ func TestStdioProtocolEndToEnd(t *testing.T) {
 		"--sglang-cache", filepath.Join(fixtures, "does-not-exist.json"),
 		"--bench-cache", filepath.Join(fixtures, "bench-cache.json"),
 	)
+	// list_fitting_models gates vLLM/SGLang rows on the weights being in
+	// the backend's store, so the child must not inherit this host's real
+	// /var/cache/devai/vllm (the fixture model is not in it, and on a host
+	// that has the directory at all the vLLM row would vanish). Point it
+	// at a fixture store holding just that model.
+	cmd.Env = append(os.Environ(),
+		"VLLM_MODELS_DIR="+fixtureStore(t, "Qwen3-8B-NVFP4"),
+		"SGLANG_MODELS_DIR="+filepath.Join(t.TempDir(), "no-sglang-store"),
+	)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -139,6 +148,23 @@ func mustGetwd(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return wd
+}
+
+// fixtureStore builds a throwaway VLLM_MODELS_DIR holding one model
+// directory per name, each with the config.json that marks weights as
+// present -- the same shape model-picker.py enumerates the real store with.
+func fixtureStore(t *testing.T, names ...string) string {
+	t.Helper()
+	dir := t.TempDir()
+	for _, name := range names {
+		if err := os.MkdirAll(filepath.Join(dir, name), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, name, "config.json"), []byte("{}"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
 }
 
 // repoFixturesDir resolves tests/fixtures/modelstatus relative to the repo

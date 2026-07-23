@@ -91,7 +91,7 @@ Use `make help` to list supported targets. Common commands:
   `FAMILY=qwen3.5` to scope to one family, `CONTEXT=32768` to bias the
   selection toward smaller-context fits, `DRY_RUN=1` to preview.
 - `make model-fit`: print which models fit at the chosen `(VRAM,
-  CONTEXT)`. Read-only diagnostic — never writes a file.
+  CONTEXT)`. Read-only diagnostic -- never writes a file.
 - `make ollama-list`: list downloaded Ollama models.
 - `make vllm-list`: list on-disk vLLM weights; backend is currently dormant.
 - `make logs SERVICE=devai-ollama`: tail a service's persisted stdout
@@ -99,25 +99,27 @@ Use `make help` to list supported targets. Common commands:
 - `make setup-logs`: one-time, sudo. Carve out a dedicated 100 GB
   thin LV in `vgais/cachepool` for `/var/cache/devai/logs` so log
   growth never crowds the model cache. `RECREATE=1` re-creates an
-  existing volume.
+  existing volume -- it destroys the LV and the mountpoint tree, so it
+  aborts on a non-empty target unless `WIPE=1` is set too (and
+  `make setup-logs` does not forward `WIPE`; call the script directly).
 - `make test-router`: Go router unit tests in a Go container (~2s).
 - `make test-ollama`: Ollama integration tests via the live router.
-- `make test-models`: matrix test over every probed digest × wire
-  protocol (`/api/chat`, `/v1/chat/completions`, `/v1/messages`) ×
+- `make test-models`: matrix test over every probed digest x wire
+  protocol (`/api/chat`, `/v1/chat/completions`, `/v1/messages`) x
   scenario (basic, tools, reasoning auto/off, ctx). Reads the probe
-  cache to enumerate cells (slow — minutes-to-tens-of-minutes).
+  cache to enumerate cells (slow -- minutes-to-tens-of-minutes).
 - `make test-vllm` / `make test-sglang`: live HF-backend integration
   tests through the router (cold-start chat, ctx switch, model switch
-  when ≥2 models cached, GPU exclusion, parameter forwarding).
+  when >=2 models cached, GPU exclusion, parameter forwarding).
   Skip cleanly when no fitting model is in the corresponding cache.
 - `make test-e2e`: bridges picker discovery, agent-command construction,
-  and a live router round-trip — proves the full picker→agent→router
+  and a live router round-trip -- proves the full picker->agent->router
   chain serves a real chat completion.
 - `make test-probe-vllm` / `make test-probe-sglang`: single-cell probe
   smoke tests with cache-schema assertion (require `cache-down` first).
 - `make test-probe-ollama-idempotent`: byte-identical regression check
   on the refactored Ollama prober.
-- `make test`: runs **every** available test in sequence — Go unit +
+- `make test`: runs **every** available test in sequence -- Go unit +
   Python unit + Ollama integration + matrix + vLLM/SGLang integration +
   E2E + probe smoke. Wall time 30-60+ min. Each layer skips cleanly
   when its prerequisites aren't met.
@@ -171,14 +173,14 @@ of truth for what fits. It is digest-keyed; each entry carries
 `probes[<vram_gb>][<ctx>]`. Each probe cell records `vram_gb`, `ctx`,
 `actual_total_gb`, `actual_vram_gb`, `fully_on_gpu`, per-cell
 capability, and timestamp. There is no `deploy/active-models.yaml`
-any more — the router and picker read this cache directly.
+any more -- the router and picker read this cache directly.
 
 The Ollama reasoning probe is in `scripts/probe-ollama-reasoning.py`.
 It loops the `(VRAM, CONTEXT)` matrix from
-`PROBE_VRAMS=16G,24G` × `PROBE_CONTEXTS=32K,64K,128K,256K`. Between
+`PROBE_VRAMS=16G,24G` x `PROBE_CONTEXTS=32K,64K,128K,256K`. Between
 VRAM bands the orchestrator recreates `devai-ollama` with
 `OLLAMA_GPU_OVERHEAD=(host_vram - target_vram) * 1024^3` so the daemon
-behaves as if it had only the target card — a 24 GB host can produce
+behaves as if it had only the target card -- a 24 GB host can produce
 cache cells valid for 16 GB targets without hardware swaps. Probing is
 incremental and never destructive: existing cells are immutable unless
 `PROBE_FORCE=1` (whole VRAM band) or `PROBE_FORCE_CTX=64K` (one tier).
@@ -197,7 +199,7 @@ support tools".
 session it derives a per-session tag `<parent>-ctx<N>` (e.g.
 `qwen3.5:9b-q8_0-ctx32768`) using Ollama's `/api/create` so
 `PARAMETER num_ctx N` is baked into the Modelfile. This makes the
-chosen context binding for every wire protocol — `/v1/chat/completions`
+chosen context binding for every wire protocol -- `/v1/chat/completions`
 (Ollama 0.21.x) silently ignores `options.num_ctx`, so per-session
 Modelfile overrides are the only universal mechanism. The router
 peels the `-ctx<N>` suffix when resolving capability/policy so the
@@ -222,13 +224,21 @@ Cluster + MCP + SkyPilot env knobs (full table in `docs/cluster-env.md`):
 - `DEVAI_HEAD_URL`, `DEVAI_WORKER_TOKEN_FILE`, `DEVAI_WORKER_NAME`,
   `DEVAI_LIFECYCLE`, `DEVAI_GPU_TYPE`, `DEVAI_BACKENDS`,
   `DEVAI_WORKER_INBOUND_PORT`: worker-side configuration.
-- `DEVAI_HEAD_LISTEN_PORT`, `DEVAI_IDLE_MINUTES`,
-  `DEVAI_QUEUE_DEPTH_THRESHOLD`: head-side configuration.
+- `DEVAI_HEAD_LISTEN_PORT`, `DEVAI_HEAD_TOKEN_FILE`,
+  `DEVAI_IDLE_MINUTES`, `DEVAI_QUEUE_DEPTH_THRESHOLD`: head-side
+  configuration. `DEVAI_HEAD_TOKEN_FILE` (default
+  `/run/devai/cluster-token`) is the bearer token the head requires on
+  `/v1/cluster/{register,heartbeat,status}` and presents on every
+  worker-bound `/v1/cluster/inbound` call.
 - `MCP_PORT`, `MCP_SECRETS_FILE`: MCP gateway (Phase 2 mounts the
   secrets file when set; default `/dev/null`).
 - `SKYPILOT_API_PORT`, `SKYPILOT_CREDENTIALS_FILE`,
-  `SKYPILOT_API_ENDPOINT`: SkyPilot fleet provisioner (head mode
-  reads `SKYPILOT_API_ENDPOINT`; unset = local-fleet-only routing).
+  `SKYPILOT_API_ENDPOINT`: SkyPilot fleet provisioner.
+  `SKYPILOT_API_ENDPOINT` is **not read by gpu-arbiter today** --
+  `skypilot_client.go` / `skypilot_policy.go` exist but
+  `NewSkyPilotClient` has no non-test caller, so setting it has no
+  effect and a head routes over the local fleet only. It stays as the
+  reserved name for that wiring (see `docs/cluster-env.md`).
 
 ## Coding Style & Naming Conventions
 

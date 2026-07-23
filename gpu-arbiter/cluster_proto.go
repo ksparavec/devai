@@ -101,6 +101,32 @@ type HeartbeatRequest struct {
 // cluster-mode decision 6.
 const HeartbeatInterval = 10 * time.Second
 
+// Head -> worker request headers on POST /v1/cluster/inbound. The
+// head's frontend listeners are one-per-backend (11434/5/6), so the
+// head is the only party that knows which backend the client asked
+// for -- the forwarded body carries no backend field. The worker
+// falls back to a model-name lookup when HeaderBackend is absent.
+const (
+	// HeaderBackend names the backend the head's frontend received
+	// the request on: "ollama" | "vllm" | "sglang".
+	HeaderBackend = "X-Devai-Backend"
+
+	// HeaderOriginalPath carries the client's original request path
+	// (e.g. /v1/chat/completions) so the worker can route it to the
+	// right upstream surface.
+	HeaderOriginalPath = "X-Devai-Original-Path"
+
+	// HeaderWorkerID echoes the head's chosen worker_id; informational
+	// (the worker logs it) -- the bearer token is what authenticates.
+	HeaderWorkerID = "X-Devai-Worker-Id"
+)
+
+// ClusterMaxBodyBytes bounds every body the cluster control plane and
+// the head frontends read into memory. Mirrors the single-host request
+// handler's cap: without it any peer that reaches the port can stream
+// an arbitrarily large body and exhaust RAM.
+const ClusterMaxBodyBytes = 32 << 20
+
 // CommandType enumerates the actions the head can request via a
 // heartbeat response. Unknown types are logged and ignored on the
 // worker side -- forward compatibility.

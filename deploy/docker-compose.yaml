@@ -1,21 +1,32 @@
 services:
+  # Loopback-only publish: apt-cacher-ng is an unauthenticated open HTTP
+  # proxy. Its only consumers reach it over loopback or over devai-net --
+  # image builds run `podman build --network=host` with
+  # APT_PROXY=http://localhost:3142 (host netns -> host loopback), and the
+  # egress-locked lab reaches it by service name on devai-lab-egress, which
+  # is unaffected by port publishing. Nothing documented reaches it from
+  # another host.
   apt-cache:
     image: sameersbn/apt-cacher-ng:latest
     container_name: devai-apt-cache
     hostname: apt-cache
     ports:
-      - "3142:3142"
+      - "127.0.0.1:3142:3142"
     volumes:
       - /var/cache/devai/apt:/var/cache/apt-cacher-ng
     networks: [default, devai-lab-egress]   # also reachable by the egress-locked lab
     restart: unless-stopped
 
+  # Loopback-only publish, same reasoning as apt-cache above: the mirror
+  # is an unauthenticated pull-through registry, and its only consumer is
+  # the host's own podman via deploy/registries.conf, which hardcodes
+  # `location = "localhost:5000"`.
   registry-cache:
     image: registry:2
     container_name: devai-registry-cache
     hostname: registry-cache
     ports:
-      - "5000:5000"
+      - "127.0.0.1:5000:5000"
     volumes:
       - /var/cache/devai/registry:/var/lib/registry
       - ./registry-config.yaml:/etc/docker/registry/config.yml:ro
@@ -156,6 +167,16 @@ services:
       # Per-model recovery flags + env. See header comment in the JSON
       # file for schema; loaded by gpu-arbiter/recovery_flags.go.
       - ./recovery-flags.json:/etc/devai/recovery-flags.json:ro
+      # The HF weight stores, read-only, at the SAME paths the router
+      # hands to libpod as the backend containers' bind source -- so
+      # VLLM_MODELS_DIR / SGLANG_MODELS_DIR need no translation between
+      # "path I mount into the engine" and "path I can stat myself".
+      # Used ONLY by checkModelWeights, which fails a launch fast when
+      # the probe cache advertises a model whose weights were never
+      # downloaded (the live SGLANG_MODELS_DIR gap). Read-only: the
+      # router must never write into a model store.
+      - ${VLLM_MODELS_DIR:-/var/cache/devai/vllm}:${VLLM_MODELS_DIR:-/var/cache/devai/vllm}:ro
+      - ${SGLANG_MODELS_DIR:-/var/cache/devai/sglang}:${SGLANG_MODELS_DIR:-/var/cache/devai/sglang}:ro
     depends_on:
       - ollama
     restart: unless-stopped
@@ -202,8 +223,14 @@ services:
     container_name: devai-mcp-gateway
     hostname: mcp-gateway
     restart: unless-stopped
+    # Loopback-only publish. This service holds a READ-WRITE podman socket
+    # (below) and must keep it rw -- creating per-call MCP server containers
+    # is its whole job -- so container-create here is equivalent to host
+    # root. Binding the published port to 127.0.0.1 is the mitigation: it
+    # keeps unauthenticated MCP tool calls off the LAN. Remote clients need
+    # an SSH tunnel or an authenticating reverse proxy in front.
     ports:
-      - "${MCP_PORT:-8088}:8088"
+      - "127.0.0.1:${MCP_PORT:-8088}:8088"
     environment:
       - MCP_GATEWAY_PORT=8088
     volumes:
@@ -224,7 +251,13 @@ services:
       - "--port=8088"
       - "--transport=streaming"
       - "--block-secrets"
-      - "--secrets=${MCP_SECRETS_PATH:-/dev/null}"
+      # Container-side path of the secrets mount above -- NOT an env-var
+      # indirection. It has to name the same path the volume entry binds
+      # to, otherwise a Phase 2 operator who renders /run/devai/mcp-secrets.env
+      # and sets MCP_SECRETS_FILE still hands the gateway an empty file.
+      # On Phase 1 installs the mount source is /dev/null, so this reads
+      # as an empty secrets file and Tier 2 servers simply stay unusable.
+      - "--secrets=/secrets/.env"
     security_opt:
       - "no-new-privileges:true"
     profiles: [mcp]
@@ -242,23 +275,56 @@ services:
     container_name: devai-skypilot-api-server
     hostname: skypilot-api-server
     restart: unless-stopped
+    # Loopback-only publish. `sky api start --deploy` binds 0.0.0.0 inside
+    # the container and ships NO authentication, so every endpoint below
+    # (POST /api/v1/launch, /exec, /down) is anonymous and spends real
+    # cloud money. 127.0.0.1 keeps it off the LAN; the gpu-arbiter head
+    # that calls it runs on this same host.
     ports:
-      - "${SKYPILOT_API_PORT:-46580}:46580"
+      - "127.0.0.1:${SKYPILOT_API_PORT:-46580}:46580"
     environment:
-      # Where SkyPilot reads its global config. Mounted from the
-      # named-volume so credential discovery survives restarts.
-      - SKYPILOT_GLOBAL_CONFIG=/root/.api-server-config.yaml
+      # Where SkyPilot reads its global config. Kept inside the
+      # skypilot-state named volume so it survives restarts -- it used
+      # to sit at /root/.api-server-config.yaml, which only persisted
+      # because the whole host $HOME was bind-mounted over /root.
+      - SKYPILOT_GLOBAL_CONFIG=/root/.sky/api-server-config.yaml
+    # Sourced into the process environment. The /secrets/.env mount below
+    # only puts the rendered file *on disk* -- nothing in `sky api start`
+    # reads it, so without this key the sops-rendered RUNPOD_API_KEY /
+    # LAMBDA_API_KEY / SKYPILOT_API_TOKEN never reach the server and a head
+    # doing cloud burst has no non-interactive credential path at all.
+    # Defaults to /dev/null, which compose parses as an empty env file, so
+    # Phase 1 installs without creds still boot.
+    env_file:
+      - ${SKYPILOT_CREDENTIALS_FILE:-/dev/null}
     volumes:
+      # rw: this is SkyPilot's own state dir (cluster registry, task
+      # logs, the provisioning SSH keypair it generates for itself).
       - skypilot-state:/root/.sky
-      # $HOME mount surfaces interactive-style cloud creds (~/.aws,
-      # ~/.config/gcloud, ~/.config/sky) -- the same mechanism the
-      # lab uses; matches skypilot-agent-skill.md decision 3.
-      - ${HOME}:/root:rw
+      # Narrowly-scoped, read-only cloud-credential mounts. These replace
+      # a `${HOME}:/root:rw` bind that also handed this container ~/.ssh
+      # and ~/.config/sops/age/keys.txt -- the age private key that
+      # decrypts every deploy/*.sops.env, whose non-recoverability is the
+      # whole basis of docs/secrets.md's recovery posture. Neither path is
+      # needed by `sky`: it generates its own provisioning keypair under
+      # ~/.sky (the rw volume above). ~/.ssh and ~/.config/sops must never
+      # be mounted here.
+      - ${HOME}/.aws:/root/.aws:ro
+      - ${HOME}/.config/gcloud:/root/.config/gcloud:ro
+      - ${HOME}/.config/sky:/root/.config/sky:ro
+      # RunPod and Lambda are the ONLY two clouds the fleet provisioner can
+      # actually pick -- gpu-arbiter/skypilot_policy.go's DefaultPricing has
+      # no aws or gcp rows, so PickCheapest never returns them. Paths match
+      # docs/skypilot-user-guide.md's setup steps (`runpod config` writes
+      # ~/.runpod/config.toml; Lambda's key goes in ~/.lambda_cloud/lambda_keys).
+      # The aws/gcloud mounts above stay for `sky check` and for operators
+      # who override the pricing table.
+      - ${HOME}/.runpod:/root/.runpod:ro
+      - ${HOME}/.lambda_cloud:/root/.lambda_cloud:ro
       # sops-rendered service credentials (RunPod / Lambda API keys).
-      # Defaults to /dev/null so Phase 1 installs without SkyPilot
-      # creds boot cleanly; operators rendering real creds set
-      # SKYPILOT_CREDENTIALS_FILE in .env to point at
-      # /run/devai/skypilot-credentials.env.
+      # Kept alongside the env_file above so the troubleshooting step in
+      # docs/skypilot.md (`ls -la /secrets/.env`) still shows whether the
+      # render happened. The env_file is what actually delivers the values.
       - ${SKYPILOT_CREDENTIALS_FILE:-/dev/null}:/secrets/.env:ro
     entrypoint: [tini]
     command:

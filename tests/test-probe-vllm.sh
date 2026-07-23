@@ -51,6 +51,20 @@ info "  cache file:   $CACHE_FILE"
 
 # Snapshot existing cache so the test can run idempotently — we restore
 # it on exit so a CI run doesn't leak state into the operator's cache.
+# The probe cache records what FITS, not what is DOWNLOADED, and the two
+# drift: on the reference host 16 vLLM rows are advertised while 5 have
+# weights. The prober correctly skips an absent model ("[skip] <name>: not on
+# disk"), writes no cell and exits 0 -- which would leave the schema assertion
+# below with nothing to assert. That is a host data condition, not a defect,
+# so report it as a skip (77) rather than a failure.
+MODELS_DIR="${VLLM_MODELS_DIR:-/var/cache/devai/vllm}"
+if [ ! -d "$MODELS_DIR" ] || ! ls -1 "$MODELS_DIR" 2>/dev/null | grep -Eq "$PROBE_MODEL"; then
+    echo "SKIP: no downloaded model under $MODELS_DIR matches '$PROBE_MODEL'" >&2
+    echo "      run 'make model-pull NAME=<catalog row>' to populate the store," >&2
+    echo "      or re-run with PROBE_MODEL=<regex matching a present model>." >&2
+    exit 77
+fi
+
 backup=""
 if [ -f "$CACHE_FILE" ]; then
     backup="$(mktemp)"

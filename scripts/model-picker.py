@@ -465,7 +465,10 @@ def _is_production_agentic(model: dict, bench_row: dict | None) -> bool:
     tasks = bench_row.get("tasks") or {}
     metrics = bench_row.get("metrics") or {}
     tools = _bench_score(tasks, "tools_use", "score")
-    he = _bench_score(tasks, "humaneval_", "pass@1")
+    # "humaneval_subset_" -- NOT bare "humaneval_", which also matches
+    # "humaneval_plus_subset_*" and would let the max-ran_at tiebreak
+    # gate the badge on HumanEval+ instead of plain HumanEval.
+    he = _bench_score(tasks, "humaneval_subset_", "pass@1")
     gsm = _bench_score(tasks, "gsm8k_", "score")
     leak = (tasks.get("leak_probe") or {}).get("leak_rate")
     peak = metrics.get("peak_vram_gb")
@@ -485,12 +488,13 @@ def _build_comparison_ctx(candidates: list[dict]) -> dict:
     preview pane can describe each model relative to its peers.
 
     Uses competition ranking (1, 2, 2, 4) — ties share a rank, the
-    next position skips. Models without a TOTAL score are excluded
+    next position skips. Models without any quality score are excluded
     from the rankings entirely; their preview will show ``--`` and
     skip the use-cases comparison line.
 
     Returns ``{"n_benched": int, "n_total": int, "ranks": {metric:
-    {id(m): rank}}}``. Empty when no candidate has bench data.
+    {id(m): rank}}}`` over tps / code / hevp / mmlu / gpqa / tools.
+    Empty when no candidate has bench data.
     """
     benched: list[tuple[dict, dict]] = []
     for m in candidates:
@@ -502,7 +506,7 @@ def _build_comparison_ctx(candidates: list[dict]) -> dict:
     if not benched:
         return ctx
     ranks: dict[str, dict[int, int]] = {}
-    for metric in ("tps", "code", "hevp", "mmlu", "gpqa"):
+    for metric in ("tps", "code", "hevp", "mmlu", "gpqa", "tools"):
         rmap: dict[int, int] = {}
         for m, s in benched:
             v = s.get(metric)
@@ -1974,6 +1978,11 @@ _USE_CASE_LABELS: dict[str, str] = {
     "doc_qa": "Doc Q&A",
 }
 
+# Score a normalised use-case term whose underlying bench task was never
+# run. Neutral (not 0.0, not 1.0) so a missing measurement neither
+# rewards nor punishes the model relative to one that was measured.
+_UNMEASURED_NEUTRAL = 0.5
+
 
 def _use_case_ratings(m: dict) -> list[tuple[str, float]] | None:
     """Score five typical use cases (0-100) from the model's bench metrics
@@ -1986,6 +1995,14 @@ def _use_case_ratings(m: dict) -> list[tuple[str, float]] | None:
     constraint for long-doc work), plus comprehension (MMLU), reasoning
     (GPQA, for Q&A) and faithfulness (1 - leak_rate). Weights are the ones
     validated against the fleet; tune here if doc lengths differ.
+
+    Unmeasured terms score ``_UNMEASURED_NEUTRAL`` rather than best- or
+    worst-case: an unrun leak probe used to read as PERFECT faithfulness
+    (1.0) while an unrun TPS read as ZERO throughput, which inflated the
+    doc-summary / doc-Q&A ranking of never-leak-tested models. Neutral is
+    applied to both, and the weights are left untouched so a partially
+    measured model's score stays on the same 0-100 scale as a fully
+    measured one (renormalising the surviving terms would not be).
     """
     s = m.get("_picker_scores") or {}
     hevp, code = s.get("hevp"), s.get("code")
@@ -1996,11 +2013,18 @@ def _use_case_ratings(m: dict) -> list[tuple[str, float]] | None:
     def z(x: object) -> float:
         return float(x) if isinstance(x, (int, float)) else 0.0
 
-    gsm, tps, leak = z(s.get("gsm")), z(s.get("tps")), z(s.get("leak"))
+    gsm = z(s.get("gsm"))
+    tps_raw, leak_raw = s.get("tps"), s.get("leak")
     ctx = int(m.get("_picker_context") or 0)
     ctx_n = min(ctx / 262144.0, 1.0) if ctx else 0.0   # 256K=1.0, 128K=0.5
-    tps_n = min(tps / 150.0, 1.0)
-    faith = 1.0 - min(leak, 1.0)
+    tps_n = (
+        min(float(tps_raw) / 150.0, 1.0)
+        if isinstance(tps_raw, (int, float)) else _UNMEASURED_NEUTRAL
+    )
+    faith = (
+        1.0 - min(float(leak_raw), 1.0)
+        if isinstance(leak_raw, (int, float)) else _UNMEASURED_NEUTRAL
+    )
     vals = {
         "coding":    0.70 * z(hevp) + 0.30 * z(code),
         "math":      0.55 * z(gpqa) + 0.30 * gsm + 0.15 * z(mmlu),
@@ -2049,9 +2073,9 @@ def _capability_summary_text(
 
     ``comparison`` is the dict returned by ``_build_comparison_ctx``;
     when present and the model has bench scores, a "Model properties"
-    section is appended with TPS / CODE / REAS / TOTAL plus per-metric
-    rank against the rest of the picker list, peak VRAM headroom,
-    steady-state TTFT, and a non-zero leak warning. The "Use cases"
+    section is appended with TOOLS / TPS / CODE / CODE+ / MMLU / GPQA
+    plus per-metric rank against the rest of the picker list, peak VRAM
+    headroom, steady-state TTFT, and a non-zero leak warning. The "Use cases"
     blurb gets one bench-derived sentence appended when the model is
     a per-metric leader or carries a noteworthy caveat.
     """
@@ -2164,10 +2188,12 @@ def _format_model_properties(m: dict, comparison: dict | None) -> str:
     string when there's no bench data to report.
 
     Layout (one line each, indented by 2 spaces):
+        TOOLS:  95.0%          (rank 1/9)  (agentic tool calling)
         TPS:    143.8 tok/s    (rank 1/9)
         CODE:   98.0%          (rank 1/9)
-        REAS:   99.7%          (rank 1/9)
-        TOTAL:  99.0%          (rank 1/9)
+        CODE+:  92.0%          (rank 1/9)
+        MMLU:   77.0%          (rank 1/9)
+        GPQA:   68.0%          (rank 1/9)
         Peak:   22.54 GB       (1.46 GB headroom under 24 GB cap)
         TTFT:   38 ms          (steady-state, post-warmup)
         Leaks:  7.5%           (3 of 40 prompts emitted special tokens)
@@ -2210,6 +2236,12 @@ def _format_model_properties(m: dict, comparison: dict | None) -> str:
         return f"  (rank {r}/{n})"
 
     lines: list[str] = ["Model properties:"]
+    tools = scores.get("tools")
+    if tools is not None:
+        lines.append(
+            f"  TOOLS:  {tools * 100:>5.1f}%{_rank_str('tools')}"
+            f"  (agentic tool calling)"
+        )
     tps = scores.get("tps")
     if tps is not None:
         lines.append(f"  TPS:    {tps:>6.1f} tok/s{_rank_str('tps')}")
@@ -2510,9 +2542,11 @@ def _build_menu(
     item_models.append(None)
     note = (
         "* = VRAM formula estimate.  "
+        "TOOLS = agentic tool calling.  "
         "CODE = HumanEval pass@1.  "
-        "REAS = 2/3*tools + 1/3*gsm8k.  "
-        "TOTAL = mean."
+        "CODE+ = HumanEval+ (hardened).  "
+        "MMLU = MMLU-Pro.  "
+        "GPQA = GPQA-Diamond."
     )
     lines.append(f"  {_DIM}{note}{_RESET}")
     selectable.append(False)
@@ -2865,6 +2899,145 @@ def _resolve_agent(agent_filter: str | None, model: dict) -> tuple[str, str, str
     return (agent_id, reasoning_mode, mtp_mode)
 
 
+# Reasoning / MTP marker tokens the arbiter's parseReasoningOverride and
+# parseMTPOverride recognise (gpu-arbiter/main.go). Anything else after a
+# trailing "::" is part of the model name and must survive the peel.
+_REASONING_MARKERS = frozenset(
+    {"nothink", "think", "off", "auto", "low", "medium", "high"})
+_MTP_MARKERS = frozenset({"mtp", "nomtp"})
+_CTX_SUFFIX_RE = re.compile(r"[+-]?\d+")
+
+
+def _peel_control_suffixes(name: str) -> str:
+    """Strip the router's control suffixes off a serving name.
+
+    Mirrors the arbiter's ``peelControlSuffixes`` (gpu-arbiter/main.go):
+    peel whichever of ``@<ctx>`` / ``::<mtp>`` / ``::<reasoning>`` is
+    currently trailing and loop until none remain, so the suffixes may
+    arrive in any order. Each peel is gated on the same sub-parser rules
+    the arbiter uses -- an ``@`` tail that is not a positive integer (HF
+    ``repo@sha``) and a ``::`` tail that is not a recognised marker token
+    are left alone, so a name that legitimately contains ``::`` or ``@``
+    survives untouched.
+    """
+    cur = name
+    while True:
+        at = cur.rfind("@")
+        if at >= 0:
+            tok = cur[at + 1:].strip()
+            if _CTX_SUFFIX_RE.fullmatch(tok) and int(tok) > 0:
+                cur = cur[:at]
+                continue
+        marker = cur.rfind("::")
+        if marker >= 0:
+            tok = cur[marker + 2:].strip().lower()
+            if tok in _MTP_MARKERS or tok in _REASONING_MARKERS:
+                cur = cur[:marker]
+                continue
+        return cur
+
+
+def _hf_probe_cache_paths(backend: str) -> list[str] | None:
+    """Probe-cache search path list for an HF backend, or None."""
+    return {
+        "vllm": _VLLM_PROBE_CACHE_PATHS,
+        "sglang": _SGLANG_PROBE_CACHE_PATHS,
+    }.get(backend)
+
+
+def _hf_entry_serveable(entry: dict | None) -> bool:
+    """True when an HF probe entry has at least one serveable cell.
+
+    Mirrors the menu's eligibility gate (`_hf_probes_for` +
+    `_vram_from_hf_probe`): the entry must not be an error/unsupported
+    probe, and at least one (vram, ctx) cell must have `fits` true with
+    `serving_ok` not explicitly false (absent = pre-load-probe cache).
+    Mere cache-key presence is NOT enough -- a failed probe writes a row
+    too, and routing to that backend would send the request to a port
+    the picker never offers the model on.
+    """
+    if not isinstance(entry, dict):
+        return False
+    if entry.get("capability") in (Capability.ERROR, Capability.UNSUPPORTED_ARCH):
+        return False
+    for band in (entry.get("probes") or {}).values():
+        if not isinstance(band, dict):
+            continue
+        for cell in band.values():
+            if not isinstance(cell, dict):
+                continue
+            if cell.get("fits") and cell.get("serving_ok") is not False:
+                return True
+    return False
+
+
+def _backend_for_model_name(name: str) -> str:
+    """Resolve the serving backend for a (possibly suffixed) model name.
+
+    Ollama is checked first: a mixed-KV Ollama row is emitted with a
+    pinned ``@<ctx>`` too (see the ``_resolve_kv_tier`` path), so the
+    old "``@`` means vLLM" shape heuristic sent it to the wrong router
+    port. A cache hit there is decisive.
+
+    For HF the resolver consults only the picker-exposed backends
+    (`_PICKER_HF_BACKENDS`) and only accepts a backend that actually has
+    a serveable cell for the model -- a model whose sole probe row is a
+    failed/non-fitting one is not offered on that backend, so routing to
+    it would be wrong.
+
+    Falls back to the old shape heuristic when nothing matches, so an
+    unprobed model behaves exactly as it did before.
+    """
+    base = _peel_control_suffixes(name)
+    candidates = (base, _strip_latest(base))
+    try:
+        ollama_records = _load_probe_records()
+    except (OSError, ValueError) as exc:
+        # Unreadable/corrupt Ollama cache: fall through to the HF caches
+        # and the heuristic rather than crashing the non-interactive
+        # launch path (the HF loader already degrades this way).
+        print(f"[picker] Ollama probe cache: {exc}", file=sys.stderr)
+        ollama_records = {}
+    if any(c in ollama_records for c in candidates):
+        return "ollama"
+    for backend in _PICKER_HF_BACKENDS:
+        paths = _hf_probe_cache_paths(backend)
+        if paths is None:
+            continue
+        records = _load_hf_probe_records(paths)
+        if any(_hf_entry_serveable(records.get(c)) for c in candidates):
+            return backend
+    return "vllm" if "@" in name else "ollama"
+
+
+def _serving_name(
+    base_name: str,
+    backend: str,
+    reasoning_suffix: str,
+    mtp_suffix: str,
+    selected_context: int,
+    ctx_pinned: bool,
+) -> str:
+    """Assemble the model name the agent command carries.
+
+    Canonical order is ``<name>::<reasoning>::<mtp>@<ctx>``.
+
+    Ollama: KV allocation is dynamic per request, so the name normally
+    rides bare. EXCEPTION: mixed-KV models (some tiers only fit with
+    quantized KV) pin ``@<ctx>`` so the router launches the chosen tier
+    with its probed KV dtype instead of defaulting to the largest
+    (quantized) tier -- dropping that pin silently costs long-chain
+    reasoning quality (GPQA ~-10 pts measured for q8_0).
+
+    vLLM / SGLang: ``@<ctx>`` is always pinned; it drives
+    ``--max-model-len`` / ``--context-length`` at container recreate.
+    """
+    if backend == "ollama":
+        ctx_suffix = f"@{selected_context}" if ctx_pinned else ""
+        return f"{base_name}{reasoning_suffix}{mtp_suffix}{ctx_suffix}"
+    return f"{base_name}{reasoning_suffix}{mtp_suffix}@{selected_context}"
+
+
 def main() -> None:
     # Non-interactive entry point. When devai-agent passes --prompt, both the
     # model and the agent are already chosen and there is no human at the
@@ -2884,11 +3057,10 @@ def main() -> None:
                 f"error: non-interactive --prompt currently supports "
                 f"--agent claude only, got {pref_agent!r}."
             )
-        # Backend selection: a per-session context suffix (`@<ctx>`) is the
-        # vLLM/SGLang launcher contract; bare names are Ollama. SGLang is
-        # not probed in INSTALL.md, so the @<ctx> path always means vLLM
-        # in the supported configuration.
-        backend = "vllm" if "@" in pref_model else "ollama"
+        # Backend selection comes from the probe caches, not from the
+        # name's shape: mixed-KV Ollama rows also carry a pinned
+        # `@<ctx>`, so keying off "@" would route them to the vLLM port.
+        backend = _backend_for_model_name(pref_model)
         cmd = _build(pref_agent, pref_model, backend)
         # _build returns ["claude", "--model", name]; splice in the
         # one-shot prompt right after the executable so the rest of the
@@ -3107,17 +3279,10 @@ def main() -> None:
         # so the router's right-to-left parse chain (ctx -> mtp ->
         # reasoning) lines up cleanly.
         mtp_suffix = "::mtp" if (_MTP_PREVIEW and mtp_mode == "on") else ""
-        if model["backend"] == "ollama":
-            # Ollama: KV allocation is dynamic per request, so the name
-            # normally rides bare. EXCEPTION: mixed-KV models (some tiers
-            # only fit with quantized KV) pin `@<ctx>` so the router
-            # launches the chosen tier with its probed KV dtype instead
-            # of defaulting to the largest (quantized) tier.
-            ctx_suffix = f"@{selected_context}" if ctx_pinned else ""
-            serving_name = f"{base_name}{reasoning_suffix}{mtp_suffix}{ctx_suffix}"
-        else:
-            # vLLM / SGLang: order is `<name>::<reasoning>::<mtp>@<ctx>`.
-            serving_name = f"{base_name}{reasoning_suffix}{mtp_suffix}@{selected_context}"
+        serving_name = _serving_name(
+            base_name, model["backend"], reasoning_suffix, mtp_suffix,
+            selected_context, ctx_pinned,
+        )
 
         cmd = _build(agent_id, serving_name, model["backend"])
         _record_pick(base_name, agent_id, selected_context)

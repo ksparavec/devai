@@ -203,7 +203,12 @@ a backend idle longer than the timeout is stopped and replaced with the
 When a request hits a different backend than the one currently on the
 GPU:
 1. Wait for the active backend's in-flight requests to drain
-   (`DRAIN_TIMEOUT`, default 30s).
+   (`DRAIN_TIMEOUT`, default 30s). "In-flight" means *already proxied
+   upstream* (`upstreamReqs`), not every request the arbiter has
+   accepted: requests still parked on the arbiter mutex are not waited
+   on. They cannot drain while the switch itself holds that mutex, so
+   counting them would stall every switch under load for the full
+   `DRAIN_TIMEOUT`.
 2. Ollama: send `keep_alive=0` to all loaded models so it releases
    VRAM. Other backends: stop their container.
 3. Recreate the target backend with the new model.
@@ -243,6 +248,15 @@ ctx / mtp keyword / reasoning keyword) and otherwise leaves the name
 unchanged, so a name that legitimately contains `::` or `@` survives
 intact, and every peel shortens the name so the loop always terminates.
 
+**Ollama: `@<ctx>` is what pins a tier.** A bare `<name>` is served
+from whatever tier is already loaded -- the router does not re-derive a
+tier per request and does not recreate the container to move to one.
+Only an explicit `<name>@<ctx>` (`ctxPinned`) can force a tier switch,
+and then only when the pinned tier differs from the running one. This
+matters for mixed-KV models, where different tiers were probed under
+different KV dtypes: the picker emits `@<ctx>` for exactly those, and a
+bare name simply reuses the resident tier.
+
 Examples:
 - `Qwen3-8B-NVFP4@65536` -> recreate vLLM with `--max-model-len 65536`,
   request body's `model` rewritten to `Qwen3-8B-NVFP4`.
@@ -278,7 +292,7 @@ backend's protocol path:
 | Backend / Path | Capability   | Action                                   |
 |----------------|--------------|------------------------------------------|
 | Ollama `/api/chat`, `/api/generate` | structured | inject `think: <true\|false>` |
-| Ollama `/v1/chat/completions`       | structured | inject `reasoning: {enabled: ...}` |
+| Ollama `/v1/chat/completions`       | structured | inject `reasoning_effort` (`low`/`medium`/`high`, or `none` to disable) |
 | Ollama `/v1/messages`               | structured | inject `thinking.type` |
 | vLLM `/v1/chat/completions`         | structured | inject `extra_body.chat_template_kwargs.enable_thinking` + `reasoning_effort` |
 | SGLang `/v1/chat/completions`       | structured | inject `extra_body.chat_template_kwargs.enable_thinking` + `separate_reasoning` |
@@ -365,15 +379,37 @@ ignore `options.num_ctx` -- for those the global
 vLLM/SGLang use `--max-model-len` / `--context-length` baked into the
 container at recreate time, not per-request injection.
 
-The vLLM entrypoint also always passes `--kv-cache-dtype fp8`. On the
-project's 24 GiB reference GPU this is what lets NVFP4 checkpoints
-(~18 GiB weights) cohabit with 128K-context KV. Default fp16 KV adds
-~7 GiB at 128K -- enough to push the total past 24 GiB. fp8 halves
+The vLLM entrypoint also passes `--kv-cache-dtype`, but the value is
+**per-model, not a global hardcode**. It is resolved from the probe
+cell covering the launch context (`resolveKVCacheType`): each cell is
+stamped with the KV dtype it was measured under, and a legacy cell with
+no stamp decodes to `fp8` -- the historical hardcode it was factually
+probed with. For SGLang an unstamped cell emits no flag at all (engine
+default). Probe-time and serve-time therefore always agree, which is
+the point: the fit data in the cache is only valid for the dtype it was
+measured under.
+
+fp8 KV is what lets NVFP4 checkpoints (~18 GiB weights) cohabit with
+128K-context KV on the project's 24 GiB reference GPU. Default fp16 KV
+adds ~7 GiB at 128K -- enough to push the total past 24 GiB. fp8 halves
 that to ~3.5 GiB, leaving room for activations and the engine's CUDA
 graph workspace. Blackwell exposes native fp8 so there is no
-throughput cost; older GPUs fall back to vLLM's fp8 emulation. The
-matching `--kv-cache-dtype fp8` is in `scripts/probe-vllm-reasoning.py`
-so probe-time fit data stays consistent with serve-time memory math.
+throughput cost; older GPUs fall back to vLLM's fp8 emulation. A model
+with VRAM slack can be re-probed with `PROBE_KV_CACHE_TYPE=auto` to
+serve unquantized KV instead -- there is no global dtype policy.
+
+On the Ollama side the same smallest-covering-tier rule now supplies
+`OLLAMA_FLASH_ATTENTION` as well, from the probe cell's own
+`flash_attention` stamp (`resolveFlashAttention`, sibling of
+`resolveKVCacheType`). It used to be derived purely from the KV dtype.
+That derivation is only half-true -- quantized KV requires flash
+attention, but a cell can equally have been probed with flash
+attention ON under the default `f16` dtype, and the dtype-derived
+value would then serve it WITHOUT flash, i.e. in a different
+environment from the one its fit was measured in. The stamp wins
+whenever present; pre-stamp cells keep the historical dtype-derived
+value. Both stamps are read from the SAME covering tier, so a launch
+always reproduces one probe cell.
 
 ## Per-model recovery flags
 
@@ -386,6 +422,7 @@ canonical case), the router appends additional flags from
 {
   "models": {
     "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4": {
+      "backends": ["vllm"],
       "engine_flags": ["--max-num-seqs", "8",
                        "--trust-remote-code",
                        "--enforce-eager"],
@@ -397,6 +434,44 @@ canonical case), the router appends additional flags from
     }
   }
 }
+```
+
+Per-entry keys:
+
+| Key            | Meaning                                                                 |
+|----------------|--------------------------------------------------------------------------|
+| `engine_flags` | CLI args appended after the parser block (and after `--max-num-seqs`, so a per-model value wins). |
+| `engine_env`   | Env vars merged into the recreated container.                             |
+| `backends`     | Optional allow-list (`["vllm"]`). Four cases, see below. |
+| `image`        | Optional per-model container image override, falling back to `$VLLM_IMAGE`. Needed when one checkpoint requires a different engine build than the global default. |
+
+`backends` exists because the rescue flags are mostly vLLM-only
+(`--language-model-only`, `--quantization modelopt`, `--max-num-seqs`,
+`VLLM_*` env) and were previously appended verbatim to SGLang launches,
+where those flags do not exist. All 10 current entries are scoped to
+`["vllm"]`.
+
+The full contract -- identical in `gpu-arbiter/recovery_flags.go` and
+`scripts/_probe_hf_common.py`, so probe and serve-time launches always
+agree on which entry applies:
+
+| `backends` value          | Meaning                                                     |
+|---------------------------|-------------------------------------------------------------|
+| key **absent** (or `null`) | Applies to EVERY backend. Backward compatible with pre-`backends` entries. |
+| key present, `[]`          | Applies to NO backend. This is the operator's disable switch for an entry -- absent and empty deliberately mean opposite things, which is why the Go decoder holds the field as a pointer. |
+| key present, list          | Applies only to the named backends.                          |
+| key present, **non-list**  | Malformed: logs a warning naming the model and is treated as ABSENT (applies everywhere). An explicit `null` is not warned about -- it is the absent case. |
+
+Decoding is **per-entry**: one malformed entry is skipped or degraded
+with a warning and never discards the rest of the registry. The
+canonical wording of this contract lives in the `_comment` header of
+`deploy/recovery-flags.json` and in the `recoveryEntry.Backends` doc
+comment.
+
+A skipped entry logs:
+
+```
+recovery registry: entry for <model> is scoped to [vllm] -- not applied to sglang
 ```
 
 `--enforce-eager` disables CUDA graph capture entirely, reclaiming the
@@ -475,7 +550,7 @@ Top-level fields used by the router:
 | `capability`      | smallest clean probe                  | reasoning policy                        |
 | `tool_parser`     | latest cell with `tool_parser` set    | engine launch flag, strip-tools gate    |
 | `reasoning_parser`| latest cell with `reasoning_parser` set | engine launch flag                    |
-| `disable_verified`| latest cell with `disable_verified`   | reasoning-disable gate                  |
+| `disable_verified`| latest cell with `disable_verified`   | reasoning-disable gate. A non-boolean value (e.g. the string `"error"` an older prober wrote on a failed disable probe) no longer fails the whole cache parse -- that one model degrades to "unknown" and the disable rewrite is simply not applied. |
 | `tool_mode`       | same cell as `tool_parser` (`evidence.tool.mode`) | tool-choice promotion       |
 | `probes[vram][ctx].fits` | per-cell verdict               | row eligibility, ProbedMaxCtx           |
 
@@ -546,7 +621,7 @@ the shell when invoking compose.
 | `IDLE_TIMEOUT`            | `0`     | seconds before an idle backend is auto-unloaded; `0` = never (keep-warm) |
 | `DRAIN_TIMEOUT`           | `30`    | seconds to wait for in-flight requests when switching backends     |
 | `HEALTH_TIMEOUT_SECONDS`  | `600`   | health-poll deadline for a *hung* load; a crashed engine fails fast via log/exit detection |
-| `MAX_CONCURRENT_REQUESTS`| `32`    | max in-flight requests per backend before HTTP 429; `0` = unlimited. Also sets the engine's `--max-num-seqs` / `--max-running-requests` |
+| `MAX_CONCURRENT_REQUESTS`| `32`    | max in-flight requests per backend before HTTP 429; `0` = unlimited **and** omits `--max-num-seqs` / `--max-running-requests` entirely (engine default). Any positive value is also passed to the engine as that flag. |
 
 ### Memory and context
 
@@ -699,8 +774,11 @@ Useful log lines:
 | `vllm plugin registry: ... loaded`             | plugin map consumed                       |
 | `vllm launch: model=X GB ... tool="Y" tool_plugin="Z"` | recreate spec                  |
 | `stopping <other-backend> (switching to <target>)` | GPU mutex switch                      |
-| `draining <backend> (N active requests)`       | drain-on-switch                          |
+| `draining <backend> (N requests in flight upstream)` | drain-on-switch (counts only requests already proxied upstream) |
 | `<backend> idle, stopping`                     | idle timeout fired                       |
+| `ERROR: <cache> failed to parse: ... -- ZERO <backend> models registered` | probe cache unreadable; the router will 404 every request for that backend and the picker lists none. Replaces the older `warning: probe cache parse failed`. |
+| `error: unloadOllama: keep_alive=0 for <model> failed/returned <status> -- GPU may still be held by ollama` | the Ollama unload that precedes a backend switch did not take; VRAM may still be held |
+| `recovery registry: entry for <model> is scoped to [vllm] -- not applied to sglang` | a per-model recovery entry was skipped because of its `backends` allow-list |
 
 ### Verify a single request end-to-end
 
@@ -753,6 +831,9 @@ Per (model, backend) pair, per run:
 |---|---|---|
 | Reasoning | GSM8K accuracy | inspect_ai task `gsm8k_subset_<n>` |
 | Coding | HumanEval pass@1 | inspect_ai task `humaneval_subset_<n>`, local subprocess sandbox |
+| Coding (hardened) | HumanEval+ pass@1 | inspect_ai task `humaneval_plus_subset_<n>` (EvalPlus test set) |
+| Knowledge | MMLU-Pro accuracy | inspect_ai task `mmlu_pro_subset_<n>` |
+| Hard reasoning | GPQA-Diamond accuracy | inspect_ai task `gpqa_subset_<n>` |
 | Tool use | Score + per-subcase breakdown | inspect_ai task `tools_use_<n>` (empty-schema, single-arg, multi-tool pick, result follow-up) |
 | Output cleanliness | Leak rate + per-marker hits | regex sweep over response bodies via `bench_latency_leak.py` |
 | Cold start | `ttft_ms_first` | First request to a freshly-recreated backend (cold container + weight load + KV alloc + prefill + first token) |
@@ -762,7 +843,7 @@ Per (model, backend) pair, per run:
 
 ### Cache file
 
-`deploy/.bench-cache.json`, schema v2, sorted-keys for diff-
+`deploy/.bench-cache.json`, schema v3, sorted-keys for diff-
 friendliness. Top-level layout:
 
 - `_meta.host_env_history` -- map keyed by 12-char SHA-256 id of
@@ -771,23 +852,30 @@ friendliness. Top-level layout:
   different days -> same id, so the table accumulates one entry per
   distinct environment.
 - `_meta.current_host_env_id` -- pointer to the most-recent run's id.
-- Bench rows -- keys `<repo>@<sha>::<backend>` for HF
-  (vllm/sglang) or `<digest>::<backend>` for Ollama. Each row stamps
-  `host_env_id` so consumers can spot mixed-provenance leaderboards.
-  The `::<backend>` suffix is mandatory; legacy keys without it are
-  migrated in-memory by `migrate_bench_cache_keys` on every load.
+- Bench rows -- keys `<repo>@<sha>::<backend>::<ctx>` for HF
+  (vllm/sglang) or `<digest>::<backend>::<ctx>` for Ollama, so the
+  same model benched at two contexts lands in two rows. Each row
+  stamps `host_env_id`, **and so does each task** -- the row-level id
+  describes the run that produced `metrics`, while a task keeps the id
+  of the run that actually produced it. The leaderboard's `Env` column
+  therefore renders every distinct id present in a row (comma-joined),
+  not just the row-level one. The `::<backend>` suffix is mandatory;
+  legacy keys without it are migrated in-memory by
+  `migrate_bench_cache_keys` on every load.
 
 Iterate with `is_row_key(key)` from `_bench_core.py` so `_meta` (and
 any future top-level meta blocks) are skipped. Schema is documented
 at the top of `scripts/bench/_bench_core.py::update_row`.
 
 Re-runs merge in (don't overwrite) so partial benches accumulate.
-`BENCH_FORCE=1` re-runs every task and **also** resets the row's
-`tasks` and `metrics` blocks before the new run starts -- preserving
-`first_benched_at`, refreshing `last_benched_at`, and stamping the
-current `host_env_id`. Without `--force`, individual tasks are
-skipped only when an entry with that exact subset name (e.g.
-`gsm8k_subset_100`) already exists.
+`update_row` is a **pure merge**: it does not clear anything.
+`BENCH_FORCE=1` re-runs every task, but only the tasks that actually
+completed are overwritten -- a task that errors out leaves its previous
+result (and that result's own `host_env_id`) in place. `first_benched_at`
+is preserved, `last_benched_at` refreshed, and the current
+`host_env_id` stamped on the row and on each re-run task. Without
+`--force`, individual tasks are skipped only when an entry with that
+exact subset name (e.g. `gsm8k_subset_100`) already exists.
 
 ### Make targets
 
@@ -804,13 +892,22 @@ Knobs (env vars; same idiom as `PROBE_*`):
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `BENCH_TASKS` | `gsm8k,humaneval,tools,leak` | comma-separated subset |
+| `BENCH_TASKS` | `gsm8k,humaneval,humaneval_plus,mmlu_pro,gpqa,tools,leak` | comma-separated subset |
 | `BENCH_REPO` | unset | regex filter on probe-cache top-level key |
 | `BENCH_FORCE` | unset | re-run tasks already cached |
 | `BENCH_N_GSM8K` | `100` | GSM8K subset size |
 | `BENCH_N_HUMANEVAL` | `50` | HumanEval subset size |
+| `BENCH_N_MMLU_PRO` | `100` | MMLU-Pro subset size |
+| `BENCH_N_GPQA` | `100` | GPQA-Diamond subset size |
 | `BENCH_N_TOOLS` | `20` | tools_use prompts (5 per subcase x 4 subcases) |
 | `BENCH_N_LEAK_PROMPTS` | `40` | latency/leak sweep prompts |
+
+> **Wall time.** The default task set grew: a plain `make bench` now
+> also runs `humaneval_plus` (n=50), `mmlu_pro` (n=100) and `gpqa`
+> (n=100) for every (model, backend, ctx), which is materially longer
+> than the old four-task sweep. The new total has not been measured.
+> `BENCH_TASKS=gsm8k,humaneval,tools,leak` restores the previous cheap
+> set.
 
 ### Adding a leak marker
 

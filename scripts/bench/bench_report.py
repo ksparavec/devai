@@ -33,7 +33,16 @@ DEFAULT_HOST_VRAM_GB = float(os.environ.get("GPU_MEMORY_GB", "24"))
 def _pick_score(tasks: dict, prefix: str, key: str) -> float | None:
     """Return ``tasks[<prefix>_*][<key>]`` for the first matching
     subset-keyed entry. Different runs may use different ``n``, so we
-    look for any task whose name starts with ``prefix``."""
+    look for any task whose name starts with ``prefix``.
+
+    Prefixes must be specific enough to name exactly one task family.
+    In particular HumanEval and HumanEval+ are separate benchmarks
+    written to the same row (``humaneval_subset_<n>`` and
+    ``humaneval_plus_subset_<n>``), so a bare ``humaneval_`` prefix
+    matches BOTH and publishes whichever happens to come first. Always
+    use ``humaneval_subset_`` / ``humaneval_plus_subset_`` -- never
+    bare ``humaneval_``. scripts/model-picker.py keys the same way.
+    """
     for tname, tdata in tasks.items():
         if tname.startswith(prefix) and isinstance(tdata, dict):
             v = tdata.get(key)
@@ -50,7 +59,7 @@ def _aggregate(row: dict) -> float | None:
     parts: list[float] = []
     for prefix, key in (
         ("gsm8k_", "score"),
-        ("humaneval_", "pass@1"),
+        ("humaneval_subset_", "pass@1"),
         ("tools_use", "score"),
     ):
         v = _pick_score(tasks, prefix, key)
@@ -78,6 +87,32 @@ def _kv_pressure_pct(peak_vram_gb: float | None, host_vram_gb: float) -> float |
     if peak_vram_gb is None or host_vram_gb <= 0:
         return None
     return float(peak_vram_gb) / float(host_vram_gb) * 100.0
+
+
+def _env_label(row: dict) -> str:
+    """Render the host environment(s) that produced this row.
+
+    ``host_env_id`` is stamped per task (each task's own provenance)
+    and on the row itself (the run that produced ``metrics``). A row
+    whose tasks were benched across several host environments -- e.g.
+    a forced re-run of the default tasks after a driver upgrade, which
+    leaves the sharper benches untouched -- renders every distinct id
+    so the mixed provenance is visible instead of being flattened to
+    the most recent one. Legacy rows carry only the row-level id.
+    """
+    ids: list[str] = []
+    row_id = row.get("host_env_id")
+    if isinstance(row_id, str) and row_id:
+        ids.append(row_id)
+    for tdata in (row.get("tasks") or {}).values():
+        if not isinstance(tdata, dict):
+            continue
+        tid = tdata.get("host_env_id")
+        if isinstance(tid, str) and tid and tid not in ids:
+            ids.append(tid)
+    if not ids:
+        return "-"
+    return ", ".join(sorted(ids))
 
 
 def _ctx_label(ctx: int) -> str:
@@ -141,18 +176,20 @@ def render(cache: dict, host_vram_gb: float = DEFAULT_HOST_VRAM_GB) -> str:
         )
         lines.append("")
     lines.append(
-        "| Model | Backend | CTX | Env | Agg | GSM8K | HumanEval | Tools | "
+        "| Model | Backend | CTX | Env | Agg | GSM8K | HumanEval | "
+        "HumanEval+ | Tools | "
         "Leak rate | TTFT first | TTFT p50 | TPS | Peak VRAM | KV % |"
     )
     lines.append(
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
     )
     for r in rows:
         row = r["row"]
         tasks = row.get("tasks") or {}
         metrics = row.get("metrics") or {}
         gsm = _pick_score(tasks, "gsm8k_", "score")
-        he = _pick_score(tasks, "humaneval_", "pass@1")
+        he = _pick_score(tasks, "humaneval_subset_", "pass@1")
+        hep = _pick_score(tasks, "humaneval_plus_subset_", "pass@1")
         tools = _pick_score(tasks, "tools_use", "score")
         leak = (tasks.get("leak_probe") or {}).get("leak_rate")
         ttft_first = metrics.get("ttft_ms_first")
@@ -162,11 +199,12 @@ def render(cache: dict, host_vram_gb: float = DEFAULT_HOST_VRAM_GB) -> str:
         kv_pct = _kv_pressure_pct(peak, host_vram_gb)
         # Round KV % to one decimal so the column stays narrow.
         kv_str = "-" if kv_pct is None else f"{kv_pct:.1f}%"
-        env_id = row.get("host_env_id") or "-"
+        env_id = _env_label(row)
         lines.append(
             f"| {r['model']} | {r['backend']} | {_ctx_label(r['ctx'])} | "
             f"{env_id} | {_fmt(r['agg'])} | "
-            f"{_fmt(gsm)} | {_fmt(he)} | {_fmt(tools)} | {_fmt(leak)} | "
+            f"{_fmt(gsm)} | {_fmt(he)} | {_fmt(hep)} | "
+            f"{_fmt(tools)} | {_fmt(leak)} | "
             f"{_fmt(ttft_first, ' ms')} | {_fmt(ttft_p50, ' ms')} | "
             f"{_fmt(tps, ' tok/s')} | {_fmt(peak, ' GB')} | {kv_str} |"
         )

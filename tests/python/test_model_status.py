@@ -1,8 +1,9 @@
 """Unit tests for the model exclusion ledger (Phase 3).
 
-Covers scripts/_model_status.py: record/load/save round-trip, the
-sha-stability and vram-stability rules of is_excluded (decision 2), clear,
-prune_to_catalog, and the CLI --clear. Stdlib unittest only.
+Covers scripts/_model_status.py: record/load/save round-trip, the atomic
+(tmp + os.replace) write, the sha-stability and vram-stability rules of
+is_excluded (decision 2), clear, prune_to_catalog, and the CLI --clear.
+Stdlib unittest only.
 
     python3 -m unittest tests.python.test_model_status
 """
@@ -13,6 +14,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
@@ -41,6 +43,38 @@ class TestRoundTrip(unittest.TestCase):
     def test_invalid_reason_rejected(self) -> None:
         with self.assertRaises(ValueError):
             MS.record_exclusion({}, "m", "vllm", "bogus")
+
+
+class TestAtomicSave(unittest.TestCase):
+    """save_ledger writes via tmp + os.replace, like the probe caches."""
+
+    def test_no_tmp_file_left_behind_on_success(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "ledger.json"
+            led = MS.load_ledger(p)
+            MS.record_exclusion(led, "m", "vllm", "too_big", host_vram=24)
+            MS.save_ledger(led, p)
+            self.assertEqual(sorted(f.name for f in Path(d).iterdir()),
+                             ["ledger.json"])
+
+    def test_crash_before_replace_leaves_old_ledger_intact(self) -> None:
+        # os.replace is the last step; a crash any time before it must leave
+        # the PREVIOUS ledger fully readable -- never a truncated JSON
+        # document that load_ledger would degrade to "nothing is excluded".
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "ledger.json"
+            led = MS.load_ledger(p)
+            MS.record_exclusion(led, "old", "vllm", "too_big", host_vram=24)
+            MS.save_ledger(led, p)
+            before = p.read_text()
+            MS.record_exclusion(led, "new", "vllm", "too_big", host_vram=24)
+            with mock.patch("os.replace", side_effect=OSError("boom")):
+                with self.assertRaises(OSError):
+                    MS.save_ledger(led, p)
+            self.assertEqual(p.read_text(), before)
+            on_disk = MS.load_ledger(p)
+            self.assertTrue(MS.is_excluded(on_disk, "old", "vllm", host_vram=24))
+            self.assertIsNone(MS.exclusion_reason(on_disk, "new", "vllm"))
 
 
 class TestStabilityRules(unittest.TestCase):

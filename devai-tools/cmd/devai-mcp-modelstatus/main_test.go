@@ -38,6 +38,9 @@ func testServer() *server {
 		probeCaches: map[string]modelcache.ProbeCache{"vllm": vllmCache},
 		benchCache:  benchCache,
 		httpClient:  &http.Client{Timeout: time.Second},
+		// weightStores deliberately nil: the deployed container mounts no
+		// weight volumes, so this is the degraded path (see
+		// TestListFittingModelsHandlerReportsMissingStore).
 	}
 }
 
@@ -49,6 +52,39 @@ func TestListFittingModelsHandler(t *testing.T) {
 	}
 	if len(out.Models) != 1 || out.Models[0].Name != "Qwen3-8B-NVFP4" {
 		t.Fatalf("Models = %+v, want one Qwen3-8B-NVFP4 row", out.Models)
+	}
+}
+
+// When the weight store cannot be seen the rows are probe-cache-only, and
+// the tool must say so rather than presenting them as verified-servable.
+func TestListFittingModelsHandlerReportsMissingStore(t *testing.T) {
+	srv := testServer()
+	_, out, err := srv.listFittingModels(context.Background(), nil, listFittingModelsInput{VRAMGB: 24, Context: 131072})
+	if err != nil {
+		t.Fatalf("listFittingModels: %v", err)
+	}
+	if len(out.Models) != 1 {
+		t.Fatalf("Models = %+v, want the un-gated row to survive the degradation", out.Models)
+	}
+	if len(out.Notes) != 1 {
+		t.Fatalf("Notes = %v, want one weights-check-skipped note", out.Notes)
+	}
+}
+
+// A visible store filters the list down to models whose weights are
+// actually on disk, and reports no note.
+func TestListFittingModelsHandlerGatesOnStore(t *testing.T) {
+	srv := testServer()
+	srv.weightStores = modelcache.WeightStores{"vllm": t.TempDir()}
+	_, out, err := srv.listFittingModels(context.Background(), nil, listFittingModelsInput{VRAMGB: 24, Context: 131072})
+	if err != nil {
+		t.Fatalf("listFittingModels: %v", err)
+	}
+	if len(out.Models) != 0 {
+		t.Fatalf("Models = %+v, want none -- the store has no weights for it", out.Models)
+	}
+	if len(out.Notes) != 0 {
+		t.Fatalf("Notes = %v, want none -- an empty store is an answer, not a degradation", out.Notes)
 	}
 }
 

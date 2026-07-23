@@ -489,8 +489,16 @@ def main() -> int:
     new_prefs["last_model"] = chosen_model
     new_prefs["last_agent"] = chosen_agent
     new_prefs["agent_session_file"] = session_path_for(chosen_agent, chosen_model)
+    # The back-channel file is written by the picker inside the container;
+    # a malformed `context` must not cost the user the rest of this run's
+    # preferences (model, agent, work dir). Keep the previous value.
     if pick.get("context"):
-        new_prefs["context"] = int(pick["context"])
+        try:
+            new_prefs["context"] = int(pick["context"])
+        except (TypeError, ValueError):
+            print(f"warning: ignoring non-numeric context "
+                  f"{pick['context']!r} from {PICK_BACK_CHANNEL.name}",
+                  file=sys.stderr)
 
     write_prefs(new_prefs)
     return rc

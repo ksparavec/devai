@@ -50,10 +50,21 @@ Recommended:
 | `DEVAI_GPU_TYPE`            | `unknown`              | Short label for routing                 |
 | `DEVAI_BACKENDS`            | `ollama,vllm,sglang`   | Comma-separated subset                  |
 | `DEVAI_WORKER_INBOUND_PORT` | `11444`                | TCP port for forwarded requests         |
-| `DEVAI_WORKER_HOST`         | `localhost`            | Hostname the head should use            |
+| `DEVAI_WORKER_HOST`         | `$(hostname)`          | Hostname the head should use            |
 
 The full per-variable reference lives in
 [docs/cluster-env.md](cluster-env.md).
+
+> **This image carries no probe caches.** A worker builds the full
+> single-host arbiter, and the arbiter derives its served model list
+> from `deploy/.ollama-reasoning-cache.json` /
+> `.vllm-reasoning-cache.json` / `.sglang-reasoning-cache.json`.
+> `deploy/Dockerfile.worker-bootstrap` bakes in only the arbiter
+> binary and the cloud-init script, so a bootstrap worker started
+> without those files mounted registers with **zero** models and
+> rejects every forwarded request. Mount (or bake) the caches -- plus
+> the podman socket and the model weights -- exactly as a single host
+> has them before expecting a bootstrap worker to serve.
 
 ## Cloud-init shape
 

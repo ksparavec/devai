@@ -14,6 +14,7 @@ Errors propagate verbatim. No exception swallowing.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -51,14 +52,47 @@ def _help_text(image: str, args: list[str], gpu: bool) -> str:
     return (r.stdout or "") + "\n" + (r.stderr or "")
 
 
+def _flag_present(flag: str, help_text: str) -> bool:
+    """True iff `flag` appears in `help_text` as a WHOLE CLI token.
+
+    A plain substring test silently passes a flag that upstream REMOVED
+    whenever its name is a prefix of a surviving one: `--kv-cache-dtype`
+    would "verify" against a help text that only offers
+    `--kv-cache-dtype-foo`, and `--model` against `--model-path`. That
+    defeats the entire purpose of this gate. Require the flag to be
+    bounded by a non-[word/dash] character on both sides, so `--flag=X`,
+    `--flag VALUE`, and `--flag, --no-flag` all still match.
+    """
+    return re.search(
+        rf"(?<![\w-]){re.escape(flag)}(?![\w-])", help_text) is not None
+
+
+def _abbreviation_hint(flag: str, help_text: str) -> str:
+    """If `flag` is a strict prefix of some advertised long option, name it.
+
+    argparse resolves an unambiguous prefix, so such a flag still *works*
+    today -- but only by accident: the moment upstream adds a second
+    option with the same prefix, every launch breaks with 'ambiguous
+    option'. And a renamed flag looks identical from here. Either way the
+    operator needs the real spelling, so surface it.
+    """
+    candidates = sorted({
+        m for m in re.findall(r"--[\w-]+", help_text)
+        if m != flag and m.startswith(flag)
+    })
+    if not candidates:
+        return ""
+    return f" (not advertised; prefix of {', '.join(candidates)})"
+
+
 def _check_flags(label: str, flags: dict, help_text: str) -> list[str]:
     """Return the list of flag names that are missing from help_text."""
     missing: list[str] = []
     for key, flag in sorted(flags.items()):
         if not isinstance(flag, str):
             continue
-        if flag not in help_text:
-            missing.append(f"{key}={flag}")
+        if not _flag_present(flag, help_text):
+            missing.append(f"{key}={flag}{_abbreviation_hint(flag, help_text)}")
     return missing
 
 

@@ -47,6 +47,7 @@ def vllm_command_args(
     reasoning_parser_plugin: str | None = None,
     tool_parser_plugin: str | None = None,
     speculative_config: str | None = None,
+    kv_cache_dtype: str | None = None,
 ) -> list[str]:
     """Build the vLLM serve arguments. Mirrors gpu-arbiter vllmEntrypoint.
 
@@ -66,7 +67,14 @@ def vllm_command_args(
     Mirrors the router's vllmEntrypoint emission so probe-time and
     serve-time launches use the same flag shape (and therefore the
     same memory math).
+
+    ``kv_cache_dtype`` -- explicit KV dtype for THIS launch. None means
+    "use the pass default" (``KV_CACHE_DTYPE``). The load probe passes
+    the dtype the target cell was fit-probed under so its serving
+    numbers describe the dtype the cell actually advertises (and the
+    router serves with), not whatever this pass happens to default to.
     """
+    dtype = KV_CACHE_DTYPE if kv_cache_dtype is None else kv_cache_dtype
     args = [
         "-m", "vllm.entrypoints.openai.api_server",
         "--model", f"/models/{model_name}",
@@ -74,19 +82,20 @@ def vllm_command_args(
         "--port", "11434",
         "--tensor-parallel-size", "1",
         "--max-model-len", str(max_ctx),
-        # KV-cache dtype for THIS probe pass (default fp8: halves KV
-        # memory vs fp16 -- on 24 GiB that's what makes 128K+ contexts
-        # on 18 GiB NVFP4 weights fit). Overridable per pass via
-        # PROBE_KV_CACHE_TYPE (e.g. `auto` to measure unquantized KV);
-        # each probed cell is stamped kv_cache_type so the router
-        # reproduces the measured dtype at serve time -- fit is only
-        # valid under the dtype it was measured with.
-        "--kv-cache-dtype", KV_CACHE_DTYPE,
         "--gpu-memory-utilization", f"{host_frac:.4f}",
         "--enable-prefix-caching",
         "--trust-remote-code",
         "--served-model-name", model_name,
     ]
+    # KV-cache dtype (default fp8: halves KV memory vs fp16 -- on 24 GiB
+    # that's what makes 128K+ contexts on 18 GiB NVFP4 weights fit).
+    # Overridable per pass via PROBE_KV_CACHE_TYPE (e.g. `auto` to measure
+    # unquantized KV) and per launch via the kv_cache_dtype kwarg; each
+    # probed cell is stamped kv_cache_type so the router reproduces the
+    # measured dtype at serve time -- fit is only valid under the dtype it
+    # was measured with. Empty string = no flag = engine default.
+    if dtype:
+        args.extend(["--kv-cache-dtype", dtype])
     if reasoning_parser_plugin:
         args.extend(["--reasoning-parser-plugin", reasoning_parser_plugin])
     if reasoning_parser:

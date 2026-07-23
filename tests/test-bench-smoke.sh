@@ -66,7 +66,14 @@ metrics = row.get("metrics") or {}
 
 probs = []
 if not any(k.startswith("gsm8k_") for k in tasks):     probs.append("missing gsm8k task")
-if not any(k.startswith("humaneval_") for k in tasks): probs.append("missing humaneval task")
+# A bare "humaneval_" prefix also matches "humaneval_plus_subset_*", so a
+# run where plain HumanEval failed but HumanEval+ succeeded would pass.
+# Assert each separately (the smoke run uses DEFAULT_TASKS, which includes
+# both humaneval and humaneval_plus).
+if not any(k.startswith("humaneval_subset_") for k in tasks):
+    probs.append("missing humaneval task")
+if not any(k.startswith("humaneval_plus_subset_") for k in tasks):
+    probs.append("missing humaneval_plus task")
 if not any(k.startswith("tools_use") for k in tasks):  probs.append("missing tools_use task")
 if "leak_probe" not in tasks:                          probs.append("missing leak_probe task")
 if metrics.get("peak_vram_gb", 0) <= 0:                probs.append("peak_vram_gb not populated")

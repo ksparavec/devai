@@ -181,24 +181,24 @@ Note: If `.env` exists with `CONTAINER_RUNTIME` set, that value is used as defau
 
 ```
 ansible/
-├── bootstrap.sh              # Entry point (installs prerequisites + runs Ansible)
-├── ansible.cfg               # Ansible configuration (become=false)
-├── requirements.yml          # Galaxy collection requirements
-├── inventory/
-│   └── localhost.yml
-├── group_vars/
-│   └── all.yml               # All configurable paths and versions
-├── playbooks/
-│   └── install-cloud-tools.yml
-└── roles/
-    ├── podman/               # Container runtime (requires sudo)
-    ├── docker/               # Container runtime (requires sudo)
-    ├── aws_cli/
-    ├── azure_cli/
-    ├── gcloud/
-    ├── terraform/
-    ├── kubectl/
-    └── kustomize/
++-- bootstrap.sh              # Entry point (installs prerequisites + runs Ansible)
++-- ansible.cfg               # Ansible configuration (become=false)
++-- requirements.yml          # Galaxy collection requirements
++-- inventory/
+|   +-- localhost.yml
++-- group_vars/
+|   +-- all.yml               # All configurable paths and versions
++-- playbooks/
+|   +-- install-cloud-tools.yml
++-- roles/
+    +-- podman/               # Container runtime (requires sudo)
+    +-- docker/               # Container runtime (requires sudo)
+    +-- aws_cli/
+    +-- azure_cli/
+    +-- gcloud/
+    +-- terraform/
+    +-- kubectl/
+    +-- kustomize/
 ```
 
 ### Available Roles and Tags

@@ -14,6 +14,9 @@ Usage:
     scripts/select-models.py --vram 16 --context 32768
     scripts/select-models.py --download              # pull missing best-fit
     scripts/select-models.py --prune                 # delete on-disk strays
+    scripts/select-models.py --name <n> --download --hf-store sglang
+                                                     # pull into the SGLang
+                                                     # store (separate volume)
 
 Errors (network, disk, subprocess) propagate verbatim.
 """
@@ -61,6 +64,29 @@ VLLM_MODELS = Path(
     os.environ.get("VLLM_MODELS_DIR",
                    "/var/cache/devai/vllm")
 )
+SGLANG_MODELS = Path(
+    os.environ.get("SGLANG_MODELS_DIR",
+                   "/var/cache/devai/sglang")
+)
+
+# vLLM and SGLang read weights from SEPARATE volumes (see CLAUDE.md's
+# /var/cache/devai mount-point convention): devai-vllm mounts VLLM_MODELS_DIR,
+# devai-sglang mounts SGLANG_MODELS_DIR, and the probe targets pass each dir
+# to its own prober. A model downloaded for one backend is therefore INVISIBLE
+# to the other. They are distinct filesystems, so hardlinking across them is
+# impossible and copying doubles hundreds of GB -- which is why the download
+# destination is an explicit opt-in (--hf-store) and never an automatic
+# duplication. `sglang_weight_gaps` catches the other half of the problem:
+# weights the SGLang probe cache advertises but the SGLang store does not have.
+HF_STORES = {"vllm": VLLM_MODELS, "sglang": SGLANG_MODELS}
+HF_STORE = "vllm"            # active store for this run; set by main()
+
+
+def hf_store_dir() -> Path:
+    """Directory HF/safetensors weights are read from and written to."""
+    return HF_STORES[HF_STORE]
+
+
 OLLAMA_CONTAINER = os.environ.get("OLLAMA_CONTAINER", "devai-ollama")
 CONTAINER_RUNTIME = os.environ.get("CONTAINER_RUNTIME", "podman")
 HF_CLI = os.environ.get("HF_CLI", "hf")
@@ -214,13 +240,20 @@ def ollama_on_disk(name: str) -> bool:
 
 
 def hf_on_disk(display_name: str) -> bool:
-    """HF/NVFP4 models live at VLLM_MODELS/<display_name>/config.json."""
-    return (VLLM_MODELS / display_name / "config.json").is_file()
+    """HF/NVFP4 models live at <hf store>/<display_name>/config.json."""
+    return (hf_store_dir() / display_name / "config.json").is_file()
 
 
 def is_downloaded(model: dict) -> bool:
     source = model.get("source")
     if source == "ollama":
+        return ollama_on_disk(model["name"])
+    # A gguf row is "downloaded" once `pull_gguf` has run `ollama create`
+    # under the catalog tag — the GGUF bytes then live in Ollama's blob
+    # store exactly like a registry-pulled tag. Checking the staging file
+    # instead would miss tags imported before a staging wipe (and re-pull
+    # multiple GB on every run).
+    if source == "gguf":
         return ollama_on_disk(model["name"])
     if source == "hf":
         return hf_on_disk(model["name"])
@@ -239,7 +272,7 @@ def pull_ollama(name: str) -> None:
 
 
 def pull_hf(display_name: str, repo: str) -> None:
-    target = VLLM_MODELS / display_name
+    target = hf_store_dir() / display_name
     target.mkdir(parents=True, exist_ok=True)
     print(f"  hf download {repo} → {target} ...", flush=True)
     rc = subprocess.call([HF_CLI, "download", repo, "--local-dir", str(target)])
@@ -340,10 +373,11 @@ def _dir_bytes(p: Path) -> int:
 def reclaim_bytes(model: dict) -> int:
     """Return the number of bytes that would be freed by deleting this model."""
     if model["source"] == "hf":
-        target = VLLM_MODELS / model["name"]
+        target = hf_store_dir() / model["name"]
         return _dir_bytes(target) if target.is_dir() else 0
-    if model["source"] == "ollama":
+    if model["source"] in ("ollama", "gguf"):
         # Weight layer is the big one; read it from the manifest file.
+        # gguf rows live in the same manifest tree once `ollama create` ran.
         name = model["name"]
         if ":" not in name:
             return 0
@@ -361,7 +395,7 @@ def reclaim_bytes(model: dict) -> int:
 
 
 def delete_hf(display_name: str) -> None:
-    target = VLLM_MODELS / display_name
+    target = hf_store_dir() / display_name
     if not target.is_dir():
         return
     print(f"  rm -rf {target} ...", flush=True)
@@ -380,7 +414,11 @@ def delete_ollama(name: str) -> None:
 
 
 def delete(model: dict) -> None:
-    if model["source"] == "ollama":
+    # gguf rows are registered as ordinary Ollama tags by `ollama create`,
+    # so `ollama rm` is the correct removal path. The staged GGUF file under
+    # GGUF_STAGING is deliberately left in place (see pull_gguf's docstring:
+    # it exists to re-import after a blob-store wipe).
+    if model["source"] in ("ollama", "gguf"):
         delete_ollama(model["name"])
     elif model["source"] == "hf":
         delete_hf(model["name"])
@@ -395,9 +433,14 @@ def shadow_ollama_tags(catalog_models: list[dict]) -> list[str]:
     not in the full catalog (e.g. hand-made aliases from `ollama cp`).
 
     These are the reason `ollama rm` of a catalog tag often reclaims no
-    space: a shadow alias still references the shared blobs."""
+    space: a shadow alias still references the shared blobs.
+
+    gguf rows count as catalog names too: `pull_gguf` registers them under
+    the catalog tag via `ollama create`, so they appear in the same manifest
+    tree. Omitting them made every imported GGUF look like a hand-made alias
+    and put it on the --prune-shadows chopping block."""
     catalog_names = {m["name"] for m in catalog_models
-                     if m.get("source") == "ollama"}
+                     if m.get("source") in ("ollama", "gguf")}
     found: list[str] = []
     if not OLLAMA_MANIFESTS.exists():
         return found
@@ -580,6 +623,156 @@ class HFProbeCaches:
                     if isinstance(cell, dict) and cell.get("fits"):
                         return True
         return False
+
+    def entry_fits(self, repo: str, sha: str, backend: str) -> bool:
+        """True iff this (repo, sha) has at least one fits=true cell."""
+        entry = self.lookup(repo, sha, backend)
+        for band in (entry.get("probes") or {}).values():
+            if not isinstance(band, dict):
+                continue
+            for cell in band.values():
+                if isinstance(cell, dict) and cell.get("fits"):
+                    return True
+        return False
+
+
+def sglang_weight_gaps(
+    models: list[dict], hf_caches: HFProbeCaches,
+) -> list[str]:
+    """Catalog rows the SGLang probe cache advertises but SGLANG_MODELS lacks.
+
+    The SGLang store is a different volume from the vLLM store, so a model
+    pulled by the (vLLM-defaulted) download path leaves no weights where
+    devai-sglang looks. Any such row is advertised by the picker and fails at
+    launch on a path with no config.json -- the "advertised but absent" state
+    this check exists to make impossible to miss.
+    """
+    gaps: list[str] = []
+    for m in models:
+        if m.get("source") != "hf":
+            continue
+        if "sglang" not in (m.get("backend") or []):
+            continue
+        if not hf_caches.entry_fits(m.get("repo") or "", m.get("sha") or "",
+                                    "sglang"):
+            continue
+        if (SGLANG_MODELS / m["name"] / "config.json").is_file():
+            continue
+        gaps.append(m["name"])
+    return gaps
+
+
+def report_sglang_weight_gaps(gaps: list[str], fatal: bool,
+                              requested: str | None = None) -> None:
+    """Print the advertised-but-absent banner on stderr.
+
+    `fatal` only changes the wording and the closing line: the caller decides
+    whether to exit. Everything goes to stderr so the fit table on stdout
+    stays machine-readable (and stays printed at all -- this banner must not
+    replace the read-only diagnostic).
+
+    `requested` is the `--name` argument when this is a pull-by-exact-name
+    run. It only steers the closing line -- the gap list itself is always the
+    whole catalog's, because a broken advertisement is not scoped by what this
+    particular run happens to be pulling.
+    """
+    label = "error" if fatal else "warning"
+    w = sys.stderr
+    print(file=w)
+    print(f"  {label}: {len(gaps)} model(s) advertised as SGLang-fitting "
+          f"by {SGLANG_PROBE_CACHE.name} have no weights under "
+          f"{SGLANG_MODELS}:", file=w)
+    for name in gaps:
+        print(f"    - {name}", file=w)
+    print(file=w)
+    print("  devai-sglang mounts a different volume than devai-vllm, "
+          "so weights pulled", file=w)
+    print("  for vLLM are invisible to SGLang. Copying is a second "
+          "full copy of the", file=w)
+    print("  weights, so it is never done implicitly. Repair by "
+          "pulling into the", file=w)
+    print("  SGLang store (one command per model):", file=w)
+    for name in gaps:
+        print(f"    python3 scripts/select-models.py --name {name} "
+              f"--download --hf-store sglang", file=w)
+    print(file=w)
+    print("  ... or drop 'sglang' from the row's backends and re-run "
+          "`make probe-sglang`", file=w)
+    print("  to clear the stale cells.", file=w)
+    if fatal and requested:
+        print(f"  '{requested}' is one of the rows above, and this run would "
+              f"pull it into the", file=w)
+        print("  vLLM store -- leaving the SGLang gap exactly as it is. Add "
+              "--hf-store sglang", file=w)
+        print("  to repair it, or --ignore-store-gaps / IGNORE_STORE_GAPS=1 "
+              "to pull into the", file=w)
+        print("  vLLM store anyway.", file=w)
+    elif fatal:
+        print("  To download anyway, pass --ignore-store-gaps or set "
+              "IGNORE_STORE_GAPS=1", file=w)
+        print("  (works through the make targets, which have no flag).",
+              file=w)
+    elif requested:
+        print(f"  '{requested}' is not one of the rows above, so this run "
+              f"proceeds; it neither", file=w)
+        print("  causes nor repairs the gap(s) listed.", file=w)
+    else:
+        print("  Nothing was changed by this run; the fit table below is "
+              "unaffected.", file=w)
+    print(file=w)
+
+
+def enforce_sglang_store_gaps(models: list[dict], args) -> None:
+    """Report advertised-but-absent SGLang weights; abort when it matters.
+
+    The rule, in one sentence: **warn on every run that could be misled by a
+    gap, and fail only when the run is about to act on a model that IS in the
+    gap.** Concretely:
+
+      * read-only run (no --download)  -> warn, exit 0. `make model-fit`
+        promises no writes, and refusing to print the fit table is not a
+        repair.
+      * enumerating --download run     -> fatal. It picks trial candidates
+        off the same probe cache that is lying about the SGLang store, so
+        every decision it makes is downstream of the wrong picture.
+      * --name <X> --download          -> fatal iff X is itself a gap row.
+        Pulling X into the vLLM store cannot repair X's SGLang gap, so
+        succeeding silently is what the original finding was about. When X
+        is NOT a gap row the operator asked for a specific, unrelated model:
+        refusing to download it because some OTHER row's SGLang weights are
+        missing would be wrong, so that run warns and proceeds.
+
+    Placement matters: this used to sit after main()'s --name short-circuit,
+    which made it unreachable for `make model-sync` -- the one caller that
+    downloads unattended (model-sync shells out to `make model-pull
+    NAME=<row>`, and the Makefile forwards NAME as --name). It is now called
+    from both paths.
+
+    The fatal-iff-requested rule cannot wedge that unattended loop, for two
+    independent reasons. Structurally: a gap row is BY DEFINITION already in
+    the SGLang probe cache (that is what "advertised" means), so model-sync's
+    plan_sync classifies it `evaluated`, and only `new` rows are ever pulled
+    by name. And defensively: model-sync's execute() logs a non-zero per-row
+    rc and moves on rather than aborting the run.
+
+    Skipped entirely when --hf-store sglang is active (that run IS the repair
+    route) or when --ignore-store-gaps / $IGNORE_STORE_GAPS opts out.
+    """
+    if args.hf_store == "sglang" or args.ignore_store_gaps:
+        return
+    gaps = sglang_weight_gaps(models, load_hf_probe_caches())
+    if not gaps:
+        return
+    # argparse defaults --name to "" rather than None, and main() gates the
+    # short-circuit on `if args.name:`. Normalise to None so an unset --name
+    # reads as "this run enumerates" and not as a request for the row named
+    # "" (which is in no gap list, and would silently de-fang the enumerating
+    # download abort).
+    requested = (getattr(args, "name", "") or "").strip() or None
+    fatal = bool(args.download) and (not requested or requested in gaps)
+    report_sglang_weight_gaps(gaps, fatal=fatal, requested=requested)
+    if fatal:
+        sys.exit(1)
 
 
 def load_hf_probe_caches() -> HFProbeCaches:
@@ -1351,6 +1544,23 @@ def main() -> None:
                     help="Comma-separated contexts for matrix mode "
                          "(default 32K,64K,128K,256K). Ignored when --context "
                          "is set.")
+    ap.add_argument("--hf-store", choices=sorted(HF_STORES), default="vllm",
+                    help="Which HF weight store this run reads and writes: "
+                         "'vllm' ($VLLM_MODELS_DIR, the default) or 'sglang' "
+                         "($SGLANG_MODELS_DIR). They are separate volumes, so "
+                         "downloading for SGLang is an explicit opt-in -- it "
+                         "costs a second full copy of the weights.")
+    ap.add_argument("--ignore-store-gaps", action="store_true",
+                    default=os.environ.get("IGNORE_STORE_GAPS", "").lower()
+                            in ("1", "true", "yes"),
+                    help="Suppress the warning printed when the SGLang probe "
+                         "cache advertises a model whose weights are absent "
+                         "from the SGLang store. Read-only runs only warn; a "
+                         "--download run aborts (with --name, only when the "
+                         "named model is itself one of the gaps), and this "
+                         "flag lets it proceed. Also settable as "
+                         "$IGNORE_STORE_GAPS, since the make targets pass no "
+                         "flag for it.")
     ap.add_argument("--kv-dtype", choices=list(KV_BYTES), default="fp16")
     ap.add_argument("--min-vram-fraction", type=float,
                     default=float(os.environ.get("MIN_VRAM_FRACTION", "0.5")),
@@ -1382,6 +1592,9 @@ def main() -> None:
                          "footer. Prunable on-disk rows are always shown.")
     args = ap.parse_args()
 
+    global HF_STORE
+    HF_STORE = args.hf_store
+
     if not CATALOG.is_file():
         sys.exit(f"error: {CATALOG} does not exist — run `make catalog-regen` first")
     cfg = yaml.safe_load(CATALOG.read_text()) or {}
@@ -1397,12 +1610,31 @@ def main() -> None:
             sys.exit(f"error: no model named '{args.name}' in catalog")
         if not args.download:
             sys.exit("error: --name requires --download (the Makefile passes it)")
+        # After the name is known to be real, before anything is pulled: this
+        # is the route `make model-sync` downloads through, so it is exactly
+        # where the gap must be visible. Fatal only when args.name is itself
+        # a gap row -- see enforce_sglang_store_gaps.
+        enforce_sglang_store_gaps(models, args)
         if not args.dry_run:
             print(f"  → {args.name}  ({match[0].get('source', '?')})")
             pull(match[0])
         else:
             print(f"  --dry-run: would pull {args.name}")
         return
+
+    # ── SGLang store gap check ──────────────────────────────────────────
+    # A model the SGLang probe cache reports as fitting but whose weights are
+    # absent from the SGLang store gets advertised by the picker and then dies
+    # at launch on a path with no config.json. Report it loudly -- and abort
+    # on this (enumerating) download path, which picks its trial candidates
+    # off the very cache that has the wrong picture of the store. Without
+    # --download this script is a read-only diagnostic (`make model-fit`
+    # promises "no writes"), so the banner goes to stderr and the fit table
+    # still prints: refusing to tell the operator what fits is not a repair.
+    # Scanned over the FULL catalog (like shadow detection) — a broken
+    # advertisement is not scoped by --family. The --name short-circuit above
+    # runs the same check with its own fatality rule.
+    enforce_sglang_store_gaps(models, args)
 
     if args.family:
         models = [m for m in models if m.get("family") == args.family]
@@ -1491,7 +1723,8 @@ def main() -> None:
     print(f"  [select] {filter_note}vram={args.vram:g} GB  "
           f"min={min_total:.1f} GB ({args.min_vram_fraction:g}×)  "
           f"{ctx_note}  kv={args.kv_dtype}  "
-          f"max_per_cell={args.max_downloads}"
+          f"max_per_cell={args.max_downloads}  "
+          f"hf_store={args.hf_store} ({hf_store_dir()})"
           + ("  (dry-run)" if args.dry_run else ""))
     print()
 

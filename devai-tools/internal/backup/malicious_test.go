@@ -78,6 +78,15 @@ func TestRestoreRejectsMaliciousArchiveWithNoWrites(t *testing.T) {
 		// (homeDir/.config/sops/evil) once joined. Only resolveTarget's
 		// containment check on the resolved path catches this.
 		{"root-depth-mismatch-escape", &tar.Header{Name: "sops-age/../evil", Typeflag: tar.TypeReg, Mode: 0o644, Size: 7}},
+		// A bare root name resolves to the root DIRECTORY. Honouring it
+		// would rename the whole deploy/ tree aside -- every probe and
+		// bench cache with it -- and write a single file in its place.
+		// Manifest never emits such an entry.
+		{"bare-root-name", &tar.Header{Name: "deploy", Typeflag: tar.TypeReg, Mode: 0o644, Size: 7}},
+		// Same clobber reached via a trailing slash. tar's writer only
+		// allows one on a directory entry, so that is what a foreign
+		// archive would carry here.
+		{"root-name-trailing-slash", &tar.Header{Name: "deploy/", Typeflag: tar.TypeDir, Mode: 0o755}},
 	}
 
 	for _, c := range cases {
@@ -104,6 +113,69 @@ func TestRestoreRejectsMaliciousArchiveWithNoWrites(t *testing.T) {
 				t.Errorf("Restore modified the filesystem despite rejecting the archive:\nbefore=%q\nafter=%q", before, after)
 			}
 		})
+	}
+}
+
+// TestRestoreLeavesRootTreeIntactOnBareRootEntry is the concrete
+// consequence of the bare-root-name case above: the pre-existing caches
+// under deploy/ must still be there, unrenamed, after the rejection.
+func TestRestoreLeavesRootTreeIntactOnBareRootEntry(t *testing.T) {
+	parent := t.TempDir()
+	repoRoot := filepath.Join(parent, "repo")
+	homeDir := filepath.Join(parent, "home")
+	deploy := filepath.Join(repoRoot, "deploy")
+	mustMkdirAll(t, deploy)
+	mustMkdirAll(t, filepath.Join(homeDir, ".devai"))
+	cache := filepath.Join(deploy, ".bench-cache.json")
+	if err := os.WriteFile(cache, []byte(`{"real":"data"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	archivePath := filepath.Join(t.TempDir(), "evil.tar.gz")
+	writeRawArchive(t, archivePath, []*tar.Header{
+		{Name: "deploy", Typeflag: tar.TypeReg, Mode: 0o644, Size: 7},
+	})
+
+	if err := Restore(archivePath, repoRoot, homeDir, "20260101T000000Z"); err == nil {
+		t.Fatal("Restore accepted a bare root-name entry")
+	}
+
+	fi, err := os.Lstat(deploy)
+	if err != nil || !fi.IsDir() {
+		t.Fatalf("deploy/ is no longer a directory: stat=%v err=%v", fi, err)
+	}
+	got, err := os.ReadFile(cache)
+	if err != nil || string(got) != `{"real":"data"}` {
+		t.Errorf("bench cache lost or clobbered: %q, err=%v", got, err)
+	}
+}
+
+// A pre-existing symlink at an intermediate component lets a perfectly
+// clean archive name write outside its declared root: the name never
+// contains "..", so only a filesystem-aware check catches it.
+func TestRestoreRejectsPreExistingSymlinkComponent(t *testing.T) {
+	parent := t.TempDir()
+	repoRoot := filepath.Join(parent, "repo")
+	homeDir := filepath.Join(parent, "home")
+	deploy := filepath.Join(repoRoot, "deploy")
+	outside := filepath.Join(parent, "outside")
+	mustMkdirAll(t, deploy)
+	mustMkdirAll(t, filepath.Join(homeDir, ".devai"))
+	mustMkdirAll(t, outside)
+	if err := os.Symlink(outside, filepath.Join(deploy, "sub")); err != nil {
+		t.Skipf("symlinks unsupported here: %v", err)
+	}
+
+	archivePath := filepath.Join(t.TempDir(), "evil.tar.gz")
+	writeRawArchive(t, archivePath, []*tar.Header{
+		{Name: "deploy/sub/pwned.json", Typeflag: tar.TypeReg, Mode: 0o644, Size: 7},
+	})
+
+	if err := Restore(archivePath, repoRoot, homeDir, "20260101T000000Z"); err == nil {
+		t.Fatal("Restore followed a pre-existing symlink component")
+	}
+	if _, err := os.Stat(filepath.Join(outside, "pwned.json")); err == nil {
+		t.Error("Restore wrote outside the declared root through the symlink")
 	}
 }
 

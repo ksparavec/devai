@@ -112,6 +112,41 @@ class TestExactDecisionTree(unittest.TestCase):
         self.assertEqual(seq, [256, 128, 64, 32])
 
 
+class TestRestrictedGrid(unittest.TestCase):
+    """The prober clamps the search grid to the operator's requested ctx
+    tiers (--ctx / PROBE_CONTEXTS). Before that, `--ctx 32K` still launched
+    (and OOM-killed) containers at 256K/128K/64K."""
+
+    def test_single_requested_tier_launches_once(self) -> None:
+        launched: list[int] = []
+
+        def works(ctx: int) -> bool:
+            launched.append(ctx)
+            return True
+
+        self.assertEqual(
+            binary_search_max_ctx(works, grid=(32 * K,)), 32 * K)
+        self.assertEqual(launched, [32 * K])
+
+    def test_never_launches_above_the_requested_ceiling(self) -> None:
+        launched: list[int] = []
+
+        def works(ctx: int) -> bool:
+            launched.append(ctx)
+            return ctx <= 64 * K
+
+        grid = tuple(c for c in BINARY_SEARCH_CONTEXTS if c <= 128 * K)
+        self.assertEqual(binary_search_max_ctx(works, grid=grid), 64 * K)
+        self.assertTrue(all(c <= 128 * K for c in launched), launched)
+
+    def test_default_grid_is_unchanged(self) -> None:
+        # A default run's ceiling is already 256K, so the full 32K-multiple
+        # grid (and its 96K/160K/192K/224K precision) must survive.
+        works, _ = _threshold(160 * K)
+        self.assertEqual(
+            binary_search_max_ctx(works, grid=BINARY_SEARCH_CONTEXTS), 160 * K)
+
+
 class TestPositionLimit(unittest.TestCase):
     def test_ceiling_capped_and_never_launched_above_limit(self) -> None:
         # Model can serve anything it can launch, but its trained ceiling is

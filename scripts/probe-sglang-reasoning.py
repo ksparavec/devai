@@ -59,6 +59,7 @@ def sglang_command_args(
     reasoning_parser_plugin: str | None = None,
     tool_parser_plugin: str | None = None,
     speculative_config: str | None = None,
+    kv_cache_dtype: str | None = None,
 ) -> list[str]:
     """Build SGLang launch arguments. Mirrors gpu-arbiter sglangEntrypoint.
 
@@ -81,8 +82,14 @@ def sglang_command_args(
     noise. The kwarg stays in the signature for parity with vllm_command_args.
     To enable SGLang MTP probing later, emit the --speculative-* family
     (pinned in deploy/backend-flags.yaml).
+
+    ``kv_cache_dtype`` -- explicit KV dtype for THIS launch. None means
+    "use the pass default" (``KV_CACHE_DTYPE``, empty = engine default).
+    The load probe passes the dtype the target cell was fit-probed under
+    so its serving numbers describe the dtype the cell advertises.
     """
     del reasoning_parser_plugin, tool_parser_plugin, speculative_config
+    dtype = KV_CACHE_DTYPE if kv_cache_dtype is None else kv_cache_dtype
     args = [
         "-m", "sglang.launch_server",
         "--model-path", f"/models/{model_name}",
@@ -101,12 +108,12 @@ def sglang_command_args(
         # sglangEntrypoint so probe and serve launch identically.
         "--disable-piecewise-cuda-graph",
     ]
-    # KV-cache dtype for THIS probe pass. SGLang's default is auto (no
-    # flag, unquantized); a PROBE_KV_CACHE_TYPE=fp8_e5m2/fp8_e4m3 pass
-    # measures quantized-KV fit and stamps the cell so serve time
-    # reproduces it. Empty env = no flag = engine default (unchanged).
-    if KV_CACHE_DTYPE:
-        args.extend(["--kv-cache-dtype", KV_CACHE_DTYPE])
+    # KV-cache dtype for THIS launch. SGLang's default is auto (no flag,
+    # unquantized); a PROBE_KV_CACHE_TYPE=fp8_e5m2/fp8_e4m3 pass measures
+    # quantized-KV fit and stamps the cell so serve time reproduces it.
+    # Empty = no flag = engine default (unchanged).
+    if dtype:
+        args.extend(["--kv-cache-dtype", dtype])
     if reasoning_parser:
         args.extend(["--reasoning-parser", reasoning_parser])
     if tool_parser:

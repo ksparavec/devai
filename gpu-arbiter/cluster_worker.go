@@ -19,6 +19,8 @@ import (
 	"math"
 	"math/rand"
 	"net/http"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -63,8 +65,14 @@ type WorkerState struct {
 	queueDepth     atomic.Int64
 	utilizationPct atomic.Uint64 // bits of float64
 	lastRequestAt  atomic.Pointer[time.Time]
-	healthStatus   atomic.Pointer[string]
 	counter        atomic.Uint64
+
+	// healthStatus is read lock-free by snapshot() on the heartbeat
+	// path; healthMu serialises the read-modify-write in
+	// CompareAndSwapHealth so a drain finishing cannot clobber a
+	// shutdown that arrived while it was running.
+	healthMu     sync.Mutex
+	healthStatus atomic.Pointer[string]
 }
 
 // SetLoadedModel atomically updates the (model, ctx) pair the worker
@@ -95,11 +103,85 @@ func (s *WorkerState) SetUtilization(pct float64) {
 	s.utilizationPct.Store(float64ToBits(pct))
 }
 
+// Health-status values carried in the heartbeat's health_status field.
+// The head's routing policy treats HealthDraining / HealthShuttingDown
+// as "do not send new work" (see workerAvailable); anything else --
+// including the "registered" a fresh worker carries before its first
+// heartbeat, and the empty string -- counts as available.
+//
+// The state machine is deliberately small:
+//
+//	ready  --drain-->      draining  --drain complete-->  ready
+//	ready  --shutdown-->   shutting_down                  (terminal)
+//	draining --shutdown--> shutting_down                  (terminal)
+//
+// draining is NOT terminal: a drain waits out in-flight requests
+// (bounded by DRAIN_TIMEOUT) and the worker is perfectly serviceable
+// afterwards. Leaving it latched at "draining" removes the worker from
+// the head's routing pool forever -- on a single-worker fleet that is a
+// permanent 503. shutting_down IS terminal: the process is about to
+// exit, so nothing may transition out of it.
+const (
+	HealthReady        = "ready"
+	HealthDraining     = "draining"
+	HealthShuttingDown = "shutting_down"
+)
+
 // SetHealthStatus updates the string carried in the heartbeat.
-// Recognised values: "ready", "draining", "shutting_down".
+// Recognised values: HealthReady, HealthDraining, HealthShuttingDown.
+// Unconditional -- use CompareAndSwapHealth for transitions that must
+// not overwrite a terminal state.
 func (s *WorkerState) SetHealthStatus(status string) {
+	s.healthMu.Lock()
+	defer s.healthMu.Unlock()
 	st := status
 	s.healthStatus.Store(&st)
+}
+
+// HealthStatus returns the current health status, defaulting to
+// HealthReady before anything has been stored.
+func (s *WorkerState) HealthStatus() string {
+	if hs := s.healthStatus.Load(); hs != nil {
+		return *hs
+	}
+	return HealthReady
+}
+
+// SetHealthUnlessShuttingDown stores `status` unless the worker has
+// already entered the terminal HealthShuttingDown state, and reports
+// whether the store happened. Used when acknowledging a drain: a drain
+// command that lands after a shutdown must not advertise the worker as
+// merely draining when the process is already on its way out.
+func (s *WorkerState) SetHealthUnlessShuttingDown(status string) bool {
+	s.healthMu.Lock()
+	defer s.healthMu.Unlock()
+	if hs := s.healthStatus.Load(); hs != nil && *hs == HealthShuttingDown {
+		return false
+	}
+	st := status
+	s.healthStatus.Store(&st)
+	return true
+}
+
+// CompareAndSwapHealth stores `to` only when the current status is
+// `from`, and reports whether the swap happened. This is how a
+// completed drain returns the worker to a routable state without
+// resurrecting one that received a shutdown mid-drain: the CAS from
+// HealthDraining fails once shutdown has moved the status to
+// HealthShuttingDown, which is terminal.
+func (s *WorkerState) CompareAndSwapHealth(from, to string) bool {
+	s.healthMu.Lock()
+	defer s.healthMu.Unlock()
+	cur := HealthReady
+	if hs := s.healthStatus.Load(); hs != nil {
+		cur = *hs
+	}
+	if cur != from {
+		return false
+	}
+	st := to
+	s.healthStatus.Store(&st)
+	return true
 }
 
 // MarkRequestAt stamps the wall-clock when a request finished.
@@ -283,6 +365,14 @@ func (w *Worker) tick(ctx context.Context) {
 	}
 	resp, err := w.HeartbeatOnce(ctx, *idPtr)
 	if err != nil {
+		if errors.Is(err, ErrHeadUnknownWorker) {
+			// The head restarted (fleet state is in-memory only, per
+			// cluster-mode decision 9) and no longer knows this id.
+			// Without re-registering here the worker would heartbeat
+			// into a 410 forever and stay invisible to the fleet.
+			w.reregister(ctx)
+			return
+		}
 		log.Printf("[worker] heartbeat failed: %v", err)
 		return
 	}
@@ -291,6 +381,26 @@ func (w *Worker) tick(ctx context.Context) {
 			log.Printf("[worker] command %s: %v", cmd.Type, err)
 		}
 	}
+}
+
+// ErrHeadUnknownWorker is what HeartbeatOnce returns when the head
+// answers 410 Gone -- its contract for "I do not know this worker_id;
+// re-register". See ClusterHead.handleHeartbeat.
+var ErrHeadUnknownWorker = errors.New("head does not recognise this worker_id")
+
+// reregister drops the stale worker_id and runs the registration
+// backoff loop again. Called from tick when the head answers 410.
+func (w *Worker) reregister(ctx context.Context) {
+	log.Printf("[worker] head reported unknown worker_id; re-registering")
+	w.State.WorkerID.Store(nil)
+	id, err := w.registerWithBackoff(ctx)
+	if err != nil {
+		log.Printf("[worker] re-registration aborted: %v", err)
+		return
+	}
+	w.State.WorkerID.Store(&id)
+	log.Printf("[worker] re-registered as %s (id=%s) with head=%s",
+		w.Config.WorkerName, id, w.Config.HeadURL)
 }
 
 // HeartbeatOnce runs one heartbeat round-trip. Exposed so tests can
@@ -318,6 +428,9 @@ func (w *Worker) HeartbeatOnce(ctx context.Context, workerID string) (*Heartbeat
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusGone {
+		return nil, fmt.Errorf("%w: %s", ErrHeadUnknownWorker, strings.TrimSpace(string(body)))
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("heartbeat HTTP %d: %s", resp.StatusCode, string(body))
 	}

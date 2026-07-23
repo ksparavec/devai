@@ -14,7 +14,20 @@ authoritative -- update this file to match.
 - **In Progress** -- some phase has been started.
 - **Done** -- all required phases shipped.
 
-Current snapshot (as of 2026-05-15):
+Current snapshot (as of 2026-07-23). Only the newest rows were
+re-verified on that date; the other statuses carry over from the
+2026-05-15 snapshot and are due an audit -- CLAUDE.md's plan
+summary is currently more current than this table.
+
+Note on `review-fixes-2026-07`: executed 2026-07-23 in **three** passes
+(remediation, then two adversarial-review repair rounds -- each round
+found defects the previous round had itself introduced). All nine
+phases were worked and its three open questions are resolved. It is
+marked **Done** rather than shipped-and-verified because the live-GPU
+tests the plan itself requires before Phase 3 may merge
+(`make test-router`, `make test-vllm`) could not run on the execution
+host -- they need the GPU free and `make cache-down`. See that plan's
+"Unverified" section.
 
 | Plan                                                                | Status      |
 | ------------------------------------------------------------------- | ----------- |
@@ -30,14 +43,27 @@ Current snapshot (as of 2026-05-15):
 | [kv-cache-quantization](./kv-cache-quantization.md)                 | Draft       |
 | [model-lifecycle-ledger](./model-lifecycle-ledger.md)               | In Progress |
 | [odysseus-borrowed-ideas](./odysseus-borrowed-ideas.md)             | Draft       |
+| [review-fixes-2026-07](./review-fixes-2026-07.md)                   | Done (see note) |
+| [card-derived-hints-and-bench-sync](./card-derived-hints-and-bench-sync.md) | Draft |
 
 ## Dependency graph
 
 ```
-                    +-------------------+
-                    |  bench-rewrite    |  <-- ships in parallel,
-                    |  (no deps)        |      no dependents
-                    +-------------------+
+   +-------------------+     +------------------------+
+   |  bench-rewrite    |     | model-lifecycle-ledger |
+   |  (no deps)        |     | (no deps)              |
+   +---------+---------+     +-----------+------------+
+             |                           |
+             |  v3 bench schema          |  exclusion ledger
+             |  + host-env stamps        |  (_model_status.py)
+             +------------+--------------+
+                          |
+                          v
+          +-------------------------------+
+          | card-derived-hints-and-       |  <-- both deps already
+          | bench-sync                    |      satisfied; no
+          | (Ph 1-4 hints, Ph 5 loop)     |      dependents
+          +-------------------------------+
 
                     +-------------------+
                     | skypilot-agent-   |  <-- ships in parallel,
@@ -113,6 +139,7 @@ probably do them in series rather than context-switching.
 | 10   | skypilot-fleet-provisioner Phase 2            | 1-2 weeks  | Yes       | Head <-> SkyPilot integration. Two-step graceful teardown per decision. |
 | 11   | skypilot-fleet-provisioner Phase 3            | 1 week     | No        | Policy hardening. Can defer indefinitely. |
 | 12   | gpu-arbiter-cluster-mode Phase 3 (optional)   | 1 week     | No        | Probe-cache federation. No dependents; activate only on user friction. |
+| 13   | card-derived-hints-and-bench-sync             | ~1.5 weeks | No        | Both prerequisites already satisfied, so it can ship at any point. Appended rather than inserted because it is off the critical path entirely. Phases 1-4 (hints) and Phase 5 (bench loop) are independent tracks and can be split across people or releases. |
 
 **Total elapsed time, serial single-operator path: roughly 6-9
 weeks** (steps 1-10; step 11 and step 12 are optional). A small
@@ -162,6 +189,13 @@ path:
   head landing.
 - pi-coding-agent (Draft) -- lab-image + picker change, no deps and no
   dependents; same shape as skypilot-agent-skill. Ships at any point.
+- card-derived-hints-and-bench-sync (Draft) -- host-side probe/bench tooling
+  only; touches no router, no picker, no container topology. Its two
+  prerequisites (bench-rewrite's v3 schema, model-lifecycle-ledger's
+  exclusion ledger) are already landed, so nothing gates it. Phases 1-4
+  (card-derived hints) and Phase 5 (bench-sync loop) are separable tracks;
+  Phase 3 is the only internal gate, held behind Phase 1's out-of-sample
+  validation result.
 - kv-cache-quantization (Draft) -- single-mode router + tooling feature,
   no hard deps and no dependents; ships at any point. Phase 1 (SGLang fp8
   parity + fit-math correctness) is behavior-preserving and standalone;

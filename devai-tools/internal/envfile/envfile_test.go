@@ -69,6 +69,28 @@ func TestSetKeysReplaceWhenPresentPreservesOtherLines(t *testing.T) {
 	}
 }
 
+// .env is last-line-wins, so rewriting only the FIRST of two duplicate
+// KEY= lines leaves the stale later line in charge and the whole call
+// silently has no effect on the value anything actually reads.
+func TestSetKeysRewritesEveryDuplicate(t *testing.T) {
+	path := tempEnvFile(t, "DEVAI_GPU_DEVICE=nvidia.com/gpu=all\n# stale duplicate below\nLAB_PORT=8888\nDEVAI_GPU_DEVICE=nvidia.com/gpu=all\n")
+	err := SetKeys(path, []string{"DEVAI_GPU_DEVICE"}, map[string]string{"DEVAI_GPU_DEVICE": "amd.com/gpu=all"})
+	if err != nil {
+		t.Fatalf("SetKeys: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "DEVAI_GPU_DEVICE=amd.com/gpu=all\n# stale duplicate below\nLAB_PORT=8888\nDEVAI_GPU_DEVICE=amd.com/gpu=all\n"
+	if string(got) != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+	if strings.Contains(string(got), "nvidia.com/gpu=all") {
+		t.Errorf("a stale duplicate survived and would win last-line-wins:\n%s", got)
+	}
+}
+
 func TestSetKeysRoundTripFlipAndFlipBack(t *testing.T) {
 	original := "LAB_PORT=8888\nCONTAINER_RUNTIME=podman\n"
 	path := tempEnvFile(t, original)

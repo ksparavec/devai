@@ -14,7 +14,8 @@ phase split live in
 ## Status snapshot
 
 - **Phase 1 shipped**: 10 Tier 1 servers (no secrets), gateway
-  reachable on port 8088 by default.
+  reachable on port 8088 by default -- published on **127.0.0.1
+  only**.
 - **Phase 2 shipped**: 4 Tier 2 servers (`github-official`,
   `firecrawl`, `hugging-face`, `context7`) backed by the shared
   sops/age secret-store scaffold from
@@ -32,9 +33,18 @@ make mcp-up          # gateway in compose 'mcp' profile
 make mcp-test        # smoke test: /health + tools/list
 ```
 
-The gateway listens on `${MCP_PORT:-8088}` on the host and on 8088
-inside the container. Override `MCP_PORT` in `.env` to relocate
-without touching `deploy/docker-compose.yaml`.
+The gateway listens on `${MCP_PORT:-8088}` on the host -- bound to
+`127.0.0.1` -- and on 8088 inside the container. Override `MCP_PORT`
+in `.env` to relocate without touching `deploy/docker-compose.yaml`.
+
+The loopback bind is deliberate: the gateway holds a read-write podman
+socket (creating per-call server containers is its whole job), so
+container-create through it is equivalent to host root, and it
+requires no authentication. Reaching it from another machine means an
+SSH tunnel or an authenticating reverse proxy -- not a wider bind. The
+two documented client URLs are unaffected: `http://localhost:8088`
+from the host, and `http://devai-mcp-gateway:8088` from inside
+`devai-net`.
 
 To stop:
 

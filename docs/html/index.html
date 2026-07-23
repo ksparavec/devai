@@ -353,7 +353,7 @@ devai-agent --init                  # reset preferences.yaml to defaults</code><
         <li>Routes by <strong>port → backend</strong> (no message inspection).</li>
         <li>Manages <strong>GPU exclusion</strong>: only one backend uses the GPU at a time. Switches by stopping the current backend (with graceful drain for in-flight requests) and starting the next via the Podman API.</li>
         <li>Sizes vLLM/SGLang launches dynamically (<code>--gpu-memory-utilization</code>, <code>--mem-fraction-static</code>, <code>--max-model-len</code>) from per-model VRAM budgets.</li>
-        <li>Auto-stops idle backends after <code>IDLE_TIMEOUT</code> seconds.</li>
+        <li>Keeps a loaded backend <strong>warm by default</strong> (<code>IDLE_TIMEOUT=0</code>): it is unloaded when a <em>different</em> model is requested, not on a timer. Set <code>IDLE_TIMEOUT</code> to a positive number of seconds to restore time-based auto-stop.</li>
         <li>Applies the <strong>reasoning policy</strong> to each request.</li>
       </ul>
 
@@ -419,7 +419,7 @@ devai-agent --init                  # reset preferences.yaml to defaults</code><
             <tr><td><code>PROBE_VRAMS</code></td><td><code>16G,24G</code></td><td>Comma-separated VRAM bands <code>make probe</code> cycles through.</td></tr>
             <tr><td><code>PROBE_CONTEXTS</code></td><td><code>32K,64K,128K,256K</code></td><td>Comma-separated context tiers probed inside each VRAM band.</td></tr>
             <tr><td><code>DEVAI_REASONING</code></td><td>auto</td><td>Default reasoning policy: <code>auto|off|low|medium|high</code></td></tr>
-            <tr><td><code>IDLE_TIMEOUT</code></td><td>300</td><td>Seconds before auto-stopping vLLM/SGLang</td></tr>
+            <tr><td><code>IDLE_TIMEOUT</code></td><td>0</td><td>Seconds before auto-stopping an idle backend. <code>0</code> (the default) = keep-warm, never auto-unload</td></tr>
           </tbody>
         </table>
       </div>

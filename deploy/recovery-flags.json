@@ -11,6 +11,40 @@
     "  models.<name>.engine_env    map of env vars merged into the",
     "                              container env (overrides per-backend",
     "                              defaults on key collision).",
+    "  models.<name>.backends      OPTIONAL list of backend names the entry",
+    "                              applies to, e.g. [\"vllm\"]. Contract C2 --",
+    "                              both readers (gpu-arbiter/recovery_flags.go",
+    "                              and scripts/_probe_hf_common.py) implement",
+    "                              EXACTLY these four cases:",
+    "                                key ABSENT           -> the entry applies",
+    "                                                        to EVERY backend",
+    "                                                        (backward compat).",
+    "                                key present, []      -> the entry applies",
+    "                                                        to NO backend;",
+    "                                                        writing [] is how",
+    "                                                        an operator",
+    "                                                        disables an entry",
+    "                                                        without deleting",
+    "                                                        it.",
+    "                                key present, list    -> applies only to",
+    "                                                        the named backends.",
+    "                                key present, NOT a   -> log a warning",
+    "                                list                    naming the model",
+    "                                                        and treat the key",
+    "                                                        as ABSENT.",
+    "                              A malformed entry NEVER discards the rest of",
+    "                              the registry: each entry is decoded on its",
+    "                              own, and the ones that parse are kept.",
+    "                              Every entry below is vLLM-only: the flags",
+    "                              (--language-model-only, --enforce-eager,",
+    "                              --max-num-seqs, --max-num-batched-tokens,",
+    "                              --gpu-memory-utilization, --quantization",
+    "                              modelopt), the VLLM_* env vars, and the",
+    "                              per-model `image` pins do not exist on",
+    "                              SGLang -- appending them there produced",
+    "                              unknown-flag launch failures, and several",
+    "                              of the entries' own comments state SGLang",
+    "                              is not viable for that arch at all.",
     "",
     "Lookup key is the canonical model name (basename of the directory",
     "under /var/cache/devai/ollama/models/vllm/ — NOT the HF repo path).",
@@ -21,6 +55,7 @@
   ],
   "models": {
     "Qwen3.6-27B-MTP-pi-tune-NVFP4": {
+      "backends": ["vllm"],
       "engine_flags": [
         "--language-model-only",
         "--max-num-seqs", "4",
@@ -54,6 +89,7 @@
       ]
     },
     "Qwen3.6-35B-A3B-NVFP4": {
+      "backends": ["vllm"],
       "engine_flags": [
         "--quantization", "modelopt",
         "--language-model-only",
@@ -98,6 +134,7 @@
       ]
     },
     "Qwen3.5-9B-NVFP4": {
+      "backends": ["vllm"],
       "engine_flags": [
         "--quantization", "modelopt",
         "--language-model-only",
@@ -124,6 +161,7 @@
       ]
     },
     "Qwen3.6-27B-Text-NVFP4-MTP": {
+      "backends": ["vllm"],
       "engine_flags": [
         "--quantization", "modelopt",
         "--language-model-only",
@@ -158,6 +196,7 @@
       ]
     },
     "Gemma-4-26B-A4B-NVFP4": {
+      "backends": ["vllm"],
       "engine_flags": [
         "--max-num-batched-tokens", "4096"
       ],
@@ -170,6 +209,7 @@
       ]
     },
     "Gemma-4-31B-IT-NVFP4": {
+      "backends": ["vllm"],
       "engine_flags": [
         "--max-num-batched-tokens", "4096",
         "--enforce-eager"
@@ -194,6 +234,7 @@
       ]
     },
     "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4": {
+      "backends": ["vllm"],
       "engine_flags": [
         "--max-num-seqs", "8",
         "--trust-remote-code",
@@ -215,6 +256,7 @@
       }
     },
     "Qwen3-Coder-30B-A3B-Instruct-FP4": {
+      "backends": ["vllm"],
       "engine_flags": [
         "--enforce-eager"
       ],
@@ -232,6 +274,7 @@
       ]
     },
     "NVIDIA-Nemotron-Nano-9B-v2-NVFP4": {
+      "backends": ["vllm"],
       "image": "docker.io/vllm/vllm-openai:v0.25.1-x86_64-cu129-ubuntu2404",
       "engine_flags": [
         "--mamba-ssm-cache-dtype", "float32"
@@ -258,6 +301,7 @@
       ]
     },
     "diffusiongemma-26B-A4B-it-NVFP4": {
+      "backends": ["vllm"],
       "image": "docker.io/vllm/vllm-openai:gemma-x86_64-cu130",
       "engine_flags": [
         "--quantization", "modelopt",

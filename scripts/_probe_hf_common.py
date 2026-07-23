@@ -31,9 +31,11 @@ docstring. SGLang gets a separate cache file but the same shape.
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -46,6 +48,7 @@ from typing import Callable
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 from _contexts import (  # noqa: E402  — local import after sys.path fix
+    BINARY_SEARCH_CONTEXTS,
     binary_search_max_ctx,
     context_label,
     parse_context_list,
@@ -161,9 +164,63 @@ def _load_recovery_registry(path: Path) -> dict[str, dict]:
 _RECOVERY_REGISTRY: dict[str, dict] = _load_recovery_registry(RECOVERY_FLAGS_PATH)
 
 
-def recovery_overrides(model_name: str) -> tuple[list[str], dict[str, str]]:
-    """Return (extra_flags, extra_env) for model_name. Empty when no entry."""
+_WARNED_BAD_BACKENDS: set[str] = set()
+
+
+def _entry_applies_to_backend(
+    entry: dict, backend: str, model_name: str = "",
+) -> bool:
+    """Backend gate for a recovery entry (cross-unit contract C2).
+
+    The agreed semantics, implemented identically by
+    gpu-arbiter/recovery_flags.go:
+
+      - key ABSENT           -> applies to ALL backends (backward
+        compatible with every entry written before the key existed).
+      - key present, ``[]``  -> applies to NO backend (an operator
+        writing an empty list means "disable this entry").
+      - key present, a list  -> applies only to the named backends --
+        vLLM-only flags like ``--language-model-only`` or
+        ``--quantization modelopt`` are not valid SGLang arguments and
+        would fail the launch outright.
+      - key present, NOT a list -> malformed; warn (naming the model)
+        and treat as ABSENT rather than silently dropping the entry's
+        recovery flags, which on 24G cards typically means an OOM.
+
+    Keep this in sync with the Go side.
+    """
+    if "backends" not in entry:
+        return True
+    backends = entry.get("backends")
+    if not isinstance(backends, list):
+        label = model_name or "<unknown model>"
+        if label not in _WARNED_BAD_BACKENDS:
+            _WARNED_BAD_BACKENDS.add(label)
+            print(f"[warn] recovery registry: {label}: \"backends\" must be a "
+                  f"list, got {type(backends).__name__}; treating the entry as "
+                  f"applying to all backends", file=sys.stderr)
+        return True
+    return backend in backends
+
+
+def _recovery_entry(model_name: str, backend: str) -> dict | None:
+    """Registry entry for (model_name, backend), or None when absent or
+    gated out by the entry's `backends` list."""
     entry = _RECOVERY_REGISTRY.get(model_name)
+    if not entry or not _entry_applies_to_backend(entry, backend, model_name):
+        return None
+    return entry
+
+
+def recovery_overrides(
+    model_name: str, backend: str,
+) -> tuple[list[str], dict[str, str]]:
+    """Return (extra_flags, extra_env) for model_name on `backend`.
+
+    Empty when there is no entry, or when the entry declares a `backends`
+    list that does not include `backend` (contract C2).
+    """
+    entry = _recovery_entry(model_name, backend)
     if not entry:
         return [], {}
     flags = entry.get("engine_flags") or []
@@ -175,7 +232,7 @@ def recovery_overrides(model_name: str) -> tuple[list[str], dict[str, str]]:
     return list(flags), dict(env)
 
 
-def recovery_image(model_name: str) -> str | None:
+def recovery_image(model_name: str, backend: str) -> str | None:
     """Return the per-model container-image override, or None.
 
     Mirrors the `image` field consumed by gpu-arbiter/recovery_flags.go:
@@ -187,8 +244,11 @@ def recovery_image(model_name: str) -> str | None:
     single-source-of-truth contract). DiffusionGemma is the first user:
     it needs the vLLM "gemma" build, which can't be the global default
     because it regresses Qwen NVFP4 loading.
+
+    Backend-gated the same way as recovery_overrides (contract C2): an
+    entry pinning a vLLM-only image must not redirect an SGLang launch.
     """
-    entry = _RECOVERY_REGISTRY.get(model_name)
+    entry = _recovery_entry(model_name, backend)
     if not entry:
         return None
     img = entry.get("image")
@@ -218,6 +278,10 @@ class BackendSpec:
     # `--*-parser-plugin <path>` flag *before* the matching parser-name
     # flag (vLLM loads plugin files at parser-resolution time). Backends
     # without a plugin model (SGLang) accept the kwargs and ignore them.
+    # The `kv_cache_dtype` kwarg names the KV dtype for THIS launch; None
+    # means "use the pass default". The load probe passes the dtype the
+    # target cell was fit-probed under so serving numbers describe the
+    # dtype the cell actually advertises.
     build_args: Callable[..., list[str]] = field(repr=False)
     # When True, parser names are looked up against the vllm-plugins
     # registry; matches inject the bind-mount + --tool-parser-plugin
@@ -450,11 +514,76 @@ def assert_no_active_backends(runtime: str) -> None:
             )
 
 
+# Probe containers this process has launched and not yet torn down, as
+# (runtime, name) pairs. Populated by container_run_detached, drained by
+# container_remove, and swept by the SIGINT/SIGTERM/atexit hooks installed
+# via install_probe_cleanup. An orphan here is a GPU-holding container that
+# assert_no_active_backends does NOT look for, so every later probe cell
+# would silently measure against the leftover allocation.
+_ACTIVE_CONTAINERS: set[tuple[str, str]] = set()
+
+# `podman rm --force` normally returns in well under a second. Bound it so
+# teardown -- which runs from a signal handler -- can never hang forever on a
+# wedged runtime.
+CONTAINER_RM_TIMEOUT = 60.0
+
+
 def container_remove(runtime: str, name: str) -> None:
-    subprocess.run(
-        [runtime, "rm", "--force", name],
-        capture_output=True, check=False,
-    )
+    """Force-remove a probe container. Idempotent, bounded, never raises."""
+    try:
+        subprocess.run(
+            [runtime, "rm", "--force", name],
+            capture_output=True, check=False, timeout=CONTAINER_RM_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"  [warn] `{runtime} rm --force {name}` timed out after "
+              f"{CONTAINER_RM_TIMEOUT:.0f}s — it may still hold the GPU",
+              file=sys.stderr)
+    except FileNotFoundError:
+        pass
+    _ACTIVE_CONTAINERS.discard((runtime, name))
+
+
+def _teardown_active_containers() -> None:
+    """Remove every probe container this process still owns. Idempotent:
+    container_remove drops each entry from the registry as it goes, and
+    `sorted()` snapshots the set so removal during iteration is safe."""
+    for runtime, name in sorted(_ACTIVE_CONTAINERS):
+        print(f"  [cleanup] removing probe container {name}", file=sys.stderr)
+        container_remove(runtime, name)
+
+
+_CLEANUP_INSTALLED = False
+
+
+def install_probe_cleanup() -> None:
+    """Guarantee probe containers are torn down on Ctrl-C / SIGTERM / exit.
+
+    Without this, an interrupt during a health poll or a chat call leaves an
+    orphaned GPU-holding container behind: assert_no_active_backends only
+    looks for devai-router / devai-vllm / devai-sglang, so the leftover is
+    invisible and silently contaminates every later probe cell with false
+    OOMs / fits=false. Idempotent — safe to call from each pass driver.
+    """
+    global _CLEANUP_INSTALLED
+    if _CLEANUP_INSTALLED:
+        return
+    _CLEANUP_INSTALLED = True
+    atexit.register(_teardown_active_containers)
+
+    def _handler(signum, _frame):
+        _teardown_active_containers()
+        # Restore the default disposition and re-raise so the process exits
+        # with the conventional signal status rather than a bare code.
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _handler)
+        except (ValueError, OSError):
+            # Not on the main thread — atexit still covers normal exit.
+            pass
 
 
 def container_logs(runtime: str, name: str, tail: int = 500) -> str:
@@ -513,6 +642,9 @@ def container_run_detached(
         args.extend(["--env", f"{k}={v}"])
     args.append(image)
     args.extend(command)
+    # Register BEFORE launching: a `podman run` that fails partway can still
+    # have created the container, and the teardown hooks must know about it.
+    _ACTIVE_CONTAINERS.add((runtime, name))
     r = subprocess.run(args, capture_output=True, text=True, check=False)
     if r.returncode != 0:
         raise RuntimeError(
@@ -938,14 +1070,16 @@ def probe_one_cell(
         reasoning_parser_plugin=reasoning_plugin_path,
         tool_parser_plugin=tool_plugin_path,
         speculative_config=speculative_config_json,
+        kv_cache_dtype=spec.kv_cache_dtype,
     )
 
     env_vars = {"VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1"}
     # Per-model recovery overrides (deploy/recovery-flags.json) — shared
     # with the router so probe and serve-time launches see the same flags.
     # Env entries override env_vars defaults on key collision; flags are
-    # appended after parser flags (mirrors gpu-arbiter/main.go).
-    extra_flags, extra_env = recovery_overrides(model_name)
+    # appended after parser flags (mirrors gpu-arbiter/main.go). Scoped by
+    # backend so a vLLM-only entry is not applied to an SGLang launch.
+    extra_flags, extra_env = recovery_overrides(model_name, spec.name)
     if extra_flags:
         cmd_args = list(cmd_args) + extra_flags
     if extra_env:
@@ -954,7 +1088,7 @@ def probe_one_cell(
     # on (mirrors gpu-arbiter buildContainerSpec). Without this a model
     # pinned to a non-default image probes on the wrong engine and records
     # a spurious fits=false cell.
-    image_override = recovery_image(model_name)
+    image_override = recovery_image(model_name, spec.name)
     if image_override and image_override != image:
         print(f"    [recovery] {model_name}: probing on pinned image "
               f"{image_override}", file=sys.stderr)
@@ -963,240 +1097,246 @@ def probe_one_cell(
     if plugin_volume is not None:
         extra_volumes.append(plugin_volume)
     container_remove(runtime, container_name)
+    # Guarantee teardown: an exception (or a Ctrl-C surfacing as
+    # KeyboardInterrupt) anywhere between here and the final record
+    # would otherwise leave a GPU-holding probe container behind, which
+    # assert_no_active_backends does not look for -- every later cell
+    # would then measure against the leftover allocation and record
+    # false OOMs / fits=false. The signal + atexit hooks installed by
+    # install_probe_cleanup cover the paths this finally cannot.
     try:
-        container_run_detached(
-            runtime, container_name, image, probe_port, models_dir, env_vars,
-            spec.entrypoint, cmd_args, extra_volumes=extra_volumes,
-        )
-    except RuntimeError as e:
-        return _failure_record(
-            ctx=requested_ctx, vram_gb=band_gb, started=started,
-            evidence={
-                "kind": "infra", "error": str(e),
-                "reasoning_parser_attempted": reasoning_parser,
-                "tool_parser_attempted": tool_parser,
-            },
-        )
-
-    base_url = f"http://127.0.0.1:{probe_port}"
-    health_deadline = time.time() + STARTUP_TIMEOUT
-    healthy = False
-    last_err: str | None = None
-    while time.time() < health_deadline:
         try:
-            http_get(f"{base_url}/health", timeout=5.0)
-            healthy = True
-            break
-        except urllib.error.URLError as e:
-            last_err = f"URLError: {e}"
-        except (TimeoutError, OSError) as e:
-            last_err = f"{type(e).__name__}: {e}"
-        except json.JSONDecodeError:
-            healthy = True
-            break
+            container_run_detached(
+                runtime, container_name, image, probe_port, models_dir, env_vars,
+                spec.entrypoint, cmd_args, extra_volumes=extra_volumes,
+            )
+        except RuntimeError as e:
+            return _failure_record(
+                ctx=requested_ctx, vram_gb=band_gb, started=started,
+                evidence={
+                    "kind": "infra", "error": str(e),
+                    "reasoning_parser_attempted": reasoning_parser,
+                    "tool_parser_attempted": tool_parser,
+                },
+            )
 
-        # Fail-fast on early exit (arg errors, OOM during model load,
-        # missing GPU). Without this check the loop would burn the full
-        # STARTUP_TIMEOUT waiting on /health from a dead process.
-        state = container_state(runtime, container_name)
-        if state in ("exited", "stopped", "absent"):
-            last_err = f"container {state} before /health"
-            break
-        time.sleep(HEALTH_POLL_INTERVAL)
+        base_url = f"http://127.0.0.1:{probe_port}"
+        health_deadline = time.time() + STARTUP_TIMEOUT
+        healthy = False
+        last_err: str | None = None
+        while time.time() < health_deadline:
+            try:
+                http_get(f"{base_url}/health", timeout=5.0)
+                healthy = True
+                break
+            except urllib.error.URLError as e:
+                last_err = f"URLError: {e}"
+            except (TimeoutError, OSError) as e:
+                last_err = f"{type(e).__name__}: {e}"
+            except json.JSONDecodeError:
+                healthy = True
+                break
 
-    startup_seconds = round(time.time() - started, 2)
-    if not healthy:
-        logs = container_logs(runtime, container_name)
-        evidence = classify_failure_logs(logs)
-        evidence.setdefault("startup_error", last_err or "unknown")
-        evidence["reasoning_parser_attempted"] = reasoning_parser
-        evidence["tool_parser_attempted"] = tool_parser
-        container_remove(runtime, container_name)
-        return _failure_record(
-            ctx=requested_ctx, vram_gb=band_gb, started=started,
-            evidence=evidence, startup_seconds=startup_seconds,
-        )
+            # Fail-fast on early exit (arg errors, OOM during model load,
+            # missing GPU). Without this check the loop would burn the full
+            # STARTUP_TIMEOUT waiting on /health from a dead process.
+            state = container_state(runtime, container_name)
+            if state in ("exited", "stopped", "absent"):
+                last_err = f"container {state} before /health"
+                break
+            time.sleep(HEALTH_POLL_INTERVAL)
 
-    # Read what the engine actually accepted for max-model-len. Recorded
-    # for evidence but no longer used as an early-exit gate — the chat
-    # probe below decides whether the cell counts as fits=True. An engine
-    # that silently clamps will still answer; an engine that breaks at
-    # the requested ctx will fail the chat probe naturally.
-    actual_max = 0
-    try:
-        models_resp = http_get(f"{base_url}/v1/models", timeout=10.0)
-        for entry in (models_resp.get("data") or []):
-            mm = entry.get("max_model_len")
-            if isinstance(mm, int) and mm > actual_max:
-                actual_max = mm
-    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
+        startup_seconds = round(time.time() - started, 2)
+        if not healthy:
+            logs = container_logs(runtime, container_name)
+            evidence = classify_failure_logs(logs)
+            evidence.setdefault("startup_error", last_err or "unknown")
+            evidence["reasoning_parser_attempted"] = reasoning_parser
+            evidence["tool_parser_attempted"] = tool_parser
+            return _failure_record(
+                ctx=requested_ctx, vram_gb=band_gb, started=started,
+                evidence=evidence, startup_seconds=startup_seconds,
+            )
+
+        # Read what the engine actually accepted for max-model-len. Recorded
+        # for evidence but no longer used as an early-exit gate — the chat
+        # probe below decides whether the cell counts as fits=True. An engine
+        # that silently clamps will still answer; an engine that breaks at
+        # the requested ctx will fail the chat probe naturally.
         actual_max = 0
+        try:
+            models_resp = http_get(f"{base_url}/v1/models", timeout=10.0)
+            for entry in (models_resp.get("data") or []):
+                mm = entry.get("max_model_len")
+                if isinstance(mm, int) and mm > actual_max:
+                    actual_max = mm
+        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
+            actual_max = 0
 
-    # ── Probe A: fit + reasoning ─────────────────────────────────────
-    # When a reasoning_parser is being attempted, request the backend's
-    # "enable thinking" surface so models with chat templates that
-    # default `enable_thinking=false` (newer Qwen3, some Phi-4) still
-    # emit a reasoning trace. This mirrors what the router's
-    # applyVLLMPolicy / applySGLangPolicy does at serve time. Without it,
-    # the probe sends a vanilla request and these models classify as
-    # `unsupported` even though the parser would work in production.
-    base_chat_body: dict = {
-        "model": model_name,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0,
-        # Reasoning models need room for the full trace before the
-        # final answer. 256 tokens often truncates mid-think; the
-        # parser then can't bracket a `<think>...</think>` block and
-        # silently drops the partial trace. 2048 covers Qwen3-8B's
-        # typical CoT for medium-complexity prompts.
-        "max_tokens": 2048,
-        "stream": False,
-    }
-    if reasoning_parser:
-        base_chat_body = build_enable_thinking_body(spec.name, base_chat_body)
-    chat_resp = _post_chat(base_url, base_chat_body)
-
-    used_mb = gpu_memory_used_mb()
-    actual_vram_gb = round(used_mb / 1024, 2)
-
-    capability, cap_evidence = classify_chat_response(
-        chat_resp, reasoning_parser_attempted=reasoning_parser,
-    )
-    cap_evidence = dict(cap_evidence)
-    cap_evidence["reasoning_parser_attempted"] = reasoning_parser
-    cap_evidence["tool_parser_attempted"] = tool_parser
-    # Forensic snapshot of the raw Probe A response — full content +
-    # reasoning_content (capped) so we can debug parser-content
-    # mismatches without re-launching. Replaces the older 200-char
-    # previews; classify_chat_response still produces those for the
-    # short-form summary.
-    try:
-        msg = ((chat_resp.get("choices") or [{}])[0].get("message") or {})
-        cap_evidence["full_content"] = (msg.get("content") or "")[:2000]
-        cap_evidence["full_reasoning_content"] = _extract_reasoning_content(msg)[:2000]
-        cap_evidence["finish_reason"] = (chat_resp.get("choices") or [{}])[0].get("finish_reason")
-    except (AttributeError, IndexError, TypeError):
-        pass
-
-    if capability == Capability.ERROR:
-        container_remove(runtime, container_name)
-        return _failure_record(
-            ctx=requested_ctx, vram_gb=band_gb, started=started,
-            startup_seconds=startup_seconds, actual_vram_gb=actual_vram_gb,
-            actual_context=actual_max,
-            evidence={"kind": "oom_chat", **cap_evidence},
-        )
-
-    # Confirmed reasoning parser only when Probe A actually produced
-    # `structured`. Any other capability means the curated parser
-    # didn't apply (model emits inline or doesn't reason at all).
-    reasoning_parser_verified = reasoning_parser if capability == Capability.STRUCTURED else None
-
-    # ── Probe B: tool-call ───────────────────────────────────────────
-    # Two-phase verification:
-    #   B1 (auto):   tool_choice="auto"  — does the model spontaneously
-    #                pick the tool? Useful signal for agents that send
-    #                "auto", but reasoning models (R1-Distill et al)
-    #                tend to ramble in reasoning_content instead of
-    #                calling, so a "no" here doesn't mean the parser is
-    #                broken.
-    #   B2 (forced): tool_choice={"type":"function","function":{"name":...}}
-    #                if B1 didn't yield a call. Forces the model to emit
-    #                the tool-call markers so we can verify the parser
-    #                actually extracts. Distinguishes "model declines
-    #                to call" from "parser can't parse what was emitted".
-    # Either path verifying counts as `tool_parser_verified=True` — the
-    # router's strip-tools logic only cares whether the parser CAN
-    # extract; agents that send explicit tool_choice still need the
-    # plugin loaded even if the model wouldn't auto-pick.
-    tool_parser_verified: str | None = None
-    tool_evidence: dict | None = None
-    if tool_parser:
-        # Reasoning models burn 500-2000 tokens on chain-of-thought before
-        # any tool-call markers. The old 128-token budget guaranteed they
-        # never reached the call. 2048 covers typical R1-Distill traces.
-        is_reasoning = capability in (Capability.STRUCTURED, Capability.INLINE)
-        tool_max_tokens = 2048 if is_reasoning else 128
-        auto_body = {
+        # ── Probe A: fit + reasoning ─────────────────────────────────────
+        # When a reasoning_parser is being attempted, request the backend's
+        # "enable thinking" surface so models with chat templates that
+        # default `enable_thinking=false` (newer Qwen3, some Phi-4) still
+        # emit a reasoning trace. This mirrors what the router's
+        # applyVLLMPolicy / applySGLangPolicy does at serve time. Without it,
+        # the probe sends a vanilla request and these models classify as
+        # `unsupported` even though the parser would work in production.
+        base_chat_body: dict = {
             "model": model_name,
-            "messages": [{"role": "user", "content": TOOL_PROBE_PROMPT}],
-            "tools": TOOL_PROBE_SPEC,
-            "tool_choice": "auto",
+            "messages": [{"role": "user", "content": prompt}],
             "temperature": 0,
-            "max_tokens": tool_max_tokens,
+            # Reasoning models need room for the full trace before the
+            # final answer. 256 tokens often truncates mid-think; the
+            # parser then can't bracket a `<think>...</think>` block and
+            # silently drops the partial trace. 2048 covers Qwen3-8B's
+            # typical CoT for medium-complexity prompts.
+            "max_tokens": 2048,
             "stream": False,
         }
-        auto_resp = _post_chat(base_url, auto_body)
-        if response_has_valid_tool_call(auto_resp, "get_time"):
-            tool_parser_verified = tool_parser
-            tool_evidence = {"verified": True, "mode": "auto"}
-        else:
-            # Force a call so the parser is exercised even when the model
-            # wouldn't pick a tool on its own. Keep the same prompt and
-            # tools spec; just change tool_choice. Boost the budget once
-            # more so reasoning + the forced call both fit.
-            forced_body = dict(auto_body)
-            forced_body["tool_choice"] = {
-                "type": "function",
-                "function": {"name": "get_time"},
+        if reasoning_parser:
+            base_chat_body = build_enable_thinking_body(spec.name, base_chat_body)
+        chat_resp = _post_chat(base_url, base_chat_body)
+
+        used_mb = gpu_memory_used_mb()
+        actual_vram_gb = round(used_mb / 1024, 2)
+
+        capability, cap_evidence = classify_chat_response(
+            chat_resp, reasoning_parser_attempted=reasoning_parser,
+        )
+        cap_evidence = dict(cap_evidence)
+        cap_evidence["reasoning_parser_attempted"] = reasoning_parser
+        cap_evidence["tool_parser_attempted"] = tool_parser
+        # Forensic snapshot of the raw Probe A response — full content +
+        # reasoning_content (capped) so we can debug parser-content
+        # mismatches without re-launching. Replaces the older 200-char
+        # previews; classify_chat_response still produces those for the
+        # short-form summary.
+        try:
+            msg = ((chat_resp.get("choices") or [{}])[0].get("message") or {})
+            cap_evidence["full_content"] = (msg.get("content") or "")[:2000]
+            cap_evidence["full_reasoning_content"] = _extract_reasoning_content(msg)[:2000]
+            cap_evidence["finish_reason"] = (chat_resp.get("choices") or [{}])[0].get("finish_reason")
+        except (AttributeError, IndexError, TypeError):
+            pass
+
+        if capability == Capability.ERROR:
+            return _failure_record(
+                ctx=requested_ctx, vram_gb=band_gb, started=started,
+                startup_seconds=startup_seconds, actual_vram_gb=actual_vram_gb,
+                actual_context=actual_max,
+                evidence={"kind": "oom_chat", **cap_evidence},
+            )
+
+        # Confirmed reasoning parser only when Probe A actually produced
+        # `structured`. Any other capability means the curated parser
+        # didn't apply (model emits inline or doesn't reason at all).
+        reasoning_parser_verified = reasoning_parser if capability == Capability.STRUCTURED else None
+
+        # ── Probe B: tool-call ───────────────────────────────────────────
+        # Two-phase verification:
+        #   B1 (auto):   tool_choice="auto"  — does the model spontaneously
+        #                pick the tool? Useful signal for agents that send
+        #                "auto", but reasoning models (R1-Distill et al)
+        #                tend to ramble in reasoning_content instead of
+        #                calling, so a "no" here doesn't mean the parser is
+        #                broken.
+        #   B2 (forced): tool_choice={"type":"function","function":{"name":...}}
+        #                if B1 didn't yield a call. Forces the model to emit
+        #                the tool-call markers so we can verify the parser
+        #                actually extracts. Distinguishes "model declines
+        #                to call" from "parser can't parse what was emitted".
+        # Either path verifying counts as `tool_parser_verified=True` — the
+        # router's strip-tools logic only cares whether the parser CAN
+        # extract; agents that send explicit tool_choice still need the
+        # plugin loaded even if the model wouldn't auto-pick.
+        tool_parser_verified: str | None = None
+        tool_evidence: dict | None = None
+        if tool_parser:
+            # Reasoning models burn 500-2000 tokens on chain-of-thought before
+            # any tool-call markers. The old 128-token budget guaranteed they
+            # never reached the call. 2048 covers typical R1-Distill traces.
+            is_reasoning = capability in (Capability.STRUCTURED, Capability.INLINE)
+            tool_max_tokens = 2048 if is_reasoning else 128
+            auto_body = {
+                "model": model_name,
+                "messages": [{"role": "user", "content": TOOL_PROBE_PROMPT}],
+                "tools": TOOL_PROBE_SPEC,
+                "tool_choice": "auto",
+                "temperature": 0,
+                "max_tokens": tool_max_tokens,
+                "stream": False,
             }
-            forced_body["max_tokens"] = max(tool_max_tokens, 4096)
-            forced_resp = _post_chat(base_url, forced_body)
-            if response_has_valid_tool_call(forced_resp, "get_time"):
+            auto_resp = _post_chat(base_url, auto_body)
+            if response_has_valid_tool_call(auto_resp, "get_time"):
                 tool_parser_verified = tool_parser
-                tool_evidence = {
-                    "verified": True,
-                    "mode": "forced",
-                    "auto_response_preview": _short(auto_resp),
-                }
+                tool_evidence = {"verified": True, "mode": "auto"}
             else:
-                tool_evidence = {
+                # Force a call so the parser is exercised even when the model
+                # wouldn't pick a tool on its own. Keep the same prompt and
+                # tools spec; just change tool_choice. Boost the budget once
+                # more so reasoning + the forced call both fit.
+                forced_body = dict(auto_body)
+                forced_body["tool_choice"] = {
+                    "type": "function",
+                    "function": {"name": "get_time"},
+                }
+                forced_body["max_tokens"] = max(tool_max_tokens, 4096)
+                forced_resp = _post_chat(base_url, forced_body)
+                if response_has_valid_tool_call(forced_resp, "get_time"):
+                    tool_parser_verified = tool_parser
+                    tool_evidence = {
+                        "verified": True,
+                        "mode": "forced",
+                        "auto_response_preview": _short(auto_resp),
+                    }
+                else:
+                    tool_evidence = {
+                        "verified": False,
+                        "auto_response_preview": _short(auto_resp),
+                        "forced_response_preview": _short(forced_resp),
+                    }
+
+        # ── Probe C: disable verification ────────────────────────────────
+        disable_verified = False
+        disable_evidence: dict | None = None
+        if capability == Capability.STRUCTURED:
+            disable_body = build_disable_thinking_body(spec.name, base_chat_body)
+            disable_resp = _post_chat(base_url, disable_body)
+            if not response_has_reasoning_content(disable_resp) and "error" not in disable_resp:
+                disable_verified = True
+                disable_evidence = {"verified": True}
+            else:
+                disable_evidence = {
                     "verified": False,
-                    "auto_response_preview": _short(auto_resp),
-                    "forced_response_preview": _short(forced_resp),
+                    "response_preview": _short(disable_resp),
                 }
 
-    # ── Probe C: disable verification ────────────────────────────────
-    disable_verified = False
-    disable_evidence: dict | None = None
-    if capability == Capability.STRUCTURED:
-        disable_body = build_disable_thinking_body(spec.name, base_chat_body)
-        disable_resp = _post_chat(base_url, disable_body)
-        if not response_has_reasoning_content(disable_resp) and "error" not in disable_resp:
-            disable_verified = True
-            disable_evidence = {"verified": True}
-        else:
-            disable_evidence = {
-                "verified": False,
-                "response_preview": _short(disable_resp),
-            }
-
-    container_remove(runtime, container_name)
-
-    rec = {
-        "ctx": requested_ctx,
-        "vram_gb": band_gb,
-        "fits": True,
-        "actual_vram_gb": actual_vram_gb,
-        "actual_context": actual_max or requested_ctx,
-        "capability": capability,
-        "reasoning_parser": reasoning_parser_verified,
-        "tool_parser": tool_parser_verified,
-        "disable_verified": disable_verified,
-        "startup_seconds": startup_seconds,
-        "probe_seconds": round(time.time() - started, 2),
-        "probed_at": now_iso(),
-        "evidence": cap_evidence,
-    }
-    if spec.kv_cache_dtype:
-        # Fit is dtype-scoped: the router reproduces this dtype when
-        # serving any ctx this cell covers (gpu-arbiter resolveKVCacheType).
-        rec["kv_cache_type"] = spec.kv_cache_dtype
-    if tool_evidence is not None:
-        rec["evidence"]["tool"] = tool_evidence
-    if disable_evidence is not None:
-        rec["evidence"]["disable"] = disable_evidence
-    return rec
+        rec = {
+            "ctx": requested_ctx,
+            "vram_gb": band_gb,
+            "fits": True,
+            "actual_vram_gb": actual_vram_gb,
+            "actual_context": actual_max or requested_ctx,
+            "capability": capability,
+            "reasoning_parser": reasoning_parser_verified,
+            "tool_parser": tool_parser_verified,
+            "disable_verified": disable_verified,
+            "startup_seconds": startup_seconds,
+            "probe_seconds": round(time.time() - started, 2),
+            "probed_at": now_iso(),
+            "evidence": cap_evidence,
+        }
+        if spec.kv_cache_dtype:
+            # Fit is dtype-scoped: the router reproduces this dtype when
+            # serving any ctx this cell covers (gpu-arbiter resolveKVCacheType).
+            rec["kv_cache_type"] = spec.kv_cache_dtype
+        if tool_evidence is not None:
+            rec["evidence"]["tool"] = tool_evidence
+        if disable_evidence is not None:
+            rec["evidence"]["disable"] = disable_evidence
+        return rec
+    finally:
+        container_remove(runtime, container_name)
 
 
 def _post_chat(base_url: str, body: dict, timeout: float = CHAT_TIMEOUT) -> dict:
@@ -1457,8 +1597,14 @@ def ensure_entry(
         # existed; refresh_top_level_from_cells repopulates from
         # cell-level evidence.tool.mode on the next probe.
         entry.setdefault("tool_mode", None)
-        if entry.get("schema_version", 1) < schema_version:
-            entry["schema_version"] = schema_version
+        # NOTE: schema_version is deliberately NOT bumped here. The v1->v2
+        # fields above are backfilled with non-verified defaults; declaring
+        # the entry v2 on that basis defeats the router's deliberate v1
+        # refusal (which exists precisely because a v1 entry has no probed
+        # tool_parser / disable_verified) and silently re-creates the
+        # tool-stripping state that refusal guards against. run_probe_pass
+        # bumps the version only after fresh cells have actually been
+        # measured by this (v2) probe driver.
     return entry
 
 
@@ -1663,6 +1809,7 @@ def build_argparser(spec: BackendSpec, doc: str) -> argparse.ArgumentParser:
 def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
     """Run one probe pass with the given backend spec and argparse args."""
     assert_no_active_backends(args.runtime)
+    install_probe_cleanup()
 
     catalog_rows = load_catalog_hf_rows(args.catalog, spec.name)
     if args.repo:
@@ -1682,6 +1829,18 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
     ctxs = parse_context_list(args.ctx) if args.ctx else standard_contexts()
     if not vrams or not ctxs:
         sys.exit("error: --vram or --ctx produced an empty list")
+    # The requested tiers CAP the binary search. Without this the search
+    # walked the full 32K-multiple grid up to 256K regardless of --ctx /
+    # PROBE_CONTEXTS, launching (and OOM-killing) containers at tiers the
+    # operator explicitly excluded. Keeping the fine grid *below* the
+    # requested ceiling preserves the documented 32K-multiple precision on
+    # a default run (whose ceiling is already 256K) while `--ctx 32K` now
+    # launches exactly one tier. Requested tiers that are not grid
+    # multiples are unioned in so an odd explicit tier is still probed.
+    ctx_ceiling = max(ctxs)
+    search_grid = tuple(sorted(
+        {c for c in BINARY_SEARCH_CONTEXTS if c <= ctx_ceiling} | set(ctxs)
+    ))
 
     cache = load_cache(args.cache)
     # Phase C: record the backend image digest this cache is being probed
@@ -1702,6 +1861,8 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
           file=sys.stderr)
     print(f"  ctx tiers:      {','.join(context_label(c) for c in ctxs)}",
           file=sys.stderr)
+    print(f"  ctx search grid:{','.join(context_label(c) for c in search_grid)}",
+          file=sys.stderr)
     print(f"  host vram:      {args.host_vram_gb}G", file=sys.stderr)
     print(f"  {spec.name} image:     {args.image}", file=sys.stderr)
     print(file=sys.stderr)
@@ -1711,6 +1872,7 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
     skipped_missing = 0
     skipped_arch = 0
     skipped_excluded = 0
+    skipped_pos_limit = 0
 
     for row in catalog_rows:
         name = row.get("name") or ""
@@ -1782,10 +1944,33 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
                 break
             band = entry.setdefault("probes", {}).setdefault(str(vram_gb), {})
 
+            # A cache entry written by an OLDER schema version must be
+            # RE-probed, not merely re-labelled: the router refuses v1
+            # entries precisely because they carry no probed parser /
+            # disable verdicts, and its own error message tells the
+            # operator to run `make probe-vllm` / `make probe-sglang`.
+            # Without this bypass a populated v1 band short-circuits, the
+            # version bump at the end of this loop (which is gated on
+            # freshly probed cells, by design) never runs, and that
+            # documented instruction can never succeed without
+            # PROBE_FORCE=1. Mirrors --force in also requiring that the
+            # result can actually be written.
+            stale_schema = (
+                entry.get("schema_version", 1) < spec.schema_version
+                and not args.no_cache_write
+            )
+            if stale_schema and band:
+                print(f"  {name}: cache entry is schema v"
+                      f"{entry.get('schema_version', 1)} < v"
+                      f"{spec.schema_version} — re-probing to upgrade",
+                      file=sys.stderr)
+
             # Keep-one-cell: a populated band already holds the single
             # binary-searched result from a prior run. Re-probe only under
-            # --force (which rewrites the cell, not appends).
-            if band and not (args.force and not args.no_cache_write):
+            # --force (which rewrites the cell, not appends) or when the
+            # entry predates the current schema version.
+            if band and not stale_schema and not (
+                    args.force and not args.no_cache_write):
                 fully_cached += 1
                 continue
             band.clear()
@@ -1795,7 +1980,9 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
                 f"T={row_tool_parser or '—'}"
             )
             print(f"  {name} @ {vram_label(vram_gb)}: binary-searching max "
-                  f"fitting ctx on the 32K grid [{parser_label}] ...",
+                  f"fitting ctx over "
+                  f"{context_label(search_grid[0])}-"
+                  f"{context_label(search_grid[-1])} [{parser_label}] ...",
                   file=sys.stderr)
 
             row_mtp = row.get("mtp") if isinstance(row.get("mtp"), dict) else None
@@ -1846,7 +2033,9 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
                 return bool(rec.get("fits"))
 
             pos_cap = pos_limit if isinstance(pos_limit, int) and pos_limit > 0 else None
-            max_ctx = binary_search_max_ctx(_fit_works, position_limit=pos_cap)
+            max_ctx = binary_search_max_ctx(
+                _fit_works, position_limit=pos_cap, grid=search_grid,
+            )
 
             # An architecture/quant rejection at any probed tier means the
             # model cannot load at all -- keep it as evidence and stop the
@@ -1921,6 +2110,29 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
                 entry.setdefault("first_probed_at", probed_cells[lo]["probed_at"])
                 entry["last_probed_at"] = probed_cells[lo]["probed_at"]
                 fresh_probes += 1
+            else:
+                # Nothing was ever launched: every grid tier sits above the
+                # model's position_limit, so binary_search_max_ctx
+                # instant-failed them all. Previously this wrote NO cell, NO
+                # ledger entry and printed NOTHING, so the model was silently
+                # re-attempted on every future run. Record the reason and
+                # exclude it -- a context ceiling below the smallest probed
+                # tier is a property of the checkpoint, not of this GPU, so
+                # the terminal (vram- and sha-independent) verdict is right.
+                detail = (f"position_limit={pos_cap} is below the smallest "
+                          f"probed ctx tier {context_label(search_grid[0])}")
+                print(f"    [skip] {name}: {detail}", file=sys.stderr)
+                _ledger_record(ledger, name, spec.name, "unsupported_arch",
+                               detail=detail, repo=repo,
+                               host_vram=args.host_vram_gb, sha=sha)
+                skipped_pos_limit += 1
+
+            if probed_cells and entry.get("schema_version", 1) < spec.schema_version:
+                # Only now is the version bump earned: fresh cells were just
+                # measured by this (v2) probe driver, so the entry carries the
+                # probed parser / disable verdicts the router's v1 refusal
+                # exists to demand. ensure_entry deliberately does NOT bump.
+                entry["schema_version"] = spec.schema_version
 
             refresh_top_level_from_cells(entry)
             if not args.no_cache_write:
@@ -1979,6 +2191,7 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
         f"{fully_cached} band(s) fully cached; "
         f"{skipped_missing} not on disk; "
         f"{skipped_excluded} ledger-excluded; "
+        f"{skipped_pos_limit} below the smallest ctx tier; "
         f"{skipped_arch} skipped as cached unsupported_arch; "
         f"{pruned} orphan sha(s) pruned",
         file=sys.stderr,
