@@ -12,39 +12,55 @@ authoritative -- update this file to match.
 - **Draft** -- design under discussion, decisions not all locked.
 - **Approved** -- decisions locked; ready to schedule.
 - **In Progress** -- some phase has been started.
-- **Done** -- all required phases shipped.
+- **Done** -- all required phases shipped and verified.
+- **Done (unverified)** -- all required phases code-complete and
+  unit-tested, but the live-GPU / live-secret verification the plan
+  itself requires has not been run on this host (the GPU is never
+  free and `make cache-down` is unavailable here). Code-complete,
+  NOT verified-in-production.
 
-Current snapshot (as of 2026-07-23). Only the newest rows were
-re-verified on that date; the other statuses carry over from the
-2026-05-15 snapshot and are due an audit -- CLAUDE.md's plan
-summary is currently more current than this table.
+Current snapshot (as of 2026-07-24). Every row was re-audited on that
+date against each plan's own phase-completion markers -- the
+2026-05-15 carry-over statuses no longer apply. The audit reclassified
+four rows the prior snapshot carried as "In Progress"
+(`sops-age-secrets`, `mcp-gateway`, `gpu-arbiter-cluster-mode`,
+`model-lifecycle-ledger`) and one it carried as "Done (see note)"
+(`review-fixes-2026-07`) into **Done (unverified)**: their code is
+complete and unit-tested, but every live-GPU / live-secret
+verification the plans require is still outstanding on this host.
+The three plans still marked **In Progress** each have real remaining
+work, not just verification: `bench-rewrite` (Phase 6 backfill is
+required and unshipped), `skypilot-agent-skill` (Phase 2 plugin install
+deferred), and `skypilot-fleet-provisioner` (Phase 2 Go code exists but
+is NOT wired -- nothing constructs the client, so cloud burst is inert).
+See each plan's own "Unverified" / caveats section for specifics.
 
 Note on `review-fixes-2026-07`: executed 2026-07-23 in **three** passes
 (remediation, then two adversarial-review repair rounds -- each round
 found defects the previous round had itself introduced). All nine
 phases were worked and its three open questions are resolved. It is
-marked **Done** rather than shipped-and-verified because the live-GPU
-tests the plan itself requires before Phase 3 may merge
+marked **Done (unverified)** rather than shipped-and-verified because the
+live-GPU tests the plan itself requires before Phase 3 may merge
 (`make test-router`, `make test-vllm`) could not run on the execution
 host -- they need the GPU free and `make cache-down`. See that plan's
 "Unverified" section.
 
-| Plan                                                                | Status      |
-| ------------------------------------------------------------------- | ----------- |
-| [sops-age-secrets](./sops-age-secrets.md)                           | In Progress |
-| [bench-rewrite](./bench-rewrite.md)                                 | In Progress |
-| [skypilot-agent-skill](./skypilot-agent-skill.md)                   | In Progress |
-| [mcp-gateway](./mcp-gateway.md)                                     | In Progress |
-| [gpu-arbiter-cluster-mode](./gpu-arbiter-cluster-mode.md)           | In Progress |
-| [skypilot-fleet-provisioner](./skypilot-fleet-provisioner.md)       | In Progress |
-| [router-shortcircuit](./router-shortcircuit.md)                     | Draft       |
-| [router-fanout](./router-fanout.md)                                 | Draft       |
-| [pi-coding-agent](./pi-coding-agent.md)                             | Draft       |
-| [kv-cache-quantization](./kv-cache-quantization.md)                 | Draft       |
-| [model-lifecycle-ledger](./model-lifecycle-ledger.md)               | In Progress |
-| [odysseus-borrowed-ideas](./odysseus-borrowed-ideas.md)             | Draft       |
-| [review-fixes-2026-07](./review-fixes-2026-07.md)                   | Done (see note) |
-| [card-derived-hints-and-bench-sync](./card-derived-hints-and-bench-sync.md) | Draft |
+| Plan                                                                | Status            |
+| ------------------------------------------------------------------- | ----------------- |
+| [sops-age-secrets](./sops-age-secrets.md)                           | Done (unverified) |
+| [bench-rewrite](./bench-rewrite.md)                                 | In Progress       |
+| [skypilot-agent-skill](./skypilot-agent-skill.md)                   | In Progress       |
+| [mcp-gateway](./mcp-gateway.md)                                     | Done (unverified) |
+| [gpu-arbiter-cluster-mode](./gpu-arbiter-cluster-mode.md)           | Done (unverified) |
+| [skypilot-fleet-provisioner](./skypilot-fleet-provisioner.md)       | In Progress       |
+| [router-shortcircuit](./router-shortcircuit.md)                     | Draft             |
+| [router-fanout](./router-fanout.md)                                 | Draft             |
+| [pi-coding-agent](./pi-coding-agent.md)                             | Draft             |
+| [kv-cache-quantization](./kv-cache-quantization.md)                 | Draft             |
+| [model-lifecycle-ledger](./model-lifecycle-ledger.md)               | Done (unverified) |
+| [odysseus-borrowed-ideas](./odysseus-borrowed-ideas.md)             | Draft             |
+| [review-fixes-2026-07](./review-fixes-2026-07.md)                   | Done (unverified) |
+| [card-derived-hints-and-bench-sync](./card-derived-hints-and-bench-sync.md) | Draft     |
 
 ## Dependency graph
 
