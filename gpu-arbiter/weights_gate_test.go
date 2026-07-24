@@ -64,6 +64,27 @@ func TestCheckModelWeights(t *testing.T) {
 	}
 }
 
+// A model name that tries to escape ModelsDir must be rejected before it
+// is joined into a filesystem path (go/path-injection). isSafeModelName
+// screens `..` upstream, but checkModelWeights re-checks locally so the
+// containment guarantee does not depend on a caller.
+func TestCheckModelWeights_RejectsPathTraversal(t *testing.T) {
+	store := t.TempDir()
+	a := &arbiter{}
+	cfg := backendConfig{Name: "vllm", ModelsDir: store}
+	for _, name := range []string{"../etc/passwd", "../../secrets", "/etc/passwd", "foo/../../bar"} {
+		if err := a.checkModelWeights(cfg, name); err == nil {
+			t.Errorf("expected %q to be rejected as a non-local name", name)
+		}
+	}
+	// The HF repo form is a legitimate relative, non-escaping name and
+	// must still pass the guard (it only fails later on missing weights).
+	if err := a.checkModelWeights(cfg, "nvidia/Qwen3-8B-NVFP4"); err == nil ||
+		!strings.Contains(err.Error(), "make model-pull") {
+		t.Errorf("HF repo form must reach the weights check, got: %v", err)
+	}
+}
+
 // The degradation path must not fire once per request.
 func TestCheckModelWeights_UnmountedStoreWarnsOnce(t *testing.T) {
 	a := &arbiter{}

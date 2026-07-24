@@ -54,6 +54,7 @@ import (
 	"os"
 	"os/signal"
 	"path"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -2593,6 +2594,17 @@ func (a *arbiter) checkModelWeights(cfg backendConfig, modelName string) error {
 	if _, err := os.Stat(cfg.ModelsDir); err != nil {
 		a.weightCheckOnce(cfg.Name)
 		return nil
+	}
+	// Defense-in-depth, and the local barrier a path-injection scanner
+	// needs to see: confirm modelName cannot escape ModelsDir before it is
+	// joined into a filesystem path. isSafeModelName already rejects `..`
+	// segments upstream, but filepath.IsLocal makes the containment
+	// guarantee local to this function -- it rejects absolute paths and any
+	// upward traversal while still allowing the HF repo form
+	// `nvidia/Qwen3-8B-NVFP4` (a relative, non-escaping path).
+	if !filepath.IsLocal(modelName) {
+		return fmt.Errorf(
+			"%s model %q is not a valid on-disk name", cfg.Name, modelName)
 	}
 	// path (not path/filepath): these are POSIX container paths, and
 	// modelName may legitimately carry a `/` (the HF repo form). The name

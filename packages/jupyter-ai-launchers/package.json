@@ -31,6 +31,9 @@
     "rimraf": "~6.0.0",
     "typescript": "~5.8.0"
   },
+  "resolutions": {
+    "fast-uri": "^3.1.4"
+  },
   "sideEffects": [
     "style/**/*.css",
     "style/index.js"

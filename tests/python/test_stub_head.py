@@ -39,7 +39,10 @@ SH = _load_stub_head_module()
 def _free_port() -> int:
     import socket
     s = socket.socket()
-    s.bind(("", 0))
+    # Bind to loopback only -- the ephemeral port is handed straight to the
+    # 127.0.0.1 HTTPServer below, so there is no reason to expose it on every
+    # interface (flagged by py/bind-socket-all-network-interfaces).
+    s.bind(("127.0.0.1", 0))
     port = s.getsockname()[1]
     s.close()
     return port
