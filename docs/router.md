@@ -612,6 +612,46 @@ the shell when invoking compose.
 | `DRAIN_TIMEOUT`           | `30`    | seconds to wait for in-flight requests when switching backends     |
 | `HEALTH_TIMEOUT_SECONDS`  | `600`   | health-poll deadline for a *hung* load; a crashed engine fails fast via log/exit detection |
 | `MAX_CONCURRENT_REQUESTS`| `32`    | max in-flight requests per backend before HTTP 429; `0` = unlimited **and** omits `--max-num-seqs` / `--max-running-requests` entirely (engine default). Any positive value is also passed to the engine as that flag. |
+| `DEVAI_SSE_KEEPALIVE_SECONDS` | `10` | interval between `: keepalive` SSE comment frames during a slow launch; `0` disables the feature |
+| `DEVAI_SSE_KEEPALIVE_GRACE_SECONDS` | `5` | how long a launch may take before the first frame is sent (and the response is committed as SSE) |
+
+### SSE keepalive during cold start
+
+The router holds a client for the whole launch window before a single
+byte moves: `makeRequestHandler -> ensureBackendRunning ->
+containerRecreate -> waitForHealthy -> proxy.ServeHTTP`. An NVFP4 cold
+start is bounded by `HEALTH_TIMEOUT_SECONDS` (default 600s). A browser or
+corporate proxy with a 30-60s idle timeout drops the connection long
+before that, and the client's retry lands on a router that is still
+loading -- so the expensive load is wasted and the cycle repeats. devai
+ships explicit `HTTP_PROXY`/`HTTPS_PROXY` support, so intermediaries are
+an expected part of the deployment.
+
+While a launch is in progress the router therefore writes SSE comment
+lines (`: keepalive <n>`), which every OpenAI/Anthropic client ignores and
+which reset an intermediary's idle timer. Three properties are worth
+knowing:
+
+- **SSE surfaces only.** The gate requires an explicit `"stream": true`
+  **and** a `/v1/` path. Ollama's native `/api/chat` and `/api/generate`
+  answer in newline-delimited JSON *and* default `stream` to true when
+  the field is absent -- a comment frame there is a parse error for every
+  Ollama-native client. Ollama's own OpenAI-compat `/v1/` endpoint is
+  SSE and does participate.
+- **Nothing happens on the warm path.** No byte is written, and no header
+  is committed, until the launch has already outrun
+  `DEVAI_SSE_KEEPALIVE_GRACE_SECONDS`. The overwhelming majority of
+  requests find the backend warm and keep their exact status-code
+  behaviour.
+- **Committing is one-way.** Once the first frame is written the response
+  is a `200 text/event-stream`, so a launch failure after that point can
+  no longer be a 5xx. It is reported in-band instead -- a `data:` frame
+  plus `data: [DONE]` on the OpenAI surfaces, an `event: error` frame on
+  `/v1/messages` -- because a stream that merely stops is
+  indistinguishable from a hang and would make the client wait out its
+  own timeout.
+
+Implementation and rationale: `gpu-arbiter/sse_keepalive.go`.
 
 ### Memory and context
 

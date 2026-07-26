@@ -73,6 +73,12 @@ What changed on 2026-07-25:
 - **`odysseus-borrowed-ideas` -> Draft (partly frozen).** RT-1, CB-4 and
   CB-1's KV term are approved for extraction; RT-2, RT-3, CMP-1 and
   CMP-2 are rejected rather than left Proposed to accrete legitimacy.
+  All three approved items have now SHIPPED (2026-07-26): CB-1's KV
+  term as the per-backend fit math, CB-4 as the picker's sort-key
+  cycle, and RT-1 as `gpu-arbiter/sse_keepalive.go` (10 tests,
+  race-clean; see docs/router.md "SSE keepalive during cold start").
+  RT-1's second deliverable, `cluster_proxy.go`, is moot -- that file
+  went to `attic/cluster-mode/` with the rest of the frozen feature.
 - **`bench-rewrite` stays In Progress, but Phase 6 is struck.** The
   backfill targets a 32K/64K/128K/256K probe grid that no longer exists
   -- the probers now keep exactly one winner cell per (model, backend).

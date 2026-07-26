@@ -865,6 +865,14 @@ type arbiter struct {
 	// engines' --max-num-seqs / --max-running-requests so CUDA-graph
 	// capture covers exactly the batch sizes we admit.
 	maxConcurrent int64
+	// SSE keepalive during a slow launch. A streaming /v1/ request that
+	// waits longer than keepaliveGrace starts receiving `: keepalive`
+	// comment frames every keepaliveInterval, so an intermediary's idle
+	// timeout cannot kill the connection mid-cold-start and waste the
+	// load. keepaliveInterval <= 0 disables the feature entirely.
+	// See sse_keepalive.go.
+	keepaliveInterval time.Duration
+	keepaliveGrace    time.Duration
 	// Size and declared-context are keyed by (backend, model name) for the
 	// same reason every other lookup below is: a model probed on BOTH vLLM
 	// and SGLang has an independent row per backend, and a name-only map
@@ -1775,6 +1783,8 @@ func buildArbiter() *arbiter {
 		drainTimeout:         time.Duration(envInt("DRAIN_TIMEOUT", 30)) * time.Second,
 		healthTimeout:        time.Duration(envInt("HEALTH_TIMEOUT_SECONDS", 600)) * time.Second,
 		maxConcurrent:        int64(envIntAllowZero("MAX_CONCURRENT_REQUESTS", 32)),
+		keepaliveInterval:    time.Duration(envIntAllowZero("DEVAI_SSE_KEEPALIVE_SECONDS", sseKeepaliveIntervalDefault)) * time.Second,
+		keepaliveGrace:       time.Duration(envIntAllowZero("DEVAI_SSE_KEEPALIVE_GRACE_SECONDS", sseKeepaliveGraceDefault)) * time.Second,
 		modelSizes:           modelSizes,
 		modelContexts:        modelContexts,
 		modelCapability:      modelCapability,
@@ -3502,13 +3512,29 @@ func (a *arbiter) makeRequestHandler(backendName string) http.HandlerFunc {
 			}
 		}
 
+		// Hold the connection open across a slow launch. Nothing is
+		// written unless the launch outlasts the grace period, so a warm
+		// backend -- the overwhelming majority -- keeps its exact
+		// status-code behaviour. See sse_keepalive.go.
+		keepalive := (*sseKeepalive)(nil)
+		if wantsSSEKeepalive(req.URL.Path, body) {
+			keepalive = startSSEKeepalive(w, a.keepaliveGrace, a.keepaliveInterval)
+		}
+
 		a.mu.Lock()
 		bs.lastRequest = time.Now()
 		if err := a.ensureBackendRunning(bs, modelName, numCtx, ctxPinned, desiredSpec); err != nil {
 			a.mu.Unlock()
-			a.writeLaunchError(w, err)
+			// stop() joins the heartbeat goroutine, so w is ours again
+			// before either error writer touches it.
+			if keepalive.stop() {
+				writeSSELaunchError(w, req.URL.Path, err)
+			} else {
+				a.writeLaunchError(w, err)
+			}
 			return
 		}
+		keepalive.stop()
 		servedCtx := bs.currentContext
 		// Count as in-flight-upstream while still holding a.mu, so a
 		// stopOtherBackends that acquires the mutex right after we drop it

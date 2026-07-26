@@ -81,7 +81,7 @@ promoting a feature to Accepted.
 
 | ID     | Feature                                                        | Area     | Value  | Effort | Verify     | Status   |
 | ------ | -------------------------------------------------------------- | -------- | ------ | ------ | ---------- | -------- |
-| RT-1   | SSE keepalive heartbeat during cold-start                      | Router   | high   | low-med| first-hand | Proposed |
+| RT-1   | SSE keepalive heartbeat during cold-start                      | Router   | high   | low-med| first-hand | **Shipped 2026-07-26** |
 | CB-1   | Analytic pre-probe fit/TPS/quality estimator                   | Cookbook | high   | med    | first-hand | Proposed |
 | CB-2   | Serve-error -> auto-fix retry loop (grows recovery-flags.json) | Cookbook | high   | med    | agent-read | Proposed |
 | CB-3   | Ingest vllm-project/recipes as authoritative launch config     | Cookbook | high   | med    | agent-read | Proposed |
@@ -482,7 +482,16 @@ this is the last item to schedule, and only after CMP-1 has a prompt corpus.
 
 ### RT-1 -- SSE keepalive heartbeat during cold-start
 
-- **Status:** Proposed
+- **Status:** Shipped 2026-07-26 -- `gpu-arbiter/sse_keepalive.go` +
+  `sse_keepalive_test.go` (10 tests, race-clean). Documented in
+  docs/router.md "SSE keepalive during cold start". The
+  `cluster_proxy.go` deliverable below is moot: that file moved to
+  `attic/cluster-mode/` when cluster mode was frozen. Both wrinkles the
+  risk note anticipated are handled as described -- the behaviour is
+  gated on `stream:true` AND a `/v1/` path (Ollama-native NDJSON must
+  never receive comment frames), a grace window keeps the warm path
+  byte-identical, and a failure after commit emits an in-band SSE error
+  rather than a 5xx.
 - **Value / Effort:** high / low-medium
 - **Verification:** first-hand (confirmed router ordering in
   `gpu-arbiter/main.go`: `ensureBackendRunning -> containerRecreate ->
