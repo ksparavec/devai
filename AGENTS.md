@@ -147,8 +147,8 @@ Use `make help` to list supported targets. Common commands:
   Python unit + Ollama integration + matrix + vLLM/SGLang integration +
   E2E + probe smoke. Wall time 30-60+ min. Each layer skips cleanly
   when its prerequisites aren't met.
-- `make test-python`: stdlib-unittest cases (511 collected as of
-  2026-07-25) covering bench v3 schema migration + runner ctx flags
+- `make test-python`: stdlib-unittest cases (612 collected as of
+  2026-07-27) covering bench v3 schema migration + runner ctx flags
   + picker keying + report rendering, sops/age scaffold script
   gates, MCP gateway catalog/compose/Makefile shape, SkyPilot
   agent-skill, catalog-discover, and the model-lifecycle ledger.

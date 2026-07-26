@@ -93,9 +93,9 @@ make logs SERVICE=devai-router LINES=200
 make setup-logs                 # One-time: 100G LV at /var/cache/devai/logs (sudo)
 
 # Tests
-make test-router                # Go unit tests for arbiter (single-host only; 220 tests after the cluster freeze)
+make test-router                # Go unit tests for arbiter (single-host only; 240 tests as of 2026-07-27)
 make test-devai-tools            # Go unit tests for devai-tools/ (backup, modelcache, routerclient, envfile, gpu-vendor -- 6 packages)
-make test-python                # Python stdlib unittests (bench v3, picker, sops/age, MCP, catalog/model-lifecycle -- 511 collected on 2026-07-25)
+make test-python                # Python stdlib unittests (bench v3, picker, sops/age, MCP, catalog/model-lifecycle, hf-store linking, bench-sync -- 612 collected on 2026-07-27)
 make test-backup-restore        # devai-backup Go tests + tests/test-backup-restore.sh
 make test-gpu-vendor            # GPU-vendor overlay: flips DEVAI_GPU_VENDOR, asserts rendered compose config both directions
 make test-ollama                # Ollama integration tests
@@ -336,7 +336,7 @@ tests/test-mcp-modelstatus.sh -- devai-model-status end-to-end against the live 
 tests/test-backup-restore.sh  -- devai-backup end-to-end: snapshot -> list -> verify -> delete originals -> restore --yes -> diff, against temp dirs standing in for deploy/, ~/.devai/, ~/.config/sops/age/ (--repo-root/--home-dir overrides; never touches the real $HOME).
 tests/test-gpu-vendor.sh      -- Flips DEVAI_GPU_VENDOR both directions, asserts the rendered `compose config` shows the right device string + backend image tags each time (and that the other vendor's values are absent).
 tests/fixtures/modelstatus/   -- Hand-crafted models.yaml + probe-cache + bench-cache fixtures matching the real schemas, shared by the Go unit tests and tests/test-mcp-modelstatus.sh.
-tests/python/                 -- Python stdlib-unittest cases (511 collected as of 2026-07-25) covering bench v3 schema migration + runner ctx flags + picker keying + report rendering, sops/age scaffold script gates, MCP gateway catalog/compose/Makefile shape, SkyPilot agent-skill Dockerfile + fetch-cli + docs, catalog-discover lineage/version parsing + structural line filter + VRAM-band filter (under/oversized) + base-model filter + real-size fetch + discover-block overrides + comment-preserving YAML add, model-lifecycle probe-failure classifier + sha-stable carry-forward/orphan-prune + exclusion-ledger stability rules + model-sync diff, network-stubbed end-to-end. Run via `make test-python`.
+tests/python/                 -- Python stdlib-unittest cases (612 collected as of 2026-07-27) covering bench v3 schema migration + runner ctx flags + picker keying + report rendering, sops/age scaffold script gates, MCP gateway catalog/compose/Makefile shape, SkyPilot agent-skill Dockerfile + fetch-cli + docs, catalog-discover lineage/version parsing + structural line filter + VRAM-band filter (under/oversized) + base-model filter + real-size fetch + discover-block overrides + comment-preserving YAML add, model-lifecycle probe-failure classifier + sha-stable carry-forward/orphan-prune + exclusion-ledger stability rules + model-sync diff, network-stubbed end-to-end. Run via `make test-python`.
 docs/backends.md              -- Lifecycle, probing, cache hygiene, failure-mode taxonomy across all 3 backends
 docs/secrets.md               -- Source of truth for the sops/age scaffold (one-time setup, edit, render, rotation, recovery, multi-host onboarding, paranoid-mode pointer). Only live consumer is the MCP gateway.
 docs/mcp.md                   -- Operator reference for the MCP gateway (catalog split, client configs, security model, troubleshooting).
