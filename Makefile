@@ -50,6 +50,18 @@ export GPU_MEMORY_GB MAX_CONTEXT_LEN
 VLLM_IMAGE ?= docker.io/vllm/vllm-openai:latest-x86_64-cu129-ubuntu2404
 export VLLM_IMAGE
 CACHE_COMPOSE = $(CURDIR)/deploy/docker-compose.yaml
+
+# Services `make cache-up` brings up, in compose-declaration order. Listed
+# explicitly because cache-up must name them one by one -- see the
+# router-managed-container note in that target. Keep in sync with
+# deploy/docker-compose.yaml; `make cache-services-check` asserts it.
+# mcp-gateway is deliberately absent: it sits behind the `mcp` profile.
+CACHE_SERVICES = apt-cache registry-cache ollama vllm sglang router \
+                 open-webui webui-proxy logger pipelock
+
+# The three the router recreates on demand. cache-up skips any of these
+# that already exist rather than colliding with the router's container.
+CACHE_BACKEND_SERVICES = ollama vllm sglang
 INFERENCE_CONFIG = deploy/models.yaml
 HF_CLI = hf
 # vLLM and SGLang safetensors live on their OWN external volumes
@@ -896,9 +908,46 @@ cache-up: ## Start all infrastructure (caches + Ollama + router + Open WebUI; vL
 	fi
 	@$(CONTAINER_RUNTIME) network exists $(DEVAI_NETWORK) 2>/dev/null || $(CONTAINER_RUNTIME) network create $(DEVAI_NETWORK)
 	@$(CONTAINER_RUNTIME) network exists $(DEVAI_EGRESS_NETWORK) 2>/dev/null || $(CONTAINER_RUNTIME) network create --internal $(DEVAI_EGRESS_NETWORK)
+	@# Backend services are brought up ONLY when no container of that name
+	@# exists. The router replaces each placeholder with its own container
+	@# (created through the libpod API, so it carries none of compose's
+	@# project labels), and compose therefore does not recognise it as its
+	@# own: it tries to create a fresh one and dies on the name collision.
+	@#
+	@#   Error response from daemon: container create: creating container
+	@#   storage: the container name "devai-ollama" is already in use
+	@#
+	@# That failure took down the WHOLE target, and every test and bench
+	@# target depends on cache-up -- so once the router had served a single
+	@# Ollama request, `make test-ollama|test-vllm|test-sglang|test-e2e|
+	@# test-models` and every `bench-*` could no longer run at all. This is
+	@# a large part of why the live suites went so long without being run.
+	@#
+	@# Skipping is the right behaviour, not a workaround: a router-managed
+	@# backend already IS up, and tearing it down here would evict a warm
+	@# model on every idempotent `make cache-up`, defeating keep-warm. Use
+	@# `make cache-down` when you genuinely want the declared placeholders
+	@# back.
+	@#
+	@# --no-deps is required, not incidental: `router depends_on ollama`,
+	@# so without it compose drags the very backend we just skipped back
+	@# into the up-set and collides anyway. Safe here because CACHE_SERVICES
+	@# names every non-profile service, so nothing needed goes unstarted --
+	@# and `make cache-services-check`'s test asserts that list stays in
+	@# sync with the compose file.
 	@key=$(PIPELOCK_CA_KEY); [ -f "$$key" ] || key=/dev/null; \
 	  if [ "$$key" = /dev/null ]; then echo "NOTE: pipelock CA key not found ($(PIPELOCK_CA_KEY)); devai-pipelock stays unhealthy until 'make pipelock-ca-init'."; fi; \
-	  PIPELOCK_CA_KEY_FILE=$$key $(COMPOSE) -f $(CACHE_COMPOSE) up -d
+	  svcs=""; \
+	  for s in $(CACHE_SERVICES); do \
+	    case " $(CACHE_BACKEND_SERVICES) " in \
+	      *" $$s "*) \
+	        if $(CONTAINER_RUNTIME) container exists devai-$$s 2>/dev/null; then \
+	          echo "  note: devai-$$s already running (router-managed); leaving it alone"; \
+	        else svcs="$$svcs $$s"; fi ;; \
+	      *) svcs="$$svcs $$s" ;; \
+	    esac; \
+	  done; \
+	  PIPELOCK_CA_KEY_FILE=$$key $(COMPOSE) -f $(CACHE_COMPOSE) up -d --no-deps $$svcs
 	@echo "Infrastructure services started:"
 	@echo "  apt-cacher-ng:     http://localhost:3142"
 	@echo "  Registry mirror:   http://localhost:5000"

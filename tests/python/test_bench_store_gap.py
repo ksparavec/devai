@@ -176,5 +176,58 @@ class SamplingOverrideTest(unittest.TestCase):
         self.assertEqual(br.load_sampling_overrides(Path("/nonexistent.json")), {})
 
 
+class CacheServicesInSyncTest(unittest.TestCase):
+    """`make cache-up` names its services explicitly, so that list must
+    not drift from the compose file.
+
+    It names them one at a time because the router replaces each backend
+    placeholder with a container created through the libpod API, carrying
+    none of compose's project labels. Compose does not recognise those as
+    its own, tries to create a fresh container, and dies on the name
+    collision -- which took down the entire cache-up target and with it
+    every test and bench target that depends on it.
+
+    If a service is added to compose and not to CACHE_SERVICES, cache-up
+    silently stops starting it.
+    """
+
+    def _makefile_var(self, name: str) -> set[str]:
+        mk = (REPO_ROOT / "Makefile").read_text()
+        line = mk.split(f"{name} =", 1)[1]
+        # Consume backslash continuations.
+        out, buf = [], ""
+        for raw in line.splitlines():
+            buf = raw.rstrip()
+            cont = buf.endswith("\\")
+            out.append(buf.rstrip("\\").strip())
+            if not cont:
+                break
+        return set(" ".join(out).split())
+
+    def test_cache_services_matches_compose(self):
+        try:
+            import yaml
+        except ImportError:
+            self.skipTest("PyYAML not installed")
+        compose = yaml.safe_load(
+            (REPO_ROOT / "deploy" / "docker-compose.yaml").read_text())
+        # Profile-gated services are opt-in and not part of cache-up.
+        declared = {
+            name for name, svc in (compose.get("services") or {}).items()
+            if not (svc or {}).get("profiles")
+        }
+        listed = self._makefile_var("CACHE_SERVICES")
+        self.assertEqual(
+            listed, declared,
+            f"CACHE_SERVICES drifted from docker-compose.yaml: "
+            f"only-in-Makefile={listed - declared}, "
+            f"only-in-compose={declared - listed}")
+
+    def test_backend_services_are_a_subset(self):
+        backends = self._makefile_var("CACHE_BACKEND_SERVICES")
+        self.assertTrue(backends <= self._makefile_var("CACHE_SERVICES"))
+        self.assertEqual(backends, {"ollama", "vllm", "sglang"})
+
+
 if __name__ == "__main__":
     unittest.main()
