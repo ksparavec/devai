@@ -1,18 +1,23 @@
 // Package routerclient implements get_router_status: a best-effort probe
-// of the running devai-router, tolerant of both cluster-head and
-// single-host deployments.
+// of the running devai-router.
+//
+// This probes the single-host serving path only. It previously tried a
+// cluster-head control-plane endpoint first and fell back to per-backend
+// health checks; cluster mode was frozen on 2026-07-25 (see
+// attic/README.md), so that first probe could only ever fail. It cost a
+// token-file read plus a doomed HTTP round trip on every single call.
+// If cluster mode is thawed, restore the probe from
+// `git log -S probeCluster -- devai-tools/internal/routerclient/`.
 package routerclient
 
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"strconv"
-	"strings"
 )
 
 // backendPortEnvVar / defaultPort mirror gpu-arbiter's own OLLAMA_PORT/
@@ -38,27 +43,12 @@ var defaultBackendPorts = []struct {
 // defaultRouterHost is the router's compose service/container name on
 // devai-net. The router service publishes NO host ports (see
 // deploy/docker-compose.yaml -- only apt-cacher, the registry mirror, the
-// webui proxy, the MCP gateway and the SkyPilot API server do), so
-// host.containers.internal never answers on 11434/5/6 and probing it
-// degraded every call to "unreachable" by construction. Reaching the
-// router by service name over devai-net is how every other in-network
-// consumer (open-webui, the lab) already addresses it.
+// webui proxy and the MCP gateway do), so host.containers.internal never
+// answers on 11434/5/6 and probing it degraded every call to
+// "unreachable" by construction. Reaching the router by service name over
+// devai-net is how every other in-network consumer (open-webui, the lab)
+// already addresses it.
 const defaultRouterHost = "devai-router"
-
-// defaultClusterTokenPath is where the sops/age scaffold renders the
-// cluster bearer token (docs/secrets.md). The head wraps
-// /v1/cluster/{register,heartbeat,status} in TokenStore.AuthMiddleware, so
-// an unauthenticated status probe gets 401 -- and, because
-// deploy/compose.head.yaml zeroes the local backends on a head, the
-// fallback then reports "unreachable" and the cluster-head branch never
-// fires. Same file the arbiter's own DEVAI_WORKER_TOKEN_FILE defaults to.
-const defaultClusterTokenPath = "/run/devai/cluster-token"
-
-// clusterTokenEnvVars are consulted in order for the token's location.
-// DEVAI_HEAD_TOKEN_FILE first so a host that is both head and worker can
-// point the two at different files; DEVAI_WORKER_TOKEN_FILE second because
-// that is the variable already documented in docs/cluster-env.md.
-var clusterTokenEnvVars = []string{"DEVAI_HEAD_TOKEN_FILE", "DEVAI_WORKER_TOKEN_FILE"}
 
 // BackendHealth is one backend's /health result in single mode. The
 // router's health handler (gpu-arbiter's makeHealthHandler) returns JSON
@@ -74,22 +64,15 @@ type BackendHealth struct {
 	Error        string `json:"error,omitempty"`
 }
 
-// Status is get_router_status's result. Mode is "cluster-head" (the
-// /v1/cluster/status probe succeeded), "single" (cluster status
-// unreachable, at least one backend health check succeeded), or
-// "unreachable" (nothing responded).
+// Status is get_router_status's result. Mode is "single" (at least one
+// backend health check succeeded) or "unreachable" (nothing responded).
 //
-// ClusterError carries why the cluster probe did not answer, whenever it
-// did not. It exists so a misconfigured bearer token is diagnosable: a 401
-// (token missing, unreadable, or wrong) is a very different operator
-// problem from "this host is not a cluster head", yet both otherwise
-// collapse into the same single/unreachable mode.
+// The "cluster-head" mode and the cluster_error field were removed when
+// cluster mode was frozen -- see the package comment.
 type Status struct {
-	Mode         string          `json:"mode"`
-	Workers      json.RawMessage `json:"workers,omitempty"`
-	Backends     []BackendHealth `json:"backends,omitempty"`
-	ClusterError string          `json:"cluster_error,omitempty"`
-	Error        string          `json:"error,omitempty"`
+	Mode     string          `json:"mode"`
+	Backends []BackendHealth `json:"backends,omitempty"`
+	Error    string          `json:"error,omitempty"`
 }
 
 type healthBody struct {
@@ -98,17 +81,9 @@ type healthBody struct {
 	ActiveReqs   int64  `json:"active_reqs"`
 }
 
-// GetStatus tries the cluster-head control-plane endpoint first, falling
-// back to per-backend /health probes (the single-mode case) on any
-// failure to reach it -- never returns an error itself, only a Status
-// describing what was reachable.
+// GetStatus probes each backend's /health through the router. It never
+// returns an error itself, only a Status describing what was reachable.
 func GetStatus(ctx context.Context, client *http.Client) Status {
-	clusterURL := env("DEVAI_ROUTER_CLUSTER_URL", "http://"+defaultRouterHost+":11444")
-	body, clusterErr := probeCluster(ctx, client, clusterURL)
-	if clusterErr == "" {
-		return Status{Mode: "cluster-head", Workers: body}
-	}
-
 	host := env("DEVAI_ROUTER_HOST", defaultRouterHost)
 	backends := make([]BackendHealth, 0, len(defaultBackendPorts))
 	anyReachable := false
@@ -123,64 +98,14 @@ func GetStatus(ctx context.Context, client *http.Client) Status {
 
 	if !anyReachable {
 		return Status{
-			Mode:         "unreachable",
-			Backends:     backends,
-			ClusterError: clusterErr,
-			Error:        "cluster status endpoint and all backend health checks failed: " + clusterErr,
+			Mode:     "unreachable",
+			Backends: backends,
+			Error: fmt.Sprintf(
+				"no backend answered /health on %s (ports %d/%d/%d) -- is `make cache-up` running?",
+				host, defaultBackendPorts[0].Port, defaultBackendPorts[1].Port, defaultBackendPorts[2].Port),
 		}
 	}
-	return Status{Mode: "single", Backends: backends, ClusterError: clusterErr}
-}
-
-// probeCluster GETs the head's /v1/cluster/status with a bearer token.
-// Returns the body on success, or a human-readable reason string on
-// failure (empty reason == success). A missing or unreadable token file is
-// NOT fatal: the request still goes out unauthenticated, so a head running
-// without auth (or a plain single-mode host, where the probe fails at the
-// connection anyway) keeps working -- but the reason string then names the
-// token problem so a 401 is traceable to it.
-func probeCluster(ctx context.Context, client *http.Client, clusterURL string) (json.RawMessage, string) {
-	token, tokenPath, tokenErr := readClusterToken()
-	body, err := getJSON(ctx, client, clusterURL+"/v1/cluster/status", token)
-	if err == nil {
-		return body, ""
-	}
-	var httpErr *httpStatusError
-	if errors.As(err, &httpErr) && (httpErr.Code == http.StatusUnauthorized || httpErr.Code == http.StatusForbidden) {
-		if tokenErr != nil {
-			return nil, fmt.Sprintf(
-				"cluster status probe rejected (HTTP %d) and no bearer token was sent: %v "+
-					"(set DEVAI_HEAD_TOKEN_FILE or DEVAI_WORKER_TOKEN_FILE, default %s)",
-				httpErr.Code, tokenErr, defaultClusterTokenPath)
-		}
-		return nil, fmt.Sprintf(
-			"cluster status probe rejected (HTTP %d) with the bearer token from %s -- "+
-				"token is stale or does not match the head's; re-render it (make secrets-render)",
-			httpErr.Code, tokenPath)
-	}
-	return nil, err.Error()
-}
-
-// readClusterToken loads the cluster bearer token, returning the token,
-// the path it came from, and any read error. Every return path is
-// non-fatal for the caller; an error simply means "no token to send".
-func readClusterToken() (token, path string, err error) {
-	path = defaultClusterTokenPath
-	for _, key := range clusterTokenEnvVars {
-		if v := os.Getenv(key); v != "" {
-			path = v
-			break
-		}
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", path, err
-	}
-	token = strings.TrimSpace(string(data))
-	if token == "" {
-		return "", path, fmt.Errorf("token at %s is empty", path)
-	}
-	return token, path, nil
+	return Status{Mode: "single", Backends: backends}
 }
 
 // httpStatusError is a non-2xx response, carrying the code so callers can
@@ -197,10 +122,9 @@ func (e *httpStatusError) Error() string {
 func probeBackendHealth(ctx context.Context, client *http.Client, host, backend string, port int) BackendHealth {
 	bh := BackendHealth{Backend: backend, Port: port}
 	url := fmt.Sprintf("http://%s:%d/health", host, port)
-	// No bearer token here: the backend /health handlers are unauthenticated
-	// (gpu-arbiter's makeHealthHandler is mounted bare), and the cluster
-	// token has no meaning on those ports.
-	body, err := getJSON(ctx, client, url, "")
+	// The backend /health handlers are unauthenticated -- gpu-arbiter's
+	// makeHealthHandler is mounted bare.
+	body, err := getJSON(ctx, client, url)
 	if err != nil {
 		bh.Error = err.Error()
 		return bh
@@ -215,16 +139,12 @@ func probeBackendHealth(ctx context.Context, client *http.Client, host, backend 
 	return bh
 }
 
-// getJSON GETs url, sending "Authorization: Bearer <token>" when token is
-// non-empty. A non-200 comes back as *httpStatusError so callers can
-// branch on the code.
-func getJSON(ctx context.Context, client *http.Client, url, token string) (json.RawMessage, error) {
+// getJSON GETs url. A non-200 comes back as *httpStatusError so the
+// caller's error string names the status code rather than swallowing it.
+func getJSON(ctx context.Context, client *http.Client, url string) (json.RawMessage, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
-	}
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	resp, err := client.Do(req)
 	if err != nil {

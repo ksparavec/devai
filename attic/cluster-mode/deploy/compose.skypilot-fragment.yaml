@@ -1,0 +1,90 @@
+# Frozen compose fragments -- SkyPilot fleet provisioner (Phase 1)
+#
+# Removed from deploy/docker-compose.yaml on 2026-07-25. Verbatim.
+# NOTE the scoped read-only credential mounts below: these REPLACED an
+# earlier ${HOME}:/root:rw whole-home bind that handed the container
+# ~/.ssh and the age private key. The plan document still shows the old
+# dangerous form -- restore from THIS file, not from the plan.
+
+services:
+  # SkyPilot API server (per docs/plans/skypilot-fleet-provisioner.md
+  # Phase 1). Long-lived service that gpu-arbiter (in head mode) calls
+  # to provision cluster workers on demand. Opt-in via the 'cluster'
+  # compose profile -- only operators running cluster mode bring it up.
+  #
+  # Image is the upstream berkeleyskypilot/skypilot release. Container
+  # port 46580 is upstream's default; host port tunable via
+  # SKYPILOT_API_PORT in .env.
+  skypilot-api-server:
+    image: docker.io/berkeleyskypilot/skypilot:0.12.1
+    container_name: devai-skypilot-api-server
+    hostname: skypilot-api-server
+    restart: unless-stopped
+    # Loopback-only publish. `sky api start --deploy` binds 0.0.0.0 inside
+    # the container and ships NO authentication, so every endpoint below
+    # (POST /api/v1/launch, /exec, /down) is anonymous and spends real
+    # cloud money. 127.0.0.1 keeps it off the LAN; the gpu-arbiter head
+    # that calls it runs on this same host.
+    ports:
+      - "127.0.0.1:${SKYPILOT_API_PORT:-46580}:46580"
+    environment:
+      # Where SkyPilot reads its global config. Kept inside the
+      # skypilot-state named volume so it survives restarts -- it used
+      # to sit at /root/.api-server-config.yaml, which only persisted
+      # because the whole host $HOME was bind-mounted over /root.
+      - SKYPILOT_GLOBAL_CONFIG=/root/.sky/api-server-config.yaml
+    # Sourced into the process environment. The /secrets/.env mount below
+    # only puts the rendered file *on disk* -- nothing in `sky api start`
+    # reads it, so without this key the sops-rendered RUNPOD_API_KEY /
+    # LAMBDA_API_KEY / SKYPILOT_API_TOKEN never reach the server and a head
+    # doing cloud burst has no non-interactive credential path at all.
+    # Defaults to /dev/null, which compose parses as an empty env file, so
+    # Phase 1 installs without creds still boot.
+    env_file:
+      - ${SKYPILOT_CREDENTIALS_FILE:-/dev/null}
+    volumes:
+      # rw: this is SkyPilot's own state dir (cluster registry, task
+      # logs, the provisioning SSH keypair it generates for itself).
+      - skypilot-state:/root/.sky
+      # Narrowly-scoped, read-only cloud-credential mounts. These replace
+      # a `${HOME}:/root:rw` bind that also handed this container ~/.ssh
+      # and ~/.config/sops/age/keys.txt -- the age private key that
+      # decrypts every deploy/*.sops.env, whose non-recoverability is the
+      # whole basis of docs/secrets.md's recovery posture. Neither path is
+      # needed by `sky`: it generates its own provisioning keypair under
+      # ~/.sky (the rw volume above). ~/.ssh and ~/.config/sops must never
+      # be mounted here.
+      - ${HOME}/.aws:/root/.aws:ro
+      - ${HOME}/.config/gcloud:/root/.config/gcloud:ro
+      - ${HOME}/.config/sky:/root/.config/sky:ro
+      # RunPod and Lambda are the ONLY two clouds the fleet provisioner can
+      # actually pick -- gpu-arbiter/skypilot_policy.go's DefaultPricing has
+      # no aws or gcp rows, so PickCheapest never returns them. Paths match
+      # docs/skypilot-user-guide.md's setup steps (`runpod config` writes
+      # ~/.runpod/config.toml; Lambda's key goes in ~/.lambda_cloud/lambda_keys).
+      # The aws/gcloud mounts above stay for `sky check` and for operators
+      # who override the pricing table.
+      - ${HOME}/.runpod:/root/.runpod:ro
+      - ${HOME}/.lambda_cloud:/root/.lambda_cloud:ro
+      # sops-rendered service credentials (RunPod / Lambda API keys).
+      # Kept alongside the env_file above so the troubleshooting step in
+      # docs/skypilot.md (`ls -la /secrets/.env`) still shows whether the
+      # render happened. The env_file is what actually delivers the values.
+      - ${SKYPILOT_CREDENTIALS_FILE:-/dev/null}:/secrets/.env:ro
+    entrypoint: [tini]
+    command:
+      - "--"
+      - sky
+      - api
+      - start
+      - "--deploy"
+      - "--foreground"
+    profiles: [cluster]
+
+
+volumes:
+  # SkyPilot API server state (provisioned cluster registry, task
+  # logs, per-cloud config). Survives container restarts so a head
+  # bounce doesn't lose track of in-flight workers. Per
+  # skypilot-fleet-provisioner.md decision 4.
+  skypilot-state:

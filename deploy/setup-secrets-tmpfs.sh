@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Idempotent setup of the /run/devai tmpfs mount used by sops-rendered
-# secrets (mcp-gateway Phase 2, gpu-arbiter cluster mode, SkyPilot fleet
-# provisioner).
+# secrets. The only live consumer is mcp-gateway Tier 2; the cluster-mode
+# and SkyPilot-fleet consumers were frozen on 2026-07-25 (see
+# attic/README.md), so this scaffold currently serves one caller.
 #
 # Mount options chosen per docs/plans/sops-age-secrets.md decision 3:
 #   - tmpfs (RAM-backed; gone on reboot, no plaintext on disk)

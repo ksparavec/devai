@@ -1,0 +1,118 @@
+# Frozen Makefile targets -- cluster mode + SkyPilot fleet provisioner
+#
+# Removed from the top-level Makefile on 2026-07-25. Verbatim copy,
+# reindented not at all, so a thaw is a paste. Read ../RESTORE.md first:
+# several of these targets could never have worked (the head crash-loops
+# on a token file nothing mounts, and :11444 was never published).
+
+# Worker-bootstrap image (per docs/plans/gpu-arbiter-cluster-mode.md
+# decision 11). Minimal image SkyPilot launches on cloud workers --
+# arbiter binary + backend images + cloud-init entrypoint, no
+# user-facing surfaces.
+WORKER_BOOTSTRAP_IMAGE = devai-worker-bootstrap
+
+test-cluster-preflight: ## Phase 1.5 preflight (worker + stub head end-to-end; no GPU required)
+	@# Builds the arbiter binary if missing, then drives 7 scripted
+	@# scenarios per docs/plans/gpu-arbiter-cluster-mode.md Phase 1.5.
+	@# Wall time ~1 minute.
+	bash tests/test-cluster-preflight.sh
+
+cluster-head-up: ## Start the head-mode router (cluster-mode Phase 2)
+	$(COMPOSE) -f $(CACHE_COMPOSE) -f $(CURDIR)/deploy/compose.head.yaml up -d router
+
+cluster-head-down: ## Stop the head-mode router
+	$(COMPOSE) -f $(CACHE_COMPOSE) -f $(CURDIR)/deploy/compose.head.yaml stop router
+
+# Bearer token for the head's cluster control plane. /v1/cluster/status is
+# authenticated like /v1/cluster/{register,heartbeat} (it enumerates every
+# worker's endpoint, GPU type and loaded model), so cluster-status must
+# present the token. Path mirrors the arbiter's own default -- see
+# gpu-arbiter/cluster_head.go's DEVAI_HEAD_TOKEN_FILE lookup. ?= so an
+# .env value, an exported shell var, or `make DEVAI_HEAD_TOKEN_FILE=... `
+# all win.
+DEVAI_HEAD_TOKEN_FILE ?= /run/devai/cluster-token
+
+# Base URL of the head's cluster control plane. NOTE: this default is very
+# likely NOT reachable as-is -- neither the `router` service in
+# deploy/docker-compose.yaml nor the deploy/compose.head.yaml overlay
+# declares a `ports:` block, so :11444 is bound only inside the devai-net
+# container network (`podman compose -f deploy/docker-compose.yaml -f
+# deploy/compose.head.yaml config` renders the router with `ports: null`).
+# Override this to whatever your deployment actually exposes -- a published
+# port, an ssh -L tunnel, or a head reachable by hostname.
+DEVAI_HEAD_STATUS_URL ?= http://localhost:11444
+
+cluster-status: ## Pretty-print the head's /v1/cluster/status JSON
+	@# The bearer is handed to curl over a PIPE (`-H @-`, curl >= 7.55), never
+	@# as a command-line argument: argv is world-readable via
+	@# /proc/<pid>/cmdline, so `-H "Authorization: Bearer $$tok"` would
+	@# disclose the token to every local user for the request's lifetime.
+	@# Piping keeps it in curl's memory only. No temp file, nothing to clean up.
+	@tok_file="$(DEVAI_HEAD_TOKEN_FILE)"; \
+	 if [ ! -r "$$tok_file" ]; then \
+	    echo "ERROR: cluster token not readable at $$tok_file" >&2; \
+	    echo "       /v1/cluster/status is bearer-authenticated. Render the token first:" >&2; \
+	    echo "         make secrets-tmpfs" >&2; \
+	    echo "         make secrets-render SOPS_FILE=deploy/cluster-token.sops.env DEST=$$tok_file" >&2; \
+	    echo "       ... or point DEVAI_HEAD_TOKEN_FILE at an existing token file." >&2; \
+	    exit 1; \
+	 fi; \
+	 tok=$$(tr -d '[:space:]' < "$$tok_file"); \
+	 if [ -z "$$tok" ]; then \
+	    echo "ERROR: cluster token file $$tok_file is empty -- refusing to send an empty bearer." >&2; \
+	    exit 1; \
+	 fi; \
+	 body=$$(printf 'Authorization: Bearer %s\n' "$$tok" \
+	         | curl -fsS -H @- "$(DEVAI_HEAD_STATUS_URL)/v1/cluster/status") || { \
+	    echo "ERROR: GET $(DEVAI_HEAD_STATUS_URL)/v1/cluster/status failed." >&2; \
+	    echo "       Most likely cause: the head's control plane is not published to" >&2; \
+	    echo "       the host. The 'router' service declares no 'ports:' block in" >&2; \
+	    echo "       deploy/docker-compose.yaml, and deploy/compose.head.yaml adds none," >&2; \
+	    echo "       so :11444 is reachable only from inside the devai-net network." >&2; \
+	    echo "       Fix by publishing 11444 on the router service, or set" >&2; \
+	    echo "         DEVAI_HEAD_STATUS_URL=<base-url-your-head-actually-exposes>" >&2; \
+	    echo "       Otherwise confirm 'make cluster-head-up' is running and that" >&2; \
+	    echo "       $$tok_file holds the token the head currently loads." >&2; \
+	    exit 1; \
+	 }; \
+	 printf '%s\n' "$$body" | python3 -m json.tool
+
+# SkyPilot fleet-provisioner Phase 1 (per
+# docs/plans/skypilot-fleet-provisioner.md). Long-lived API server
+# the head calls to provision cluster workers. Profile=cluster, opt-in.
+skypilot-up: ## Start the SkyPilot API server (cluster profile)
+	$(COMPOSE) -f $(CACHE_COMPOSE) --profile cluster up -d devai-skypilot-api-server
+
+skypilot-down: ## Stop the SkyPilot API server
+	$(COMPOSE) -f $(CACHE_COMPOSE) stop devai-skypilot-api-server || true
+	$(COMPOSE) -f $(CACHE_COMPOSE) rm -f devai-skypilot-api-server || true
+
+skypilot-check: ## Health-check the running SkyPilot API server
+	bash scripts/skypilot-api-health.sh
+
+skypilot-secrets-render: secrets-tmpfs ## Render deploy/skypilot-credentials.sops.env to tmpfs
+	@if [ ! -f deploy/skypilot-credentials.sops.env ]; then \
+		echo "ERROR: deploy/skypilot-credentials.sops.env not present." >&2; \
+		echo "       See deploy/skypilot-credentials.sops.env.example for the" >&2; \
+		echo "       expected variable names. Encrypt your file with sops," >&2; \
+		echo "       then re-run this target." >&2; \
+		exit 1; \
+	fi
+	bash scripts/render-secret.sh \
+	     deploy/skypilot-credentials.sops.env \
+	     /run/devai/skypilot-credentials.env
+
+build-worker-bootstrap: ## Build the minimal cluster-worker bootstrap image (cluster-mode Phase 1)
+	@# Requires gpu-arbiter binary at gpu-arbiter/gpu-arbiter; build
+	@# with `make build-router` first when running outside the
+	@# project's distroless build flow.
+	@if [ ! -x gpu-arbiter/gpu-arbiter ]; then \
+		echo "ERROR: gpu-arbiter/gpu-arbiter not found or not executable." >&2; \
+		echo "       Run 'make build-router' first (or copy the binary built" >&2; \
+		echo "       by the distroless image into gpu-arbiter/gpu-arbiter)." >&2; \
+		exit 1; \
+	fi
+	$(CONTAINER_RUNTIME) build --network=host \
+		$(PROXY_BUILD_ARGS) \
+		-f deploy/Dockerfile.worker-bootstrap \
+		-t $(WORKER_BOOTSTRAP_IMAGE) .

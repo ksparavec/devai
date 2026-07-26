@@ -41,7 +41,7 @@ jobs:
           - deploy/Dockerfile.base
           - deploy/Dockerfile.lab
           - deploy/Dockerfile.router
-          - deploy/Dockerfile.worker-bootstrap
+          - deploy/Dockerfile.mcp-modelstatus
     steps:
       - uses: actions/checkout@v7
       - name: Run hadolint

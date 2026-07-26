@@ -6,8 +6,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -18,43 +16,7 @@ func testClient() *http.Client {
 	return &http.Client{Timeout: 2 * time.Second}
 }
 
-// closedPort starts and immediately closes a listener, returning a
-// "host:port" pair that refuses connections fast -- used to simulate an
-// unreachable service without a slow real-network timeout.
-func closedPort(t *testing.T) string {
-	t.Helper()
-	srv := httptest.NewServer(http.NotFoundHandler())
-	addr := srv.Listener.Addr().String()
-	srv.Close()
-	return addr
-}
-
-func TestGetStatusClusterModeSuccess(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/cluster/status" {
-			http.NotFound(w, r)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`[{"worker_id":"w1","name":"worker-1","health_status":"ok"}]`))
-	}))
-	defer srv.Close()
-
-	t.Setenv("DEVAI_ROUTER_CLUSTER_URL", srv.URL)
-	status := GetStatus(context.Background(), testClient())
-
-	if status.Mode != "cluster-head" {
-		t.Fatalf("Mode = %q, want cluster-head", status.Mode)
-	}
-	if len(status.Workers) == 0 {
-		t.Fatal("expected non-empty Workers payload")
-	}
-}
-
-func TestGetStatusSingleModeFallback(t *testing.T) {
-	// Cluster endpoint unreachable.
-	t.Setenv("DEVAI_ROUTER_CLUSTER_URL", "http://"+closedPort(t))
-
+func TestGetStatusSingleMode(t *testing.T) {
 	// One backend (vllm) healthy, the other two closed.
 	vllm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -91,7 +53,6 @@ func TestGetStatusSingleModeFallback(t *testing.T) {
 }
 
 func TestGetStatusEverythingUnreachable(t *testing.T) {
-	t.Setenv("DEVAI_ROUTER_CLUSTER_URL", "http://"+closedPort(t))
 	t.Setenv("DEVAI_ROUTER_HOST", "127.0.0.1")
 	t.Setenv("DEVAI_ROUTER_OLLAMA_PORT", strconv.Itoa(freeClosedTCPPort(t)))
 	t.Setenv("DEVAI_ROUTER_VLLM_PORT", strconv.Itoa(freeClosedTCPPort(t)))
@@ -112,6 +73,23 @@ func TestGetStatusEverythingUnreachable(t *testing.T) {
 	}
 }
 
+// Cluster mode is frozen (attic/README.md), so "cluster-head" must no
+// longer be reachable as a Mode however the environment is configured.
+// Regression guard against a partial thaw reintroducing the doomed probe.
+func TestGetStatusNeverReportsClusterMode(t *testing.T) {
+	t.Setenv("DEVAI_ROUTER_HOST", "127.0.0.1")
+	t.Setenv("DEVAI_ROUTER_OLLAMA_PORT", strconv.Itoa(freeClosedTCPPort(t)))
+	t.Setenv("DEVAI_ROUTER_VLLM_PORT", strconv.Itoa(freeClosedTCPPort(t)))
+	t.Setenv("DEVAI_ROUTER_SGLANG_PORT", strconv.Itoa(freeClosedTCPPort(t)))
+	// Variables the removed cluster probe used to honour.
+	t.Setenv("DEVAI_ROUTER_CLUSTER_URL", "http://127.0.0.1:11444")
+	t.Setenv("DEVAI_HEAD_TOKEN_FILE", "/nonexistent/token")
+
+	if status := GetStatus(context.Background(), testClient()); status.Mode == "cluster-head" {
+		t.Fatalf("Mode = %q, want cluster mode to be unreachable while frozen", status.Mode)
+	}
+}
+
 // The router service publishes no host ports -- it is reachable only by
 // service name on devai-net -- so the built-in defaults must address
 // devai-router, not host.containers.internal. Asserted through the real
@@ -120,7 +98,6 @@ func TestGetStatusEverythingUnreachable(t *testing.T) {
 func TestGetStatusDefaultsToComposeServiceName(t *testing.T) {
 	// Empty value == unset for env(), so this restores the shipped defaults
 	// even when the ambient environment has them set.
-	t.Setenv("DEVAI_ROUTER_CLUSTER_URL", "")
 	t.Setenv("DEVAI_ROUTER_HOST", "")
 	t.Setenv("DEVAI_ROUTER_OLLAMA_PORT", "")
 	t.Setenv("DEVAI_ROUTER_VLLM_PORT", "")
@@ -149,154 +126,10 @@ func TestGetStatusDefaultsToComposeServiceName(t *testing.T) {
 	}
 }
 
-// writeTokenFile drops a bearer token in a temp dir and returns its path.
-func writeTokenFile(t *testing.T, token string) string {
-	t.Helper()
-	path := filepath.Join(t.TempDir(), "cluster-token")
-	if err := os.WriteFile(path, []byte(token+"\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	return path
-}
-
-// authHead is a stub cluster head that mirrors the real one: every
-// /v1/cluster/* route sits behind TokenStore.AuthMiddleware, so an
-// unauthenticated probe gets 401. seen captures the Authorization header
-// each request arrived with.
-func authHead(t *testing.T, wantToken string, seen *[]string) *httptest.Server {
-	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		*seen = append(*seen, r.Header.Get("Authorization"))
-		if r.URL.Path != "/v1/cluster/status" {
-			http.NotFound(w, r)
-			return
-		}
-		if r.Header.Get("Authorization") != "Bearer "+wantToken {
-			w.Header().Set("WWW-Authenticate", `Bearer realm="devai-cluster"`)
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`[{"worker_id":"w1","name":"worker-1","health_status":"ok"}]`))
-	}))
-	t.Cleanup(srv.Close)
-	return srv
-}
-
-// The head wraps /v1/cluster/status in AuthMiddleware. Without a bearer
-// token the probe gets 401 and -- since compose.head.yaml zeroes the local
-// backends on a head -- the tool degrades all the way to "unreachable",
-// making the cluster-head branch dead code. Regression for that.
-func TestGetStatusClusterModeSendsBearerToken(t *testing.T) {
-	var seen []string
-	srv := authHead(t, "s3cr3t", &seen)
-
-	t.Setenv("DEVAI_ROUTER_CLUSTER_URL", srv.URL)
-	t.Setenv("DEVAI_HEAD_TOKEN_FILE", writeTokenFile(t, "s3cr3t"))
-
-	status := GetStatus(context.Background(), testClient())
-
-	if status.Mode != "cluster-head" {
-		t.Fatalf("Mode = %q (cluster_error %q), want cluster-head", status.Mode, status.ClusterError)
-	}
-	if len(status.Workers) == 0 {
-		t.Error("expected non-empty Workers payload")
-	}
-	if status.ClusterError != "" {
-		t.Errorf("ClusterError = %q, want empty on success", status.ClusterError)
-	}
-	if len(seen) != 1 || seen[0] != "Bearer s3cr3t" {
-		t.Errorf("Authorization headers seen = %q, want exactly [Bearer s3cr3t]", seen)
-	}
-}
-
-// DEVAI_HEAD_TOKEN_FILE wins over DEVAI_WORKER_TOKEN_FILE so a host that is
-// both head and worker can point the two at different files.
-func TestGetStatusPrefersHeadTokenFile(t *testing.T) {
-	var seen []string
-	srv := authHead(t, "head-token", &seen)
-
-	t.Setenv("DEVAI_ROUTER_CLUSTER_URL", srv.URL)
-	t.Setenv("DEVAI_WORKER_TOKEN_FILE", writeTokenFile(t, "worker-token"))
-	t.Setenv("DEVAI_HEAD_TOKEN_FILE", writeTokenFile(t, "head-token"))
-
-	if status := GetStatus(context.Background(), testClient()); status.Mode != "cluster-head" {
-		t.Fatalf("Mode = %q (cluster_error %q), want cluster-head", status.Mode, status.ClusterError)
-	}
-}
-
-// DEVAI_WORKER_TOKEN_FILE is the variable docs/cluster-env.md already
-// documents, so it must work on its own.
-func TestGetStatusFallsBackToWorkerTokenFile(t *testing.T) {
-	var seen []string
-	srv := authHead(t, "worker-token", &seen)
-
-	t.Setenv("DEVAI_ROUTER_CLUSTER_URL", srv.URL)
-	t.Setenv("DEVAI_HEAD_TOKEN_FILE", "")
-	t.Setenv("DEVAI_WORKER_TOKEN_FILE", writeTokenFile(t, "worker-token"))
-
-	if status := GetStatus(context.Background(), testClient()); status.Mode != "cluster-head" {
-		t.Fatalf("Mode = %q (cluster_error %q), want cluster-head", status.Mode, status.ClusterError)
-	}
-}
-
-// A missing token file must degrade, not crash -- and the resulting 401
-// must be reported distinctly from "nothing answered" so a misconfigured
-// token is diagnosable rather than looking like a non-cluster host.
-func TestGetStatusMissingTokenFileReports401Distinctly(t *testing.T) {
-	var seen []string
-	srv := authHead(t, "s3cr3t", &seen)
-
-	t.Setenv("DEVAI_ROUTER_CLUSTER_URL", srv.URL)
-	t.Setenv("DEVAI_HEAD_TOKEN_FILE", filepath.Join(t.TempDir(), "absent-token"))
-	t.Setenv("DEVAI_ROUTER_HOST", "127.0.0.1")
-	t.Setenv("DEVAI_ROUTER_OLLAMA_PORT", strconv.Itoa(freeClosedTCPPort(t)))
-	t.Setenv("DEVAI_ROUTER_VLLM_PORT", strconv.Itoa(freeClosedTCPPort(t)))
-	t.Setenv("DEVAI_ROUTER_SGLANG_PORT", strconv.Itoa(freeClosedTCPPort(t)))
-
-	status := GetStatus(context.Background(), testClient())
-
-	if status.Mode != "unreachable" {
-		t.Fatalf("Mode = %q, want unreachable (head answered 401, no local backends)", status.Mode)
-	}
-	if !strings.Contains(status.ClusterError, "401") {
-		t.Errorf("ClusterError = %q, want it to name the 401", status.ClusterError)
-	}
-	if !strings.Contains(status.ClusterError, "DEVAI_HEAD_TOKEN_FILE") {
-		t.Errorf("ClusterError = %q, want it to name the env var to set", status.ClusterError)
-	}
-	if len(seen) != 1 || seen[0] != "" {
-		t.Errorf("Authorization headers seen = %q, want one unauthenticated request", seen)
-	}
-}
-
-// A present-but-wrong token is a different operator problem from a missing
-// one: the message must point at the file that supplied the bad value.
-func TestGetStatusWrongTokenNamesTheTokenFile(t *testing.T) {
-	var seen []string
-	srv := authHead(t, "s3cr3t", &seen)
-	tokenPath := writeTokenFile(t, "stale-token")
-
-	t.Setenv("DEVAI_ROUTER_CLUSTER_URL", srv.URL)
-	t.Setenv("DEVAI_HEAD_TOKEN_FILE", tokenPath)
-	t.Setenv("DEVAI_ROUTER_HOST", "127.0.0.1")
-	t.Setenv("DEVAI_ROUTER_OLLAMA_PORT", strconv.Itoa(freeClosedTCPPort(t)))
-	t.Setenv("DEVAI_ROUTER_VLLM_PORT", strconv.Itoa(freeClosedTCPPort(t)))
-	t.Setenv("DEVAI_ROUTER_SGLANG_PORT", strconv.Itoa(freeClosedTCPPort(t)))
-
-	status := GetStatus(context.Background(), testClient())
-
-	if !strings.Contains(status.ClusterError, tokenPath) {
-		t.Errorf("ClusterError = %q, want it to name the token file %q", status.ClusterError, tokenPath)
-	}
-	if len(seen) != 1 || seen[0] != "Bearer stale-token" {
-		t.Errorf("Authorization headers seen = %q, want the stale token to have been sent", seen)
-	}
-}
-
-// The backend /health handlers are unauthenticated and live on different
-// ports; the cluster token must not leak to them.
-func TestGetStatusDoesNotSendTokenToBackends(t *testing.T) {
+// The backend /health handlers are unauthenticated. Nothing should send
+// them an Authorization header -- there is no credential in this path to
+// leak, and adding one later would be a change worth catching here.
+func TestGetStatusSendsNoAuthorizationToBackends(t *testing.T) {
 	var backendAuth []string
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		backendAuth = append(backendAuth, r.Header.Get("Authorization"))
@@ -306,8 +139,6 @@ func TestGetStatusDoesNotSendTokenToBackends(t *testing.T) {
 	defer backend.Close()
 
 	host, port := splitHostPort(t, backend.URL)
-	t.Setenv("DEVAI_ROUTER_CLUSTER_URL", "http://"+closedPort(t))
-	t.Setenv("DEVAI_HEAD_TOKEN_FILE", writeTokenFile(t, "s3cr3t"))
 	t.Setenv("DEVAI_ROUTER_HOST", host)
 	t.Setenv("DEVAI_ROUTER_OLLAMA_PORT", port)
 	t.Setenv("DEVAI_ROUTER_VLLM_PORT", port)

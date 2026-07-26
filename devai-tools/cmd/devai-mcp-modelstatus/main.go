@@ -1,7 +1,7 @@
 // Command devai-mcp-modelstatus is a stdio MCP server exposing read-only
 // query tools over devai's model catalog, probe caches, bench cache, and
 // live router status. Registered with the Docker MCP Gateway (see
-// deploy/mcp-servers.yaml) rather than invoked directly by agents.
+// deploy/mcp-catalog-devai.yaml) rather than invoked directly by agents.
 // See docs/mcp-model-status.md.
 package main
 
@@ -185,7 +185,7 @@ func main() {
 
 	mcp.AddTool(mcpServer, &mcp.Tool{
 		Name:        "get_router_status",
-		Description: "Live status of the running devai-router: cluster-head worker list, or single-mode per-backend health (running/current_model/active_reqs), or an unreachable report if nothing responds.",
+		Description: "Live status of the running devai-router: per-backend health (running/current_model/active_reqs), or an unreachable report if nothing responds.",
 	}, srv.getRouterStatus)
 
 	if err := mcpServer.Run(context.Background(), &mcp.StdioTransport{}); err != nil {

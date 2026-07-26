@@ -146,7 +146,6 @@ func TestGetModelBenchHandlerMissingCtx(t *testing.T) {
 }
 
 func TestGetRouterStatusHandlerUnreachable(t *testing.T) {
-	t.Setenv("DEVAI_ROUTER_CLUSTER_URL", "http://127.0.0.1:1")
 	t.Setenv("DEVAI_ROUTER_HOST", "127.0.0.1")
 	t.Setenv("DEVAI_ROUTER_OLLAMA_PORT", "1")
 	t.Setenv("DEVAI_ROUTER_VLLM_PORT", "1")
