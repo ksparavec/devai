@@ -310,5 +310,55 @@ class MakefileWiringTest(unittest.TestCase):
                       "interactive session")
 
 
+class BenchRepoPatternTest(unittest.TestCase):
+    """execute() filters the runner with BENCH_REPO. That regex is matched
+    against PROBE-cache keys, but discover_models hands back BENCH-cache
+    keys -- which carry a ::<backend>::<ctx> suffix the probe keys do not.
+
+    The first implementation passed the bench key through unchanged, so
+    the alternation matched nothing and every single run died with "no
+    fitting <backend> models in probe cache". The plan looked perfect and
+    zero work happened. These tests exist so that cannot recur silently.
+    """
+
+    def test_probe_key_strips_the_backend_and_ctx_suffix(self):
+        self.assertEqual(
+            bs.probe_key("openai/gpt-oss-20b@6cee5e81ee83::sglang::131072"),
+            "openai/gpt-oss-20b@6cee5e81ee83")
+
+    def test_probe_key_handles_ollama_digest_keys(self):
+        self.assertEqual(
+            bs.probe_key("5571076f3d70050487b26b341705799e::ollama::262144"),
+            "5571076f3d70050487b26b341705799e")
+
+    def test_probe_key_is_idempotent_on_an_already_bare_key(self):
+        self.assertEqual(bs.probe_key("org/M@abc"), "org/M@abc")
+
+    def test_built_pattern_matches_the_bare_probe_key(self):
+        """The end-to-end property: whatever execute() builds must
+        actually select the model inside the runner."""
+        import re
+        bench_key = "ykarout/Qwen3.5-9B-NVFP4@bd8c8f493d2e::sglang::196608"
+        probe = "ykarout/Qwen3.5-9B-NVFP4@bd8c8f493d2e"
+        rx = re.compile(bs._escape(bs.probe_key(bench_key)))
+        self.assertTrue(rx.search(probe),
+                        "BENCH_REPO pattern does not match the probe key it "
+                        "is supposed to select")
+
+    def test_regex_metacharacters_in_a_repo_name_are_escaped(self):
+        """Qwen3.5's dot would otherwise match any character, and could
+        select a different model."""
+        import re
+        rx = re.compile(bs._escape(bs.probe_key("org/Qwen3.5-9B@abc::vllm::32768")))
+        self.assertTrue(rx.search("org/Qwen3.5-9B@abc"))
+        self.assertFalse(rx.search("org/Qwen3X5-9B@abc"))
+
+    def test_two_ctx_tiers_of_one_model_collapse_to_one_alternative(self):
+        """Both tiers share a probe key; emitting it twice would be
+        harmless but noisy, and hides the real cardinality."""
+        keys = ["org/M@abc::vllm::32768", "org/M@abc::vllm::131072"]
+        self.assertEqual(len({bs.probe_key(k) for k in keys}), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

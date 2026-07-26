@@ -280,10 +280,12 @@ def execute(plan: dict, *, max_targets: int, tasks: tuple[str, ...],
 
     rc = 0
     for backend, rows in by_backend.items():
-        # BENCH_REPO is a regex over the probe-cache key, which is exactly
-        # what discover_models matched on -- so an alternation of the
-        # queued keys reproduces this selection inside the runner.
-        pattern = "|".join(_escape(r["key"]) for r in rows)
+        # BENCH_REPO is a regex over the PROBE-cache key, so the bench
+        # key's ::<backend>::<ctx> suffix has to come off first -- see
+        # probe_key(). An alternation of the de-suffixed keys reproduces
+        # this selection inside the runner. Duplicates collapse because
+        # two ctx tiers of one model share a probe key.
+        pattern = "|".join(sorted({_escape(probe_key(r["key"])) for r in rows}))
         cmd = ["make", f"bench-{backend}",
                f"BENCH_REPO={pattern}",
                f"BENCH_TASKS={','.join(tasks)}"]
@@ -304,6 +306,23 @@ def execute(plan: dict, *, max_targets: int, tasks: tuple[str, ...],
 
     report = _run(["make", "bench-report"])
     return rc or report
+
+
+def probe_key(bench_key: str) -> str:
+    """The probe-cache key underlying a bench-cache key.
+
+    `discover_models` returns the BENCH-cache key
+    (`<repo>@<sha>::<backend>::<ctx>`, or `<digest>::ollama::<ctx>`), but
+    `--repo` is matched with `re.search` against PROBE-cache keys, which
+    carry no backend or ctx suffix. Handing the bench key straight to
+    `--repo` therefore matches nothing at all, and the runner exits with
+    "no fitting <backend> models in probe cache" -- which is what the
+    first version of execute() did on every single run.
+
+    Splitting on the first `::` is safe for both key shapes: HF repo
+    names and Ollama manifest digests never contain a colon pair.
+    """
+    return bench_key.split("::", 1)[0]
 
 
 def _escape(s: str) -> str:
