@@ -1,14 +1,26 @@
-"""Tests for MCP Gateway Phase 1 deliverables.
+"""Tests for the MCP gateway wiring.
+
+Rewritten 2026-07-25. The previous version asserted the shape of a
+hand-maintained deploy/mcp-servers.yaml that listed all 14 third-party
+servers. Those assertions all passed while the gateway exposed ZERO
+tools, because the file used a schema the gateway does not parse and
+pinned every image at a tag (:0.7.0) that exists for none of them.
+
+Shape assertions cannot catch that class of defect. The real regression
+guard is tests/test-mcp.sh, which now performs a live handshake, asserts
+a tool-count floor, and makes a real tools/call. What is left here is
+only the static wiring that must hold for that test to be reachable at
+all -- the things that, when wrong, stop the gateway before it can be
+exercised.
 
 Covers:
-  - deploy/mcp-servers.yaml is well-formed and lists the 10 Tier 1
-    servers (no Tier 2 entries enabled).
-  - deploy/docker-compose.yaml gains the devai-mcp-gateway service
-    with the right image, ports, mounts, and security flags.
-  - deploy/mcp-gateway.env documents MCP_PORT.
-  - scripts/mcp-health.sh and tests/test-mcp.sh exist and are
-    bash-syntax-valid.
-  - docs/mcp.md covers the operator-facing surface.
+  - deploy/mcp-catalog-devai.yaml carries ONLY first-party servers, in
+    the gateway's real schema (name/displayName/registry-as-a-map).
+  - deploy/docker-compose.yaml wires the gateway correctly: merged
+    catalog, explicit --servers, dual-homed networks, loopback publish,
+    security flags.
+  - The Makefile targets name the compose service that actually exists.
+  - scripts/mcp-health.sh and tests/test-mcp.sh are bash-syntax-valid.
 """
 
 from __future__ import annotations
@@ -19,26 +31,32 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
-# 10 Tier 1 servers, per docs/plans/mcp-gateway.md.
-TIER1_SERVERS = {
+# Upstream catalog keys we enable via --servers. These are Docker's
+# official catalog names and are CASE-SENSITIVE: "SQLite", not "sqlite".
+# We do not define these servers ourselves -- upstream does, and it
+# digest-pins them. We only choose which to switch on.
+ENABLED_SERVERS = {
     "filesystem",
     "git",
-    "sqlite",
+    "SQLite",
     "fetch",
     "memory",
     "time",
     "sequentialthinking",
     "duckduckgo",
-    "arxiv",
-    "wikipedia",
-}
-
-TIER2_SERVERS = {
+    "arxiv-mcp-server",
+    "wikipedia-mcp",
     "github-official",
     "firecrawl",
     "hugging-face",
     "context7",
+    "devai-model-status",
 }
+
+# The only server this repo builds. Everything else must come from
+# upstream -- a second entry here means someone started hand-maintaining
+# third-party definitions again, which is what broke this before.
+FIRST_PARTY_SERVERS = {"devai-model-status"}
 
 
 def _yaml() -> object:
@@ -49,57 +67,61 @@ def _yaml() -> object:
         return None
 
 
-class TestMcpServersYaml(unittest.TestCase):
+class TestFirstPartyCatalog(unittest.TestCase):
+    """deploy/mcp-catalog-devai.yaml: first-party servers only, real schema."""
+
     def setUp(self) -> None:
         self.yaml = _yaml()
         if self.yaml is None:
             self.skipTest("PyYAML not installed")
-        self.path = REPO_ROOT / "deploy" / "mcp-servers.yaml"
+        self.path = REPO_ROOT / "deploy" / "mcp-catalog-devai.yaml"
+
+    def _doc(self) -> dict:
+        with open(self.path) as f:
+            return self.yaml.safe_load(f)
 
     def test_file_exists(self) -> None:
         self.assertTrue(self.path.is_file())
 
-    def test_well_formed_yaml(self) -> None:
-        with open(self.path) as f:
-            doc = self.yaml.safe_load(f)
+    def test_old_hand_maintained_catalog_is_gone(self) -> None:
+        """deploy/mcp-servers.yaml declared all 14 third-party servers with
+        invented tags. Its return would mean someone resumed hand-
+        maintaining definitions upstream already owns."""
+        self.assertFalse(
+            (REPO_ROOT / "deploy" / "mcp-servers.yaml").exists(),
+            msg="deploy/mcp-servers.yaml is back -- third-party servers must "
+                "come from Docker's official catalog, not from this repo.",
+        )
+
+    def test_uses_the_gateways_real_schema(self) -> None:
+        """The gateway parses top-level name/displayName/registry, where
+        registry is a MAP. The old apiVersion/schemaVersion/servers-list
+        shape parses to an EMPTY registry and yields zero tools -- silently,
+        which is why this needs an explicit assertion."""
+        doc = self._doc()
         self.assertIsInstance(doc, dict)
-        self.assertEqual(doc.get("schemaVersion"), 1)
-        self.assertIsInstance(doc.get("servers"), list)
+        self.assertIsInstance(doc.get("name"), str)
+        self.assertIsInstance(doc.get("registry"), dict,
+                              msg="registry must be a map keyed by server name")
+        for absent in ("apiVersion", "schemaVersion", "servers"):
+            self.assertNotIn(absent, doc,
+                             msg=f"{absent!r} is not part of the gateway schema")
 
-    def test_all_tier1_present(self) -> None:
-        with open(self.path) as f:
-            doc = self.yaml.safe_load(f)
-        names = {s.get("name") for s in doc["servers"]}
-        missing = TIER1_SERVERS - names
-        self.assertEqual(
-            missing, set(), msg=f"Tier 1 servers missing: {missing}"
-        )
+    def test_contains_only_first_party_servers(self) -> None:
+        self.assertEqual(set(self._doc()["registry"]), FIRST_PARTY_SERVERS)
 
-    def test_tier1_present(self) -> None:
-        # Phase 1 invariant: every Tier 1 server stays catalog-listed
-        # even after Phase 2 added Tier 2 entries above.
-        with open(self.path) as f:
-            doc = self.yaml.safe_load(f)
-        names = {s.get("name") for s in doc["servers"]}
-        # All 10 Tier 1 still there.
-        missing_t1 = TIER1_SERVERS - names
-        self.assertEqual(
-            missing_t1, set(),
-            msg=f"Tier 1 servers regressed after Phase 2 added Tier 2: {missing_t1}",
-        )
+    def test_every_entry_has_a_required_type(self) -> None:
+        """Server.Type is validate:"required,oneof=server remote poci"."""
+        for name, entry in self._doc()["registry"].items():
+            with self.subTest(server=name):
+                self.assertIn(entry.get("type"), {"server", "remote", "poci"})
 
-    def test_every_server_has_image_and_description(self) -> None:
-        with open(self.path) as f:
-            doc = self.yaml.safe_load(f)
-        for s in doc["servers"]:
-            with self.subTest(server=s.get("name")):
-                self.assertIsInstance(s.get("image"), str)
-                # localhost/ covers first-party servers built locally rather
-                # than pulled from a registry (e.g. devai-model-status --
-                # see docs/mcp-model-status.md).
-                self.assertTrue(s["image"].startswith(("docker.io/", "ghcr.io/", "mcp/", "localhost/")))
-                self.assertIsInstance(s.get("description"), str)
-                self.assertGreater(len(s["description"]), 10)
+    def test_first_party_image_is_locally_built(self) -> None:
+        """devai-model-status has no upstream registry: the gateway runs
+        servers with --pull never, so the tag must be one `make
+        build-mcp-modelstatus-image` produces in the local store."""
+        entry = self._doc()["registry"]["devai-model-status"]
+        self.assertTrue(entry["image"].startswith("localhost/"))
 
 
 class TestDockerComposeMcpService(unittest.TestCase):
@@ -154,11 +176,41 @@ class TestDockerComposeMcpService(unittest.TestCase):
                 "revisit the loopback-bind rationale",
         )
 
-    def test_catalog_mount_read_only(self) -> None:
+    def test_catalog_mount_read_only_and_under_catalogs_dir(self) -> None:
+        """Gateway v0.43.3 rejects a catalog path outside its catalogs
+        directory, so the old /app/catalog.yaml mount breaks on upgrade."""
         vols = self.svc["volumes"]
-        catalog = [v for v in vols if "catalog.yaml" in v]
-        self.assertEqual(len(catalog), 1)
+        catalog = [v for v in vols if "mcp-catalog-devai.yaml" in v]
+        self.assertEqual(len(catalog), 1, msg=f"volumes: {vols}")
         self.assertTrue(catalog[0].endswith(":ro"))
+        self.assertIn("/root/.docker/mcp/catalogs/", catalog[0])
+
+    def test_merges_with_upstream_catalog_rather_than_replacing_it(self) -> None:
+        """--catalog REPLACES the built-in catalog, which would strand every
+        third-party server. --additional-catalog merges on top of Docker's
+        official one, which is where all 14 third-party servers come from."""
+        cmd = self.svc.get("command") or []
+        self.assertTrue(any(c.startswith("--additional-catalog=") for c in cmd),
+                        msg=f"command: {cmd}")
+        self.assertFalse(any(c.startswith("--catalog=") for c in cmd),
+                         msg="--catalog replaces the upstream catalog; use "
+                             "--additional-catalog")
+
+    def test_servers_explicitly_enabled(self) -> None:
+        """Without --servers the gateway enables NOTHING and serves only its
+        own builtins -- a correct catalog alone yields '0 tools listed'."""
+        cmd = self.svc.get("command") or []
+        flag = [c for c in cmd if c.startswith("--servers=")]
+        self.assertEqual(len(flag), 1, msg=f"command: {cmd}")
+        listed = set(flag[0].split("=", 1)[1].split(","))
+        self.assertEqual(listed, ENABLED_SERVERS)
+
+    def test_dual_homed_so_the_lab_can_reach_it(self) -> None:
+        """Lab containers sit on devai-lab-egress. A service published only
+        on devai-net is unresolvable from them, which made this gateway
+        unreachable from every agent regardless of its config."""
+        nets = self.svc.get("networks") or []
+        self.assertIn("devai-lab-egress", nets, msg=f"networks: {nets}")
 
     def test_no_new_privileges(self) -> None:
         sec = self.svc.get("security_opt") or []
@@ -211,18 +263,34 @@ class TestScriptsBashSyntax(unittest.TestCase):
 
 class TestDocsMcp(unittest.TestCase):
     def test_present_and_covers_required_sections(self) -> None:
+        """The Tier 1 / Tier 2 headings this used to require are gone on
+        purpose: that phasing described a hand-maintained catalog which no
+        longer exists. What an operator needs now is where the servers
+        come from, how to reach the endpoint, and the security posture."""
         path = REPO_ROOT / "docs" / "mcp.md"
         self.assertTrue(path.is_file())
         text = path.read_text()
         for header in (
             "Bring-up",
-            "Tier 1 server catalog",
-            "Client configurations",
+            "catalog",
             "Security model",
-            "Phase 2",
             "Troubleshooting",
+            "Known limitations",
         ):
             self.assertIn(header, text, msg=f"docs/mcp.md missing: {header}")
+
+    def test_documents_the_mcp_path_and_bearer_token(self) -> None:
+        """Both are required to talk to the gateway at all, and both were
+        absent from the previous version of this doc."""
+        text = (REPO_ROOT / "docs" / "mcp.md").read_text()
+        self.assertIn(":8088/mcp", text, msg="the /mcp path is not optional")
+        self.assertIn("Bearer", text, msg="bearer token not documented")
+
+    def test_does_not_claim_default_reachability(self) -> None:
+        """The gateway is behind `profiles: [mcp]`; `make cache-up` does not
+        start it. The old doc claimed port 8088 was up by default."""
+        text = (REPO_ROOT / "docs" / "mcp.md").read_text()
+        self.assertNotIn("reachable on port 8088 by default", text)
 
 
 if __name__ == "__main__":

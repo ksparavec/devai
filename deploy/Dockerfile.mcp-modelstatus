@@ -1,6 +1,6 @@
 # devai-mcp-modelstatus -- stdio MCP server exposing model catalog/probe/
 # bench query tools + live router status. Registered with the Docker MCP
-# Gateway (deploy/mcp-servers.yaml), spawned per-call over stdio -- never
+# Gateway (deploy/mcp-catalog-devai.yaml), spawned per-call over stdio -- never
 # invoked directly by agents. See docs/mcp-model-status.md.
 #
 # Build: podman build -f deploy/Dockerfile.mcp-modelstatus -t devai-mcp-modelstatus .
@@ -28,7 +28,7 @@ COPY --from=build /devai-mcp-modelstatus /devai-mcp-modelstatus
 # Baked in at build time, not bind-mounted: the pinned MCP Gateway
 # (docker/mcp-gateway:v0.42.1) catalog schema doesn't have a confirmed
 # per-server volume-mount field (none of the other 14 entries in
-# deploy/mcp-servers.yaml demonstrate one -- see docs/mcp-model-status.md).
+# deploy/mcp-catalog-devai.yaml demonstrate one -- see docs/mcp-model-status.md).
 # Refresh by rebuilding this image (`make build-mcp-modelstatus-image`)
 # after `make probe`/`make bench` update the source files.
 COPY --from=build /etc/devai /etc/devai

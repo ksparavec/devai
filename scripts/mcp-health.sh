@@ -1,38 +1,42 @@
 #!/usr/bin/env bash
-# Smoke test for devai-mcp-gateway.
+# Liveness probe for devai-mcp-gateway.
 #
-# Hits /health on the gateway's host port (default 8088), then enumerates
-# the loaded server catalog. Used by `make mcp-test` and as a manual
-# sanity check after `make cache-up --profile mcp`.
+# This is deliberately a LIVENESS check, not a functional one. It answers
+# "is the process up and listening", nothing more.
 #
-# Exit code: 0 on success, 1 on any HTTP failure or unexpected response.
+# Read this before trusting it: on 2026-07-25 the gateway returned
+# HTTP 200 from /health while serving ZERO tools -- its catalog had
+# parsed to an empty registry and no server was enabled. A green
+# /health told the operator nothing at all. The functional check is
+# `make mcp-test` (tests/test-mcp.sh), which performs a real MCP
+# handshake, asserts a tool-count floor and makes a real tools/call.
+# Use that to answer "does it work".
+#
+# Exit code: 0 when the gateway is listening, 1 otherwise.
 
 set -euo pipefail
 
 PORT="${MCP_PORT:-8088}"
-HOST="${MCP_HOST:-localhost}"
+HOST="${MCP_HOST:-127.0.0.1}"
 URL="http://${HOST}:${PORT}"
 
 echo ">>> mcp-health: probing ${URL}"
 
-# /health: returns "OK" or a JSON status block depending on gateway version.
 http_code=$(curl -fsS -o /tmp/mcp-health.body -w '%{http_code}' "${URL}/health" || true)
 if [[ "${http_code}" != "200" ]]; then
     echo "FAIL: /health returned HTTP ${http_code}" >&2
     cat /tmp/mcp-health.body >&2 || true
+    echo "      Is the gateway up? 'make mcp-up'." >&2
     exit 1
 fi
-echo "  /health: OK"
+echo "  /health: listening"
 
-# /servers: enumeration endpoint. Some gateway builds expose this as
-# /api/v1/servers; tolerate either.
-for path in /servers /api/v1/servers; do
-    http_code=$(curl -fsS -o /tmp/mcp-servers.body -w '%{http_code}' "${URL}${path}" || true)
-    if [[ "${http_code}" == "200" ]]; then
-        n=$(python3 -c "import json,sys; d=json.load(open('/tmp/mcp-servers.body')); print(len(d) if isinstance(d, list) else len(d.get('servers') or []))" 2>/dev/null || echo "?")
-        echo "  ${path}: ${n} server(s) loaded"
-        break
-    fi
-done
+# There is no catalog-enumeration endpoint to probe here. This script
+# used to try /servers and /api/v1/servers; on the pinned gateway both
+# return 307 (they redirect to /mcp -- they do not exist), so that check
+# could never have succeeded and quietly printed nothing when it failed.
+# Enumerating the catalog requires a full MCP handshake against /mcp with
+# the bearer token, which is what tests/test-mcp.sh does.
 
-echo ">>> mcp-health OK"
+echo ">>> mcp-health: gateway is listening."
+echo "    This does NOT mean it serves any tools -- run 'make mcp-test' for that."

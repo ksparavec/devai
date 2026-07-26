@@ -99,7 +99,7 @@ DEVAI_OPEN_NETWORK = "devai-net"
 PIPELOCK_CONTAINER = "devai-pipelock"
 PIPELOCK_PROXY = "http://devai-pipelock:8888"
 # Internal hosts that must bypass the proxy (router for inference, caches).
-NO_PROXY_HOSTS = "devai-router,router,apt-cache,registry-cache,ollama,localhost,127.0.0.1,::1"
+NO_PROXY_HOSTS = "devai-router,router,apt-cache,registry-cache,ollama,devai-mcp-gateway,mcp-gateway,localhost,127.0.0.1,::1"
 OLLAMA_HOST = "http://devai-router:11434"
 FALLBACK_MODEL = "qwen3.5:9b-q8_0"
 CONTAINER_USER = "devai"

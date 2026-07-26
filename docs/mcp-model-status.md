@@ -3,7 +3,7 @@
 The first devai-authored MCP server -- read-only queries over the
 model catalog, the three probe caches, the bench cache, and live
 router status. Registered with the Docker MCP Gateway
-(`deploy/mcp-servers.yaml`), spawned per-call over stdio by the
+(`deploy/mcp-catalog-devai.yaml`), spawned per-call over stdio by the
 gateway like any other server -- agents never invoke it directly.
 Source: `devai-tools/cmd/devai-mcp-modelstatus` (Go, using the
 official `github.com/modelcontextprotocol/go-sdk`). This doc is also
@@ -159,7 +159,7 @@ cluster probe does not answer, the reason is reported in the
 before the tool falls back to the per-backend probes.
 
 Caveat: the server runs in a gateway-spawned distroless container, and
-its `deploy/mcp-servers.yaml` entry declares no volume mount, so
+its `deploy/mcp-catalog-devai.yaml` entry declares no volume mount, so
 `/run/devai/cluster-token` is **not** visible inside it today. Against
 a real authenticated head the client therefore sends no token and
 `cluster_error` reports the 401. Point `DEVAI_HEAD_TOKEN_FILE` at a
@@ -173,12 +173,12 @@ Built locally (`make build-mcp-modelstatus-image`, from
 `localhost/devai-mcp-modelstatus:latest` in the same host's Podman
 image store the gateway already spawns containers from via the
 mounted socket -- no registry push needed. Registered in
-`deploy/mcp-servers.yaml` under a new "First-party (devai-authored)"
+`deploy/mcp-catalog-devai.yaml` under a new "First-party (devai-authored)"
 section, ahead of the Tier 2 entries.
 
 **Config files are baked into the image at build time, not
 bind-mounted.** None of the other 14 catalog entries in
-`deploy/mcp-servers.yaml` demonstrate a per-server volume mount, and
+`deploy/mcp-catalog-devai.yaml` demonstrate a per-server volume mount, and
 the pinned gateway version's (`docker/mcp-gateway:v0.42.1`) exact
 schema field for one isn't confirmed. Rather than guess at an
 unverified catalog key, `Dockerfile.mcp-modelstatus` copies

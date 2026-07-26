@@ -1,0 +1,59 @@
+# devai first-party MCP catalog.
+#
+# This file contains ONLY servers this project builds itself. Every
+# third-party server comes from Docker's official MCP catalog, which the
+# gateway loads by default and which upstream digest-pins and maintains.
+# We merge this file on top with `--additional-catalog`.
+#
+# Why it is shaped this way (changed 2026-07-25):
+#
+# The previous deploy/mcp-servers.yaml hand-declared all 14 third-party
+# servers and pinned each at `:0.7.0`. That tag exists for none of them:
+# 13 of the 14 docker.io/mcp/* repos publish only `latest`, and
+# mcp/hugging-face is not a repository at all -- upstream converted it to
+# a `type: remote` streamable-http endpoint. The file also used the wrong
+# schema entirely (`apiVersion` / `schemaVersion` / `servers:` as a list),
+# which the gateway parses into an EMPTY registry, so it exposed zero
+# tools no matter what the tags said.
+#
+# Hand-maintaining those definitions was the root cause, and pinning them
+# ourselves is not fixable in principle: with upstream publishing only
+# `latest`, our only pinning option is a digest, and a digest against a
+# moving `latest` goes stale with no signal. Deferring to the official
+# catalog removes both the invented-tag class of bug and the pinning
+# problem, and it is what the gateway is designed for.
+#
+# Schema (docker/mcp-gateway pkg/catalog/types.go): top level is
+# `name` / `displayName` / `registry`, where `registry` is a MAP keyed by
+# server name. `type` is required and must be one of server|remote|poci.
+#
+# To enable a third-party server, add its upstream catalog key to the
+# `--servers=` list in deploy/docker-compose.yaml. Names are the upstream
+# keys and are case-sensitive -- note `SQLite`, not `sqlite`.
+
+name: devai
+displayName: devai first-party MCP servers
+
+registry:
+
+  # The only MCP server this project authors. Exposes the probe and bench
+  # caches -- list_fitting_models, get_model_bench, get_router_status --
+  # which no third-party server can know about.
+  #
+  # Built locally, never pulled: `make build-mcp-modelstatus-image` tags
+  # localhost/devai-mcp-modelstatus:latest in this host's Podman store.
+  # The gateway runs servers with `--pull never`, so a locally built tag
+  # with no upstream registry is exactly the right shape here.
+  #
+  # Config files (models.yaml + the probe/bench caches) are baked into
+  # the image at build time rather than bind-mounted, so rebuild after
+  # `make probe` / `make bench` to refresh. See docs/mcp-model-status.md.
+  devai-model-status:
+    title: "devai model status"
+    description: |
+      Read-only view of this lab's model fit and benchmark data:
+      which models fit at a given VRAM/context, their bench scores,
+      and the running router's per-backend health.
+    type: server
+    image: localhost/devai-mcp-modelstatus:latest
+    disableNetwork: false

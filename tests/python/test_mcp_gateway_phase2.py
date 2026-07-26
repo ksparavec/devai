@@ -1,14 +1,23 @@
-"""Tests for MCP Gateway Phase 2 deliverables.
+"""Tests for the MCP gateway's secret-bearing servers.
 
-Covers:
-  - deploy/mcp-servers.yaml carries the 4 Tier 2 entries with
-    {secret: NAME} references.
-  - deploy/mcp-secrets.sops.env.example documents the 4 expected
-    secret names (operators see what to encrypt).
-  - docker-compose.yaml mounts /run/devai/mcp-secrets.env (or its
-    /dev/null fallback) and emits --secrets to the gateway.
-  - Makefile mcp-secrets-render target wires through the shared
-    sops/age scaffold.
+Rewritten 2026-07-25 alongside test_mcp_gateway_phase1. The Tier 2
+server definitions this used to assert against are gone: we no longer
+hand-maintain third-party server entries at all, so there is no local
+`{secret: NAME}` syntax to check. Those servers now come from Docker's
+official catalog, which declares its own secret names.
+
+Two of the four former "Tier 2" servers turned out to need no secret at
+all -- upstream converted hugging-face and context7 to `type: remote`
+endpoints that connect anonymously (verified live: 4 tools and 2 tools
+respectively, with no credentials).
+
+What remains testable statically is the secret PLUMBING: the mount, the
+--secrets flag, and the render target. The secret names themselves are
+upstream's, and are recorded here so a drifting example file is caught.
+
+NOTE: the end-to-end secrets path is UNVERIFIED. github-official and
+firecrawl enumerate their tools without credentials, but no tool has
+been invoked with a real token.
 """
 
 from __future__ import annotations
@@ -19,13 +28,21 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
-TIER2_SERVERS = {"github-official", "firecrawl", "hugging-face", "context7"}
+# Servers that genuinely need a credential to DO anything. Both come
+# from the upstream catalog; we only switch them on.
+SECRET_BEARING_SERVERS = {"github-official", "firecrawl"}
 
+# Servers that used to be listed as secret-bearing but are not: upstream
+# serves both as anonymous remote endpoints now.
+NO_LONGER_SECRET_BEARING = {"hugging-face", "context7"}
+
+# Secret names as the UPSTREAM catalog declares them. The gateway looks
+# secrets up by catalog secret name, so the old GITHUB_TOKEN-style keys
+# would silently never resolve -- the same class of quiet failure that
+# made the whole gateway look shipped while serving zero tools.
 EXPECTED_SECRETS = {
-    "GITHUB_TOKEN",
-    "FIRECRAWL_API_KEY",
-    "HF_TOKEN",
-    "CONTEXT7_API_KEY",
+    "github.personal_access_token",
+    "firecrawl.api_key",
 }
 
 
@@ -37,44 +54,29 @@ def _yaml():
         return None
 
 
-class TestMcpServersYamlTier2(unittest.TestCase):
+class TestSecretBearingServersEnabled(unittest.TestCase):
+    """The secret-bearing servers must still be in the --servers list; the
+    secrets plumbing below is pointless if they are not enabled."""
+
     def setUp(self) -> None:
         self.yaml = _yaml()
         if self.yaml is None:
             self.skipTest("PyYAML not installed")
-        with open(REPO_ROOT / "deploy" / "mcp-servers.yaml") as f:
-            self.doc = self.yaml.safe_load(f)
+        with open(REPO_ROOT / "deploy" / "docker-compose.yaml") as f:
+            compose = self.yaml.safe_load(f)
+        svc = (compose.get("services") or {}).get("mcp-gateway") or {}
+        flag = [c for c in (svc.get("command") or []) if c.startswith("--servers=")]
+        self.enabled = set(flag[0].split("=", 1)[1].split(",")) if flag else set()
 
-    def test_tier2_servers_present(self) -> None:
-        names = {s.get("name") for s in self.doc["servers"]}
-        missing = TIER2_SERVERS - names
-        self.assertEqual(missing, set(), msg=f"Tier 2 servers missing: {missing}")
+    def test_secret_bearing_servers_are_enabled(self) -> None:
+        missing = SECRET_BEARING_SERVERS - self.enabled
+        self.assertEqual(missing, set(), msg=f"not enabled: {missing}")
 
-    def test_each_tier2_references_a_secret(self) -> None:
-        servers = {s["name"]: s for s in self.doc["servers"] if s.get("name") in TIER2_SERVERS}
-        for name, srv in servers.items():
-            with self.subTest(server=name):
-                env = srv.get("environment") or []
-                self.assertGreater(len(env), 0, msg=f"{name}: no env entries")
-                # At least one env entry must reference {secret: ...}.
-                self.assertTrue(
-                    any("{secret:" in str(e) for e in env),
-                    msg=f"{name}: no {{secret: NAME}} reference in env",
-                )
-
-    def test_secret_names_match_expected_set(self) -> None:
-        seen = set()
-        for srv in self.doc["servers"]:
-            if srv.get("name") not in TIER2_SERVERS:
-                continue
-            for entry in srv.get("environment", []) or []:
-                m = re.search(r"\{secret:\s*([A-Z0-9_]+)\}", str(entry))
-                if m:
-                    seen.add(m.group(1))
-        self.assertEqual(
-            seen, EXPECTED_SECRETS,
-            msg=f"secret-name set drift: seen={seen}",
-        )
+    def test_anonymous_remote_servers_are_enabled_too(self) -> None:
+        """These need no secret, so they must work on an install that has
+        never run mcp-secrets-render."""
+        missing = NO_LONGER_SECRET_BEARING - self.enabled
+        self.assertEqual(missing, set(), msg=f"not enabled: {missing}")
 
 
 class TestMcpSecretsExample(unittest.TestCase):
@@ -82,7 +84,7 @@ class TestMcpSecretsExample(unittest.TestCase):
         path = REPO_ROOT / "deploy" / "mcp-secrets.sops.env.example"
         self.assertTrue(path.is_file())
 
-    def test_documents_all_four_names(self) -> None:
+    def test_documents_upstream_secret_names(self) -> None:
         text = (REPO_ROOT / "deploy" / "mcp-secrets.sops.env.example").read_text()
         for name in EXPECTED_SECRETS:
             self.assertRegex(
