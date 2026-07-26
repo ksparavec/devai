@@ -462,6 +462,28 @@ families:
       vllm:
         reasoning: nemotron_v3
         tool: nemotron_json
+      sglang:
+        reasoning: nemotron_3
+        # No tool entry on purpose -- see the tool-parser note below.
+    # SGLang had NO parsers block until 2026-07-26, and the cost was
+    # measured: with no curated hint the prober recorded
+    # reasoning_parser=null and capability=inline, so the <think> trace
+    # stayed in `content` and HumanEval scored **0.04 on SGLang against
+    # 0.80 on vLLM** for the same checkpoint at the same ctx, while GSM8K
+    # was 0.98 on both (its extractor finds a final number, which appears
+    # in the reasoning trace anyway). The bench correctly flagged a drop;
+    # the drop was an artefact of the missing parser, not of the model.
+    # That is the same ~0.10 HumanEval floor described below for vLLM,
+    # from the same cause.
+    #
+    # `nemotron_3` is registered in the pinned SGLang v0.5.10.post1 image
+    # (verified by introspecting ReasoningParser.DetectorMap) and its
+    # detector is built on "<think>"/"</think>" -- the exact tokens this
+    # model's chat template emits (verified in tokenizer_config.json). No
+    # per-model image override is needed on the SGLang side.
+    # UNVERIFIED end to end: this needs `make probe-sglang` to confirm the
+    # round-trip and a re-bench to confirm the HumanEval recovery.
+    #
     # Reasoning parser nemotron_v3 is NOT registered in the pinned vLLM
     # v0.22.1 image (passing it crashes the engine at startup, container
     # exits before /health). It IS registered in vLLM v0.25.1, to which
