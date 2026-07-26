@@ -31,6 +31,10 @@
     "rimraf": "~6.0.0",
     "typescript": "~5.8.0"
   },
+  "resolutions": {
+    "fast-uri": "^3.1.4",
+    "postcss": "^8.5.18"
+  },
   "sideEffects": [
     "style/**/*.css",
     "style/index.js"
@@ -40,7 +44,7 @@
     "extension": true,
     "outputDir": "jupyter_ai_launchers/labextension",
     "_build": {
-      "load": "static/remoteEntry.e54a86cc7edc883b17a9.js",
+      "load": "static/remoteEntry.c609fa89e61411f25157.js",
       "extension": "./extension",
       "style": "./style"
     }
