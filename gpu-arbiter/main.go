@@ -803,6 +803,27 @@ type backendState struct {
 	// stopOtherBackends cannot observe zero for a request already cleared
 	// to proxy) and decremented after ServeHTTP returns.
 	upstreamReqs int64
+	// failedLaunches counts consecutive recreates of the SAME (model, ctx)
+	// that never produced a completed upstream request. Reset to 0 the
+	// moment one completes, so a working model never accumulates.
+	//
+	// This is the circuit breaker. Without it the router will relaunch a
+	// model that dies every time, forever: Ornith-1.0-9B-NVFP4 at 256K on
+	// SGLang was recreated 10 times in one bench run (3 of those
+	// teardowns logged `container exited`, i.e. the engine genuinely
+	// terminating) and would have continued indefinitely. Each cycle
+	// costs a full cold start, so one client asking for a model that
+	// cannot sustain its advertised context pins the GPU with no progress
+	// and no error ever reaching the caller.
+	//
+	// Distinct from detectLaunchFailure, which catches an engine that
+	// dies DURING launch. This catches one that launches cleanly and then
+	// dies serving.
+	failedLaunches int
+	// failedLaunchKey identifies what failedLaunches is counting, so a
+	// switch to a different model or context starts a fresh budget rather
+	// than inheriting the previous model's failures.
+	failedLaunchKey string
 	// Recreate coalescing — without this, a second request that arrives
 	// during the 50–60s cold-start `waitForHealthy` window sees
 	// running=false, decides it needs its own recreate, and tears down
@@ -926,6 +947,10 @@ type arbiter struct {
 	// connection pool) every time -- hoisted here so successive probes
 	// reuse the same idle connection.
 	healthClient *http.Client
+	// containerStateStub, when non-nil, replaces the podman libpod call in
+	// containerState. Tests only -- see backend_vanished_test.go. nil in
+	// production, so the real path is what ships.
+	containerStateStub func(name string) (string, int, bool)
 	// weightWarned tracks which backends have already logged the
 	// "models dir not visible" degradation in checkModelWeights, so an
 	// unmounted store costs one log line rather than one per request.
@@ -1032,36 +1057,26 @@ func memFraction(modelSizeGB, totalVRAMGB float64, backend string) float64 {
 	return max(0.40, min(0.95, frac))
 }
 
-// maxContextLen estimates the maximum context length that fits in the
-// available KV cache memory.  Both vLLM and SGLang store KV cache in BF16
-// regardless of weight quantization.
-//
-// Rough per-token KV footprint (BF16, GQA):
-//
-//	2 (K+V) × layers × kv_heads × head_dim × 2 bytes
-//
-// We approximate this from the weight file size since we don't have the
-// architecture config:
-//
-//	≤ 6 GB  →  ~100 KB/token  (small models, fewer layers)
-//	≤ 12 GB →  ~160 KB/token  (9B class)
-//	≤ 20 GB →  ~256 KB/token  (14-27B class)
-//	> 20 GB →  ~400 KB/token  (35B+ class)
-//
 // fittableContext estimates the maximum context length that fits in the
-// available KV cache memory.  Both vLLM and SGLang store KV cache in BF16
-// regardless of weight quantization.
+// available KV cache memory.
 //
-// Approximate per-token KV footprint (BF16, GQA):
-//
-//	2 (K+V) × layers × kv_heads × head_dim × 2 bytes
-//
-// Estimated from weight file size (architecture config unavailable):
+// The per-token figures below are a coarse lookup keyed on weight size,
+// used because the architecture config is not available here:
 //
 //	≤ 6 GB  →  ~100 KB/token  (small models, fewer layers)
 //	≤ 12 GB →  ~160 KB/token  (9B class)
 //	≤ 20 GB →  ~256 KB/token  (14-27B class)
 //	> 20 GB →  ~400 KB/token  (35B+ class)
+//
+// These were derived assuming unquantized (2-byte) KV. That assumption
+// no longer describes how the engines are launched: containerRecreate
+// passes --kv-cache-dtype from the probe cell, and an unstamped cell
+// decodes to fp8 (see resolveKVCacheType), so real per-token cost is
+// typically half the table. The table is deliberately NOT rescaled --
+// it is only consulted when applyProbeCeiling has no probe measurement
+// to override it (probedMax == 0), and in that no-data case erring
+// small is the safe direction. Any model with a probe cell ignores
+// these numbers entirely.
 func fittableContext(availableKVGB, modelSizeGB float64) int {
 	var kvPerTokenKB float64
 	switch {
@@ -1464,27 +1479,25 @@ func specLabel(s *configSpeculative) string {
 
 // --- Main ---
 
-// arbiterMode selects single-host vs cluster behaviour. Default
-// "single" preserves the pre-cluster-mode code path byte-for-byte.
-// Per docs/plans/gpu-arbiter-cluster-mode.md decision 7 + 11.
+// arbiterMode is retained so an operator (or a stale compose file) passing
+// --mode / DEVAI_MODE gets a clear error instead of a silently ignored flag.
+// Cluster worker/head modes are FROZEN -- their implementation lives under
+// attic/cluster-mode/ behind the devai_frozen_cluster build tag. See
+// attic/README.md for the rationale and the restore procedure.
 var arbiterMode = flag.String(
 	"mode", env("DEVAI_MODE", "single"),
-	"arbiter mode: single|worker|head",
+	"arbiter mode: single (worker|head are frozen -- see attic/README.md)",
 )
 
 func main() {
 	flag.Parse()
-	switch *arbiterMode {
-	case "single":
-		// Fall through to the existing single-host code path.
-	case "worker":
-		runWorkerMode()
-		return
-	case "head":
-		runHeadMode()
-		return
-	default:
-		log.Fatalf("unknown --mode %q (want single|worker|head)", *arbiterMode)
+	if *arbiterMode != "single" {
+		log.Fatalf(
+			"--mode %q is frozen: cluster worker/head support was retired to "+
+				"attic/cluster-mode/ and is not compiled into this binary. "+
+				"Only --mode=single is supported. See attic/README.md.",
+			*arbiterMode,
+		)
 	}
 
 	runSingleHost(buildArbiter())
@@ -1492,9 +1505,10 @@ func main() {
 
 // buildArbiter constructs the single-host arbiter: probe caches,
 // per-backend config, the lookup maps, and the image-drift check.
-// Split out of main() (behaviour-identical) so cluster worker mode can
-// build the very same scheduler and dispatch head-forwarded requests
-// through it -- see makeInboundHandler in cluster_main.go.
+// Kept split out of main() (behaviour-identical) because the frozen
+// cluster worker path under attic/cluster-mode/ builds the very same
+// scheduler; keeping the seam costs nothing and makes a future thaw a
+// file move rather than a refactor.
 func buildArbiter() *arbiter {
 	ollamaURL, _ := url.Parse(env("OLLAMA_URL", "http://devai-ollama:11434"))
 	vllmURL, _ := url.Parse(env("VLLM_URL", "http://devai-vllm:11434"))
@@ -1818,6 +1832,71 @@ func buildArbiter() *arbiter {
 	return a
 }
 
+// ollamaMutationPaths are the Ollama endpoints that change what the
+// daemon has on disk. They are refused at the router.
+//
+// Why this matters: the probe caches are this project's fit gate --
+// nothing should serve unless a probe measured that it fits and serves
+// at the requested context. For vLLM and SGLang that gate is enforced
+// directly, by the allowlist check in makeRequestHandler. For Ollama it
+// is enforced INDIRECTLY: the router forwards any name and relies on
+// upstream's own "allowlist", which is simply the set of locally pulled
+// tags. That indirection only holds while the set of locally pulled tags
+// is controlled by the probe pipeline. `/api/pull` through the router
+// broke it -- any agent in the lab container, or an Open WebUI user,
+// could add an unprobed model and then serve it, with no fit data and no
+// bench data behind it. `/api/delete` was the mirror image: it could
+// silently remove a model the probe cache still advertises.
+//
+// The operator's own pipeline is unaffected. select-models.py shells out
+// with `podman exec devai-ollama ollama pull/create` (scripts/
+// select-models.py pull_ollama / pull_gguf) and the prober talks to
+// devai-ollama:11434 directly, so neither traverses the router. The
+// sanctioned path stays `make model-pull`.
+var ollamaMutationPaths = []string{
+	"/api/pull",
+	"/api/create",
+	"/api/push",
+	"/api/copy",
+	"/api/delete",
+}
+
+// makeMutationGuard refuses a model-store mutation with 403 and names the
+// sanctioned path. Registered on every backend listener: these routes are
+// Ollama's, but a client aiming one at the vLLM or SGLang port is making
+// the same mistake and deserves the same answer rather than a bare 404
+// from an upstream that never implemented the endpoint.
+func (a *arbiter) makeMutationGuard(backendName string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("[%s] REFUSED %s %s from %s -- model-store mutation via router",
+			backendName, r.Method, r.URL.Path, r.RemoteAddr)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = fmt.Fprintf(w,
+			`{"error":"%s is disabled at the router: models must be probed before they can be served. `+
+				`Use 'make model-pull' on the host, then 'make probe' (or probe-vllm/probe-sglang)."}`+"\n",
+			r.URL.Path)
+	}
+}
+
+// newBackendMux builds one backend listener's route table. Split out of
+// runSingleHost (which blocks forever) purely so the routing itself is
+// testable -- notably that the mutation guards win over the catch-all.
+func (a *arbiter) newBackendMux(name string) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/models", a.makeModelsHandler(name))
+	mux.HandleFunc("/api/tags", a.makeTagsHandler(name))
+	mux.HandleFunc("/health", a.makeHealthHandler(name))
+	// ServeMux prefers the longer pattern, so these win over "/"
+	// regardless of registration order; registering them adjacent to the
+	// catch-all makes that precedence obvious to a reader.
+	for _, p := range ollamaMutationPaths {
+		mux.HandleFunc(p, a.makeMutationGuard(name))
+	}
+	mux.HandleFunc("/", a.makeRequestHandler(name))
+	return mux
+}
+
 // runSingleHost starts the single-host serving path: idle watcher,
 // signal handler, one listener per backend. Blocks forever.
 func runSingleHost(a *arbiter) {
@@ -1835,11 +1914,7 @@ func runSingleHost(a *arbiter) {
 
 	// Start one listener per backend
 	for name, bs := range a.backends {
-		mux := http.NewServeMux()
-		mux.HandleFunc("/v1/models", a.makeModelsHandler(name))
-		mux.HandleFunc("/api/tags", a.makeTagsHandler(name))
-		mux.HandleFunc("/health", a.makeHealthHandler(name))
-		mux.HandleFunc("/", a.makeRequestHandler(name))
+		mux := a.newBackendMux(name)
 
 		addr := fmt.Sprintf(":%d", bs.config.ListenPort)
 		log.Printf("  %s → %s (port %d, %d models)",
@@ -1901,17 +1976,18 @@ func (a *arbiter) containerRemove(name string) {
 	}
 }
 
-func (a *arbiter) containerIsRunning(name string) bool {
-	status, _, ok := a.containerState(name)
-	return ok && status == "running"
-}
-
 // containerState returns the container's libpod State.Status (e.g.
 // "running", "exited", "created") and ExitCode. ok=false when the podman
 // API is unreachable or the body can't be decoded -- callers treat that as
 // "unknown", not "crashed", so a podman blip never triggers a spurious
 // recreate or a false fail-fast.
 func (a *arbiter) containerState(name string) (status string, exitCode int, ok bool) {
+	// Test seam: backendVanished's whole job is distinguishing "container
+	// gone" from "podman did not answer", and that distinction cannot be
+	// exercised against a real podman socket.
+	if a.containerStateStub != nil {
+		return a.containerStateStub(name)
+	}
 	if a.podmanClient == nil {
 		return "", 0, false
 	}
@@ -2156,6 +2232,131 @@ func (a *arbiter) backendIsServing(bs *backendState) bool {
 	defer resp.Body.Close()
 	io.Copy(io.Discard, resp.Body)
 	return resp.StatusCode == http.StatusOK
+}
+
+// maxFailedLaunches is how many consecutive recreates of the same
+// (model, ctx) may fail to produce a completed request before the router
+// stops trying and returns an error instead. Three is deliberate: it
+// tolerates a genuine transient (a podman hiccup, an unlucky OOM under a
+// concurrent switch) while capping the damage of a model that simply
+// cannot sustain its advertised context at roughly three cold starts
+// rather than an unbounded loop.
+//
+// Override with DEVAI_MAX_FAILED_LAUNCHES; 0 disables the breaker.
+var maxFailedLaunches = envInt("DEVAI_MAX_FAILED_LAUNCHES", 3)
+
+// launchKey identifies what the failure budget is being spent on.
+func launchKey(modelName string, ctx int) string {
+	return fmt.Sprintf("%s@%d", modelName, ctx)
+}
+
+// noteLaunchAttempt spends one unit of the circuit-breaker budget for
+// (model, ctx). Called with a.mu held. A different key starts a fresh
+// budget so one model's failures are never charged to another's.
+func (bs *backendState) noteLaunchAttempt(key string) {
+	if bs.failedLaunchKey != key {
+		bs.failedLaunchKey = key
+		bs.failedLaunches = 0
+	}
+	bs.failedLaunches++
+}
+
+// noteLaunchSucceeded clears the budget. Called with a.mu held, at the
+// point a request is handed to the backend.
+//
+// Deliberately unkeyed: whatever is running right now just accepted a
+// request, so the currently-running launch is good, full stop. Keying
+// this would reintroduce the bug it is meant to prevent -- the attempt
+// is charged against the RESOLVED ctx while the request is served at the
+// LAUNCHED ctx, and any drift between those two would leave the budget
+// permanently unreset and eventually refuse a working model.
+func (bs *backendState) noteLaunchSucceeded() {
+	bs.failedLaunches = 0
+	bs.failedLaunchKey = ""
+}
+
+// launchBudgetExhausted reports whether this (model, ctx) has burned its
+// recreate budget without ever completing a request.
+func (bs *backendState) launchBudgetExhausted(key string) bool {
+	if maxFailedLaunches <= 0 {
+		return false
+	}
+	return bs.failedLaunchKey == key && bs.failedLaunches >= maxFailedLaunches
+}
+
+// refusalMessage is what a caller sees when the circuit breaker trips.
+// It is the ONLY signal they get, so it names the model, the context it
+// failed at, and both ways out -- re-probe, or ask for a smaller ctx.
+func refusalMessage(bs *backendState, modelName string, ctx int) string {
+	return fmt.Sprintf(
+		"%s: %s failed to serve %d consecutive launches at ctx=%d and is now "+
+			"refused. The engine started and passed /health but died before "+
+			"completing a request, which usually means the model cannot "+
+			"sustain that context. Re-measure it with `make probe-load-%s`, "+
+			"or request a smaller `@<ctx>`. Requesting a different model "+
+			"clears this; DEVAI_MAX_FAILED_LAUNCHES=0 disables the guard.",
+		bs.config.Name, modelName, bs.failedLaunches, ctx, bs.config.Name)
+}
+
+// healthProbeAttempts is how many times backendVanished retries /health
+// before concluding a backend is gone. A single probe is not enough: the
+// client timeout is 2s and a busy engine can miss it while serving
+// perfectly well. SGLang answers /health on a ~1s scheduler tick, so a
+// chunked prefill is enough to push one probe past the deadline.
+const healthProbeAttempts = 3
+
+// backendVanished reports whether a backend that we believe is `running`
+// has actually gone away, and why. The reason is returned so the log
+// names the condition that fired instead of guessing at both.
+//
+// This exists because the previous inline check recreated healthy
+// backends. Observed 2026-07-25: gpt-oss-20b on SGLang was torn down and
+// relaunched 9 times in 18 minutes, each teardown almost exactly 2s after
+// the router logged "sglang ready", while the engine was answering
+// /health 200 and serving 10 concurrent requests at 461 tok/s. Every
+// in-flight request died with "proxy error: context canceled". The same
+// signature accounts for ~100 recreates of another model over an hour.
+//
+// Three things were wrong:
+//
+//  1. containerIsRunning collapses "podman API unreachable" into
+//     "not running". containerState's own doc comment promises callers
+//     treat that as unknown so "a podman blip never triggers a spurious
+//     recreate" -- but the caller could not tell the two apart, so a
+//     blip did exactly that. Unknown now means "leave it alone".
+//  2. A single /health probe decided the question. One slow response
+//     from a loaded engine was indistinguishable from a dead one.
+//  3. Requests in flight to the backend were ignored. If the router is
+//     actively proxying to it, it is serving, and no probe is needed.
+func (a *arbiter) backendVanished(bs *backendState) (bool, string) {
+	// Requests currently proxied upstream are proof of life. Checked
+	// first because it is free and because tearing a backend down while
+	// it is answering is the specific harm here.
+	if atomic.LoadInt64(&bs.upstreamReqs) > 0 {
+		return false, ""
+	}
+
+	status, _, ok := a.containerState(bs.config.ContainerName)
+	if !ok {
+		// Podman unreachable -> unknown, NOT gone. Honours the contract
+		// containerState documents.
+		return false, ""
+	}
+	if status != "running" {
+		return true, fmt.Sprintf("container %s", status)
+	}
+
+	// Container is up: is the engine answering? Retry before condemning
+	// it -- see healthProbeAttempts.
+	for attempt := 1; attempt <= healthProbeAttempts; attempt++ {
+		if a.backendIsServing(bs) {
+			return false, ""
+		}
+		if attempt < healthProbeAttempts {
+			time.Sleep(500 * time.Millisecond)
+		}
+	}
+	return true, fmt.Sprintf("no /health response in %d attempts", healthProbeAttempts)
 }
 
 // resolvePluginLaunch consults the vllm-plugins registry for the
@@ -2740,17 +2941,20 @@ func (a *arbiter) ensureBackendRunning(bs *backendState, modelName string, desir
 	//      still true. The placeholder responds to `containerIsRunning`
 	//      with `running` but has no listener on the backend port.
 	//
-	// `backendIsServing` polls /health to distinguish these cases. If
-	// it fails, the state is reset so the recreate path fires below.
-	if bs.running && a.podmanClient != nil &&
-		(!a.containerIsRunning(bs.config.ContainerName) || !a.backendIsServing(bs)) {
-		log.Printf("%s not serving (container gone or placeholder up), resetting state",
-			bs.config.Name)
-		bs.running = false
-		bs.containerLaunched = false
-		bs.currentModel = ""
-		bs.currentContext = 0
-		bs.currentSpec = nil
+	// `backendVanished` distinguishes these cases -- and, critically,
+	// distinguishes both from "busy but healthy" and "podman blipped".
+	// See its doc comment: the previous inline check tore down healthy
+	// backends mid-request.
+	if bs.running && a.podmanClient != nil {
+		if vanished, why := a.backendVanished(bs); vanished {
+			log.Printf("%s not serving (%s), resetting state",
+				bs.config.Name, why)
+			bs.running = false
+			bs.containerLaunched = false
+			bs.currentModel = ""
+			bs.currentContext = 0
+			bs.currentSpec = nil
+		}
 	}
 
 	// Recreate when the model, the baked context cap, OR the
@@ -2783,6 +2987,15 @@ func (a *arbiter) ensureBackendRunning(bs *backendState, modelName string, desir
 	// ""), so that eviction was reachable from any liveness checker.
 	if modelName == "" {
 		return fmt.Errorf("model name required for %s", bs.config.Name)
+	}
+
+	// Circuit breaker, also before the GPU is touched. A model that has
+	// already burned its recreate budget without ever completing a
+	// request is not going to succeed on attempt N+1, and each attempt
+	// costs a full cold start. Refuse with a message that names the
+	// model and the remedy instead of looping. See maxFailedLaunches.
+	if key := launchKey(modelName, resolvedCtx); bs.launchBudgetExhausted(key) {
+		return fmt.Errorf("%s", refusalMessage(bs, modelName, resolvedCtx))
 	}
 
 	// Same reasoning: fail before the GPU is touched. A model the probe
@@ -2825,6 +3038,13 @@ func (a *arbiter) ensureBackendRunning(bs *backendState, modelName string, desir
 		bs.pendingContext = 0
 		bs.recreateCond.Broadcast()
 	}()
+
+	// Spend one unit of the circuit-breaker budget up front. It is repaid
+	// (reset to 0) only when a request actually completes upstream on this
+	// (model, ctx) -- reaching /health is not enough, because the failure
+	// this guards against is precisely an engine that becomes healthy and
+	// then dies serving. See maxFailedLaunches.
+	bs.noteLaunchAttempt(launchKey(modelName, resolvedCtx))
 
 	launchedCtx, err := a.containerRecreate(bs, modelName, desiredCtx, desiredSpec)
 	if err != nil {
@@ -2924,13 +3144,17 @@ func (a *arbiter) ensureOllamaRunning(bs *backendState, modelName string, desire
 	}
 
 	// Drop stale state if the container vanished or a placeholder replaced it.
-	if bs.running && a.podmanClient != nil &&
-		(!a.containerIsRunning(bs.config.ContainerName) || !a.backendIsServing(bs)) {
-		log.Printf("ollama not serving (container gone or placeholder up), resetting state")
-		bs.running = false
-		bs.containerLaunched = false
-		bs.currentModel = ""
-		bs.currentContext = 0
+	// Same guard as the vLLM/SGLang path -- see backendVanished. Ollama is
+	// less exposed (it is not recreated per model the way the HF backends
+	// are) but the failure mode is identical, so both paths use one check.
+	if bs.running && a.podmanClient != nil {
+		if vanished, why := a.backendVanished(bs); vanished {
+			log.Printf("ollama not serving (%s), resetting state", why)
+			bs.running = false
+			bs.containerLaunched = false
+			bs.currentModel = ""
+			bs.currentContext = 0
+		}
 	}
 
 	// resolvedCtx is what a launch at probedCtx would ACTUALLY settle on --
@@ -3291,6 +3515,10 @@ func (a *arbiter) makeRequestHandler(backendName string) http.HandlerFunc {
 		// sees this request in drainBackend instead of pulling the backend
 		// out from under it.
 		atomic.AddInt64(&bs.upstreamReqs, 1)
+		// Repay the circuit-breaker budget: this (model, ctx) has now
+		// actually served a request, which is the only proof a launch was
+		// good. Done under a.mu, which we still hold. See maxFailedLaunches.
+		bs.noteLaunchSucceeded()
 		a.mu.Unlock()
 		defer atomic.AddInt64(&bs.upstreamReqs, -1)
 
