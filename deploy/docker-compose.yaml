@@ -125,6 +125,11 @@ services:
       - DRAIN_TIMEOUT=${DRAIN_TIMEOUT:-30}
       - HEALTH_TIMEOUT_SECONDS=${HEALTH_TIMEOUT_SECONDS:-600}
       - MAX_CONCURRENT_REQUESTS=${MAX_CONCURRENT_REQUESTS:-32}
+      # SSE keepalive during cold start. Forwarded explicitly because the
+      # router only ever sees what compose hands it -- a knob documented
+      # but not listed here is inert, and silently so.
+      - DEVAI_SSE_KEEPALIVE_SECONDS=${DEVAI_SSE_KEEPALIVE_SECONDS:-10}
+      - DEVAI_SSE_KEEPALIVE_GRACE_SECONDS=${DEVAI_SSE_KEEPALIVE_GRACE_SECONDS:-5}
       - GPU_MEMORY_GB=${GPU_MEMORY_GB:-24}
       - MAX_CONTEXT_LEN=${MAX_CONTEXT_LEN:-262144}
       - DEVAI_REASONING=${DEVAI_REASONING:-auto}

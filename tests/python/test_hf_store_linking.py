@@ -230,5 +230,40 @@ class DocsMatchRealityTest(unittest.TestCase):
         self.assertIn("link-hf-store.py", mk)
 
 
+class RouterEnvKnobsAreForwardedTest(unittest.TestCase):
+    """A knob the router reads but compose does not forward is inert --
+    and silently so, which is the worst shape for a documented setting.
+
+    The repo already carries one instance of this class of bug (the
+    router container is never handed DEVAI_GPU_DEVICE, per
+    docs/gpu-vendors.md), so it is worth a test rather than a habit.
+    """
+
+    def _router_env(self) -> list[str]:
+        import yaml
+        c = yaml.safe_load(
+            (REPO_ROOT / "deploy" / "docker-compose.yaml").read_text())
+        return [str(e) for e in c["services"]["router"]["environment"]]
+
+    def test_every_env_knob_read_by_sse_keepalive_is_forwarded(self):
+        go = (REPO_ROOT / "gpu-arbiter" / "main.go").read_text()
+        env = "\n".join(self._router_env())
+        import re
+        # Every DEVAI_SSE_* name the Go source pulls from the environment.
+        names = set(re.findall(r'env\w*\("(DEVAI_SSE_[A-Z_]+)"', go))
+        self.assertTrue(names, "no SSE env knobs found in main.go")
+        for name in sorted(names):
+            with self.subTest(var=name):
+                self.assertIn(name, env,
+                              f"{name} is read by the router but never "
+                              f"forwarded by compose -- it would be inert")
+
+    def test_knobs_are_documented_for_operators(self):
+        example = (REPO_ROOT / ".env.example").read_text()
+        for name in ("DEVAI_SSE_KEEPALIVE_SECONDS",
+                     "DEVAI_SSE_KEEPALIVE_GRACE_SECONDS"):
+            self.assertIn(name, example)
+
+
 if __name__ == "__main__":
     unittest.main()
