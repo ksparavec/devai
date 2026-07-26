@@ -651,6 +651,17 @@ knowing:
   indistinguishable from a hang and would make the client wait out its
   own timeout.
 
+One ordering constraint is load-bearing. The keepalive is armed only
+*after* `makeRequestHandler` has read the POST body and replaced it with
+an in-memory reader. Writing the first frame commits the response, at
+which point Go's server closes the ORIGINAL request body -- so a
+keepalive armed any earlier makes `ReverseProxy` fail to forward the
+request (`http: invalid Read on closed Body`), and because the response
+is already a committed 200 the client receives heartbeats followed by
+nothing at all. This was verified by writing it the wrong way round
+first, and is pinned by
+`TestKeepaliveIsArmedAfterTheBodyIsReplaced`.
+
 Implementation and rationale: `gpu-arbiter/sse_keepalive.go`.
 
 ### Memory and context

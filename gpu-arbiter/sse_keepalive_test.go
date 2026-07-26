@@ -1,9 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -248,5 +253,115 @@ func TestItoa(t *testing.T) {
 		if got := itoa(tc.in); got != tc.want {
 			t.Fatalf("itoa(%d) = %q, want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+// The handoff to the proxy is the part that only reasoning covered:
+// after the keepalive commits a 200 text/event-stream, the request is
+// handed to httputil.ReverseProxy, which will try to write its OWN
+// status and headers. This exercises the real thing end to end rather
+// than asserting what the net/http docs imply.
+func TestProxyStreamsThroughAfterKeepaliveCommitted(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			for _, chunk := range []string{
+				`data: {"choices":[{"delta":{"content":"hel"}}]}`,
+				`data: {"choices":[{"delta":{"content":"lo"}}]}`,
+				"data: [DONE]",
+			} {
+				_, _ = w.Write([]byte(chunk + "\n\n"))
+				w.(http.Flusher).Flush()
+			}
+		}))
+	defer upstream.Close()
+
+	target, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := httputil.NewSingleHostReverseProxy(target)
+
+	front := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			// Mirror makeRequestHandler: the POST body is read and
+			// replaced with an in-memory reader BEFORE the keepalive is
+			// armed. That ordering is load-bearing -- see
+			// TestKeepaliveIsArmedAfterTheBodyIsReplaced.
+			raw, _ := io.ReadAll(r.Body)
+			r.Body = io.NopCloser(bytes.NewReader(raw))
+			r.ContentLength = int64(len(raw))
+			// Simulate a launch that outruns the grace window.
+			k := startSSEKeepalive(w, 5*time.Millisecond, 5*time.Millisecond)
+			time.Sleep(30 * time.Millisecond)
+			if !k.stop() {
+				t.Error("expected the response to be committed")
+			}
+			proxy.ServeHTTP(w, r)
+		}))
+	defer front.Close()
+
+	resp, err := http.Post(front.URL+"/v1/chat/completions",
+		"application/json", strings.NewReader(`{"model":"m","stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(body)
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if !strings.Contains(got, ": keepalive 1") {
+		t.Fatalf("keepalive frames missing from %q", got)
+	}
+	// The whole point: real content still arrives after the heartbeats.
+	for _, want := range []string{`"hel"`, `"lo"`, "data: [DONE]"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("upstream chunk %s missing from %q", want, got)
+		}
+	}
+	if strings.Index(got, ": keepalive 1") > strings.Index(got, `"hel"`) {
+		t.Fatal("keepalive frames must precede the upstream body")
+	}
+}
+
+// The ordering that makes the proxy handoff work at all.
+//
+// Once the keepalive writes its first frame the response is committed,
+// and Go's server then closes the ORIGINAL request body. If the
+// keepalive were armed before makeRequestHandler read and replaced that
+// body, ReverseProxy would fail forwarding the request with "http:
+// invalid Read on closed Body" -- and, because the response is already a
+// committed 200, the client would receive heartbeats and then nothing at
+// all. Verified by writing it the wrong way round first: the client got
+// `: keepalive 1..5` and no completion.
+//
+// The guard is structural rather than behavioural because the failure
+// only appears with a real network body; httptest bodies do not
+// reproduce it once the handler has read them.
+func TestKeepaliveIsArmedAfterTheBodyIsReplaced(t *testing.T) {
+	src, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(src)
+
+	replace := strings.Index(s, "req.Body = io.NopCloser(bytes.NewReader(body))")
+	arm := strings.Index(s, "startSSEKeepalive(w,")
+	if replace < 0 || arm < 0 {
+		t.Fatalf("anchors missing (replace=%d arm=%d) -- update this test "+
+			"along with the handler", replace, arm)
+	}
+	if arm < replace {
+		t.Fatal("the SSE keepalive is armed BEFORE the request body is " +
+			"replaced with an in-memory reader. Committing the response " +
+			"closes the original body, so the proxy can no longer forward " +
+			"the request -- the client would get heartbeats and no answer.")
 	}
 }

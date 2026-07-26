@@ -3516,6 +3516,16 @@ func (a *arbiter) makeRequestHandler(backendName string) http.HandlerFunc {
 		// written unless the launch outlasts the grace period, so a warm
 		// backend -- the overwhelming majority -- keeps its exact
 		// status-code behaviour. See sse_keepalive.go.
+		//
+		// MUST stay below the `req.Body = io.NopCloser(...)` replacement
+		// above. Writing the first keepalive frame commits the response,
+		// and Go's server then closes the ORIGINAL request body -- so a
+		// keepalive armed before that replacement makes ReverseProxy fail
+		// to forward the request ("http: invalid Read on closed Body"),
+		// and since the response is already a committed 200 the client
+		// gets heartbeats followed by nothing. Verified the wrong way
+		// round: `: keepalive 1..5` and no completion. Pinned by
+		// TestKeepaliveIsArmedAfterTheBodyIsReplaced.
 		keepalive := (*sseKeepalive)(nil)
 		if wantsSSEKeepalive(req.URL.Path, body) {
 			keepalive = startSSEKeepalive(w, a.keepaliveGrace, a.keepaliveInterval)
