@@ -130,7 +130,18 @@ services:
       # but not listed here is inert, and silently so.
       - DEVAI_SSE_KEEPALIVE_SECONDS=${DEVAI_SSE_KEEPALIVE_SECONDS:-10}
       - DEVAI_SSE_KEEPALIVE_GRACE_SECONDS=${DEVAI_SSE_KEEPALIVE_GRACE_SECONDS:-5}
+      # Launch circuit breaker: consecutive failed launches of the same
+      # (model, ctx) before the router refuses to keep retrying. 0 disables.
+      - DEVAI_MAX_FAILED_LAUNCHES=${DEVAI_MAX_FAILED_LAUNCHES:-3}
       - GPU_MEMORY_GB=${GPU_MEMORY_GB:-24}
+      # The CDI device string the router stamps onto the vLLM/SGLang
+      # containers it recreates (main.go, containerRecreate). The compose
+      # services above interpolate ${DEVAI_GPU_DEVICE} into their OWN
+      # device lists, but the router does not inherit the shell that ran
+      # compose -- so without this line it fell back to the hardcoded
+      # nvidia.com/gpu=all default and every router-recreated backend was
+      # NVIDIA regardless of `make gpu-vendor VENDOR=amd`.
+      - DEVAI_GPU_DEVICE=${DEVAI_GPU_DEVICE:-nvidia.com/gpu=all}
       - MAX_CONTEXT_LEN=${MAX_CONTEXT_LEN:-262144}
       - DEVAI_REASONING=${DEVAI_REASONING:-auto}
       - PODMAN_SOCKET=/run/podman/podman.sock

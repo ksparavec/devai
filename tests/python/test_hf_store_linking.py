@@ -230,6 +230,20 @@ class DocsMatchRealityTest(unittest.TestCase):
         self.assertIn("link-hf-store.py", mk)
 
 
+# Variables the router reads that must NOT be forwarded, each with the
+# reason. An exemption list is only honest if every entry justifies
+# itself -- otherwise it becomes the place bugs go to hide.
+EXEMPT_FROM_COMPOSE = {
+    # Only a fallback for the --mode flag, and single is the ONLY
+    # supported topology: any other value exits with a pointer to
+    # attic/README.md. Leaving it unset means the router takes its
+    # built-in "single" default, which is what we want. Forwarding it
+    # would let a stale DEVAI_MODE=worker in someone's .env turn every
+    # router start into a fatal error.
+    "DEVAI_MODE",
+}
+
+
 class RouterEnvKnobsAreForwardedTest(unittest.TestCase):
     """A knob the router reads but compose does not forward is inert --
     and silently so, which is the worst shape for a documented setting.
@@ -245,18 +259,30 @@ class RouterEnvKnobsAreForwardedTest(unittest.TestCase):
             (REPO_ROOT / "deploy" / "docker-compose.yaml").read_text())
         return [str(e) for e in c["services"]["router"]["environment"]]
 
-    def test_every_env_knob_read_by_sse_keepalive_is_forwarded(self):
+    def test_every_devai_env_knob_the_router_reads_is_forwarded(self):
+        """Generalised deliberately. Scoping this to DEVAI_SSE_* would
+        have passed while DEVAI_GPU_DEVICE -- the first instance of this
+        bug, and the more damaging one -- stayed broken."""
         go = (REPO_ROOT / "gpu-arbiter" / "main.go").read_text()
         env = "\n".join(self._router_env())
         import re
-        # Every DEVAI_SSE_* name the Go source pulls from the environment.
-        names = set(re.findall(r'env\w*\("(DEVAI_SSE_[A-Z_]+)"', go))
-        self.assertTrue(names, "no SSE env knobs found in main.go")
-        for name in sorted(names):
+        names = set(re.findall(r'env\w*\("(DEVAI_[A-Z_]+)"', go))
+        self.assertTrue(names, "no DEVAI_* env knobs found in main.go")
+        for name in sorted(names - EXEMPT_FROM_COMPOSE):
             with self.subTest(var=name):
                 self.assertIn(name, env,
                               f"{name} is read by the router but never "
                               f"forwarded by compose -- it would be inert")
+
+    def test_gpu_device_reaches_the_router(self):
+        """vLLM and SGLang start as `sleep infinity` placeholders and are
+        ALWAYS recreated by the router, so this variable not reaching the
+        router meant the amd overlay never reached the two services it
+        matters most for."""
+        self.assertTrue(
+            any(e.startswith("DEVAI_GPU_DEVICE=") for e in self._router_env()),
+            "the router recreates every HF backend container; without this "
+            "it stamps the hardcoded nvidia.com/gpu=all on all of them")
 
     def test_knobs_are_documented_for_operators(self):
         example = (REPO_ROOT / ".env.example").read_text()

@@ -59,16 +59,28 @@ the NVIDIA default as fallback) into the three backend services'
 `devices:` lists -- no `DEVAI_GPU_VENDOR` awareness needed at that
 layer, just the one derived string.
 
-**`gpu-arbiter`** reads `DEVAI_GPU_DEVICE` in code, but the router
-service's `environment:` block in `deploy/docker-compose.yaml` does
-**not** pass it in. A composed router therefore always falls back to
-the built-in `nvidia.com/gpu=all` when it recreates a backend
-container, whatever `.env` says. Until that env line is added, the
-`amd` overlay only reaches the backends compose starts itself -- an
-on-demand vLLM/SGLang container recreated by the router still gets the
-NVIDIA device string. Passing `-e DEVAI_GPU_DEVICE=...` to a
-hand-started arbiter does work; that is the only path where the
-arbiter's own read is effective today.
+**`gpu-arbiter`** reads `DEVAI_GPU_DEVICE` in code (`containerRecreate`)
+and, **since 2026-07-27, the router service's `environment:` block in
+`deploy/docker-compose.yaml` passes it in.**
+
+Until then it did not, and the consequence was silent: a composed router
+fell back to the built-in `nvidia.com/gpu=all` whenever it recreated a
+backend container, whatever `.env` said. The `amd` overlay reached only
+the backends compose started itself -- and since vLLM and SGLang start
+as `sleep infinity` placeholders and are *always* recreated by the
+router on first request, that meant the overlay never reached the two
+services it matters most for. Passing `-e DEVAI_GPU_DEVICE=...` to a
+hand-started arbiter was the only path where the arbiter's own read had
+any effect.
+
+The router does not inherit the shell that ran compose, so
+interpolating `${DEVAI_GPU_DEVICE}` into the *backend* services' device
+lists (which compose already did) never reached the router's own
+process environment. That is the general shape of this bug, and it bit
+twice: the SSE keepalive knobs landed with the same defect on the same
+day. `tests/python/test_hf_store_linking.py` now asserts that every
+`DEVAI_*` name the router pulls from its environment is forwarded by
+compose, so a third instance fails a test instead of shipping.
 
 **`Makefile`'s `GPU_FLAGS`** reads the same `DEVAI_GPU_DEVICE` (via
 `.env`, which the Makefile already `-include`s) -- one variable change
