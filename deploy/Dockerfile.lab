@@ -197,6 +197,10 @@ COPY scripts/late-launcher.sh /usr/local/bin/late
 COPY scripts/aiagent-launcher.sh /usr/local/bin/aiagent-shell
 COPY scripts/agent-picker.sh /usr/local/bin/agent-picker
 COPY scripts/model-picker.py /usr/local/bin/model-picker
+# SkyPilot first-launch helper. docs/skypilot-user-guide.md instructs the
+# user to run /usr/local/bin/sky-setup.sh; it was never COPY'd, so that
+# instruction was dead. The `sky` CLI itself is installed above.
+COPY scripts/sky-setup.sh /usr/local/bin/sky-setup.sh
 # Capability constants module imported by the picker at startup. Co-located
 # so /usr/local/bin/ is on the resolved PYTHONPATH and a plain
 # `from _capability import Capability` works without sys.path gymnastics.
@@ -205,7 +209,7 @@ COPY scripts/model-picker.py /usr/local/bin/model-picker
 COPY scripts/_capability.py /usr/local/bin/_capability.py
 COPY scripts/vram-fit.py /usr/local/bin/vram-fit.py
 COPY deploy/models.yaml /etc/devai/models.yaml
-RUN chmod +x /usr/local/bin/ollama-chat /usr/local/bin/aider-launcher /usr/local/bin/late /usr/local/bin/aiagent-shell /usr/local/bin/agent-picker /usr/local/bin/model-picker
+RUN chmod +x /usr/local/bin/ollama-chat /usr/local/bin/aider-launcher /usr/local/bin/late /usr/local/bin/aiagent-shell /usr/local/bin/agent-picker /usr/local/bin/model-picker /usr/local/bin/sky-setup.sh
 
 # Name the GPU 'render' group in /etc/group. On the host, /dev/dri/renderD* is
 # owned by group `render` (GID 992 here); `--device nvidia.com/gpu=all` (NVIDIA

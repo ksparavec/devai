@@ -1,5 +1,22 @@
 # SkyPilot Fleet Provisioner
 
+> **FROZEN 2026-07-25 -- do not execute this plan as written.**
+>
+> Phase 2 was never wired: `NewSkyPilotClient`, `NewSkyPilotPolicy` and
+> `NewIdleTeardownCoordinator` had zero non-test callers and
+> `SKYPILOT_API_ENDPOINT` was read by nothing, so cloud burst was inert.
+> The code is preserved under `attic/cluster-mode/`.
+>
+> **Security warning:** decision 1 and the Phase 1 compose YAML below
+> still prescribe `${HOME}:/root:rw`. That whole-home mount was removed
+> precisely because it hands the container `~/.ssh` and
+> `~/.config/sops/age/keys.txt` -- the private key behind every
+> `deploy/*.sops.env`. If this is ever thawed, restore from the frozen
+> compose fragment in `attic/cluster-mode/deploy/`, NOT from this text.
+>
+> It also depends on cluster mode, which is itself frozen.
+
+
 _Run SkyPilot API server as a devai compose service so gpu-arbiter (in head
 mode) can provision cluster workers on demand across cloud, Slurm, and
 on-prem._

@@ -1,5 +1,21 @@
 # sops/age Shared Secret Store
 
+> **NON-FUNCTIONAL as of 2026-07-25.** The scaffold exists and its unit
+> tests pass, but it has never performed a real encrypt or decrypt on
+> this host: `.sops.yaml` still carries the literal `age1xxxx...`
+> placeholder recipient, no age key has ever been generated
+> (`~/.config/sops/age/keys.txt` is absent), `/run/devai` has never been
+> mounted, and only `.example` files exist in `deploy/`.
+>
+> The test that should have caught the placeholder passes on it -- its
+> regex `age1[0-9a-zA-Z]{30,}` matches the placeholder itself.
+>
+> Two of the three consumers this plan was built to serve (cluster mode,
+> the SkyPilot fleet provisioner) are now frozen. The only live consumer
+> is the MCP gateway's optional secret-bearing servers, and those are not
+> required for the gateway to work.
+
+
 _Establish the sops + age encrypted-at-rest secret-store scaffold once,
 in one place, so MCP gateway Phase 2, gpu-arbiter cluster mode, and the
 SkyPilot fleet provisioner all reuse the same pattern instead of each

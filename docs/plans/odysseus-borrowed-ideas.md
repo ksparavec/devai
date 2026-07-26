@@ -1,5 +1,28 @@
 # Ideas borrowed from odysseus
 
+> **Triaged 2026-07-25.** This is an idea register, not a plan; treat
+> each item separately.
+>
+> - **Approved for extraction:** RT-1 (SSE keepalive during cold start --
+>   a verified router defect), CB-4 (use-case-weighted sort key, roughly
+>   20 lines on top of scoring the picker already computes), and CB-1's
+>   KV-at-ctx term for `catalog-discover`'s weight-only VRAM estimate.
+> - **REJECTED, not merely deferred:** RT-2 (MCP write tools -- turns
+>   devai into a conversational fleet manager), RT-3 (fail-closed MCP tool
+>   policy -- hardening for a threat model a single-user loopback-only
+>   deployment does not have, and it exists only as RT-2's prerequisite),
+>   CMP-1 (blind A/B duel -- a new cache schema, runner, report and picker
+>   column, requiring the operator to sit through two cold starts per duel
+>   on a GPU described as never free, for a sample size one person cannot
+>   make significant) and CMP-2 (LLM-as-judge -- depends on CMP-1 and is
+>   advisory by construction, so it can never feed a decision).
+> - Everything else stays Proposed.
+>
+> Note CB-4's gap statement below is stale: `scripts/model-picker.py`
+> already computes the weighted per-use-case composite it asks for, so
+> only the sort-key exposure remains.
+
+
 _A living register of features mined from the odysseus project (Cookbook,
 Compare, Chat+Agents) that could improve devai -- each independently tracked
 from Proposed through Implemented or Rejected._

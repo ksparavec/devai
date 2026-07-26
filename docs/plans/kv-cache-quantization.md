@@ -1,5 +1,22 @@
 # KV-cache quantization
 
+> **SUPERSEDED 2026-07-25 -- do not execute this plan as written.**
+>
+> The engine-side substance of Phases 1-3 shipped independently, under a
+> better design than this plan proposed: per-probe-cell stamped KV dtype
+> with no global policy (commits 8325255, 664bc76, 38facb5).
+>
+> **Phase 2 must NOT be executed.** Its headline -- flip the Ollama
+> default to `q8_0` globally -- is now contradicted by the project's own
+> measurement: q8_0 costs roughly 12 GPQA points on long reasoning
+> chains, which is why it shipped as a per-tier opt-in with a picker
+> warning instead. See `docs/backends.md`.
+>
+> The one part that had not shipped, backend-aware fit math (Phase 1
+> step 4), was extracted and shipped on 2026-07-25: `select-models.py`
+> now costs KV per backend rather than assuming fp16 everywhere.
+
+
 _Bring KV-cache quantization to parity across all three backends, fix the fit-math that silently assumes fp16 KV everywhere, and promote KV dtype to a first-class per-model / per-request knob -- so a 24 GiB card serves longer contexts at a measured, not assumed, quality cost._
 
 ## Status

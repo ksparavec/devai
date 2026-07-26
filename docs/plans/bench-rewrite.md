@@ -1,5 +1,19 @@
 # Bench Harness Rewrite -- Per-Context Rows
 
+> **Phase 6 STRUCK 2026-07-25 -- do not execute it.** Phases 1-5 shipped
+> and are correct. Phase 6 backfills a 32K/64K/128K/256K probe grid that
+> no longer exists: the vLLM/SGLang probers were later rewritten to
+> binary-search and keep exactly ONE winner cell per (model, backend), so
+> the picker can only ever offer that one ctx. Benching a model at 64K
+> would write a row the picker is structurally incapable of reading.
+>
+> The gap Phase 6 was reaching for is real but has a different shape: 14
+> of 27 pickable (model, backend) rows have no bench row at the ctx the
+> picker actually offers, and all 8 SGLang rows have no bench data at
+> all. That work is re-filed under the bench-sync loop in
+> `card-derived-hints-and-bench-sync.md` Phase 5.
+
+
 ## Status
 
 **In Progress.** Phases 1-5 (schema + migrator + runner flags +

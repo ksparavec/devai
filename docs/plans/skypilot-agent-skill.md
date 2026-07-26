@@ -1,5 +1,18 @@
 # SkyPilot Agent Skill in Lab
 
+> **FROZEN 2026-07-25.** Phase 2 (the Agent Skill plugin install) was
+> never done, and Phase 1 shipped documentation claiming it had been --
+> `docs/skypilot-user-guide.md`, `scripts/sky-setup.sh` and `CLAUDE.md`
+> all told the user the plugin was pre-installed. Those claims are now
+> corrected.
+>
+> What remains live and is NOT frozen: the `sky` CLI itself in the lab
+> image, and `scripts/sky-setup.sh`, which is now actually COPY'd to
+> `/usr/local/bin/sky-setup.sh` (it never was before, while the docs
+> instructed users to run it). The system-side fleet provisioner this
+> paired with is frozen -- see `attic/README.md`.
+
+
 _Pre-install the SkyPilot Agent Skill plugin and the SkyPilot CLI in the
 devai lab container so users running CLI agents (Claude Code, Codex,
 Cursor, GitHub Copilot) can launch GPU jobs through natural-language

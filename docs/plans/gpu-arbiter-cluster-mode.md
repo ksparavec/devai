@@ -1,5 +1,20 @@
 # gpu-arbiter Cluster Mode
 
+> **FROZEN 2026-07-25 -- do not execute this plan as written.**
+>
+> The implementation was moved to `attic/cluster-mode/` behind a
+> `//go:build devai_frozen_cluster` tag. Nothing was deleted, and the
+> feature is intended to return, but it never worked: head mode called
+> `log.Fatalf` on a bearer-token file compose never mounted, its control
+> plane was never published off the container network, and routing
+> ignored the probe-cache/GPU-fit lookup this plan calls its point.
+>
+> Read `attic/README.md` for the reasoning and
+> `attic/cluster-mode/RESTORE.md` for the 12 defects open at freeze time
+> BEFORE reviving any of this. Several instructions below would restore
+> broken behaviour.
+
+
 _Add `--mode={single,worker,head}` to gpu-arbiter so the same Go binary
 serves as either a single-host scheduler (today's behavior), a fleet
 worker registering with a head, or a fleet head routing requests to

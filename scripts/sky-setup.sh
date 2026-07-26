@@ -57,11 +57,12 @@ Next steps:
        sky launch --cloud runpod --gpus 3090:1 -- echo hello
        sky down --all -y
 
-  3. From a CLI agent (Claude Code, Codex, Gemini CLI), the
-     SkyPilot Agent Skill is pre-installed -- ask the agent
-     "what GPUs are available right now across my clouds?" or
-     "spin up a 3090 on the cheapest cloud, run train.py, copy
-     results back, then shut it down."
+  3. From a CLI agent (Claude Code, Codex, Gemini CLI), just ask it
+     to drive the `sky` CLI directly -- "what GPUs are available
+     right now across my clouds?" or "spin up a 3090 on the cheapest
+     cloud, run train.py, copy results back, then shut it down."
+     (There is no packaged Agent Skill plugin; `sky` on PATH is all
+     the agent needs.)
 
 Cost guidance: cloud GPU jobs can spend $1-50/hour depending on
 instance type. Use `sky cost-report` to see your total spend, and

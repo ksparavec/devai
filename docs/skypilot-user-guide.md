@@ -92,8 +92,12 @@ Total cost: ~$0.05 if you remember to tear down. Lifetime cap:
 
 ## Driving SkyPilot from an AI agent
 
-The SkyPilot Agent Skill plugin is pre-installed for supported CLI
-agents. From inside the lab:
+There is **no** SkyPilot Agent Skill plugin installed. An earlier
+version of this page said there was; nothing in the image ever
+installed one (skypilot-agent-skill Phase 2 was never done). What you
+get is the plain `sky` CLI on PATH, which the agents below drive as an
+ordinary command-line tool -- that works, it just is not a packaged
+skill. From inside the lab:
 
 - **Claude Code**: `claude` -- "Spin up a single 3090 on the
   cheapest cloud, run `train.py` from this directory, copy results

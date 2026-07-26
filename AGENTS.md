@@ -11,22 +11,30 @@ on demand when a request arrives on the backend's port. See
 `docs/backends.md` for the lifecycle, probing procedure, and failure-mode
 taxonomy before changing backend behavior.
 
-Optional opt-in surfaces (all gated behind compose profiles or the `--mode` flag,
-default behaviour unchanged):
+Single-host is the only supported topology. Multi-host cluster mode
+(`--mode=worker|head`) and the SkyPilot fleet provisioner were **frozen on
+2026-07-25** and moved to `attic/cluster-mode/` -- not deleted, and intended
+to return. `gpu-arbiter` still accepts `--mode`, but any value other than
+`single` exits with a pointer to `attic/README.md`. Read that README before
+touching anything cluster- or fleet-shaped.
 
-- **Cluster mode** (`gpu-arbiter --mode={single,worker,head}`) for multi-host
-  fleets. Single is byte-identical to today; worker registers with a head;
-  head proxies to whichever worker scores highest for the incoming
-  `(model, ctx)`. See `docs/cluster-mode.md`.
+Optional opt-in surfaces (gated behind compose profiles, default behaviour
+unchanged):
+
 - **MCP gateway** (profile=`mcp`) -- Docker MCP Gateway peer service on port
-  8088 with 10 Tier 1 + 4 Tier 2 servers. See `docs/mcp.md`.
-- **SkyPilot fleet provisioner** (profile=`cluster`) -- long-lived API server
-  on port 46580 that head mode calls for cloud-burst provisioning. See
-  `docs/skypilot.md`. The lab image also bundles the SkyPilot CLI for the
-  user-facing flow (`docs/skypilot-user-guide.md`).
-- **sops + age secret store** -- shared encrypted-at-rest scaffold consumed by
-  the three above. Operators run `make age-keygen-host` once and append their
+  8088, endpoint path `/mcp`, bearer token minted at startup. Third-party
+  servers come from Docker's official catalog; `deploy/mcp-catalog-devai.yaml`
+  adds the one server this repo authors. 15 servers enabled, 134 tools
+  verified live on 2026-07-25. See `docs/mcp.md`.
+- **sops + age secret store** -- shared encrypted-at-rest scaffold. Two of its
+  three intended consumers are now frozen, so the only remaining one is the
+  MCP gateway's `github-official` / `firecrawl` secrets, and that path is
+  unverified. Operators run `make age-keygen-host` once and append their
   public key to `.sops.yaml`. See `docs/secrets.md`.
+
+The lab image bundles the `sky` CLI and `/usr/local/bin/sky-setup.sh` for the
+user-facing cloud flow (`docs/skypilot-user-guide.md`). That is a separate
+thing from the frozen system-side provisioner and it stays.
 
 The project supports both Podman and Docker. Most workflows are intentionally
 driven through `make` targets so contributors do not need to remember container
@@ -47,6 +55,12 @@ flags, mounted paths, or runtime environment variables.
 - `packages/jupyter-ai-launchers/`: JupyterLab launcher extension.
 - `docs/`: design notes and operational documentation.
 - `ansible/`: host provisioning resources.
+- `attic/`: frozen work, kept deliberately and excluded from every build.
+  `attic/cluster-mode/` holds the cluster-mode and SkyPilot-fleet sources,
+  infra, tests and docs; its Go files carry `//go:build devai_frozen_cluster`
+  and `attic/` sits outside every Go module, so `go build ./...` cannot see
+  them. Do not add new code here, do not wire anything to it, and read
+  `attic/cluster-mode/RESTORE.md` before proposing a thaw.
 
 Do not put generated caches, local logs, model weights, or temporary test output
 into the repository. The model cache lives under `/var/cache/devai/` outside the
@@ -66,6 +80,16 @@ behavior, and request forwarding. Request path and port determine protocol and
 backend. Reasoning activation for Ollama should be handled by the router using
 protocol fields, not by prompt hacks in agents. The current reasoning semantics
 are documented in `docs/ollama_models.md`.
+
+The router also refuses model-store mutations. `/api/pull`, `/api/create`,
+`/api/push`, `/api/copy` and `/api/delete` return 403 on every backend
+listener, for every HTTP method, before the catch-all proxy sees them
+(`ollamaMutationPaths` / `makeMutationGuard` / `newBackendMux` in
+`gpu-arbiter/main.go`). Without that guard anything in the lab could pull an
+unprobed model and then serve it, bypassing the probe-cache fit gate. The
+operator pipeline does not traverse the router -- `select-models.py` uses
+`podman exec devai-ollama ollama pull` -- so `make model-pull` followed by
+`make probe` remains the sanctioned path.
 
 ## Build, Test, and Development Commands
 
@@ -123,33 +147,33 @@ Use `make help` to list supported targets. Common commands:
   Python unit + Ollama integration + matrix + vLLM/SGLang integration +
   E2E + probe smoke. Wall time 30-60+ min. Each layer skips cleanly
   when its prerequisites aren't met.
-- `make test-python`: stdlib-unittest cases (138 tests as of
-  2026-05-15) covering bench v3 schema migration + runner ctx flags
+- `make test-python`: stdlib-unittest cases (511 collected as of
+  2026-07-25) covering bench v3 schema migration + runner ctx flags
   + picker keying + report rendering, sops/age scaffold script
-  gates, MCP gateway Phase 1+2 catalog/compose/Makefile shape,
-  SkyPilot agent-skill, SkyPilot fleet Phase 1 service shape, and
-  the cluster-mode Phase 1.5 stub head's HTTP surface.
-- `make test-cluster-preflight`: runs the 7-scenario cluster-mode
-  Phase 1.5 preflight against a real arbiter binary + stub head
-  (no GPU; ~55s wall time). Gates every PR touching `gpu-arbiter/`
-  cluster files.
+  gates, MCP gateway catalog/compose/Makefile shape, SkyPilot
+  agent-skill, catalog-discover, and the model-lifecycle ledger.
 
-Cluster / MCP / SkyPilot / secrets targets (opt-in):
+MCP / secrets targets (opt-in):
 
-- `make cluster-head-up` / `make cluster-head-down` /
-  `make cluster-status`: head-mode router lifecycle.
-- `make build-worker-bootstrap`: build the minimal cloud-VM image
-  (arbiter binary + cloud-init only). Requires
-  `gpu-arbiter/gpu-arbiter` to exist; build via `make build-router`
-  first when running outside the distroless image flow.
-- `make mcp-up` / `make mcp-down` / `make mcp-test` /
+- `make mcp-up` / `make mcp-down` / `make mcp-logs` / `make mcp-test` /
   `make mcp-secrets-render`: MCP gateway (profile=`mcp`).
-- `make skypilot-up` / `make skypilot-down` /
-  `make skypilot-check` / `make skypilot-secrets-render`: SkyPilot
-  API server (profile=`cluster`).
+  `make mcp-test` does a real handshake, asserts a tool-count floor,
+  and invokes a tool; it skips (77) only when the gateway container
+  is absent. `make mcp-health` is liveness only -- do not read it as
+  a functional check.
+- `make build-mcp-modelstatus-image` / `make test-mcp-modelstatus`:
+  the one MCP server this repo authors. The gateway runs servers with
+  `--pull never`, so build the image before starting the gateway.
 - `make age-keygen-host` / `make secrets-tmpfs` /
   `make secrets-edit SOPS_FILE=...` / `make secrets-rotate`:
   shared sops/age scaffold.
+
+The cluster-mode and SkyPilot targets are gone. All 9 of them
+(`cluster-head-up`, `cluster-head-down`, `cluster-status`,
+`skypilot-up`, `skypilot-down`, `skypilot-check`,
+`skypilot-secrets-render`, `build-worker-bootstrap`,
+`test-cluster-preflight`) are preserved verbatim in
+`attic/cluster-mode/Makefile.frozen-targets`.
 
 JupyterLab extension changes must be built inside a container, not directly on
 the host. Use the documented container build flow from `CLAUDE.md` or
@@ -195,6 +219,19 @@ the imported tag. The renderer/parser pair is what makes imported
 GGUFs accept tool calls; without them Ollama returns "does not
 support tools".
 
+Its KV-cache cost model is **per backend**, not fp16 everywhere.
+`--kv-dtype` defaults to the sentinel `per-backend`, which
+`resolve_kv_dtype` maps to fp8 for vLLM/SGLang rows and fp16 for
+ollama-only rows -- the dtypes the router actually launches with. An
+explicit `--kv-dtype` still overrides. Costing every row at fp16
+double-counted the KV term for HF models and silently shrank the
+download-candidate set, so models that fit at their served dtype were
+never downloaded and therefore never probed. Measured effect of the
+fix: 1-3 more models classified as fitting per context tier.
+`scripts/model-picker.py` carries the same correction as
+`_KV_BYTES_HF = 1` (was `_KV_BYTES_FP16`), used only on its
+vLLM/SGLang formula-fallback path; Ollama rows never reach it.
+
 `scripts/model-picker.py` reads the probe cache directly. For each
 session it derives a per-session tag `<parent>-ctx<N>` (e.g.
 `qwen3.5:9b-q8_0-ctx32768`) using Ollama's `/api/create` so
@@ -218,27 +255,17 @@ Important runtime knobs:
   the named tier, ignoring existing cache cells.
 - `DEVAI_REASONING`: `auto|off|low|medium|high`.
 
-Cluster + MCP + SkyPilot env knobs (full table in `docs/cluster-env.md`):
+MCP env knobs:
 
-- `DEVAI_MODE`: `single` (default), `worker`, or `head`.
-- `DEVAI_HEAD_URL`, `DEVAI_WORKER_TOKEN_FILE`, `DEVAI_WORKER_NAME`,
-  `DEVAI_LIFECYCLE`, `DEVAI_GPU_TYPE`, `DEVAI_BACKENDS`,
-  `DEVAI_WORKER_INBOUND_PORT`: worker-side configuration.
-- `DEVAI_HEAD_LISTEN_PORT`, `DEVAI_HEAD_TOKEN_FILE`,
-  `DEVAI_IDLE_MINUTES`, `DEVAI_QUEUE_DEPTH_THRESHOLD`: head-side
-  configuration. `DEVAI_HEAD_TOKEN_FILE` (default
-  `/run/devai/cluster-token`) is the bearer token the head requires on
-  `/v1/cluster/{register,heartbeat,status}` and presents on every
-  worker-bound `/v1/cluster/inbound` call.
-- `MCP_PORT`, `MCP_SECRETS_FILE`: MCP gateway (Phase 2 mounts the
-  secrets file when set; default `/dev/null`).
-- `SKYPILOT_API_PORT`, `SKYPILOT_CREDENTIALS_FILE`,
-  `SKYPILOT_API_ENDPOINT`: SkyPilot fleet provisioner.
-  `SKYPILOT_API_ENDPOINT` is **not read by gpu-arbiter today** --
-  `skypilot_client.go` / `skypilot_policy.go` exist but
-  `NewSkyPilotClient` has no non-test caller, so setting it has no
-  effect and a head routes over the local fleet only. It stays as the
-  reserved name for that wiring (see `docs/cluster-env.md`).
+- `MCP_PORT`: gateway host port, default 8088, bound to 127.0.0.1.
+  The endpoint is `http://127.0.0.1:${MCP_PORT}/mcp` -- the `/mcp`
+  path is required and a bearer token is mandatory.
+- `MCP_SECRETS_FILE`: host path of the rendered secrets file, mounted
+  at the fixed container path `/secrets/.env`; default `/dev/null`.
+
+`DEVAI_MODE` and the whole `DEVAI_HEAD_*` / `DEVAI_WORKER_*` /
+`SKYPILOT_*` env surface went with the freeze. Their contract table is
+in `attic/cluster-mode/docs/cluster-env.md`.
 
 ## Coding Style & Naming Conventions
 

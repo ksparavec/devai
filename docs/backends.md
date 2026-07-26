@@ -378,8 +378,11 @@ fit probe already marked `fits=true`, it:
    first use into `~/.cache/devai/probe-corpus/` (override with
    `DEVAI_PROBE_CORPUS_DIR`; pre-populate on an air-gapped host) -- it is
    NOT vendored in git,
-4. sends ONE completion (max_tokens 256, small so prompt+output stays
-   under `--max-model-len`) while a 0.1s VRAM sampler runs,
+4. sends ONE completion (`max_tokens` 2048, with 2304 tokens of output
+   headroom reserved so prompt+output stays under `--max-model-len`)
+   while a 0.1s VRAM sampler runs. It was 256; the ceiling was raised
+   because a reasoning model can spend the whole answer budget on its
+   `<think>` trace and never emit the needle, scoring a false 0.0,
 5. captures the peak, scores needle retrieval, classifies OOM
    (transport error / container exit / OOM markers in logs),
 6. augments the cell with `serving_ok`, `serving_peak_gb`,
@@ -388,6 +391,52 @@ fit probe already marked `fits=true`, it:
 7. **stops ascending at the first OOM** -- a larger context cannot fit a
    transient that already overflowed -- and marks the higher tiers
    `serving_ok=false` (implied) without launching them.
+
+**What these fields are actually worth** (audited 2026-07-26 against the
+live caches -- read this before building anything on them):
+
+- `serving_ok` is the load probe's ONLY load-bearing output. It asserts
+  one thing, and only one: the engine survived its largest **single**
+  prefill without raising, exiting, or logging an OOM marker.
+
+  **It is necessary, not sufficient, and there is a live counterexample.**
+  `Ornith-1.0-9B-NVFP4` at 256K on SGLang reproduces `serving_ok=True`
+  on a forced load probe, then terminates its container 3 times during a
+  single gsm8k bench run (measured 2026-07-26, with the router's
+  spurious-recreate bug already fixed -- the teardowns are logged as
+  `container exited`, not as health-check misses). Treat `serving_ok` as
+  "the engine can load and answer once at this ctx", and treat a
+  completed bench as the only evidence it can sustain a workload there.
+- `transient_gb` does NOT isolate the per-step serving buffers, despite
+  what this document used to imply. It is `peak - baseline` from
+  `nvidia-smi --query-gpu=memory.used`, and vLLM/SGLang preallocate to
+  `--gpu-memory-utilization` / `--mem-fraction-static` at startup while
+  the torch caching allocator never returns memory -- so the instrument
+  reads the *reservation*, not the working set. Measured: 11 of 13 vLLM
+  cells report exactly 0.0, and every SGLang cell lands in 0.01-0.27.
+  Treat it as a coarse device-level reading, not a per-step figure.
+- `predicted_logits_gb` is populated on **2 of 23** cells. It is derived
+  from `--max-num-batched-tokens`, which neither prober nor the router
+  ever emits, so it resolves to None in the default configuration.
+- `needle_score` is one needle, at one depth, in one sample, and is
+  confounded: a failed serve records 0.0 as well. On this fleet 3 of its
+  4 zeros are reasoning models that hit the 2048-token output ceiling,
+  not recall failures. Nothing gates on it and nothing should until the
+  measurement is repaired. See `docs/plans/README.md`.
+
+**Why there is no concurrency burst.** The load probe deliberately sends
+one request, not a workload. `max_num_batched_tokens` defaults to 2048
+on the pinned vLLM image, capping tokens per engine step regardless of
+how many requests are in flight -- so the softcap-logits allocation this
+probe exists to catch is identical at concurrency 1 and 32. The paged KV
+pool preempts and recomputes rather than OOMing, and at the
+binary-search winning ctx the pool cannot hold two full windows anyway.
+`--enable-prefix-caching` is on in both prober and router, so N copies of
+one needle prompt would share KV blocks and measure nothing. And
+`_detect_serving_failure` turns any error body into `serving_ok=false`,
+which writes an `oom` ledger exclusion -- a queue-full 503 under a burst
+would hide a good model permanently. Concurrency evidence belongs in the
+bench harness, on models that have already passed fit+load.
 
 The new fields are additive; no schema bump. Both consumers gate on
 `serving_ok` **only when present** -- a cell the load probe never

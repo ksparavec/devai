@@ -24,12 +24,12 @@ For tasks where cloud AI is appropriate, the JupyterLab environment also include
 - **Two-step interactive picker** -- pick a model (+ backend for HF repos), then an agent. Arrow-key navigation via fzf in the shell (`make shell-gpu`); same flow from JupyterLab launcher cards. Renders per-backend discovery with FORMAT, PARSER, and reasoning-off variants. Inline-reasoning models produce two rows (default + "Reasoning off").
 - **Probe-verified model facts** -- every downloaded model is probed against the live runtime (Ollama, vLLM, or SGLang). Reasoning behavior (Structured / Inline / Unsupported / Error) plus actual VRAM use at every (VRAM band, context tier) cell, full on-GPU confirmation, and tool-parser verification are measured, not guessed. Cells are probed independently; no interpolation.
 - **Per-context bench leaderboard** -- bench cache schema v3 keys rows by `(model, backend, ctx)` so the picker shows TOOLS / TPS / CODE% / CODE+% / MMLU% / GPQA% / LEAK% values at the user's chosen ctx exactly (the saturated `REAS%` / `TOTAL%` composites were retired for those sharper discriminators). Same model benched at 32K and 128K lands in distinct rows instead of silently overwriting (under MTP a single model can differ by 17+ tok/s between ctx tiers). See `docs/bench-results.md`.
-- **Optional cluster mode** -- `gpu-arbiter --mode={single,worker,head}` extends the same Go binary to multi-host fleets. Single mode (default) is byte-identical to the pre-cluster code path. Worker mode registers with a head + sends 10s heartbeats + accepts head-forwarded requests. Head mode listens on cluster control plane port 11444 + the OpenAI-compat ports (11434/5/6) and proxies to the highest-scoring registered worker (4-tier policy: exact-match / right-model / idle / different-model). On-prem multi-host or SkyPilot cloud-burst, no Kubernetes. See `docs/cluster-mode.md`.
-- **MCP gateway** (opt-in, profile=`mcp`) -- the Docker MCP Gateway as a peer service on port 8088. 10 Tier 1 servers with no secrets (filesystem / git / sqlite / fetch / memory / time / sequentialthinking / duckduckgo / arxiv / wikipedia) + 4 Tier 2 servers backed by sops-rendered tmpfs secrets (github / firecrawl / hugging-face / context7). Single endpoint any MCP-aware agent can target. See `docs/mcp.md`.
-- **SkyPilot fleet provisioner** (opt-in, profile=`cluster`) -- long-lived SkyPilot API server peer to gpu-arbiter, callable from head mode for cloud-burst provisioning across RunPod / Lambda / AWS / GCP / Azure / k8s / Slurm. The lab image also bundles the SkyPilot CLI + Agent Skill so any agent (Claude Code, Codex, Gemini) can spin up cloud GPUs through natural-language. See `docs/skypilot.md` (system-side) and `docs/skypilot-user-guide.md` (user-facing).
-- **sops + age secret store** -- shared encrypted-at-rest scaffold for every credential the project needs (MCP secrets, cluster bearer tokens, SkyPilot creds). Per-host age key custody, tmpfs-only render targets, idempotent rotation, multi-host onboarding via `sops updatekeys`. See `docs/secrets.md`.
+- **Single-host by design** -- one workstation, one GPU, one router. Multi-host cluster mode and the SkyPilot cloud-burst fleet provisioner were built, never ran end to end, and are frozen (not deleted) under `attic/cluster-mode/`. `gpu-arbiter` still accepts `--mode`, but any value other than `single` exits with a pointer to [`attic/README.md`](attic/README.md). See "Frozen work" below.
+- **MCP gateway** (opt-in, profile=`mcp`) -- the Docker MCP Gateway as a peer service on port 8088, published on `127.0.0.1` only. 15 servers enabled: 14 resolved from Docker's official catalog, which upstream digest-pins and maintains (filesystem / git / SQLite / fetch / memory / time / sequentialthinking / duckduckgo / arxiv-mcp-server / wikipedia-mcp / github-official / firecrawl / hugging-face / context7), plus the project's own `devai-model-status`. Single endpoint any MCP-aware agent can target; the gateway is dual-homed on `devai-net` and `devai-lab-egress` so lab containers can reach it. See "MCP Gateway" below and `docs/mcp.md`.
+- **sops + age secret store** -- shared encrypted-at-rest scaffold for the credentials the project needs (today: the MCP gateway's `github-official` / `firecrawl` secrets). Per-host age key custody, tmpfs-only render targets, idempotent rotation, extra-recipient onboarding via `sops updatekeys`. See `docs/secrets.md`.
 - **MoE / dense awareness** -- Ollama probe captures `expert_count` / `expert_used_count` from `/api/show`, surfaced in the picker as `MoE 8/128` or `dense`. Same fit rules apply (full weights must be GPU-resident), but you can see at a glance which models give big-model-quality at small-model speed.
 - **Multiple AI CLIs pre-installed** -- Claude Code, OpenAI Codex, Google Gemini CLI, Aider, LATE, Open Interpreter, Ollama. All wired through the local router by default.
+- **SkyPilot CLI in the lab** -- the lab image installs the `sky` CLI (offline, from pre-fetched wheels) plus the `sky-setup.sh` first-launch helper, so a user can drive her own cloud accounts from inside the container. This is user-driven and entirely separate from the frozen system-side fleet provisioner. See `docs/skypilot-user-guide.md`.
 - **VS Code in the browser** -- code-server provides a full Visual Studio Code experience accessible from any browser.
 - **Automatic GPU-arbitrated model serving** -- Ollama for GGUF models, vLLM/SGLang for NVFP4 models. The gpu-arbiter router transparently switches backends and exposes a single endpoint per protocol (`/api/chat`, `/v1/chat/completions`, `/v1/messages`).
 - **Reasoning policy at the router** -- set `DEVAI_REASONING=auto|off|low|medium|high` to control thinking mode globally; override per-request via `X-DevAI-Reasoning` header or per-session via `<model>::<reasoning>` suffix (e.g., `qwen3.5:9b::nothink` forces thinking off even for structured-capable models). The router maps your policy to the right native protocol field (Ollama's `think:`, vLLM/SGLang's `enable_thinking`) based on each model's verified capability.
@@ -220,6 +220,7 @@ missing.
 ```
 
 **External access** (host ports): JupyterLab `:8888`, Open WebUI `:8443`
+**Loopback only** (`127.0.0.1`): APT cache `:3142`, registry mirror `:5000`, and -- when the `mcp` profile is up -- the MCP gateway `:8088`. Reaching any of those from another machine means an SSH tunnel or an authenticating proxy, not a wider bind.
 **Internal only** (devai-net): router, Ollama, vLLM, SGLang, caches.
 
 ### GPU Arbitration
@@ -231,6 +232,7 @@ The router (`devai-router`) is a small Go reverse proxy (~9 MB distroless) that:
 - Sizes vLLM/SGLang launches dynamically (`--gpu-memory-utilization`, `--mem-fraction-static`, `--max-model-len`) from per-model VRAM budgets.
 - Keeps a loaded backend warm by default (`IDLE_TIMEOUT=0`): it is unloaded when a *different* model is requested, not on a timer. Set `IDLE_TIMEOUT` to a positive number of seconds to restore time-based auto-stop.
 - Applies the **reasoning policy** to each request (see below).
+- Refuses the Ollama **write endpoints** (`/api/pull`, `/api/create`, `/api/push`, `/api/copy`, `/api/delete`) with 403 on every backend listener, so an agent in the lab or an Open WebUI user cannot pull an unprobed model and then serve it around the probe-cache fit gate. The sanctioned path is still `make model-pull`; `scripts/select-models.py` reaches Ollama via `podman exec`, never through the router, so it is unaffected.
 
 > **Status:** all three backends are wired. vLLM and SGLang start as `sleep infinity` placeholders (compose can't know which model the user will pick); the router replaces them on demand via libpod when a request arrives on port 11435 / 11436. The picker shows HF rows once they have a fitting probe entry.
 >
@@ -372,29 +374,60 @@ ollama-clean     Clean partials                                                 
 
 MAINTENANCE                                                                         TESTING
 clean            Remove all images        prune           Prune dangling images     test              Run all tests (router + python + ollama + matrix)
-                                                                                    test-router       Go unit tests for arbiter (single + cluster mode)
-                                                                                    test-python       Python stdlib unittests (bench v3, picker, sops/age, MCP, SkyPilot)
-                                                                                    test-cluster-preflight  cluster-mode Phase 1.5 (worker + stub head; no GPU)
+                                                                                    test-router       Go unit tests for arbiter (single-host)
+                                                                                    test-python       Python stdlib unittests (bench v3, picker, sops/age, MCP)
                                                                                     test-ollama       Ollama integration tests
                                                                                     test-models       Matrix: every probed digest x wire x scenario
                                                                                     test-agents       Smoke-test all agents against ollama
 ```
 
-### Cluster mode + MCP gateway + SkyPilot (opt-in)
+### MCP gateway + secrets scaffold (opt-in)
 
 ```
-CLUSTER (cluster-mode plan, all profile=cluster)        MCP GATEWAY (mcp-gateway plan, profile=mcp)
-cluster-head-up        Start router in head mode        mcp-up               Start the MCP gateway
-cluster-head-down      Stop the head router             mcp-down             Stop it
-cluster-status         GET /v1/cluster/status (head)    mcp-test             Smoke-test gateway
-build-worker-bootstrap Build cloud-VM bootstrap image   mcp-secrets-render   Render Tier 2 secrets (Phase 2)
-
-SKYPILOT FLEET PROVISIONER (skypilot plan, profile=cluster)        SECRETS SCAFFOLD (sops-age plan, shared)
-skypilot-up            Start API server (port 46580)    age-keygen-host      One-time per host: gen keypair
-skypilot-down          Stop it                          secrets-tmpfs        Mount /run/devai tmpfs
-skypilot-check         /api/v1/version + sky check      secrets-edit         Edit *.sops.env in place
-skypilot-secrets-render Render cloud creds + token      secrets-rotate       Re-key after .sops.yaml change
+MCP GATEWAY (mcp-gateway plan, profile=mcp)             SECRETS SCAFFOLD (sops-age plan, shared)
+mcp-up               Start the MCP gateway              age-keygen-host      One-time per host: gen keypair
+mcp-down             Stop it                            secrets-tmpfs        Mount /run/devai tmpfs
+mcp-logs             Tail the gateway log               secrets-edit         Edit *.sops.env in place
+mcp-test             Real MCP handshake + tools/call    secrets-rotate       Re-key after .sops.yaml change
+mcp-secrets-render   Render Tier 2 secrets to tmpfs
 ```
+
+## MCP Gateway (opt-in)
+
+`make mcp-up` starts the [Docker MCP Gateway](https://github.com/docker/mcp-gateway) (`docker/mcp-gateway:v0.43.3`) as a peer service to the router, on the `mcp` compose profile. It is one HTTP endpoint that any MCP-aware agent can target; the gateway spawns each MCP server in its own short-lived container through the host's Podman socket.
+
+Third-party servers are **not** defined in this repo. The gateway loads Docker's official catalog by default -- upstream digest-pins and maintains it -- and `deploy/mcp-catalog-devai.yaml` is merged on top via `--additional-catalog` carrying exactly one entry, the project's own `devai-model-status` server. The enabled set is the explicit `--servers=` list in `deploy/docker-compose.yaml`; those names are upstream catalog keys and are **case-sensitive** (`SQLite`, not `sqlite`).
+
+```bash
+make mcp-up          # start (compose profile 'mcp')
+make mcp-test        # real handshake: initialize -> tools/list -> tools/call
+make mcp-logs        # tail; the bearer token is printed here once at startup
+make mcp-down        # stop
+```
+
+**Reaching it.** The endpoint is `http://127.0.0.1:8088/mcp` -- the `/mcp` path is required -- over streamable HTTP, and every request needs an `Authorization: Bearer <token>` header. The gateway mints that token at startup and prints it once to its own log (`Use Bearer token: ...`), so `make mcp-logs` is how you retrieve it. Responses come back SSE-framed (`event: message` / `data: {...}`). From inside `devai-net` or `devai-lab-egress` the host is `devai-mcp-gateway` (also `mcp-gateway`) on port 8088; both names are in the `NO_PROXY` lists the Makefile and `bin/devai-agent` set.
+
+**What `make mcp-test` asserts.** `tests/test-mcp.sh` performs a real MCP handshake (`initialize` -> `notifications/initialized` -> `tools/list`), requires the tool count to clear a floor (`MCP_MIN_TOOLS`, default 40), asserts the three first-party tools by name, and then performs a real `tools/call`. It skips (exit 77) only when the gateway container is absent.
+
+**Measured on 2026-07-25:** the gateway comes up in ~13s and `tools/list` returns 134 tools; a `tools/call` of `list_fitting_models` returned 27 models.
+
+**Known limitations** -- open, not worked around:
+
+- 2 of the 15 servers fail to start: `filesystem` (`Error accessing directory : ENOENT, stat ''`) and `arxiv-mcp-server` (`invalid docker volume ':/app/papers': source and target are required`). Both want a host path supplied through gateway config that is not set yet. The 134 tools above are what the other 13 provide.
+- `get_router_status` enumerates but returns unreachable when called: the gateway spawns each server container without attaching it to `devai-net`, so the spawned container cannot resolve `devai-router`. The catalog schema has no field for a custom network (only `disableNetwork` / `extraHosts`). The other two first-party tools (`list_fitting_models`, `get_model_bench`) read caches baked into the image at build time and work. Unresolved; needs an operator decision.
+- `github-official` and `firecrawl` enumerate their tools but need secrets before any call can succeed, and that secrets path is unverified. The upstream secret names are `github.personal_access_token` and `firecrawl.api_key` -- not the `GITHUB_TOKEN`-style keys. `hugging-face` and `context7` are `type: remote` upstream and connect anonymously, so they need no secret.
+
+See [`docs/mcp.md`](docs/mcp.md) for the operator reference and client configs.
+
+## Frozen work
+
+Multi-host cluster mode (`gpu-arbiter --mode=worker|head`) and the SkyPilot cloud-burst fleet provisioner are **frozen**: moved to `attic/cluster-mode/`, not deleted, and intended to return. This is a single-workstation lab with one GPU, and the fleet was solving a problem it does not have yet.
+
+What moved: 22 Go files (11 source + 11 test, each now carrying a `//go:build devai_frozen_cluster` tag -- and `attic/` sits outside every Go module, so they are excluded twice over), `compose.head.yaml`, `Dockerfile.worker-bootstrap`, `worker-cloud-init.sh`, the SkyPilot API-server compose service and its state volume, the cluster/fleet tests and fixtures, and five docs (`cluster-mode.md`, `cluster-env.md`, `cluster-mode-preflight.md`, `worker-bootstrap.md`, `skypilot.md`). Nine Make targets went with them -- `cluster-head-up`, `cluster-head-down`, `cluster-status`, `build-worker-bootstrap`, `test-cluster-preflight`, `skypilot-up`, `skypilot-down`, `skypilot-check`, `skypilot-secrets-render` -- preserved verbatim in `attic/cluster-mode/Makefile.frozen-targets`.
+
+`gpu-arbiter` still accepts `--mode`, but any value other than `single` now exits with a pointer to the attic. Read [`attic/README.md`](attic/README.md) for why it was frozen, and `attic/cluster-mode/RESTORE.md` for the defects that were open at freeze time before attempting a thaw -- a naive thaw restores broken code.
+
+The design plans stay in `docs/plans/` with a frozen status; they are still the design record.
 
 ## GPU Support
 
@@ -558,36 +591,26 @@ deploy/
                                     probes nested by VRAM x CONTEXT)
   .bench-cache.json               -- Bench cache (schema v3, per (model, backend, ctx))
   docker-compose.yaml             -- Infrastructure services (router/ollama/vllm/sglang/
-                                    webui + opt-in mcp-gateway + skypilot-api-server)
-  compose.head.yaml               -- Cluster-head overlay (zeroes local backends,
-                                    sets DEVAI_MODE=head on router)
-  mcp-servers.yaml                -- MCP gateway catalog (10 Tier 1 + 4 Tier 2 servers)
+                                    webui + opt-in mcp-gateway)
+  mcp-catalog-devai.yaml          -- First-party MCP catalog (devai-model-status only;
+                                    every third-party server comes from Docker's
+                                    official catalog via --additional-catalog)
   mcp-secrets.sops.env.example    -- Operator template for Tier 2 secrets
-  skypilot-credentials.sops.env.example -- Operator template for cloud creds + tokens
   Dockerfile.base                 -- Base image (system packages, Python, Node)
-  Dockerfile.lab                  -- Lab image (CLI tools incl. SkyPilot, JupyterLab)
+  Dockerfile.lab                  -- Lab image (CLI tools incl. the sky CLI, JupyterLab)
   Dockerfile.router               -- Router image (distroless, 9 MB)
-  Dockerfile.worker-bootstrap     -- Cloud-VM bootstrap image for SkyPilot-launched workers
-  worker-cloud-init.sh            -- Cloud-init entrypoint baked into bootstrap image
+  Dockerfile.mcp-modelstatus      -- devai-model-status MCP server image (distroless;
+                                    bakes the catalog + probe/bench caches at build time)
   setup-secrets-tmpfs.sh          -- Idempotent /run/devai tmpfs mount
   webui-proxy/                    -- nginx TLS proxy for Open WebUI
   systemd/                        -- Auto-start service
 gpu-arbiter/
-  main.go                         -- Router source (multi-port proxy, reasoning, --mode dispatch)
+  main.go                         -- Router source (multi-port proxy, reasoning policy,
+                                    write-endpoint guard; single-host only)
+  recovery_flags.go               -- Per-model engine flags/env from recovery-flags.json
+  vllm_plugins.go                 -- vLLM parser-plugin registry (vllm-plugins.json)
+  catalog_mtp.go                  -- MTP launch-param side-table read from models.yaml
   policy_test.go                  -- Unit tests for the reasoning policy
-  cluster_proto.go                -- Cluster wire-protocol types (Register/Heartbeat/Command)
-  cluster_auth.go                 -- Bearer-token TokenStore + AuthMiddleware
-  parse_minimal.go                -- Head-side request parser (model + @ctx + ::reasoning)
-  cluster_worker.go               -- Worker-mode loop (register, heartbeat, dispatchCommand)
-  cluster_main.go                 -- runWorkerMode + runHeadMode entrypoints
-  fleet_state.go                  -- Head's in-memory worker map + heartbeat-TTL expiry
-  routing_policy.go               -- 4-tier scoring + round-robin tiebreak
-  cluster_head.go                 -- Head's control plane + frontend proxy handlers
-  cluster_proxy.go                -- Stream-preserving HTTP proxy to chosen worker
-  skypilot_client.go              -- HTTP client for SkyPilot /api/v1/{launch,status,down}
-  skypilot_policy.go              -- Cheapest-cloud picker + IdleTeardownCoordinator
-                                     (retry-forever-with-backoff, instance-keyed,
-                                      conflict-guarded)
 scripts/
   model-families.yaml             -- Hand-edited family definitions
   _contexts.py                    -- Shared (VRAM, CONTEXT) tier arrays + parsers
@@ -597,33 +620,35 @@ scripts/
   model-picker.py                 -- Two-step interactive picker (model -> agent)
   age-keygen-host.sh              -- Per-host age keypair generator (idempotent)
   render-secret.sh                -- Generic single-file decrypt to tmpfs (refuses non-tmpfs)
-  mcp-health.sh                   -- MCP gateway health probe
-  skypilot-api-health.sh          -- SkyPilot API server health probe
-  sky-setup.sh                    -- First-launch helper inside the lab
+  sky-setup.sh                    -- SkyPilot first-launch helper inside the lab
+                                    (installed to /usr/local/bin/sky-setup.sh)
   bench/_bench_core.py            -- Bench harness shared helpers (schema v3 keys + migrator)
   bench/bench_runner.py           -- Bench driver with --ctx / --all-ctx flags
   bench/bench_report.py           -- Markdown leaderboard with CTX column
 docs/
   ollama_models.md                -- Reasoning detection design doc
+  router.md                       -- Router architecture + request rewrite chain
+  backends.md                     -- Backend lifecycle, probing, cache hygiene
   secrets.md                      -- sops/age scaffold reference (canonical)
   mcp.md                          -- MCP gateway operator reference
-  cluster-mode.md                 -- Cluster-mode operator reference
-  cluster-env.md                  -- Per-env-var contract for cluster mode
-  worker-bootstrap.md             -- Cloud-VM bootstrap image reference
-  cluster-mode-preflight.md       -- Phase 1.5 preflight test report
-  skypilot.md                     -- System-side fleet provisioner reference
-  skypilot-user-guide.md          -- User-facing SkyPilot CLI guide
-  plans/                          -- 6 design plans + execution-order README
+  mcp-model-status.md             -- devai-model-status MCP server reference
+  skypilot-user-guide.md          -- User-facing SkyPilot CLI guide (lab-side `sky`)
+  plans/                          -- 14 design plans + execution-order README
+                                    (README.md holds the canonical status table)
+attic/
+  README.md                       -- Why cluster mode + SkyPilot fleet were frozen
+  cluster-mode/                   -- The frozen tree (Go behind a build tag, compose
+                                    fragment, tests, docs, Makefile.frozen-targets,
+                                    RESTORE.md)
 tests/
   agent-matrix.sh                 -- Smoke-test all agents against ollama
   test-router*.sh                 -- Router integration tests
-  test-cluster-preflight.sh       -- cluster-mode Phase 1.5 preflight (CI-runnable, no GPU)
-  test-mcp.sh                     -- MCP gateway end-to-end smoke
-  test-fleet-routing.sh           -- Fleet-routing skeleton (skips when no SkyPilot endpoint)
-  fixtures/stub-head.py           -- Stub head for cluster-mode preflight
-  python/                         -- 138 Python stdlib unittests covering bench v3,
-                                    sops/age scaffold, MCP gateway P1+P2, SkyPilot
-                                    fleet P1, agent-skill, stub head
+  test-mcp.sh                     -- MCP gateway end-to-end (real handshake, tool-count
+                                    floor, first-party tools by name, real tools/call)
+  test-mcp-modelstatus.sh         -- devai-model-status against the live gateway
+  python/                         -- 508 Python stdlib unittests covering bench v3,
+                                    picker, sops/age scaffold, MCP gateway,
+                                    catalog-discover, model lifecycle
 requirements-base.txt             -- Base Python packages (always installed)
 requirements.txt                  -- Optional project-specific packages
 packages/jupyter-ai-launchers     -- JupyterLab launcher extension
