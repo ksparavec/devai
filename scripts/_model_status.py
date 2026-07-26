@@ -13,10 +13,23 @@ model keeps its verdict, unlike the repo@sha probe-cache key. Reasons:
                           vram- and sha-independent)
   oom                  -- ran out of memory at serve time (weight-specific;
                           re-checked on a new sha)
+  retired              -- fit fine, but lost the bake-off: superseded by a
+                          better model, or dropped on context/speed grounds.
+                          Carries `superseded_by`. Vram-DEPENDENT: a bigger
+                          GPU genuinely changes the comparison, so the
+                          verdict is re-derived on a VRAM change.
   manual               -- operator-pinned
 
+`retired` exists because every other reason answers "this model cannot run
+here", and none of them could express "it ran, we just chose something
+else". That gap had a measurable cost: of 11 vLLM models probed-fitting
+whose weights were later removed, only the 5 that had been benched carried
+any ledger entry. The 6 removed before they were benched left no trace at
+all, so nothing recorded whether they were rejected or merely forgotten.
+See `record_retirement` below and select-models.py's `delete()`.
+
 Sha-stability and vram-stability follow plan decision 2: only too_big /
-too_small / unsupported_arch / manual survive a re-quant; only
+too_small / unsupported_arch / retired / manual survive a re-quant; only
 unsupported_arch / manual survive a GPU-VRAM change.
 
 See docs/plans/model-lifecycle-ledger.md (Phase 3). Read-only inspection /
@@ -35,11 +48,28 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 LEDGER_PATH = REPO_ROOT / "deploy" / ".model-status.json"
 SCHEMA_VERSION = 1
 
-VALID_REASONS = ("too_big", "too_small", "unsupported_arch", "oom", "manual")
+VALID_REASONS = ("too_big", "too_small", "unsupported_arch", "oom",
+                 "retired", "manual")
 # Reasons that do NOT depend on the exact weights (survive a re-quant).
-_SHA_STABLE_REASONS = ("too_big", "too_small", "unsupported_arch", "manual")
+# `retired` is here because a re-quant of a model already rejected on
+# context or speed grounds does not change that judgement.
+_SHA_STABLE_REASONS = ("too_big", "too_small", "unsupported_arch",
+                       "retired", "manual")
 # Reasons that do NOT depend on the GPU VRAM (survive a GPU change).
+# `retired` is deliberately NOT here: it is a judgement relative to the
+# rest of the fleet at a given VRAM budget, and most retirements on this
+# host cite a context ceiling. A bigger GPU genuinely reopens that.
 _VRAM_INDEPENDENT_REASONS = ("unsupported_arch", "manual")
+
+# Everything else is vram-dependent: the verdict is only trusted when it
+# was judged at this GPU's VRAM. DERIVED rather than hand-listed -- when
+# `retired` was added, is_excluded still carried a literal
+# ("too_big", "too_small", "oom") tuple, so retirements fell through to
+# the unknown-reason branch and silently failed open. Deriving it means a
+# new reason is vram-dependent by default, which is the safe direction.
+_VRAM_DEPENDENT_REASONS = tuple(
+    r for r in VALID_REASONS if r not in _VRAM_INDEPENDENT_REASONS
+)
 
 
 def _now() -> str:
@@ -91,14 +121,21 @@ def save_ledger(ledger: dict, path: Path = LEDGER_PATH, *,
 def record_exclusion(ledger: dict, name: str, backend: str, reason: str, *,
                      detail: str = "", repo: str | None = None,
                      host_vram: float | None = None, ctx: int | None = None,
-                     sha: str | None = None) -> None:
-    """Mark (name, backend) excluded for `reason`. Idempotent (overwrites)."""
+                     sha: str | None = None,
+                     superseded_by: str | None = None) -> None:
+    """Mark (name, backend) excluded for `reason`. Idempotent (overwrites).
+
+    `superseded_by` names the model that displaced this one. It is only
+    meaningful for `retired` and is stored as a structured field rather
+    than buried in `detail`, so "what replaced X" and "what did Y
+    displace" are both answerable without parsing free text.
+    """
     if reason not in VALID_REASONS:
         raise ValueError(f"invalid reason {reason!r}; expected {VALID_REASONS}")
     m = ledger.setdefault("models", {}).setdefault(name, {})
     if repo:
         m["repo"] = repo
-    m.setdefault("backends", {})[backend] = {
+    entry = {
         "status": "excluded",
         "reason": reason,
         "detail": detail,
@@ -110,6 +147,30 @@ def record_exclusion(ledger: dict, name: str, backend: str, reason: str, *,
         "sha_stable": reason in _SHA_STABLE_REASONS,
         "updated_at": _now(),
     }
+    if superseded_by:
+        entry["superseded_by"] = superseded_by
+    m.setdefault("backends", {})[backend] = entry
+
+
+def record_retirement(ledger: dict, name: str, backend: str, *,
+                      detail: str = "", superseded_by: str | None = None,
+                      repo: str | None = None, host_vram: float | None = None,
+                      sha: str | None = None) -> None:
+    """Record that (name, backend) ran fine but was deliberately dropped.
+
+    Called on the weight-removal path so a model cannot leave the fleet
+    without leaving a reason behind. Never overwrites a stronger verdict:
+    if the model is already excluded for a hard reason (oom,
+    unsupported_arch, too_big, too_small) that verdict is the real story
+    and retirement would obscure it.
+    """
+    existing = _backend_entry(ledger, name, backend)
+    if existing is not None and existing.get("reason") in (
+            "oom", "unsupported_arch", "too_big", "too_small"):
+        return
+    record_exclusion(ledger, name, backend, "retired", detail=detail,
+                     repo=repo, host_vram=host_vram, sha=sha,
+                     superseded_by=superseded_by)
 
 
 def _backend_entry(ledger: dict, name: str, backend: str) -> dict | None:
@@ -137,7 +198,7 @@ def is_excluded(ledger: dict, name: str, backend: str, *,
     reason = e.get("reason")
     if reason in _VRAM_INDEPENDENT_REASONS:        # unsupported_arch, manual
         return True
-    if reason not in ("too_big", "too_small", "oom"):
+    if reason not in _VRAM_DEPENDENT_REASONS:
         return False                              # unknown reason -> fail open
     # vram-dependent: trust the verdict ONLY when judged at this GPU's VRAM.
     # A missing/corrupt/different judged_vram means we cannot confirm it still
@@ -206,10 +267,36 @@ def _main(argv: list[str] | None = None) -> int:
     ap.add_argument("--clear", metavar="NAME[::BACKEND]",
                     help="Remove an exclusion (all backends if ::BACKEND "
                          "omitted), then exit.")
+    ap.add_argument("--retire", metavar="NAME::BACKEND",
+                    help="Record that a model ran fine but was dropped "
+                         "(superseded, or rejected on context/speed "
+                         "grounds), then exit. Requires --reason.")
+    ap.add_argument("--reason", default="",
+                    help="Why it was retired. Required with --retire.")
+    ap.add_argument("--superseded-by", metavar="MODEL", default=None,
+                    help="Optional: the model that displaced this one.")
     ap.add_argument("--ledger", default=str(LEDGER_PATH))
     args = ap.parse_args(argv)
     path = Path(args.ledger)
     ledger = load_ledger(path)
+    if args.retire:
+        name, sep, backend = args.retire.partition("::")
+        if not sep or not backend:
+            print("--retire needs NAME::BACKEND (the verdict is per-backend: "
+                  "a model can be retired from SGLang and kept on vLLM)",
+                  file=sys.stderr)
+            return 1
+        if not args.reason:
+            print("--retire requires --reason; recording a retirement with "
+                  "no reason recreates the gap this exists to close",
+                  file=sys.stderr)
+            return 1
+        record_retirement(ledger, name, backend, detail=args.reason,
+                          superseded_by=args.superseded_by)
+        save_ledger(ledger, path)
+        sup = f" (superseded by {args.superseded_by})" if args.superseded_by else ""
+        print(f"retired {name} [{backend}]: {args.reason}{sup}")
+        return 0
     if args.clear:
         name, _, backend = args.clear.partition("::")
         ok = clear(ledger, name, backend or None)

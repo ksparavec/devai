@@ -53,7 +53,36 @@ SGLANG_PROBE_CACHE = REPO_ROOT / "deploy" / ".sglang-reasoning-cache.json"
 VLLM_OVERHEAD_GB = 1.5       # CUDA graphs (~1) + activations (~0.5)
 OLLAMA_OVERHEAD_GB = 0.5     # small buffer for runtime state
 
-KV_BYTES = {"fp16": 2, "bf16": 2, "fp8": 1, "int8": 1}
+# Bytes per KV element, per dtype. "auto" is vLLM/SGLang's word for
+# "unquantized", i.e. the same 2 bytes as fp16/bf16; q8_0/q4_0 are
+# Ollama's (llama.cpp's) quantized KV types.
+KV_BYTES = {
+    "fp16": 2.0, "bf16": 2.0, "auto": 2.0,
+    "fp8": 1.0, "int8": 1.0, "q8_0": 1.0,
+    "q4_0": 0.5,
+}
+
+# Sentinel --kv-dtype value (the default): cost each candidate at the
+# dtype its serving backend actually uses, rather than assuming one
+# global dtype for the whole catalog.
+#
+# Why this is not fp16 any more: the router launches vLLM and SGLang with
+# --kv-cache-dtype resolved from the probe cell, and a cell with no stamp
+# decodes to fp8 -- the historical hardcode those cells were factually
+# probed under (see gpu-arbiter resolveKVCacheType and docs/backends.md).
+# On this host 20 of 21 vLLM cells and 20 of 20 SGLang cells are
+# unstamped, so nearly every HF model is *served* at 1 byte/element while
+# this planner was *costing* it at 2 -- a 2x overcount of the KV term.
+# That does not produce a wrong answer for models already probed (probe
+# data wins), but it silently shrinks the download-candidate set: at
+# ctx=128K it classified 34 models "too large" that fit at the dtype
+# they would actually be served with, so they were never downloaded and
+# therefore never probed.
+#
+# Ollama is the other way round: it defaults to fp16 KV and only uses
+# q8_0 on the specific tiers whose probe cell says so, so ollama-only
+# rows keep the 2-byte assumption.
+KV_DTYPE_PER_BACKEND = "per-backend"
 DEFAULT_CANDIDATE_CONTEXTS = "32768,65536,131072,262144"
 
 OLLAMA_MANIFESTS = Path(
@@ -130,13 +159,32 @@ def parse_size_gb(s: str) -> float:
     return float(s)
 
 
-def kv_per_token_bytes(arch: dict, kv_dtype: str) -> int:
+def kv_per_token_bytes(arch: dict, kv_dtype: str) -> float:
     copies = 1 if arch.get("k_eq_v") else 2
     return (copies
             * int(arch["layers"])
             * int(arch["kv_heads"])
             * int(arch["head_dim"])
             * KV_BYTES[kv_dtype])
+
+
+def resolve_kv_dtype(model: dict, kv_dtype: str) -> str:
+    """Resolve the KV dtype this row would actually be served with.
+
+    An explicit --kv-dtype is honoured as-is (operator override, and what
+    the probe targets use when PROBE_KV_CACHE_TYPE is set). The default
+    sentinel resolves per backend -- see KV_DTYPE_PER_BACKEND.
+    """
+    if kv_dtype != KV_DTYPE_PER_BACKEND:
+        return kv_dtype
+    return "fp16" if is_ollama_only(model) else "fp8"
+
+
+def kv_dtype_label(kv_dtype: str) -> str:
+    """Human-readable form of --kv-dtype for the summary lines."""
+    if kv_dtype == KV_DTYPE_PER_BACKEND:
+        return "per-backend (fp8 vLLM/SGLang, fp16 Ollama)"
+    return kv_dtype
 
 
 def vram_breakdown(model: dict, context: int, kv_dtype: str) -> dict:
@@ -153,19 +201,18 @@ def vram_breakdown(model: dict, context: int, kv_dtype: str) -> dict:
       Ollama:      OLLAMA_OVERHEAD_GB (smaller runtime buffer)
     """
     weight_gb = parse_size_gb(model["size"])
+    ollama_only = is_ollama_only(model)
+    effective_dtype = resolve_kv_dtype(model, kv_dtype)
+
     arch = model.get("arch")
     if not arch:
         # No arch means we can't compute KV. Be conservative: assume
         # worst-case 256 KB/token (rough upper bound for 13B-class models).
         kv_gb = (256 * 1024 * context) / (1024 ** 3)
     else:
-        kv_gb = (kv_per_token_bytes(arch, kv_dtype) * context) / (1024 ** 3)
+        kv_gb = (kv_per_token_bytes(arch, effective_dtype) * context) / (1024 ** 3)
 
-    backends = model.get("backend", [])
-    is_ollama_only = ("ollama" in backends
-                      and "vllm" not in backends
-                      and "sglang" not in backends)
-    overhead = OLLAMA_OVERHEAD_GB if is_ollama_only else VLLM_OVERHEAD_GB
+    overhead = OLLAMA_OVERHEAD_GB if ollama_only else VLLM_OVERHEAD_GB
 
     return {
         "weights_gb": round(weight_gb, 2),
@@ -173,7 +220,10 @@ def vram_breakdown(model: dict, context: int, kv_dtype: str) -> dict:
         "overhead_gb": overhead,
         "total_gb": round(weight_gb + kv_gb + overhead, 2),
         "context": context,
-        "kv_dtype": kv_dtype,
+        # The dtype actually costed, not the flag value -- with the
+        # per-backend default these differ, and callers that print this
+        # should show what was used.
+        "kv_dtype": effective_dtype,
     }
 
 
@@ -271,11 +321,50 @@ def pull_ollama(name: str) -> None:
         sys.exit(f"error: ollama pull {name} failed with rc={rc}")
 
 
+# Repo paths vLLM and SGLang never read, excluded from every HF pull.
+#
+# Both engines load safetensors from the repo ROOT. Several repos also ship
+# alternative-format copies of the same weights in subdirectories, and an
+# unfiltered `hf download` pulls all of them. Measured on this host:
+# openai/gpt-oss-20b occupies 39 GB on disk against a 12.82 GB catalog
+# figure, because `metal/` (Apple Silicon) and `original/` (the original
+# MXFP4 checkpoint) are 13 GB each and neither engine can use either. That
+# is 26 GB of dead weight per copy, and it is paid twice once a model is
+# staged for both backends.
+#
+# GGUF is excluded for the same reason from the other direction: it is
+# Ollama's format, and Ollama gets its weights through `ollama pull` /
+# `ollama create`, never through this path.
+#
+# Override with DEVAI_HF_EXCLUDE (comma-separated globs) if a repo ever
+# keeps its real weights in a subdirectory -- though a repo with no
+# root-level safetensors would not load in either engine anyway.
+_DEFAULT_HF_EXCLUDES = ("original/*", "metal/*", "*.gguf")
+
+
+def hf_exclude_patterns() -> list[str]:
+    raw = os.environ.get("DEVAI_HF_EXCLUDE")
+    if raw is None:
+        return list(_DEFAULT_HF_EXCLUDES)
+    return [p.strip() for p in raw.split(",") if p.strip()]
+
+
 def pull_hf(display_name: str, repo: str) -> None:
     target = hf_store_dir() / display_name
     target.mkdir(parents=True, exist_ok=True)
-    print(f"  hf download {repo} → {target} ...", flush=True)
-    rc = subprocess.call([HF_CLI, "download", repo, "--local-dir", str(target)])
+    cmd = [HF_CLI, "download", repo, "--local-dir", str(target)]
+    excludes = hf_exclude_patterns()
+    # One --exclude per pattern. Passing them as several values after a
+    # single flag makes the hf CLI read patterns 2..n as positional
+    # FILENAMES, which then disables the filter completely -- it warns
+    # "Ignoring `--exclude` since filenames have being explicitly set"
+    # and downloads the whole repo anyway. That warning scrolls past in a
+    # multi-GB pull, so the failure is silent in practice.
+    for pattern in excludes:
+        cmd.extend(["--exclude", pattern])
+    print(f"  hf download {repo} → {target} "
+          f"(excluding {', '.join(excludes) or 'nothing'}) ...", flush=True)
+    rc = subprocess.call(cmd)
     if rc != 0:
         sys.exit(f"error: hf download {repo} failed with rc={rc}")
 
@@ -413,7 +502,22 @@ def delete_ollama(name: str) -> None:
                  f"(is the ollama container running?)")
 
 
-def delete(model: dict) -> None:
+def delete(model: dict, *, host_vram: float | None = None,
+           reason: str = "") -> None:
+    """Remove a model's weights AND record why it left.
+
+    The ledger write is the point. Before this, weights could be removed
+    with no trace: an audit of 11 vLLM models that were probed-fitting
+    and later deleted found only the 5 that happened to have been benched
+    carried any ledger entry, because the ledger was only ever written
+    from the download/probe paths. The 6 removed before benching left
+    nothing behind, so "deliberately rejected" and "accidentally lost"
+    became indistinguishable after the fact.
+
+    record_retirement declines to overwrite a harder verdict (oom,
+    unsupported_arch, too_big, too_small), so pruning a model that failed
+    for a real reason keeps that reason.
+    """
     # gguf rows are registered as ordinary Ollama tags by `ollama create`,
     # so `ollama rm` is the correct removal path. The staged GGUF file under
     # GGUF_STAGING is deliberately left in place (see pull_gguf's docstring:
@@ -424,6 +528,20 @@ def delete(model: dict) -> None:
         delete_hf(model["name"])
     else:
         sys.exit(f"error: unknown source for {model['name']}")
+
+    try:
+        ledger = _model_status.load_ledger()
+        for backend in (model.get("backend") or []):
+            _model_status.record_retirement(
+                ledger, model["name"], backend,
+                detail=reason or "weights removed by --prune",
+                repo=model.get("repo"), host_vram=host_vram,
+                sha=model.get("sha"),
+            )
+        _model_status.save_ledger(ledger, host_vram_gb=host_vram)
+    except Exception as exc:  # never let bookkeeping abort a deletion
+        print(f"  warning: could not record retirement for "
+              f"{model['name']}: {exc}", file=sys.stderr)
 
 
 # ── Shadow / orphan detection ────────────────────────────────────────────────
@@ -662,6 +780,61 @@ def sglang_weight_gaps(
     return gaps
 
 
+def unrecorded_retirements(
+    models: list[dict], hf_caches: HFProbeCaches, ledger: dict,
+) -> list[tuple[str, str]]:
+    """(name, backend) pairs that probed as fitting, have no weights on
+    disk, and carry no ledger verdict explaining why.
+
+    This is the leak `delete()`'s ledger write cannot close on its own.
+    `delete()` only fires on the `--prune` path; weights removed by hand
+    (`rm -rf` on the store) bypass it entirely, and that is how the
+    historical gaps actually arose -- an audit found 11 vLLM models
+    probed-fitting with weights gone, and only the 5 that had been
+    benched carried any entry. Reporting the state rather than only
+    hooking the tooling path makes the gap visible however it was made.
+
+    Not an error: a model may legitimately be mid-download, or awaiting a
+    decision. It is a prompt to record one.
+    """
+    stores = {"vllm": VLLM_MODELS, "sglang": SGLANG_MODELS}
+    out: list[tuple[str, str]] = []
+    for m in models:
+        if m.get("source") != "hf":
+            continue
+        for backend, store in stores.items():
+            if backend not in (m.get("backend") or []):
+                continue
+            if not hf_caches.entry_fits(m.get("repo") or "",
+                                        m.get("sha") or "", backend):
+                continue
+            if (store / m["name"] / "config.json").is_file():
+                continue
+            if _model_status.exclusion_reason(ledger, m["name"], backend):
+                continue
+            out.append((m["name"], backend))
+    return out
+
+
+def report_unrecorded_retirements(pairs: list[tuple[str, str]]) -> None:
+    """Print the unrecorded-removal banner on stderr. Never fatal."""
+    if not pairs:
+        return
+    w = sys.stderr
+    print(file=w)
+    print(f"  note: {len(pairs)} probed-fitting model/backend pair(s) have "
+          f"no weights on disk and no ledger verdict:", file=w)
+    for name, backend in sorted(pairs):
+        print(f"    {name}  [{backend}]", file=w)
+    print("  Nothing records whether these were rejected or merely lost.",
+          file=w)
+    print("  Record a verdict with:", file=w)
+    print("    python3 scripts/_model_status.py --retire "
+          "<name>::<backend> --reason '<why>' [--superseded-by <model>]",
+          file=w)
+    print(file=w)
+
+
 def report_sglang_weight_gaps(gaps: list[str], fatal: bool,
                               requested: str | None = None) -> None:
     """Print the advertised-but-absent banner on stderr.
@@ -758,6 +931,16 @@ def enforce_sglang_store_gaps(models: list[dict], args) -> None:
     Skipped entirely when --hf-store sglang is active (that run IS the repair
     route) or when --ignore-store-gaps / $IGNORE_STORE_GAPS opts out.
     """
+    # Unrecorded removals are reported on every run, including SGLang-store
+    # runs: unlike a store gap this is never fatal and is not scoped to one
+    # backend, so the `--hf-store sglang` early return below must not hide it.
+    if not args.ignore_store_gaps:
+        try:
+            report_unrecorded_retirements(unrecorded_retirements(
+                models, load_hf_probe_caches(), _model_status.load_ledger()))
+        except Exception:
+            pass  # bookkeeping must never break a download run
+
     if args.hf_store == "sglang" or args.ignore_store_gaps:
         return
     gaps = sglang_weight_gaps(models, load_hf_probe_caches())
@@ -1496,7 +1679,7 @@ def print_cell_matrix(
         cols = "  ".join(f"{context_label(c):<{col_w}s}" for c in contexts)
         return (f"  {'FAMILY':<{name_w}s}  {'BACKEND':<{backend_w}s}  {cols}")
 
-    print(f"  ── Cell matrix: vram={vram_budget:g} GB, kv={kv_dtype}, "
+    print(f"  ── Cell matrix: vram={vram_budget:g} GB, kv={kv_dtype_label(kv_dtype)}, "
           f"contexts=[{', '.join(context_label(c) for c in contexts)}] ──")
     print()
     print(header_line())
@@ -1561,7 +1744,14 @@ def main() -> None:
                          "flag lets it proceed. Also settable as "
                          "$IGNORE_STORE_GAPS, since the make targets pass no "
                          "flag for it.")
-    ap.add_argument("--kv-dtype", choices=list(KV_BYTES), default="fp16")
+    ap.add_argument(
+        "--kv-dtype",
+        choices=[KV_DTYPE_PER_BACKEND] + list(KV_BYTES),
+        default=KV_DTYPE_PER_BACKEND,
+        help="KV-cache dtype to cost candidates at. Default resolves per "
+             "backend (fp8 for vLLM/SGLang, fp16 for Ollama-only rows), "
+             "matching what the router actually launches. Pass an explicit "
+             "dtype to plan against a uniform assumption.")
     ap.add_argument("--min-vram-fraction", type=float,
                     default=float(os.environ.get("MIN_VRAM_FRACTION", "0.5")),
                     help="Drop models whose total VRAM is less than this "
@@ -1722,7 +1912,7 @@ def main() -> None:
                 else f"contexts=[{', '.join(context_label(c) for c in contexts)}]")
     print(f"  [select] {filter_note}vram={args.vram:g} GB  "
           f"min={min_total:.1f} GB ({args.min_vram_fraction:g}×)  "
-          f"{ctx_note}  kv={args.kv_dtype}  "
+          f"{ctx_note}  kv={kv_dtype_label(args.kv_dtype)}  "
           f"max_per_cell={args.max_downloads}  "
           f"hf_store={args.hf_store} ({hf_store_dir()})"
           + ("  (dry-run)" if args.dry_run else ""))
@@ -1824,7 +2014,7 @@ def main() -> None:
 
     print(f"  {fit_count} of {len(rows)} variants fit at ctx="
           f"{context_label(display_ctx)} in [{min_total:.1f}, {args.vram:g}] GB / "
-          f"{args.kv_dtype} KV "
+          f"{kv_dtype_label(args.kv_dtype)} KV "
           f"(skipped: {too_small_count} too small, {too_large_count} too large).")
     print(f"  matrix: {len(cell_index)} cell(s)  ·  {cell_filled} filled  "
           f"·  {cell_candidate} candidate  ·  {cell_pending} pending probe  "
@@ -1892,7 +2082,8 @@ def main() -> None:
               f"(~{prunable_gb:.1f} GB) ...")
         for r in prunable:
             print(f"\n  ✗ {r.model['name']}  ({r.model['source']})")
-            delete(r.model)
+            delete(r.model, host_vram=args.vram,
+                   reason="pruned: on disk but outside the fitting set")
             r.downloaded = False
         for r in rows:
             r.active_eligible = active_eligible(r)
