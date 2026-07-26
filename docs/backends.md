@@ -217,16 +217,44 @@ make cache-up
 ### SGLang store gaps (`--hf-store`, `--ignore-store-gaps`)
 
 `devai-sglang` mounts `SGLANG_MODELS_DIR` (`/var/cache/devai/sglang`),
-a different volume from `devai-vllm`'s `VLLM_MODELS_DIR`. `make
+a different directory from `devai-vllm`'s `VLLM_MODELS_DIR`. `make
 model-pull` -- including `NAME=<row>` -- always downloads into the vLLM
-store, so weights are never implicitly visible to SGLang and copying
-them is a second full copy of the weights on a different filesystem
-(no hardlinks). The only way to populate the SGLang store is the
-explicit opt-in:
+store, so weights are never implicitly visible to SGLang. The only way
+to populate the SGLang store is the explicit opt-in:
 
 ```bash
 python3 scripts/select-models.py --name <n> --download --hf-store sglang
 ```
+
+**This does not re-download when the peer store already has the
+model.** Since the 2026-07 storage change both stores sit on the same
+filesystem (`/var/cache/devai`, `vgais-cache`), so `pull_hf` first
+tries `try_link_from_peer_store`, which **hard-links** every weight
+file from the vLLM store instead of fetching it again. Measured on
+this fleet: 57.5 GiB across the five kept models, reclaimed in seconds
+with no network traffic. Hard links, not symlinks -- each engine's
+container bind-mounts only its own store, so a symlink into the peer
+store would dangle inside the container; a hard link is simply a second
+name for the same inode, and `stat -c %h` reads 2.
+
+The link path is deliberately conservative and falls back to a normal
+download without erroring when the peer copy is absent, the two stores
+are on different devices (`st_dev` mismatch -- the pre-2026-07 layout,
+and any host that splits them again), or the link helper exits nonzero.
+A slow download beats a failed provision.
+
+`scripts/link-hf-store.py` does the same job standalone, for stores
+populated before this path existed:
+
+```bash
+python3 scripts/link-hf-store.py --from vllm --to sglang --dry-run
+python3 scripts/link-hf-store.py --from vllm --to sglang
+```
+
+It skips `original/`, `metal/`, `.cache/` and `*.gguf` (the same
+excludes `pull_hf` passes to `hf download`), stages into
+`.<name>.linking` and swaps with `os.replace`, so an interrupted run
+never leaves a half-linked model in place of a good one.
 
 An SGLang probe cell marked `fits=true` whose weights are absent from
 that store is a **store gap**: the picker advertises the row and the

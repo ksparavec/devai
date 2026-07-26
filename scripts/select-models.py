@@ -349,7 +349,82 @@ def hf_exclude_patterns() -> list[str]:
     return [p.strip() for p in raw.split(",") if p.strip()]
 
 
+def _peer_hf_store(store: str) -> tuple[str, Path] | None:
+    """(name, path) of the HF store this run is NOT writing to."""
+    others = [(n, p) for n, p in HF_STORES.items() if n != store]
+    return others[0] if len(others) == 1 else None
+
+
+def try_link_from_peer_store(display_name: str, store: str) -> bool:
+    """Hard-link an already-downloaded copy from the peer HF store.
+
+    vLLM and SGLang read separate directories but share one filesystem
+    (since the 2026-07 storage change), so staging a model for the second
+    backend costs one copy rather than two -- if it is linked instead of
+    fetched again. On this fleet that is ~57 GiB across five models, and
+    a re-download of gpt-oss-20b alone is 13 GiB over the network.
+
+    Hard links, not symlinks: each engine's container bind-mounts only
+    its OWN store, so a symlink pointing into the peer store would dangle
+    inside the container. A hard link is a second name for the same
+    inode.
+
+    Returns True when the model was linked. False means "not available
+    that way" -- the caller downloads. Deliberately conservative: a
+    cross-filesystem layout, a missing peer copy, or any link failure all
+    fall back to the network rather than erroring, because a slow
+    download beats a failed provision.
+    """
+    peer = _peer_hf_store(store)
+    if peer is None:
+        return False
+    peer_name, peer_root = peer
+    peer = peer_root / display_name
+    if not (peer / "config.json").is_file():
+        return False
+
+    dest_root = hf_store_dir()
+    dest_root.mkdir(parents=True, exist_ok=True)
+    try:
+        if peer_root.stat().st_dev != dest_root.stat().st_dev:
+            print(f"  {display_name}: peer copy exists in {peer_root} but it is "
+                  f"on a different filesystem -- downloading instead", flush=True)
+            return False
+    except OSError:
+        return False
+
+    print(f"  {display_name}: hard-linking from {peer_root} "
+          f"(no download needed) ...", flush=True)
+    # The helper resolves both stores from the environment, so hand it the
+    # paths THIS process resolved. Without that it silently operates on the
+    # default /var/cache/devai pair and still exits 0.
+    env = dict(os.environ,
+               VLLM_MODELS_DIR=str(HF_STORES["vllm"]),
+               SGLANG_MODELS_DIR=str(HF_STORES["sglang"]))
+    rc = subprocess.call([
+        sys.executable, str(Path(__file__).with_name("link-hf-store.py")),
+        "--from", peer_name, "--to", store, "--name", display_name,
+    ], env=env)
+    if rc != 0:
+        print(f"  warning: link failed (rc={rc}); falling back to download",
+              file=sys.stderr, flush=True)
+        return False
+    # rc=0 is not proof the model arrived -- the helper skips a source it
+    # does not recognise and still succeeds. Only a loadable destination
+    # may suppress the download.
+    if not (dest_root / display_name / "config.json").is_file():
+        print(f"  warning: link reported success but {display_name} is not "
+              f"present in {dest_root}; falling back to download",
+              file=sys.stderr, flush=True)
+        return False
+    return True
+
+
 def pull_hf(display_name: str, repo: str) -> None:
+    # Prefer an existing copy in the peer store. Same bytes, same sha, so
+    # probe cells stay valid -- and no second copy on disk.
+    if try_link_from_peer_store(display_name, HF_STORE):
+        return
     target = hf_store_dir() / display_name
     target.mkdir(parents=True, exist_ok=True)
     cmd = [HF_CLI, "download", repo, "--local-dir", str(target)]

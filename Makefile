@@ -1164,6 +1164,13 @@ vllm-list: ## List vLLM models with status
 	@INFERENCE_CONFIG=$(INFERENCE_CONFIG) VLLM_MODELS_DIR=$(VLLM_MODELS_DIR) \
 		python3 scripts/vllm-list.py
 
+hf-link: ## Hard-link HF weights between the vLLM and SGLang stores (FROM=vllm TO=sglang [NAME=<model>] [DRY_RUN=1])
+	@VLLM_MODELS_DIR=$(VLLM_MODELS_DIR) SGLANG_MODELS_DIR=$(SGLANG_MODELS_DIR) \
+		python3 scripts/link-hf-store.py \
+			--from $${FROM:-vllm} --to $${TO:-sglang} \
+			$(if $(NAME),--name $(NAME),) \
+			$(if $(DRY_RUN),--dry-run,)
+
 vram-fit: ## Show which models from the full catalog fit in VRAM (planning aid; use model-pull to act)
 	@GPU_MEMORY_GB=$${VRAM:-$(GPU_MEMORY_GB)} MAX_CONTEXT_LEN=$${CONTEXT:-$(MAX_CONTEXT_LEN)} \
 		python3 scripts/vram-fit.py \
