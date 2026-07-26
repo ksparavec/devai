@@ -105,7 +105,7 @@ PROXY_RUN_ENV = \
 # Egress-lock env for the interactive lab/shell targets: force ALL egress
 # through the pipelock MITM proxy; internal hosts (router, caches) bypass it.
 PIPELOCK_PROXY = http://devai-pipelock:8888
-PIPELOCK_NO_PROXY = devai-router,router,apt-cache,registry-cache,ollama,localhost,127.0.0.1,::1
+PIPELOCK_NO_PROXY = devai-router,router,apt-cache,registry-cache,ollama,devai-mcp-gateway,mcp-gateway,localhost,127.0.0.1,::1
 EGRESS_PROXY_ENV = \
 	-e HTTP_PROXY=$(PIPELOCK_PROXY) \
 	-e HTTPS_PROXY=$(PIPELOCK_PROXY) \
@@ -202,7 +202,7 @@ endif
 .PHONY: build-backup-tool build-gpu-vendor-tool build-mcp-modelstatus build-mcp-modelstatus-image build-devai-tools test-devai-tools
 .PHONY: gpu-vendor test-gpu-vendor
 .PHONY: backup-create backup-list backup-verify backup-restore test-backup-restore
-.PHONY: mcp-up mcp-down mcp-logs mcp-test mcp-health mcp-secrets-render test-mcp-modelstatus build-worker-bootstrap test-cluster-preflight cluster-head-up cluster-head-down cluster-status skypilot-up skypilot-down skypilot-check skypilot-secrets-render
+.PHONY: mcp-up mcp-down mcp-logs mcp-test mcp-health mcp-secrets-render test-mcp-modelstatus
 
 all: help
 
@@ -560,9 +560,10 @@ prune: ## Clean up dangling images only (keeps tagged images and volumes)
 	$(CONTAINER_RUNTIME) image prune -f
 
 # sops/age secret-store scaffold (per docs/plans/sops-age-secrets.md).
-# Consumer plans (mcp-gateway Phase 2, gpu-arbiter cluster mode,
-# SkyPilot fleet provisioner) wrap secrets-render with their own
-# (input, output) pair and gate cache-up on the result.
+# A consumer wraps secrets-render with its own (input, output) pair and
+# gates cache-up on the result. mcp-gateway Tier 2 is the only live
+# consumer; the cluster-mode and SkyPilot-fleet consumers were frozen on
+# 2026-07-25 (see attic/README.md).
 SOPS_FILE ?=
 
 secrets-tmpfs: ## Mount /run/devai as a 4 MiB tmpfs (one-time per boot)
@@ -651,16 +652,18 @@ backup-restore: build-backup-tool ## Restore from an archive. ARCHIVE=<path> YES
 test-backup-restore: test-devai-tools ## devai-tools Go tests + tests/test-backup-restore.sh
 	./tests/test-backup-restore.sh
 
-# MCP gateway (per docs/plans/mcp-gateway.md). Phase 1: start the
-# gateway with the 10 Tier 1 servers via the 'mcp' compose profile.
-# Phase 2 will append a `mcp-secrets-render` prerequisite that depends
-# on the shared sops-age secrets-tmpfs/render targets.
-mcp-up: ## Start the MCP gateway (10 Tier 1 servers, no secrets)
-	$(COMPOSE) -f $(CACHE_COMPOSE) --profile mcp up -d devai-mcp-gateway
+# MCP gateway (see docs/mcp.md, the source of truth). Third-party
+# servers resolve from Docker's official catalog; deploy/mcp-catalog-devai.yaml
+# adds only the first-party devai-model-status. Opt-in via the 'mcp'
+# compose profile -- cache-up does NOT start it. Two of the 15 enabled
+# servers (filesystem, arxiv-mcp-server) currently fail to start pending
+# config; the other 13 served 134 tools when last verified.
+mcp-up: ## Start the MCP gateway (15 servers; secrets optional)
+	$(COMPOSE) -f $(CACHE_COMPOSE) --profile mcp up -d mcp-gateway
 
 mcp-down: ## Stop the MCP gateway
-	$(COMPOSE) -f $(CACHE_COMPOSE) stop devai-mcp-gateway || true
-	$(COMPOSE) -f $(CACHE_COMPOSE) rm -f devai-mcp-gateway || true
+	$(COMPOSE) -f $(CACHE_COMPOSE) stop mcp-gateway || true
+	$(COMPOSE) -f $(CACHE_COMPOSE) rm -f mcp-gateway || true
 
 mcp-logs: ## Tail the MCP gateway log
 	$(CONTAINER_RUNTIME) logs -f devai-mcp-gateway
@@ -714,118 +717,6 @@ pipelock-ca-init: ## One-time: generate the pipelock MITM CA. Cert -> deploy/ (c
 	echo "CA cert -> deploy/pipelock-ca.crt        (local build input; gitignored)"; \
 	echo "CA key  -> $(PIPELOCK_CA_KEY)  (0600, host-only, never committed)"; \
 	echo "Next: make build-gpu && make cache-up"
-
-# Worker-bootstrap image (per docs/plans/gpu-arbiter-cluster-mode.md
-# decision 11). Minimal image SkyPilot launches on cloud workers --
-# arbiter binary + backend images + cloud-init entrypoint, no
-# user-facing surfaces.
-WORKER_BOOTSTRAP_IMAGE = devai-worker-bootstrap
-
-test-cluster-preflight: ## Phase 1.5 preflight (worker + stub head end-to-end; no GPU required)
-	@# Builds the arbiter binary if missing, then drives 7 scripted
-	@# scenarios per docs/plans/gpu-arbiter-cluster-mode.md Phase 1.5.
-	@# Wall time ~1 minute.
-	bash tests/test-cluster-preflight.sh
-
-cluster-head-up: ## Start the head-mode router (cluster-mode Phase 2)
-	$(COMPOSE) -f $(CACHE_COMPOSE) -f $(CURDIR)/deploy/compose.head.yaml up -d router
-
-cluster-head-down: ## Stop the head-mode router
-	$(COMPOSE) -f $(CACHE_COMPOSE) -f $(CURDIR)/deploy/compose.head.yaml stop router
-
-# Bearer token for the head's cluster control plane. /v1/cluster/status is
-# authenticated like /v1/cluster/{register,heartbeat} (it enumerates every
-# worker's endpoint, GPU type and loaded model), so cluster-status must
-# present the token. Path mirrors the arbiter's own default -- see
-# gpu-arbiter/cluster_head.go's DEVAI_HEAD_TOKEN_FILE lookup. ?= so an
-# .env value, an exported shell var, or `make DEVAI_HEAD_TOKEN_FILE=... `
-# all win.
-DEVAI_HEAD_TOKEN_FILE ?= /run/devai/cluster-token
-
-# Base URL of the head's cluster control plane. NOTE: this default is very
-# likely NOT reachable as-is -- neither the `router` service in
-# deploy/docker-compose.yaml nor the deploy/compose.head.yaml overlay
-# declares a `ports:` block, so :11444 is bound only inside the devai-net
-# container network (`podman compose -f deploy/docker-compose.yaml -f
-# deploy/compose.head.yaml config` renders the router with `ports: null`).
-# Override this to whatever your deployment actually exposes -- a published
-# port, an ssh -L tunnel, or a head reachable by hostname.
-DEVAI_HEAD_STATUS_URL ?= http://localhost:11444
-
-cluster-status: ## Pretty-print the head's /v1/cluster/status JSON
-	@# The bearer is handed to curl over a PIPE (`-H @-`, curl >= 7.55), never
-	@# as a command-line argument: argv is world-readable via
-	@# /proc/<pid>/cmdline, so `-H "Authorization: Bearer $$tok"` would
-	@# disclose the token to every local user for the request's lifetime.
-	@# Piping keeps it in curl's memory only. No temp file, nothing to clean up.
-	@tok_file="$(DEVAI_HEAD_TOKEN_FILE)"; \
-	 if [ ! -r "$$tok_file" ]; then \
-	    echo "ERROR: cluster token not readable at $$tok_file" >&2; \
-	    echo "       /v1/cluster/status is bearer-authenticated. Render the token first:" >&2; \
-	    echo "         make secrets-tmpfs" >&2; \
-	    echo "         make secrets-render SOPS_FILE=deploy/cluster-token.sops.env DEST=$$tok_file" >&2; \
-	    echo "       ... or point DEVAI_HEAD_TOKEN_FILE at an existing token file." >&2; \
-	    exit 1; \
-	 fi; \
-	 tok=$$(tr -d '[:space:]' < "$$tok_file"); \
-	 if [ -z "$$tok" ]; then \
-	    echo "ERROR: cluster token file $$tok_file is empty -- refusing to send an empty bearer." >&2; \
-	    exit 1; \
-	 fi; \
-	 body=$$(printf 'Authorization: Bearer %s\n' "$$tok" \
-	         | curl -fsS -H @- "$(DEVAI_HEAD_STATUS_URL)/v1/cluster/status") || { \
-	    echo "ERROR: GET $(DEVAI_HEAD_STATUS_URL)/v1/cluster/status failed." >&2; \
-	    echo "       Most likely cause: the head's control plane is not published to" >&2; \
-	    echo "       the host. The 'router' service declares no 'ports:' block in" >&2; \
-	    echo "       deploy/docker-compose.yaml, and deploy/compose.head.yaml adds none," >&2; \
-	    echo "       so :11444 is reachable only from inside the devai-net network." >&2; \
-	    echo "       Fix by publishing 11444 on the router service, or set" >&2; \
-	    echo "         DEVAI_HEAD_STATUS_URL=<base-url-your-head-actually-exposes>" >&2; \
-	    echo "       Otherwise confirm 'make cluster-head-up' is running and that" >&2; \
-	    echo "       $$tok_file holds the token the head currently loads." >&2; \
-	    exit 1; \
-	 }; \
-	 printf '%s\n' "$$body" | python3 -m json.tool
-
-# SkyPilot fleet-provisioner Phase 1 (per
-# docs/plans/skypilot-fleet-provisioner.md). Long-lived API server
-# the head calls to provision cluster workers. Profile=cluster, opt-in.
-skypilot-up: ## Start the SkyPilot API server (cluster profile)
-	$(COMPOSE) -f $(CACHE_COMPOSE) --profile cluster up -d devai-skypilot-api-server
-
-skypilot-down: ## Stop the SkyPilot API server
-	$(COMPOSE) -f $(CACHE_COMPOSE) stop devai-skypilot-api-server || true
-	$(COMPOSE) -f $(CACHE_COMPOSE) rm -f devai-skypilot-api-server || true
-
-skypilot-check: ## Health-check the running SkyPilot API server
-	bash scripts/skypilot-api-health.sh
-
-skypilot-secrets-render: secrets-tmpfs ## Render deploy/skypilot-credentials.sops.env to tmpfs
-	@if [ ! -f deploy/skypilot-credentials.sops.env ]; then \
-		echo "ERROR: deploy/skypilot-credentials.sops.env not present." >&2; \
-		echo "       See deploy/skypilot-credentials.sops.env.example for the" >&2; \
-		echo "       expected variable names. Encrypt your file with sops," >&2; \
-		echo "       then re-run this target." >&2; \
-		exit 1; \
-	fi
-	bash scripts/render-secret.sh \
-	     deploy/skypilot-credentials.sops.env \
-	     /run/devai/skypilot-credentials.env
-
-build-worker-bootstrap: ## Build the minimal cluster-worker bootstrap image (cluster-mode Phase 1)
-	@# Requires gpu-arbiter binary at gpu-arbiter/gpu-arbiter; build
-	@# with `make build-router` first when running outside the
-	@# project's distroless build flow.
-	@if [ ! -x gpu-arbiter/gpu-arbiter ]; then \
-		echo "ERROR: gpu-arbiter/gpu-arbiter not found or not executable." >&2; \
-		echo "       Run 'make build-router' first (or copy the binary built" >&2; \
-		echo "       by the distroless image into gpu-arbiter/gpu-arbiter)." >&2; \
-		exit 1; \
-	fi
-	$(CONTAINER_RUNTIME) build --network=host \
-		$(PROXY_BUILD_ARGS) \
-		-f deploy/Dockerfile.worker-bootstrap \
-		-t $(WORKER_BOOTSTRAP_IMAGE) .
 
 test-router: ## Run Go unit tests for gpu-arbiter router
 	cd gpu-arbiter && go test -race -v -count=1 ./...
@@ -1697,10 +1588,20 @@ uninstall-systemd: ## Stop, disable and remove the systemd infrastructure unit
 
 # Cache mounts mirror what the router uses so the runner reads the same
 # probe data the live stack does.
+# The two HF weight stores are mounted READ-ONLY so the runner can skip
+# models the probe cache advertises but whose weights are not on disk.
+# Without them the runner is blind to the store and burns a full task
+# sweep per absent model against a router that cannot launch it -- seen
+# 2026-07-25, when `make bench-sglang` began benching six models with no
+# weights and produced tps=0.0 / ttft=None before it was killed. Same
+# `wildcard` guard the lab-image mounts use, so a host without one of the
+# volumes still runs.
 BENCH_CACHE_MOUNTS = \
 	-v $(CURDIR)/scripts:/scripts:ro \
 	-v $(CURDIR)/deploy:/deploy \
-	-v $(CACHE_DIR)/bench:$(CACHE_DIR)/bench
+	-v $(CACHE_DIR)/bench:$(CACHE_DIR)/bench \
+	$(if $(wildcard $(VLLM_MODELS_DIR)),-v $(VLLM_MODELS_DIR):$(VLLM_MODELS_DIR):ro) \
+	$(if $(wildcard $(SGLANG_MODELS_DIR)),-v $(SGLANG_MODELS_DIR):$(SGLANG_MODELS_DIR):ro)
 
 # n-knobs surface to the runner as both env (for inspect_ai's task
 # constructors that read defaults) and CLI flags (the runner reads them

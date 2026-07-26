@@ -186,8 +186,21 @@ class TestDiscoverModels(unittest.TestCase):
             bench_runner, "load_cache", _patched_load_cache
         )
         self.lc.start()
+        # These tests are about ctx SELECTION, not weight presence, and
+        # their fixture models are invented -- so they must not be graded
+        # against the real weight stores. Pointing the stores at a path
+        # that does not exist makes weights_present fail open, which is
+        # the documented behaviour when a store is not mounted.
+        # See tests/python/test_bench_store_gap.py for the check itself.
+        self.stores = mock.patch.dict(
+            bench_runner.HF_WEIGHT_STORE_BY_BACKEND,
+            {"vllm": Path("/nonexistent/vllm-store"),
+             "sglang": Path("/nonexistent/sglang-store")},
+        )
+        self.stores.start()
 
     def tearDown(self) -> None:
+        self.stores.stop()
         self.lc.stop()
 
     def test_default_picks_largest_fitting_per_model(self) -> None:

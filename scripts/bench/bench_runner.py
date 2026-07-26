@@ -61,6 +61,38 @@ PROBE_CACHE_BY_BACKEND = {
     "vllm": REPO_ROOT / "deploy" / ".vllm-reasoning-cache.json",
     "sglang": REPO_ROOT / "deploy" / ".sglang-reasoning-cache.json",
 }
+
+# Weight stores for the HF backends, checked before a model is benched.
+# Ollama is absent on purpose: its weights live in a blob store keyed by
+# digest, not a directory named after the model, so there is no
+# equivalent path to stat.
+#
+# The probe cache advertising a model is NOT evidence the weights are
+# present. The two SGLang/vLLM stores are separate volumes, and
+# `make model-pull` only ever writes the vLLM one, so an SGLang-probed
+# model routinely has a fits=true cell and no weights at all. Benching
+# such a model cannot work: the router has nothing to launch, and the
+# whole task sweep records tps=0.0 / ttft=None. Observed 2026-07-25 --
+# `make bench-sglang` started working through six absent models before it
+# was stopped by hand. select-models.py has carried this same check as
+# `sglang_weight_gaps` all along; the bench runner simply never used it.
+HF_WEIGHT_STORE_BY_BACKEND = {
+    "vllm": Path(os.environ.get("VLLM_MODELS_DIR", "/var/cache/devai/vllm")),
+    "sglang": Path(os.environ.get("SGLANG_MODELS_DIR", "/var/cache/devai/sglang")),
+}
+
+
+def weights_present(backend: str, alias: str) -> bool:
+    """True when `alias` has loadable weights in `backend`'s store.
+
+    Fails OPEN for Ollama (no directory to check) and when the store
+    itself is not visible -- the mount is `wildcard`-guarded in the
+    Makefile, and a missing mount must not silently skip every model.
+    """
+    store = HF_WEIGHT_STORE_BY_BACKEND.get(backend)
+    if store is None or not store.is_dir():
+        return True
+    return (store / alias / "config.json").is_file()
 DEFAULT_HOST_VRAM_GB = int(os.environ.get("GPU_MEMORY_GB", "24"))
 DEFAULT_INSPECT_LOG_DIR = Path(
     os.environ.get("BENCH_INSPECT_LOG_DIR", "/var/cache/devai/bench/inspect-logs")
@@ -273,6 +305,16 @@ def discover_models(
         alias = serving_alias(entry)
         if not alias:
             continue
+        if not weights_present(backend, alias):
+            print(
+                f"  note: {alias}: skipping -- probe cache says it fits on "
+                f"{backend} but no weights under "
+                f"{HF_WEIGHT_STORE_BY_BACKEND[backend]}/{alias}. "
+                f"Download with: python3 scripts/select-models.py --name "
+                f"{alias} --download --hf-store {backend}",
+                file=sys.stderr,
+            )
+            continue
         for ctx in chosen:
             cache_key = cache_key_for_entry(entry, backend, ctx) or key
             out.append(
@@ -328,6 +370,79 @@ def parse_ctx_list(raw: str) -> list[int]:
 
 # --- inspect_ai task dispatch ---
 
+# Sampling for the scored inspect_ai tasks (gsm8k, humaneval,
+# humaneval_plus, mmlu_pro, gpqa, tools).
+#
+# These used to pass NO sampling parameters at all, which meant every
+# scored task ran at whatever the serving backend happened to default to
+# -- and vLLM, SGLang and Ollama do not default the same. Two models
+# benched on different backends were therefore not being compared under
+# the same conditions, which is the one thing a leaderboard has to get
+# right.
+#
+# Zero is not a new policy here: the two sidecar tasks that talk HTTP
+# directly already pin it (bench_longctx.py, bench_latency_leak.py), and
+# docs/sampling-strategies.md prescribes greedy decoding for
+# deterministic eval. This makes the inspect_ai path consistent with the
+# rest of the harness rather than introducing a rule.
+#
+# Override with BENCH_TEMPERATURE / BENCH_TOP_P when deliberately
+# measuring a model at its card-recommended sampling (some reasoning
+# models recommend temperature > 0 and can degrade into repetition at
+# greedy). Doing so makes those rows non-comparable with the rest of the
+# table, so record why.
+#
+# NOTE: rows benched BEFORE this change carry unknown sampling. They are
+# not comparable with rows benched after it; re-bench to compare.
+BENCH_TEMPERATURE = float(os.environ.get("BENCH_TEMPERATURE", "0"))
+BENCH_TOP_P = float(os.environ.get("BENCH_TOP_P", "1.0"))
+
+
+BENCH_SAMPLING_PATH = REPO_ROOT / "deploy" / "bench-sampling.json"
+
+
+def load_sampling_overrides(path: Path | None = None) -> dict:
+    """Per-model sampling overrides. Missing/malformed file -> {}."""
+    p = path or BENCH_SAMPLING_PATH
+    try:
+        with open(p) as f:
+            return (json.load(f) or {}).get("models") or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def sampling_for(alias: str, overrides: dict | None = None) -> tuple[float, float]:
+    """(temperature, top_p) for `alias`.
+
+    Greedy by default. A handful of models cannot be benched greedily --
+    NVIDIA-Nemotron-Nano-9B-v2 loops on its own <think> trace at
+    temperature 0 and never emits an answer, which scores ~0 on every
+    task and reads as a capability failure rather than the sampling
+    artifact it is. deploy/bench-sampling.json carries those exceptions.
+    """
+    ov = load_sampling_overrides() if overrides is None else overrides
+    for name, cfg in ov.items():
+        if name in alias:
+            return (
+                float(cfg.get("temperature", BENCH_TEMPERATURE)),
+                float(cfg.get("top_p", BENCH_TOP_P)),
+            )
+    return BENCH_TEMPERATURE, BENCH_TOP_P
+
+
+def _sampling_config(alias: str = ""):
+    """GenerateConfig pinning sampling for the scored tasks.
+
+    Imported lazily, like inspect_eval itself, so the module stays
+    importable without inspect_ai installed (the unit tests rely on
+    that).
+    """
+    from inspect_ai.model import GenerateConfig
+
+    temperature, top_p = sampling_for(alias)
+    return GenerateConfig(temperature=temperature, top_p=top_p)
+
+
 def _invoke_inspect_task(
     *,
     task_obj,
@@ -364,6 +479,11 @@ def _invoke_inspect_task(
         # start vLLM can need 90+ seconds on first request and the
         # sample-level timeout fires AFTER the model is loaded.
         time_limit=int(timeout_s),
+        # Explicit sampling. Without this the backend's own default
+        # applies and differs per engine -- see BENCH_TEMPERATURE above.
+        # Keyed on the served model so deploy/bench-sampling.json can
+        # exempt the models that cannot be benched greedily.
+        config=_sampling_config(served_model),
     )
     if fail_on_error is not None:
         eval_kwargs["fail_on_error"] = fail_on_error
