@@ -49,7 +49,25 @@ LEDGER_PATH = REPO_ROOT / "deploy" / ".model-status.json"
 SCHEMA_VERSION = 1
 
 VALID_REASONS = ("too_big", "too_small", "unsupported_arch", "oom",
-                 "retired", "manual")
+                 "retired", "manual", "bench_dropped", "bench_failed")
+# Bench verdicts. These say how a model PERFORMED, not whether it loads,
+# so they must never gate download or probe: a model dropped for leaking
+# its system prompt is still perfectly downloadable and probeable, and
+# re-probing it is exactly what an operator does after a re-quant.
+#
+# They are therefore queried through is_bench_excluded(), NEVER through
+# is_excluded(). Keeping them out of both reason tuples below makes
+# is_excluded() fall through to its unknown-reason branch and fail open,
+# which is the required behaviour.
+#
+# This has to be explicit. docs/plans/card-derived-hints-and-bench-sync.md
+# reasoned that leaving is_excluded()'s allowlist untouched would make the
+# new reasons fail open "by construction" -- true when that allowlist was
+# a hand-written literal, but it is now DERIVED from VALID_REASONS (the
+# fix for `retired` silently failing open). Under the derived form, simply
+# adding a reason opts it INTO gating. The subtraction below is what
+# actually delivers the intended behaviour.
+_BENCH_REASONS = ("bench_dropped", "bench_failed")
 # Reasons that do NOT depend on the exact weights (survive a re-quant).
 # `retired` is here because a re-quant of a model already rejected on
 # context or speed grounds does not change that judgement.
@@ -68,8 +86,16 @@ _VRAM_INDEPENDENT_REASONS = ("unsupported_arch", "manual")
 # the unknown-reason branch and silently failed open. Deriving it means a
 # new reason is vram-dependent by default, which is the safe direction.
 _VRAM_DEPENDENT_REASONS = tuple(
-    r for r in VALID_REASONS if r not in _VRAM_INDEPENDENT_REASONS
+    r for r in VALID_REASONS
+    if r not in _VRAM_INDEPENDENT_REASONS and r not in _BENCH_REASONS
 )
+
+# How many recorded failures before a `bench_failed` verdict is believed.
+# One failure is usually a transient -- a cold-start timeout, a router
+# recreate landing mid-request. Excluding on the first would quietly
+# shrink the leaderboard on infrastructure noise, which is the failure
+# mode this whole ledger exists to make visible rather than silent.
+BENCH_FAILED_ATTEMPTS_BEFORE_EXCLUDE = 2
 
 
 def _now() -> str:
@@ -171,6 +197,108 @@ def record_retirement(ledger: dict, name: str, backend: str, *,
     record_exclusion(ledger, name, backend, "retired", detail=detail,
                      repo=repo, host_vram=host_vram, sha=sha,
                      superseded_by=superseded_by)
+
+
+def record_bench_verdict(ledger: dict, name: str, backend: str, reason: str, *,
+                         detail: str = "", ctx: int | None = None,
+                         repo: str | None = None,
+                         sha: str | None = None) -> dict:
+    """Record a bench-time verdict for (name, backend).
+
+    Separate from record_exclusion because the two answer different
+    questions and must not be confused at the call site: this one says
+    "benched badly", not "will not load".
+
+    `bench_failed` accumulates an attempt counter rather than excluding
+    outright -- see BENCH_FAILED_ATTEMPTS_BEFORE_EXCLUDE. `bench_dropped`
+    is a quality judgement and applies immediately.
+
+    Returns the stored entry so a caller can report the attempt count.
+    """
+    if reason not in _BENCH_REASONS:
+        raise ValueError(
+            f"invalid bench reason {reason!r}; expected {_BENCH_REASONS}")
+
+    prev = _backend_entry(ledger, name, backend)
+    attempts = 1
+    if prev is not None and prev.get("reason") == reason:
+        try:
+            attempts = int(prev.get("attempts", 1)) + 1
+        except (TypeError, ValueError):
+            attempts = 1
+
+    m = ledger.setdefault("models", {}).setdefault(name, {})
+    if repo:
+        m["repo"] = repo
+    entry = {
+        "status": "excluded",
+        "reason": reason,
+        "detail": detail,
+        "judged_at": {
+            # Deliberately no host_vram_gb: a bench verdict is about model
+            # quality, which a different GPU does not change. Recording one
+            # would invite a reader to re-derive it on a GPU swap.
+            "host_vram_gb": None,
+            "ctx": int(ctx) if ctx is not None else None,
+        },
+        "last_sha": sha,
+        "sha_stable": False,   # a re-quant genuinely re-opens the question
+        "attempts": attempts,
+        "updated_at": _now(),
+    }
+    m.setdefault("backends", {})[backend] = entry
+    return entry
+
+
+def is_bench_excluded(ledger: dict, name: str, backend: str, *,
+                      ctx: int | None = None, sha: str | None = None) -> bool:
+    """True iff a BENCH verdict currently disqualifies (name, backend).
+
+    Deliberately a separate query from is_excluded(): bench verdicts must
+    not stop a model being downloaded or probed.
+
+    Stability rules:
+      - VRAM-independent. A leak or a failing score is a property of the
+        model, not of the card it ran on.
+      - sha-dependent. A re-quant is a different artefact and re-opens the
+        question.
+      - ctx-scoped, judged-ctx-and-above. Long-context behaviour is where
+        these failures concentrate (a model that leaks at 128K may be
+        clean at 32K), so a verdict at 131072 says nothing about 32768.
+        A verdict with no recorded ctx applies everywhere -- it is the
+        only safe reading of "we do not know where this was judged".
+      - `bench_failed` needs repetition. A single failure is usually
+        infrastructure noise.
+
+    Fails OPEN on any malformed row, like is_excluded().
+    """
+    e = _backend_entry(ledger, name, backend)
+    if e is None:
+        return False
+    reason = e.get("reason")
+    if reason not in _BENCH_REASONS:
+        return False
+
+    last = e.get("last_sha")
+    if sha and last and sha != last:
+        return False                       # re-quant -> re-check
+
+    if reason == "bench_failed":
+        try:
+            attempts = int(e.get("attempts", 1))
+        except (TypeError, ValueError):
+            attempts = 1
+        if attempts < BENCH_FAILED_ATTEMPTS_BEFORE_EXCLUDE:
+            return False
+
+    ja = e.get("judged_at")
+    judged_ctx = ja.get("ctx") if isinstance(ja, dict) else None
+    if judged_ctx is None or ctx is None:
+        return True                        # unscoped verdict applies everywhere
+    try:
+        return int(ctx) >= int(judged_ctx)
+    except (TypeError, ValueError):
+        return True
 
 
 def _backend_entry(ledger: dict, name: str, backend: str) -> dict | None:

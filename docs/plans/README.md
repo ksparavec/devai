@@ -105,7 +105,7 @@ found three more findings.
 | [review-fixes-2026-07](./review-fixes-2026-07.md)                   | Done (unverified) |
 | [bench-rewrite](./bench-rewrite.md)                                 | In Progress       |
 | [kv-cache-quantization](./kv-cache-quantization.md)                 | Superseded        |
-| [card-derived-hints-and-bench-sync](./card-derived-hints-and-bench-sync.md) | Draft     |
+| [card-derived-hints-and-bench-sync](./card-derived-hints-and-bench-sync.md) | In Progress (Phase 5 shipped) |
 | [router-shortcircuit](./router-shortcircuit.md)                     | Draft             |
 | [odysseus-borrowed-ideas](./odysseus-borrowed-ideas.md)             | Draft (partly frozen) |
 | [pi-coding-agent](./pi-coding-agent.md)                             | Draft             |
@@ -398,13 +398,16 @@ path:
   head landing.
 - pi-coding-agent (Draft) -- lab-image + picker change, no deps and no
   dependents; same shape as skypilot-agent-skill. Ships at any point.
-- card-derived-hints-and-bench-sync (Draft) -- host-side probe/bench tooling
-  only; touches no router, no picker, no container topology. Its two
+- card-derived-hints-and-bench-sync (In Progress) -- host-side probe/bench
+  tooling only; touches no router, no picker, no container topology. Its two
   prerequisites (bench-rewrite's v3 schema, model-lifecycle-ledger's
-  exclusion ledger) are already landed, so nothing gates it. Phases 1-4
+  exclusion ledger) are already landed, so nothing gated it. Phases 1-4
   (card-derived hints) and Phase 5 (bench-sync loop) are separable tracks;
   Phase 3 is the only internal gate, held behind Phase 1's out-of-sample
-  validation result.
+  validation result. **Phase 5 shipped 2026-07-26** -- `scripts/bench-sync.py`,
+  `make bench-plan` / `make bench-sync`, bench verdicts in the exclusion
+  ledger, backend-image digest stamped on every bench row. Phases 1-4 remain
+  Draft.
 - kv-cache-quantization (Draft) -- single-mode router + tooling feature,
   no hard deps and no dependents; ships at any point. Phase 1 (SGLang fp8
   parity + fit-math correctness) is behavior-preserving and standalone;

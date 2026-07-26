@@ -693,6 +693,81 @@ Ollama models are identified by their manifest digest. Pulling a new
 quantization or alias changes the digest; the prober keys on digest
 directly, so re-running `make probe` populates new entries.
 
+### The bench closed loop (`make bench-plan`, `make bench-sync`)
+
+Keeping the leaderboard current used to be a state transition done by
+hand and by memory: work out which probed models have no bench row, which
+rows predate the current driver, which predate the current engine image,
+then sequence the steps without leaving the stack down.
+`scripts/bench-sync.py` makes that diff explicit.
+
+`make bench-plan` is **read-only** -- it starts no container and writes
+no file. It classifies every bench target into exactly one bucket:
+
+| Class | Meaning |
+| ----- | ------- |
+| `new` | a fitting probe cell with no bench row at all |
+| `incomplete` | a row exists but is missing tasks from the requested set |
+| `stale_env` | row's `host_env_id` differs from `_meta.current_host_env_id` (driver/kernel/GPU moved) |
+| `stale_image` | row's `backend_image_digest` differs from the probe cache's `_meta.current_image_digest` |
+| `dropped` | the row carries a `drop_recommendation` from an early-drop bench |
+| `excluded` | the exclusion ledger carries a bench verdict for it |
+| `current` | complete and not stale |
+
+`make bench-sync` runs the plan, benching the `new` / `incomplete` /
+`stale_*` rows grouped by backend (one `make bench-<backend>` each, so a
+mixed queue does not thrash the GPU with a model switch per row), then
+re-renders the leaderboard. It is a **long-running, GPU-exclusive** job
+and says so on start: it cannot overlap an interactive session.
+
+Knobs: `DRY_RUN=1` (plan only), `BENCH_MAX_TARGETS=<n>` (cap this run;
+whatever the cap leaves undone is reported explicitly rather than
+silently truncated), `BACKEND=`, and the existing `BENCH_REPO` /
+`BENCH_CTX` / `BENCH_TASKS` filters. `BENCH_TASKS` also defines what
+"complete" means, so a deliberately narrow sweep is not reported as
+permanently incomplete.
+
+**Resumability is inherited, not invented.** `update_row` is a pure
+merge and the runner skips tasks already present unless `--force`, so
+re-running after an interrupt continues where it stopped. bench-sync
+keeps no state of its own.
+
+**Two things it deliberately does NOT do.**
+
+It does not re-derive the target set. `bench_runner.discover_models()`
+already diffs the probe cache, honours `serving_ok is not False`, and
+checks that the weights are on disk; a second implementation would drift
+from it, and a target set that disagrees with the runner's is worse than
+none. (The first version of the task-name comparison *did* reimplement
+one small piece of the runner -- the cache-key-to-task-name mapping --
+and promptly reported `tools` missing on 9 of 10 rows that had benched
+it, which would have re-run the whole leaderboard to reproduce data it
+already had. It now calls the runner's `_strip_subset` directly.)
+
+It does not edit the exclusion ledger by default. A drop flag "never
+deletes weights or edits the exclusion ledger -- that stays an explicit
+operator action"; `--record-drops` (`RECORD_DROPS=1`) is that explicit
+action. Without it, drops are reported and nothing is written.
+
+**Bench verdicts are a separate ledger query.** `bench_dropped` and
+`bench_failed` are recorded with `record_bench_verdict()` and read with
+`is_bench_excluded()` -- never with `is_excluded()`. A model dropped for
+leaking its system prompt is still perfectly downloadable and probeable,
+and re-probing it is exactly what an operator does after a re-quant, so
+these verdicts must not gate download or probe. They are
+VRAM-independent (a leak is a property of the model, not the card),
+sha-dependent (a re-quant re-opens the question), and scoped to the
+judged ctx **and above** (a model that leaks at 128K may be clean at
+32K). `bench_failed` needs two recorded attempts before it is believed,
+because a single failure is usually a cold-start timeout rather than a
+real verdict.
+
+An unstamped row is classified `current`, never `stale`. Rows written
+before `backend_image_digest` existed carry no evidence either way;
+calling them stale would force hours of needless GPU time and calling
+them fresh would hide a real drift, so the reason string says which
+stamp is missing.
+
 ## Failure-mode taxonomy
 
 When a probe records `fits: false`, `evidence.kind` tells you why:

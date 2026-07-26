@@ -304,6 +304,7 @@ def update_row(
     task_results: dict[str, dict] | None = None,
     metrics: dict | None = None,
     host_env_id: str | None = None,
+    backend_image_digest: str | None = None,
     drop_recommendation: dict | None = None,
 ) -> dict:
     """Merge a single bench result into the cache.
@@ -367,6 +368,18 @@ def update_row(
         row["metrics"].update(metrics)
     if host_env_id is not None:
         row["host_env_id"] = host_env_id
+    # The backend image these numbers were produced under. Sourced from the
+    # probe cache's `_meta.current_image_digest` (see probe_image_digest),
+    # not inspected live: `make bench` runs inside a container with no
+    # access to the host's container runtime. That is the right source
+    # anyway -- if the engine image moved, the fit data the bench targets
+    # were selected from is equally suspect.
+    #
+    # Rows written before this field existed simply lack it, and
+    # bench-sync classifies those as `unknown` rather than stale. Guessing
+    # would either force a needless full re-bench or hide a real drift.
+    if backend_image_digest:
+        row["backend_image_digest"] = backend_image_digest
     # Early-drop recommendation (leak / low-score disqualifier). A flag only --
     # readers/operators act on it; it never deletes weights. Written only when
     # a run actually triggers it (non-None); the immutable cache never wipes a

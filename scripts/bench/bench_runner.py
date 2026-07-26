@@ -62,6 +62,34 @@ PROBE_CACHE_BY_BACKEND = {
     "sglang": REPO_ROOT / "deploy" / ".sglang-reasoning-cache.json",
 }
 
+def probe_image_digest(backend: str) -> str | None:
+    """The backend engine image digest the probe cache was measured under.
+
+    Read from the probe cache's `_meta.current_image_digest`, which the
+    prober stamps (see `_probe_core.stamp_image_digest`). `make bench`
+    runs inside a container with no access to the host container runtime,
+    so inspecting the image live is not an option -- and the probe cache
+    is the better source regardless: if the engine image moved, the fit
+    data that selected these bench targets is equally stale.
+
+    Returns None for Ollama (its cache carries no image block) and on any
+    read error. Callers stamp nothing in that case, and bench-sync
+    classifies an unstamped row `unknown` rather than guessing.
+    """
+    path = PROBE_CACHE_BY_BACKEND.get(backend)
+    if path is None:
+        return None
+    try:
+        cache = load_cache(path)
+    except Exception:
+        return None
+    meta = cache.get("_meta")
+    if not isinstance(meta, dict):
+        return None
+    digest = meta.get("current_image_digest")
+    return digest if isinstance(digest, str) and digest else None
+
+
 # Weight stores for the HF backends, checked before a model is benched.
 # Ollama is absent on purpose: its weights live in a blob store keyed by
 # digest, not a directory named after the model, so there is no
@@ -609,6 +637,7 @@ def run_for_target(
     cache_path: Path,
     force: bool,
     host_env_id: str | None = None,
+    backend_image_digest: str | None = None,
     drop_threshold: float = 0.70,
     early_drop: bool = True,
 ) -> None:
@@ -676,6 +705,7 @@ def run_for_target(
                 _latency_metrics_into_row(
                     cache, key, latency, target, backend, router_url,
                     host_env_id=host_env_id,
+                    backend_image_digest=backend_image_digest,
                 )
                 _print_latency_summary(latency)
             except Exception as e:  # noqa: BLE001
@@ -909,6 +939,7 @@ def run_for_target(
         task_results=task_results,
         metrics=metrics,
         host_env_id=host_env_id,
+        backend_image_digest=backend_image_digest,
         drop_recommendation=drop_flag,
     )
     save_cache(cache_path, cache)
@@ -918,6 +949,7 @@ def _latency_metrics_into_row(
     cache: dict, key: str, latency: dict,
     target: dict, backend: str, router_url: str,
     host_env_id: str | None = None,
+    backend_image_digest: str | None = None,
 ) -> None:
     """Latency metrics belong on row.metrics, not row.tasks. Pulled
     out so the leak-task branch can write both shapes from one
@@ -935,6 +967,7 @@ def _latency_metrics_into_row(
             "n_latency_samples": latency.get("n_samples"),
         },
         host_env_id=host_env_id,
+        backend_image_digest=backend_image_digest,
     )
 
 
@@ -1123,6 +1156,15 @@ def main() -> None:
         f"gpu={env.get('gpu_name')!r}",
         file=sys.stderr,
     )
+    image_digest = probe_image_digest(args.backend)
+    if image_digest:
+        print(f"bench: backend_image_digest={image_digest}", file=sys.stderr)
+    else:
+        print(
+            f"bench: no image digest available for {args.backend}; rows will be "
+            f"unstamped and bench-sync will classify them 'unknown', not stale",
+            file=sys.stderr,
+        )
     for tgt in targets:
         run_for_target(
             tgt,
@@ -1144,6 +1186,7 @@ def main() -> None:
             cache_path=args.cache,
             force=args.force,
             host_env_id=env_id,
+            backend_image_digest=image_digest,
         )
 
     print(f"\nbench: wrote {args.cache}", file=sys.stderr)

@@ -1725,6 +1725,29 @@ bench-ollama: ## Bench every loaded Ollama model via devai-router:11434
 		/scripts/bench/bench_runner.py --backend ollama \
 			$(BENCH_RUN_FLAGS)
 
+bench-plan: ## Read-only: classify every bench target as new/incomplete/stale/dropped/excluded/current. Touches nothing.
+	@GPU_MEMORY_GB=$(GPU_MEMORY_GB) \
+	  VLLM_MODELS_DIR=$(VLLM_MODELS_DIR) SGLANG_MODELS_DIR=$(SGLANG_MODELS_DIR) \
+	  python3 scripts/bench-sync.py --dry-run \
+	    $(if $(BACKEND),--backend $(BACKEND),) \
+	    $(if $(BENCH_REPO),--repo '$(BENCH_REPO)',) \
+	    $(if $(BENCH_CTX),--ctx $(BENCH_CTX),) \
+	    $(if $(BENCH_TASKS),--tasks $(BENCH_TASKS),) \
+	    $(if $(BENCH_MAX_TARGETS),--max-targets $(BENCH_MAX_TARGETS),)
+
+bench-sync: ## Closed loop: bench-plan, then bench the new/incomplete/stale rows and re-render the leaderboard. LONG + GPU-exclusive. DRY_RUN=1, BENCH_MAX_TARGETS=<n>, RECORD_DROPS=1.
+	@echo "bench-sync: long-running GPU-exclusive job -- do not start an interactive session against the stack while it runs."
+	@GPU_MEMORY_GB=$(GPU_MEMORY_GB) \
+	  VLLM_MODELS_DIR=$(VLLM_MODELS_DIR) SGLANG_MODELS_DIR=$(SGLANG_MODELS_DIR) \
+	  python3 scripts/bench-sync.py \
+	    $(if $(DRY_RUN),--dry-run,) \
+	    $(if $(BACKEND),--backend $(BACKEND),) \
+	    $(if $(BENCH_REPO),--repo '$(BENCH_REPO)',) \
+	    $(if $(BENCH_CTX),--ctx $(BENCH_CTX),) \
+	    $(if $(BENCH_TASKS),--tasks $(BENCH_TASKS),) \
+	    $(if $(BENCH_MAX_TARGETS),--max-targets $(BENCH_MAX_TARGETS),) \
+	    $(if $(RECORD_DROPS),--record-drops,)
+
 bench-report: ## Print a Markdown leaderboard from .bench-cache.json
 	@$(CONTAINER_RUNTIME) run --rm \
 		-v $(CURDIR)/scripts:/scripts:ro \

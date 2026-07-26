@@ -356,6 +356,19 @@ docs/bench-results.md               modify   -- record the policy decision
 
 ## Phase 5 -- bench-sync closed loop
 
+**Status: Shipped 2026-07-26.** `scripts/bench-sync.py` + `make bench-plan`
+/ `make bench-sync`, 29 tests in `tests/python/test_bench_sync.py`,
+documented in docs/backends.md "The bench closed loop".
+
+One correction to the design below. Step 2 reasoned that leaving
+`is_excluded()`'s reason allowlist untouched would make the new bench
+reasons fail open "by construction". That was true of the hand-written
+literal the plan was drafted against, but the allowlist is now DERIVED
+from `VALID_REASONS` (the fix for `retired` silently failing open), so
+merely adding a reason opts it INTO gating -- the exact opposite. The
+implementation subtracts `_BENCH_REASONS` from the derived tuple
+explicitly, and a test pins it.
+
 ### Goal
 
 `make bench-sync` populates and refreshes the leaderboard as one bounded,
