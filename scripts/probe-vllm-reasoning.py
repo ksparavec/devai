@@ -96,6 +96,11 @@ def vllm_command_args(
     # was measured with. Empty string = no flag = engine default.
     if dtype:
         args.extend(["--kv-cache-dtype", dtype])
+    # Before the parser / recovery flags, so a per-model --max-num-seqs
+    # from deploy/recovery-flags.json still wins last -- same ordering the
+    # router uses in vllmEntrypoint.
+    if MAX_NUM_SEQS > 0:
+        args.extend(["--max-num-seqs", str(MAX_NUM_SEQS)])
     if reasoning_parser_plugin:
         args.extend(["--reasoning-parser-plugin", reasoning_parser_plugin])
     if reasoning_parser:
@@ -114,6 +119,21 @@ def vllm_command_args(
 # PROBE_KV_CACHE_TYPE=auto pass measures unquantized KV for models with
 # VRAM slack.
 KV_CACHE_DTYPE = os.environ.get("PROBE_KV_CACHE_TYPE") or "fp8"
+
+# Concurrent-sequence cap this pass launches with, mirroring the router's
+# MAX_CONCURRENT_REQUESTS (default 32, gpu-arbiter/main.go).
+#
+# The prober used to omit this flag entirely while the router always
+# passes it, despite this module's docstring claiming it mirrors
+# vllmEntrypoint. That divergence is not cosmetic: vLLM sizes its
+# CUDA-graph capture set and its memory-profiling dummy forward off
+# max_num_seqs, so probe-time and serve-time VRAM reservations differed
+# and the measured fit did not describe the configuration that actually
+# serves.
+#
+# 0 omits the flag (engine default), matching the router's
+# `if lc.MaxNumSeqs > 0` guard.
+MAX_NUM_SEQS = int(os.environ.get("PROBE_MAX_NUM_SEQS") or "32")
 
 SPEC = BackendSpec(
     name="vllm",

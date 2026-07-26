@@ -1627,6 +1627,19 @@ def refresh_top_level_from_cells(entry: dict) -> None:
     Non-terminal `error` (kind=oom/infra/clamped_ctx) at one tier does
     NOT downgrade a successful classification at a higher tier — a 16G
     spill doesn't invalidate a 24G fit.
+
+    ...but stickiness yields to a CLEAN CELL. A tier-independent load
+    failure and a probe that loaded and produced structured output cannot
+    both be true of the same (repo, sha, backend): if the engine answered,
+    it supports the arch. Without this escape, a stale terminal verdict
+    outlived the evidence that disproved it and `--force` could not clear
+    it -- observed 2026-07-25 on ykarout/Qwen3.5-9B-NVFP4 under SGLang,
+    which re-probed clean at 256K (structured, rp=qwen3, tp=qwen) while
+    the top-level row stayed `error`/kind=quant with both parsers None
+    from a July run. The router injects `--reasoning-parser` /
+    `--tool-call-parser` from those top-level fields, so the model would
+    have been served with no parsers at all -- silently losing tool
+    calling and reasoning on a model that probes perfectly.
     """
     cur_cap = entry.get("capability") or Capability.UNKNOWN
     cur_kind = ((entry.get("evidence") or {}).get("kind") or "")
@@ -1638,10 +1651,10 @@ def refresh_top_level_from_cells(entry: dict) -> None:
         cur_cap == Capability.UNSUPPORTED_ARCH
         or (cur_cap == Capability.ERROR and cur_kind in ("arch", "quant"))
     )
-    if cur_is_terminal:
-        return
 
     smallest = smallest_clean_probe(entry)
+    if cur_is_terminal and smallest is None:
+        return
     if smallest is not None:
         entry["capability"] = smallest.get("capability") or Capability.UNKNOWN
         ev = smallest.get("evidence") or {}

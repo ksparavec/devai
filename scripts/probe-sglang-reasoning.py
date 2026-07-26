@@ -114,12 +114,26 @@ def sglang_command_args(
     # Empty = no flag = engine default (unchanged).
     if dtype:
         args.extend(["--kv-cache-dtype", dtype])
+    # SGLang's analogue of vLLM's --max-num-seqs. Emitted for the same
+    # reason: the router always passes it, the prober used to omit it, so
+    # probe-time and serve-time reservations diverged. Before the parser
+    # flags, matching gpu-arbiter sglangEntrypoint's ordering.
+    if MAX_RUNNING_REQUESTS > 0:
+        args.extend(["--max-running-requests", str(MAX_RUNNING_REQUESTS)])
     if reasoning_parser:
         args.extend(["--reasoning-parser", reasoning_parser])
     if tool_parser:
         args.extend(["--tool-call-parser", tool_parser])
     return args
 
+
+# Concurrent-request cap this pass launches with, mirroring the router's
+# MAX_CONCURRENT_REQUESTS (default 32). SGLang sizes its CUDA-graph
+# capture set off this, so a probe that omits it does not measure the
+# configuration that actually serves. 0 omits the flag (engine default),
+# matching the router's own guard. Shares PROBE_MAX_NUM_SEQS with the
+# vLLM prober so one knob moves both backends together.
+MAX_RUNNING_REQUESTS = int(os.environ.get("PROBE_MAX_NUM_SEQS") or "32")
 
 # KV dtype this probe pass enforces; empty = SGLang engine default
 # (auto/unquantized), matching every pre-field cache cell.

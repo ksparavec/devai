@@ -691,25 +691,63 @@ def load_probe_one_cell(
 
         content = ""
         reasoning_text = ""
+        finish_reason = None
         input_tokens = output_tokens = 0
         if isinstance(chat_resp, dict):
             try:
-                msg = ((chat_resp.get("choices") or [{}])[0].get("message") or {})
+                choice = (chat_resp.get("choices") or [{}])[0]
+                msg = choice.get("message") or {}
                 content = msg.get("content") or ""
                 # Reasoning models (R1-Distill, Qwen3 thinking) may emit the
                 # answer in reasoning_content, or burn the output budget on
                 # the <think> trace before reaching content. Score both so a
                 # genuine recall in the reasoning isn't logged as needle=0.
                 reasoning_text = msg.get("reasoning_content") or ""
+                # finish_reason == "length" means the model was cut off at the
+                # output ceiling, so a missing needle says nothing about
+                # recall. Recorded so needle_valid can reject that case --
+                # see below.
+                finish_reason = choice.get("finish_reason")
             except (AttributeError, IndexError, TypeError):
                 content = ""
             usage = chat_resp.get("usage") or {}
             input_tokens = int(usage.get("prompt_tokens") or 0)
             output_tokens = int(usage.get("completion_tokens") or 0)
 
-        needle = 0.0 if failed else max(
+        # None, not 0.0, when the serve failed. A failed request produced no
+        # answer to score, so scoring it 0.0 fabricates a recall verdict that
+        # is indistinguishable from a real one -- and every serving_ok=false
+        # cell used to carry exactly that. `None` means "not measured".
+        needle = None if failed else max(
             score_needle(content), score_needle(reasoning_text))
         transient = round(max(0.0, peak_gb - baseline_gb), 2) if peak_gb else 0.0
+
+        fill_ratio = (round(input_tokens / requested_ctx, 3)
+                      if input_tokens else None)
+
+        # Whether needle_score is worth believing. Two measured artefacts make
+        # a 0.0 meaningless, and on this fleet they account for every zero on
+        # disk:
+        #   - finish_reason == "length": a reasoning model spent the whole
+        #     output budget on its <think> trace and never reached the answer.
+        #     3 of 4 zeros observed 2026-07-26 terminated at exactly the 2048
+        #     ceiling; none of the 19 ones came within 4x of it.
+        #   - a low fill ratio: SGLang has no /tokenize, so the prompt is
+        #     built from a chars-per-token calibration and can land at ~0.75.
+        #     A needle at depth 0.5 of a 0.75-filled window sits around 37% of
+        #     the ADVERTISED context -- it never tested the long window.
+        # Consumers must ignore needle_score entirely when this is false.
+        needle_valid = (
+            not failed
+            and finish_reason != "length"
+            and fill_ratio is not None
+            and fill_ratio >= 0.9
+        )
+
+        # Last 200 chars of whatever the model actually said, so a 0.0 can be
+        # judged by reading the cache instead of burning a GPU re-probe.
+        excerpt_src = (content or reasoning_text or "")
+        needle_excerpt = excerpt_src[-200:] if excerpt_src else None
 
         rec: dict = {
             "serving_ok": not failed,
@@ -717,14 +755,19 @@ def load_probe_one_cell(
             "serving_baseline_gb": baseline_gb,
             "transient_gb": transient,
             "needle_score": needle,
+            # Gate for needle_score -- see the derivation above. False means
+            # the recall number is an artefact and must be ignored, NOT that
+            # recall failed.
+            "needle_valid": needle_valid,
+            "needle_excerpt": needle_excerpt,
+            "serving_finish_reason": finish_reason,
             "serving_input_tokens": input_tokens,
             "serving_output_tokens": output_tokens,
             # How full the KV pool actually got: input_tokens / ctx, from the
             # engine's own usage count. ~0.99 means the window was genuinely
             # exercised; a low value (char-estimate fallback) means the OOM
             # ceiling at full fill was NOT tested -- surfaced for auditing.
-            "serving_fill_ratio": (round(input_tokens / requested_ctx, 3)
-                                   if input_tokens else None),
+            "serving_fill_ratio": fill_ratio,
             "serving_fill_method": fill_method,
             "predicted_logits_gb": pred_logits,
             "serving_chat_timeout_s": round(chat_timeout, 1),
