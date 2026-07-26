@@ -243,10 +243,45 @@ class TestVramEstimation(unittest.TestCase):
         self.assertAlmostEqual(ceiling, 24.0, places=2)        # capped at GPU
 
     def test_band_family_relative_ceiling_below_gpu(self) -> None:
+        """Ceiling is the family max at the SAME context the candidates are
+        costed at. 35B NVFP4 = 19.25 GB of weights, +4.0 GB KV at the 32K
+        default = 23.25. Costing the ceiling weights-only while candidates
+        carry KV would make every candidate read as oversized."""
         lin = cd.Lineage(key="qwen|", brand="qwen", suffix="")
-        lin.tracked_repos = {"nvidia/qwen3.5-35b-a3b-nvfp4"}  # ~19.25 GB
+        lin.tracked_repos = {"nvidia/qwen3.5-35b-a3b-nvfp4"}
         floor, ceiling = lin.vram_band_gb(24.0, 1.0, 0.5)      # tolerance 1.0
+        self.assertAlmostEqual(ceiling, 23.25, places=2)
+
+    def test_band_ceiling_weights_only_at_zero_ctx(self) -> None:
+        """ctx=0 reproduces the pre-KV behaviour exactly."""
+        lin = cd.Lineage(key="qwen|", brand="qwen", suffix="")
+        lin.tracked_repos = {"nvidia/qwen3.5-35b-a3b-nvfp4"}
+        _, ceiling = lin.vram_band_gb(24.0, 1.0, 0.5, 0)
         self.assertAlmostEqual(ceiling, 19.25, places=2)
+
+    def test_kv_term_grows_with_context(self) -> None:
+        w = 10.0
+        self.assertEqual(cd.estimate_kv_gb(w, 0), 0.0)
+        k32 = cd.estimate_kv_gb(w, 32768)
+        k128 = cd.estimate_kv_gb(w, 131072)
+        self.assertGreater(k32, 0.0)
+        self.assertAlmostEqual(k128, k32 * 4, places=3)
+
+    def test_kv_term_grows_with_model_size(self) -> None:
+        """Bigger models have more layers/KV heads, so more KV per token."""
+        small = cd.estimate_kv_gb(5.0, 32768)
+        large = cd.estimate_kv_gb(25.0, 32768)
+        self.assertGreater(large, small)
+
+    def test_estimate_includes_kv_when_context_given(self) -> None:
+        weights = cd.estimate_vram_gb(9.0, "NVFP4", 0)
+        withkv = cd.estimate_vram_gb(9.0, "NVFP4", 32768)
+        self.assertGreater(withkv, weights)
+        self.assertAlmostEqual(
+            withkv, weights + cd.estimate_kv_gb(weights, 32768), places=3)
+
+    def test_unparseable_params_stay_none_with_context(self) -> None:
+        self.assertIsNone(cd.estimate_vram_gb(None, "NVFP4", 32768))
 
     def test_small_family_ceiling_falls_back_to_gpu(self) -> None:
         # Family max ~4.4 GB -> family ceiling 5.5 < floor 12 -> empty band;

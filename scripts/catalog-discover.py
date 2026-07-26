@@ -113,6 +113,34 @@ _BYTES_PER_PARAM = {
 # worst (2 bytes) so an unquantized giant is not waved through.
 _DEFAULT_BYTES_PER_PARAM = 2.0
 
+# Context the band filter costs KV cache at. The estimate used to be
+# weights-ONLY, which meant a model whose weights just fit the card was
+# surfaced as a candidate even when it could not hold a usable context on
+# top of them -- and context is the binding constraint for most of this
+# fleet, not weight size (several models are excluded from serving for a
+# 32K ceiling, not for being too big).
+#
+# 32K is deliberate: it is the SMALLEST standard tier here, so the filter
+# only rejects a model that cannot fit even a minimum useful context. A
+# larger default would hide models that are perfectly good at 32-64K.
+DEFAULT_DISCOVER_CTX = 32768
+
+# Approximate KV bytes per token, keyed by weight size. Discovery has no
+# config.json -- layers / kv_heads / head_dim are unknown at this stage --
+# so this mirrors the same coarse weight-size lookup the router falls back
+# to in fittableContext, at the 1 byte/element the engines actually serve
+# (vLLM and SGLang launch with fp8 KV; see the router's resolveKVCacheType
+# and scripts/select-models.py's per-backend dtype).
+#
+# Coarse on purpose. It is a pre-filter to stop discovery advertising the
+# hopeless, not a fit guarantee -- `make probe` remains the source of truth.
+_KV_KB_PER_TOKEN_BY_WEIGHT_GB = (
+    (6.0, 50.0),     # small models, fewer layers
+    (12.0, 80.0),    # 9B class
+    (20.0, 128.0),   # 14-27B class
+    (float("inf"), 200.0),  # 35B+
+)
+
 # Quant / format markers we surface in the report so a candidate's
 # serving backend is obvious at a glance (NVFP4 -> vllm, gguf -> ollama).
 _FORMAT_MARKERS = (
@@ -280,12 +308,37 @@ def bytes_per_param(fmt: str) -> float:
     return _BYTES_PER_PARAM.get(fmt.upper(), _DEFAULT_BYTES_PER_PARAM)
 
 
-def estimate_vram_gb(params_b: float | None, fmt: str) -> float | None:
-    """Approximate weight VRAM in GB (params x bytes-per-param), or None
-    when the parameter count cannot be parsed from the name."""
+def estimate_kv_gb(weight_gb: float, context: int) -> float:
+    """Approximate KV-cache GB for `context` tokens at this weight size.
+
+    See _KV_KB_PER_TOKEN_BY_WEIGHT_GB for why this is keyed on weight size
+    rather than on the architecture: discovery has not fetched config.json
+    and does not know layers / kv_heads / head_dim.
+    """
+    if context <= 0 or weight_gb <= 0:
+        return 0.0
+    kb_per_token = _KV_KB_PER_TOKEN_BY_WEIGHT_GB[-1][1]
+    for limit, kb in _KV_KB_PER_TOKEN_BY_WEIGHT_GB:
+        if weight_gb <= limit:
+            kb_per_token = kb
+            break
+    return (kb_per_token * context) / (1024.0 * 1024.0)
+
+
+def estimate_vram_gb(params_b: float | None, fmt: str,
+                     context: int = 0) -> float | None:
+    """Approximate serving VRAM in GB, or None when the parameter count
+    cannot be parsed from the name.
+
+    Weights (params x bytes-per-param) plus, when `context` is non-zero,
+    the KV cache that context needs. Callers that genuinely want the bare
+    weight figure -- the on-disk size comparison, for instance -- leave
+    `context` at 0 and get the old behaviour.
+    """
     if params_b is None:
         return None
-    return params_b * bytes_per_param(fmt)
+    weight_gb = params_b * bytes_per_param(fmt)
+    return weight_gb + estimate_kv_gb(weight_gb, context)
 
 
 def candidate_next_versions(
@@ -394,20 +447,30 @@ class Lineage:
         """
         return [t for t in re.split(r"[^a-z0-9]+", self.suffix.lower()) if t.isalpha()]
 
-    def tracked_vram_estimates(self) -> list[float]:
-        """Estimated weight VRAM (GB) of each tracked repo whose size is
-        parseable from its name -- the family's known-fitting envelope."""
+    def tracked_vram_estimates(
+        self, context: int = DEFAULT_DISCOVER_CTX,
+    ) -> list[float]:
+        """Estimated serving VRAM (GB) of each tracked repo whose size is
+        parseable from its name -- the family's known-fitting envelope.
+
+        Costed at the same `context` as the candidates it is compared
+        against. Both sides must include the KV term or neither: the
+        ceiling is derived from these numbers, so adding KV to candidates
+        alone would make every candidate look oversized against a
+        weights-only envelope."""
         out: list[float] = []
         for repo in self.tracked_repos:
             base = repo_basename(repo)
-            est = estimate_vram_gb(parse_param_count(base), detect_format(base, []))
+            est = estimate_vram_gb(parse_param_count(base),
+                                   detect_format(base, []), context)
             if est is not None:
                 out.append(est)
         return out
 
     def vram_band_gb(self, gpu_budget: float, tolerance: float,
-                     min_frac: float) -> tuple[float, float]:
-        """The (floor, ceiling) weight-VRAM band a candidate must land in.
+                     min_frac: float,
+                     context: int = DEFAULT_DISCOVER_CTX) -> tuple[float, float]:
+        """The (floor, ceiling) serving-VRAM band a candidate must land in.
 
         floor   = min_frac x GPU budget -- below this the model wastes the
                   card (a 1B model on 24 GB).
@@ -418,7 +481,7 @@ class Lineage:
                   -- the floor still keeps tiny models out.
         """
         floor = min_frac * gpu_budget
-        ests = self.tracked_vram_estimates()
+        ests = self.tracked_vram_estimates(context)
         if ests:
             family_ceiling = max(ests) * tolerance
             ceiling = (gpu_budget if family_ceiling < floor
@@ -734,7 +797,8 @@ def lineage_name_re(lin: Lineage) -> re.Pattern[str]:
 
 def discover_hf(lin: Lineage, *, hf_limit: int, timeout: int,
                 gpu_budget: float, vram_tolerance: float,
-                min_vram_frac: float) -> list[HFCandidate]:
+                min_vram_frac: float,
+                context: int = DEFAULT_DISCOVER_CTX) -> list[HFCandidate]:
     authors = effective_authors(lin)
     if not authors:
         return []
@@ -742,7 +806,8 @@ def discover_hf(lin: Lineage, *, hf_limit: int, timeout: int,
     min_ver = lin.discover.min_version
     if min_ver is None and lin.all_versions:
         min_ver = min(lin.all_versions)
-    floor, ceiling = lin.vram_band_gb(gpu_budget, vram_tolerance, min_vram_frac)
+    floor, ceiling = lin.vram_band_gb(gpu_budget, vram_tolerance,
+                                      min_vram_frac, context)
 
     seen: set[str] = set()
     out: list[HFCandidate] = []
@@ -772,7 +837,7 @@ def discover_hf(lin: Lineage, *, hf_limit: int, timeout: int,
             conv = "conversational" in tags
             is_base = is_base_model(base, conv)
             params = parse_param_count(base)
-            est_vram = estimate_vram_gb(params, fmt)
+            est_vram = estimate_vram_gb(params, fmt, context)
             measured = False
             # For an unmarked format, the param x bytes estimate has to guess
             # the precision; read the real on-disk size instead (one extra
@@ -780,7 +845,13 @@ def discover_hf(lin: Lineage, *, hf_limit: int, timeout: int,
             if fmt == "?" and not is_base:
                 real = hf_weight_gb(repo, timeout)
                 if real is not None:
-                    est_vram, measured = real, True
+                    # hf_weight_gb is the on-disk WEIGHT size, so the KV term
+                    # has to be added here too -- otherwise a measured
+                    # candidate is compared against a KV-inclusive ceiling
+                    # using a weights-only number and reads as smaller than
+                    # it serves.
+                    est_vram = real + estimate_kv_gb(real, context)
+                    measured = True
             klass, mapping = classify_candidate(ver, lin)
             seen.add(repo.lower())
             out.append(HFCandidate(
@@ -981,7 +1052,8 @@ def render_report(results: list[dict], *, do_hf: bool, do_ollama: bool,
                   include_undersized: bool = False, include_base: bool = False,
                   gpu_budget: float = DEFAULT_GPU_MEMORY_GB,
                   vram_tolerance: float = DEFAULT_VRAM_TOLERANCE,
-                  min_vram_frac: float = DEFAULT_MIN_VRAM_FRAC) -> str:
+                  min_vram_frac: float = DEFAULT_MIN_VRAM_FRAC,
+                  context: int = DEFAULT_DISCOVER_CTX) -> str:
     lines: list[str] = []
     lines.append("# catalog-discover (read-only) -- newer-version candidates")
     lines.append("# source of truth: scripts/model-families.yaml")
@@ -990,6 +1062,8 @@ def render_report(results: list[dict], *, do_hf: bool, do_ollama: bool,
     lines.append(f"# VRAM band: GPU budget {gpu_budget:.0f} GB; keep candidates "
                  f">= {min_vram_frac:.0%} of it and <= {vram_tolerance:g}x the "
                  f"family's largest model.")
+    lines.append(f"# Sizes are weights + KV cache at {context // 1024}K ctx "
+                 f"(fp8 KV, coarse per-weight-size estimate -- probe is truth).")
     lines.append("")
 
     total_hf = sum(1 for r in results for c in r["hf"]
@@ -1007,8 +1081,8 @@ def render_report(results: list[dict], *, do_hf: bool, do_ollama: bool,
         lines.append(f"   tracked versions: {tracked}")
         lines.append(f"   trusted authors : {authors}")
         floor, ceiling = lin.vram_band_gb(gpu_budget, vram_tolerance,
-                                          min_vram_frac)
-        ests = lin.tracked_vram_estimates()
+                                          min_vram_frac, context)
+        ests = lin.tracked_vram_estimates(context)
         basis = (f" (family max ~{max(ests):.0f} GB)" if ests
                  else " (GPU budget; no tracked size)")
         lines.append(f"   VRAM band       : ~{floor:.0f}-{ceiling:.0f} GB{basis}")
@@ -1391,7 +1465,8 @@ def run(families: list[dict], *, family_filter: str | None, do_hf: bool,
         do_ollama: bool, hf_limit: int, ollama_probe: int, timeout: int,
         gpu_budget: float = DEFAULT_GPU_MEMORY_GB,
         vram_tolerance: float = DEFAULT_VRAM_TOLERANCE,
-        min_vram_frac: float = DEFAULT_MIN_VRAM_FRAC) -> list[dict]:
+        min_vram_frac: float = DEFAULT_MIN_VRAM_FRAC,
+        context: int = DEFAULT_DISCOVER_CTX) -> list[dict]:
     lineages = build_lineages(families)
     results: list[dict] = []
     for key in sorted(lineages):
@@ -1416,7 +1491,8 @@ def run(families: list[dict], *, family_filter: str | None, do_hf: bool,
             r["hf"] = discover_hf(lin, hf_limit=hf_limit, timeout=timeout,
                                   gpu_budget=gpu_budget,
                                   vram_tolerance=vram_tolerance,
-                                  min_vram_frac=min_vram_frac)
+                                  min_vram_frac=min_vram_frac,
+                                  context=context)
         if do_ollama:
             r["ollama"] = discover_ollama(
                 lin, probe_count=ollama_probe, timeout=timeout)
@@ -1447,6 +1523,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--include-same", action="store_true",
                     help="List every untracked repo at an already-tracked "
                          "version (default: collapse to a per-family count).")
+    ap.add_argument("--ctx", type=int, default=DEFAULT_DISCOVER_CTX,
+                    help="Context (tokens) the VRAM band costs KV cache at "
+                         f"(default {DEFAULT_DISCOVER_CTX}). Sizes are "
+                         "weights + KV, so a model whose weights fit but "
+                         "which cannot hold this context is filtered out.")
     ap.add_argument("--include-oversized", action="store_true",
                     help="Also show candidates above the VRAM band (too big to "
                          "load on the GPU; hidden by default).")
@@ -1502,7 +1583,8 @@ def main(argv: list[str] | None = None) -> int:
         families, family_filter=args.family, do_hf=do_hf, do_ollama=do_ollama,
         hf_limit=args.hf_limit, ollama_probe=args.ollama_probe,
         timeout=args.timeout, gpu_budget=gpu_budget,
-        vram_tolerance=args.vram_tolerance, min_vram_frac=args.min_vram_frac)
+        vram_tolerance=args.vram_tolerance, min_vram_frac=args.min_vram_frac,
+        context=args.ctx)
 
     # Interactive add: confirm each discovered candidate, then exit.
     if args.add == "__INTERACTIVE__":
@@ -1518,7 +1600,8 @@ def main(argv: list[str] | None = None) -> int:
                             include_base=args.include_base,
                             gpu_budget=gpu_budget,
                             vram_tolerance=args.vram_tolerance,
-                            min_vram_frac=args.min_vram_frac))
+                            min_vram_frac=args.min_vram_frac,
+                            context=args.ctx))
     return 0
 
 

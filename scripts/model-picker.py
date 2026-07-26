@@ -719,16 +719,24 @@ def _vram_from_probe(probe: dict) -> dict:
 # (weights + KV(ctx) + overhead) so the user sees per-ctx growth that
 # actually reflects the model's resource footprint at that tier.
 #
-# These constants mirror scripts/select-models.py:51, 65 — keeping them
-# in sync is a manual operation but each side has small enough surface
-# area that drift is unlikely. See `vram_breakdown` over there for the
-# canonical formula.
-_KV_BYTES_FP16 = 2
+# These constants mirror scripts/select-models.py KV_BYTES /
+# VLLM_OVERHEAD_GB — keeping them in sync is a manual operation but each
+# side has small enough surface area that drift is unlikely. See
+# `vram_breakdown` over there for the canonical formula.
+#
+# 1 byte, not 2: this helper is only ever used on the HF (vLLM/SGLang)
+# formula-fallback path, and the router launches those engines with
+# --kv-cache-dtype resolved from the probe cell, where an unstamped cell
+# decodes to fp8 (see gpu-arbiter resolveKVCacheType, docs/backends.md).
+# Costing the estimate at fp16 inflated the "*" cells by the whole KV
+# term. Ollama rows never reach here; they keep fp16 unless their cell
+# is stamped q8_0.
+_KV_BYTES_HF = 1
 _HF_OVERHEAD_GB = 3.0
 
 
 def _hf_kv_gb(arch: dict, context: int) -> float:
-    """KV cache size in GB for a given (arch, ctx) at fp16."""
+    """KV cache size in GB for a given (arch, ctx) as vLLM/SGLang serve it."""
     if not arch:
         return 0.0
     copies = 1 if arch.get("k_eq_v") else 2
@@ -737,7 +745,7 @@ def _hf_kv_gb(arch: dict, context: int) -> float:
         * int(arch.get("layers") or 0)
         * int(arch.get("kv_heads") or 0)
         * int(arch.get("head_dim") or 0)
-        * _KV_BYTES_FP16
+        * _KV_BYTES_HF
     )
     return (bytes_per_token * context) / (1024 ** 3)
 
@@ -1715,6 +1723,30 @@ def _kv_cells(m: dict) -> dict[int, str]:
     return out
 
 
+def _needle_failed_at(m: dict, ctx: int) -> bool:
+    """True when the LOAD probe measured a TRUSTWORTHY recall failure at
+    `ctx` for this model at the picker's VRAM band.
+
+    Gated on the probe's own ``needle_valid``. That flag is false whenever
+    the number is an artefact rather than a result -- a reasoning model
+    truncated at the output ceiling, or an under-filled SGLang prompt that
+    never reached the advertised window. On this fleet those two cases
+    accounted for every zero on disk, which is why the picker warns only
+    when the probe itself vouches for the measurement, and why nothing
+    anywhere GATES on it: it is one sample at the hardest depth.
+
+    Cells written before ``needle_valid`` existed have no such vouching,
+    so they are treated as untrustworthy and stay silent.
+    """
+    band = ((m.get("vram") or {}).get("probes") or {}).get(str(int(_VRAM_BUDGET)))
+    if not isinstance(band, dict) or ctx <= 0:
+        return False
+    cell = band.get(str(int(ctx)))
+    if not isinstance(cell, dict):
+        return False
+    return bool(cell.get("needle_valid")) and cell.get("needle_score") == 0.0
+
+
 def _kv_mixed(m: dict) -> bool:
     """True when the model's fitting tiers span more than one KV dtype
     (e.g. 64K probed under f16, 128K only fits under q8_0). Such models
@@ -2035,6 +2067,16 @@ def _use_case_ratings(m: dict) -> list[tuple[str, float]] | None:
     return sorted(((k, v * 100.0) for k, v in vals.items()), key=lambda kv: -kv[1])
 
 
+def _use_case_score(m: dict, case: str) -> float | None:
+    """One use case's 0-100 composite, or None when the model lacks the
+    bench data to score it (so it sorts to the bottom rather than to 0,
+    which would read as 'measured and terrible')."""
+    ranked = _use_case_ratings(m)
+    if not ranked:
+        return None
+    return dict(ranked).get(case)
+
+
 def _use_case_tier(score: float) -> str:
     """Absolute quality band for a use-case score (0-100)."""
     if score >= 80:
@@ -2143,6 +2185,27 @@ def _capability_summary_text(
             f"           up to {f16_max} serves f16 (full quality).\n"
             f"           Pick the tier at launch.\n"
         )
+    # Long-context recall, warning only. The LOAD probe buries one needle at
+    # mid-depth in a nearly-full window and checks whether the model repeats
+    # it back. A miss is worth telling the operator about, but it is ONE
+    # sample at the hardest depth, so it is never a gate and never demotes
+    # the advertised ctx.
+    #
+    # Shown only when needle_valid is true. That flag rejects the two
+    # artefacts that account for every zero measured on this fleet: a
+    # reasoning model truncated at the output ceiling, and an under-filled
+    # SGLang prompt that never reached the advertised window. An
+    # untrustworthy measurement is silent rather than hedged -- a warning the
+    # operator learns to ignore is worse than no warning.
+    recall_line = ""
+    _rctx_i = int(m.get("_picker_context") or 0)
+    if _needle_failed_at(m, _rctx_i):
+        _rctx = _context_label(_rctx_i)
+        recall_line = (
+            f"Recall:    FAILED a single mid-depth needle test at {_rctx}.\n"
+            f"           ONE sample, not conclusive -- verify before relying\n"
+            f"           on long-context retrieval at this tier.\n"
+        )
     niche = _MODEL_NICHE.get(str(m.get("name") or ""))
     niche_line = ""
     if niche:
@@ -2155,6 +2218,7 @@ def _capability_summary_text(
         f"Params:    {params}    Type: {type_label}\n"
         f"Context:   {_context_label(ctx)} (max fit at {_VRAM_BUDGET:g} GB)\n"
         f"{kv_line}"
+        f"{recall_line}"
         f"VRAM:      {vram_str}\n"
         f"{niche_line}"
         f"\n"
@@ -2357,7 +2421,26 @@ def _extra_use_case_lines(m: dict, comparison: dict | None) -> list[str]:
 # largest probe-confirmed context tier that fits at the picker's VRAM
 # band -- useful when the user cares about long-context capacity over
 # raw quality scores.
-_SORT_MODES: tuple[str, ...] = ("gpqa", "tps", "code", "hevp", "mmlu", "tools", "ctx")
+# Raw-metric sort modes: each maps to a rendered table column.
+_METRIC_SORT_MODES: tuple[str, ...] = (
+    "gpqa", "tps", "code", "hevp", "mmlu", "tools", "ctx",
+)
+
+# Use-case sort modes. These reorder by the weighted composite the preview
+# pane already computes and shows under "Recommended for:" -- the picker
+# was scoring five use cases per model and then offering no way to sort by
+# any of them, so choosing "the best coding model here" meant reading every
+# preview by hand. Sorting by a composite is also the honest way to pick:
+# no single column answers "best for coding", which is 70% HumanEval+ and
+# 30% HumanEval, not either alone.
+#
+# These have no table column, so no header arrow appears for them; the
+# sort note names the active mode instead.
+_USE_CASE_SORT_MODES: tuple[str, ...] = (
+    "coding", "math", "reasoning", "summary", "doc_qa",
+)
+
+_SORT_MODES: tuple[str, ...] = _METRIC_SORT_MODES + _USE_CASE_SORT_MODES
 _SORT_LABELS: dict[str, str] = {
     "gpqa": "GPQA",
     "tps": "TPS",
@@ -2366,6 +2449,11 @@ _SORT_LABELS: dict[str, str] = {
     "mmlu": "MMLU",
     "tools": "TOOLS",
     "ctx": "CTX",
+    "coding": "for:CODING",
+    "math": "for:MATH",
+    "reasoning": "for:REASONING",
+    "summary": "for:SUMMARY",
+    "doc_qa": "for:DOC-QA",
 }
 
 
@@ -2392,6 +2480,13 @@ def _sort_key_for_mode(mode: str, sort_dir: str = "desc"):
             return (
                 0 if ctx > 0 else 1,
                 ctx * sign,
+                -_score(m),
+            )
+        if mode in _USE_CASE_SORT_MODES:
+            v = _use_case_score(m, mode)
+            return (
+                0 if v is not None else 1,
+                (v if v is not None else 0.0) * sign,
                 -_score(m),
             )
         scores = m.get("_picker_scores") or {}
@@ -2532,7 +2627,13 @@ def _build_menu(
     lines.append(f"{_BOLD}{column_header}{_RESET}")
     selectable.append(False)
     item_models.append(None)
-    cycle_hint = " > ".join(_SORT_LABELS[m] for m in _SORT_MODES)
+    # Naming all 12 modes here produced a line wider than the terminal.
+    # Show the metric columns (which the header arrows also mark) and
+    # collapse the five use-case composites into one token.
+    cycle_hint = (
+        " > ".join(_SORT_LABELS[m] for m in _METRIC_SORT_MODES)
+        + " > for:CODING/MATH/REASONING/SUMMARY/DOC-QA"
+    )
     sort_note = (
         f"sort: {_BOLD}{sort_label} {arrow} {sort_dir}{_RESET}{_DIM}  "
         f"(ctrl-s cycles {cycle_hint}; ctrl-r flips direction){_RESET}"
