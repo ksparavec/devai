@@ -1657,7 +1657,21 @@ BENCH_CACHE_MOUNTS = \
 	-v $(CURDIR)/deploy:/deploy \
 	-v $(CACHE_DIR)/bench:$(CACHE_DIR)/bench \
 	$(if $(wildcard $(VLLM_MODELS_DIR)),-v $(VLLM_MODELS_DIR):$(VLLM_MODELS_DIR):ro) \
-	$(if $(wildcard $(SGLANG_MODELS_DIR)),-v $(SGLANG_MODELS_DIR):$(SGLANG_MODELS_DIR):ro)
+	$(if $(wildcard $(SGLANG_MODELS_DIR)),-v $(SGLANG_MODELS_DIR):$(SGLANG_MODELS_DIR):ro) \
+	$(if $(wildcard $(HF_TOKEN_FILE)),-v $(HF_TOKEN_FILE):/root/.cache/huggingface/token:ro)
+
+# GPQA-Diamond lives behind a gated HF dataset (Idavidrein/gpqa), so the
+# bench needs credentials or that task -- and only that task -- fails.
+# `-e HF_TOKEN` alone was not enough: it forwards the variable only when
+# the invoking shell exports it, and `hf auth login` writes a FILE rather
+# than exporting anything. A logged-in operator therefore got a silent
+# per-task failure (one `!!` line in a multi-thousand-line log) and a row
+# that looked complete until something counted its tasks.
+#
+# Mounted as a file at the path huggingface_hub already looks in, rather
+# than passed as `-e HF_TOKEN=$(shell cat ...)`, which would expose the
+# token in `ps` output for the life of the run.
+HF_TOKEN_FILE ?= $(HOME)/.cache/huggingface/token
 
 # n-knobs surface to the runner as both env (for inspect_ai's task
 # constructors that read defaults) and CLI flags (the runner reads them
