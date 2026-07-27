@@ -106,6 +106,7 @@ found three more findings.
 | [bench-rewrite](./bench-rewrite.md)                                 | In Progress       |
 | [kv-cache-quantization](./kv-cache-quantization.md)                 | Superseded        |
 | [card-derived-hints-and-bench-sync](./card-derived-hints-and-bench-sync.md) | In Progress (Phase 5 shipped) |
+| [router-anthropic-messages-compat](./router-anthropic-messages-compat.md) | Draft         |
 | [router-shortcircuit](./router-shortcircuit.md)                     | Draft             |
 | [odysseus-borrowed-ideas](./odysseus-borrowed-ideas.md)             | Draft (partly frozen) |
 | [pi-coding-agent](./pi-coding-agent.md)                             | Draft             |
@@ -349,6 +350,7 @@ probably do them in series rather than context-switching.
 | 11   | skypilot-fleet-provisioner Phase 3            | 1 week     | No        | Policy hardening. Can defer indefinitely. |
 | 12   | gpu-arbiter-cluster-mode Phase 3 (optional)   | 1 week     | No        | Probe-cache federation. No dependents; activate only on user friction. |
 | 13   | card-derived-hints-and-bench-sync             | ~1.5 weeks | No        | Both prerequisites already satisfied, so it can ship at any point. Appended rather than inserted because it is off the critical path entirely. Phases 1-4 (hints) and Phase 5 (bench loop) are independent tracks and can be split across people or releases. |
+| 14   | router-anthropic-messages-compat              | ~half a day | No       | No dependencies, off the critical path, but the only entry here that fixes a CURRENT user-facing break (Claude Code cannot complete a turn against any vLLM row). Numbered last only because this table is ordered by dependency, not priority -- in practice it should be done first. Its one open question is a ~30 min GPU-exclusive replay that gates the code. |
 
 **Total elapsed time, serial single-operator path: roughly 6-9
 weeks** (steps 1-10; step 11 and step 12 are optional). A small
