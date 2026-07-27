@@ -1099,13 +1099,27 @@ def _check_cache_visible() -> None:
 
 # ── fzf wrapper ──────────────────────────────────────────────────────────────
 
+# Cursor position remembered per modal, so backing out of a sub-modal
+# returns you to the row you were on instead of the top of the list.
+#
+# Keyed by modal rather than held by each caller because every level of
+# the picker wants the same behaviour -- model list, context tier, agent,
+# reasoning toggle, MTP toggle, aiagent GPU mode. One dict and one _fzf
+# parameter covers them all; per-caller state would drift.
+#
+# Values are fzf's 1-based item positions, NOT indices into `lines`: with
+# --header-lines=N the header rows are not items, so the two differ by N.
+_LAST_POS: dict[str, int] = {}
+
+
 def _fzf(lines: list[str], header: str,
          selectable: list[bool] | None = None,
          preview_cmd: str | None = None,
          preview_window: str = "right:42%:wrap",
          extra_bindings: list[str] | None = None,
          input_text: str | None = None,
-         header_lines: int = 0) -> int | None:
+         header_lines: int = 0,
+         memory_key: str | None = None) -> int | None:
     """Run fzf; return selected line index or None on cancel.
 
     `selectable[i]=False` marks line i as a non-selectable section header.
@@ -1124,6 +1138,11 @@ def _fzf(lines: list[str], header: str,
     `input_text` overrides the default tag-prefixed line stream (used
     when a binding provides its own pre-built input file -- the caller
     can hand fzf the same shape directly).
+
+    `memory_key`, when set, remembers the cursor position for that
+    modal and restores it on the next call. This is what makes Esc
+    out of a sub-modal return to the row you were on rather than the
+    top of the list.
 
     `header_lines` (>0) maps to fzf's `--header-lines=N` so the first
     N input lines become a fixed header the cursor cannot navigate
@@ -1180,6 +1199,20 @@ def _fzf(lines: list[str], header: str,
             ]
             if header_lines > 0:
                 args.extend(["--header-lines", str(header_lines)])
+            # Restore the remembered cursor position. `--sync` is
+            # REQUIRED, not decorative: without it fzf can run the
+            # `start:` binding before the item list is loaded and the
+            # pos() is silently dropped (verified on fzf 0.60 --
+            # start:pos(N)+accept returned nothing until --sync was
+            # added). Emitted only when there IS something to restore, so
+            # a first-time modal keeps fzf's default streaming startup.
+            saved = _LAST_POS.get(memory_key) if memory_key else None
+            if saved:
+                n_items = max(len(lines) - header_lines, 1)
+                args.extend([
+                    "--sync",
+                    "--bind", f"start:pos({min(max(saved, 1), n_items)})",
+                ])
             if preview_cmd:
                 # Preview pane gets its own rounded frame so the split
                 # between list and details is visually obvious. Older
@@ -1210,7 +1243,12 @@ def _fzf(lines: list[str], header: str,
         if tag == "--":
             # User landed on a section header — re-prompt.
             continue
-        return int(tag)
+        idx = int(tag)
+        if memory_key:
+            # `lines` index -> fzf item position: header rows are
+            # not items, so shift by header_lines, 1-based.
+            _LAST_POS[memory_key] = max(idx - header_lines + 1, 1)
+        return idx
 
 
 def _numbered_fallback(lines: list[str], header: str,
@@ -2886,7 +2924,7 @@ def _resolve_aiagent_gpu_mode() -> str | None:
         f"  Share GPU    {_DIM}(aiagent may run its own CUDA code; risks OOM vs the loaded model){_RESET}",
     ]
     header = f"aiagent GPU access  ▸  {_DIM}(Esc → back to model list){_RESET}"
-    idx = _fzf(lines, header)
+    idx = _fzf(lines, header, memory_key="aiagent_gpu")
     if idx is None:
         return None
     return "share" if idx == 1 else "router-only"
@@ -2934,7 +2972,7 @@ def _resolve_kv_tier(model: dict) -> tuple[int, bool] | None:
         f"Context tier  ▸  {_BOLD}{_strip_latest(model['name'])}{_RESET}"
         f"   {_DIM}(tier sets KV dtype; Esc → back to model list){_RESET}"
     )
-    idx = _fzf(lines, header)
+    idx = _fzf(lines, header, memory_key="kv_tier")
     if idx is None:
         return None
     return (tiers[idx], True)
@@ -2965,7 +3003,7 @@ def _resolve_agent(agent_filter: str | None, model: dict) -> tuple[str, str, str
             f"Reasoning mode  ▸  {_BOLD}{_strip_latest(model['name'])}{_RESET}"
             f"   {_DIM}(Esc → back to model list){_RESET}"
         )
-        idx = _fzf(toggle_lines, toggle_header)
+        idx = _fzf(toggle_lines, toggle_header, memory_key="reasoning")
         if idx is None:
             return None
         if idx == 1:
@@ -2993,7 +3031,7 @@ def _resolve_agent(agent_filter: str | None, model: dict) -> tuple[str, str, str
             f"MTP toggle  ▸  {_BOLD}{_strip_latest(model['name'])}{_RESET}"
             f"   {_DIM}(Esc → back to model list){_RESET}{warn}"
         )
-        idx = _fzf(mtp_lines, mtp_header)
+        idx = _fzf(mtp_lines, mtp_header, memory_key="mtp")
         if idx is None:
             return None
         if idx == 1:
@@ -3023,7 +3061,7 @@ def _resolve_agent(agent_filter: str | None, model: dict) -> tuple[str, str, str
         f"  via {_BACKENDS[model['backend']][0]}"
         f"   {_DIM}(Esc → back to model list){_RESET}"
     )
-    idx = _fzf(alines, header)
+    idx = _fzf(alines, header, memory_key="agent")
     if idx is None:
         return None
     agent_id = _AGENTS[idx][0]
@@ -3377,6 +3415,9 @@ def main() -> None:
             # always emits exactly these three at the top; if that
             # ever changes, update this constant in lockstep.
             header_lines=3,
+            # Esc out of any sub-modal lands back here; without
+            # this the cursor jumped to the first row every time.
+            memory_key="model",
         )
         if idx is None:
             # User cancelled the model list (Ctrl-C / Esc). Exit cleanly so
