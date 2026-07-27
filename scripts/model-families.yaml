@@ -481,8 +481,30 @@ families:
     # detector is built on "<think>"/"</think>" -- the exact tokens this
     # model's chat template emits (verified in tokenizer_config.json). No
     # per-model image override is needed on the SGLang side.
-    # UNVERIFIED end to end: this needs `make probe-sglang` to confirm the
-    # round-trip and a re-bench to confirm the HumanEval recovery.
+    # MEASURED 2026-07-27, after catalog-regen + a forced re-probe:
+    # capability flipped inline -> structured and reasoning_parser is now
+    # nemotron_3, so the round-trip is confirmed. HumanEval went
+    # 0.04 -> 0.64 -- a 16x recovery that settles the diagnosis.
+    #
+    # It does NOT reach vLLM's 0.80, and 0.64 is still under the 0.70
+    # early-drop threshold, so the SGLang row remains drop-flagged. That
+    # flag is now an accurate verdict rather than an artefact.
+    #
+    # The likely remaining cause is a real asymmetry, not more parser
+    # trouble: deploy/recovery-flags.json gives this hybrid
+    # Mamba-Transformer checkpoint `--mamba-ssm-cache-dtype float32` plus
+    # a v0.25.1 image, and that entry is scoped `backends: ["vllm"]`.
+    # SGLang runs it with the default SSM dtype. SGLang does expose the
+    # analogue (`--mamba-ssm-dtype {float32,bfloat16,float16}`, verified
+    # in the pinned image's --help), but the registry is keyed one entry
+    # per model with a single allow-list and no per-backend flag
+    # variation, so wiring it needs a schema change across
+    # recovery-flags.json, gpu-arbiter/recovery_flags.go and
+    # scripts/_probe_hf_common.py -- plus a re-probe, since float32 SSM
+    # cache changes the memory math. UNVERIFIED hypothesis; not attempted.
+    #
+    # Serve this model on vLLM. Per the standing policy (vLLM first,
+    # SGLang only for a special reason) that is sufficient.
     #
     # Reasoning parser nemotron_v3 is NOT registered in the pinned vLLM
     # v0.22.1 image (passing it crashes the engine at startup, container
