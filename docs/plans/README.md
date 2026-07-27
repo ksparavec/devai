@@ -106,6 +106,7 @@ found three more findings.
 | [bench-rewrite](./bench-rewrite.md)                                 | In Progress       |
 | [kv-cache-quantization](./kv-cache-quantization.md)                 | Superseded        |
 | [card-derived-hints-and-bench-sync](./card-derived-hints-and-bench-sync.md) | In Progress (Phase 5 shipped) |
+| [sglang-backend-remediation](./sglang-backend-remediation.md)       | Draft (Phase 0 run) |
 | [router-anthropic-messages-compat](./router-anthropic-messages-compat.md) | Draft         |
 | [router-shortcircuit](./router-shortcircuit.md)                     | Draft             |
 | [odysseus-borrowed-ideas](./odysseus-borrowed-ideas.md)             | Draft (partly frozen) |
@@ -280,6 +281,21 @@ whose weights were not on disk.
                     | skill (no deps)   |      no dependents
                     +-------------------+
 
+          +-------------------------------+
+          | sglang-backend-remediation    |  <-- no deps, no
+          | (Ph 0 run; Ph 1 stops a live  |      dependents. Phase 1
+          |  crash loop -- do it first)   |      is the only urgent
+          +---------------+---------------+      item in this graph.
+                          |
+                          |  answers open questions 1 + 4
+                          v
+          +-------------------------------+
+          | router-anthropic-messages-    |  <-- soft edge only: that
+          | compat (no hard deps)         |      plan can ship without
+          +-------------------------------+      this one, but Phase 0
+                                                 already settled its
+                                                 two blocking unknowns.
+
                     +-------------------+
                     | sops-age-secrets  |  <-- prerequisite for
                     | (no deps)         |      three downstream
@@ -340,55 +356,82 @@ probably do them in series rather than context-switching.
 | 1    | bench-rewrite (all 6 phases)                  | ~4 hours   | No        | Smallest plan, no deps, immediate picker-accuracy win. Clears the deck. |
 | 2    | sops-age-secrets                              | 1-2 days   | Yes       | Hard prerequisite for three downstream plans. Should land before any consumer schedules. |
 | 3    | mcp-gateway Phase 1                           | 1-2 days   | No        | Independent of sops-age; can run in parallel with step 2 or step 4. Validates Podman-socket compatibility early. |
-| 4    | skypilot-agent-skill (Phases 1-2)             | 2-3 days   | No        | Independent of everything; user-facing win; one Dockerfile change. Parallel with steps 2 or 3. |
-| 5    | gpu-arbiter-cluster-mode Phase 1              | 2 weeks    | Yes       | Depends on sops-age (step 2). Long pole of the cluster work. |
-| 6    | gpu-arbiter-cluster-mode Phase 1.5            | ~1 day     | Yes       | CI hard gate. Blocks Phase 2 of cluster-mode AND all of fleet-provisioner. |
+| 4    | **[FROZEN]** skypilot-agent-skill (Phases 1-2) | 2-3 days  | No        | Independent of everything; user-facing win; one Dockerfile change. Parallel with steps 2 or 3. Frozen 2026-07-25 -- Phase 2 was never done and nothing ever installed the Agent Skill the docs promised. |
+| 5    | **[FROZEN]** gpu-arbiter-cluster-mode Phase 1 | 2 weeks    | Yes       | Depends on sops-age (step 2). Long pole of the cluster work. Code in `attic/cluster-mode/` behind a build tag. |
+| 6    | **[FROZEN]** gpu-arbiter-cluster-mode Phase 1.5 | ~1 day   | Yes       | CI hard gate. Blocks Phase 2 of cluster-mode AND all of fleet-provisioner. |
 | 7    | mcp-gateway Phase 2                           | 2-3 days   | No        | Depends on sops-age (step 2) but not on cluster-mode. Can run in parallel with step 5 or after step 6. |
-| 8    | gpu-arbiter-cluster-mode Phase 2              | 2 weeks    | Yes       | Head mode + routing. Required before any fleet-provisioner work. |
-| 9    | skypilot-fleet-provisioner Phase 1            | 2-3 days   | Yes       | API server stand-alone. Inherits cluster-mode worker bootstrap + sops-age scaffold. |
-| 10   | skypilot-fleet-provisioner Phase 2            | 1-2 weeks  | Yes       | Head <-> SkyPilot integration. Two-step graceful teardown per decision. |
-| 11   | skypilot-fleet-provisioner Phase 3            | 1 week     | No        | Policy hardening. Can defer indefinitely. |
-| 12   | gpu-arbiter-cluster-mode Phase 3 (optional)   | 1 week     | No        | Probe-cache federation. No dependents; activate only on user friction. |
+| 8    | **[FROZEN]** gpu-arbiter-cluster-mode Phase 2 | 2 weeks    | Yes       | Head mode + routing. Required before any fleet-provisioner work. |
+| 9    | **[FROZEN]** skypilot-fleet-provisioner Phase 1 | 2-3 days | Yes       | API server stand-alone. Inherits cluster-mode worker bootstrap + sops-age scaffold. |
+| 10   | **[FROZEN]** skypilot-fleet-provisioner Phase 2 | 1-2 weeks | Yes      | Head <-> SkyPilot integration. Two-step graceful teardown per decision. |
+| 11   | **[FROZEN]** skypilot-fleet-provisioner Phase 3 | 1 week   | No        | Policy hardening. Can defer indefinitely. |
+| 12   | **[FROZEN]** gpu-arbiter-cluster-mode Phase 3 (optional) | 1 week | No | Probe-cache federation. No dependents; activate only on user friction. |
 | 13   | card-derived-hints-and-bench-sync             | ~1.5 weeks | No        | Both prerequisites already satisfied, so it can ship at any point. Appended rather than inserted because it is off the critical path entirely. Phases 1-4 (hints) and Phase 5 (bench loop) are independent tracks and can be split across people or releases. |
-| 14   | router-anthropic-messages-compat              | ~half a day | No       | No dependencies, off the critical path, but the only entry here that fixes a CURRENT user-facing break (Claude Code cannot complete a turn against any vLLM row). Numbered last only because this table is ordered by dependency, not priority -- in practice it should be done first. Its one open question is a ~30 min GPU-exclusive replay that gates the code. |
+| 14   | router-anthropic-messages-compat              | ~half a day | No       | No dependencies, off the critical path, but the only entry here that fixes a CURRENT user-facing break (Claude Code cannot complete a turn against any vLLM row). Numbered last only because this table is ordered by dependency, not priority -- in practice it should be done first. Its one open question is a ~30 min GPU-exclusive replay that gates the code. Note its open questions 1 and 4 (does SGLang expose `/v1/messages`; does its shim behave like vLLM's) are already ANSWERED in sglang-backend-remediation Phase 0 -- yes, and folding the stray system message is sufficient for both HF backends. |
+| 15   | sglang-backend-remediation                    | ~2 weeks + 1 GPU window | No | No dependencies. Off the dependency critical path, but **Phase 1 should be run before anything else in this table**: the fleet is currently burning GPU on a crash loop (72 router recreates of one model in a day, 93% of SGLang's server errors from that single model). Phases 2-3 are mostly backend-agnostic and improve vLLM too -- 12 of its 19 HIGH findings are owed whether SGLang is kept or frozen. Phase 4 needs the GPU window; Phase 5 is the optional keep-or-freeze adjudication. |
 
-**Total elapsed time, serial single-operator path: roughly 6-9
-weeks** (steps 1-10; step 11 and step 12 are optional). A small
-team can shave a week or two by running steps 3, 4, 7 in
-parallel with the cluster-mode long pole.
+**Eight of these fifteen steps are FROZEN** (4, 5, 6, 8, 9, 10, 11, 12) -- their plans
+were parked on 2026-07-25 and their sources moved to `attic/`. They are kept in this
+table as the design record of the intended sequence, not as schedulable work. See
+`attic/README.md`, and `attic/cluster-mode/RESTORE.md` for the defects open at freeze
+time.
 
-## Critical path
+The old headline figure here ("roughly 6-9 weeks, steps 1-10") was arithmetic over that
+frozen chain and has been removed rather than recomputed: it counted two weeks of
+cluster-mode Phase 1, two of Phase 2 and one-to-two of fleet-provisioner Phase 2, none
+of which is schedulable.
 
-The longest must-be-sequential chain is:
+**Actually schedulable work, in priority order:** step 15 Phase 1 (stops a live crash
+loop, half a day), step 14 (~half a day, fixes a current user-facing break), step 1
+(~4 hours), then step 15 Phases 2-5 (~2 weeks + one GPU window) and step 13
+(~1.5 weeks). Step 2 (`sops-age-secrets`) is **Non-functional** rather than pending --
+it cannot encrypt anything until an age key exists and `.sops.yaml`'s `age1xxxx...`
+placeholder is replaced -- and two of its three intended consumers are frozen, so its
+"hard prerequisite" framing above now applies only to the MCP gateway's two
+secret-needing servers.
+
+## Critical path -- FROZEN, no longer live
+
+The longest must-be-sequential chain was:
 
 ```
-sops-age-secrets
-  -> cluster-mode Phase 1
-  -> cluster-mode Phase 1.5
-  -> cluster-mode Phase 2
-  -> fleet-provisioner Phase 1
-  -> fleet-provisioner Phase 2
+sops-age-secrets                 <-- Non-functional
+  -> cluster-mode Phase 1        <-- FROZEN
+  -> cluster-mode Phase 1.5      <-- FROZEN
+  -> cluster-mode Phase 2        <-- FROZEN
+  -> fleet-provisioner Phase 1   <-- FROZEN
+  -> fleet-provisioner Phase 2   <-- FROZEN
 ```
 
-Everything else can either be scheduled around this chain or
-deferred. Compressing the critical path means compressing one
-of these six phases -- there's no parallelism to exploit
-within it.
+**Five of these six phases are frozen and the sixth is non-functional, so this chain is
+not a critical path today -- it is a record of the one that was planned.** Retained
+because a thaw would restore it intact: `attic/cluster-mode/RESTORE.md` lists what was
+broken when the work was parked, and the ordering above is still the right ordering if it
+ever resumes.
+
+**There is currently no critical path.** Every schedulable plan
+(`sglang-backend-remediation`, `router-anthropic-messages-compat`, `bench-rewrite`,
+`card-derived-hints-and-bench-sync`) has no hard dependencies, so ordering is a priority
+judgement rather than a dependency constraint. The priority order is in the paragraph
+above the previous section.
 
 ## Parallelism map
 
-Side branches that genuinely have no dependency on the critical
-path:
+Side branches with no hard dependency on anything else. Since the critical path is now
+frozen (see above), most of this list is free-floating by default rather than by design.
 
 - bench-rewrite (step 1) -- can ship at any point.
-- skypilot-agent-skill (step 4) -- lab image change only;
-  decoupled from cluster mode.
+- **[FROZEN]** skypilot-agent-skill (step 4) -- lab image change only;
+  decoupled from cluster mode. Parked 2026-07-25.
 - mcp-gateway Phase 1 (step 3) -- independent of sops-age and
-  cluster-mode.
+  cluster-mode. **Shipped: the plan is Done.**
 - mcp-gateway Phase 2 (step 7) -- depends on sops-age only;
-  parallel with cluster-mode Phase 1 onwards.
-- cluster-mode Phase 3 (step 12) -- no dependents; activate on
+  parallel with cluster-mode Phase 1 onwards. **Shipped: the plan is Done.**
+- **[FROZEN]** cluster-mode Phase 3 (step 12) -- no dependents; activate on
   demand.
+- sglang-backend-remediation (Draft, Phase 0 run) -- host-side probe/bench tooling
+  plus localised router edits; no deps and no dependents. Phase 1 stops a live crash
+  loop and should go first. Phases 2-3 are largely backend-agnostic and improve vLLM
+  too. Phase 4 needs a GPU-exclusive window; Phase 5 is an optional adjudication.
 - router-shortcircuit (Draft) -- single-mode router feature, no deps
   and no dependents; ships at any point. Phase 1 (fingerprint logger)
   is the productized "empirical pass" and can run standalone wherever a
@@ -396,8 +439,9 @@ path:
 - router-fanout (Draft) -- NOT free-floating: Phase 1 (single-host
   demux) has no deps, but Phases 2-3 (concurrent demux + broadcast, the
   cluster-first payoff) depend on gpu-arbiter-cluster-mode Phase 2.
-  Schedule Phase 1 any time; gate Phases 2-3 behind the cluster-mode
-  head landing.
+  Schedule Phase 1 any time; **Phases 2-3 are blocked indefinitely --
+  their prerequisite is FROZEN**, so treat them as parked too rather
+  than merely unscheduled.
 - pi-coding-agent (Draft) -- lab-image + picker change, no deps and no
   dependents; same shape as skypilot-agent-skill. Ships at any point.
 - card-derived-hints-and-bench-sync (In Progress) -- host-side probe/bench
@@ -433,3 +477,31 @@ Update this file when any of the following happens:
 
 If this file disagrees with a plan's `Dependencies` section,
 the plan wins. Fix this file.
+
+## Deferred: full snapshot refresh
+
+Known stale as of **2026-07-27**, deliberately NOT fixed in the same pass that added
+`sglang-backend-remediation` and marked the frozen steps. Recorded here so the next
+reader does not mistake it for current:
+
+- **The snapshot narrative above is dated 2026-07-25** and reads as of that portfolio
+  review. It has not been re-verified since. Re-dating it means re-checking all 16 rows
+  against the tree, which is its own job -- the 2026-07-25 review found the previous
+  snapshot systematically over-stated, so a header date bump without that re-check would
+  repeat the mistake it was written to correct.
+- **The recommended-order table lists work that is already Done.** `mcp-gateway` is
+  **Done** (verified live, 134 tools), yet its Phase 1 and Phase 2 still appear as
+  schedulable steps 3 and 7. Steps 1 and 13 belong to plans marked *In Progress* and
+  should say which phases remain.
+- **`bench-rewrite` is In Progress with Phase 6 deferred to a live GPU**, which the
+  ~4 hours estimate at step 1 does not reflect.
+- **The parallelism map disagrees with the status table on one plan:** it lists
+  `kv-cache-quantization` as `(Draft)`, while the status table marks it **Superseded**.
+  The status table wins, per the rule above. The map entry should be rewritten or dropped.
+- The frozen steps were marked in place rather than removed, on the same reasoning as
+  `attic/`: parked is not deleted, and the intended sequence is worth keeping.
+
+Doing this properly means one pass that re-derives every status from the tree and rebuilds
+all three views (status table, dependency graph, order table) together. Until then, treat
+the status table as authoritative for *state* and the order table as authoritative only
+for *intended sequence*.
