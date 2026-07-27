@@ -2805,7 +2805,7 @@ def _build_menu(
                 f"≤ {_VRAM_BUDGET:g} GB"
             )
         if hidden.get("bench_excluded"):
-            notes.append(
+            bits.append(
                 f"{hidden['bench_excluded']} dropped on bench verdict "
                 f"(`make model-status` to see, CLEAR= to restore)"
             )
