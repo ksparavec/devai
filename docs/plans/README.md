@@ -103,7 +103,7 @@ found three more findings.
 | [mcp-gateway](./mcp-gateway.md)                                     | **Done**          |
 | [model-lifecycle-ledger](./model-lifecycle-ledger.md)               | Done (unverified) |
 | [review-fixes-2026-07](./review-fixes-2026-07.md)                   | Done (unverified) |
-| [bench-rewrite](./bench-rewrite.md)                                 | In Progress       |
+| [bench-rewrite](./bench-rewrite.md)                                 | **Done**          |
 | [kv-cache-quantization](./kv-cache-quantization.md)                 | Superseded        |
 | [card-derived-hints-and-bench-sync](./card-derived-hints-and-bench-sync.md) | In Progress (Phase 5 shipped) |
 | [sglang-backend-remediation](./sglang-backend-remediation.md)       | In Progress (Phases 0-1 shipped) |
@@ -353,13 +353,13 @@ probably do them in series rather than context-switching.
 
 | Step | Plan / Phase                                  | Wall-clock | Blocking? | Why this position                                                     |
 | ---- | --------------------------------------------- | ---------- | --------- | --------------------------------------------------------------------- |
-| 1    | bench-rewrite (all 6 phases)                  | ~4 hours   | No        | Smallest plan, no deps, immediate picker-accuracy win. Clears the deck. |
+| 1    | ~~bench-rewrite (all 6 phases)~~ **DONE**      | --         | No        | **Closed 2026-07-27.** Phases 1-5 shipped 2026-05-15; Phase 6 struck (targets a probe grid that no longer exists). Verified against the tree: cache is schema v3 with every row ctx-keyed, the report renders CTX/Env, the picker reads the row for the ctx it is about to launch, and `make bench-plan` reports nothing to bench. |
 | 2    | sops-age-secrets                              | 1-2 days   | Yes       | Hard prerequisite for three downstream plans. Should land before any consumer schedules. |
-| 3    | mcp-gateway Phase 1                           | 1-2 days   | No        | Independent of sops-age; can run in parallel with step 2 or step 4. Validates Podman-socket compatibility early. |
+| 3    | ~~mcp-gateway Phase 1~~ **DONE**              | --         | No        | Shipped; plan is **Done** (verified live, 134 tools over a real MCP handshake). Retained as a row so the step numbering below still resolves. |
 | 4    | **[FROZEN]** skypilot-agent-skill (Phases 1-2) | 2-3 days  | No        | Independent of everything; user-facing win; one Dockerfile change. Parallel with steps 2 or 3. Frozen 2026-07-25 -- Phase 2 was never done and nothing ever installed the Agent Skill the docs promised. |
 | 5    | **[FROZEN]** gpu-arbiter-cluster-mode Phase 1 | 2 weeks    | Yes       | Depends on sops-age (step 2). Long pole of the cluster work. Code in `attic/cluster-mode/` behind a build tag. |
 | 6    | **[FROZEN]** gpu-arbiter-cluster-mode Phase 1.5 | ~1 day   | Yes       | CI hard gate. Blocks Phase 2 of cluster-mode AND all of fleet-provisioner. |
-| 7    | mcp-gateway Phase 2                           | 2-3 days   | No        | Depends on sops-age (step 2) but not on cluster-mode. Can run in parallel with step 5 or after step 6. |
+| 7    | ~~mcp-gateway Phase 2~~ **DONE**              | --         | No        | Shipped; plan is **Done**. Retained as a row so the step numbering below still resolves. |
 | 8    | **[FROZEN]** gpu-arbiter-cluster-mode Phase 2 | 2 weeks    | Yes       | Head mode + routing. Required before any fleet-provisioner work. |
 | 9    | **[FROZEN]** skypilot-fleet-provisioner Phase 1 | 2-3 days | Yes       | API server stand-alone. Inherits cluster-mode worker bootstrap + sops-age scaffold. |
 | 10   | **[FROZEN]** skypilot-fleet-provisioner Phase 2 | 1-2 weeks | Yes      | Head <-> SkyPilot integration. Two-step graceful teardown per decision. |
@@ -385,9 +385,10 @@ of which is schedulable.
 repayment moved off `/health` onto a real engine response; see that plan's Phase 1
 for the deviations)**, ~~step 14~~ **(SHIPPED 2026-07-27 -- Claude Code now completes
 turns, incl. tool use, against vLLM and SGLang rows; folding the stray system message
-proved sufficient with no field filtering)**, step 1
-(~4 hours), then step 15 Phases 2-5 (~2 weeks + one GPU window) and step 13
-(~1.5 weeks). Step 2 (`sops-age-secrets`) is **Non-functional** rather than pending --
+proved sufficient with no field filtering)**, ~~step 1~~ **(CLOSED 2026-07-27 --
+bench-rewrite is Done; Phases 1-5 were already shipped and Phase 6 is struck, so the
+~4 hours was work that no longer existed)**, then step 15 Phases 2-5 (~2 weeks + one
+GPU window) and step 13 (~1.5 weeks). Step 2 (`sops-age-secrets`) is **Non-functional** rather than pending --
 it cannot encrypt anything until an age key exists and `.sops.yaml`'s `age1xxxx...`
 placeholder is replaced -- and two of its three intended consumers are frozen, so its
 "hard prerequisite" framing above now applies only to the MCP gateway's two
@@ -423,7 +424,7 @@ above the previous section.
 Side branches with no hard dependency on anything else. Since the critical path is now
 frozen (see above), most of this list is free-floating by default rather than by design.
 
-- bench-rewrite (step 1) -- can ship at any point.
+- bench-rewrite (step 1) -- **Done 2026-07-27**; nothing left to schedule.
 - **[FROZEN]** skypilot-agent-skill (step 4) -- lab image change only;
   decoupled from cluster mode. Parked 2026-07-25.
 - mcp-gateway Phase 1 (step 3) -- independent of sops-age and
@@ -458,11 +459,12 @@ frozen (see above), most of this list is free-floating by default rather than by
   `make bench-plan` / `make bench-sync`, bench verdicts in the exclusion
   ledger, backend-image digest stamped on every bench row. Phases 1-4 remain
   Draft.
-- kv-cache-quantization (Draft) -- single-mode router + tooling feature,
-  no hard deps and no dependents; ships at any point. Phase 1 (SGLang fp8
-  parity + fit-math correctness) is behavior-preserving and standalone;
-  Phase 3's bench-cache key change softly assumes bench-rewrite's v3
-  schema is already landed.
+- kv-cache-quantization -- **Superseded, do not schedule.** This entry
+  previously read `(Draft)`, contradicting the status table; the status
+  table wins, per the rule above. Its engine-side substance shipped under
+  a better per-probe-cell design, and its Phase 2 headline (flip Ollama
+  to q8_0 globally) is contradicted by this repo's own measured GPQA
+  regression and must NOT be executed.
 
 ## When this file becomes stale
 
@@ -484,28 +486,40 @@ the plan wins. Fix this file.
 
 ## Deferred: full snapshot refresh
 
-Known stale as of **2026-07-27**, deliberately NOT fixed in the same pass that added
-`sglang-backend-remediation` and marked the frozen steps. Recorded here so the next
-reader does not mistake it for current:
+Partially closed **2026-07-27**. What was fixed, and what genuinely remains:
 
-- **The snapshot narrative above is dated 2026-07-25** and reads as of that portfolio
-  review. It has not been re-verified since. Re-dating it means re-checking all 16 rows
-  against the tree, which is its own job -- the 2026-07-25 review found the previous
-  snapshot systematically over-stated, so a header date bump without that re-check would
-  repeat the mistake it was written to correct.
-- **The recommended-order table lists work that is already Done.** `mcp-gateway` is
-  **Done** (verified live, 134 tools), yet its Phase 1 and Phase 2 still appear as
-  schedulable steps 3 and 7. Steps 1 and 13 belong to plans marked *In Progress* and
-  should say which phases remain.
-- **`bench-rewrite` is In Progress with Phase 6 deferred to a live GPU**, which the
-  ~4 hours estimate at step 1 does not reflect.
-- **The parallelism map disagrees with the status table on one plan:** it lists
-  `kv-cache-quantization` as `(Draft)`, while the status table marks it **Superseded**.
-  The status table wins, per the rule above. The map entry should be rewritten or dropped.
+**Fixed in this pass** (each verified against the tree, not assumed):
+
+- ~~The recommended-order table lists work that is already Done.~~ Steps 3 and 7
+  (`mcp-gateway` Phases 1 and 2) are struck through and marked DONE. Step 1
+  (`bench-rewrite`) is struck through: Phases 1-5 shipped, Phase 6 is struck, so the
+  plan is now **Done** and the `~4 hours` estimate described work that no longer
+  existed. Steps 14 and 15-Phase-1 are struck as shipped in this same sequence.
+- ~~`bench-rewrite` is In Progress with Phase 6 deferred to a live GPU.~~ Closed.
+  Verified: cache is schema v3 with every row ctx-keyed and host-env-stamped, the
+  report renders CTX/Env, the picker reads the row for the ctx it is about to launch
+  (proved on a model with rows at two ctxs), and `make bench-plan` reports nothing to
+  bench. The plan's internal contradiction -- a rollout table still declaring all six
+  phases required while the banner struck Phase 6 -- is resolved in the plan itself.
+- ~~The parallelism map disagrees with the status table on `kv-cache-quantization`.~~
+  The map entry now reads **Superseded, do not schedule**, matching the status table.
+
+**Still outstanding:**
+
+- **The snapshot narrative above is still dated 2026-07-25** and has not been
+  re-verified wholesale. Rows touched by the 2026-07-27 execution sequence
+  (`bench-rewrite`, `router-anthropic-messages-compat`, `sglang-backend-remediation`,
+  `mcp-gateway`) are current; the remaining rows -- notably the two
+  **Done (unverified)** entries, `model-lifecycle-ledger` and `review-fixes-2026-07`
+  -- have NOT been re-checked and still require the live-GPU runs their own plans
+  demand. Re-dating the header means re-deriving all 16 rows against the tree, which
+  stays its own job: the 2026-07-25 review found the previous snapshot systematically
+  over-stated, so a date bump without that re-check would repeat the mistake it was
+  written to correct.
+- **The dependency graph has not been rebuilt.** It still draws `sops-age-secrets`
+  feeding three downstream plans, two of which are frozen.
 - The frozen steps were marked in place rather than removed, on the same reasoning as
   `attic/`: parked is not deleted, and the intended sequence is worth keeping.
 
-Doing this properly means one pass that re-derives every status from the tree and rebuilds
-all three views (status table, dependency graph, order table) together. Until then, treat
-the status table as authoritative for *state* and the order table as authoritative only
-for *intended sequence*.
+Until the snapshot narrative is re-derived, treat the status table as authoritative for
+*state* and the order table as authoritative only for *intended sequence*.

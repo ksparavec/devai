@@ -16,23 +16,57 @@
 
 ## Status
 
-**In Progress.** Phases 1-5 (schema + migrator + runner flags +
-picker + report + docs) shipped 2026-05-15 with full unit-test
-coverage in `tests/python/` (59 stdlib unittest cases, run via
-`make test-python`). The migrator runs idempotently on first writer
-invocation and the 9 historical rows hardcoded in
-`RECOVERED_CTX_MAP` get their context recovered from the
-2026-05-05 router log. Phase 6 (backfill) is deferred to a real
-GPU host -- it requires `~45-60 min` of live cold-start + bench
-runs against the project's RTX 4000 PRO Blackwell, which is
-out-of-scope for the current implementation pass; it lands as a
-separate commit once the host is available.
+**Done (2026-07-27).** Phases 1-5 shipped; Phase 6 is struck, not
+outstanding, so there is nothing left to execute.
+
+Phases 1-5 (schema + migrator + runner flags + picker + report +
+docs) shipped 2026-05-15 with unit-test coverage in `tests/python/`
+(run via `make test-python`). The migrator runs idempotently on first
+writer invocation and the 9 historical rows hardcoded in
+`RECOVERED_CTX_MAP` get their context recovered from the 2026-05-05
+router log.
 
 **Amended 2026-05-14**: Phase 6 (backfill) promoted from optional
 to required. Rationale captured in the "Phased rollout" section.
 
 **Amended 2026-05-15**: Phases 1-5 complete; only Phase 6 remains
 (deferred to live GPU bench session).
+
+**Amended 2026-07-25**: Phase 6 STRUCK -- see the banner at the top of
+this file. It targets a probe grid that no longer exists.
+
+**Closed 2026-07-27, verified against the tree rather than assumed:**
+
+- **Schema (Phase 1).** `deploy/.bench-cache.json` is `schema_version: 3`.
+  All 21 rows carry a `::<ctx>` key suffix, a `context` field and a
+  `host_env_id`; `_meta` carries `host_env_history` plus
+  `current_host_env_id`. Zero rows missing any of them.
+- **Report (Phase 4).** `make bench-report` renders the `CTX` and `Env`
+  columns and joins each row to `_meta.host_env_history`; it wrote no
+  tracked files (read-only, as designed).
+- **Picker (Phase 3).** Demonstrated by a case that can only go one way:
+  `gemma4:26b-a4b-it-q4_K_M` has bench rows at BOTH 128K (116.99 tok/s)
+  and 256K (110.82). The picker offers it at 256K and displays 110.8 --
+  i.e. it reads the row for the ctx it is about to launch and does not
+  silently substitute the other one. That is the exact failure this plan
+  was written to fix.
+- **Coverage (the re-filed Phase 6 intent).** `make bench-plan` now
+  reports **"nothing to bench: every target is current, dropped, or
+  excluded"** -- 10 current targets plus 1 ledger-excluded, across all
+  three backends. The gap recorded on 2026-07-25 ("14 of 27 pickable
+  rows have no bench row at the ctx the picker offers; all 8 SGLang rows
+  have none at all") has since been closed by the bench-sync loop; two
+  SGLang rows are benched and current.
+
+### Known gap, deliberately not closed here
+
+Five vLLM rows classify as `complete (unstamped image -- cannot judge
+staleness)`: they predate the backend-image digest stamping that
+`card-derived-hints-and-bench-sync` Phase 5 added, so if the vLLM image
+moves, `bench-plan` cannot mark them `stale_image`. Re-benching five
+models to acquire a stamp costs a multi-hour GPU window and changes no
+score. Left as a blind spot on purpose, recorded here rather than
+silently tolerated.
 
 ## Dependencies
 
@@ -384,7 +418,18 @@ needs:
 
 ## Phased rollout
 
-Six small commits, each green at HEAD. **All six phases (including
+Six small commits, each green at HEAD.
+
+> **Superseded 2026-07-25/27.** The paragraph below promoted Phase 6 to
+> required. Phase 6 is now STRUCK (see the banner at the top of this
+> file) and **Phases 1-5 alone constitute Done.** The paragraph is kept
+> because its reasoning was sound at the time and explains why the
+> requirement existed: what changed is the probe grid it assumed, not
+> the motivation. The motivation itself was met another way -- the
+> bench-sync loop now reports full coverage at the ctx each row is
+> actually offered at (see Status).
+
+**All six phases (including
 Phase 6 backfill) are required for the plan to be Done.** Phase 6
 was originally drafted as optional; promoted to required on
 2026-05-14 because the load-bearing motivation in the Context
@@ -403,7 +448,7 @@ this plan exists to fix.
 | 3 | **Picker consumer** | `model-picker.py` | Tuple key grows by one int. Pre-migration rows (ctx=0) treated as "no bench at this ctx" by lookup. |
 | 4 | **Report renderer** | `bench_report.py`, regenerate `docs/bench-results.md` | New CTX column; multi-ctx benches grouped by model. |
 | 5 | **Project docs** | `CLAUDE.md` | Schema description aligned with code. |
-| 6 (**required**) | **Backfill bench coverage** | bench-cache writes | Run `make bench --ctx 32K,64K,128K` over the 9 historical models to populate empty cells. ~45-60 min wall time. Plan is not Done until this lands. |
+| 6 (~~required~~ **STRUCK**) | ~~Backfill bench coverage~~ | -- | **Do not execute.** Targets a 32K/64K/128K/256K probe grid that no longer exists; the probers keep exactly one winner cell per (model, backend), so these rows would be unreadable by the picker. Intent re-filed under the bench-sync loop, which now reports full coverage. |
 
 Suggested commit messages (matching project style):
 
