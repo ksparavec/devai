@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -340,5 +341,244 @@ func TestWriteLaunchError_UnknownErrorIs503(t *testing.T) {
 	a.writeLaunchError(w, fmt.Errorf("podman create failed: connection refused"))
 	if w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("non-launchFailure error must default to 503, got %d", w.Code)
+	}
+}
+
+// --- SGLang terminal signatures (Phase 1, sglang-backend-remediation) ---
+//
+// Every log fixture below is CAPTURED from /var/cache/devai/logs/
+// devai-sglang.log, not invented. That matters: the whole defect class
+// here is the router failing to recognise a real corpse, so a test built
+// from a guessed banner would prove nothing.
+
+// sglangSchedulerDeathLog is the actual shape of the Ornith-1.0-9B-NVFP4
+// failure, verbatim from the log (180 occurrences). Note the `GET /health
+// ... 200 OK` on the line BEFORE the assert: the HTTP server keeps
+// answering health checks while the scheduler dies behind it, which is
+// exactly why /health is not evidence a launch was good.
+const sglangSchedulerDeathLog = `[2026-07-25 14:35:07] INFO:     10.89.0.23:55166 - "GET /health HTTP/1.1" 200 OK
+/pytorch/aten/src/ATen/native/cuda/TensorCompare.cu:112: _assert_async_cuda_kernel: block: [0,0,0], thread: [0,0,0] Assertion ` + "`" + `probability tensor contains either ` + "`" + `inf` + "`" + `, ` + "`" + `nan` + "`" + `
+[2026-07-25 14:35:08] Scheduler hit an exception: Traceback (most recent call last):
+  File "/sgl-workspace/sglang/python/sglang/srt/managers/scheduler.py", line 3616, in run_scheduler_process
+    scheduler.run_event_loop()`
+
+// sglangHealthyLaunchLog is a real successful SGLang cold start. The 503s
+// are the normal pre-ready state (SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION
+// makes /health run a real generation), so a signature set that fires on
+// this would abort every healthy launch.
+const sglangHealthyLaunchLog = `[2026-07-27 08:54:35] INFO:     Uvicorn running on http://0.0.0.0:11434 (Press CTRL+C to quit)
+[2026-07-27 08:54:36] INFO:     127.0.0.1:58294 - "GET /model_info HTTP/1.1" 200 OK
+[2026-07-27 08:54:36] INFO:     10.89.0.114:37694 - "GET /health HTTP/1.1" 503 Service Unavailable
+[2026-07-27 08:54:42] INFO:     10.89.0.114:37694 - "GET /health HTTP/1.1" 503 Service Unavailable
+[2026-07-27 08:54:43] Prefill batch, #new-seq: 1, #new-token: 6, #cached-token: 0, full token usage: 0.00
+[2026-07-27 08:54:44] INFO:     127.0.0.1:58310 - "POST /generate HTTP/1.1" 200 OK
+[2026-07-27 08:54:44] The server is fired up and ready to roll!`
+
+func TestDetectLaunchFailure_SGLangSchedulerExceptionIsTerminal(t *testing.T) {
+	// Container still reports "running" -- SGLang's HTTP server outlives
+	// its scheduler, which is the entire problem.
+	a := fakePodmanArbiter(`{"State":{"Status":"running","ExitCode":0}}`, sglangSchedulerDeathLog)
+	err := a.detectLaunchFailure("devai-sglang")
+	if err == nil {
+		t.Fatal("a dead SGLang scheduler must be detected as terminal, got nil")
+	}
+	if !strings.Contains(err.Error(), "Scheduler hit an exception") {
+		t.Fatalf("want the scheduler exception attributed, got %q", err)
+	}
+}
+
+func TestDetectLaunchFailure_SGLangDeviceSideAssertIsTerminal(t *testing.T) {
+	logs := "INFO loading weights\nRuntimeError: CUDA error: device-side assert triggered\n"
+	a := fakePodmanArbiter(`{"State":{"Status":"running","ExitCode":0}}`, logs)
+	if err := a.detectLaunchFailure("devai-sglang"); err == nil {
+		t.Fatal("a device-side assert must be terminal, got nil")
+	}
+}
+
+// The argparse rejection is lowercase (`error:`), which the `Error:`
+// anchor did not match before lastErrorLine became case-insensitive. It
+// was therefore filed under a generic container-exited tail with no root
+// cause -- and, while the container was still running, burned the full
+// 600s HEALTH_TIMEOUT_SECONDS first. String captured from the
+// Qwen3-Coder-30B-A3B-Instruct-FP4 cell in .sglang-reasoning-cache.json.
+func TestDetectLaunchFailure_SGLangArgparseRejectionIsAttributed(t *testing.T) {
+	logs := "usage: sglang serve [-h] [--model-path MODEL_PATH]\nsglang serve: error: unrecognized arguments: --enforce-eager\n"
+	a := fakePodmanArbiter(`{"State":{"Status":"running","ExitCode":0}}`, logs)
+	err := a.detectLaunchFailure("devai-sglang")
+	if err == nil {
+		t.Fatal("an argparse rejection must fail fast, not wait out HEALTH_TIMEOUT")
+	}
+	if !strings.Contains(err.Error(), "unrecognized arguments: --enforce-eager") {
+		t.Fatalf("want the rejected flag named in the error, got %q", err)
+	}
+}
+
+func TestDetectLaunchFailure_SGLangHealthyLaunchReturnsNil(t *testing.T) {
+	a := fakePodmanArbiter(`{"State":{"Status":"running","ExitCode":0}}`, sglangHealthyLaunchLog)
+	if err := a.detectLaunchFailure("devai-sglang"); err != nil {
+		t.Fatalf("a captured healthy SGLang launch must not fail-fast, got %v", err)
+	}
+}
+
+func TestLastErrorLine_IsCaseInsensitive(t *testing.T) {
+	logs := "sglang serve: error: unrecognized arguments: --enforce-eager"
+	if got := lastErrorLine(logs, failureAnchors); got == "" {
+		t.Fatal("lowercase 'error:' must match the Error: anchor")
+	}
+	// Returned text keeps the ORIGINAL casing, not the lowered copy.
+	if got := lastErrorLine(logs, failureAnchors); got != logs {
+		t.Fatalf("want the original line verbatim, got %q", got)
+	}
+}
+
+// --- Circuit-breaker repayment (Phase 1 step 3) ---
+
+// breakerSpent reads the budget under the breaker lock. Repayment now
+// runs on the proxy path, so an unlocked read here would be a race.
+func breakerSpent(bs *backendState) int {
+	bs.breakerMu.Lock()
+	defer bs.breakerMu.Unlock()
+	return bs.failedLaunches
+}
+
+// testBackendCredited is testBackend plus the production credit wiring:
+// the proxy repays the circuit breaker when the engine actually answers.
+func testBackendCredited(name string, server *httptest.Server) *backendState {
+	bs := testBackend(name, server)
+	u, _ := url.Parse(server.URL)
+	bs.proxy = newSmartProxy(u, false, bs.noteLaunchSucceeded)
+	return bs
+}
+
+// This is the regression for the Ornith crash loop, and it is the test
+// the three existing breaker tests cannot express: they drive the
+// counters directly, so they cannot see WHERE repayment is triggered
+// from. Against the old code -- repayment right after ensureBackendRunning
+// returned -- this fails, because reaching the proxy at all was treated
+// as proof the launch was good.
+//
+// Upstream answers 200 on /health and then drops the connection on the
+// real request, which is what a dead SGLang scheduler looks like on the
+// wire: 72 container recreates of one model in a single day.
+func TestMakeRequestHandler_BreakerNotRepaidWhenEngineDiesServing(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			t.Error("test server ResponseWriter must support hijacking")
+			return
+		}
+		conn, _, err := hj.Hijack()
+		if err == nil {
+			conn.Close() // no response at all -- the engine is a corpse
+		}
+	}))
+	defer server.Close()
+
+	bs := testBackendCredited("sglang", server)
+	bs.running = true
+	bs.currentModel = "test-model"
+	a := testArbiter(bs)
+
+	bs.noteLaunchAttempt(launchKey("test-model", 0))
+	if breakerSpent(bs) != 1 {
+		t.Fatalf("setup: want budget spent 1, got %d", breakerSpent(bs))
+	}
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"test-model","messages":[]}`))
+	a.makeRequestHandler("sglang")(w, req)
+
+	if got := breakerSpent(bs); got != 1 {
+		t.Fatalf("budget was repaid despite the engine never returning a response: spent=%d, want 1", got)
+	}
+}
+
+// Positive control: a healthy engine must still clear the budget, or the
+// breaker would refuse working models after maxFailedLaunches recreates.
+// Credit lands on the response HEADERS, so a long generation counts too.
+func TestMakeRequestHandler_BreakerRepaidOnRealResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"choices":[]}`))
+	}))
+	defer server.Close()
+
+	bs := testBackendCredited("sglang", server)
+	bs.running = true
+	bs.currentModel = "test-model"
+	a := testArbiter(bs)
+
+	bs.noteLaunchAttempt(launchKey("test-model", 0))
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"test-model","messages":[]}`))
+	a.makeRequestHandler("sglang")(w, req)
+
+	if got := breakerSpent(bs); got != 0 {
+		t.Fatalf("a real upstream response must repay the budget: spent=%d, want 0", got)
+	}
+}
+
+// A 5xx from the engine is NOT proof the launch was good. Without this
+// an engine that boots and then 500s every request keeps its budget
+// refilled forever -- the same unbounded loop in a different costume.
+func TestMakeRequestHandler_BreakerNotRepaidOnUpstream5xx(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"error":"internal"}`))
+	}))
+	defer server.Close()
+
+	bs := testBackendCredited("sglang", server)
+	bs.running = true
+	bs.currentModel = "test-model"
+	a := testArbiter(bs)
+
+	bs.noteLaunchAttempt(launchKey("test-model", 0))
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"test-model","messages":[]}`))
+	a.makeRequestHandler("sglang")(w, req)
+
+	if got := breakerSpent(bs); got != 1 {
+		t.Fatalf("an upstream 5xx must not repay the budget: spent=%d, want 1", got)
+	}
+}
+
+// The 500 -> 400 "maximum context length" rewrite in newSmartProxy runs
+// BEFORE the credit, so the breaker judges the status the client
+// actually sees. An over-long request is a client error against a
+// perfectly healthy engine and must not spend the launch budget.
+func TestMakeRequestHandler_BreakerRepaidOnRewrittenContextLength400(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"error":"This model's maximum context length is 4096 tokens"}`))
+	}))
+	defer server.Close()
+
+	bs := testBackendCredited("vllm", server)
+	bs.running = true
+	bs.currentModel = "test-model"
+	a := testArbiter(bs)
+
+	bs.noteLaunchAttempt(launchKey("test-model", 0))
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"test-model","messages":[]}`))
+	a.makeRequestHandler("vllm")(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("setup: want the 500->400 rewrite, got %d", w.Code)
+	}
+	if got := breakerSpent(bs); got != 0 {
+		t.Fatalf("a rewritten 400 must repay the budget: spent=%d, want 0", got)
 	}
 }

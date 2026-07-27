@@ -339,6 +339,10 @@ future reader needs to know how they were obtained.
 
 ## Phase 1 -- Stop the bleeding
 
+**SHIPPED 2026-07-27.** All five steps done; exit criteria met except the
+24-hour soak, which is time-based and still pending. One criterion was
+met differently than written -- see "Exit criteria" below.
+
 ### Goal
 
 End the live Ornith crash loop and make the router recognise a dead SGLang engine.
@@ -378,11 +382,45 @@ gpu-arbiter/lifecycle_test.go      modify -- handler-level breaker test
 
 - `Ornith-1.0-9B-NVFP4` no longer appears in the picker's SGLang rows, and a request
   for it on port 11436 is refused with a message naming the ledger entry.
+  **MET, with one deviation.** The picker hides the row (footer reports it under
+  "no context tier fits"), the router synthesises 9 SGLang rows instead of 10, and
+  `POST /v1/chat/completions` on 11436 returns
+  `404 {"error":"unknown model \"Ornith-1.0-9B-NVFP4\" for sglang"}`. The message does
+  NOT name the ledger entry: **the router does not read `deploy/.model-status.json`
+  at all** -- it gates on the probe cache, so `serving_ok: false` is what actually
+  refuses the model. Naming the ledger would mean teaching the router to read it,
+  which is not in this phase's deliverables. Filed as a Phase 3 candidate.
+  `Ornith-1.0-9B-NVFP4` on **vLLM** is untouched and still serves at 262144, as intended.
 - A synthetic SGLang log containing `Scheduler hit an exception` causes
-  `detectLaunchFailure` to abort within seconds in a unit test.
+  `detectLaunchFailure` to abort within seconds in a unit test. **MET** --
+  `TestDetectLaunchFailure_SGLangSchedulerExceptionIsTerminal`, built from the
+  captured log (note the `GET /health ... 200 OK` on the line before the assert),
+  with `TestDetectLaunchFailure_SGLangHealthyLaunchReturnsNil` as the negative
+  control against a real healthy cold start.
 - The new breaker test fails against current `main.go` and passes after step 3.
+  **MET, verified both ways.** With the repayment restored to its old position,
+  `TestMakeRequestHandler_BreakerNotRepaidWhenEngineDiesServing` and
+  `TestMakeRequestHandler_BreakerNotRepaidOnUpstream5xx` both fail with `spent=0`
+  (i.e. repaid); after the fix both pass. 357 router tests are race-clean.
 - 24 hours after deploy, `grep -c 'sglang with model' devai-router.log` for a single
-  model is in single digits.
+  model is in single digits. **PENDING** -- time-based; router redeployed
+  2026-07-27T17:39Z.
+
+### Deviation recorded during execution
+
+Repayment was moved to the proxy's `ModifyResponse` rather than to a
+post-`ServeHTTP` check, and the breaker counters were given their own
+`breakerMu` instead of continuing to rely on `arbiter.mu`. The mutex is
+not cosmetic: `stopOtherBackends` -> `drainBackend` holds `arbiter.mu`
+while busy-waiting for exactly the in-flight upstream requests that would
+now be taking it, so repaying under `arbiter.mu` would stall every
+backend switch under load for the full `DRAIN_TIMEOUT`. Lock order is
+`arbiter.mu` -> `breakerMu`, never the reverse.
+
+Credit is also given to **every** backend including Ollama. The breaker
+is generic over `backendState`, so wiring the callback only into the two
+HF backends would have made Ollama refuse healthy models after three
+recreates.
 
 ### Phase 1 risks
 

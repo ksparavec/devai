@@ -824,6 +824,20 @@ type backendState struct {
 	// switch to a different model or context starts a fresh budget rather
 	// than inheriting the previous model's failures.
 	failedLaunchKey string
+	// breakerMu guards failedLaunches/failedLaunchKey INDEPENDENTLY of
+	// arbiter.mu, because the repayment now happens on the proxy path.
+	//
+	// Repayment fires from ModifyResponse, i.e. inside proxy.ServeHTTP.
+	// stopOtherBackends -> drainBackend holds arbiter.mu while busy-waiting
+	// for exactly those in-flight upstream requests to finish, so taking
+	// arbiter.mu here would make every backend switch under load stall for
+	// the full DRAIN_TIMEOUT -- the same class of bug the upstreamReqs
+	// comment above records having already been fixed once.
+	//
+	// Lock order is arbiter.mu -> breakerMu, never the reverse. The
+	// attempt/exhausted paths run under arbiter.mu and take this as the
+	// inner lock; the repayment path takes only this one.
+	breakerMu sync.Mutex
 	// Recreate coalescing — without this, a second request that arrives
 	// during the 50–60s cold-start `waitForHealthy` window sees
 	// running=false, decides it needs its own recreate, and tears down
@@ -976,14 +990,36 @@ func noKeepAliveTransport() *http.Transport {
 	}
 }
 
-func newProxy(target *url.URL) *httputil.ReverseProxy {
+// creditLaunch reports a real upstream response to the circuit breaker.
+//
+// ModifyResponse is the right hook because it runs ONLY when the engine
+// actually produced a response, and it runs when the headers arrive
+// rather than at stream completion -- so a long generation still counts.
+// When the engine is dead the proxy never gets a response at all: the
+// default ErrorHandler synthesises a 502 without ever calling this, so
+// the budget correctly stays spent.
+//
+// A non-5xx status is required. A 4xx still credits -- the engine
+// answered, and a client schema error says nothing about the launch --
+// but an engine returning 5xx to everything has not demonstrably served.
+func creditLaunch(onServed func(), resp *http.Response) {
+	if onServed != nil && resp.StatusCode < 500 {
+		onServed()
+	}
+}
+
+func newProxy(target *url.URL, onServed func()) *httputil.ReverseProxy {
 	p := httputil.NewSingleHostReverseProxy(target)
 	p.FlushInterval = -1
 	p.Transport = noKeepAliveTransport()
+	p.ModifyResponse = func(resp *http.Response) error {
+		creditLaunch(onServed, resp)
+		return nil
+	}
 	return p
 }
 
-func newSmartProxy(target *url.URL, imageStale bool) *httputil.ReverseProxy {
+func newSmartProxy(target *url.URL, imageStale bool, onServed func()) *httputil.ReverseProxy {
 	p := httputil.NewSingleHostReverseProxy(target)
 	p.FlushInterval = -1
 	p.Transport = noKeepAliveTransport()
@@ -1005,6 +1041,10 @@ func newSmartProxy(target *url.URL, imageStale bool) *httputil.ReverseProxy {
 			}
 			resp.Body = io.NopCloser(bytes.NewReader(body))
 		}
+		// Credited LAST, so the breaker judges the same status the client
+		// sees. An over-long request arrives as a 500 and leaves as a 400:
+		// that is the engine answering a client error, not a bad launch.
+		creditLaunch(onServed, resp)
 		return nil
 	}
 	return p
@@ -1822,21 +1862,25 @@ func buildArbiter() *arbiter {
 			log.Printf("WARNING: %s image drift -- probe cache captured on %s but running image %s is %s; serving with X-DevAI-Warning. Re-run `make probe-%s`.",
 				bc.Name, probed, bc.Image, running, bc.Name)
 		}
-		var proxy *httputil.ReverseProxy
-		if bc.Name == "ollama" {
-			proxy = newProxy(bc.BackendURL)
-		} else {
-			proxy = newSmartProxy(bc.BackendURL, stale)
-		}
-		a.backends[bc.Name] = &backendState{
+		bs := &backendState{
 			config:             bc,
-			proxy:              proxy,
 			modelNames:         modelsForBackend(cfg.Models, bc.Name),
 			recreateCond:       sync.NewCond(&a.mu),
 			imageStale:         stale,
 			probedImageDigest:  probed,
 			runningImageDigest: running,
 		}
+		// Every backend gets the credit callback, Ollama included: the
+		// breaker is generic over backendState, so a backend whose proxy
+		// never credited would be refused after maxFailedLaunches
+		// recreates of a perfectly healthy model.
+		onServed := bs.noteLaunchSucceeded
+		if bc.Name == "ollama" {
+			bs.proxy = newProxy(bc.BackendURL, onServed)
+		} else {
+			bs.proxy = newSmartProxy(bc.BackendURL, stale, onServed)
+		}
+		a.backends[bc.Name] = bs
 	}
 
 	return a
@@ -2163,6 +2207,21 @@ var terminalLaunchErrors = []string{
 	"quantization is not supported",
 	"Model architectures", // "Model architectures ['X'] are not supported" -- specific anchor; the bare "are not supported" tail can hit benign startup warnings (see scripts/_probe_hf_common.py:722-732)
 	"is not a supported model type",
+
+	// SGLang. Sourced from the recorded devai-sglang.log, not guessed.
+	//
+	// "Scheduler hit an exception" appears exactly 180 times, matching the
+	// 180 occurrences of the CUDA device-side assert that causes it. When
+	// the scheduler dies SGLang's HTTP server keeps answering, so nothing
+	// else in this router recognises the corpse -- that is precisely how
+	// one model produced 72 recreates in a day. Both strings are exception
+	// text, never banner text: neither appears in the healthy-launch
+	// banner hazard documented at scripts/_probe_hf_common.py:862-868.
+	"Scheduler hit an exception",
+	"device-side assert triggered",
+	// An argparse rejection is fatal immediately, but without this the
+	// router waits out the full HEALTH_TIMEOUT_SECONDS (600s) first.
+	"unrecognized arguments",
 }
 
 // failureAnchors mark the root-cause line of a crash. Trusted only once the
@@ -2225,14 +2284,24 @@ func demuxDockerStream(raw []byte) string {
 // lastErrorLine returns the last (trimmed) log line containing any of the
 // substrings, or "". Last-match wins so a traceback yields its final
 // exception line (the root cause) rather than the "Traceback" header.
+//
+// Matching is case-INSENSITIVE. Engines do not agree on case: SGLang
+// emits `sglang serve: error: unrecognized arguments: ...` in lowercase,
+// which the `Error:` anchor missed, so an argparse rejection was filed
+// under a generic container-exited tail with no root cause attributed.
 func lastErrorLine(logs string, sigs []string) string {
 	if logs == "" {
 		return ""
 	}
+	lowered := make([]string, len(sigs))
+	for i, sig := range sigs {
+		lowered[i] = strings.ToLower(sig)
+	}
 	lines := strings.Split(logs, "\n")
 	for i := len(lines) - 1; i >= 0; i-- {
-		for _, sig := range sigs {
-			if strings.Contains(lines[i], sig) {
+		lowerLine := strings.ToLower(lines[i])
+		for _, sig := range lowered {
+			if strings.Contains(lowerLine, sig) {
 				return strings.TrimSpace(lines[i])
 			}
 		}
@@ -2314,9 +2383,11 @@ func launchKey(modelName string, ctx int) string {
 }
 
 // noteLaunchAttempt spends one unit of the circuit-breaker budget for
-// (model, ctx). Called with a.mu held. A different key starts a fresh
-// budget so one model's failures are never charged to another's.
+// (model, ctx). A different key starts a fresh budget so one model's
+// failures are never charged to another's.
 func (bs *backendState) noteLaunchAttempt(key string) {
+	bs.breakerMu.Lock()
+	defer bs.breakerMu.Unlock()
 	if bs.failedLaunchKey != key {
 		bs.failedLaunchKey = key
 		bs.failedLaunches = 0
@@ -2324,16 +2395,28 @@ func (bs *backendState) noteLaunchAttempt(key string) {
 	bs.failedLaunches++
 }
 
-// noteLaunchSucceeded clears the budget. Called with a.mu held, at the
-// point a request is handed to the backend.
+// noteLaunchSucceeded clears the budget. Called from the proxy path the
+// moment the engine returns a real, non-5xx response -- which is the
+// only evidence that a launch was actually good.
 //
-// Deliberately unkeyed: whatever is running right now just accepted a
+// It must NOT be called when /health first answers. SGLang's Ornith cell
+// passed /health, then died serving, and the budget was repaid on every
+// cycle -- producing 72 container recreates of one model in one day with
+// zero completed work. /health proves a listener exists; it does not
+// prove the engine can serve.
+//
+// Credit lands when the response HEADERS arrive, not at stream
+// completion, so a long generation still counts.
+//
+// Deliberately unkeyed: whatever is running right now just answered a
 // request, so the currently-running launch is good, full stop. Keying
 // this would reintroduce the bug it is meant to prevent -- the attempt
 // is charged against the RESOLVED ctx while the request is served at the
 // LAUNCHED ctx, and any drift between those two would leave the budget
 // permanently unreset and eventually refuse a working model.
 func (bs *backendState) noteLaunchSucceeded() {
+	bs.breakerMu.Lock()
+	defer bs.breakerMu.Unlock()
 	bs.failedLaunches = 0
 	bs.failedLaunchKey = ""
 }
@@ -2344,6 +2427,8 @@ func (bs *backendState) launchBudgetExhausted(key string) bool {
 	if maxFailedLaunches <= 0 {
 		return false
 	}
+	bs.breakerMu.Lock()
+	defer bs.breakerMu.Unlock()
 	return bs.failedLaunchKey == key && bs.failedLaunches >= maxFailedLaunches
 }
 
@@ -2351,6 +2436,11 @@ func (bs *backendState) launchBudgetExhausted(key string) bool {
 // It is the ONLY signal they get, so it names the model, the context it
 // failed at, and both ways out -- re-probe, or ask for a smaller ctx.
 func refusalMessage(bs *backendState, modelName string, ctx int) string {
+	// Read the count under the breaker lock: repayment now runs on the
+	// proxy path and can land concurrently with this formatting.
+	bs.breakerMu.Lock()
+	spent := bs.failedLaunches
+	bs.breakerMu.Unlock()
 	return fmt.Sprintf(
 		"%s: %s failed to serve %d consecutive launches at ctx=%d and is now "+
 			"refused. The engine started and passed /health but died before "+
@@ -2358,7 +2448,7 @@ func refusalMessage(bs *backendState, modelName string, ctx int) string {
 			"sustain that context. Re-measure it with `make probe-load-%s`, "+
 			"or request a smaller `@<ctx>`. Requesting a different model "+
 			"clears this; DEVAI_MAX_FAILED_LAUNCHES=0 disables the guard.",
-		bs.config.Name, modelName, bs.failedLaunches, ctx, bs.config.Name)
+		bs.config.Name, modelName, spent, ctx, bs.config.Name)
 }
 
 // healthProbeAttempts is how many times backendVanished retries /health
@@ -3604,10 +3694,11 @@ func (a *arbiter) makeRequestHandler(backendName string) http.HandlerFunc {
 		// sees this request in drainBackend instead of pulling the backend
 		// out from under it.
 		atomic.AddInt64(&bs.upstreamReqs, 1)
-		// Repay the circuit-breaker budget: this (model, ctx) has now
-		// actually served a request, which is the only proof a launch was
-		// good. Done under a.mu, which we still hold. See maxFailedLaunches.
-		bs.noteLaunchSucceeded()
+		// NOTE: the circuit-breaker budget is NOT repaid here. Reaching
+		// this line only means /health answered, which a dead-scheduler
+		// engine does too. Repayment happens from the proxy's
+		// ModifyResponse, once the engine returns a real non-5xx response.
+		// See maxFailedLaunches and noteLaunchSucceeded.
 		a.mu.Unlock()
 		defer atomic.AddInt64(&bs.upstreamReqs, -1)
 

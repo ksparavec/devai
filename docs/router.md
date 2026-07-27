@@ -642,6 +642,7 @@ the shell when invoking compose.
 | `MAX_CONCURRENT_REQUESTS`| `32`    | max in-flight requests per backend before HTTP 429; `0` = unlimited **and** omits `--max-num-seqs` / `--max-running-requests` entirely (engine default). Any positive value is also passed to the engine as that flag. |
 | `DEVAI_SSE_KEEPALIVE_SECONDS` | `10` | interval between `: keepalive` SSE comment frames during a slow launch; `0` disables the feature |
 | `DEVAI_SSE_KEEPALIVE_GRACE_SECONDS` | `5` | how long a launch may take before the first frame is sent (and the response is committed as SSE) |
+| `DEVAI_MAX_FAILED_LAUNCHES` | `3` | consecutive launches of the same `(model, ctx)` that may fail to produce a real engine response before the router refuses; `0` disables the breaker. See [Launch circuit breaker](#launch-circuit-breaker-engine-dies-after-passing-health). |
 
 ### SSE keepalive during cold start
 
@@ -760,6 +761,50 @@ consumer GPUs; sometimes longer on first-ever load (kernel
 JIT-compilation cached afterwards). Fix: bump
 `HEALTH_TIMEOUT_SECONDS=900` and retry, or rerun the request -- the
 second attempt usually hits warm caches.
+
+### Launch circuit breaker (engine dies after passing `/health`)
+
+```
+sglang: Ornith-1.0-9B-NVFP4 failed to serve 3 consecutive launches at
+ctx=131072 and is now refused. The engine started and passed /health but
+died before completing a request ...
+```
+
+Cause: an engine that launches cleanly, answers `/health`, and then dies
+serving. `detectLaunchFailure` cannot see this -- it catches an engine
+that dies *during* launch. Without a breaker the router relaunches
+forever: one SGLang model was recreated **72 times in a single day**,
+completing zero work and holding the GPU throughout. `podman inspect`
+reports `RestartCount: 0` the whole time, because each cycle is a brand
+new container, so that counter is no use for spotting it.
+
+Behaviour: each launch of a `(model, ctx)` spends one unit of a budget
+(`DEVAI_MAX_FAILED_LAUNCHES`, default 3; `0` disables the breaker). The
+budget is repaid **only when the engine returns a real, non-5xx
+response**, which is the only evidence a launch was actually good.
+Repayment fires from the proxy's `ModifyResponse`, i.e. when the
+response headers arrive -- so a long generation still counts, while an
+engine that never answers gets no credit (the proxy's default error
+handler synthesises a 502 without ever reaching that hook). On
+exhaustion the router refuses with the message above, naming the model,
+the context, and both remedies.
+
+Two deliberate details:
+
+- **`/health` is not proof.** SGLang's HTTP server outlives its
+  scheduler, so a corpse keeps answering `200 OK` on `/health` while
+  every real request fails. Crediting there is what made the 72-recreate
+  loop possible.
+- **The reset is unkeyed.** Whatever is running right now just answered,
+  so the running launch is good, full stop. Keying it would reintroduce
+  the bug it prevents: the attempt is charged against the *resolved*
+  ctx while the request is served at the *launched* ctx, and any drift
+  would leave the budget permanently unreset and eventually refuse a
+  working model.
+
+Fix: re-measure the model (`make probe-load-vllm` / `probe-load-sglang`)
+or request a smaller `@<ctx>`. Requesting a different model clears the
+budget.
 
 ### Backend image drift (serve-with-warning)
 

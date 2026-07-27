@@ -23,7 +23,7 @@ func testBackend(name string, server *httptest.Server) *backendState {
 			BackendURL: u,
 			HealthPath: "/health",
 		},
-		proxy: newProxy(u),
+		proxy: newProxy(u, nil),
 		// Default allowlist for tests: production code populates this
 		// from modelsForBackend(cfg.Models, bc.Name) at startup. The
 		// handler's allowlist check (HI4) refuses unknown vllm/sglang
@@ -879,7 +879,7 @@ func TestSmartProxy_RewritesContextOverflow(t *testing.T) {
 	defer backend.Close()
 
 	u, _ := url.Parse(backend.URL)
-	proxy := newSmartProxy(u, false)
+	proxy := newSmartProxy(u, false, nil)
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
 	w := httptest.NewRecorder()
@@ -898,7 +898,7 @@ func TestSmartProxy_PassesThroughOtherErrors(t *testing.T) {
 	defer backend.Close()
 
 	u, _ := url.Parse(backend.URL)
-	proxy := newSmartProxy(u, false)
+	proxy := newSmartProxy(u, false, nil)
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
 	w := httptest.NewRecorder()
@@ -922,7 +922,7 @@ func TestSmartProxy_ImageStaleSetsWarningHeader(t *testing.T) {
 	u, _ := url.Parse(backend.URL)
 
 	// Not stale -> no header.
-	fresh := newSmartProxy(u, false)
+	fresh := newSmartProxy(u, false, nil)
 	wf := httptest.NewRecorder()
 	fresh.ServeHTTP(wf, httptest.NewRequest("POST", "/v1/chat/completions", nil))
 	if got := wf.Header().Get("X-DevAI-Warning"); got != "" {
@@ -930,7 +930,7 @@ func TestSmartProxy_ImageStaleSetsWarningHeader(t *testing.T) {
 	}
 
 	// Stale -> header present.
-	stale := newSmartProxy(u, true)
+	stale := newSmartProxy(u, true, nil)
 	ws := httptest.NewRecorder()
 	stale.ServeHTTP(ws, httptest.NewRequest("POST", "/v1/chat/completions", nil))
 	if got := ws.Header().Get("X-DevAI-Warning"); got == "" {
