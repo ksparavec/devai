@@ -1941,7 +1941,60 @@ func runSingleHost(a *arbiter) {
 	log.Printf("gpu-arbiter started: idle=%s drain=%ds health=%ds max_concurrent=%d",
 		idleDesc, int(a.drainTimeout.Seconds()), int(a.healthTimeout.Seconds()), a.maxConcurrent)
 
+	a.reconcileBackendState()
+
 	select {} // block forever
+}
+
+// reconcileBackendState adopts backends that were already serving when
+// this router process started.
+//
+// GPU exclusion is driven entirely by in-memory state: stopOtherBackends
+// skips any backend whose `running` and `containerLaunched` are both
+// false. Those start false in a fresh process, so a router restarted
+// while a backend held the GPU believed the GPU was free -- and the next
+// request to a DIFFERENT backend launched an engine into a card that was
+// already ~22 of 24 GB committed. The engine dies with "Engine core
+// initialization failed", which reads like a bad model or a bad context
+// rather than what it is.
+//
+// That is not hypothetical: it is what a routine `make build-router` +
+// recreate did on this host while devai-sglang was serving, and the
+// symptom gives no hint that a stale sibling is the cause.
+//
+// The reconciliation is a health probe, not a container-state check.
+// devai-vllm and devai-sglang exist as `sleep infinity` placeholders
+// whenever compose has run, so "container is running" says nothing; only
+// an answer on /health distinguishes a live engine from a placeholder.
+//
+// Ollama is skipped deliberately. Its container is always up and always
+// answers /health, so probing tells us nothing about whether a model is
+// resident -- and `running` for Ollama means "a model is loaded", which
+// unloadOllama already establishes from /api/ps at switch time.
+//
+// currentModel is deliberately left empty: the reconciliation knows a
+// backend is live but not what it loaded. The cost is one extra recreate
+// if the next request happens to want the model already resident; the
+// alternative -- trusting a guess -- risks serving a request from the
+// wrong weights, which is far worse than a cold start.
+func (a *arbiter) reconcileBackendState() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for name, bs := range a.backends {
+		if name == "ollama" {
+			continue
+		}
+		if !a.backendIsServing(bs) {
+			continue
+		}
+		bs.running = true
+		bs.containerLaunched = true
+		bs.currentModel = ""
+		bs.currentContext = 0
+		log.Printf("adopted already-serving backend %s (model unknown; it "+
+			"will be stopped on a switch, or recreated on its next request)",
+			name)
+	}
 }
 
 // --- Podman container management ---

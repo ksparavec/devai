@@ -188,6 +188,34 @@ cold start is paid once per model, not again after every idle gap. Set
 a backend idle longer than the timeout is stopped and replaced with the
 `sleep infinity` placeholder.
 
+### Router restart while a backend is serving
+
+GPU exclusion is driven entirely by in-memory state: `stopOtherBackends`
+skips any backend whose `running` and `containerLaunched` are both false.
+Both start false in a fresh process, so a router restarted while a
+backend held the GPU used to believe the GPU was free -- and the next
+request to a *different* backend launched an engine into an
+already-committed card. The engine dies with "Engine core initialization
+failed", which reads like a bad model or a bad context rather than what
+it is. Observed on a routine `make build-router` + recreate while
+`devai-sglang` was serving: 22.3 of 24.5 GB were already taken and the
+vLLM launch had no chance.
+
+`reconcileBackendState` runs once at startup and adopts any HF backend
+that answers `/health`. It is a health probe rather than a container
+check on purpose: `devai-vllm` and `devai-sglang` exist as `sleep
+infinity` placeholders whenever compose has run, so "container running"
+says nothing -- only an answer on `/health` separates a live engine from
+a placeholder. Ollama is skipped: its container is always up and always
+answers, and `running` for Ollama means "a model is loaded", which
+`unloadOllama` establishes from `/api/ps` at switch time.
+
+The adopted backend's `currentModel` is deliberately left empty. The
+router knows a backend is live but not what it loaded; the cost is one
+extra recreate if the next request happens to want the resident model,
+and the alternative -- trusting a guess -- risks serving from the wrong
+weights.
+
 ### Backend switch (GPU exclusion)
 
 When a request hits a different backend than the one currently on the
