@@ -207,6 +207,12 @@ COPY scripts/sky-setup.sh /usr/local/bin/sky-setup.sh
 # bin/devai-agent additionally bind-mounts a host copy over this for
 # hot-update workflows.
 COPY scripts/_capability.py /usr/local/bin/_capability.py
+# Exclusion ledger reader. The picker imports it to hide (model, backend)
+# rows an operator has recorded a bench verdict for. Co-located for the
+# same reason as _capability, and likewise bind-mountable from the host.
+# The picker treats it as OPTIONAL -- an older image without it degrades
+# to showing every row rather than failing to start.
+COPY scripts/_model_status.py /usr/local/bin/_model_status.py
 COPY scripts/vram-fit.py /usr/local/bin/vram-fit.py
 COPY deploy/models.yaml /etc/devai/models.yaml
 RUN chmod +x /usr/local/bin/ollama-chat /usr/local/bin/aider-launcher /usr/local/bin/late /usr/local/bin/aiagent-shell /usr/local/bin/agent-picker /usr/local/bin/model-picker /usr/local/bin/sky-setup.sh

@@ -170,7 +170,8 @@ PROBE_CACHE_MOUNT = \
 	$(if $(wildcard deploy/.ollama-reasoning-cache.json),-v $(CURDIR)/deploy/.ollama-reasoning-cache.json:/etc/devai/.ollama-reasoning-cache.json:ro) \
 	$(if $(wildcard deploy/.vllm-reasoning-cache.json),-v $(CURDIR)/deploy/.vllm-reasoning-cache.json:/etc/devai/.vllm-reasoning-cache.json:ro) \
 	$(if $(wildcard deploy/.sglang-reasoning-cache.json),-v $(CURDIR)/deploy/.sglang-reasoning-cache.json:/etc/devai/.sglang-reasoning-cache.json:ro) \
-	$(if $(wildcard deploy/.bench-cache.json),-v $(CURDIR)/deploy/.bench-cache.json:/etc/devai/.bench-cache.json:ro)
+	$(if $(wildcard deploy/.bench-cache.json),-v $(CURDIR)/deploy/.bench-cache.json:/etc/devai/.bench-cache.json:ro) \
+	$(if $(wildcard deploy/.model-status.json),-v $(CURDIR)/deploy/.model-status.json:/etc/devai/.model-status.json:ro)
 
 # User switching: only needed for docker (rootless podman root = host user)
 USER_ENV =
@@ -1536,6 +1537,7 @@ install: ## Install bin/devai-agent to $(INSTALL_PREFIX)/bin and stage config in
 	@# would fail when devai-agent bind-mounts the host picker over the
 	@# in-image one without bind-mounting the constants module too.
 	@ln -sf "$(CURDIR)/scripts/_capability.py" $(DEVAI_HOME)/_capability.py
+	@ln -sf "$(CURDIR)/scripts/_model_status.py" $(DEVAI_HOME)/_model_status.py
 	@# Symlink each backend's probe cache so it stays fresh as the prober
 	@# regenerates it. If users want a frozen snapshot they can replace the
 	@# link with a copy after install. Missing caches are warned but not
@@ -1561,6 +1563,13 @@ install: ## Install bin/devai-agent to $(INSTALL_PREFIX)/bin and stage config in
 	else \
 		echo "  WARNING: $$bench_src missing — run 'make bench-vllm' to populate picker score columns"; \
 	fi
+	@# Exclusion ledger: lets the picker hide rows an operator recorded a
+	@# bench verdict for. Absent just means nothing is hidden.
+	@ledger_src="$(CURDIR)/deploy/.model-status.json"; \
+	if [ -f "$$ledger_src" ]; then \
+		ln -sf "$$ledger_src" "$(DEVAI_HOME)/.model-status.json"; \
+		echo "  linked: $(DEVAI_HOME)/.model-status.json"; \
+	fi
 	@echo "  linked: $(DEVAI_HOME)/model-picker.py"
 	@echo "  installed: $(INSTALL_PREFIX)/bin/devai-agent"
 	@echo
@@ -1577,6 +1586,8 @@ uninstall: ## Remove devai-agent launcher and the staged config dir
 	@rm -f $(DEVAI_HOME)/.bench-cache.json
 	@rm -f $(DEVAI_HOME)/model-picker.py
 	@rm -f $(DEVAI_HOME)/_capability.py
+	@rm -f $(DEVAI_HOME)/_model_status.py
+	@rm -f $(DEVAI_HOME)/.model-status.json
 	@echo "Removed $(INSTALL_PREFIX)/bin/devai-agent and the symlinks under $(DEVAI_HOME)/."
 	@echo "preferences.yaml and sessions/ are kept; remove $(DEVAI_HOME)/ manually if you want a clean slate."
 

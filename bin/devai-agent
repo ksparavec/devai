@@ -59,6 +59,10 @@ PICKER_SRC = CONFIG_DIR / "model-picker.py"
 # The picker imports `_capability` at module load -- bind-mounted next
 # to the picker so the import resolves on the in-container PYTHONPATH.
 CAPABILITY_SRC = CONFIG_DIR / "_capability.py"
+# Same for the exclusion-ledger reader, which the picker imports to hide
+# rows carrying an operator-recorded bench verdict. Optional in the
+# picker, so an image predating it still starts.
+MODEL_STATUS_SRC = CONFIG_DIR / "_model_status.py"
 SESSIONS_DIR = CONFIG_DIR / "sessions"
 PICK_BACK_CHANNEL = CONFIG_DIR / ".last-pick.json"
 
@@ -79,6 +83,8 @@ PROBE_CACHES = {
 # picker renders the four score columns as '-' and the sort modes
 # still work, just with all rows tied at no-data.
 BENCH_CACHE = CONFIG_DIR / ".bench-cache.json"
+# Exclusion ledger -- the picker hides rows carrying a bench verdict.
+MODEL_STATUS_CACHE = CONFIG_DIR / ".model-status.json"
 
 DEFAULTS: dict = {
     "vram": 24,
@@ -350,6 +356,9 @@ def build_run_cmd(
     # repo's deploy/.bench-cache.json is fully populated.
     if BENCH_CACHE.exists():
         cmd += ["-v", f"{BENCH_CACHE}:/etc/devai/.bench-cache.json:ro"]
+    if MODEL_STATUS_CACHE.is_file():
+        cmd += ["-v",
+                f"{MODEL_STATUS_CACHE}:/etc/devai/.model-status.json:ro"]
 
     # Override the baked-in /usr/local/bin/model-picker with the host copy
     # so improvements made in the repo (and copied to ~/.devai/ by
@@ -359,6 +368,9 @@ def build_run_cmd(
     # Same for the Capability constants module the picker imports.
     if CAPABILITY_SRC.is_file():
         cmd += ["-v", f"{CAPABILITY_SRC}:/usr/local/bin/_capability.py:ro"]
+    # Same for the exclusion-ledger reader.
+    if MODEL_STATUS_SRC.is_file():
+        cmd += ["-v", f"{MODEL_STATUS_SRC}:/usr/local/bin/_model_status.py:ro"]
 
     cmd += [*optional_mounts()]
 

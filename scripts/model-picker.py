@@ -46,7 +46,19 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 from _capability import Capability  # noqa: E402
-import _model_status as _MS  # noqa: E402
+
+# _model_status is OPTIONAL at import time, unlike _capability.
+#
+# bin/devai-agent bind-mounts the HOST copy of this script over the
+# baked-in /usr/local/bin/model-picker, so a freshly edited picker
+# routinely runs inside an older image. A hard import here took the whole
+# picker down with ModuleNotFoundError the moment the ledger gate was
+# added -- before any image had the module. The gate is a filter, not a
+# core function: losing it shows more rows, losing the picker shows none.
+try:
+    import _model_status as _MS  # noqa: E402
+except ImportError:                     # pragma: no cover - image-skew path
+    _MS = None
 
 
 def _bench_ledger() -> dict:
@@ -58,10 +70,17 @@ def _bench_ledger() -> dict:
     """
     global _BENCH_LEDGER
     if _BENCH_LEDGER is None:
-        try:
-            _BENCH_LEDGER = _MS.load_ledger()
-        except Exception:
-            _BENCH_LEDGER = {"models": {}}   # fail open: show everything
+        if _MS is None:
+            _BENCH_LEDGER = {"models": {}}   # module absent -> no verdicts
+        else:
+            try:
+                path = next(
+                    (Path(p) for p in _MODEL_STATUS_PATHS if Path(p).is_file()),
+                    None)
+                _BENCH_LEDGER = (
+                    _MS.load_ledger(path) if path else {"models": {}})
+            except Exception:
+                _BENCH_LEDGER = {"models": {}}   # fail open: show everything
     return _BENCH_LEDGER
 
 
@@ -83,6 +102,17 @@ _PROBE_CACHE_PATHS = [
 _VLLM_PROBE_CACHE_PATHS = [
     "/etc/devai/.vllm-reasoning-cache.json",
     str(Path(__file__).resolve().parent.parent / "deploy" / ".vllm-reasoning-cache.json"),
+]
+
+# Exclusion ledger. Same dual-path shape as the probe caches: the
+# container sees /etc/devai (bind-mounted by bin/devai-agent and the
+# Makefile), a repo checkout sees deploy/. Resolving it from
+# _model_status.LEDGER_PATH does NOT work in the container -- that module
+# derives its path from __file__, which is /usr/local/bin there, so the
+# lookup lands on /usr/deploy and silently reads an empty ledger.
+_MODEL_STATUS_PATHS = [
+    "/etc/devai/.model-status.json",
+    str(Path(__file__).resolve().parent.parent / "deploy" / ".model-status.json"),
 ]
 
 _SGLANG_PROBE_CACHE_PATHS = [
@@ -2651,7 +2681,7 @@ def _build_candidates(
         # same silent-exclusion shape that hid Ornith for a day on a
         # 256K-only serving verdict. `make model-status CLEAR=<n>::<b>`
         # puts a row back.
-        if _MS.is_bench_excluded(
+        if _MS is not None and _MS.is_bench_excluded(
                 _bench_ledger(), name_key, backend_key,
                 ctx=ctx_key or None, sha=decorated.get("sha")):
             hidden["bench_excluded"] += 1
