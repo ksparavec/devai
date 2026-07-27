@@ -138,17 +138,33 @@ _BACKENDS: dict[str, tuple[str, str, int]] = {
     "sglang": ("SGLang", "NVFP4 tensor cores — RadixAttention, multi-turn optimized", 11436),
 }
 
-# Backends actually surfaced as picker rows. SGLang stays in _BACKENDS,
-# in the router, in `make probe-sglang`, and in select-models.py because
-# the infrastructure still works and may be useful for chat-only direct
-# access — but its OpenAI-compat surface is too thin for current agent
-# flows: gpt-oss community parsers mangle harmony tool/reasoning channels
-# (vLLM uses OpenAI's official `openai_gptoss`/`openai` parsers instead),
-# Codex 0.124+ /v1/responses tools schema only accepts hosted-tool types
-# (rejects `function`), Claude Code's split-model orchestration races on
-# the long cold-start path. Re-enable by adding "sglang" back here when
-# upstream parser/Responses-API support catches up.
-_PICKER_BACKENDS: tuple[str, ...] = ("ollama", "vllm")
+# Backends actually surfaced as picker rows.
+#
+# SGLang was hidden here on 2026-05-01 (87aa382) because its OpenAI-compat
+# surface was too thin for the agent flows: gpt-oss community parsers
+# mangled harmony tool/reasoning channels (vLLM uses OpenAI's official
+# `openai_gptoss`/`openai` parsers), Codex 0.124+ /v1/responses accepts
+# only hosted-tool types and rejects `function`, and Claude Code's
+# split-model orchestration raced on the long cold-start path.
+#
+# Re-enabled 2026-07-27 by operator decision, with SGLang now probed and
+# benched on this fleet. What changed, and what did not:
+#
+#   - Tool calling measured rather than assumed: gpt-oss-20b scores
+#     TOOLS 0.90 on SGLang against 0.95 on vLLM (deploy/.bench-cache.json),
+#     so the harmony channels are usable, not mangled.
+#   - The cold-start window no longer starves a streaming client: the
+#     router emits SSE keepalive comment frames past a grace period
+#     (gpu-arbiter/sse_keepalive.go).
+#   - Codex's /v1/responses schema limitation is upstream and UNCHANGED.
+#     Agents that drive that surface should stay on vLLM; nothing here
+#     forces them onto SGLang, since the picker offers one row per
+#     (model, backend) and the operator picks.
+#
+# Ordering matters: _dedup_hf_rows keeps one row per (model, backend)
+# and ranks vllm above sglang, so a model probed on both still leads
+# with its vLLM row while the SGLang row stays selectable.
+_PICKER_BACKENDS: tuple[str, ...] = ("ollama", "vllm", "sglang")
 _PICKER_HF_BACKENDS: tuple[str, ...] = tuple(
     b for b in _PICKER_BACKENDS if b != "ollama"
 )
@@ -973,9 +989,9 @@ def _discover_models() -> list[dict]:
     # Placeholder rows for files with no probe data anywhere are tagged
     # with DEVAI_HF_BACKEND when it is one of the picker-exposed HF
     # backends; otherwise we fall back to the first picker-exposed HF
-    # backend (typically "vllm"). Without this gate, setting
-    # DEVAI_HF_BACKEND=sglang would still surface placeholder rows
-    # tagged sglang even though sglang is filtered out of the picker.
+    # backend (typically "vllm"). The gate still matters: it keeps an
+    # unknown DEVAI_HF_BACKEND value from tagging placeholder rows with a
+    # backend the picker does not surface.
     fallback_backend = (
         _HF_BACKEND if _HF_BACKEND in _PICKER_HF_BACKENDS
         else (_PICKER_HF_BACKENDS[0] if _PICKER_HF_BACKENDS else "vllm")
@@ -986,9 +1002,9 @@ def _discover_models() -> list[dict]:
         non-error probe for this model. Empty list when neither backend
         has a usable entry — the caller emits a single placeholder."""
         out_pairs: list[tuple[dict, str]] = []
-        # Iterate only picker-exposed HF backends. The sglang probe
-        # cache is still loaded (above) and used by the router; it
-        # just doesn't generate menu rows while sglang is filtered out.
+        # Iterate only picker-exposed HF backends. Both caches are
+        # loaded above; _PICKER_HF_BACKENDS decides which of them
+        # generate menu rows.
         store_by_backend = {"vllm": vllm_probes, "sglang": sglang_probes}
         for backend in _PICKER_HF_BACKENDS:
             store = store_by_backend.get(backend)
@@ -1775,25 +1791,41 @@ def _kv_for_ctx(m: dict, ctx: int) -> str:
     return kv or _kv_legacy_default(m)
 
 
-def _dedup_hf_by_name(models: list[dict]) -> list[dict]:
-    """When the same model name has rows for multiple HF backends, keep
-    the highest-priority one. vLLM > SGLang. Ollama tag names never
-    collide with HF directory names, so Ollama rows pass through
-    unchanged.
+def _dedup_hf_rows(models: list[dict]) -> list[dict]:
+    """Keep one row per (name, backend), vLLM-first within a name.
+
+    This used to key on the NAME alone and drop every backend but the
+    highest-priority one, which contradicted the documented contract
+    ("the picker shows one row per (model, backend) pair"). While SGLang
+    was filtered out of _PICKER_BACKENDS the discrepancy was invisible --
+    each name had at most one HF row, so the function was a no-op. The
+    moment SGLang was re-enabled it silently swallowed all four SGLang
+    rows, because every SGLang model here is also probed on vLLM.
+
+    A model that fits on both backends is a genuine choice for the
+    operator: SGLang brings RadixAttention multi-turn reuse, vLLM brings
+    the better-supported tool/Responses surface. Collapsing that to one
+    row makes the choice for them and hides work the probe and bench
+    caches already paid for.
+
+    vLLM still leads within a name, so the default eye-line is unchanged
+    for anyone who does not care.
+
+    Ollama tag names never collide with HF directory names, so Ollama
+    rows pass through unchanged.
     """
     hf_priority = {"vllm": 2, "sglang": 1}
-    chosen: dict[str, dict] = {}
+    chosen: dict[tuple[str, str], dict] = {}
     for m in models:
-        name = m.get("name") or ""
-        prev = chosen.get(name)
-        if prev is None:
-            chosen[name] = m
-            continue
-        cur_p = hf_priority.get(str(m.get("backend") or ""), 0)
-        prev_p = hf_priority.get(str(prev.get("backend") or ""), 0)
-        if cur_p > prev_p:
-            chosen[name] = m
-    return list(chosen.values())
+        key = (m.get("name") or "", str(m.get("backend") or ""))
+        chosen.setdefault(key, m)
+    return sorted(
+        chosen.values(),
+        key=lambda m: (
+            m.get("name") or "",
+            -hf_priority.get(str(m.get("backend") or ""), 0),
+        ),
+    )
 
 
 # ── Quant format notes (info modal copy) ────────────────────────────────────
@@ -2556,7 +2588,7 @@ def _build_candidates(
     # HF dedup -- vLLM preferred over SGLang for the same name. Ollama
     # tag names never collide with HF directory names so Ollama rows
     # pass through unchanged.
-    candidates = _dedup_hf_by_name(candidates)
+    candidates = _dedup_hf_rows(candidates)
     return candidates, hidden
 
 
