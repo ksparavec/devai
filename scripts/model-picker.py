@@ -2619,6 +2619,35 @@ def _sort_key_for_mode(mode: str, sort_dir: str = "desc"):
     return key
 
 
+def _artefact_sha(m: dict) -> str | None:
+    """The artefact identity the exclusion ledger's re-quant rule needs.
+
+    `is_bench_excluded` re-opens a verdict when the model's sha no longer
+    matches the recorded `last_sha` -- "a re-quant is a different
+    artefact". Feeding it None disables that rule silently, leaving a
+    verdict stuck until an operator runs `make model-status CLEAR=`.
+
+    A picker row has no top-level `sha`; the identity lives in `probe`,
+    whose shape follows the cache it came from -- `sha` for the
+    repo+sha-keyed vLLM/SGLang caches, `digest` for the digest-keyed
+    Ollama one. Reading a top-level `sha` therefore returned None for
+    EVERY backend, not merely for Ollama.
+
+    Falls back to None on a missing or malformed probe, which restores the
+    old always-applies behaviour rather than dropping the verdict: the
+    ledger is an explicit operator action and must not evaporate because
+    a row is oddly shaped.
+    """
+    probe = m.get("probe")
+    if not isinstance(probe, dict):
+        return None
+    for key in ("sha", "digest"):
+        value = probe.get(key)
+        if value:
+            return str(value)
+    return None
+
+
 def _build_candidates(
     models: list[dict],
     bench_records: dict[tuple[str, str, int], dict] | None = None,
@@ -2681,9 +2710,16 @@ def _build_candidates(
         # same silent-exclusion shape that hid Ornith for a day on a
         # 256K-only serving verdict. `make model-status CLEAR=<n>::<b>`
         # puts a row back.
-        if _MS is not None and _MS.is_bench_excluded(
+        # Resolved per call, and on the ATTRIBUTE rather than the module:
+        # `_MS is not None` is satisfied by any _model_status that imports,
+        # including one predating is_bench_excluded. The optional import
+        # exists because devai-agent bind-mounts a fresh picker into an
+        # older image, so that skew is the expected case, and it must cost
+        # the filter rather than the picker.
+        bench_gate = getattr(_MS, "is_bench_excluded", None)
+        if bench_gate is not None and bench_gate(
                 _bench_ledger(), name_key, backend_key,
-                ctx=ctx_key or None, sha=decorated.get("sha")):
+                ctx=ctx_key or None, sha=_artefact_sha(decorated)):
             hidden["bench_excluded"] += 1
             continue
         candidates.append(decorated)
