@@ -566,3 +566,71 @@ class TestRunLoadProbePassWriteLogic(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ServingSearchStepsDownTest(unittest.TestCase):
+    """A model that FITS at its ceiling but only SERVES lower must be
+    recorded at the serving ctx, not discarded.
+
+    Ornith-1.0-9B-NVFP4 fits at 256K on SGLang and degenerates there
+    (emits `!` until the request times out), but serves cleanly at 128K
+    -- 21.95 GB peak, 119,555 input tokens. If the search stopped at a
+    failing ceiling the model would vanish from the picker entirely on
+    the strength of one context it happens to fail.
+
+    Pinned because the consequence is silent: a lost model looks
+    identical to a model that was never probed.
+    """
+
+    def setUp(self):
+        import importlib.util as _il
+        spec = _il.spec_from_file_location(
+            "contexts_stepdown", REPO_ROOT / "scripts" / "_contexts.py")
+        self.cx = _il.module_from_spec(spec)
+        spec.loader.exec_module(self.cx)
+
+    def test_ceiling_failure_searches_downward(self):
+        probed = []
+
+        def works(ctx):
+            probed.append(ctx)
+            return ctx <= 131072
+
+        got = self.cx.binary_search_max_ctx(
+            works, position_limit=262144,
+            grid=self.cx.BINARY_SEARCH_CONTEXTS)
+        self.assertEqual(got, 131072)
+        self.assertGreater(len(probed), 1,
+                           "a failing ceiling must not end the search")
+        self.assertIn(262144, probed, "the ceiling is probed first")
+
+    def test_serving_everywhere_resolves_in_one_probe(self):
+        probed = []
+
+        def works(ctx):
+            probed.append(ctx)
+            return True
+
+        got = self.cx.binary_search_max_ctx(
+            works, grid=self.cx.BINARY_SEARCH_CONTEXTS)
+        self.assertEqual(got, max(self.cx.BINARY_SEARCH_CONTEXTS))
+        self.assertEqual(len(probed), 1, "the common case costs one launch")
+
+    def test_serving_nowhere_returns_none(self):
+        got = self.cx.binary_search_max_ctx(
+            lambda ctx: False, grid=self.cx.BINARY_SEARCH_CONTEXTS)
+        self.assertIsNone(got)
+
+    def test_single_tier_grid_cannot_step_down(self):
+        """Worth stating: with a one-element grid a failure yields None
+        and there is nowhere to step. An operator narrowing the grid to a
+        single ctx is asking for a pass/fail on that ctx, not a search."""
+        probed = []
+
+        def works(ctx):
+            probed.append(ctx)
+            return False
+
+        self.assertIsNone(
+            self.cx.binary_search_max_ctx(works, grid=(262144,)))
+        self.assertEqual(probed, [262144])
