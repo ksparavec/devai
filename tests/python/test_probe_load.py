@@ -480,10 +480,10 @@ class TestRunLoadProbePassWriteLogic(unittest.TestCase):
         cells = {"131072": {"ctx": 131072, "fits": True, "capability": "inline",
                             "actual_vram_gb": 22.0}}
         scripted = {
-            131072: {"serving_ok": False, "serving_error": "oom"},
+            131072: {"serving_ok": False, "serving_error": "oom_marker: CUDA out of memory"},
             65536:  {"serving_ok": True, "serving_peak_gb": 21.0,
                      "serving_baseline_gb": 19.0, "needle_score": 1.0},
-            98304:  {"serving_ok": False, "serving_error": "oom"},
+            98304:  {"serving_ok": False, "serving_error": "oom_marker: CUDA out of memory"},
         }
         cache, calls, _ = self._run(cells=cells, scripted=scripted)
         entry = cache["vendor/m@sha1"]
@@ -500,13 +500,44 @@ class TestRunLoadProbePassWriteLogic(unittest.TestCase):
     def test_serving_nowhere_marks_fail_and_excludes(self) -> None:
         # Fits at 32K but OOMs when actually serving -> serving_ok=False + oom.
         cells = {"32768": {"ctx": 32768, "fits": True, "capability": "inline"}}
-        scripted = {32768: {"serving_ok": False, "serving_error": "oom"}}
+        scripted = {32768: {"serving_ok": False, "serving_error": "oom_marker: CUDA out of memory"}}
         cache, calls, ledger_records = self._run(cells=cells, scripted=scripted)
         cell = cache["vendor/m@sha1"]["probes"]["24"]["32768"]
         self.assertTrue(cell["fits"])                      # still fits...
         self.assertFalse(cell["serving_ok"])               # ...but cannot serve
         self.assertEqual(calls, [32768])
         self.assertIn(("m", "vllm", "oom"), ledger_records)
+
+    def test_infra_serving_failure_writes_no_exclusion(self) -> None:
+        # An `oom` exclusion is sha-stable: it survives until the model's
+        # weights change. Recording one for a transient 500, a queue-full
+        # 503 or an engine bug therefore hides a model that fits perfectly
+        # well, indefinitely. _detect_serving_failure turns ANY error body
+        # into a failure, so this path was reachable from a single blip.
+        cells = {"32768": {"ctx": 32768, "fits": True, "capability": "inline"}}
+        scripted = {32768: {"serving_ok": False,
+                            "serving_error": "api_error: internal server error"}}
+        cache, _, ledger_records = self._run(cells=cells, scripted=scripted)
+        cell = cache["vendor/m@sha1"]["probes"]["24"]["32768"]
+        self.assertFalse(cell["serving_ok"], "the cell is still unserveable")
+        self.assertEqual(
+            [r for r in ledger_records if r[2] == "oom"], [],
+            "a non-OOM serving failure must not write an oom exclusion")
+
+    def test_degenerate_serving_excludes_as_manual_not_oom(self) -> None:
+        # The Ornith case: the engine served without OOMing and produced
+        # garbage. `oom` would be a false statement about the cause AND is
+        # re-checked only on a new sha; `manual` is sha-stable and carries
+        # the evidence.
+        cells = {"32768": {"ctx": 32768, "fits": True, "capability": "inline"}}
+        scripted = {32768: {"serving_ok": False,
+                            "serving_degenerate": True,
+                            "serving_degenerate_reason": "empty content at cap",
+                            "serving_error": "degenerate"}}
+        _, _, ledger_records = self._run(cells=cells, scripted=scripted)
+        reasons = [r[2] for r in ledger_records]
+        self.assertIn("manual", reasons)
+        self.assertNotIn("oom", reasons)
 
     def test_relaunches_under_the_cells_stamped_kv_dtype(self) -> None:
         # Cell fit-probed with PROBE_KV_CACHE_TYPE=auto: a fleet-wide

@@ -1841,6 +1841,15 @@ def _needle_failed_at(m: dict, ctx: int) -> bool:
 
     Cells written before ``needle_valid`` existed have no such vouching,
     so they are treated as untrustworthy and stay silent.
+
+    A DEGENERATE cell warns regardless of ``needle_valid``. That gate was
+    suppressing precisely the failure it should surface: an engine
+    producing empty content (or a single character repeated) also fails
+    every `needle_valid` precondition -- it finishes at the output ceiling
+    with `finish_reason="length"` -- so the one row a user most needed
+    warning about was the one row that stayed silent. Ornith-1.0-9B-NVFP4
+    on SGLang sat in the picker that way while the router recreated it 72
+    times in a day.
     """
     band = ((m.get("vram") or {}).get("probes") or {}).get(str(int(_VRAM_BUDGET)))
     if not isinstance(band, dict) or ctx <= 0:
@@ -1848,7 +1857,24 @@ def _needle_failed_at(m: dict, ctx: int) -> bool:
     cell = band.get(str(int(ctx)))
     if not isinstance(cell, dict):
         return False
+    if cell.get("serving_degenerate"):
+        return True
     return bool(cell.get("needle_valid")) and cell.get("needle_score") == 0.0
+
+
+def _degenerate_at(m: dict, ctx: int) -> str | None:
+    """Reason string when the LOAD probe judged the output degenerate at
+    `ctx`, else None. Distinct from a recall miss: a recall miss is one
+    sample at the hardest depth, while this is the engine not generating
+    usable text at all.
+    """
+    band = ((m.get("vram") or {}).get("probes") or {}).get(str(int(_VRAM_BUDGET)))
+    if not isinstance(band, dict) or ctx <= 0:
+        return None
+    cell = band.get(str(int(ctx)))
+    if not isinstance(cell, dict) or not cell.get("serving_degenerate"):
+        return None
+    return str(cell.get("serving_degenerate_reason") or "degenerate output")
 
 
 def _kv_mixed(m: dict) -> bool:
@@ -2321,11 +2347,22 @@ def _capability_summary_text(
     _rctx_i = int(m.get("_picker_context") or 0)
     if _needle_failed_at(m, _rctx_i):
         _rctx = _context_label(_rctx_i)
-        recall_line = (
-            f"Recall:    FAILED a single mid-depth needle test at {_rctx}.\n"
-            f"           ONE sample, not conclusive -- verify before relying\n"
-            f"           on long-context retrieval at this tier.\n"
-        )
+        _degen = _degenerate_at(m, _rctx_i)
+        if _degen:
+            # Not a recall miss -- the engine did not produce usable text.
+            # Worth a blunter warning than "one sample, not conclusive".
+            recall_line = (
+                f"BROKEN:    the load probe got DEGENERATE output at {_rctx}\n"
+                f"           ({_degen}).\n"
+                f"           The engine answered but generated nothing usable.\n"
+                f"           Re-probe before using this row.\n"
+            )
+        else:
+            recall_line = (
+                f"Recall:    FAILED a single mid-depth needle test at {_rctx}.\n"
+                f"           ONE sample, not conclusive -- verify before relying\n"
+                f"           on long-context retrieval at this tier.\n"
+            )
     niche = _MODEL_NICHE.get(str(m.get("name") or ""))
     niche_line = ""
     if niche:

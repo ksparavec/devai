@@ -4021,11 +4021,38 @@ func (a *arbiter) applyVLLMPolicy(path, modelName, policy string, body []byte) [
 	}
 }
 
-// applySGLangPolicy mirrors applyVLLMPolicy. SGLang exposes a top-level
-// `separate_reasoning` field on /v1/chat/completions plus the same
-// `extra_body.chat_template_kwargs.enable_thinking` path for Qwen3-style
-// templates. Setting both makes the disable directive robust regardless
-// of which surface SGLang's runtime honours.
+// applySGLangPolicy does NOT mirror applyVLLMPolicy's wire shape, and the
+// difference is load-bearing. Verified directly against the pinned image
+// `lmsysorg/sglang:v0.5.10.post1-cu130` by inspecting
+// `sglang.srt.entrypoints.openai.protocol.ChatCompletionRequest`:
+//
+//   - `extra_body` is **not a field** on the request model, and the model
+//     config sets no `extra` policy -- so Pydantic's default `ignore`
+//     applies and the whole payload is **silently discarded**. No 422, no
+//     warning. Every reasoning directive this router sent to SGLang for
+//     months went nowhere.
+//   - `chat_template_kwargs` IS a top-level field. That is where the
+//     directive has to go.
+//   - `separate_reasoning` defaults to **True**, so the old ENABLE branch
+//     set a default and did nothing at all. Worse, its DISABLE branch was
+//     the only live effect and it is a *parsing* switch, not a generation
+//     switch: it stops SGLang splitting `<think>` out into
+//     `reasoning_content`, leaving the trace merged into `content`. The
+//     user asked for no-think, still paid for the thinking tokens, and got
+//     the trace glued to the answer. It is dropped as a policy lever
+//     entirely.
+//   - `reasoning_effort: "none"` is a real one-field generation-off lever.
+//     `normalize_reasoning_inputs` expands it to BOTH key spellings the
+//     chat templates use -- `thinking` (deepseek-v3, kimi_k2) and
+//     `enable_thinking` (qwen3, glm45, nemotron_3, interns1) -- via
+//     setdefault, so a client-supplied value still wins.
+//
+// One trap worth recording: `serving_chat.py` raises
+// `ValueError("Harmony does not support reasoning effort none")` for
+// gpt-oss, but it reads the value **popped out of `chat_template_kwargs`**,
+// not the top-level field. Sending `reasoning_effort` top-level (as here)
+// does not trip that guard; nesting it inside `chat_template_kwargs`
+// would.
 func (a *arbiter) applySGLangPolicy(path, modelName, policy string, body []byte) []byte {
 	if strings.TrimRight(path, "/") != "/v1/chat/completions" {
 		return body
@@ -4033,22 +4060,34 @@ func (a *arbiter) applySGLangPolicy(path, modelName, policy string, body []byte)
 	switch a.reasoningAction("sglang", modelName, policy) {
 	case reasoningEnable:
 		log.Printf("info: sglang/%s reasoning ENABLE (policy=%q)", modelName, policy)
-		body = setJSONFieldIfAbsent(
-			body, []string{"separate_reasoning"}, "separate_reasoning", true,
-		)
+		// Only an explicitly-requested effort level is sent. Under `auto`
+		// the model's own default is the right answer, and inventing a
+		// "medium" would silently override whatever the checkpoint ships.
+		if policy == "low" || policy == "medium" || policy == "high" {
+			body = setJSONFieldIfAbsent(
+				body, []string{"reasoning_effort", "reasoning"},
+				"reasoning_effort", policy,
+			)
+		}
 		return setNestedJSONFieldIfAbsent(
 			body,
-			[]string{"extra_body", "chat_template_kwargs", "enable_thinking"},
+			[]string{"chat_template_kwargs", "enable_thinking"},
 			true,
 		)
 	case reasoningDisable:
 		log.Printf("info: sglang/%s reasoning DISABLE (policy=%q)", modelName, policy)
+		// `reasoning_effort: "none"` is the lever that actually stops
+		// generation, and it covers both template key spellings. The
+		// explicit enable_thinking=false below is belt-and-braces for the
+		// same intent; the two agree, and setdefault means neither
+		// overrides a client that asked for something itself.
 		body = setJSONFieldIfAbsent(
-			body, []string{"separate_reasoning"}, "separate_reasoning", false,
+			body, []string{"reasoning_effort", "reasoning"},
+			"reasoning_effort", "none",
 		)
 		return setNestedJSONFieldIfAbsent(
 			body,
-			[]string{"extra_body", "chat_template_kwargs", "enable_thinking"},
+			[]string{"chat_template_kwargs", "enable_thinking"},
 			false,
 		)
 	default:

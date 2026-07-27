@@ -350,6 +350,50 @@ func readEnableThinking(t *testing.T, body []byte) (set bool, val bool) {
 	return true, b
 }
 
+// readSGLangEnableThinking reads the TOP-LEVEL chat_template_kwargs path.
+// SGLang has no `extra_body` field at all -- a payload nested there is
+// silently dropped by Pydantic -- so the two backends genuinely differ in
+// wire shape and need separate readers. Using readEnableThinking for
+// SGLang is what let the broken shape pass tests for months.
+func readSGLangEnableThinking(t *testing.T, body []byte) (set bool, val bool) {
+	t.Helper()
+	var root map[string]any
+	if err := json.Unmarshal(body, &root); err != nil {
+		t.Fatalf("body not valid JSON: %v", err)
+	}
+	ctk, ok := root["chat_template_kwargs"].(map[string]any)
+	if !ok {
+		return false, false
+	}
+	v, ok := ctk["enable_thinking"]
+	if !ok {
+		return false, false
+	}
+	b, ok := v.(bool)
+	if !ok {
+		t.Fatalf("enable_thinking not bool: %T %v", v, v)
+	}
+	return true, b
+}
+
+// assertNoSGLangDeadFields guards the two shapes that do nothing on this
+// engine: an `extra_body` wrapper (not a field -> discarded) and
+// `separate_reasoning` (a parsing switch, defaulting true, dropped as a
+// policy lever). Neither may be emitted by the router.
+func assertNoSGLangDeadFields(t *testing.T, body []byte) {
+	t.Helper()
+	var root map[string]any
+	if err := json.Unmarshal(body, &root); err != nil {
+		t.Fatalf("body not valid JSON: %v", err)
+	}
+	if _, ok := root["extra_body"]; ok {
+		t.Fatalf("router must not emit extra_body to sglang (silently discarded): %s", body)
+	}
+	if _, ok := root["separate_reasoning"]; ok {
+		t.Fatalf("router must not emit separate_reasoning as a policy lever: %s", body)
+	}
+}
+
 func TestPolicy_VLLMStructuredEnable(t *testing.T) {
 	a := newTestArbiterHF()
 	for _, p := range []string{"auto", "low", "medium", "high"} {
@@ -419,11 +463,15 @@ func TestPolicy_DisableVerifiedIsBackendScoped(t *testing.T) {
 		t.Fatalf("vllm off (disable not verified) must leave body untouched, got %s", vout)
 	}
 
-	// SGLang: off DOES disable via its own mechanism (separate_reasoning=false).
+	// SGLang: off DOES disable, via reasoning_effort="none" sent TOP-LEVEL.
+	// The Harmony guard that rejects "none" for gpt-oss reads the value
+	// popped out of chat_template_kwargs, not the top-level field, so this
+	// shape does not trip it.
 	sout := a.applyReasoningPolicy("sglang", "/v1/chat/completions", "gpt-oss-20b", "off", in)
-	if setSR, valSR := bodyBoolField(t, sout, "separate_reasoning"); !setSR || valSR {
-		t.Fatalf("sglang off (disable verified) must set separate_reasoning=false, got set=%v val=%v body=%s", setSR, valSR, sout)
+	if setE, valE := bodyStringField(t, sout, "reasoning_effort"); !setE || valE != "none" {
+		t.Fatalf("sglang off (disable verified) must set reasoning_effort=none, got set=%v val=%q body=%s", setE, valE, sout)
 	}
+	assertNoSGLangDeadFields(t, sout)
 }
 
 func TestPolicy_VLLMInlineNonOffNoop(t *testing.T) {
@@ -496,13 +544,33 @@ func TestPolicy_SGLangStructuredEnable(t *testing.T) {
 	a := newTestArbiterHF()
 	in := []byte(`{"model":"Qwen3.5-9B-NVFP4","messages":[]}`)
 	out := a.applyReasoningPolicy("sglang", "/v1/chat/completions", "Qwen3.5-9B-NVFP4", "auto", in)
-	setSR, valSR := bodyBoolField(t, out, "separate_reasoning")
-	if !setSR || !valSR {
-		t.Fatalf("expected separate_reasoning=true, got set=%v val=%v body=%s", setSR, valSR, out)
-	}
-	setT, valT := readEnableThinking(t, out)
+	setT, valT := readSGLangEnableThinking(t, out)
 	if !setT || !valT {
-		t.Fatalf("expected enable_thinking=true, got set=%v val=%v body=%s", setT, valT, out)
+		t.Fatalf("expected top-level chat_template_kwargs.enable_thinking=true, got set=%v val=%v body=%s", setT, valT, out)
+	}
+	assertNoSGLangDeadFields(t, out)
+	// Under `auto` the model's own default effort is the right answer;
+	// inventing one would silently override what the checkpoint ships.
+	if setE, valE := bodyStringField(t, out, "reasoning_effort"); setE {
+		t.Fatalf("auto must not invent a reasoning_effort, got %q body=%s", valE, out)
+	}
+}
+
+// An explicit effort level IS forwarded, because SGLang passes
+// request.reasoning_effort through to the chat template.
+func TestPolicy_SGLangStructuredEnableForwardsExplicitEffort(t *testing.T) {
+	a := newTestArbiterHF()
+	in := []byte(`{"model":"Qwen3.5-9B-NVFP4","messages":[]}`)
+	for _, p := range []string{"low", "medium", "high"} {
+		out := a.applyReasoningPolicy("sglang", "/v1/chat/completions", "Qwen3.5-9B-NVFP4", p, in)
+		setE, valE := bodyStringField(t, out, "reasoning_effort")
+		if !setE || valE != p {
+			t.Fatalf("policy=%s: expected reasoning_effort=%s, got set=%v val=%q body=%s", p, p, setE, valE, out)
+		}
+		if setT, valT := readSGLangEnableThinking(t, out); !setT || !valT {
+			t.Fatalf("policy=%s: expected enable_thinking=true, got set=%v val=%v", p, setT, valT)
+		}
+		assertNoSGLangDeadFields(t, out)
 	}
 }
 
@@ -510,14 +578,20 @@ func TestPolicy_SGLangOffDisableVerified(t *testing.T) {
 	a := newTestArbiterHF()
 	in := []byte(`{"model":"Qwen3.5-9B-NVFP4","messages":[]}`)
 	out := a.applyReasoningPolicy("sglang", "/v1/chat/completions", "Qwen3.5-9B-NVFP4", "off", in)
-	setSR, valSR := bodyBoolField(t, out, "separate_reasoning")
-	if !setSR || valSR {
-		t.Fatalf("expected separate_reasoning=false, got set=%v val=%v body=%s", setSR, valSR, out)
+	// reasoning_effort="none" is the lever that actually stops generation:
+	// SGLang expands it to BOTH template key spellings (`thinking` and
+	// `enable_thinking`). separate_reasoning=false, the old behaviour, only
+	// stopped the trace being SPLIT OUT -- the model still thought, and the
+	// user paid for it and got it merged into content.
+	setE, valE := bodyStringField(t, out, "reasoning_effort")
+	if !setE || valE != "none" {
+		t.Fatalf("expected reasoning_effort=none, got set=%v val=%q body=%s", setE, valE, out)
 	}
-	setT, valT := readEnableThinking(t, out)
+	setT, valT := readSGLangEnableThinking(t, out)
 	if !setT || valT {
-		t.Fatalf("expected enable_thinking=false, got set=%v val=%v body=%s", setT, valT, out)
+		t.Fatalf("expected top-level enable_thinking=false, got set=%v val=%v body=%s", setT, valT, out)
 	}
+	assertNoSGLangDeadFields(t, out)
 }
 
 func TestPolicy_SGLangOffWithoutDisableVerifiedNoop(t *testing.T) {
@@ -535,12 +609,13 @@ func TestPolicy_SGLangInlineNonOffNoop(t *testing.T) {
 	// Non-off policies: inline + auto/L/M/H must not inject anything.
 	for _, p := range []string{"auto", "low", "medium", "high"} {
 		out := a.applyReasoningPolicy("sglang", "/v1/chat/completions", "Llama-3.1-8B-Instruct-NVFP4", p, in)
-		if setSR, _ := bodyBoolField(t, out, "separate_reasoning"); setSR {
-			t.Fatalf("policy=%s: inline must not set separate_reasoning, got body=%s", p, out)
-		}
-		if setT, _ := readEnableThinking(t, out); setT {
+		if setT, _ := readSGLangEnableThinking(t, out); setT {
 			t.Fatalf("policy=%s: inline must not set enable_thinking, got body=%s", p, out)
 		}
+		if setE, _ := bodyStringField(t, out, "reasoning_effort"); setE {
+			t.Fatalf("policy=%s: inline must not set reasoning_effort, got body=%s", p, out)
+		}
+		assertNoSGLangDeadFields(t, out)
 	}
 }
 
@@ -550,23 +625,45 @@ func TestPolicy_SGLangInlineOffDisables(t *testing.T) {
 	// Inline + off: explicit user opt-out injects the disable shape on
 	// SGLang too. No modelDisableOK gate — the suffix IS the opt-in.
 	out := a.applyReasoningPolicy("sglang", "/v1/chat/completions", "Llama-3.1-8B-Instruct-NVFP4", "off", in)
-	setSR, valSR := bodyBoolField(t, out, "separate_reasoning")
-	if !setSR || valSR {
-		t.Fatalf("inline+off: expected separate_reasoning=false, got set=%v val=%v body=%s", setSR, valSR, out)
+	setE, valE := bodyStringField(t, out, "reasoning_effort")
+	if !setE || valE != "none" {
+		t.Fatalf("inline+off: expected reasoning_effort=none, got set=%v val=%q body=%s", setE, valE, out)
 	}
-	setT, valT := readEnableThinking(t, out)
+	setT, valT := readSGLangEnableThinking(t, out)
 	if !setT || valT {
 		t.Fatalf("inline+off: expected enable_thinking=false, got set=%v val=%v body=%s", setT, valT, out)
 	}
+	assertNoSGLangDeadFields(t, out)
 }
 
-func TestPolicy_SGLangClientSeparateReasoningWins(t *testing.T) {
+// The router no longer touches separate_reasoning, so a client that sets
+// it deliberately (to keep the trace merged into content, say) keeps it.
+func TestPolicy_SGLangClientSeparateReasoningUntouched(t *testing.T) {
 	a := newTestArbiterHF()
 	in := []byte(`{"model":"Qwen3.5-9B-NVFP4","messages":[],"separate_reasoning":false}`)
 	out := a.applyReasoningPolicy("sglang", "/v1/chat/completions", "Qwen3.5-9B-NVFP4", "auto", in)
-	_, valSR := bodyBoolField(t, out, "separate_reasoning")
-	if valSR {
-		t.Fatalf("client separate_reasoning=false must survive, got body=%s", out)
+	set, val := bodyBoolField(t, out, "separate_reasoning")
+	if !set || val {
+		t.Fatalf("client separate_reasoning=false must survive untouched, got set=%v val=%v body=%s", set, val, out)
+	}
+}
+
+func TestPolicy_SGLangClientChatTemplateKwargsWins(t *testing.T) {
+	a := newTestArbiterHF()
+	in := []byte(`{"model":"Qwen3.5-9B-NVFP4","messages":[],"chat_template_kwargs":{"enable_thinking":false}}`)
+	out := a.applyReasoningPolicy("sglang", "/v1/chat/completions", "Qwen3.5-9B-NVFP4", "auto", in)
+	setT, valT := readSGLangEnableThinking(t, out)
+	if !setT || valT {
+		t.Fatalf("client enable_thinking=false must survive, got set=%v val=%v body=%s", setT, valT, out)
+	}
+}
+
+func TestPolicy_SGLangClientReasoningEffortWins(t *testing.T) {
+	a := newTestArbiterHF()
+	in := []byte(`{"model":"Qwen3.5-9B-NVFP4","messages":[],"reasoning_effort":"low"}`)
+	out := a.applyReasoningPolicy("sglang", "/v1/chat/completions", "Qwen3.5-9B-NVFP4", "high", in)
+	if _, effort := bodyStringField(t, out, "reasoning_effort"); effort != "low" {
+		t.Fatalf("client reasoning_effort=low must survive, got %q body=%s", effort, out)
 	}
 }
 

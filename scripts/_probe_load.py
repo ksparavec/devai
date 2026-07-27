@@ -88,6 +88,7 @@ from _probe_hf_common import (
     gpu_memory_used_mb,
     host_scaled_fraction,
     http_get,
+    is_degenerate_generation,
     http_post,
     install_probe_cleanup,
     is_downloaded,
@@ -472,6 +473,54 @@ def _detect_serving_failure(
     return False, ""
 
 
+# Prefixes emitted by _detect_serving_failure that genuinely mean "ran out
+# of VRAM". Everything else -- a transport blip, a queue-full 503, an
+# engine bug -- is infrastructure and says nothing about whether this
+# (model, ctx) fits.
+_OOM_FAILURE_PREFIXES = ("oom_marker:",)
+
+
+def serving_failure_kind(reason: str, logs: str = "") -> str:
+    """Classify a serving failure as ``oom`` or ``infra``.
+
+    Exists so the exclusion ledger stops recording `oom` for failures that
+    were never about memory. `_detect_serving_failure` turns ANY error body
+    into a failure, and the caller then wrote an `oom` verdict
+    unconditionally -- so a transient 500 or a queue-full 503 could
+    permanently exclude a model that fits perfectly well. An `oom`
+    exclusion is re-checked only on a new sha, so that verdict is sticky.
+
+    A container that exited is inspected rather than assumed: an engine
+    killed by the OOM reaper is a real OOM, an engine that segfaulted is
+    not.
+    """
+    r = (reason or "").lower()
+    if any(r.startswith(p) for p in _OOM_FAILURE_PREFIXES):
+        return "oom"
+    # Also match the marker text itself: cells written before this
+    # classification existed carry only `serving_error`, and an OOM there
+    # still reads as one.
+    if any(m in r for m in ("out of memory", "outofmemoryerror")):
+        return "oom"
+    if r.startswith("container_state=") and _logs_show_oom(logs) is not None:
+        return "oom"
+    return "infra"
+
+
+def cell_failure_kind(cell: dict) -> str:
+    """Failure kind for a cell, tolerating pre-classification caches.
+
+    New cells carry `serving_failure_kind` directly. Older ones carry only
+    `serving_error`, so it is re-classified on read rather than defaulting
+    to either verdict -- defaulting to `oom` is the bug being fixed, and
+    defaulting to `infra` would silently stop excluding genuine OOMs.
+    """
+    kind = cell.get("serving_failure_kind")
+    if kind:
+        return str(kind)
+    return serving_failure_kind(str(cell.get("serving_error") or ""))
+
+
 # ── VRAM settle between cells ─────────────────────────────────────────────────
 
 # GPU is considered idle below this; the probe host runs nothing else on
@@ -749,8 +798,30 @@ def load_probe_one_cell(
         excerpt_src = (content or reasoning_text or "")
         needle_excerpt = excerpt_src[-200:] if excerpt_src else None
 
+        # An engine can answer HTTP 200 while generating nothing at all --
+        # a dead CUDA kernel behind a live HTTP server. `not failed` cannot
+        # see that, and certified the Ornith cell serving_ok=true on
+        # thousands of '!' characters. The predicate is shared with the fit
+        # classifier ON PURPOSE: two copies would drift, and the whole
+        # defect was two sides of the design each assuming the other
+        # checked.
+        degenerate, degenerate_reason = (False, "")
+        if not failed:
+            degenerate, degenerate_reason = is_degenerate_generation(
+                content, reasoning_text, finish_reason,
+                output_tokens, _MAX_OUTPUT_TOKENS,
+            )
+            if degenerate:
+                print(f"      degenerate generation: {degenerate_reason}",
+                      flush=True)
+
         rec: dict = {
-            "serving_ok": not failed,
+            "serving_ok": not failed and not degenerate,
+            # Recorded separately from serving_ok so an operator can tell a
+            # VRAM failure ("did not fit") from a degenerate one ("fit, ran,
+            # produced garbage") without re-reading the excerpt.
+            "serving_degenerate": degenerate,
+            "serving_degenerate_reason": degenerate_reason or None,
             "serving_peak_gb": peak_gb,
             "serving_baseline_gb": baseline_gb,
             "transient_gb": transient,
@@ -776,6 +847,8 @@ def load_probe_one_cell(
         }
         if failed:
             rec["serving_error"] = reason
+            # oom vs infra. Only the former may write an exclusion.
+            rec["serving_failure_kind"] = serving_failure_kind(reason, logs_tail)
             # Capture diagnostics so a failure is explainable without
             # relaunching: vLLM/SGLang put the real exception in the HTTP
             # error body, and the container-log tail shows OOM vs a transient
@@ -1024,16 +1097,44 @@ def run_load_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
                 _ledger_clear(ledger, name, spec.name)
             probed += 1
         elif probed_cells:
-            # Fits but serves nowhere (OOM at every probed ctx). Keep the fit
-            # cell, stamp the failing serving verdict, exclude with `oom`.
+            # Fits but serves nowhere. Keep the fit cell and stamp the
+            # failing serving verdict either way -- but only write an
+            # exclusion when the failure was actually about memory.
             lo = min(probed_cells)
             fit_cell.update(probed_cells[lo])
             fit_cell["serving_ok"] = False
             entry["last_load_probed_at"] = now_iso()
-            _ledger_record(
-                ledger, name, spec.name, "oom",
-                detail="serving OOM at every probed ctx (fits but cannot serve)",
-                repo=repo, host_vram=args.host_vram_gb, sha=sha)
+            worst = probed_cells[lo]
+            kinds = {
+                cell_failure_kind(c)
+                for c in probed_cells.values()
+                if isinstance(c, dict)
+            }
+            if worst.get("serving_degenerate"):
+                # The engine served without OOMing and produced garbage.
+                # `oom` would be an outright false statement about why, and
+                # is re-checked only on a new sha; `manual` is sha-stable
+                # and carries the real evidence for an operator to judge.
+                _ledger_record(
+                    ledger, name, spec.name, "manual",
+                    detail=("degenerate generation under a near-full-context "
+                            "request: "
+                            + str(worst.get("serving_degenerate_reason") or "")),
+                    repo=repo, host_vram=args.host_vram_gb, sha=sha)
+            elif "oom" in kinds:
+                _ledger_record(
+                    ledger, name, spec.name, "oom",
+                    detail="serving OOM at every probed ctx (fits but cannot serve)",
+                    repo=repo, host_vram=args.host_vram_gb, sha=sha)
+            else:
+                # Infrastructure failure -- a transport blip, a queue-full
+                # 503, an engine bug. Recording `oom` here was a false
+                # verdict that stuck until the model's sha changed, so the
+                # cell is marked unserveable but the model is NOT excluded.
+                print(f"      {name}: serving failed for a non-OOM reason "
+                      f"({worst.get('serving_error')!r}); marking the cell "
+                      f"unserveable but writing NO exclusion",
+                      file=sys.stderr)
             probed += 1
 
         if not args.no_cache_write:

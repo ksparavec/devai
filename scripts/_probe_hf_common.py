@@ -735,8 +735,27 @@ def build_disable_thinking_body(backend: str, base: dict) -> dict:
     vLLM (Qwen3-style template):
         extra_body.chat_template_kwargs.enable_thinking = False
     SGLang:
-        separate_reasoning = False (top-level field; SGLang's OpenAI-
-        compatible layer reads it from the request body)
+        top-level chat_template_kwargs.enable_thinking = False, plus
+        reasoning_effort = "none"
+
+    The shapes differ because the ENGINES differ, and the probe must send
+    exactly what the router sends or it is measuring a fiction.
+
+    SGLang previously got `separate_reasoning = False` here, which made the
+    whole probe a tautology: that field stops SGLang SPLITTING `<think>`
+    out into `reasoning_content`, and the verification then checked
+    whether `reasoning_content` was absent. It could only ever pass.
+    Measured across the caches, `disable_verified` was true for 8 of 9
+    SGLang reasoning rows and false for 0 of 11 vLLM rows on the same
+    checkpoints -- not a capability difference, an artefact. It also sent
+    `extra_body`, which is not a field on SGLang's request model and is
+    discarded silently.
+
+    `reasoning_effort="none"` is the real lever: SGLang's
+    `normalize_reasoning_inputs` expands it to both template key spellings
+    (`thinking` and `enable_thinking`). It is sent TOP-LEVEL deliberately
+    -- the Harmony guard that rejects "none" for gpt-oss reads the value
+    popped out of `chat_template_kwargs`, so nesting it there would 400.
 
     Both fields are no-ops when the model has no template-level
     thinking switch — the disable verdict is then `False` and the
@@ -750,16 +769,33 @@ def build_disable_thinking_body(backend: str, base: dict) -> dict:
         extra["chat_template_kwargs"] = ctk
         body["extra_body"] = extra
     elif backend == "sglang":
-        body["separate_reasoning"] = False
-        # SGLang also accepts the chat_template_kwargs path on the same
-        # template families it shares with vLLM (Qwen3). Set both so we
-        # disable cleanly regardless of which path the runtime honours.
-        extra = dict(body.get("extra_body") or {})
-        ctk = dict(extra.get("chat_template_kwargs") or {})
+        ctk = dict(body.get("chat_template_kwargs") or {})
         ctk["enable_thinking"] = False
-        extra["chat_template_kwargs"] = ctk
-        body["extra_body"] = extra
+        body["chat_template_kwargs"] = ctk
+        body["reasoning_effort"] = "none"
     return body
+
+
+# Inline reasoning markers. A model that was told not to think and then
+# emits one of these in `content` did not honour the directive -- it just
+# stopped having its trace split into a separate field.
+_INLINE_THINK_MARKERS = ("<think>", "</think>", "<thinking>", "<|channel|>analysis")
+
+
+def response_has_inline_reasoning(resp: dict) -> bool:
+    """True when the assistant's `content` carries an inline reasoning
+    trace. Needed to make the disable check falsifiable: absence of
+    `reasoning_content` alone proves nothing, because a parsing switch can
+    produce that absence while the model thinks exactly as much as before.
+    """
+    if not isinstance(resp, dict) or "error" in resp:
+        return False
+    choices = resp.get("choices") or []
+    if not choices:
+        return False
+    msg = choices[0].get("message") or {}
+    content = (msg.get("content") or "").lower()
+    return any(marker in content for marker in _INLINE_THINK_MARKERS)
 
 
 def build_enable_thinking_body(backend: str, base: dict) -> dict:
@@ -880,8 +916,28 @@ _QUANT_ERROR_PATTERNS = (
     "quantization is not supported",
     "Unsupported quant",
     "FP8 is not supported",
-    "GPTQ",
-    "AWQ kernel",
+    # NOTE: bare "GPTQ" and "AWQ kernel" used to live here and were a
+    # false-positive factory. The patterns are matched against the WHOLE
+    # log, and an argparse usage dump enumerates every choice of
+    # --quantization (…awq, gptq, gptq_marlin…). Seven SGLang cells were
+    # therefore filed as `kind: quant` -- a permanent per-model verdict --
+    # when the actual cause was this lab handing SGLang a vLLM-only
+    # recovery flag. All seven recorded matched_pattern: "GPTQ".
+    # Anything re-added here must be a phrase that cannot appear in help
+    # text.
+    "GPTQ quantization is not supported",
+    "AWQ kernel is not supported",
+)
+
+# An argparse rejection is a defect in OUR launch construction, not a
+# verdict about the model. It must be classified BEFORE the arch/quant
+# cascade (a usage dump contains enough vocabulary to match several of
+# those patterns) and must never produce a terminal capability, or the
+# model is written off permanently for a flag we chose to send.
+_LAUNCH_ARGS_ERROR_PATTERNS = (
+    "unrecognized arguments",
+    "error: argument",
+    "invalid choice:",
 )
 _OOM_PATTERNS = (
     "CUDA out of memory",
@@ -900,6 +956,85 @@ _FAILURE_ANCHORS = (
     "ValueError", "RuntimeError", "AssertionError", "KeyError",
     "ImportError", "OSError", "Error:",
 )
+
+
+# Fraction of the generated text that may be a single repeated character
+# before the output is judged degenerate. 0.9 is deliberately far from any
+# healthy sample: the worst real reasoning trace on this fleet
+# (Qwen3.5-9B, 477 coherent output tokens) is nowhere near it, while the
+# Ornith failure was thousands of consecutive '!'.
+_DEGENERATE_RUN_FRACTION = 0.9
+# Below this many characters a "run" is not evidence of anything -- a
+# short answer like "!!!" or "..." is legitimate.
+_DEGENERATE_MIN_CHARS = 32
+
+
+def is_degenerate_generation(
+    content: str | None,
+    reasoning: str | None,
+    finish_reason: str | None,
+    output_tokens: int | None,
+    output_cap: int | None,
+) -> tuple[bool, str]:
+    """Detect an engine that is answering HTTP but not generating text.
+
+    Returns ``(degenerate, reason)``; ``reason`` is "" when healthy.
+
+    This exists because a dead CUDA kernel does not look like a failure
+    over HTTP. `Ornith-1.0-9B-NVFP4` on SGLang raised a device-side assert,
+    killed its scheduler, and then kept returning 200s whose content was
+    empty and whose reasoning_content was thousands of identical '!'. The
+    load probe scored that cell ``serving_ok: true`` because it computed
+    ``not failed`` and consulted nothing about what came back.
+
+    Two independent signals, either of which is decisive:
+
+    1. **Empty content that ran to the output cap.** A model with nothing
+       to say stops; it does not spend its entire budget saying nothing.
+       BOTH conditions are required -- a reasoning model legitimately
+       returns empty ``content`` when the answer is still inside a
+       ``<think>`` block, and a short answer legitimately stops early.
+    2. **A single character repeated across almost the whole output.**
+       Catches the same corpse when it terminates before the cap.
+
+    Deliberately NOT a recall check. ``needle_score`` is confounded on this
+    fleet -- 3 of its 4 zeros were reasoning models that spent the answer
+    budget on a ``<think>`` trace -- so gating on it would hide healthy
+    models at a 100% false-positive rate. This predicate asks the narrower
+    question "did the engine emit anything meaningful at all", which is
+    answerable from the response alone.
+    """
+    text = (content or "").strip()
+    reasoning_text = (reasoning or "").strip()
+
+    if not text and output_cap and output_tokens and output_tokens >= output_cap:
+        return True, (
+            f"empty content with output at the {output_cap}-token cap "
+            f"(finish_reason={finish_reason!r})"
+        )
+
+    for label, sample in (("content", text), ("reasoning_content", reasoning_text)):
+        if len(sample) < _DEGENERATE_MIN_CHARS:
+            continue
+        run = _longest_char_run(sample)
+        if run / len(sample) >= _DEGENERATE_RUN_FRACTION:
+            return True, (
+                f"{label} is {run}/{len(sample)} chars of a single repeated "
+                f"character (>= {_DEGENERATE_RUN_FRACTION:.0%})"
+            )
+    return False, ""
+
+
+def _longest_char_run(s: str) -> int:
+    """Length of the longest run of one repeated character in `s`."""
+    best = run = 0
+    prev = None
+    for ch in s:
+        run = run + 1 if ch == prev else 1
+        prev = ch
+        if run > best:
+            best = run
+    return best
 
 
 def _failure_excerpt(logs: str, context: int = 120) -> str:
@@ -927,15 +1062,27 @@ def _failure_excerpt(logs: str, context: int = 120) -> str:
 def classify_failure_logs(logs: str) -> dict:
     """Inspect container logs after a failed launch and tag the cause.
 
-    Returns {kind, log_excerpt, matched_pattern?}. kind ∈ {arch, quant,
-    oom_startup, infra}. The matched pattern is recorded when the cause
-    is determined by a keyword match (everything except `infra`) so an
-    operator can audit why a particular run was tagged the way it was.
-    Pattern matching runs against the FULL log; `_failure_excerpt` then
-    saves the root-cause region (not just the tail) for the cache.
+    Returns {kind, log_excerpt, matched_pattern?}. kind ∈ {launch_args,
+    arch, quant, oom_startup, infra}. The matched pattern is recorded when
+    the cause is determined by a keyword match (everything except `infra`)
+    so an operator can audit why a particular run was tagged the way it
+    was. Pattern matching runs against the FULL log; `_failure_excerpt`
+    then saves the root-cause region (not just the tail) for the cache.
+
+    `launch_args` is checked FIRST and deliberately so. It means the
+    engine rejected our command line, which says nothing whatsoever about
+    the model -- and an argparse usage dump is long, quotes every
+    supported quantisation and architecture name, and will happily match
+    an arch or quant pattern if given the chance. That is exactly how
+    seven SGLang cells acquired a permanent `quant` verdict for a flag
+    this lab should never have sent them.
     """
     excerpt = _failure_excerpt(logs)
     lc = logs.lower()
+    for pat in _LAUNCH_ARGS_ERROR_PATTERNS:
+        if pat.lower() in lc:
+            return {"kind": "launch_args", "log_excerpt": excerpt,
+                    "matched_pattern": pat}
     for pat in _ARCH_ERROR_PATTERNS:
         if pat.lower() in lc:
             return {"kind": "arch", "log_excerpt": excerpt, "matched_pattern": pat}
@@ -1302,12 +1449,21 @@ def probe_one_cell(
         if capability == Capability.STRUCTURED:
             disable_body = build_disable_thinking_body(spec.name, base_chat_body)
             disable_resp = _post_chat(base_url, disable_body)
-            if not response_has_reasoning_content(disable_resp) and "error" not in disable_resp:
+            # Falsifiable on BOTH surfaces. Absence of `reasoning_content`
+            # alone is not evidence: a parsing switch can produce that
+            # absence while the model thinks exactly as much as before and
+            # merges the trace into `content`. Requiring no inline
+            # `<think>` either means the check can actually fail.
+            has_separate = response_has_reasoning_content(disable_resp)
+            has_inline = response_has_inline_reasoning(disable_resp)
+            if not has_separate and not has_inline and "error" not in disable_resp:
                 disable_verified = True
                 disable_evidence = {"verified": True}
             else:
                 disable_evidence = {
                     "verified": False,
+                    "reasoning_content_present": has_separate,
+                    "inline_think_present": has_inline,
                     "response_preview": _short(disable_resp),
                 }
 
@@ -1733,7 +1889,15 @@ def refresh_top_level_from_cells(entry: dict) -> None:
 
     # No clean probe in the corpus — pick the most-severe failure kind
     # to set capability.
-    severities = {"arch": 3, "quant": 2}  # other kinds = severity 1
+    #
+    # `launch_args` is severity 0: the engine rejected OUR command line, so
+    # the run produced no evidence about the model at all. Giving it any
+    # positive severity would write Capability.ERROR, which the router
+    # treats as terminal -- permanently writing off a model because this
+    # lab sent it a flag it does not accept. That is precisely how seven
+    # SGLang cells were condemned. The run must fail loudly (the caller
+    # aborts the pass) and leave the previous verdict alone.
+    severities = {"arch": 3, "quant": 2, "launch_args": 0}  # others = 1
     chosen_severity = 0
     chosen_ev: dict = {}
     for value in (entry.get("probes") or {}).values():
