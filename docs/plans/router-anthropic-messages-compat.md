@@ -5,12 +5,13 @@ SGLang by normalising the `/v1/messages` request body in the router._
 
 ## Status
 
-Draft. Not scheduled.
+**Done. Shipped 2026-07-27.** All four exit criteria met live.
 
-Root cause is **verified** (see Context -- captured on the wire and
-reproduced byte-for-byte on 2026-07-27). Whether the proposed fix is
-**sufficient** is NOT verified -- see Open question 1, which must be
-answered before any code is written.
+Root cause was verified before the work started (see Context). Open
+question 1 -- whether folding is sufficient, or whether a beta field is
+also rejected -- has now been **answered by replay: folding alone is
+sufficient, no field filtering is needed.** All four open questions are
+resolved; see "Open questions" below for what each replay showed.
 
 ## Dependencies
 
@@ -46,6 +47,33 @@ None. This is self-contained inside `gpu-arbiter/`.
   a fix we control.
 
 ## Open questions
+
+**All four resolved 2026-07-27.** Summary first, original text kept below
+because the reasoning behind each recommendation is still the record.
+
+1. **RESOLVED -- folding alone is sufficient; no field filtering.**
+   Replayed against a live vLLM engine, first with a synthetic body and
+   then with a REAL captured Claude Code body (183 KB, 25 tools, every
+   beta field present): as-is -> **400** with the exact reported locator
+   `('body','messages',1,'role')`; folded with the beta fields **KEPT**
+   -> **200**; folded with them stripped -> 200. `input_tokens` rose
+   from 85 to 124 between the stripped and kept variants, which confirms
+   the tools were genuinely processed rather than ignored. So
+   `context_management`, `output_config`, `thinking`, `metadata` and
+   `tools` are NOT the blocker and are passed through untouched. The
+   plan's contingency ("add a field-filtering step") is not needed.
+2. **RESOLVED -- fold, as recommended.** Content blocks are appended to
+   the top-level `system` verbatim and in order; nothing is dropped.
+3. **RESOLVED -- vllm + sglang only, as recommended.** Verified live that
+   Ollama is untouched: an Ollama row still completes a Claude Code turn
+   and the router logged zero folds on that backend.
+4. **RESOLVED -- SGLang behaves like vLLM.** Answered at zero cost by
+   Phase 0 of `sglang-backend-remediation` (finding 11): SGLang exposes
+   `/v1/messages`, rejects the same body with the same locator, and
+   accepts it once folded. The impact table's `NOT TESTED` row is filled
+   in below.
+
+### Original text
 
 1. **Is folding the stray `system` message sufficient, or does vLLM then
    reject a beta-only field?** The captured request also carries
@@ -174,10 +202,11 @@ Two contributing causes, which have NOT been separated:
 | ------- | ------------------------- | ------------------------- |
 | Ollama  | system-role in messages[] | 200 -- works              |
 | vLLM    | same                      | 400 -- fails every turn   |
-| SGLang  | same                      | NOT TESTED                |
+| SGLang  | same                      | 400 -- same locator (Phase 0 finding 11) |
 
-So Claude Code is usable only with Ollama rows, regardless of which
-model is picked.
+So Claude Code was usable only with Ollama rows, regardless of which
+model was picked. **Fixed 2026-07-27** -- the router now folds the stray
+message for both HF backends and all three rows work.
 
 ## Approach
 
@@ -236,13 +265,51 @@ CLAUDE.md                             modify -- update the rewrite-chain summary
 ### Exit criteria
 
 - `make test-router` green, including a case built from the real
-  captured body shape.
+  captured body shape. **MET** -- 9 new tests in
+  `anthropic_compat_test.go`, whose fixture is the body captured on
+  2026-07-27 from Claude Code v2.1.220 (text truncated and the
+  device/session ids redacted; every field and the message/system
+  structure verbatim). Whole suite race-clean.
 - A live `devai-agent` run with Claude Code against a vLLM row completes
   a first turn and a follow-up turn, with tool use exercised at least
-  once. Recorded here with the model and ctx used.
+  once. **MET** -- `Gemma-4-26B-A4B-it-NVFP4@262144` on vLLM (port
+  11435). A plain turn returned `HELLO-FROM-VLLM`; a second run drove the
+  Bash tool (`echo TOOLS-WORK`) to completion, which is inherently
+  multi-turn -- the follow-up request carries `assistant` +
+  `tool_result` messages, proving the fold does not corrupt the
+  conversation array on later turns. Router logged 9 folds across the
+  sessions and **zero** `literal_error` responses.
 - The same run against an Ollama row still works -- proof the Ollama
-  path was not disturbed.
+  path was not disturbed. **MET** -- `gemma4:26b-a4b-it-q4_K_M` on port
+  11434 returned `HELLO-FROM-OLLAMA`, with **0** folds logged for that
+  backend.
 - `docs/router.md` documents the step and its backend/path gating.
+  **MET** -- new section "2. Anthropic `/v1/messages` normalisation",
+  with the rewrite chain renumbered to keep it in execution order.
+
+### Deployment note (cost an hour, worth recording)
+
+`podman restart devai-router` does **not** pick up a rebuilt image -- it
+restarts the existing container, which keeps the image ID it was created
+with. After `make build-router` the router therefore still ran the old
+binary, the live Claude Code run reproduced the original 400 exactly, and
+the unit tests all passed the whole time.
+
+`make cache-up` does not fix this either: it deliberately skips any
+container that already exists (see the comment at that target). The
+working sequence is:
+
+```
+make build-router && podman rm -f devai-router && make cache-up
+```
+
+Verify with `podman inspect devai-router --format '{{.Image}}'` against
+`podman image inspect localhost/devai-router:latest --format '{{.Id}}'`
+-- they must match. This also means an earlier "verification" of
+sglang-backend-remediation Phase 1 was invalid and had to be redone: the
+probe caches are bind-mounted, so cache-driven effects (Ornith
+disappearing from the SGLang rows) appear after a plain restart and look
+like proof that new CODE is live when it is not.
 
 ### Risks
 

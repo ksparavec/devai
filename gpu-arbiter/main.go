@@ -3581,6 +3581,15 @@ func (a *arbiter) makeRequestHandler(backendName string) http.HandlerFunc {
 			if reasoningOverride != "" {
 				policy = reasoningOverride
 			}
+			// Anthropic /v1/messages shape reconciliation, before every
+			// other body rewrite so they all see one canonical shape.
+			// Claude Code puts a `role:"system"` message inside
+			// messages[], which vLLM's and SGLang's stricter compat shims
+			// reject with a 400 on every turn; folding it into the
+			// top-level `system` is verified sufficient against both.
+			// No-op on Ollama (tolerant) and on every other path. See
+			// anthropic_compat.go.
+			body = a.maybeNormaliseAnthropic(backendName, req.URL.Path, body)
 			body = a.applyReasoningPolicy(backendName, req.URL.Path, policyModel, policy, body)
 			// Reasoning + MTP + inline-reasoning guard for vllm#34650.
 			// When the picker (or a client) opts into MTP via `::mtp`

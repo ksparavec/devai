@@ -422,6 +422,18 @@ is generic over `backendState`, so wiring the callback only into the two
 HF backends would have made Ollama refuse healthy models after three
 recreates.
 
+**The first live verification of this phase was invalid and was redone.**
+`podman restart devai-router` does not pick up a rebuilt image, so the
+router was still running the old binary. The cache-driven effects (Ornith
+vanishing from the SGLang rows, the 404 on 11436) appeared anyway,
+because the probe caches are bind-mounted -- which is exactly what made
+the stale binary hard to notice. Re-verified after
+`podman rm -f devai-router && make cache-up`: 9 SGLang serving rows, the
+404 refusal, and zero spurious breaker refusals across live vLLM and
+Ollama traffic (exercising both `newSmartProxy` and `newProxy` credit
+paths against real engines). See the deployment note in
+`router-anthropic-messages-compat.md`.
+
 ### Phase 1 risks
 
 | Risk | Mitigation |

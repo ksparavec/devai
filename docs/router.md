@@ -20,10 +20,11 @@ caches consumed, and failure modes.
 - [Backend lifecycle](#backend-lifecycle)
 - [Request rewrite chain](#request-rewrite-chain)
   - [1. Override parsing](#1-override-parsing-namectxreasoning)
-  - [2. Reasoning policy](#2-reasoning-policy)
-  - [3. Tool-choice promotion](#3-tool-choice-promotion-vllmsglang)
-  - [4. Tool stripping](#4-tool-stripping-vllmsglang)
-  - [5. Context injection](#5-context-injection-ollama-only)
+  - [2. Anthropic /v1/messages normalisation](#2-anthropic-v1messages-normalisation-vllmsglang)
+  - [3. Reasoning policy](#3-reasoning-policy)
+  - [4. Tool-choice promotion](#4-tool-choice-promotion-vllmsglang)
+  - [5. Tool stripping](#5-tool-stripping-vllmsglang)
+  - [6. Context injection](#6-context-injection-ollama-only)
 - [vLLM plugin registry](#vllm-plugin-registry)
 - [Caches consumed](#caches-consumed)
 - [Configuration (env vars)](#configuration-env-vars)
@@ -297,7 +298,57 @@ Examples:
   [vllm#34650](https://github.com/vllm-project/vllm/issues/34650).
   Use `::nothink::mtp@65536` or omit `::mtp`.
 
-### 2. Reasoning policy
+### 2. Anthropic `/v1/messages` normalisation (vLLM/SGLang)
+
+Claude Code sends a `role:"system"` message **inside** `messages[]`, in
+addition to a correct top-level `system`. The Anthropic Messages API
+defines message roles as `user` | `assistant` only, and both engines'
+compat shims implement that stricter schema, so every turn was rejected:
+
+```
+400 1 validation error:
+  {'type': 'literal_error', 'loc': ('body', 'messages', 1, 'role'),
+   'msg': "Input should be 'user' or 'assistant'", 'input': 'system'}
+```
+
+`normaliseAnthropicMessages` (`gpu-arbiter/anthropic_compat.go`) moves
+every message whose role is not `user`/`assistant` into the top-level
+`system` block list, preserving order, and leaves the rest of the body
+alone. A bare-string `system` or `content` is promoted to a text block
+first. When there is nothing to move the original bytes are returned
+**unchanged**, so the common path costs no re-serialisation. Each rewrite
+logs once, naming how many messages moved -- a silent body rewrite is
+very hard to debug from the client side.
+
+**Gating: backend `vllm` or `sglang`, AND path exactly `/v1/messages`.**
+Ollama is verified tolerant of the exact shape Claude Code sends, and
+rewriting a path that already works is unnecessary risk.
+
+Scope was fixed by replay against the live engines, not by reading
+schemas. Using a real captured Claude Code body (183 KB, 25 tools, every
+beta field present) against vLLM:
+
+| Request shape                                | Result |
+| -------------------------------------------- | ------ |
+| as-is                                        | 400    |
+| folded, beta fields KEPT                     | 200    |
+| folded, beta fields stripped                 | 200    |
+
+So folding alone is sufficient and **no field filtering is needed** --
+`context_management`, `output_config`, `thinking`, `metadata` and `tools`
+are not the blocker and are passed through untouched. SGLang was verified
+independently and behaves identically (see
+`docs/plans/sglang-backend-remediation.md` Phase 0, finding 11).
+
+This is a client/server API-version mismatch rather than a devai defect:
+Claude Code emits a newer Anthropic beta wire format (note the
+`?beta=true` query) that the pinned engine images do not implement. The
+rejected alternative was bumping vLLM until its shim accepts the newer
+schema -- not under our control, invalidates the probe and bench caches
+for every HF row, and would have to be repeated every time the client's
+format moves again.
+
+### 3. Reasoning policy
 
 Driven by the `DEVAI_REASONING` env (default `auto`) plus the
 `X-DevAI-Reasoning` header plus the `::<reasoning>` suffix override
@@ -321,7 +372,7 @@ Models with `disable_verified=False` can't reliably suppress
 reasoning -- the directive is sent, but the model may emit reasoning
 anyway (R1-Distill family is the standing example).
 
-### 3. Tool-choice promotion (vLLM/SGLang)
+### 4. Tool-choice promotion (vLLM/SGLang)
 
 Fires when the probe's `tool_mode == "forced"` -- the model only
 verified tool calls when `tool_choice` was pinned to a specific
@@ -337,7 +388,7 @@ function, not under `auto`. Applies the rule:
 
 Models with `tool_mode == "auto"` (probe verified spontaneous calls
 work) skip this step entirely. Models without a verified `tool_parser`
-fall through to step 4 (tool stripping).
+fall through to step 5 (tool stripping).
 
 **Multi-tool reject payload:**
 
@@ -369,7 +420,7 @@ single-tool promote / multi-tool reject rules above. See
 `docs/backends.md` "Operational notes -- R1-Distill family" for the
 behavioural difference between the two distill variants.
 
-### 4. Tool stripping (vLLM/SGLang)
+### 5. Tool stripping (vLLM/SGLang)
 
 Fires when the model has **no** verified `tool_parser` in the cache.
 Without an engine-level `--tool-call-parser` flag, vLLM rejects every
@@ -382,7 +433,7 @@ unavailable for that model. Benefit: chat works without backend errors.
 Ollama is unaffected -- its protocol negotiates tool support per
 request and tolerates `tools=[]` without launch flags.
 
-### 5. Context injection (Ollama only)
+### 6. Context injection (Ollama only)
 
 For Ollama's native `/api/chat` and `/api/generate` paths, the router
 injects `options.num_ctx = <effective ctx>` into the body. The

@@ -107,7 +107,7 @@ found three more findings.
 | [kv-cache-quantization](./kv-cache-quantization.md)                 | Superseded        |
 | [card-derived-hints-and-bench-sync](./card-derived-hints-and-bench-sync.md) | In Progress (Phase 5 shipped) |
 | [sglang-backend-remediation](./sglang-backend-remediation.md)       | In Progress (Phases 0-1 shipped) |
-| [router-anthropic-messages-compat](./router-anthropic-messages-compat.md) | Draft         |
+| [router-anthropic-messages-compat](./router-anthropic-messages-compat.md) | **Done**      |
 | [router-shortcircuit](./router-shortcircuit.md)                     | Draft             |
 | [odysseus-borrowed-ideas](./odysseus-borrowed-ideas.md)             | Draft (partly frozen) |
 | [pi-coding-agent](./pi-coding-agent.md)                             | Draft             |
@@ -383,7 +383,9 @@ of which is schedulable.
 **Actually schedulable work, in priority order:** ~~step 15 Phase 1~~ **(SHIPPED
 2026-07-27 -- Ornith quarantined, SGLang terminal signatures added, launch-breaker
 repayment moved off `/health` onto a real engine response; see that plan's Phase 1
-for the deviations)**, step 14 (~half a day, fixes a current user-facing break), step 1
+for the deviations)**, ~~step 14~~ **(SHIPPED 2026-07-27 -- Claude Code now completes
+turns, incl. tool use, against vLLM and SGLang rows; folding the stray system message
+proved sufficient with no field filtering)**, step 1
 (~4 hours), then step 15 Phases 2-5 (~2 weeks + one GPU window) and step 13
 (~1.5 weeks). Step 2 (`sops-age-secrets`) is **Non-functional** rather than pending --
 it cannot encrypt anything until an age key exists and `.sops.yaml`'s `age1xxxx...`
