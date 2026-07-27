@@ -153,5 +153,104 @@ class DocumentedContractTest(unittest.TestCase):
                       "the dedup behaviour and the doc must agree")
 
 
+
+
+class BenchVerdictHidesRowsTest(unittest.TestCase):
+    """An operator-recorded bench verdict must remove the row.
+
+    Before this, `drop_recommendation` was read by the bench harness and
+    nothing else -- not the picker, not the router. A model the bench had
+    recommended dropping stayed on offer indefinitely, which is how
+    Nemotron-Nano-9B-v2 kept its SGLang row at HumanEval 0.64 against
+    0.80 on vLLM for the same checkpoint.
+
+    The gate is the LEDGER, not the raw drop flag. Drops are documented
+    as advisory ("never edits the exclusion ledger -- that stays an
+    explicit operator action"), and auto-hiding on one metric crossing a
+    threshold is the same silent-exclusion shape that hid Ornith for a
+    day on a 256K-only serving verdict.
+
+    Driven through real discovery rather than a synthetic model dict: the
+    probe-cell shape the picker consumes is non-obvious (cells carry
+    `fully_on_gpu`, and `context` is derived rather than stored), and a
+    hand-built fixture that silently produces zero candidates would make
+    these assertions vacuous.
+    """
+
+    def setUp(self):
+        import importlib.util as _il
+        sp = _il.spec_from_file_location(
+            "ms_picker", REPO_ROOT / "scripts" / "_model_status.py")
+        self.MS = _il.module_from_spec(sp)
+        sp.loader.exec_module(self.MS)
+        self._saved = mp._BENCH_LEDGER
+        self.addCleanup(setattr, mp, "_BENCH_LEDGER", self._saved)
+
+        mp._BENCH_LEDGER = self.MS._empty()
+        rows, _ = mp._build_candidates(mp._discover_models(), {})
+        self.pairs = [(r["name"], r["backend"]) for r in rows]
+        if not self.pairs:
+            self.skipTest("no models on disk to exercise the gate")
+
+    def _with(self, ledger):
+        mp._BENCH_LEDGER = ledger
+        rows, hidden = mp._build_candidates(mp._discover_models(), {})
+        return [(r["name"], r["backend"]) for r in rows], hidden
+
+    def test_a_verdict_removes_exactly_that_row(self):
+        name, backend = self.pairs[0]
+        led = self.MS._empty()
+        self.MS.record_bench_verdict(led, name, backend, "bench_dropped")
+        rows, hidden = self._with(led)
+        self.assertNotIn((name, backend), rows)
+        self.assertEqual(hidden["bench_excluded"], 1)
+        self.assertEqual(len(rows), len(self.pairs) - 1,
+                         "exactly one row should disappear")
+
+    def test_other_backends_of_the_same_model_survive(self):
+        """The verdict is per (name, backend). Nemotron dropped on SGLang
+        must keep its vLLM row -- that is the whole point."""
+        multi = [n for n, _ in self.pairs
+                 if sum(1 for nn, _ in self.pairs if nn == n) > 1]
+        if not multi:
+            self.skipTest("no model present on two backends")
+        name = multi[0]
+        backends = [b for n, b in self.pairs if n == name]
+        led = self.MS._empty()
+        self.MS.record_bench_verdict(led, name, backends[0], "bench_dropped")
+        rows, _ = self._with(led)
+        self.assertNotIn((name, backends[0]), rows)
+        for other in backends[1:]:
+            self.assertIn((name, other), rows)
+
+    def test_unconfirmed_bench_failed_does_not_hide(self):
+        """One failure is infrastructure noise; it takes two."""
+        name, backend = self.pairs[0]
+        led = self.MS._empty()
+        self.MS.record_bench_verdict(led, name, backend, "bench_failed")
+        rows, _ = self._with(led)
+        self.assertIn((name, backend), rows)
+
+    def test_corrupt_ledger_fails_open(self):
+        rows, _ = self._with({"models": "not-a-dict"})
+        self.assertEqual(len(rows), len(self.pairs),
+                         "a broken ledger must not empty the picker")
+
+
+class PickerIgnoresTheRawDropFlagTest(unittest.TestCase):
+    """Reading drop_recommendation directly would re-introduce silent,
+    unrecorded exclusion. Mentioning it in a comment is fine -- and is
+    exactly what the picker does, to explain why it does not read it."""
+
+    def test_no_code_level_read_of_drop_recommendation(self):
+        src = (REPO_ROOT / "scripts" / "model-picker.py").read_text()
+        code = "\n".join(
+            ln for ln in src.split("\n") if not ln.lstrip().startswith("#"))
+        for pattern in ('get("drop_recommendation"', "get('drop_recommendation'",
+                        '["drop_recommendation"]', "['drop_recommendation']"):
+            with self.subTest(pattern=pattern):
+                self.assertNotIn(pattern, code)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -46,6 +46,26 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 from _capability import Capability  # noqa: E402
+import _model_status as _MS  # noqa: E402
+
+
+def _bench_ledger() -> dict:
+    """Host-local exclusion ledger, loaded once per process.
+
+    Only the BENCH verdicts are consulted here (via is_bench_excluded);
+    fit/OOM verdicts already express themselves through the probe cache
+    the picker reads, so honouring is_excluded() too would double-gate.
+    """
+    global _BENCH_LEDGER
+    if _BENCH_LEDGER is None:
+        try:
+            _BENCH_LEDGER = _MS.load_ledger()
+        except Exception:
+            _BENCH_LEDGER = {"models": {}}   # fail open: show everything
+    return _BENCH_LEDGER
+
+
+_BENCH_LEDGER: dict | None = None
 
 
 # ── Configuration ────────────────────────────────────────────────────────────
@@ -2586,6 +2606,7 @@ def _build_candidates(
     hidden = {
         "missing_capability": 0,
         "no_fitting_ctx": 0,
+        "bench_excluded": 0,
     }
     candidates: list[dict] = []
     for m in models:
@@ -2622,6 +2643,19 @@ def _build_candidates(
         decorated["_picker_bench_row"] = bench_row
         decorated["_picker_bench_other_ctxs"] = other_ctxs
         decorated["_picker_agentic"] = _is_production_agentic(decorated, bench_row)
+        # Operator-recorded bench verdict (bench_dropped / bench_failed).
+        # Gated on the LEDGER, never on the raw `drop_recommendation` in
+        # the bench cache: a drop is documented as advisory ("never edits
+        # the exclusion ledger -- that stays an explicit operator
+        # action"), and auto-hiding on a single-metric threshold is the
+        # same silent-exclusion shape that hid Ornith for a day on a
+        # 256K-only serving verdict. `make model-status CLEAR=<n>::<b>`
+        # puts a row back.
+        if _MS.is_bench_excluded(
+                _bench_ledger(), name_key, backend_key,
+                ctx=ctx_key or None, sha=decorated.get("sha")):
+            hidden["bench_excluded"] += 1
+            continue
         candidates.append(decorated)
     # HF dedup -- vLLM preferred over SGLang for the same name. Ollama
     # tag names never collide with HF directory names so Ollama rows
@@ -2654,7 +2688,8 @@ def _build_menu(
         candidates, hidden = _build_candidates(models, bench_records)
     else:
         candidates = list(_candidates)
-        hidden = _hidden or {"missing_capability": 0, "no_fitting_ctx": 0}
+        hidden = _hidden or {"missing_capability": 0, "no_fitting_ctx": 0,
+                             "bench_excluded": 0}
 
     if sort_mode not in _SORT_MODES:
         sort_mode = "gpqa"
@@ -2738,6 +2773,11 @@ def _build_menu(
             bits.append(
                 f"{hidden['no_fitting_ctx']} no context tier fits "
                 f"≤ {_VRAM_BUDGET:g} GB"
+            )
+        if hidden.get("bench_excluded"):
+            notes.append(
+                f"{hidden['bench_excluded']} dropped on bench verdict "
+                f"(`make model-status` to see, CLEAR= to restore)"
             )
         if hidden["missing_capability"]:
             bits.append(

@@ -772,6 +772,21 @@ deletes weights or edits the exclusion ledger -- that stays an explicit
 operator action"; `--record-drops` (`RECORD_DROPS=1`) is that explicit
 action. Without it, drops are reported and nothing is written.
 
+**Who acts on a bench verdict.** The raw `drop_recommendation` in the
+bench cache is read by the bench harness alone -- it halts an early-drop
+run and tells `bench-plan` to classify the row `dropped`. It does NOT
+hide anything: for a long time nothing outside the harness read it at
+all, so a model the bench had recommended dropping stayed in the picker
+indefinitely. Acting on a drop is an operator step: record it with
+`make bench-sync RECORD_DROPS=1` (or `record_bench_verdict`), and from
+then on the picker hides that `(model, backend)` at the judged ctx and
+above, and `bench-plan` reports it as `excluded` rather than `dropped`.
+`make model-status CLEAR=<name>::<backend>` puts it back.
+
+A direct `make bench-<backend>` still benches a ledger-excluded model on
+purpose -- re-measuring is exactly how an operator decides whether to
+clear a verdict. Only the automated loop (`bench-sync`) skips it.
+
 **Bench verdicts are a separate ledger query.** `bench_dropped` and
 `bench_failed` are recorded with `record_bench_verdict()` and read with
 `is_bench_excluded()` -- never with `is_excluded()`. A model dropped for
