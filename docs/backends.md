@@ -340,6 +340,29 @@ in the cache when the corresponding round-trip succeeds -- a curated
 hint that the model doesn't actually honour produces a null cache
 entry, and the router launches without the flag.
 
+**Changing the hint on a model that is already probed takes three
+steps, and skipping any of them looks like the hint simply did not
+work:**
+
+```bash
+# 1. Edit scripts/model-families.yaml -- the SOURCE of the hint.
+# 2. Propagate it into the generated catalog the probers actually read.
+make catalog-regen
+# 3. Re-probe. PROBE_FORCE=1 is required, not just PROBE_FORCE_ARCH=1.
+PROBE_REPO=<org>/<Model> PROBE_FORCE=1 PROBE_FORCE_ARCH=1 make probe-sglang
+```
+
+Step 2 is easy to miss because the file you edited is not the file the
+prober reads: the prober resolves `row["parsers"][<backend>]` out of
+`deploy/models.yaml`, so an un-regenerated catalog silently supplies the
+old hint (or none).
+
+Step 3's `PROBE_FORCE=1` matters for the same class of reason. The
+band-level "fully cached" short-circuit is evaluated **before** the arch
+probe, so `PROBE_FORCE_ARCH=1` on its own reports `0 probe(s); 1 band(s)
+fully cached` and never re-runs the parser round-trip. Both flags
+together re-probe the cell and re-derive the capability.
+
 ### Probe knobs
 
 | Env / Make var | Effect |
