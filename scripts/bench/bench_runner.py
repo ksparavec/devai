@@ -941,9 +941,39 @@ def run_for_target(
         host_env_id=host_env_id,
         backend_image_digest=backend_image_digest,
         drop_recommendation=drop_flag,
+        clear_drop_recommendation=_should_clear_drop(
+            existing, task_results, drop_flag),
     )
     save_cache(cache_path, cache)
 
+
+
+def _should_clear_drop(existing: dict, task_results: dict,
+                       drop_flag: dict | None) -> bool:
+    """True when this run re-measured the flagged metric and it passed.
+
+    A drop flag records the last MEASUREMENT of one metric. Left in
+    place after the cause is fixed it becomes permanent: bench-sync
+    classifies the row `dropped` and never re-benches it, so nothing can
+    ever clear it. Nemotron-Nano-9B-v2 hit exactly that -- HumanEval 0.04
+    on SGLang purely because no reasoning parser was wired, and once the
+    parser was fixed the stale flag would have kept the row excluded from
+    every future run.
+
+    Deliberately narrow. Clearing on ANY clean run would let a partial
+    re-run (`--tasks leak`) erase a humaneval verdict it never re-tested,
+    which is how a genuinely bad model sneaks back onto the leaderboard.
+    So the flagged metric must appear in THIS run's results.
+    """
+    if drop_flag is not None:
+        return False                      # this run tripped its own flag
+    prev = existing.get("drop_recommendation")
+    if not isinstance(prev, dict):
+        return False
+    metric = prev.get("metric")
+    if not metric:
+        return False                      # unattributable -- leave it alone
+    return any(_strip_subset(name) == metric for name in task_results)
 
 def _latency_metrics_into_row(
     cache: dict, key: str, latency: dict,

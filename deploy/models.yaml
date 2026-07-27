@@ -2,7 +2,7 @@
 #
 # Regenerate with: make catalog-regen
 # Source of truth:  scripts/model-families.yaml
-# Generated at:     2026-07-16T14:04:45+00:00
+# Generated at:     2026-07-27T01:03:12+00:00
 #
 # Every 'size' and 'arch' below was fetched live from the
 # upstream provider at generation time. Do not hand-edit.
@@ -13,48 +13,60 @@ models:
     backend: [vllm, sglang]
     repo: "google/gemma-4-e2b-it"
     source: hf
-    sha: "179516f0c449"
+    sha: "3e22461f65e8"
     size: "9.54 GB"
     arch: { layers: 35, kv_heads: 1, head_dim: 256, k_eq_v: false }
     arch_source: "google/gemma-4-e2b-it/config.json"
     purpose: "gemma4 · 9.5 GB · 35L/1kv/256h"
     conversational: false
+    parsers:
+      vllm:
+        tool: gemma4
 
   - name: "gemma-4-e4b-it"
     family: gemma4
     backend: [vllm, sglang]
     repo: "google/gemma-4-e4b-it"
     source: hf
-    sha: "fa62d88df2e6"
+    sha: "ee0ef6023621"
     size: "14.89 GB"
     arch: { layers: 42, kv_heads: 2, head_dim: 256, k_eq_v: false }
     arch_source: "google/gemma-4-e4b-it/config.json"
     purpose: "gemma4 · 14.9 GB · 42L/2kv/256h"
     conversational: false
+    parsers:
+      vllm:
+        tool: gemma4
 
   - name: "gemma-4-26b-a4b-it"
     family: gemma4
     backend: [vllm, sglang]
     repo: "google/gemma-4-26b-a4b-it"
     source: hf
-    sha: "01e5b3ee840d"
+    sha: "4d7ae4984b7d"
     size: "48.07 GB"
     arch: { layers: 30, kv_heads: 8, head_dim: 256, k_eq_v: true }
     arch_source: "google/gemma-4-26b-a4b-it/config.json"
     purpose: "gemma4 · 48.1 GB · 30L/8kv/256h · k=v"
     conversational: true
+    parsers:
+      vllm:
+        tool: gemma4
 
   - name: "gemma-4-31b-it"
     family: gemma4
     backend: [vllm, sglang]
     repo: "google/gemma-4-31b-it"
     source: hf
-    sha: "b9ea41a2887d"
+    sha: "842da3794eaa"
     size: "58.25 GB"
     arch: { layers: 60, kv_heads: 16, head_dim: 256, k_eq_v: true }
     arch_source: "google/gemma-4-31b-it/config.json"
     purpose: "gemma4 · 58.3 GB · 60L/16kv/256h · k=v"
     conversational: true
+    parsers:
+      vllm:
+        tool: gemma4
 
   - name: "Gemma-4-26B-A4B-NVFP4"
     family: gemma4
@@ -67,6 +79,9 @@ models:
     arch_source: "nvidia/Gemma-4-26B-A4B-NVFP4/config.json"
     purpose: "gemma4 · 17.5 GB · 30L/8kv/256h · k=v"
     conversational: true
+    parsers:
+      vllm:
+        tool: gemma4
     mtp:
       method: mtp
       drafter: google/gemma-4-26B-A4B-it-assistant
@@ -98,6 +113,9 @@ models:
     arch_source: "nvidia/Gemma-4-31B-IT-NVFP4/config.json"
     purpose: "gemma4 · 30.4 GB · 60L/16kv/256h · k=v"
     conversational: true
+    parsers:
+      vllm:
+        tool: gemma4
     mtp:
       method: mtp
       drafter: google/gemma-4-31B-it-assistant
@@ -108,12 +126,15 @@ models:
     backend: [vllm, sglang]
     repo: "google/gemma-4-12B-it"
     source: hf
-    sha: "12ace6d648d7"
+    sha: "707f0a3b8a3c"
     size: "22.28 GB"
     arch: { layers: 48, kv_heads: 8, head_dim: 256, k_eq_v: true }
     arch_source: "google/gemma-4-12B-it/config.json"
     purpose: "gemma4 · 22.3 GB · 48L/8kv/256h · k=v"
     conversational: false
+    parsers:
+      vllm:
+        tool: gemma4
 
   - name: "Gemma-4-E4B-it-NVFP4"
     family: gemma4
@@ -126,18 +147,24 @@ models:
     arch_source: "bg-digitalservices/Gemma-4-E4B-it-NVFP4/config.json"
     purpose: "gemma4 · 9.5 GB · 42L/2kv/256h"
     conversational: true
+    parsers:
+      vllm:
+        tool: gemma4
 
   - name: "gemma-4-12b-it"
     family: gemma4
     backend: [vllm, sglang]
     repo: "unsloth/gemma-4-12b-it"
     source: hf
-    sha: "0f03bc8c5a5d"
+    sha: "55cdba0740a9"
     size: "22.28 GB"
     arch: { layers: 48, kv_heads: 8, head_dim: 256, k_eq_v: true }
     arch_source: "unsloth/gemma-4-12b-it/config.json"
     purpose: "gemma4 · 22.3 GB · 48L/8kv/256h · k=v"
     conversational: true
+    parsers:
+      vllm:
+        tool: gemma4
 
   - name: "gemma4:e2b-it-q4_K_M"
     family: gemma4
@@ -2714,6 +2741,8 @@ models:
       vllm:
         reasoning: nemotron_v3
         tool: nemotron_json
+      sglang:
+        reasoning: nemotron_3
 
   - name: "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"
     family: nemotron-3-nano

@@ -360,5 +360,95 @@ class BenchRepoPatternTest(unittest.TestCase):
         self.assertEqual(len({bs.probe_key(k) for k in keys}), 1)
 
 
+
+
+class StaleDropFlagTest(unittest.TestCase):
+    """A drop flag must be clearable once its cause is fixed.
+
+    update_row only ever WROTE the flag (when non-None), so a clean
+    re-run left the old verdict in place. Combined with bench-sync
+    classifying a flagged row `dropped` and never re-benching it, that
+    made the verdict permanent -- a one-way door with no way back.
+
+    Nemotron-Nano-9B-v2 walked into it: HumanEval 0.04 on SGLang purely
+    because no reasoning parser was wired. After the parser was fixed the
+    stale flag would have kept the row excluded from every future run.
+    """
+
+    def setUp(self):
+        self.core = _load("bench_core_drop", "scripts/bench/_bench_core.py")
+
+    def _row_with_flag(self, metric="humaneval"):
+        cache = {}
+        self.core.update_row(
+            cache, "k", model="M", backend="sglang",
+            router_endpoint="http://r", context=131072,
+            drop_recommendation={"reason": "low_score", "metric": metric,
+                                 "value": 0.04})
+        return cache
+
+    def test_flag_persists_by_default(self):
+        """The existing guarantee: a partial re-run must not silently
+        erase a verdict it did not re-test."""
+        cache = self._row_with_flag()
+        self.core.update_row(cache, "k", model="M", backend="sglang",
+                             router_endpoint="http://r", context=131072)
+        self.assertIn("drop_recommendation", cache["k"])
+
+    def test_flag_clears_when_explicitly_told(self):
+        cache = self._row_with_flag()
+        self.core.update_row(cache, "k", model="M", backend="sglang",
+                             router_endpoint="http://r", context=131072,
+                             clear_drop_recommendation=True)
+        self.assertNotIn("drop_recommendation", cache["k"])
+
+    def test_a_new_flag_still_wins_over_clearing(self):
+        cache = self._row_with_flag()
+        self.core.update_row(
+            cache, "k", model="M", backend="sglang",
+            router_endpoint="http://r", context=131072,
+            drop_recommendation={"reason": "leak", "metric": "leak"},
+            clear_drop_recommendation=True)
+        self.assertEqual(cache["k"]["drop_recommendation"]["reason"], "leak")
+
+
+class ShouldClearDropTest(unittest.TestCase):
+    """The clear condition is deliberately narrow."""
+
+    def _existing(self, metric="humaneval"):
+        return {"drop_recommendation": {"reason": "low_score",
+                                        "metric": metric, "value": 0.04}}
+
+    def test_clears_when_the_flagged_metric_was_re_measured_clean(self):
+        self.assertTrue(runner._should_clear_drop(
+            self._existing(), {"humaneval_subset_50": {}}, None))
+
+    def test_does_not_clear_when_the_metric_was_not_re_run(self):
+        """A `--tasks leak` run must not erase a humaneval verdict it
+        never re-tested -- that is how a bad model sneaks back."""
+        self.assertFalse(runner._should_clear_drop(
+            self._existing(), {"leak_probe": {}}, None))
+
+    def test_does_not_clear_when_this_run_tripped_its_own_flag(self):
+        self.assertFalse(runner._should_clear_drop(
+            self._existing(), {"humaneval_subset_50": {}},
+            {"reason": "low_score", "metric": "humaneval"}))
+
+    def test_no_prior_flag_is_a_no_op(self):
+        self.assertFalse(runner._should_clear_drop({}, {"humaneval_subset_50": {}}, None))
+
+    def test_unattributable_flag_is_left_alone(self):
+        """A flag with no metric cannot be shown to have been re-tested,
+        so it stays until an operator looks at it."""
+        self.assertFalse(runner._should_clear_drop(
+            {"drop_recommendation": {"reason": "low_score"}},
+            {"humaneval_subset_50": {}}, None))
+
+    def test_malformed_flag_is_left_alone(self):
+        self.assertFalse(runner._should_clear_drop(
+            {"drop_recommendation": "not-a-dict"},
+            {"humaneval_subset_50": {}}, None))
+
+
 if __name__ == "__main__":
     unittest.main()

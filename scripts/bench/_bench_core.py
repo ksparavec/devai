@@ -306,6 +306,7 @@ def update_row(
     host_env_id: str | None = None,
     backend_image_digest: str | None = None,
     drop_recommendation: dict | None = None,
+    clear_drop_recommendation: bool = False,
 ) -> dict:
     """Merge a single bench result into the cache.
 
@@ -386,6 +387,21 @@ def update_row(
     # row, so a prior flag persists until a triggering run overwrites it.
     if drop_recommendation is not None:
         row["drop_recommendation"] = drop_recommendation
+    elif clear_drop_recommendation:
+        # A drop flag describes the most recent MEASUREMENT of a metric.
+        # Once the cause is fixed and that same metric is re-measured
+        # clean, keeping the flag makes the verdict permanent: bench-sync
+        # classifies the row `dropped` forever and never re-benches it, so
+        # nothing can ever clear it. That is a one-way door, and this
+        # project hit it -- Nemotron-Nano-9B-v2 scored HumanEval 0.04 on
+        # SGLang purely because no reasoning parser was wired, and after
+        # the parser was fixed the stale flag would have kept it excluded.
+        #
+        # The caller decides, not this function: clearing is only correct
+        # when the run actually re-measured the flagged metric. A narrow
+        # re-run (`--tasks leak`) must never erase a humaneval verdict it
+        # did not re-test.
+        row.pop("drop_recommendation", None)
     row["last_benched_at"] = now
     cache[key] = row
     return row
