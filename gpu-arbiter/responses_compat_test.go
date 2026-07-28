@@ -107,28 +107,49 @@ func TestResponsesPolicy_AutoInjectsNothing(t *testing.T) {
 	}
 }
 
-func TestResponsesPolicy_OffEmitsNoneWhenVerified(t *testing.T) {
-	a := responsesArbiter()
-	in := []byte(`{"model":"structured-model","input":"hi"}`)
-	out := a.applyReasoningPolicy("vllm", "/v1/responses",
-		"structured-model", "off", in)
-	got, ok := reasoningEffortOf(t, out)
-	if !ok || got != "none" {
-		t.Fatalf("verified disable must emit effort=none, got %q (set=%v)",
-			got, ok)
+// `none` must NEVER be emitted on this surface, verified-disable or not.
+// It is rejected by both engines -- vLLM 400 ("Supported values are: high,
+// medium, low"), SGLang 500 because ResponsesRequest.reasoning.effort is
+// Literal['low','medium','high'], i.e. invalid for EVERY model. An earlier
+// version of this file emitted it behind the disable_verified gate; that
+// was a live defect, since Qwen3.5-9B-NVFP4 is exactly the one SGLang row
+// with disable_verified=true.
+func TestResponsesPolicy_NeverEmitsNone(t *testing.T) {
+	for _, verified := range []bool{true, false} {
+		a := responsesArbiter()
+		a.modelDisableOK["vllm"]["structured-model"] = verified
+		in := []byte(`{"model":"structured-model","input":"hi"}`)
+		out := a.applyReasoningPolicy("vllm", "/v1/responses",
+			"structured-model", "off", in)
+		if got, ok := reasoningEffortOf(t, out); ok {
+			t.Fatalf("disable_verified=%v: emitted effort=%q; `none` is "+
+				"rejected by both engines", verified, got)
+		}
+		if string(out) != string(in) {
+			t.Fatalf("disable_verified=%v: body must pass through unchanged, "+
+				"got %s", verified, out)
+		}
 	}
 }
 
-func TestResponsesPolicy_OffWithoutVerificationIsNoop(t *testing.T) {
-	// Harmony models reject effort="none" with 400 and probe as
-	// disable_verified=false; the gate is what keeps them out.
+// Rejected alternatives, pinned so nobody "improves" them back in: `low`
+// would answer a different question than the user asked, and
+// chat_template_kwargs only halves the trace on SGLang (1104 -> 481 chars)
+// -- a partial disable presented as a disable.
+func TestResponsesPolicy_OffDoesNotSubstituteAnotherLever(t *testing.T) {
 	a := responsesArbiter()
-	a.modelDisableOK["vllm"]["structured-model"] = false
 	in := []byte(`{"model":"structured-model","input":"hi"}`)
 	out := a.applyReasoningPolicy("vllm", "/v1/responses",
 		"structured-model", "off", in)
-	if string(out) != string(in) {
-		t.Fatalf("unverified disable must not inject anything, got %s", out)
+	var doc map[string]any
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"reasoning", "reasoning_effort",
+		"chat_template_kwargs", "extra_body"} {
+		if _, bad := doc[k]; bad {
+			t.Fatalf("off must not substitute %q for an unsupported disable", k)
+		}
 	}
 }
 

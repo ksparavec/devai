@@ -448,13 +448,45 @@ Rules:
 - `auto` injects **nothing**. The checkpoint's own default is the right
   answer; inventing `medium` would silently override it. The body comes
   out byte-identical.
-- `off` -> `effort: "none"`, but only when the probe verified the model
-  honours a disable directive. Harmony models reject `none` with
-  `400 "Supported values are: high, medium, low"` -- and they also probe
-  as `disable_verified: false` for exactly that reason, so the existing
-  gate keeps them out. **Known limitation:** that verification was
-  performed on `/v1/chat/completions` and does not strictly transfer here.
+- `off` injects **nothing**, and logs that the directive is unsupported
+  here. `none` is not a legal effort on this surface:
+
+  | Engine | `effort: "none"` |
+  | --- | --- |
+  | vLLM | 400 `"reasoning_effort='none' is not supported by Harmony. Supported values are: high, medium, low."` |
+  | SGLang | 500 -- and schema-level, not model-specific: `ResponsesRequest.reasoning.effort` is `Literal['low','medium','high']`, so it is invalid for **every** model |
+
+  Rejected alternatives: `low` would silently answer a different question
+  than the user asked, and `chat_template_kwargs.enable_thinking=false` is
+  accepted by SGLang but only halves the trace (1104 -> 481 chars on
+  gpt-oss-20b) -- a partial disable presented as a disable. Not honouring
+  an unsupported directive, loudly, is the call this router already makes
+  for unverified tool parsers.
 - A client-supplied `reasoning` object is never overridden.
+
+#### SGLang: verified, with two caveats that are not ours to fix
+
+`reasoning.effort` is honoured (gpt-oss-20b: baseline 556 reasoning chars
+-> `low` 138 -> `high` 746), and the Chat Completions `reasoning_effort`
+is ignored there too (463, i.e. baseline). So the shape above is right for
+both engines.
+
+Two SGLang-side limitations, both measured, both engine bugs rather than
+router ones:
+
+- **Function tools are not supported on this surface at all.**
+  `ResponsesRequest.tools[].type` is `Literal['web_search_preview',
+  'code_interpreter']` and `tool_choice` is `Literal['auto','required',
+  'none']`. A normal function tool therefore fails with a pydantic
+  `ValidationError` surfaced as an unhandled **500**. Codex uses function
+  tools, so Codex cannot work against SGLang's Responses endpoint
+  regardless of configuration.
+- **Non-Harmony models appear broken on the endpoint.**
+  `Qwen3.5-9B-NVFP4` returns `400 "input_ids should be a list of lists
+  for batch processing"` on *every* `/v1/responses` request, including a
+  minimal one, while `/v1/chat/completions` on the same loaded model
+  returns 200. `gpt-oss-20b` works. The router forwards the engine's
+  error unchanged.
 
 **Tool handling on this surface.** Tool *stripping* needs no change:
 `maybeStripTools` is not path-gated and operates on the top-level

@@ -62,18 +62,35 @@ func responsesEffort(policy string) string {
 	case "low", "medium", "high":
 		return policy
 	case "off":
-		// Only reachable when the probe verified this model honours a
-		// disable directive (see reasoningAction / modelDisableOK).
+		// NOTHING is emitted. `none` is not a legal effort on this
+		// surface, and the earlier "known limitation" turned out to be a
+		// live defect when SGLang was actually tested:
 		//
-		// KNOWN LIMITATION: that verification was performed on
-		// /v1/chat/completions, and it does not transfer here. Harmony
-		// models reject effort="none" with 400 ("Supported values are:
-		// high, medium, low") -- but they also probe as
-		// disable_verified=false for exactly that reason, so the gate
-		// already keeps them out. A non-Harmony model that verified
-		// disable on chat could still reject it here; that would surface
-		// as a visible 400 rather than silent wrong behaviour.
-		return "none"
+		//   vLLM    effort="none" -> 400 "reasoning_effort='none' is not
+		//           supported by Harmony. Supported values are: high,
+		//           medium, low."
+		//   SGLang  effort="none" -> 500, and the cause is schema-level
+		//           rather than model-specific:
+		//           ResponsesRequest.reasoning.effort is
+		//           Literal['low','medium','high'], so `none` is invalid
+		//           for EVERY model, not just Harmony ones.
+		//
+		// The disable directive is also unreachable-or-useless in
+		// practice today: 0 of 11 vLLM structured rows probe as
+		// disable_verified, and the single SGLang row that does
+		// (Qwen3.5-9B-NVFP4) returns 400 "input_ids should be a list of
+		// lists for batch processing" on EVERY /v1/responses request,
+		// minimal ones included, while /v1/chat/completions on the same
+		// model returns 200.
+		//
+		// Rejected alternatives: emitting `low` would silently answer a
+		// different question than the user asked; emitting
+		// `chat_template_kwargs.enable_thinking=false` is accepted by
+		// SGLang but only halves the trace (1104 -> 481 chars on
+		// gpt-oss-20b), i.e. a partial disable presented as a disable.
+		// Not honouring an unsupported directive, loudly, is the same
+		// call this router makes for unverified tool parsers.
+		return ""
 	}
 	return ""
 }
@@ -95,7 +112,14 @@ func (a *arbiter) applyResponsesPolicy(
 	case reasoningEnable:
 		effort = responsesEffort(policy)
 	case reasoningDisable:
-		effort = responsesEffort("off")
+		// Say so rather than failing silently: the user asked for
+		// reasoning off and is not getting it.
+		log.Printf("info: %s/%s responses reasoning DISABLE requested but "+
+			"unsupported on /v1/responses (effort=\"none\" is rejected: "+
+			"vLLM 400, SGLang 500 -- its schema allows only low|medium|high); "+
+			"serving at the model default",
+			backendName, modelName)
+		return body
 	}
 	if effort == "" {
 		return body
