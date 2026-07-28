@@ -314,6 +314,53 @@ and refuses:
   inspected the transient losses and accepts the smaller catalog. It
   is an opt-in, not a restored default.
 
+### Cross-backend VRAM verdicts (vLLM -> SGLang, one way)
+
+SGLang does not re-probe a model whose VRAM verdict vLLM already
+measured, because on this fleet SGLang needs **strictly more** VRAM for
+the same `(model, ctx)`:
+
+- reserve: `SGLANG_RESERVE_GB = 3.0` vs `VLLM_RESERVE_GB = 2.0`
+- KV dtype: the vLLM prober launches `--kv-cache-dtype fp8` (1 byte per
+  element); the SGLang prober emits no such flag, so it runs the engine
+  default -- unquantized, 2 bytes. Twice the KV.
+
+So "vLLM could not fit this" implies "SGLang cannot fit it either", and
+probing anyway burns a cold start to rediscover a known answer.
+`_model_status.implied_vram_exclusion()` applies that implication;
+`_VRAM_IMPLIED_BY` is the table.
+
+**The implication is one-way and reason-scoped.** Only `too_big`,
+`too_small` and `oom` carry, and only vLLM -> SGLang. Never the reverse:
+SGLang failing says nothing about vLLM, which has more room.
+
+Two reasons are deliberately excluded from the mechanism:
+
+- **`unsupported_arch`** -- engine-specific by definition. The two
+  engines do not support the same architecture set, which is the whole
+  reason the ledger is keyed per backend.
+- **`manual`** -- an operator verdict with no recorded physics.
+  Propagating it would be actively wrong here: `Qwen3-8B-NVFP4` and
+  `Qwen3-14B-NVFP4` both carry a vLLM `manual` exclusion **and** fit on
+  SGLang, where they are currently served. A blanket "anything vLLM
+  rejected" rule would delete both.
+
+An implied exclusion is never more durable than the verdict it derives
+from: it reuses `is_excluded` for the source backend, so a host-VRAM
+change re-derives it and a re-quant re-checks an `oom`. The skip is
+announced on stderr naming the source backend, because it is the one
+skip whose evidence lives under a *different* backend's ledger entry --
+a reader inspecting SGLang's ledger would otherwise find no reason for
+it. `PROBE_FORCE_ARCH=1` probes anyway.
+
+**Currently this skips nothing**, and that is correct rather than
+broken. The only VRAM-derived vLLM verdict on an SGLang-capable catalog
+row is `Gemma-4-31B-IT-NVFP4`'s `oom`, recorded against sha
+`e5ef03afa233` while the catalog has since moved to `4135a98a9b72` --
+the model was re-quantized, so the verdict no longer applies. The gate
+is a standing rule that bites as vLLM accumulates fresh VRAM verdicts,
+not a one-off cleanup.
+
 ### Curating parser hints
 
 Reasoning and tool-call parsers are per-architecture. The curated

@@ -313,6 +313,66 @@ def _backend_entry(ledger: dict, name: str, backend: str) -> dict | None:
     return e if isinstance(e, dict) and e.get("status") == "excluded" else None
 
 
+# Reasons whose basis is VRAM arithmetic rather than an engine-specific
+# capability or an operator judgement. Only these can carry from one
+# backend to another.
+_VRAM_DERIVED_REASONS = ("too_big", "too_small", "oom")
+
+# backend -> backends whose VRAM-derived verdicts also apply here.
+#
+# ONLY vllm -> sglang, and only in that direction. SGLang needs strictly
+# MORE VRAM than vLLM for the same (model, ctx) on this fleet:
+#
+#   * reserve:  SGLANG_RESERVE_GB = 3.0  vs  VLLM_RESERVE_GB = 2.0
+#   * KV dtype: the vLLM prober launches --kv-cache-dtype fp8 (1 byte per
+#     element); the SGLang prober emits no such flag, so it runs the
+#     engine default -- unquantized, 2 bytes. Twice the KV.
+#
+# So "vLLM could not fit this" implies "SGLang cannot fit it either", and
+# probing it on SGLang burns a cold start to rediscover a known answer.
+# The converse is NOT true and must never be added: SGLang failing says
+# nothing about vLLM, which has more room.
+#
+# Deliberately excluded from this mechanism:
+#
+#   unsupported_arch -- engine-specific by definition. vLLM and SGLang do
+#     not support the same architecture set, which is the entire reason
+#     the ledger is keyed per backend.
+#   manual -- an operator verdict with no recorded physics. Propagating it
+#     would be actively wrong here: Qwen3-8B-NVFP4 and Qwen3-14B-NVFP4
+#     both carry a vLLM `manual` exclusion AND fit on SGLang, where they
+#     are currently served.
+#   retired / bench_* -- not probe gates.
+_VRAM_IMPLIED_BY: dict[str, tuple[str, ...]] = {"sglang": ("vllm",)}
+
+
+def implied_vram_exclusion(ledger: dict, name: str, backend: str, *,
+                           host_vram: float | None,
+                           sha: str | None = None) -> tuple[str, str] | None:
+    """A VRAM-derived exclusion on a roomier backend that applies here.
+
+    Returns ``(source_backend, reason)`` or None. Used to skip a probe
+    that would only rediscover a VRAM verdict already measured on a
+    backend with strictly more headroom -- see _VRAM_IMPLIED_BY for why
+    the implication is one-way.
+
+    Reuses `is_excluded` for the source backend so the stability rules
+    (re-derive on a VRAM change, re-check `oom` on a new sha) apply
+    identically; an implied exclusion is never more durable than the
+    verdict it is derived from.
+    """
+    for source in _VRAM_IMPLIED_BY.get(backend, ()):
+        e = _backend_entry(ledger, name, source)
+        if e is None:
+            continue
+        reason = e.get("reason")
+        if reason not in _VRAM_DERIVED_REASONS:
+            continue
+        if is_excluded(ledger, name, source, host_vram=host_vram, sha=sha):
+            return source, str(reason)
+    return None
+
+
 def is_excluded(ledger: dict, name: str, backend: str, *,
                 host_vram: float | None, sha: str | None = None) -> bool:
     """True iff (name, backend) is excluded AND that verdict still applies at

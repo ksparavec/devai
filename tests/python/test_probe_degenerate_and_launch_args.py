@@ -259,3 +259,70 @@ class TestLaunchFingerprint(unittest.TestCase):
         fp = P.launch_fingerprint(self._BASE)
         self.assertEqual(fp, P.launch_fingerprint(list(self._BASE)))
         self.assertEqual(len(fp), 12)
+
+
+class TestImpliedVramExclusion(unittest.TestCase):
+    """A VRAM verdict measured on a roomier backend applies to a tighter
+    one, so SGLang need not rediscover it. One-way and reason-scoped.
+    """
+
+    def setUp(self):
+        sys.path.insert(0, str(REPO_ROOT / "scripts"))
+        import _model_status
+        self.MS = _model_status
+
+    def _ledger(self, backend: str, reason: str, vram=24.0):
+        led: dict = {}
+        self.MS.record_exclusion(led, "M", backend, reason,
+                                 detail="t", host_vram=vram, sha="s1")
+        return led
+
+    def test_vllm_oom_implies_sglang(self):
+        led = self._ledger("vllm", "oom")
+        self.assertEqual(
+            self.MS.implied_vram_exclusion(led, "M", "sglang", host_vram=24.0,
+                                           sha="s1"),
+            ("vllm", "oom"))
+
+    def test_vllm_too_big_implies_sglang(self):
+        led = self._ledger("vllm", "too_big")
+        got = self.MS.implied_vram_exclusion(led, "M", "sglang", host_vram=24.0)
+        self.assertEqual(got, ("vllm", "too_big"))
+
+    def test_manual_does_not_propagate(self):
+        # Load-bearing: Qwen3-8B-NVFP4 and Qwen3-14B-NVFP4 both carry a
+        # vLLM `manual` exclusion AND fit on SGLang, where they serve.
+        # Propagating `manual` would delete working rows.
+        led = self._ledger("vllm", "manual")
+        self.assertIsNone(
+            self.MS.implied_vram_exclusion(led, "M", "sglang", host_vram=24.0))
+
+    def test_unsupported_arch_does_not_propagate(self):
+        # Engine-specific by definition -- the two engines do not support
+        # the same architecture set, which is why the ledger is keyed per
+        # backend in the first place.
+        led = self._ledger("vllm", "unsupported_arch")
+        self.assertIsNone(
+            self.MS.implied_vram_exclusion(led, "M", "sglang", host_vram=24.0))
+
+    def test_direction_is_one_way(self):
+        # SGLang failing says NOTHING about vLLM, which has more room.
+        led = self._ledger("sglang", "oom")
+        self.assertIsNone(
+            self.MS.implied_vram_exclusion(led, "M", "vllm", host_vram=24.0))
+
+    def test_inherits_the_source_stability_rules(self):
+        # An implied exclusion must never outlive the verdict it derives
+        # from: a different host VRAM re-derives, and a new sha re-checks.
+        led = self._ledger("vllm", "oom", vram=24.0)
+        self.assertIsNone(
+            self.MS.implied_vram_exclusion(led, "M", "sglang", host_vram=48.0),
+            "a VRAM change must re-derive, not inherit")
+        self.assertIsNone(
+            self.MS.implied_vram_exclusion(led, "M", "sglang", host_vram=24.0,
+                                           sha="s2"),
+            "a re-quant must re-check an oom verdict")
+
+    def test_absent_source_entry_is_not_an_exclusion(self):
+        self.assertIsNone(
+            self.MS.implied_vram_exclusion({}, "M", "sglang", host_vram=24.0))

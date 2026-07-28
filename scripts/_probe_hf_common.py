@@ -75,6 +75,7 @@ from _vllm_plugins import PluginEntry, PluginRegistry, get_registry  # noqa: E40
 from _model_status import (  # noqa: E402
     clear as _ledger_clear,
     exclusion_reason as _ledger_reason,
+    implied_vram_exclusion as _ledger_implied_vram_exclusion,
     is_excluded as _ledger_is_excluded,
     load_ledger as _load_ledger,
     record_exclusion as _ledger_record,
@@ -2157,6 +2158,27 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
                                         host_vram=args.host_vram_gb, sha=sha)):
             skipped_excluded += 1
             continue
+
+        # A VRAM verdict already measured on a roomier backend applies
+        # here too, so probing would burn a cold start to rediscover a
+        # known answer. One-way and reason-scoped -- see
+        # _model_status._VRAM_IMPLIED_BY. Announced rather than silent:
+        # this is the one skip whose evidence lives under a DIFFERENT
+        # backend, so a reader looking at this backend's ledger would
+        # otherwise find no reason for it.
+        if not args.force_arch:
+            implied = _ledger_implied_vram_exclusion(
+                ledger, name, spec.name,
+                host_vram=args.host_vram_gb, sha=sha)
+            if implied:
+                src, why = implied
+                print(f"  [skip] {name}: {src} recorded {why!r} at this VRAM, "
+                      f"and {spec.name} needs strictly more (reserve "
+                      f"{spec.reserve_gb:g} GB, unquantized KV) -- so it "
+                      f"cannot fit here either. PROBE_FORCE_ARCH=1 to probe "
+                      f"anyway.", file=sys.stderr)
+                skipped_excluded += 1
+                continue
 
         if not is_downloaded(name, models_dir):
             print(f"  [skip] {name}: not on disk under {models_dir}",
