@@ -22,6 +22,7 @@ caches consumed, and failure modes.
 - [Request rewrite chain](#request-rewrite-chain)
   - [1. Override parsing](#1-override-parsing-namectxreasoning)
   - [2. Anthropic /v1/messages normalisation](#2-anthropic-v1messages-normalisation-vllmsglang)
+  - [2b. Responses API reasoning](#2b-responses-api-reasoning-v1responses-vllmsglang)
   - [3. Reasoning policy](#3-reasoning-policy)
   - [4. Tool-choice promotion](#4-tool-choice-promotion-vllmsglang)
   - [5. Tool stripping](#5-tool-stripping-vllmsglang)
@@ -410,6 +411,70 @@ rejected alternative was bumping vLLM until its shim accepts the newer
 schema -- not under our control, invalidates the probe and bench caches
 for every HF row, and would have to be repeated every time the client's
 format moves again.
+
+### 2b. Responses API reasoning (`/v1/responses`, vLLM/SGLang)
+
+Codex speaks **only** this wire -- `wire_api = "chat"` was removed
+upstream and `responses` is now the sole variant -- and the reasoning
+rewrite used to be gated to `/v1/chat/completions` and `/v1/messages`, so
+every Codex request went through with no reasoning policy at all.
+
+Both engines implement the endpoint: vLLM v0.22.1 verified live, SGLang
+v0.5.10 registers it at `http_server.py:1563`.
+
+**The shape differs, and the wrong one is accepted silently.** Measured
+against the live engine serving `gpt-oss-20b`:
+
+| Request field | Result |
+| --- | --- |
+| `reasoning: {"effort": "low"}` | 200 -- reasoning_tokens **298 -> 37** |
+| `reasoning_effort: "low"` | 200 -- reasoning_tokens **282** (ignored) |
+
+So simply widening the path gate and reusing `applyVLLMPolicy` would have
+produced a fix that looked right and did nothing. `applyResponsesPolicy`
+emits the Responses-native `reasoning.effort` instead.
+
+Verified end-to-end through the router afterwards, same prompt:
+
+```
+bare name (policy=auto)   reasoning_tokens=249     <- no injection, model default
+<name>::low               reasoning_tokens=59
+<name>::high              reasoning_tokens=298
+```
+
+Rules:
+
+- `low` / `medium` / `high` -> `reasoning.effort` = that level.
+- `auto` injects **nothing**. The checkpoint's own default is the right
+  answer; inventing `medium` would silently override it. The body comes
+  out byte-identical.
+- `off` -> `effort: "none"`, but only when the probe verified the model
+  honours a disable directive. Harmony models reject `none` with
+  `400 "Supported values are: high, medium, low"` -- and they also probe
+  as `disable_verified: false` for exactly that reason, so the existing
+  gate keeps them out. **Known limitation:** that verification was
+  performed on `/v1/chat/completions` and does not strictly transfer here.
+- A client-supplied `reasoning` object is never overridden.
+
+**Tool handling on this surface.** Tool *stripping* needs no change:
+`maybeStripTools` is not path-gated and operates on the top-level
+`tools` / `tool_choice` keys, which the Responses API also uses. Tool
+*choice promotion* is now explicitly skipped, because the engine will not
+accept a pin here at all:
+
+| `tool_choice` sent | Result |
+| --- | --- |
+| `"auto"` | 200 |
+| `{"type":"function","name":...}` (flat) | 501 "Only 'auto' or 'none' tool_choice is supported in response API with Harmony" |
+| `{"type":"function","function":{"name":...}}` (what the router emits) | 400 "Tool choice 'function' not found in 'tools' parameter" |
+
+It already no-opped by accident -- `toolNameAt` reads the nested Chat
+Completions tools shape while the Responses API requires a **flattened**
+one (`{"type":"function","name":...}`; the nested form is rejected with
+400 and 25 validation errors) -- so the skip is now deliberate rather
+than a happy consequence of a shape mismatch.
+
+See `gpu-arbiter/responses_compat.go`.
 
 ### 3. Reasoning policy
 

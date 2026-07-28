@@ -3690,7 +3690,18 @@ func (a *arbiter) makeRequestHandler(backendName string) http.HandlerFunc {
 			// requests are rejected with HTTP 400 instead of silently
 			// running with auto on a model that won't call. Models
 			// with mode=auto or no verified tool_parser pass through.
-			promoted, perr := a.maybePromoteToolChoice(backendName, policyModel, body)
+			// tool_choice promotion is Chat-Completions-only. On
+			// /v1/responses the engine rejects a pinned choice outright
+			// (501 "Only 'auto' or 'none' tool_choice is supported in
+			// response API with Harmony"), and the nested shape this
+			// emits returns 400. It currently no-ops there by accident --
+			// `toolNameAt` reads the nested tools shape while Responses
+			// requires a flattened one -- so make the skip deliberate
+			// rather than a happy consequence of a shape mismatch.
+			promoted, perr := body, (*promoteToolChoiceError)(nil)
+			if !isResponsesPath(req.URL.Path) {
+				promoted, perr = a.maybePromoteToolChoice(backendName, policyModel, body)
+			}
 			if perr != nil {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(perr.HTTPStatus())
@@ -4031,9 +4042,17 @@ func (a *arbiter) applyReasoningPolicy(backendName, path, modelName, policy stri
 		case "/v1/messages":
 			return a.applyOllamaAnthropicMessagesPolicy(modelName, policy, body)
 		}
-	case "vllm":
-		return a.applyVLLMPolicy(path, modelName, policy, body)
-	case "sglang":
+	case "vllm", "sglang":
+		// The Responses API needs its own shape: `reasoning.effort`.
+		// The Chat Completions shape (`reasoning_effort`) is accepted
+		// here with HTTP 200 and silently IGNORED -- measured, see
+		// responses_compat.go. Codex speaks only this wire.
+		if isResponsesPath(path) {
+			return a.applyResponsesPolicy(backendName, modelName, policy, body)
+		}
+		if backendName == "vllm" {
+			return a.applyVLLMPolicy(path, modelName, policy, body)
+		}
 		return a.applySGLangPolicy(path, modelName, policy, body)
 	}
 	return body
