@@ -17,6 +17,7 @@ caches consumed, and failure modes.
 
 - [Architecture](#architecture)
 - [Port layout](#port-layout)
+- [What the router advertises](#what-the-router-advertises)
 - [Backend lifecycle](#backend-lifecycle)
 - [Request rewrite chain](#request-rewrite-chain)
   - [1. Override parsing](#1-override-parsing-namectxreasoning)
@@ -233,6 +234,68 @@ GPU:
 3. Recreate the target backend with the new model.
 
 ---
+
+## What the router advertises
+
+Two endpoints, registered per backend port: `/v1/models` (OpenAI shape)
+and `/api/tags` (Ollama shape). Both answer from a **vetted** subset, and
+that subset is deliberately NOT the same as what the router will serve.
+
+| Set | Contents | Read by |
+| --- | --- | --- |
+| **advertised** | probed AND benched AND weights in THIS backend's store AND no bench verdict | `/v1/models`, `/api/tags` |
+| **serveable** (`modelNames`) | has a fitting probe cell | the request handler's allowlist |
+
+**Why they must differ.** The bench harness is itself a router client --
+`bench_runner.py` drives every scored task through `router_url + "/v1"`.
+If the serving allowlist required a bench row, a newly probed model could
+never earn its first one: the router would refuse it, so it would never
+be benched, so the router would keep refusing it. Gating only the
+*advertisement* breaks that loop and still satisfies "never advertise
+anything un-vetted", because the bench names its target explicitly and
+never reads the listing.
+
+Concretely, a withheld model behaves like this:
+
+```
+POST /v1/chat/completions {"model":"Qwen3-8B-NVFP4"}   -> 503, "has no weights on disk at
+                                                          /var/cache/devai/sglang/... run
+                                                          `make model-pull NAME=...`"
+POST /v1/chat/completions {"model":"does-not-exist"}   -> 404, "unknown model"
+GET  /v1/models                                        -> does not list it
+```
+
+The 503 is `checkModelWeights` failing fast with an actionable message;
+the 404 is the allowlist. A withheld model is reachable, a nonexistent
+one is not.
+
+**The live passthrough is filtered too.** Both handlers first ask the
+running engine for its own model list and merge the result. That echoes
+whatever is currently resident, which is exactly when an un-vetted model
+would be most visible, so it is intersected with the vetted set before
+merging.
+
+**Vetting inputs** are read once at startup, like every other cache the
+router consumes -- `BENCH_CACHE` (default `/etc/devai/.bench-cache.json`)
+and `MODEL_STATUS_LEDGER` (default `/etc/devai/.model-status.json`), both
+mounted read-only. A missing file means "nothing benched", so nothing is
+advertised: the safe direction for a display decision, and loud, because
+each backend logs its gap at startup:
+
+```
+vllm: advertising 5 of 16 probed model(s) -- withheld: 11 no weights in this
+backend's store, 0 never benched, 0 bench-dropped. Withheld models are still
+SERVEABLE by explicit name ...
+```
+
+Only `bench_*` verdicts gate advertisement. A probe-side verdict (`oom`,
+`unsupported_arch`, `manual`) already prevented the model reaching
+`modelNames`, and re-applying it here would conflate two different
+questions. The ctx rule matches the Python `is_bench_excluded`: a verdict
+recorded at ctx N applies at N and above, and one with no recorded ctx
+applies everywhere.
+
+See `gpu-arbiter/advertise.go`.
 
 ## Request rewrite chain
 

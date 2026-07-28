@@ -154,6 +154,11 @@ func TestMakeModelsHandler_ReturnsConfiguredModels(t *testing.T) {
 
 	bs := testBackend("vllm", server)
 	bs.modelNames = []string{"model-a", "model-b"}
+	// The handlers serve the VETTED subset now, not modelNames. Both are
+	// vetted here so this test keeps testing what it was written for
+	// (merge/dedup shape); TestModelsHandler_HidesUnvettedModels covers
+	// the narrowing.
+	bs.advertised = []string{"model-a", "model-b"}
 	a := testArbiter(bs)
 
 	handler := a.makeModelsHandler("vllm")
@@ -191,6 +196,9 @@ func TestMakeModelsHandler_MergesLiveAndConfigured(t *testing.T) {
 	bs := testBackend("vllm", server)
 	bs.running = true
 	bs.modelNames = []string{"live-model", "config-only-model"}
+	// Both vetted: this test is about merge/dedup between the live
+	// passthrough and the configured list, not about narrowing.
+	bs.advertised = []string{"live-model", "config-only-model"}
 	a := testArbiter(bs)
 
 	handler := a.makeModelsHandler("vllm")
@@ -1580,6 +1588,7 @@ func TestMakeTagsHandler_ReturnsConfiguredModels(t *testing.T) {
 
 	bs := testBackend("vllm", server)
 	bs.modelNames = []string{"model-a"}
+	bs.advertised = []string{"model-a"}
 	a := testArbiter(bs)
 
 	handler := a.makeTagsHandler("vllm")

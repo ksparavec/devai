@@ -773,6 +773,11 @@ type backendState struct {
 	config     backendConfig
 	proxy      *httputil.ReverseProxy
 	modelNames []string
+	// advertised is the vetted subset of modelNames that /v1/models and
+	// /api/tags list. modelNames itself remains the SERVING allowlist, so
+	// a withheld model can still be benched by explicit name. See
+	// advertise.go.
+	advertised []string
 	running    bool
 	// containerLaunched tracks CONTAINER LIVENESS, which is not the same
 	// thing as `running` (= "healthy and serving"). `podman start`
@@ -894,6 +899,13 @@ type arbiter struct {
 	// SGLang's context cap used to size a vLLM launch).
 	modelSizes    map[string]map[string]float64 // backend → model name → weight size in GB
 	modelContexts map[string]map[string]int     // backend → model name → declared max context
+	// Advertisement vetting inputs, read once at startup like every other
+	// cache here. benchedModels: backend → model → largest benched ctx.
+	// benchExclusions: backend → model → recorded bench verdict. See
+	// advertise.go for why these gate ADVERTISEMENT only and never
+	// serving.
+	benchedModels   map[string]map[string]int
+	benchExclusions map[string]map[string]benchVerdict
 	// Capability and disable-verified are backend-specific for the same
 	// reason the parser maps below are: a model that runs on both vLLM and
 	// SGLang can carry different reasoning classifications per engine.
@@ -1852,6 +1864,26 @@ func buildArbiter() *arbiter {
 		env("RECOVERY_FLAGS_REGISTRY", "/etc/devai/recovery-flags.json"),
 	)
 
+	// Advertisement vetting inputs. Both are OPTIONAL, and a missing file
+	// means "nothing benched" -- so nothing is advertised. That is loud
+	// (the per-backend gap line below says so) and safe, because every
+	// model stays SERVEABLE by explicit name; only the listing shrinks.
+	// See advertise.go.
+	benchCachePath := env("BENCH_CACHE", "/etc/devai/.bench-cache.json")
+	benchedModels := loadBenchedModels(benchCachePath)
+	ledgerPath := env("MODEL_STATUS_LEDGER", "/etc/devai/.model-status.json")
+	benchExclusions := loadBenchExclusions(ledgerPath)
+	benchRows, dropRows := 0, 0
+	for _, m := range benchedModels {
+		benchRows += len(m)
+	}
+	for _, m := range benchExclusions {
+		dropRows += len(m)
+	}
+	log.Printf("bench cache: %s loaded (%d benched (model,backend) pair(s)); "+
+		"ledger: %s (%d bench verdict(s))",
+		benchCachePath, benchRows, ledgerPath, dropRows)
+
 	a := &arbiter{
 		backends:             make(map[string]*backendState),
 		ollamaURL:            ollamaURL,
@@ -1864,6 +1896,8 @@ func buildArbiter() *arbiter {
 		keepaliveGrace:       time.Duration(envIntAllowZero("DEVAI_SSE_KEEPALIVE_GRACE_SECONDS", sseKeepaliveGraceDefault)) * time.Second,
 		modelSizes:           modelSizes,
 		modelContexts:        modelContexts,
+		benchedModels:        benchedModels,
+		benchExclusions:      benchExclusions,
 		modelCapability:      modelCapability,
 		modelDisableOK:       modelDisableOK,
 		modelToolParser:      modelToolParser,
@@ -1917,6 +1951,10 @@ func buildArbiter() *arbiter {
 		} else {
 			bs.proxy = newSmartProxy(bc.BackendURL, stale, onServed)
 		}
+		// Vetted advertisement subset. Computed after modelNames and the
+		// weight/bench indexes exist; see advertise.go.
+		bs.advertised = a.advertisedNames(bs)
+		a.logAdvertisementGap(bs, bs.advertised)
 		a.backends[bc.Name] = bs
 	}
 
@@ -4650,21 +4688,37 @@ func (a *arbiter) makeModelsHandler(backendName string) http.HandlerFunc {
 		running := bs.running
 		a.mu.Unlock()
 
+		// Vetted set for this backend. Anything outside it is withheld
+		// from the LISTING only -- it stays serveable by explicit name, so
+		// the bench harness can still earn a model its first bench row.
+		// See advertise.go.
+		vetted := make(map[string]bool, len(bs.advertised))
+		for _, n := range bs.advertised {
+			vetted[n] = true
+		}
+
 		if running {
 			if resp, err := http.Get(bs.config.BackendURL.String() + "/v1/models"); err == nil {
 				var list modelList
 				json.NewDecoder(resp.Body).Decode(&list)
 				resp.Body.Close()
-				all = append(all, list.Data...)
+				// The live passthrough must be filtered too. It echoes
+				// whatever the engine currently has resident, which is
+				// exactly when an un-vetted model would be most visible.
+				for _, m := range list.Data {
+					if vetted[m.ID] {
+						all = append(all, m)
+					}
+				}
 			}
 		}
 
-		// Always add configured models (they may not be loaded yet)
+		// Add the rest of the vetted set (not loaded yet, but offerable).
 		seen := make(map[string]bool)
 		for _, m := range all {
 			seen[m.ID] = true
 		}
-		for _, name := range bs.modelNames {
+		for _, name := range bs.advertised {
 			if !seen[name] {
 				all = append(all, model{ID: name, Object: "model", OwnedBy: backendName})
 			}
@@ -4704,12 +4758,24 @@ func (a *arbiter) makeTagsHandler(backendName string) http.HandlerFunc {
 			}
 		}
 
-		// Add configured models
+		// Vetted set -- see the /v1/models handler above.
+		vetted := make(map[string]bool, len(bs.advertised))
+		for _, n := range bs.advertised {
+			vetted[n] = true
+		}
+		kept := all.Models[:0]
+		for _, m := range all.Models {
+			if vetted[m.Name] {
+				kept = append(kept, m)
+			}
+		}
+		all.Models = kept
+
 		seen := make(map[string]bool)
 		for _, m := range all.Models {
 			seen[m.Name] = true
 		}
-		for _, name := range bs.modelNames {
+		for _, name := range bs.advertised {
 			if !seen[name] {
 				all.Models = append(all.Models, ollamaModel{Name: name, Model: name})
 			}

@@ -160,6 +160,16 @@ services:
       # launches stay in sync. Missing file → no per-model overrides;
       # behaviour identical to pre-registry builds.
       - RECOVERY_FLAGS_REGISTRY=/etc/devai/recovery-flags.json
+      # Advertisement vetting (gpu-arbiter/advertise.go). The router lists
+      # on /v1/models and /api/tags ONLY models that are probed AND
+      # benched AND have weights in that backend's own store AND carry no
+      # bench verdict. Anything withheld stays SERVEABLE by explicit name,
+      # which is what lets `make bench-*` earn a model its first bench row
+      # -- the bench harness drives every task through the router. Missing
+      # files are not fatal: they mean "nothing benched", so nothing is
+      # advertised, and the per-backend startup line says so.
+      - BENCH_CACHE=/etc/devai/.bench-cache.json
+      - MODEL_STATUS_LEDGER=/etc/devai/.model-status.json
     volumes:
       - ${XDG_RUNTIME_DIR:-/run/user/1000}/podman/podman.sock:/run/podman/podman.sock
       # Probe caches (schema v3 for Ollama digest-keyed; schema v1 for
@@ -183,6 +193,12 @@ services:
       # Per-model recovery flags + env. See header comment in the JSON
       # file for schema; loaded by gpu-arbiter/recovery_flags.go.
       - ./recovery-flags.json:/etc/devai/recovery-flags.json:ro
+      # Bench cache + exclusion ledger, read once at startup for
+      # advertisement vetting (see BENCH_CACHE / MODEL_STATUS_LEDGER
+      # above). Read-only: the router is a consumer of both, never a
+      # writer -- the bench harness and `make model-status` own them.
+      - ./.bench-cache.json:/etc/devai/.bench-cache.json:ro
+      - ./.model-status.json:/etc/devai/.model-status.json:ro
       # The HF weight stores, read-only, at the SAME paths the router
       # hands to libpod as the backend containers' bind source -- so
       # VLLM_MODELS_DIR / SGLANG_MODELS_DIR need no translation between
