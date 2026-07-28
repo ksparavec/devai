@@ -44,11 +44,27 @@ export GPU_MEMORY_GB MAX_CONTEXT_LEN
 # fallback. Exported so host-run probers (scripts/probe-vllm-reasoning.py)
 # launch the SAME image the router/compose use -- without this a .env
 # VLLM_IMAGE bump reaches compose but the prober silently falls back to
-# its own hardcoded default, probing the wrong engine. (SGLANG_IMAGE is
-# intentionally NOT exported here: it has no .env value, so exporting it
-# empty would beat the prober's os.environ.get default and break it.)
+# its own hardcoded default, probing the wrong engine.
+#
+# SGLANG_IMAGE used to be deliberately NOT exported, because it has no
+# .env value and exporting it EMPTY would beat the prober's
+# os.environ.get default and break it. The `?=` pin below removes that
+# hazard -- the variable is never empty now -- so it can be exported for
+# the same reason VLLM_IMAGE is: otherwise a .env bump reaches compose
+# while the host-run prober measures a different engine build, and the
+# probe cache silently describes an image that is not the one serving.
+# Keep in sync with deploy/docker-compose.yaml and
+# deploy/backend-flags.yaml.
 VLLM_IMAGE ?= docker.io/vllm/vllm-openai:latest-x86_64-cu129-ubuntu2404
 export VLLM_IMAGE
+SGLANG_IMAGE ?= docker.io/lmsysorg/sglang:v0.5.10.post1-cu130
+export SGLANG_IMAGE
+# Exported for the same reason: the probers launch their own containers
+# on the host and must use the same CDI device string the compose
+# services do (written into .env by `make gpu-vendor`). Defaulted so an
+# install without .env still resolves.
+DEVAI_GPU_DEVICE ?= nvidia.com/gpu=all
+export DEVAI_GPU_DEVICE
 CACHE_COMPOSE = $(CURDIR)/deploy/docker-compose.yaml
 
 # Services `make cache-up` brings up, in compose-declaration order. Listed

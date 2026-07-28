@@ -174,16 +174,37 @@ def resolve_kv_dtype(model: dict, kv_dtype: str) -> str:
     An explicit --kv-dtype is honoured as-is (operator override, and what
     the probe targets use when PROBE_KV_CACHE_TYPE is set). The default
     sentinel resolves per backend -- see KV_DTYPE_PER_BACKEND.
+
+    Three cases, matching what each engine is ACTUALLY launched with:
+
+    - Ollama-only -> fp16. Ollama's default KV is unquantized.
+    - SGLang-only -> fp16. This is the case that used to be wrong.
+      `sglangEntrypoint` emits `--kv-cache-dtype` only for a cell STAMPED
+      with a dtype, and all 10 SGLang fitting cells on this host are
+      unstamped -- confirmed in a live launch argv, which carries no such
+      flag. The router agrees: it decodes an unstamped cell to fp8 for
+      vLLM only and leaves SGLang at "" (the engine default). Costing
+      SGLang at fp8 therefore HALVED its KV estimate and classified
+      models as fitting that will not.
+    - Anything reachable on vLLM -> fp8. vLLM's unstamped cells were all
+      measured under the prober's historical `--kv-cache-dtype fp8`
+      hardcode, and a model available on both engines is served by vLLM
+      (the picker sorts vLLM ahead of SGLang for the same name).
     """
     if kv_dtype != KV_DTYPE_PER_BACKEND:
         return kv_dtype
-    return "fp16" if is_ollama_only(model) else "fp8"
+    if is_ollama_only(model):
+        return "fp16"
+    backends = model.get("backend", [])
+    if "vllm" not in backends:
+        return "fp16"
+    return "fp8"
 
 
 def kv_dtype_label(kv_dtype: str) -> str:
     """Human-readable form of --kv-dtype for the summary lines."""
     if kv_dtype == KV_DTYPE_PER_BACKEND:
-        return "per-backend (fp8 vLLM/SGLang, fp16 Ollama)"
+        return "per-backend (fp8 vLLM, fp16 SGLang-only/Ollama)"
     return kv_dtype
 
 

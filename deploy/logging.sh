@@ -59,7 +59,11 @@ fi
 if [ -z "$LOG_TARGETS" ]; then
   echo "[$(stamp)] [logger] no devai-* containers found yet; will start"
   echo "[$(stamp)] [logger] following the well-known set instead"
-  LOG_TARGETS="devai-ollama devai-router devai-open-webui devai-webui-proxy"
+  # Includes the two HF backends: they start as `sleep infinity`
+  # placeholders and are RECREATED by the router on first request, so
+  # a logger that started before either was ever used would otherwise
+  # never follow the engine whose crash logs matter most.
+  LOG_TARGETS="devai-ollama devai-router devai-vllm devai-sglang devai-open-webui devai-webui-proxy"
 fi
 
 echo "[$(stamp)] [logger] following: $LOG_TARGETS"

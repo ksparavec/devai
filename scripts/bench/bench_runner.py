@@ -827,7 +827,31 @@ def run_for_target(
             except Exception as e:  # noqa: BLE001
                 print(f"    !! gpqa failed: {e}", file=sys.stderr)
 
-        if drop_flag is None and "tools" in tasks and (force or "tools" not in [_strip_subset(t) for t in existing_tasks]):
+        _tool_parser = (target.get("entry") or {}).get("tool_parser")
+        _tools_wanted = (drop_flag is None and "tools" in tasks
+                         and (force or "tools" not in
+                              [_strip_subset(t) for t in existing_tasks]))
+        if _tools_wanted and backend != "ollama" and not _tool_parser:
+            # A vLLM/SGLang row with no probe-verified tool parser CANNOT
+            # call tools: the router strips `tools`/`tool_choice` from the
+            # request (maybeStripTools) precisely so the engine does not
+            # 400. Running the task anyway measured the router's own
+            # stripping and recorded 0.0 -- indistinguishable in the
+            # leaderboard and the picker from a model that was asked and
+            # got it wrong. Record an explicit sentinel instead.
+            #
+            # Ollama is exempt: it negotiates tools natively over /api/chat
+            # and has no probed tool_parser by design.
+            print(f"  [tools]   SKIPPED -- {backend}/{served} has no "
+                  f"probe-verified tool parser, so the router strips tools; "
+                  f"a score here would measure nothing.", file=sys.stderr)
+            task_results[f"tools_use_{n_tools}"] = {
+                "score": None,
+                "n": 0,
+                "skipped": "no_tool_parser",
+                "ran_at": _now_iso(),
+            }
+        elif _tools_wanted:
             from bench.tasks.tools_use import tools_use_task
             print(f"  [tools]   running n={n_tools} ...", file=sys.stderr)
             try:
@@ -860,6 +884,12 @@ def run_for_target(
                     "score": round(score, 4),
                     "n": n,
                     "by_subcase": by_sub,
+                    # The mode the score was MEASURED in. A forced-mode
+                    # number and an auto-mode number are not comparable --
+                    # forced pins the tool for the model, auto asks it to
+                    # choose -- so the leaderboard must be able to say which.
+                    "tool_mode": _tool_mode,
+                    "tool_parser": _tool_parser,
                     "ran_at": _now_iso(),
                     "inspect_log_dir": str(log_dir),
                 }

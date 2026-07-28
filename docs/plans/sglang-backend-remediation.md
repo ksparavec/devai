@@ -518,8 +518,7 @@ gpu-arbiter/policy_test.go    modify -- assert the emitted SGLang reasoning wire
 
 ## Phase 3 -- Pay the backend-agnostic debt
 
-**PARTIALLY SHIPPED 2026-07-28.** Steps 9, 1, 2, 3, 4 and 5 are done and
-verified live; steps 6, 7 and 8 remain. Details under "Progress" below.
+**SHIPPED 2026-07-28.** All nine steps done. Details under "Progress".
 
 ### Goal
 
@@ -643,10 +642,54 @@ and `devai-sglang:11434/v1/models` returns `['gpt-oss-20b']` -- previously
 returned 200 with a populated `reasoning_content`, which also confirms Phase
 2's rewritten reasoning wire shape reaches the engine.
 
-**Not yet done: steps 6, 7, 8** (bench tools sentinel + `tool_mode` +
-`BENCH_FORCE`; picker per-backend store gate, `_has_tools`, bench hint,
-`resolve_kv_dtype` backend threading, `catalog-discover` fp8 premise; Makefile
-`SGLANG_IMAGE`/`DEVAI_GPU_DEVICE` export and `logging.sh` fallback list).
+- **Step 6 -- bench honesty.** A vLLM/SGLang row with no probe-verified tool
+  parser now records `{"score": null, "skipped": "no_tool_parser"}` instead of
+  `0.0`. Running the task measured the ROUTER's own `maybeStripTools`, and a
+  0.0 was indistinguishable in the leaderboard and picker from a model that
+  was asked and got it wrong. Ollama is exempt (native tool negotiation, no
+  probed parser by design). Both consumers already treat a null score as
+  "unbenched", so the picker falls back to parser-presence rather than showing
+  zero. Successful runs now also record `tool_mode` and `tool_parser` -- a
+  forced-mode score and an auto-mode score are not comparable.
+  `bench-sync` groups by **(backend, force)** and passes `BENCH_FORCE=1` for
+  `stale_env`/`stale_image` rows only: `update_row` is a pure merge, so
+  re-benching a stale row unforced leaves half the metrics from the old
+  host-env/image behind under a single fresh stamp -- while forcing a
+  `new`/`incomplete` row would discard the resumability the planner exists
+  for. This needed a `class` field on plan rows; `needs_bench()` flattens the
+  classes, so the distinction was gone by the time execute() needed it, and
+  the first version of the check was silently inert.
+- **Step 7 -- consumers.** The picker gained a per-backend HF store map and
+  now requires the weights to be in THAT backend's store (each engine
+  bind-mounts only its own), naming every gated row in the footer with the
+  `link-hf-store.py` command -- a hard link, not a re-download. On this host
+  the gate is currently a no-op because both stores are already in sync;
+  proven non-inert by pointing `SGLANG_MODELS_DIR` at an empty directory,
+  which correctly drops all four SGLang rows and names them.
+  `_has_tools` no longer subtracts `disable_verified`: that field is about
+  whether REASONING can be turned off and has nothing to do with tool calling.
+  The conflation became actively harmful once the disable probe was made
+  falsifiable, since 8 of 9 SGLang reasoning rows carry a
+  `disable_verified: true` this would have read as "cannot use tools". It now
+  mirrors the router's actual gate -- a non-empty probed `tool_parser`.
+  **`resolve_kv_dtype` was wrong for SGLang and is corrected.** It returned
+  `fp8` for every non-Ollama row, but `sglangEntrypoint` emits
+  `--kv-cache-dtype` only for a STAMPED cell; all 10 SGLang fitting cells here
+  are unstamped, a live launch argv carries no such flag, and the router
+  itself decodes an unstamped cell to fp8 **for vLLM only**. SGLang therefore
+  serves unquantized KV, and costing it at fp8 halved its KV estimate and
+  classified models as fitting that will not. Now: vLLM-reachable -> fp8,
+  SGLang-only -> fp16, Ollama-only -> fp16. `test_kv_fit_math` asserted the
+  old premise and is corrected with that evidence.
+- **Step 8 -- infra.** `SGLANG_IMAGE` is exported with a `?=` pin. It had been
+  deliberately unexported because exporting it EMPTY would beat the prober's
+  own default; the pin removes that hazard, so a `.env` bump can no longer
+  reach compose while the host-run prober measures a different build.
+  `DEVAI_GPU_DEVICE` is exported for the same reason. `deploy/logging.sh`'s
+  fallback target list gains `devai-vllm` and `devai-sglang` -- both start as
+  `sleep infinity` placeholders and are recreated by the router, so a logger
+  starting before either was used would never follow the engine whose crash
+  logs matter most.
 
 **Incidental finding, not fixed here:** a resident Ollama model survives a
 router restart invisibly. After recreating the router, `ollama ps` still
@@ -671,7 +714,7 @@ know is running. Worth its own item.
   flag. The defensible reading is "no UNINTENDED argv change", which holds --
   the full diff is only the three intended edits.
 - A bench row for a parser-less model records the sentinel, not `tools: 0.0`.
-  **NOT YET** -- step 6 is outstanding.
+  **MET** -- `{"score": null, "n": 0, "skipped": "no_tool_parser"}`.
 
 ### Phase 3 risks
 

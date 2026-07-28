@@ -4,11 +4,17 @@ scripts/select-models.py used to cost every candidate's KV cache at fp16
 (2 bytes/element) regardless of which engine would serve it. That is not
 what the router launches: containerRecreate passes --kv-cache-dtype
 resolved from the probe cell, and an unstamped cell decodes to fp8 (see
-gpu-arbiter resolveKVCacheType and docs/backends.md). On this host 20 of
-21 vLLM cells and 20 of 20 SGLang cells are unstamped, so nearly every HF
-row was costed at twice the KV it is actually served with -- which pushes
-rows over the VRAM budget and quietly removes them from the download
-candidate set, so they are never downloaded and never probed.
+gpu-arbiter resolveKVCacheType and docs/backends.md). On this host nearly
+every vLLM cell is unstamped, so nearly every vLLM row was costed at twice
+the KV it is actually served with -- which pushes rows over the VRAM budget
+and quietly removes them from the download candidate set, so they are never
+downloaded and never probed.
+
+SGLang is NOT the same case, and treating it as one was a second error in
+the opposite direction. `sglangEntrypoint` emits --kv-cache-dtype only for
+a STAMPED cell, and no SGLang cell on this host is stamped, so SGLang runs
+the engine default (unquantized). The router encodes exactly that: it
+decodes an unstamped cell to fp8 for vLLM only.
 
 Ollama is the opposite case: it defaults to fp16 KV and only uses q8_0 on
 the specific tiers whose probe cell says so, so ollama-only rows must
@@ -66,11 +72,34 @@ class KVBytesTableTest(unittest.TestCase):
 
 
 class ResolveKVDtypeTest(unittest.TestCase):
-    def test_hf_rows_default_to_fp8(self):
-        for backends in (["vllm"], ["sglang"], ["vllm", "sglang"]):
+    def test_vllm_reachable_rows_default_to_fp8(self):
+        """Any row vLLM can serve is costed at fp8.
+
+        vLLM's unstamped cells were all measured under the prober's
+        historical `--kv-cache-dtype fp8` hardcode, and the router decodes
+        an unstamped cell to fp8 for vLLM specifically. A row available on
+        both engines is served by vLLM (the picker sorts vLLM first).
+        """
+        for backends in (["vllm"], ["vllm", "sglang"]):
             self.assertEqual(
                 sm.resolve_kv_dtype(_row(backends), sm.KV_DTYPE_PER_BACKEND),
                 "fp8", f"backends={backends}")
+
+    def test_sglang_only_rows_default_to_fp16(self):
+        """SGLang-only rows are costed UNQUANTIZED, not fp8.
+
+        This assertion was previously `fp8`, and that was wrong.
+        `sglangEntrypoint` emits `--kv-cache-dtype` only for a cell STAMPED
+        with a dtype; all 10 SGLang fitting cells on this host are
+        unstamped, and a live launch argv carries no such flag. The router
+        agrees -- it decodes an unstamped cell to fp8 for vLLM only and
+        leaves SGLang at "" (the engine default). Costing SGLang at fp8
+        halved its KV estimate and classified models as fitting that will
+        not.
+        """
+        self.assertEqual(
+            sm.resolve_kv_dtype(_row(["sglang"]), sm.KV_DTYPE_PER_BACKEND),
+            "fp16")
 
     def test_ollama_only_rows_default_to_fp16(self):
         self.assertEqual(

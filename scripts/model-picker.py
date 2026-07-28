@@ -127,6 +127,22 @@ _BENCH_CACHE_PATHS = [
 
 _ROUTER = os.environ.get("DEVAI_ROUTER_HOST", "devai-router")
 _VLLM_DIR = os.environ.get("VLLM_MODELS_DIR", "/var/cache/devai/vllm")
+_SGLANG_DIR = os.environ.get("SGLANG_MODELS_DIR", "/var/cache/devai/sglang")
+# Each engine's container bind-mounts ONLY its own store, so a row is
+# serveable on a backend only when the weights are in THAT backend's
+# store. HF discovery walks the vLLM store, so without this gate an
+# SGLang row was advertised whenever the vLLM copy existed -- and the
+# launch then failed on a path the container cannot see. The fix is a
+# hard link, not a re-download: both stores are on one filesystem.
+# (name, backend) rows hidden because that backend's store lacks the
+# weights. Surfaced in the picker footer -- a silently missing row is how
+# an operator ends up believing a model is unavailable when it is one
+# hard-link away.
+_STORE_GAPS: list[tuple[str, str]] = []
+_HF_STORE_BY_BACKEND: dict[str, str] = {
+    "vllm": _VLLM_DIR,
+    "sglang": _SGLANG_DIR,
+}
 _OLLAMA_MANIFESTS = os.environ.get(
     "OLLAMA_MANIFESTS_DIR",
     "/var/cache/devai/ollama/models/manifests/registry.ollama.ai/library",
@@ -966,6 +982,10 @@ def _discover_models() -> list[dict]:
     probed reasoning capability) are layered on top when available — never
     recomputed here.
     """
+    # Reset per pass: the picker renders several sort modes and may call
+    # this more than once, and a module-level list would otherwise grow a
+    # duplicate entry each time.
+    _STORE_GAPS.clear()
     catalog = _load_catalog()
     # Ollama canonicalizes a k-quant tag's case on `ollama create` (e.g. a
     # catalog `ornith:9b-q4_k_m` is stored on disk as `ornith:9b-q4_K_M`),
@@ -1064,6 +1084,12 @@ def _discover_models() -> list[dict]:
             if not entry:
                 continue
             if entry.get("capability") in (Capability.ERROR, Capability.UNSUPPORTED_ARCH):
+                continue
+            # Weights must be in THIS backend's store, not merely
+            # somewhere on the host.
+            store_dir = _HF_STORE_BY_BACKEND.get(backend)
+            if store_dir and not (Path(store_dir) / name / "config.json").is_file():
+                _STORE_GAPS.append((name, backend))
                 continue
             out_pairs.append((entry, backend))
         return out_pairs
@@ -1634,18 +1660,26 @@ _REASONING_SCORE: dict[str, int] = {
 def _has_tools(m: dict) -> bool:
     """True when the model can serve tool calls today.
 
-    Ollama negotiates tools per-request natively (parser='native'); HF
-    rows are tools-capable only when the probe confirmed a parser AND
-    didn't flag `disable_verified` (router strips tools/tool_choice in
-    that case to avoid backend rejection).
+    Ollama negotiates tools per-request natively (parser='native'); an HF
+    row is tools-capable exactly when the probe recorded a non-empty
+    `tool_parser`.
+
+    This MIRRORS the router's actual gate. `maybeStripTools` strips
+    `tools`/`tool_choice` when the model has no probe-verified tool
+    parser -- and that is the only condition it looks at.
+
+    It used to also require `disable_verified` to be FALSE, which
+    conflated two unrelated fields: `disable_verified` is about whether
+    REASONING can be turned off, and has nothing to do with tool calling.
+    The conflation became actively harmful once the SGLang disable probe
+    was made falsifiable, because 8 of 9 SGLang reasoning rows carry a
+    `disable_verified: true` that this function would read as "cannot use
+    tools".
     """
     parser = str(m.get("tool_parser") or "").strip()
     if not parser or parser.upper() == "N/A":
         return False
-    if parser == "native":
-        return True
-    probe = m.get("probe") or {}
-    return not bool(probe.get("disable_verified"))
+    return True
 
 
 # Known MoE family substrings -- name-based fallback for cases where
@@ -2865,6 +2899,23 @@ def _build_menu(
         lines.append(_format_model_row(m, idx))
         selectable.append(True)
         item_models.append(m)
+
+    if _STORE_GAPS:
+        # Named, not silently dropped: the fix is a hard link, not a
+        # re-download, and an operator cannot act on a row that simply
+        # is not there.
+        lines.append("")
+        selectable.append(False)
+        item_models.append(None)
+        for name, backend in sorted(set(_STORE_GAPS)):
+            lines.append(
+                f"  {_DIM}hidden: {name} [{backend}] -- probed, but no weights "
+                f"in the {backend} store. Link them: "
+                f"python3 scripts/link-hf-store.py --from vllm --to {backend} "
+                f"--name {name}{_RESET}"
+            )
+            selectable.append(False)
+            item_models.append(None)
 
     total_hidden = sum(hidden.values())
     if total_hidden:

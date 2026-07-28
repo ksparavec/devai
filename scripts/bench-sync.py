@@ -209,6 +209,12 @@ def plan_bench(
                 "alias": t.get("alias") or t["key"],
                 "ctx": t.get("ctx"),
                 "reason": why,
+                # Carried so execute() can tell a STALE row (which must be
+                # re-benched with --force, because update_row merges) from a
+                # new/incomplete one (which must not be, or resumability is
+                # lost). needs_bench() flattens the classes, so without this
+                # the distinction is gone by the time it is needed.
+                "class": cls,
             })
     return plan
 
@@ -274,12 +280,23 @@ def execute(plan: dict, *, max_targets: int, tasks: tuple[str, ...],
         print(f"\nbudget: benching {max_targets}, leaving {dropped} for a "
               f"later run (BENCH_MAX_TARGETS)")
 
-    by_backend: dict[str, list[dict]] = {}
+    # Group by (backend, force). Backend grouping keeps GPU switches to
+    # one per backend. The force split matters for correctness: update_row
+    # is a pure MERGE, so re-benching a stale row without --force
+    # overwrites only the tasks that actually re-ran and leaves the rest
+    # of the row's metrics behind -- producing a row that is half old
+    # host-env/image and half new, with a single fresh stamp claiming all
+    # of it. `new` and `incomplete` rows have nothing stale to merge into
+    # and must NOT be forced, or every partially-benched row restarts from
+    # scratch and the resumability the planner exists for is lost.
+    _FORCE_CLASSES = ("stale_env", "stale_image")
+    by_group: dict[tuple[str, bool], list[dict]] = {}
     for r in queue:
-        by_backend.setdefault(r["backend"], []).append(r)
+        force = r.get("class") in _FORCE_CLASSES
+        by_group.setdefault((r["backend"], force), []).append(r)
 
     rc = 0
-    for backend, rows in by_backend.items():
+    for (backend, force), rows in sorted(by_group.items()):
         # BENCH_REPO is a regex over the PROBE-cache key, so the bench
         # key's ::<backend>::<ctx> suffix has to come off first -- see
         # probe_key(). An alternation of the de-suffixed keys reproduces
@@ -289,6 +306,10 @@ def execute(plan: dict, *, max_targets: int, tasks: tuple[str, ...],
         cmd = ["make", f"bench-{backend}",
                f"BENCH_REPO={pattern}",
                f"BENCH_TASKS={','.join(tasks)}"]
+        if force:
+            cmd.append("BENCH_FORCE=1")
+            print(f"  ({backend}: {len(rows)} stale row(s) -> BENCH_FORCE=1, "
+                  f"so the whole row is re-measured rather than merged)")
         step = _run(cmd)
         if step != 0:
             print(f"\nstep failed (rc={step}): {' '.join(cmd)}", file=sys.stderr)
