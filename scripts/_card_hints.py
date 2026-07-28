@@ -219,7 +219,27 @@ TOOL_FORMAT_TO_PARSER: dict[tuple[str, str], str | None] = {
 REASONING_FORMAT_TO_PARSER: dict[tuple[str, str], str | None] = {
     ("harmony", "vllm"): "openai_gptoss",
     ("harmony", "sglang"): "gpt-oss",
-    ("gemma4_think", "vllm"): "gemma4",
+    # AMBIGUOUS, on the same principle as qwen3_xml_family and settled by
+    # the Phase 2 measurement. `Gemma-4-26B-A4B-it-NVFP4` and
+    # `diffusiongemma-26B-A4B-it-NVFP4` have IDENTICAL reasoning markup --
+    # one `<|think|>`, two `<channel|>`, three `<|channel>`, three
+    # `strip_thinking` each -- yet the gemma4 family curates NO reasoning
+    # parser and diffusiongemma curates `gemma4`.
+    #
+    # Measured on Gemma-4-26B-A4B-it-NVFP4 (2026-07-28, one vLLM launch):
+    # `enable_thinking=true` genuinely changes behaviour (1250 chars of
+    # deliberative output vs 393 without) but emits NO `<|think|>` and no
+    # channel delimiters, and leaves `reasoning_content` empty. `<|think|>`
+    # is not even a special token in the checkpoint -- it is absent from
+    # added_tokens_decoder, so the template writes it as plain PROMPT text
+    # to instruct the model, and the model answers in prose beginning
+    # "thought". There is nothing delimited for a reasoning parser to
+    # extract.
+    #
+    # So the markup cannot distinguish the two families, and the one
+    # family measured emits nothing parseable. Deriving a reasoning parser
+    # here would be a guess dressed as evidence.
+    ("gemma4_think", "vllm"): None,
     ("gemma4_think", "sglang"): None,
     # `think_delimited` deliberately resolves to None. A bare `<think>`
     # block is emitted by qwen3, deepseek-r1 and nemotron templates alike,

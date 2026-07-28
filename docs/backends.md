@@ -318,7 +318,69 @@ and refuses:
 
 Reasoning and tool-call parsers are per-architecture. The curated
 choices live in `scripts/model-families.yaml` under each family's
-`parsers:` block:
+`parsers:` block.
+
+**How much of this is mechanically derivable: measured, not guessed.**
+`make card-hints` (read-only, no GPU) predicts the parser from the
+checkpoint's own chat template and prints predicted vs curated vs
+probe-recorded, with the evidence substring behind each prediction.
+`make card-hints-fetch` stages metadata only -- three files, a few
+hundred KB per repo, no weights -- so families that are not downloaded
+can be checked too.
+
+The current answer, over 13 checkpoints across 10 curated families:
+
+- **Derives cleanly:** `gemma4` tool format (inverted `<|tool_call>`
+  delimiters), `harmony` (`<|channel|>commentary` / `analysis`),
+  `nemotron_json` (`<TOOLCALL>`), and `hermes` (`<tool_call>` WITHOUT
+  `<function=`). Ten predictions, all matching the curated and
+  probe-recorded values.
+- **Deliberately derives nothing**, because the markup does not determine
+  the answer:
+  - `qwen3_xml` vs `qwen3_coder`. Four probe-verified checkpoints ship
+    byte-identical `<tool_call>`+`<function=`+`<parameter=` markup and
+    split evenly -- `Qwen3.5-9B` and `Ornith` are `qwen3_xml`,
+    `Qwen3-Coder-30B` and `Nemotron-3-Nano-30B` are `qwen3_coder`. Token
+    sets are identical; only counts differ, and `<think>` does not
+    separate them either (coder=0, nemotron-3-nano=12, both
+    `qwen3_coder`).
+  - Bare `<think>`. qwen3, deepseek-r1 and nemotron templates all emit it
+    but need `qwen3` / `deepseek_r1` / `nemotron_v3`.
+  - Gemma-4's `<|think|>` -- see the next subsection.
+  - Every SGLang gap where the engine has no analogue of a vLLM parser
+    name.
+
+A wrong tool parser mis-parses live tool calls; NO parser merely means
+the router strips tools and plain chat still works. So the derivation is
+built to refuse rather than guess, and these names stay curated.
+
+#### Gemma-4's `<|think|>` is prompt text, not an output delimiter
+
+Gemma-4's template gates a `<|think|>` token on `enable_thinking` and
+carries a `strip_thinking()` macro, which reads like a missing reasoning
+parser. Measured on one vLLM launch of `Gemma-4-26B-A4B-it-NVFP4`
+(2026-07-28):
+
+| Request | content | `reasoning_content` | think markers |
+| --- | --- | --- | --- |
+| `enable_thinking=true` | 1250 chars, opens with the plain word "thought" | 0 | none |
+| `enable_thinking=false` | 405 chars | 0 | none |
+| no kwargs | 393 chars | 0 | none |
+
+So the switch is genuinely live -- it roughly triples the response and
+makes it deliberative -- but nothing delimited reaches the output.
+`<|think|>` is not a special token in the checkpoint at all (absent from
+`added_tokens_decoder`), so the template writes it as plain PROMPT text
+to instruct the model; `strip_thinking()` splits on
+`<channel|>`/`<|channel>`, which are different markers and also never
+appeared.
+
+**This is not a probe-detection gap.** There is nothing for a reasoning
+parser to extract, so adding one would change nothing. The family's
+omission of a reasoning parser is correct. Recorded here so the next
+reader does not re-investigate.
+
+The `parsers:` block shape:
 
 ```yaml
 - name: qwen3.5

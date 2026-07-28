@@ -259,6 +259,9 @@ Phase 2 exists to settle, now visible as data rather than suspicion.
 
 ## Phase 2 -- Gemma-4 reasoning discrepancy
 
+**SHIPPED 2026-07-28.** Resolved by measurement: branch 3 (not a probe
+gap). Output recorded verbatim below, as the exit criterion requires.
+
 ### Goal
 
 Settle a suspected second scoring miss on the model that already cost a tools
@@ -286,10 +289,64 @@ scripts/_probe_hf_common.py         modify   -- only if a classifier gap is conf
 3. If it does not emit: record that in the family block so the next reader does
    not re-investigate.
 
+### Result (2026-07-28)
+
+One vLLM launch of `Gemma-4-26B-A4B-it-NVFP4@262144`, three requests
+differing only in `chat_template_kwargs.enable_thinking`:
+
+| Request | content | `reasoning_content` | think markers found |
+| --- | --- | --- | --- |
+| `enable_thinking=true` | 1250 chars | 0 | **none** |
+| `enable_thinking=false` | 405 chars | 0 | none |
+| no kwargs (default) | 393 chars | 0 | none |
+
+First 300 chars with `enable_thinking=true`, verbatim:
+
+```
+thought
+*   Initial number of sheep: 17.
+    *   Event: "All but 9 run away."
+    *   Question: "How many are left?"
+
+    *   "All but 9 run away" means that a certain number of sheep left, but 9 sheep stayed behind.
+    *   Mathematically, this can be expressed as: (Total) - (Number that ran away)
+```
+
+**Verdict: step 3, not step 2 -- this is NOT a probe-detection gap.**
+
+The switch is genuinely live: it roughly triples the response and makes it
+deliberative. But no `<|think|>` and no `<channel|>` delimiter reaches the
+output, and `reasoning_content` stays empty in all three cases.
+
+Two further facts that settle it:
+
+- `<|think|>` is **not a special token** in this checkpoint -- absent from
+  `added_tokens_decoder` -- so the template writes it as plain PROMPT text
+  to instruct the model, and the model answers in prose beginning
+  "thought". It was never an output delimiter.
+- `strip_thinking()` splits on `<channel|>` / `<|channel>`, entirely
+  different markers, which also never appeared.
+
+So there is nothing delimited for a reasoning parser to extract, and adding
+one would change nothing. `model-families.yaml`'s omission is correct and
+now carries the measurement; `docs/backends.md` gains a subsection so the
+next reader does not re-investigate. No classifier change was made, because
+none is warranted.
+
+**Consequence for Phase 1's rules.** `Gemma-4-26B-A4B-it-NVFP4` and
+`diffusiongemma-26B-A4B-it-NVFP4` have IDENTICAL reasoning markup (one
+`<|think|>`, two `<channel|>`, three `<|channel>`, three `strip_thinking`
+each) yet the gemma4 family curates no reasoning parser while
+diffusiongemma curates `gemma4` -- and diffusiongemma's value is
+unverified (`probed=-`). Since the markup cannot separate them and the one
+family actually measured emits nothing parseable, `gemma4_think` was
+changed to derive **no** reasoning parser, on the same principle as
+`qwen3_xml_family`. Its TOOL side is unaffected.
+
 ### Exit criteria
 
 - The launch output is recorded verbatim in the finding. No claim either way
-  without it.
+  without it. **MET** -- table and raw excerpt above.
 
 ### Phase 2 risks
 

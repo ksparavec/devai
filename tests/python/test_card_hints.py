@@ -126,6 +126,22 @@ class TestParserMapping(unittest.TestCase):
                 CH.parser_for("qwen3_xml_family", backend, "tool"),
                 f"{backend}: ambiguous markup must derive no tool parser")
 
+    def test_gemma4_think_derives_no_reasoning_parser(self):
+        """Settled by measurement, not taste (plan Phase 2).
+
+        Gemma-4-26B-A4B-it and diffusiongemma-26B-A4B-it have identical
+        reasoning markup, yet one family curates no reasoning parser and
+        the other curates `gemma4`. And on a live launch Gemma-4-26B-it
+        with enable_thinking=true emitted NO <|think|> and no channel
+        delimiters at all -- <|think|> is not a special token in the
+        checkpoint, it is plain prompt text. Nothing to parse.
+        """
+        for backend in ("vllm", "sglang"):
+            self.assertIsNone(
+                CH.parser_for("gemma4_think", backend, "reasoning"))
+        # The TOOL side is unaffected: gemma4 tool markup is unambiguous.
+        self.assertEqual(CH.parser_for("gemma4", "vllm", "tool"), "gemma4")
+
     def test_think_delimited_derives_no_reasoning_parser(self):
         # qwen3, deepseek-r1 and nemotron templates all emit bare <think>
         # but need qwen3 / deepseek_r1 / nemotron_v3 respectively.
@@ -218,6 +234,9 @@ class TestHintsForModel(unittest.TestCase):
             self.assertEqual(h["tool_parser"]["vllm"], "gemma4")
             self.assertIsNone(h["tool_parser"]["sglang"])
             self.assertEqual(h["reasoning_format"], "gemma4_think")
+            # Classified, but deliberately derives no parser -- see
+            # test_gemma4_think_derives_no_reasoning_parser.
+            self.assertIsNone(h["reasoning_parser"]["vllm"])
             self.assertEqual(h["sampling"]["temperature"], 1.0)
 
     def test_end_to_end_on_a_bare_checkpoint(self):

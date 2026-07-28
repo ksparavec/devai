@@ -148,8 +148,23 @@ families:
       # tools/tool_choice and the model scored 0 on the tools bench despite
       # tool-calling fine (its Ollama GGUF twin scored tools=1.00). vLLM
       # only: Gemma-4 NVFP4 does not serve on SGLang (arch/quant gap).
-      # Reasoning deliberately omitted -- the -it instruct variants probe as
-      # capability=none (non-reasoning); revisit if a thinking variant lands.
+      # Reasoning deliberately omitted, and MEASURED 2026-07-28 rather than
+      # assumed (card-derived-hints Phase 2). The template gates a
+      # `<|think|>` token on `enable_thinking`, which looks like a missing
+      # reasoning parser. It is not:
+      #   * `enable_thinking=true` DOES change behaviour -- one vLLM launch
+      #     of Gemma-4-26B-A4B-it-NVFP4 produced 1250 chars of deliberative
+      #     output vs 393 chars without it, opening with the plain word
+      #     "thought".
+      #   * but NO `<|think|>` and no `<channel|>` delimiters appear in the
+      #     output, and `reasoning_content` stays empty.
+      #   * `<|think|>` is not even a special token here -- it is absent
+      #     from `added_tokens_decoder`, so the template writes it as plain
+      #     PROMPT text to instruct the model. `strip_thinking()` splits on
+      #     `<channel|>`/`<|channel>`, different markers entirely.
+      # So there is nothing delimited for a reasoning parser to extract and
+      # adding one would change nothing. This is NOT a probe-detection gap.
+      # Do not re-investigate without new evidence.
       vllm:
         tool: gemma4
     arch_ref: google/gemma-4-26b-a4b-it
