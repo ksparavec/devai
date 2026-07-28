@@ -146,6 +146,12 @@ SPEC = BackendSpec(
     build_args=vllm_command_args,
     supports_plugins=True,
     kv_cache_dtype=KV_CACHE_DTYPE,
+    # From `--kv-cache-dtype` on v0.22.1 (`vllm serve --help=all`; the
+    # plain --help lists only config GROUPS on this version). vLLM's bare
+    # `fp8` is an alias for fp8_e4m3.
+    allowed_kv_dtypes=("auto", "bfloat16", "float16", "fp8", "fp8_ds_mla",
+                       "fp8_e4m3", "fp8_e5m2", "fp8_inc",
+                       "fp8_per_token_head", "int8_per_token_head", "nvfp4"),
 )
 
 

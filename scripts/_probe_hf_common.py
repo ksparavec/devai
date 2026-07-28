@@ -295,6 +295,15 @@ class BackendSpec:
     # under the dtype it was measured with. "" = engine default, cell
     # left unstamped (legacy shape).
     kv_cache_dtype: str = ""
+    # KV dtypes this backend's --kv-cache-dtype actually accepts, taken
+    # from the pinned image's --help. The two engines DISAGREE: vLLM
+    # accepts a bare `fp8` (= fp8_e4m3), SGLang does not -- its choices are
+    # {auto,fp8_e5m2,fp8_e4m3,bf16,bfloat16,fp4_e2m1}. Since
+    # PROBE_KV_CACHE_TYPE is a single knob shared by BOTH probers and its
+    # canonical vLLM value is `fp8`, one `make probe-sglang
+    # PROBE_KV_CACHE_TYPE=fp8` would have every launch rejected by
+    # argparse. Empty tuple = do not validate.
+    allowed_kv_dtypes: tuple[str, ...] = ()
     # schema_version v2 added reasoning_parser, tool_parser (populated),
     # disable_verified, and per-cell tool/disable verdicts. v1 readers
     # backfill defaults on first read.
@@ -727,6 +736,36 @@ def response_has_valid_tool_call(resp: dict, expected_tool_name: str) -> bool:
             return True
     legacy = msg.get("function_call") or {}
     return legacy.get("name") == expected_tool_name
+
+
+def validate_kv_dtype(spec: "BackendSpec", dtype: str | None) -> None:
+    """Reject a KV dtype this backend's CLI does not accept, before launch.
+
+    Without this the launch fails inside the container with an argparse
+    error, which the probe then has to classify from a log -- and which,
+    until the `launch_args` kind existed, was misfiled as a permanent
+    per-model `quant` verdict. Failing here instead names the knob, the
+    backend and the accepted set.
+
+    No cell is stamped with a non-default dtype on this host today, so
+    this guard is latent rather than fixing live data -- it stops the
+    NEXT `make probe-sglang PROBE_KV_CACHE_TYPE=fp8` from manufacturing a
+    fresh batch of poisoned cells.
+    """
+    if not dtype or not spec.allowed_kv_dtypes:
+        return
+    if dtype in spec.allowed_kv_dtypes:
+        return
+    hint = ""
+    if dtype == "fp8" and "fp8_e4m3" in spec.allowed_kv_dtypes:
+        hint = (" Did you mean fp8_e4m3? vLLM's bare `fp8` is an alias for it, "
+                "but SGLang requires the explicit spelling.")
+    raise SystemExit(
+        f"error: KV cache dtype {dtype!r} is not accepted by {spec.name}.\n"
+        f"  accepted: {', '.join(spec.allowed_kv_dtypes)}\n"
+        f"  set PROBE_KV_CACHE_TYPE to one of those, or unset it for the "
+        f"engine default.{hint}"
+    )
 
 
 def build_disable_thinking_body(backend: str, base: dict) -> dict:
@@ -1211,6 +1250,9 @@ def probe_one_cell(
             # the same JSON works at probe and serve time.
             spec_payload["model"] = f"/models/{mtp_drafter.split('/')[-1]}"
         speculative_config_json = json.dumps(spec_payload, separators=(",", ":"))
+    # Fail before touching the GPU: the two engines accept DIFFERENT KV
+    # dtype spellings and PROBE_KV_CACHE_TYPE is one knob shared by both.
+    validate_kv_dtype(spec, spec.kv_cache_dtype)
     cmd_args = spec.build_args(
         model_name, requested_ctx, host_frac,
         reasoning_parser=reasoning_parser, tool_parser=tool_parser,

@@ -518,6 +518,9 @@ gpu-arbiter/policy_test.go    modify -- assert the emitted SGLang reasoning wire
 
 ## Phase 3 -- Pay the backend-agnostic debt
 
+**PARTIALLY SHIPPED 2026-07-28.** Steps 9, 1, 2, 3, 4 and 5 are done and
+verified live; steps 6, 7 and 8 remain. Details under "Progress" below.
+
 ### Goal
 
 Fix the shared defects that would corrupt Phase 4's measurements, and close the
@@ -585,13 +588,90 @@ gpu-arbiter/flags_allowlist_test.go new -- emitted flags must be pinned
    `make test-probe-ollama-idempotent` technique. Roughly 200 lines, and it converts
    "I believe this is a no-op" into a checked diff.
 
+### Progress (2026-07-28)
+
+**Done, in the plan's own order (step 9 first, deliberately):**
+
+- **Step 9 -- argv golden corpus.** `gpu-arbiter/argv_golden_test.go` +
+  `testdata/argv-golden.txt`, frozen BEFORE any launch-path edit, 9 cases x 3
+  backends. It then caught exactly the three intended changes and nothing else:
+  14 memory fractions reformatted, 9 `--tp` -> `--tp-size`, 9
+  `--served-model-name` pairs added.
+- **Step 1 -- flag-drift class closed.** `gpu-arbiter/flags_allowlist_test.go`
+  extracts flag literals from the entrypoints and requires each to be pinned.
+  It found two real gaps on its first run: `--reasoning-parser-plugin` and
+  `--tool-parser-plugin` were emitted for months with no pin. `--tp` was
+  corrected to `--tp-size` in the YAML and BOTH emitters (router and prober);
+  `max_num_seqs`, `max_running_requests` and `served_model_name` are now
+  pinned. `make verify-backend-flags` **exits 0**, now covering 17 vLLM +
+  18 SGLang flags (was 15 + 16).
+- **Step 2 -- `--served-model-name`** added to `sglangEntrypoint` and the
+  SGLang prober. The prober's docstring had asserted the opposite ("default
+  served-model name is the directory basename ... no --served-model-name flag
+  in the router's sglangEntrypoint either") and is corrected.
+- **Step 3 -- `%.4f`.** Both Go sites now match the probers' `f"{x:.4f}"`.
+  This is not cosmetic: the router rounded a probe-measured `0.8836` to
+  `0.88`, handing the engine ~0.09 GB less than the fit was measured with on a
+  24 GB card.
+- **Step 4 -- `memFraction` guard.** Reserves are a per-backend map; Ollama is
+  recognised-and-ignored and an unknown backend logs a warning instead of
+  silently inheriting vLLM's 2.0 GB. *Deviation:* the plan said "an error".
+  Returning one would change the signature and ripple through a serving path,
+  so it warns and falls back explicitly. The intent -- no silent inheritance --
+  is met.
+- **Step 5 -- KV dtype validation.** `BackendSpec.allowed_kv_dtypes` +
+  `validate_kv_dtype`, called before launch. Sets taken from each pinned
+  image's `--help`: SGLang `{auto,fp8_e5m2,fp8_e4m3,bf16,bfloat16,fp4_e2m1}`
+  (**no bare `fp8`**), vLLM includes `fp8`. The error names the knob, the
+  backend and the accepted set, and suggests `fp8_e4m3` for the exact
+  `PROBE_KV_CACHE_TYPE=fp8` mistake the plan predicted.
+
+**Verified live**, after `make build-router && podman rm -f devai-router &&
+make cache-up` (a plain `podman restart` does NOT pick up a rebuild -- see
+`router-anthropic-messages-compat.md`). The SGLang launch argv is now:
+
+```
+python3 -m sglang.launch_server --model-path /models/gpt-oss-20b \
+  --served-model-name gpt-oss-20b --host 0.0.0.0 --port 11434 --tp-size 1 \
+  --mem-fraction-static 0.8750 --context-length 131072 --trust-remote-code \
+  --disable-piecewise-cuda-graph --max-running-requests 32 \
+  --reasoning-parser gpt-oss --tool-call-parser gpt-oss
+```
+
+and `devai-sglang:11434/v1/models` returns `['gpt-oss-20b']` -- previously
+`/models/gpt-oss-20b`, an id the router answered 404 for. The same request
+returned 200 with a populated `reasoning_content`, which also confirms Phase
+2's rewritten reasoning wire shape reaches the engine.
+
+**Not yet done: steps 6, 7, 8** (bench tools sentinel + `tool_mode` +
+`BENCH_FORCE`; picker per-backend store gate, `_has_tools`, bench hint,
+`resolve_kv_dtype` backend threading, `catalog-discover` fp8 premise; Makefile
+`SGLANG_IMAGE`/`DEVAI_GPU_DEVICE` export and `logging.sh` fallback list).
+
+**Incidental finding, not fixed here:** a resident Ollama model survives a
+router restart invisibly. After recreating the router, `ollama ps` still
+showed `gemma4:26b-a4b-it-q4_K_M` holding 21.8 GB ("Forever", keep-warm), and
+the router -- which logs `adopted already-serving backend vllm` -- did not
+adopt or evict it, so the next SGLang launch OOMed at 186 MiB free. The
+fail-fast worked correctly (~18 s, not the 600 s timeout) and the message
+named the cause, but `stopOtherBackends` cannot free a backend it does not
+know is running. Worth its own item.
+
 ### Exit criteria
 
-- `make verify-backend-flags` exits 0 against both pinned images.
-- The new allowlist test fails if a flag is added to either entrypoint without a pin.
+- `make verify-backend-flags` exits 0 against both pinned images. **MET.**
+- The new allowlist test fails if a flag is added to either entrypoint without
+  a pin. **MET** -- and it failed on first run against two real unpinned flags.
 - `curl devai-router:11436/v1/models` contains no `/models/`-prefixed id.
-- The argv golden corpus is byte-identical for Ollama and vLLM across the whole phase.
+  **MET** (checked at the engine: `['gpt-oss-20b']`).
+- The argv golden corpus is byte-identical for Ollama and vLLM across the whole
+  phase. **PARTIALLY MET, and the criterion contradicts step 3.** Ollama is
+  byte-identical (verified). vLLM is NOT, and cannot be: step 3 explicitly
+  changes `--gpu-memory-utilization` from `%.2f` to `%.4f`, which is a vLLM
+  flag. The defensible reading is "no UNINTENDED argv change", which holds --
+  the full diff is only the three intended edits.
 - A bench row for a parser-less model records the sentinel, not `tools: 0.0`.
+  **NOT YET** -- step 6 is outstanding.
 
 ### Phase 3 risks
 

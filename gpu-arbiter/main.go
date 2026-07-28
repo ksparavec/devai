@@ -1073,24 +1073,46 @@ func parseSizeGB(s string) float64 {
 // Backend-specific reservations (kept outside the static pool):
 //   - vLLM:   ~2 GB — CUDA graphs + activations
 //   - SGLang: ~3 GB — RadixAttention tree + CUDA graphs + activations
+//
+// memFraction computes the engine's static-pool fraction.
+//
+// The backend must be one this function has a reserve for. It used to
+// fall through a `default: // vllm` arm, and computeLaunchConfig calls it
+// with cfg.Name for ALL THREE backends -- so Ollama silently received
+// vLLM's 2.0 GB reserve. That was inert only because Ollama's entrypoint
+// ignores MemFraction entirely; the moment a fourth backend (or an Ollama
+// change) made it load-bearing, the wrong number would have been used
+// with nothing to flag it. An unknown backend is now a caller error
+// rather than an inherited guess.
 func memFraction(modelSizeGB, totalVRAMGB float64, backend string) float64 {
-	if modelSizeGB <= 0 {
-		// Unknown model size — conservative defaults
-		switch backend {
-		case "sglang":
-			return 0.82
-		default:
-			return 0.88
+	// Per-backend runtime reserve outside the static pool. SGLang needs
+	// more: RadixAttention tree + CUDA graphs.
+	reserveByBackend := map[string]float64{
+		"vllm":   2.0,
+		"sglang": 3.0,
+	}
+	// Ollama sizes its own runner and never consults MemFraction, so it is
+	// explicitly recognised-and-ignored rather than silently defaulted.
+	unknownDefaults := map[string]float64{
+		"vllm":   0.88,
+		"sglang": 0.82,
+	}
+	reserveGB, known := reserveByBackend[backend]
+	if !known {
+		if backend != "ollama" {
+			log.Printf("warning: memFraction called for unknown backend %q; "+
+				"falling back to the vLLM reserve. Add it to reserveByBackend.",
+				backend)
 		}
+		reserveGB = reserveByBackend["vllm"]
 	}
 
-	// Base reservation for runtime memory outside the static pool
-	var reserveGB float64
-	switch backend {
-	case "sglang":
-		reserveGB = 3.0
-	default: // vllm
-		reserveGB = 2.0
+	if modelSizeGB <= 0 {
+		// Unknown model size — conservative defaults
+		if f, ok := unknownDefaults[backend]; ok {
+			return f
+		}
+		return unknownDefaults["vllm"]
 	}
 
 	// Tight fit: model barely leaves room for KV cache + runtime
@@ -1312,7 +1334,12 @@ func vllmEntrypoint(modelName string, lc launchConfig) []string {
 		"--tensor-parallel-size", "1",
 		"--max-model-len", fmt.Sprintf("%d", lc.MaxContext),
 		"--kv-cache-dtype", kvDtype,
-		"--gpu-memory-utilization", fmt.Sprintf("%.2f", lc.MemFraction),
+		// %.4f, matching both probers (f"{host_frac:.4f}"). At %.2f the
+		// router rounded a probe-measured fraction before launching, so
+		// serve time did not reproduce probe time -- e.g. 0.8836 became
+		// 0.88, giving the engine ~0.09 GB less than the fit was measured
+		// with on a 24 GB card. Pinned by TestMemFractionFormatMatchesProbers.
+		"--gpu-memory-utilization", fmt.Sprintf("%.4f", lc.MemFraction),
 		"--enable-prefix-caching",
 		"--trust-remote-code",
 		"--served-model-name", modelName,
@@ -1444,10 +1471,20 @@ func sglangEntrypoint(modelName string, lc launchConfig) []string {
 	args := []string{
 		"python3", "-m", "sglang.launch_server",
 		"--model-path", "/models/" + modelName,
+		// The engine's internal identity. Without it SGLang falls back to
+		// model_path -- it does NOT default to the directory basename --
+		// so `/v1/models` advertises `/models/<name>`, an id this router
+		// then answers 404 for. Verified in SGLang's own recorded launch
+		// args for all six models on this fleet.
+		"--served-model-name", modelName,
 		"--host", "0.0.0.0",
 		"--port", "11434",
-		"--tp", "1",
-		"--mem-fraction-static", fmt.Sprintf("%.2f", lc.MemFraction),
+		// --tp-size, not --tp: the pinned image exposes only the former,
+		// and the old spelling resolved purely by argparse prefix
+		// matching. Pinned in deploy/backend-flags.yaml.
+		"--tp-size", "1",
+		// %.4f -- see the vLLM note above.
+		"--mem-fraction-static", fmt.Sprintf("%.4f", lc.MemFraction),
 		"--context-length", fmt.Sprintf("%d", lc.MaxContext),
 		"--trust-remote-code",
 		// SGLang v0.5.10 enables piecewise CUDA graph by default, which

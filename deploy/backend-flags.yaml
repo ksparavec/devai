@@ -22,7 +22,9 @@
 #   SGLANG_IMAGE = docker.io/lmsysorg/sglang:v0.5.10.post1-cu130
 #                  (SGLang 0.5.10.post1, CUDA 13)
 #
-# Verified 2026-04-29 against the images above.
+# Verified 2026-04-29 against the images above; SGLang re-verified
+# 2026-07-28 (--tp corrected to --tp-size; served_model_name and
+# max_running_requests added).
 
 vllm:
   model:                "--model"
@@ -31,6 +33,9 @@ vllm:
   port:                 "--port"
   tensor_parallel_size: "--tensor-parallel-size"
   max_model_len:        "--max-model-len"
+  # Emitted from MAX_CONCURRENT_REQUESTS by both the router and the
+  # probers; pinned for the same reason as SGLang's analogue above.
+  max_num_seqs:         "--max-num-seqs"
   gpu_memory_util:      "--gpu-memory-utilization"
   # Per-model KV-cache dtype. Emitted by BOTH entrypoints (gpu-arbiter
   # vllmEntrypoint / sglangEntrypoint and the two probers), and the fit
@@ -42,6 +47,12 @@ vllm:
   enable_auto_tool:     "--enable-auto-tool-choice"
   tool_call_parser:     "--tool-call-parser"
   reasoning_parser:     "--reasoning-parser"
+  # Plugin-file variants, emitted when a parser resolves through the
+  # vllm-plugins registry (scripts/vllm_plugins). Emitted for months
+  # without a pin -- found by TestEmittedFlagsArePinned, which checks the
+  # direction this file never did: that everything EMITTED is pinned.
+  reasoning_parser_plugin: "--reasoning-parser-plugin"
+  tool_parser_plugin:      "--tool-parser-plugin"
   # Multi-token-prediction launch flag (Phase 4 of the
   # catalog-crystalline-beaver plan). Single JSON argument carries
   # method, optional drafter path, and num_speculative_tokens.
@@ -51,7 +62,20 @@ sglang:
   model_path:           "--model-path"
   host:                 "--host"
   port:                 "--port"
-  tp:                   "--tp"
+  # --tp does NOT exist on the pinned image; only --tp-size does. The old
+  # `--tp` spelling worked ONLY by argparse prefix matching, and it made
+  # `make verify-backend-flags` red -- so the drift gate this file exists
+  # to power was failing on the very file that defines it. Verified
+  # 2026-07-28 against v0.5.10.post1-cu130.
+  tp_size:              "--tp-size"
+  # The engine's internal identity. Without it SGLang falls back to
+  # model_path, so `/v1/models` advertises `/models/<name>` -- an id the
+  # router answers 404 for. It does NOT default to the directory basename.
+  served_model_name:    "--served-model-name"
+  # Analogue of vLLM's --max-num-seqs. Emitted by the router from
+  # MAX_CONCURRENT_REQUESTS and by the prober, but never pinned, so a
+  # rename would have gone unnoticed until launches started failing.
+  max_running_requests: "--max-running-requests"
   context_length:       "--context-length"
   mem_fraction_static:  "--mem-fraction-static"
   # Same flag spelling as vLLM on the pinned image, but emitted only when

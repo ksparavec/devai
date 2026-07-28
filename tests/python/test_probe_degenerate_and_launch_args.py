@@ -178,3 +178,41 @@ class TestLaunchArgsClassification(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestKVDtypeValidation(unittest.TestCase):
+    """PROBE_KV_CACHE_TYPE is one knob shared by two engines that accept
+    different spellings. vLLM takes a bare `fp8`; SGLang does not.
+    """
+
+    def _spec(self, name: str, allowed: tuple[str, ...]):
+        return P.BackendSpec(
+            name=name, image="i", container_name="c", probe_port=1,
+            cache_path=Path("/tmp/unused"), reserve_gb=3.0,
+            entrypoint="python3", build_args=lambda *a, **k: [],
+            allowed_kv_dtypes=allowed,
+        )
+
+    def test_sglang_rejects_bare_fp8_with_a_usable_hint(self):
+        spec = self._spec("sglang", ("auto", "fp8_e5m2", "fp8_e4m3", "bf16",
+                                     "bfloat16", "fp4_e2m1"))
+        with self.assertRaises(SystemExit) as ctx:
+            P.validate_kv_dtype(spec, "fp8")
+        msg = str(ctx.exception)
+        self.assertIn("fp8_e4m3", msg, "must name the correct spelling")
+        self.assertIn("sglang", msg, "must name the backend")
+
+    def test_vllm_accepts_bare_fp8(self):
+        spec = self._spec("vllm", ("auto", "fp8", "fp8_e4m3", "fp8_e5m2"))
+        P.validate_kv_dtype(spec, "fp8")  # must not raise
+
+    def test_empty_and_none_are_the_engine_default(self):
+        spec = self._spec("sglang", ("auto", "fp8_e4m3"))
+        P.validate_kv_dtype(spec, None)
+        P.validate_kv_dtype(spec, "")
+
+    def test_no_allowed_set_disables_validation(self):
+        # Backward compatible: a spec that has not declared its set yet
+        # must not start rejecting dtypes that used to work.
+        spec = self._spec("legacy", ())
+        P.validate_kv_dtype(spec, "anything")

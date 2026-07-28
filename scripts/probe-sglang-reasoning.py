@@ -16,11 +16,10 @@ SGLang differences from vLLM:
   - Context flag: `--context-length` (vLLM: `--max-model-len`).
   - Reserve budget: 3.0 GB (vLLM: 2.0 GB) — RadixAttention tree +
     CUDA graphs. Mirrors gpu-arbiter/main.go memFraction.
-  - Default served-model name is the directory basename, not the
-    catalog row name (no --served-model-name flag in the router's
-    sglangEntrypoint either). The probe sends `model: <basename>` in
-    the chat body, which here equals the catalog `name` — so the
-    same field works.
+  - `--served-model-name` is passed explicitly, matching the router.
+    SGLang does NOT default it to the directory basename; it falls
+    back to `model_path`, which is why the router's own /v1/models
+    used to advertise an unusable `/models/<name>` id.
 
 Hard pre-condition: devai-router, devai-vllm, and devai-sglang must
 be stopped — the prober launches devai-sglang-probe with explicit
@@ -93,9 +92,16 @@ def sglang_command_args(
     args = [
         "-m", "sglang.launch_server",
         "--model-path", f"/models/{model_name}",
+        # The engine's internal identity. SGLang does NOT default this
+        # to the directory basename -- it falls back to model_path. The
+        # router emits it too, so probe-time and serve-time agree.
+        "--served-model-name", model_name,
         "--host", "0.0.0.0",
         "--port", "11434",
-        "--tp", "1",
+        # --tp-size, not --tp: the pinned image exposes only the former
+        # (the old spelling resolved by argparse prefix matching alone).
+        # MUST match gpu-arbiter sglangEntrypoint.
+        "--tp-size", "1",
         "--mem-fraction-static", f"{host_frac:.4f}",
         "--context-length", str(max_ctx),
         "--trust-remote-code",
@@ -149,6 +155,10 @@ SPEC = BackendSpec(
     entrypoint="python3",
     build_args=sglang_command_args,
     kv_cache_dtype=KV_CACHE_DTYPE,
+    # From `--kv-cache-dtype` on v0.5.10.post1-cu130. Note there is NO
+    # bare `fp8` here, unlike vLLM -- verified 2026-07-28.
+    allowed_kv_dtypes=("auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16",
+                       "fp4_e2m1"),
 )
 
 
