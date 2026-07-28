@@ -314,6 +314,41 @@ and refuses:
   inspected the transient losses and accepts the smaller catalog. It
   is an opt-in, not a restored default.
 
+### SGLang bench candidacy is gated on vLLM (enforced in code)
+
+A `(model, ctx)` becomes an SGLang **bench** target only when vLLM has
+already benched that model at a context **at least as large**, with no
+bench verdict recorded against it. Enforced in
+`bench_runner.discover_models()` via `gate_reason()`, so it applies to a
+direct `make bench-sglang` as well as to `make bench-sync`.
+
+Same physics as the probe-side rule above: SGLang reserves 3.0 GB against
+vLLM's 2.0 and runs unquantized KV where vLLM runs fp8, so a model vLLM
+could not serve cannot pass on SGLang. Benching it there spends a cold
+start **plus a full task sweep** to rediscover a known answer.
+
+Four things disqualify an SGLang bench target:
+
+1. **Never benched on vLLM.** No row, no candidacy.
+2. **vLLM benched only at a smaller ctx.** The inherited claim is
+   context-dependent: a vLLM pass at 32K says nothing about SGLang at
+   128K. A vLLM row at 256K *does* vouch for SGLang at 192K, which is the
+   real `Qwen3.5-9B-NVFP4` case -- the two backends legitimately reach
+   different ceilings.
+3. **A vLLM bench verdict** (`bench_dropped` / `bench_failed`) at that ctx.
+4. **Its own prior SGLang bench verdict.** `bench-sync` already classifies
+   these as `excluded`, but a direct `make bench-sglang` goes straight
+   through `discover_models` and would otherwise re-run a model a previous
+   session deliberately dropped.
+
+**Ollama and vLLM are ungated** and independent of each other. Ollama is a
+different runtime with its own memory model; nothing here implies anything
+about it. The gate is also strictly one-way -- an SGLang bench row never
+vouches for a vLLM target.
+
+Every skip prints its reason to stderr. A silent skip reads as coverage,
+which is the failure mode this whole area keeps producing.
+
 ### Cross-backend VRAM verdicts (vLLM -> SGLang, one way)
 
 SGLang does not re-probe a model whose VRAM verdict vLLM already

@@ -111,8 +111,25 @@ class DiscoverModelsAppliesTheCheckTest(unittest.TestCase):
         }
 
     def test_absent_model_is_not_a_target(self):
+        # discover_models reads TWO caches on the sglang path: the probe
+        # cache, and the bench cache for the vLLM-bench gate. A blanket
+        # patch would feed the probe fixture to both, and the gate would
+        # then block every target for want of a vLLM bench row -- masking
+        # what this test is actually about. Dispatch on the path instead,
+        # and vouch for OnDisk-9B with a vLLM row so only the store gap
+        # decides the outcome.
         orig = br.load_cache
-        br.load_cache = lambda _p: self.cache
+        bench_cache = {
+            "org/OnDisk-9B@aaa::vllm::32768": {
+                "model": "OnDisk-9B", "backend": "vllm", "context": 32768,
+            },
+            "org/Absent-9B@bbb::vllm::32768": {
+                "model": "Absent-9B", "backend": "vllm", "context": 32768,
+            },
+        }
+        br.load_cache = lambda p: (
+            bench_cache if str(p) == str(br.DEFAULT_CACHE_PATH) else self.cache
+        )
         self.addCleanup(setattr, br, "load_cache", orig)
 
         targets = br.discover_models("sglang", host_vram_gb=24,

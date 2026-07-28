@@ -37,6 +37,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
+import _model_status as _MS  # noqa: E402
 from _capability import Capability  # noqa: E402
 from _probe_core import http_get, load_cache, save_cache  # noqa: E402
 from bench import bench_latency_leak  # noqa: E402
@@ -45,6 +46,7 @@ from bench._bench_core import (  # noqa: E402
     assert_cache_schema_compatible,
     cache_key_for_entry,
     capture_host_env,
+    is_row_key,
     migrate_bench_cache_keys,
     router_url_for,
     serving_alias,
@@ -267,6 +269,93 @@ def _fitting_ctxs(entry: dict, host_vram_gb: int) -> list[int]:
     return sorted(out)
 
 
+# ── SGLang candidacy: gated on vLLM having benched it first ──────────────────
+#
+# SGLang needs strictly MORE VRAM than vLLM for the same (model, ctx) on
+# this fleet:
+#
+#   * reserve:  SGLANG_RESERVE_GB = 3.0  vs  VLLM_RESERVE_GB = 2.0
+#   * KV dtype: the vLLM prober/router launch --kv-cache-dtype fp8 (1 byte
+#     per element); SGLang emits no such flag for an unstamped cell, so it
+#     runs the engine default -- unquantized, 2 bytes. Twice the KV.
+#
+# So a model vLLM could not serve cannot pass on SGLang, and benching it
+# there spends a cold start (plus a full task sweep) to rediscover a known
+# answer. Unprobed, unbenched, and previously bench-dropped models are all
+# excluded on the same grounds.
+#
+# The gate is ctx-aware: vLLM must have benched at a context AT LEAST as
+# large as the one SGLang is about to bench. A vLLM row at 256K vouches
+# for an SGLang run at 192K; a vLLM row at only 32K does not vouch for
+# 128K, because the VRAM claim being inherited is context-dependent.
+#
+# One-way by construction. vLLM candidacy never consults SGLang, and
+# Ollama is independent of both -- it is a different runtime with its own
+# memory model, and nothing here implies anything about it.
+_BENCH_GATE_SOURCE: dict[str, str] = {"sglang": "vllm"}
+
+
+def vllm_bench_ceiling(alias: str, cache: dict | None = None) -> int | None:
+    """Largest ctx at which `alias` has a vLLM bench row, or None.
+
+    None means vLLM never benched it, which under the gate below makes it
+    ineligible for SGLang entirely.
+    """
+    rows = cache if cache is not None else load_cache(DEFAULT_CACHE_PATH)
+    best: int | None = None
+    for key, row in (rows or {}).items():
+        if not is_row_key(key) or not isinstance(row, dict):
+            continue
+        if row.get("backend") != "vllm" or row.get("model") != alias:
+            continue
+        try:
+            ctx = int(row.get("context") or 0)
+        except (TypeError, ValueError):
+            continue
+        if ctx and (best is None or ctx > best):
+            best = ctx
+    return best
+
+
+def gate_reason(backend: str, alias: str, ctx: int, *,
+                bench_cache: dict | None = None,
+                ledger: dict | None = None,
+                sha: str | None = None) -> str | None:
+    """Why `alias` @ `ctx` may NOT be benched on `backend`, or None.
+
+    Returns a human-readable reason so callers can print it rather than
+    dropping the target silently -- an invisible skip reads as coverage.
+    """
+    source = _BENCH_GATE_SOURCE.get(backend)
+    if source is None:
+        return None  # ollama and vllm are ungated
+
+    led = ledger if ledger is not None else _MS.load_ledger()
+    # Its OWN prior bench verdict disqualifies it too. bench-sync already
+    # classifies these as `excluded`, but a direct `make bench-sglang`
+    # goes straight through discover_models and would otherwise re-run a
+    # model a previous session deliberately dropped.
+    if _MS.is_bench_excluded(led, alias, backend, ctx=ctx, sha=sha):
+        return (f"a previous {backend} bench session recorded a verdict "
+                f"against it at this ctx (`make model-status` to see, "
+                f"CLEAR= to restore)")
+    if _MS.is_bench_excluded(led, alias, source, ctx=ctx, sha=sha):
+        return (f"{source} recorded a bench verdict against it at this ctx; "
+                f"{backend} needs more VRAM than {source}, so it cannot pass "
+                f"here either")
+
+    ceiling = vllm_bench_ceiling(alias, bench_cache)
+    if ceiling is None:
+        return (f"never benched on {source}; {backend} requires more VRAM "
+                f"for the same (model, ctx), so a {source} pass is the "
+                f"precondition. Bench it on {source} first.")
+    if ceiling < ctx:
+        return (f"{source} has only been benched up to ctx={ceiling}, below "
+                f"this target's ctx={ctx}; the VRAM claim being inherited is "
+                f"context-dependent, so it does not carry")
+    return None
+
+
 def discover_models(
     backend: str,
     *,
@@ -301,6 +390,11 @@ def discover_models(
     rx = re.compile(repo_filter) if repo_filter else None
     cache_path = PROBE_CACHE_BY_BACKEND[backend]
     cache = load_cache(cache_path)
+    # Read once per pass, not once per model: both are file reads and the
+    # gate is consulted for every (model, ctx) candidate.
+    gated = backend in _BENCH_GATE_SOURCE
+    gate_cache = load_cache(DEFAULT_CACHE_PATH) if gated else None
+    gate_ledger = _MS.load_ledger() if gated else None
     out: list[dict] = []
     all_ctxs = ctx_filter == [-1]
     for key, entry in cache.items():
@@ -344,6 +438,13 @@ def discover_models(
             )
             continue
         for ctx in chosen:
+            blocked = gate_reason(backend, alias, int(ctx),
+                                  bench_cache=gate_cache, ledger=gate_ledger,
+                                  sha=entry.get("sha"))
+            if blocked:
+                print(f"  note: {alias} @ {ctx}: skipping on {backend} -- "
+                      f"{blocked}", file=sys.stderr)
+                continue
             cache_key = cache_key_for_entry(entry, backend, ctx) or key
             out.append(
                 {
