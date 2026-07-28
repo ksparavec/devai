@@ -106,7 +106,7 @@ found three more findings.
 | [bench-rewrite](./bench-rewrite.md)                                 | **Done**          |
 | [kv-cache-quantization](./kv-cache-quantization.md)                 | Superseded        |
 | [card-derived-hints-and-bench-sync](./card-derived-hints-and-bench-sync.md) | In Progress (Phase 5 shipped) |
-| [sglang-backend-remediation](./sglang-backend-remediation.md)       | In Progress (Phases 0-1 shipped) |
+| [sglang-backend-remediation](./sglang-backend-remediation.md)       | In Progress (Phases 0-3 shipped; Ph 4 partial) |
 | [router-anthropic-messages-compat](./router-anthropic-messages-compat.md) | **Done**      |
 | [router-shortcircuit](./router-shortcircuit.md)                     | Draft             |
 | [odysseus-borrowed-ideas](./odysseus-borrowed-ideas.md)             | Draft (partly frozen) |
@@ -387,8 +387,12 @@ for the deviations)**, ~~step 14~~ **(SHIPPED 2026-07-27 -- Claude Code now comp
 turns, incl. tool use, against vLLM and SGLang rows; folding the stray system message
 proved sufficient with no field filtering)**, ~~step 1~~ **(CLOSED 2026-07-27 --
 bench-rewrite is Done; Phases 1-5 were already shipped and Phase 6 is struck, so the
-~4 hours was work that no longer existed)**, then step 15 Phases 2-5 (~2 weeks + one
-GPU window) and step 13 (~1.5 weeks). Step 2 (`sops-age-secrets`) is **Non-functional** rather than pending --
+~4 hours was work that no longer existed)**, ~~then step 15 Phases 2-5~~ **(Phases 2 and 3
+SHIPPED 2026-07-28; Phase 4 steps 1-3 shipped, its re-probe DEFERRED by operator
+decision -- all 8 poisoned cells belong to models with no weights on disk, so it
+needs ~159.5 GB of downloads before a GPU sweep, and the plan's own analysis
+bounds the prize to 2 models. Phase 5 adjudication is moot until then.)** and
+step 13 (~1.5 weeks). Step 2 (`sops-age-secrets`) is **Non-functional** rather than pending --
 it cannot encrypt anything until an age key exists and `.sops.yaml`'s `age1xxxx...`
 placeholder is replaced -- and two of its three intended consumers are frozen, so its
 "hard prerequisite" framing above now applies only to the MCP gateway's two
