@@ -105,7 +105,7 @@ found three more findings.
 | [review-fixes-2026-07](./review-fixes-2026-07.md)                   | Done (unverified) |
 | [bench-rewrite](./bench-rewrite.md)                                 | **Done**          |
 | [kv-cache-quantization](./kv-cache-quantization.md)                 | Superseded        |
-| [card-derived-hints-and-bench-sync](./card-derived-hints-and-bench-sync.md) | In Progress (Phase 5 shipped) |
+| [card-derived-hints-and-bench-sync](./card-derived-hints-and-bench-sync.md) | **Done** (Phases 1-5 shipped) |
 | [sglang-backend-remediation](./sglang-backend-remediation.md)       | In Progress (Phases 0-3 shipped; Ph 4 partial) |
 | [router-anthropic-messages-compat](./router-anthropic-messages-compat.md) | **Done**      |
 | [router-shortcircuit](./router-shortcircuit.md)                     | Draft             |
@@ -392,7 +392,10 @@ SHIPPED 2026-07-28; Phase 4 steps 1-3 shipped, its re-probe DEFERRED by operator
 decision -- all 8 poisoned cells belong to models with no weights on disk, so it
 needs ~159.5 GB of downloads before a GPU sweep, and the plan's own analysis
 bounds the prize to 2 models. Phase 5 adjudication is moot until then.)** and
-step 13 (~1.5 weeks). Step 2 (`sops-age-secrets`) is **Non-functional** rather than pending --
+~~step 13~~ **(SHIPPED 2026-07-28 -- card-hint derivation validated
+out-of-sample and wired as a probe-time fallback with provenance; Phase 4's
+sampling-mode deliverable superseded by the greedy-default + per-model-override
+design that landed 2026-07-25).** Step 2 (`sops-age-secrets`) is **Non-functional** rather than pending --
 it cannot encrypt anything until an age key exists and `.sops.yaml`'s `age1xxxx...`
 placeholder is replaced -- and two of its three intended consumers are frozen, so its
 "hard prerequisite" framing above now applies only to the MCP gateway's two

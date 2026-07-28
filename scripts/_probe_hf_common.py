@@ -2230,6 +2230,20 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
         # Provenance. Additive fields only, matching how the LOAD probe
         # augments cells -- no schema bump. Lets a reader tell "a human
         # chose this" from "the checkpoint's own template implied it".
+        # Sampling defaults from the checkpoint's generation_config.json.
+        # Stamped HERE, host-side, because the bench container mounts
+        # scripts/ + deploy/ but deliberately NOT the model weights -- so
+        # the runner can read this from /deploy without a weights mount it
+        # has no other reason to have.
+        try:
+            card_sampling = _card_hints.sampling_defaults(models_dir / name)
+        except Exception:  # noqa: BLE001
+            card_sampling = {}
+        if card_sampling:
+            entry["card_sampling"] = card_sampling
+        else:
+            entry.pop("card_sampling", None)
+
         entry["tool_parser_source"] = parser_sources.get("tool")
         entry["reasoning_parser_source"] = parser_sources.get("reasoning")
         if disagreements:

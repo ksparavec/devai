@@ -30,6 +30,47 @@ from bench._bench_core import (  # noqa: E402
 DEFAULT_HOST_VRAM_GB = float(os.environ.get("GPU_MEMORY_GB", "24"))
 
 
+def _sampling_footnote(rows: dict) -> list[str]:
+    """Lines naming every row NOT benched greedily.
+
+    A leaderboard that mixes greedy and non-greedy rows without saying so
+    invites exactly the wrong comparison. Rows predating the stamp are
+    listed separately as unknown rather than assumed greedy.
+    """
+    non_greedy: list[str] = []
+    unknown = 0
+    for key, row in rows.items():
+        if key.startswith("_") or not isinstance(row, dict):
+            continue
+        samp = (row.get("metrics") or {}).get("sampling")
+        if not isinstance(samp, dict):
+            unknown += 1
+            continue
+        if samp.get("source") != "greedy_default":
+            non_greedy.append(
+                f"  - `{row.get('model')}` [{row.get('backend')}] @ "
+                f"{row.get('context')}: temperature={samp.get('temperature')}, "
+                f"top_p={samp.get('top_p')} -- NOT directly comparable with the "
+                f"greedy rows (see deploy/bench-sampling.json for why)")
+    out: list[str] = []
+    if non_greedy or unknown:
+        out.append("")
+        out.append("### Sampling")
+        out.append("")
+        out.append("Scored tasks run greedily (temperature=0, top_p=1.0) so rows "
+                   "are comparable across backends, which default differently.")
+        if non_greedy:
+            out.append("")
+            out.append("Exceptions, benched at their override:")
+            out.extend(non_greedy)
+        if unknown:
+            out.append("")
+            out.append(f"{unknown} row(s) predate per-row sampling stamps and "
+                       f"carry UNKNOWN sampling. Re-bench to make them "
+                       f"comparable.")
+    return out
+
+
 def _pick_score(tasks: dict, prefix: str, key: str) -> float | None:
     """Return ``tasks[<prefix>_*][<key>]`` for the first matching
     subset-keyed entry. Different runs may use different ``n``, so we
@@ -221,6 +262,7 @@ def render(cache: dict, host_vram_gb: float = DEFAULT_HOST_VRAM_GB) -> str:
         f"threshold where KV paging starts to bite -- see "
         f"`docs/bench-results.md` > 'KV-pressure observations'._"
     )
+    lines.extend(_sampling_footnote(cache))
     return "\n".join(lines) + "\n"
 
 

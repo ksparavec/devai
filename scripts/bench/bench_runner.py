@@ -458,6 +458,30 @@ def sampling_for(alias: str, overrides: dict | None = None) -> tuple[float, floa
     return BENCH_TEMPERATURE, BENCH_TOP_P
 
 
+def sampling_record(alias: str, overrides: dict | None = None) -> dict:
+    """What sampling this row was ACTUALLY benched at, for the cache.
+
+    Zero of 21 existing rows record this, which makes a mixed cache
+    unauditable: greedy rows and override rows sit side by side in the
+    leaderboard with nothing to say they are not comparable. At least one
+    model already has an override (NVIDIA-Nemotron-Nano-9B-v2 loops on its
+    own <think> trace at temperature 0), so "mixed" is the real state, not
+    a hypothetical.
+
+    `source` is "override" when deploy/bench-sampling.json matched this
+    alias, else "greedy_default".
+    """
+    ov = load_sampling_overrides() if overrides is None else overrides
+    temperature, top_p = sampling_for(alias, ov)
+    matched = any(name in alias for name in ov)
+    return {
+        "temperature": temperature,
+        "top_p": top_p,
+        "source": "override" if matched else "greedy_default",
+        "comparable": not matched,
+    }
+
+
 def _sampling_config(alias: str = ""):
     """GenerateConfig pinning sampling for the scored tasks.
 
@@ -959,6 +983,10 @@ def run_for_target(
                 f"  /metrics: kv_cache={kv}  preemptions={preempt}",
                 file=sys.stderr,
             )
+    # Record the sampling this row was measured at, so a cache holding
+    # both greedy and override rows stays auditable.
+    metrics = dict(metrics or {})
+    metrics["sampling"] = sampling_record(target["alias"])
     update_row(
         cache,
         key,

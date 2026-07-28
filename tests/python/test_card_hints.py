@@ -296,3 +296,51 @@ class TestDeriveParserFallback(unittest.TestCase):
         with tempfile.TemporaryDirectory() as t:
             (Path(t) / "Bare").mkdir()
             self.assertIsNone(CH.derive_parser("Bare", t, "vllm", "tool"))
+
+
+class TestBenchSamplingRecord(unittest.TestCase):
+    """Phase 4: every bench row must record the sampling it ran at.
+
+    Zero of 21 existing rows did, which made a cache holding both greedy
+    and override rows unauditable -- and at least one model already has an
+    override, so "mixed" is the real state.
+    """
+
+    def _runner(self):
+        import importlib
+        return importlib.import_module("bench.bench_runner")
+
+    def test_greedy_default_is_marked_comparable(self):
+        r = self._runner()
+        rec = r.sampling_record("Some-Model-NVFP4", overrides={})
+        self.assertEqual(rec["source"], "greedy_default")
+        self.assertTrue(rec["comparable"])
+        self.assertEqual(rec["temperature"], r.BENCH_TEMPERATURE)
+
+    def test_override_is_marked_not_comparable(self):
+        r = self._runner()
+        ov = {"Nemotron-Nano-9B-v2": {"temperature": 0.6, "top_p": 0.95}}
+        rec = r.sampling_record("NVIDIA-Nemotron-Nano-9B-v2-NVFP4", overrides=ov)
+        self.assertEqual(rec["source"], "override")
+        self.assertFalse(rec["comparable"],
+                         "an override row is NOT comparable with greedy rows")
+        self.assertEqual(rec["temperature"], 0.6)
+
+    def test_report_footnote_flags_unknown_and_override_rows(self):
+        import importlib
+        rep = importlib.import_module("bench.bench_report")
+        cache = {
+            "_meta": {},
+            "a@1::vllm::32768": {"model": "A", "backend": "vllm",
+                                 "context": 32768, "metrics": {}},
+            "b@1::vllm::32768": {"model": "B", "backend": "vllm",
+                                 "context": 32768,
+                                 "metrics": {"sampling": {
+                                     "temperature": 0.6, "top_p": 0.95,
+                                     "source": "override",
+                                     "comparable": False}}},
+        }
+        out = "\n".join(rep._sampling_footnote(cache))
+        self.assertIn("UNKNOWN", out, "unstamped rows must be called out")
+        self.assertIn("NOT directly comparable", out)
+        self.assertIn("`B`", out)

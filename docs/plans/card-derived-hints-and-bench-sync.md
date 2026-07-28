@@ -4,7 +4,9 @@ _Derive backend hints from checkpoint metadata instead of hand-curating them, an
 
 ## Status
 
-Draft. Not yet scheduled for execution.
+**In Progress.** Phases 1, 2, 3 and 4 shipped 2026-07-28 (Phase 5 shipped
+2026-07-26). Phase 4's `--sampling={harness,card}` deliverable is
+superseded rather than built -- see its Result section.
 
 ## Dependencies
 
@@ -445,6 +447,12 @@ CLAUDE.md                           modify   -- new script + target in the key-f
 
 ## Phase 4 -- Bench sampling parity
 
+**SHIPPED 2026-07-28, with its premise partly SUPERSEDED.** Step 1's
+premise -- "no sampling parameters are set anywhere in bench_runner.py" --
+was true when written and is not any more; the gap it describes was closed
+on 2026-07-25. What remained was narrower and is what shipped. See
+"Result".
+
 ### Goal
 
 Make the sampling policy used by the bench harness explicit and recorded,
@@ -481,12 +489,55 @@ docs/bench-results.md               modify   -- record the policy decision
    Record the mode actually used on every row so mixed-mode caches remain
    auditable.
 
+### Result (2026-07-28)
+
+**Step 1's premise is stale.** `bench_runner.py` now pins greedy decoding
+for every scored task (`BENCH_TEMPERATURE=0`, `BENCH_TOP_P=1.0`), with
+per-model exceptions in `deploy/bench-sampling.json` -- one of the defects
+closed on 2026-07-25 ("bench tasks ran at backend-default sampling"). So
+the bias the phase set out to remove is already gone.
+
+**The `--sampling={harness,card}` deliverable is superseded and was NOT
+built.** The shipped design is strictly better for the stated goal: a
+global `card` mode would make EVERY row non-comparable at once, whereas
+the override file makes only the rows that genuinely need it
+non-comparable, keyed by model, each with a recorded `reason`. Adding a
+second, coarser mechanism alongside it would give two ways to express the
+same thing and no way to tell which produced a given row.
+
+**What was genuinely missing, and shipped:**
+
+1. **The probe cache stamps `card_sampling`** (`temperature`, `top_p`,
+   `top_k`, `eos_token_id`) from `generation_config.json`, host-side in
+   the prober -- because the bench container mounts `scripts/` and
+   `deploy/` but deliberately not the weights, and the plan is right that
+   it should stay that way. This records what the checkpoint recommends,
+   so the gap between card and harness is visible rather than invisible.
+2. **Every bench row records the sampling it actually ran at**
+   (`metrics.sampling` = temperature, top_p, `source` in
+   `greedy_default`/`override`, and `comparable`). **Zero of 21 existing
+   rows carried this**, which made a mixed cache unauditable -- and it IS
+   mixed: `NVIDIA-Nemotron-Nano-9B-v2` has an override because it loops on
+   its own `<think>` trace at temperature 0.
+3. **`make bench-report` names the exceptions**, and lists rows predating
+   the stamp as UNKNOWN rather than assuming they were greedy. It
+   currently reports all 21 as unknown, which is the honest state.
+
 ### Exit criteria
 
 - `make bench-vllm BENCH_REPO=<one model> BENCH_TASKS=gsm8k` run at each mode
   produces two rows, each recording its own mode.
+  **SUPERSEDED** -- there are no longer two "modes" to run. The equivalent
+  assertion, that a row records the sampling it was measured at and that an
+  override row is marked non-comparable, is covered by unit tests. The
+  stamp has not yet been written by a real bench run: doing so needs a
+  GPU-exclusive bench, and every existing row would still read UNKNOWN
+  until re-benched anyway.
 - `make bench-report` shows the mode, and the policy decision is written down
-  in `docs/bench-results.md`.
+  in `docs/bench-results.md`. **MET** -- the report renders a `### Sampling`
+  section naming every non-greedy row and counting the unstamped ones;
+  `deploy/bench-sampling.json` already carries the policy rationale, and
+  `docs/bench-results.md` links to it.
 
 ### Phase 4 risks
 
