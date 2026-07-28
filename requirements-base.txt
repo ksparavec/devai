@@ -5,7 +5,6 @@ ipywidgets
 # AI providers
 openai
 ollama
-open-interpreter
 chromadb
 llm
 jupyter-server-proxy

@@ -335,18 +335,6 @@ fetch-cli: ## Download all external binaries and packages to local cache (uses E
 			&& ln -sf ../lib/node_modules/@google/gemini-cli/bundle/gemini.js $(CACHE_DIR)/pip/bin/gemini/bin/gemini \
 			&& echo "$$LATEST" > $(ETAG_DIR)/gemini.version \
 			&& echo "Gemini CLI: updated to $$LATEST"; fi
-	@ARCH=$$(dpkg --print-architecture) \
-		&& case "$$ARCH" in amd64) LATE_ARCH=amd64;; arm64) LATE_ARCH=arm64;; esac \
-		&& HTTP_CODE=$$(curl -fsSL -w '%{http_code}' -o $(CACHE_DIR)/pip/bin/late.tmp \
-			--etag-compare $(ETAG_DIR)/late.etag --etag-save $(ETAG_DIR)/late.etag \
-			"https://github.com/mlhher/late/releases/latest/download/late-linux-$${LATE_ARCH}") \
-		&& if [ "$$HTTP_CODE" = "304" ] || [ ! -s $(CACHE_DIR)/pip/bin/late.tmp ]; then \
-			rm -f $(CACHE_DIR)/pip/bin/late.tmp; STATE="up to date"; \
-		else \
-			mv $(CACHE_DIR)/pip/bin/late.tmp $(CACHE_DIR)/pip/bin/late \
-			&& chmod +x $(CACHE_DIR)/pip/bin/late && STATE="updated"; fi \
-		&& VERSION=$$($(CACHE_DIR)/pip/bin/late --version 2>&1 | awk '{print $$2; exit}' | sed 's/^v//') \
-		&& echo "LATE: $$STATE ($$VERSION)"
 	@# sops + age (sops-age-secrets plan): static Go binaries from GitHub
 	@# releases. ETag-stamped per the existing CLI pattern. Both projects
 	@# publish single-arch binaries with a -linux-${arch}.tar.gz naming

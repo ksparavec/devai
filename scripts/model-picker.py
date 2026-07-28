@@ -241,8 +241,6 @@ _AGENTS: list[tuple[str, str, str]] = [
     ("aider",       "Aider",             "Git-aware pair programming"),
     ("codex",       "Codex",             "OpenAI terminal coding agent"),
     ("opencode",    "OpenCode",          "Open-source terminal agent; strong with local models"),
-    ("late",        "LATE",              "Lightweight AI Terminal Environment — ephemeral subagents"),
-    ("interpreter", "Open Interpreter",  "Natural language computer control"),
     ("aiagent",     "AIAgent (shell)",   "DSPy agent CLI — drops to bash; run `aiagent` yourself"),
 ]
 
@@ -3051,23 +3049,6 @@ def _build(agent_id: str, model_name: str, backend: str) -> list[str]:
         # register it just-in-time before launching.
         _ensure_opencode_model(backend, name)
         return ["opencode", "-m", f"router-{backend}/{name}"]
-
-    if agent_id == "late":
-        # LATE appends `/v1/chat/completions` itself — OPENAI_BASE_URL must
-        # NOT end in `/v1` or requests go to /v1/v1/... → HTTP 404.
-        os.environ["OPENAI_BASE_URL"] = base
-        os.environ["OPENAI_API_KEY"] = "local"
-        os.environ["OPENAI_MODEL"] = name
-        return ["late"]
-
-    if agent_id == "interpreter":
-        if backend == "ollama":
-            return ["interpreter", "--model", f"ollama/{name}"]
-        return [
-            "interpreter", "--model", f"openai/{name}",
-            "--api_base", f"{base}/v1",
-            "--api_key", "local",
-        ]
 
     if agent_id == "aiagent":
         # aiagent is a CLI the user drives herself, so we do NOT exec it.

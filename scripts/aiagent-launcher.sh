@@ -31,7 +31,7 @@
 # suppresses the prompt.
 #
 # Precedence for every knob below: caller env (picker) > these defaults >
-# hard fallback -- mirrors scripts/late-launcher.sh.
+# hard fallback.
 
 set -u
 
@@ -41,7 +41,7 @@ set -u
 # carry no /v1, but an OPENAI_BASE_URL already does (OpenAI-SDK convention, and
 # this project's own -- model-picker.py setdefaults it WITH /v1), so append
 # conditionally rather than blindly -- otherwise a preset OPENAI_BASE_URL=.../v1
-# yields /v1/v1 -> HTTP 404 (the exact trap late-launcher.sh documents).
+# yields /v1/v1 -> HTTP 404.
 if [ -z "${AIAGENT_API_BASE:-}" ]; then
     _base="${OPENAI_BASE_URL:-${OLLAMA_HOST:-http://devai-router:11434}}"
     _base="${_base%/}"

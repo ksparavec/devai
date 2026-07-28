@@ -49,11 +49,12 @@ ENV PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1
 ENV PATH="${PATH}:/home/devai/.local/bin"
 
 # --- Dependencies for coding agents ---
-# libxcb1 is needed by Open Interpreter — it imports cv2 at startup which
-# loads X11 client libs even in headless mode. Without it, OI crashes on
-# the first prompt with `libxcb.so.1: cannot open shared object file`.
+# libxcb1 was here only for Open Interpreter, which imported cv2 at startup
+# and pulled in X11 client libs even headless. Open Interpreter was removed
+# from the project on 2026-07-28 (dead in this image on modern setuptools,
+# and abandoned upstream), so the dependency went with it.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ripgrep fzf libxcb1 ca-certificates \
+        ripgrep fzf ca-certificates \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # --- pipelock MITM CA trust (egress fail-closed; see docs/pipelock.md) ---
@@ -83,12 +84,9 @@ ENV NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/pipelock-ca.crt \
 # layer, and every layer downstream (code-server, gemini, aiagent) with it.
 ARG BIN_HASH=unknown
 # Install CLI binaries (pre-downloaded to /var/cache/bin/ via cache mount).
-# LATE is installed as late-bin; a shell wrapper is installed as `late` to
-# apply sensible OPENAI_* defaults pointing at the in-cluster router.
 RUN echo "binary cache key: BIN_HASH=$BIN_HASH" \
     && cp /var/cache/bin/uv /var/cache/bin/uvx /var/cache/bin/claude /var/cache/bin/codex /var/cache/bin/opencode /var/cache/bin/ollama /usr/local/bin/ \
-    && cp /var/cache/bin/late /usr/local/bin/late-bin \
-    && chmod +x /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/claude /usr/local/bin/codex /usr/local/bin/opencode /usr/local/bin/late-bin /usr/local/bin/ollama
+    && chmod +x /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/claude /usr/local/bin/codex /usr/local/bin/opencode /usr/local/bin/ollama
 
 # Install code-server (pre-downloaded)
 RUN cp -a /var/cache/bin/code-server /usr/local/lib/code-server \
@@ -190,7 +188,6 @@ COPY packages/jupyter-ai-launchers/jupyter_ai_launchers/labextension /usr/local/
 # Install wrapper scripts for JupyterLab launchers and shell picker
 COPY scripts/ollama-chat.sh /usr/local/bin/ollama-chat
 COPY scripts/aider-launcher.sh /usr/local/bin/aider-launcher
-COPY scripts/late-launcher.sh /usr/local/bin/late
 # aiagent shell launcher: the picker's "AIAgent (shell)" agent configures the
 # router endpoint + model, then execs this to drop the user into an interactive
 # bash shell where they run `aiagent ...` themselves. See scripts/aiagent-launcher.sh.
@@ -215,7 +212,7 @@ COPY scripts/_capability.py /usr/local/bin/_capability.py
 COPY scripts/_model_status.py /usr/local/bin/_model_status.py
 COPY scripts/vram-fit.py /usr/local/bin/vram-fit.py
 COPY deploy/models.yaml /etc/devai/models.yaml
-RUN chmod +x /usr/local/bin/ollama-chat /usr/local/bin/aider-launcher /usr/local/bin/late /usr/local/bin/aiagent-shell /usr/local/bin/agent-picker /usr/local/bin/model-picker /usr/local/bin/sky-setup.sh
+RUN chmod +x /usr/local/bin/ollama-chat /usr/local/bin/aider-launcher /usr/local/bin/aiagent-shell /usr/local/bin/agent-picker /usr/local/bin/model-picker /usr/local/bin/sky-setup.sh
 
 # Name the GPU 'render' group in /etc/group. On the host, /dev/dri/renderD* is
 # owned by group `render` (GID 992 here); `--device nvidia.com/gpu=all` (NVIDIA

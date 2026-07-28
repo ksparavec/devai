@@ -576,9 +576,9 @@ $ sed -i.bak 's|uv-x86_64-unknown-linux-gnu|uv-aarch64-unknown-linux-gnu|g' \
        ${REPO_DIR}/Makefile
 ```
 
-The repo's other CLI fetches (codex, ollama, code-server, claude,
-late) already detect `dpkg --print-architecture` and pick the right
-arch automatically. Only `uv` is hardcoded.
+The repo's other CLI fetches (codex, ollama, code-server, claude)
+already detect `dpkg --print-architecture` and pick the right arch
+automatically. Only `uv` is hardcoded.
 
 **B. Force an x86_64 VM via Rosetta 2.** `podman machine init
 --arch=amd64` on Apple Silicon creates an x86_64 VM that runs under

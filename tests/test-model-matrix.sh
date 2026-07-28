@@ -18,7 +18,7 @@
 #
 # Wire protocols:
 #   /api/chat                Aider via ollama_chat/, OI via ollama/
-#   /v1/chat/completions     Codex, LATE, OI/Aider via openai/
+#   /v1/chat/completions     Codex, Aider via openai/
 #   /v1/messages             Claude Code
 #
 # Run from the host:  make test-models

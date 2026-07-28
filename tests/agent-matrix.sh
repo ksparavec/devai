@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # DevAI agent smoke-test matrix — ollama only.
 #
-# For each agent (claude, aider, codex, interpreter, late), fires a one-shot
-# "say hi" prompt at the router's ollama port and classifies the outcome.
+# For each agent (claude, aider, codex), fires a one-shot "say hi" prompt
+# at the router's ollama port and classifies the outcome.
 #
 # Outcomes:
 #   PASS — agent exited 0 within timeout AND produced a non-empty reply
 #   FAIL — non-zero exit, timeout, or empty reply (reason captured to log)
-#   SKIP — agent has no headless mode (LATE)
+#   SKIP — agent has no headless mode
 #
 # Exit code: 0 only if every non-skip cell is PASS. 1 otherwise.
 #
@@ -138,25 +138,6 @@ run_codex() {
         "$PROMPT" >"$log" 2>&1
 }
 
-run_interpreter() {
-    local model="$1" log="$2"
-    # Force plain-text replies — OI's default behaviour is to generate code
-    # and try to execute it, which fails on missing GUI libs in this image
-    # and would never produce a literal token like PONG.
-    local custom="Reply with plain text only. Do not write or execute any code."
-    # Prepend /no_think (Qwen3 hint to skip <think>…</think> blocks) here
-    # rather than in the global prompt — aider rejects messages starting
-    # with `/` as malformed slash commands.
-    echo "/no_think $PROMPT" | timeout "$CELL_TIMEOUT" interpreter \
-        --model "ollama/$model" -y --offline --stdin \
-        --custom_instructions "$custom" >"$log" 2>&1
-}
-
-run_late() {
-    # LATE v1.1.1 is TUI-only — opens /dev/tty unconditionally, no
-    # --prompt/--exec/--stdin. Cannot be smoke-tested headlessly.
-    return 99
-}
 
 # ── Cell evaluator ──────────────────────────────────────────────────────────
 evaluate_cell() {
@@ -214,7 +195,7 @@ echo
 declare -i pass=0 fail=0 skip=0
 declare -A RESULT
 
-for agent in claude aider codex interpreter late; do
+for agent in claude aider codex; do
     cell=$(evaluate_cell "$agent" "$MODEL")
     RESULT["$agent"]="$cell"
     status="${cell%%|*}"

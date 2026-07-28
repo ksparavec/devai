@@ -1122,7 +1122,6 @@ Downloads to `/var/cache/devai/pip/bin/` (ETag cached):
 - code-server
 - `uv` / `uvx`
 - Google Gemini CLI
-- LATE
 
 These are bind-mounted read-only into the lab image at build time, so
 Section 9 is offline.
@@ -1134,7 +1133,7 @@ Section 9 is offline.
                 | grep -E '(debian|nvidia/cuda|golang|distroless|apt-cacher|registry|ollama|vllm|sglang|open-webui|nginx|podman/stable)' \
                 | sort -u
 [vm] [verify] $ ls -1 /var/cache/devai/pip/bin/ \
-                | grep -E '^(claude|codex|ollama|code-server|uv|uvx|gemini|late)$'
+                | grep -E '^(claude|codex|ollama|code-server|uv|uvx|gemini)$'
 ```
 
 ---

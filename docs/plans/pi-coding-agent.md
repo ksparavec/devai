@@ -1,6 +1,8 @@
 # Pi coding agent integration
 
-_Bundle the pi coding agent (earendil-works/pi) into the lab image and wire it to the router as a first-class picker agent, alongside Claude Code / Codex / Aider / LATE / Open Interpreter._
+_Bundle the pi coding agent (earendil-works/pi) into the lab image and wire it to the router as a first-class picker agent, alongside Claude Code / Codex / Aider / OpenCode._
+
+> **Note (2026-07-28):** LATE and Open Interpreter were removed from the project; this plan's framing predates that.
 
 ## Status
 
