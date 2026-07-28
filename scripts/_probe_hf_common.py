@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import hashlib
 import json
 import os
 import re
@@ -736,6 +737,46 @@ def response_has_valid_tool_call(resp: dict, expected_tool_name: str) -> bool:
             return True
     legacy = msg.get("function_call") or {}
     return legacy.get("name") == expected_tool_name
+
+
+# Launch-argv values that legitimately vary per cell and must NOT be part
+# of the fingerprint, or every model and every context tier would hash
+# differently and the signal would be noise.
+_FINGERPRINT_VALUE_FLAGS = (
+    "--model-path", "--model", "--served-model-name",
+    "--context-length", "--max-model-len",
+    "--mem-fraction-static", "--gpu-memory-utilization",
+)
+
+
+def launch_fingerprint(cmd_args: list[str]) -> str:
+    """Stable 12-char hash of the launch argv's SHAPE.
+
+    Per-cell values (model path, served name, context, memory fraction)
+    are elided; everything else -- flag names, parser names, dtypes,
+    recovery flags, their ORDER -- is hashed. So the fingerprint changes
+    exactly when the way we launch changes, and not when we launch a
+    different model.
+
+    This is what makes the stale-cell class self-detecting. Seven SGLang
+    cells sat in the cache for three weeks recording a permanent `quant`
+    verdict that was really an argparse rejection of a flag the lab should
+    never have sent; the allow-list fix shipped with no cache
+    invalidation, so those verdicts stayed authoritative and were cited in
+    three places as genuine arch/quant gaps. A fingerprint per cell turns
+    "the way we launch changed" from an archaeology problem into a diff.
+    """
+    parts: list[str] = []
+    skip_next = False
+    for tok in cmd_args:
+        if skip_next:
+            skip_next = False
+            parts.append("<elided>")
+            continue
+        parts.append(tok)
+        if tok in _FINGERPRINT_VALUE_FLAGS:
+            skip_next = True
+    return hashlib.sha256("\x00".join(parts).encode()).hexdigest()[:12]
 
 
 def validate_kv_dtype(spec: "BackendSpec", dtype: str | None) -> None:
@@ -1524,6 +1565,10 @@ def probe_one_cell(
             "probed_at": now_iso(),
             "evidence": cap_evidence,
         }
+        # The launch SHAPE this fit was measured under. A cell measured
+        # with a different set of flags is not evidence about today's
+        # launch -- see launch_fingerprint.
+        rec["launch_fingerprint"] = launch_fingerprint(cmd_args)
         if spec.kv_cache_dtype:
             # Fit is dtype-scoped: the router reproduces this dtype when
             # serving any ctx this cell covers (gpu-arbiter resolveKVCacheType).
@@ -2186,10 +2231,36 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
 
             # Keep-one-cell: a populated band already holds the single
             # binary-searched result from a prior run. Re-probe only under
-            # --force (which rewrites the cell, not appends) or when the
-            # entry predates the current schema version.
-            if band and not stale_schema and not (
-                    args.force and not args.no_cache_write):
+            # --force (which rewrites the cell, not appends), when the
+            # entry predates the current schema version, when the band
+            # holds NO fitting cell, or when the launch shape has changed.
+            #
+            # "Band is non-empty" was the old condition and it was too
+            # weak: a band of nothing but FAILURES counted as complete, so
+            # a model that failed once was never retried even after the
+            # cause was fixed -- which is precisely how seven SGLang cells
+            # kept an argparse-rejection verdict for three weeks after the
+            # flag bug was fixed.
+            #
+            # Launch-fingerprint drift is deliberately NOT an
+            # auto-invalidation trigger here. The fingerprint is
+            # per-(model, launch shape) -- it includes parser names and
+            # per-model recovery flags -- so the prober cannot compute
+            # "what today's launch would hash to" for a row without
+            # building that row's full argv, and getting it slightly wrong
+            # turns a routine `make probe-sglang` into an unrequested
+            # fleet-wide re-probe. Drift is REPORTED instead, by
+            # `make probe-check`, where a false positive costs a line of
+            # output rather than a GPU day. Re-probe with PROBE_FORCE=1.
+            has_fitting = any(
+                isinstance(c, dict) and c.get("fits") for c in band.values()
+            )
+            if not has_fitting and band:
+                print(f"  {name}: cached band holds no fitting cell — "
+                      f"re-probing rather than treating failure as complete",
+                      file=sys.stderr)
+            if (band and has_fitting and not stale_schema
+                    and not (args.force and not args.no_cache_write)):
                 fully_cached += 1
                 continue
             band.clear()

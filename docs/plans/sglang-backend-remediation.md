@@ -728,6 +728,10 @@ know is running. Worth its own item.
 
 ## Phase 4 -- Honest re-probe
 
+**PARTIALLY SHIPPED 2026-07-28.** Steps 1, 2 and 3 are done (step 3 is a
+"do not"). Steps 4-5, the re-probe itself, are BLOCKED on a resource
+decision the plan did not anticipate -- see "Blocker" below.
+
 ### Goal
 
 Replace every manufactured SGLang verdict with a measured one, and make the stale-cell
@@ -792,14 +796,87 @@ deploy/.sglang-reasoning-cache.json data -- eight cells re-measured
    `serving_*` augmentation, so skipping this would leave cells advertising a fit with
    no serving evidence.
 
+### Progress (2026-07-28)
+
+- **Step 1 -- launch fingerprint. DONE.** `launch_fingerprint()` hashes the
+  argv's SHAPE: per-cell values (model path, served name, context, memory
+  fraction) are elided, everything else -- flag names, parser names, dtypes,
+  recovery flags, order -- is hashed. Verified to be equal across
+  model/ctx/fraction changes and to differ on `--tp` vs `--tp-size`, an added
+  flag, or a different parser. Stamped on every successful fit cell.
+- **Step 2 -- band-skip condition. DONE.** Changed from "band is non-empty"
+  to "band contains a FITTING cell". A band of nothing but failures counted as
+  complete, so a model that failed once was never retried even after the cause
+  was fixed -- exactly how the seven poisoned cells survived the allow-list fix
+  by three weeks.
+- **Step 3 -- parser blocks. Correctly NOT done**, per the plan's own
+  refutation.
+- **Drift reporting. DONE, but as reporting only.** `make probe-check` now
+  prints per-backend fingerprint coverage. It currently reports **16/16 vLLM
+  and 10/10 SGLang fitting cells UNSTAMPED** -- they predate the mechanism, so
+  the argv they were measured under is unknown. That is stated as age, not
+  staleness, and does not fail the gate.
+
+  *Deviation:* the plan says "invalidate the cell when it changes". Automatic
+  invalidation was implemented and then deliberately backed out. The
+  fingerprint is per-(model, launch shape) -- it includes parser names and
+  per-model recovery flags -- so the prober cannot cheaply compute "what
+  today's launch would hash to" for a row without rebuilding that row's full
+  argv, and a slightly-wrong answer converts a routine `make probe-sglang`
+  into an unrequested fleet-wide re-probe. Reporting puts the same
+  information in front of an operator where a false positive costs one line
+  of output instead of a GPU day. `PROBE_FORCE=1` remains the re-probe path.
+
+### Blocker: steps 4-5 need ~160 GB of downloads, not just a GPU window
+
+Open question 4 asked whether a multi-hour GPU window was available and told
+the plan to "say so up front rather than discovering it mid-phase". Saying so:
+**the window is not the binding constraint. The weights are.**
+
+All eight poisoned cells belong to models with **no weights in either store**:
+
+| Model | approx size |
+| --- | --- |
+| Gemma-4-31B-IT-NVFP4 | 30.4 GB |
+| Qwen3.6-35B-A3B-NVFP4 | 21.8 GB |
+| Qwen3.6-27B-MTP-pi-tune-NVFP4 | 19.2 GB |
+| Qwen3.6-27B-Text-NVFP4-MTP | 18.3 GB |
+| NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4 | 18.0 GB |
+| diffusiongemma-26B-A4B-it-NVFP4 | 17.5 GB |
+| Gemma-4-26B-A4B-NVFP4 | 17.5 GB |
+| Qwen3-Coder-30B-A3B-Instruct-FP4 | 16.9 GB |
+| **total** | **~159.5 GB** |
+
+Disk is not the problem (581 GB free on `vgais-cache`); the download time and
+the multi-hour GPU sweep afterwards are, and they are a materially larger
+commitment than any other step in this plan.
+
+The plan's own second verification pass already bounds the prize to **two**
+models -- `Qwen3-Coder-30B-A3B-Instruct-FP4` and
+`NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4` (~35 GB combined). The other six are
+either genuine `gemma4` arch walls hit inside `AutoConfig.from_pretrained`, or
+the qwen3.6 gated-delta-net kernel gap, both corroborated by independent clean
+probes. Re-probing those six is expected to reproduce their failures with
+better labels.
+
+Recommended scope when this is scheduled: download and re-probe the two
+unexplained models only, and record the other six as expected-failure with the
+corrected `launch_args` classification rather than spending ~125 GB and
+several hours to confirm what two independent probes already show.
+
 ### Exit criteria
 
 - No SGLang cell carries an evidence kind of `quant` whose `log_excerpt` is argparse
-  usage text.
+  usage text. **NOT YET** -- the eight cells still carry the old verdict
+  (7 of them `matched_pattern: "GPTQ"`). The classifier that produced them is
+  fixed and proven, but the cells themselves are only rewritten by a re-probe.
 - Every SGLang cell carries a launch fingerprint, and `make probe-check` reports drift
-  when an entrypoint flag changes.
+  when an entrypoint flag changes. **HALF MET.** The mechanism exists, is tested,
+  and `make probe-check` reports coverage; but no existing cell is stamped yet,
+  because stamping happens on probe and no re-probe has run.
 - The count of servable SGLang models is a measured number, and the docs in Phase 5
-  cite it rather than the 2026-07-09 verdicts.
+  cite it rather than the 2026-07-09 verdicts. **NOT YET** -- blocked on the same
+  re-probe.
 
 ### Phase 4 risks
 

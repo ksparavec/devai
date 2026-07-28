@@ -59,6 +59,69 @@ def _probed_digest(cache_path: Path) -> str | None:
     return meta.get("current_image_digest")
 
 
+def _report_fingerprints() -> bool:
+    """Report launch-argv fingerprint spread per backend cache.
+
+    A cell's `launch_fingerprint` records the SHAPE of the argv it was
+    measured under (see _probe_hf_common.launch_fingerprint). Cells within
+    one backend legitimately differ -- parser names and per-model recovery
+    flags are part of the shape -- so this does NOT flag a mismatch as an
+    error. What it surfaces is UNSTAMPED cells: those predate the
+    fingerprint entirely and cannot be checked against anything, which is
+    the condition that let seven SGLang cells keep a verdict measured
+    under an argv the lab no longer emits.
+
+    Returns True when any cache still holds unstamped cells.
+    """
+    print("Launch-argv fingerprints")
+    print("=" * 72)
+    any_unstamped = False
+    repo_root = Path(__file__).resolve().parent.parent
+    for backend, rel_path, _env, _img in BACKENDS:
+        cache_path = repo_root / rel_path
+        if not cache_path.exists():
+            continue
+        try:
+            data = json.loads(cache_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        stamped = unstamped = 0
+        prints: set[str] = set()
+        for key, entry in data.items():
+            if key.startswith("_") or not isinstance(entry, dict):
+                continue
+            for band in (entry.get("probes") or {}).values():
+                if not isinstance(band, dict):
+                    continue
+                for cell in band.values():
+                    if not isinstance(cell, dict) or not cell.get("fits"):
+                        continue
+                    fp = cell.get("launch_fingerprint")
+                    if fp:
+                        stamped += 1
+                        prints.add(str(fp))
+                    else:
+                        unstamped += 1
+        total = stamped + unstamped
+        if not total:
+            continue
+        if unstamped:
+            any_unstamped = True
+            print(f"  {backend:<7} {unstamped}/{total} fitting cell(s) UNSTAMPED "
+                  f"-- measured before launch fingerprints existed, so the argv "
+                  f"they were measured under is unknown")
+        else:
+            print(f"  {backend:<7} all {total} fitting cell(s) stamped")
+        if prints:
+            print(f"          shapes  : {', '.join(sorted(prints))}")
+    print()
+    if any_unstamped:
+        print("Unstamped cells are not proof of staleness, only of age. "
+              "Re-probe with PROBE_FORCE=1 to stamp them.")
+        print()
+    return False  # advisory only -- never fails the gate on age alone
+
+
 def main() -> int:
     repo_root = Path(
         os.environ.get("DEVAI_REPO_ROOT", Path(__file__).resolve().parents[1]))
@@ -91,6 +154,8 @@ def main() -> int:
         print(f"          image   : {image_ref}")
         print(f"          probed  : {probed or '(none)'}")
         print(f"          running : {running or '(none)'}\n")
+
+    stale_any = _report_fingerprints() or stale_any
 
     if stale_any:
         print("At least one backend has drifted. Refresh with:")

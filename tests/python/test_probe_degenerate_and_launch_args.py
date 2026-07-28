@@ -216,3 +216,46 @@ class TestKVDtypeValidation(unittest.TestCase):
         # must not start rejecting dtypes that used to work.
         spec = self._spec("legacy", ())
         P.validate_kv_dtype(spec, "anything")
+
+
+class TestLaunchFingerprint(unittest.TestCase):
+    """The fingerprint must change when the LAUNCH SHAPE changes, and not
+    when the model, context or memory fraction does -- otherwise it is
+    noise and nobody will act on it.
+    """
+
+    _BASE = ["-m", "sglang.launch_server",
+             "--model-path", "/models/A", "--served-model-name", "A",
+             "--tp-size", "1", "--mem-fraction-static", "0.8750",
+             "--context-length", "131072", "--trust-remote-code"]
+
+    def test_per_cell_values_are_elided(self):
+        other = ["-m", "sglang.launch_server",
+                 "--model-path", "/models/B", "--served-model-name", "B",
+                 "--tp-size", "1", "--mem-fraction-static", "0.9100",
+                 "--context-length", "32768", "--trust-remote-code"]
+        self.assertEqual(P.launch_fingerprint(self._BASE),
+                         P.launch_fingerprint(other),
+                         "model, ctx and mem-fraction must not affect the hash")
+
+    def test_flag_rename_changes_the_fingerprint(self):
+        # The exact change this phase made: --tp -> --tp-size.
+        renamed = [t.replace("--tp-size", "--tp") for t in self._BASE]
+        self.assertNotEqual(P.launch_fingerprint(self._BASE),
+                            P.launch_fingerprint(renamed))
+
+    def test_added_flag_changes_the_fingerprint(self):
+        added = self._BASE + ["--disable-piecewise-cuda-graph"]
+        self.assertNotEqual(P.launch_fingerprint(self._BASE),
+                            P.launch_fingerprint(added))
+
+    def test_parser_choice_changes_the_fingerprint(self):
+        a = self._BASE + ["--reasoning-parser", "qwen3"]
+        b = self._BASE + ["--reasoning-parser", "gpt-oss"]
+        self.assertNotEqual(P.launch_fingerprint(a), P.launch_fingerprint(b),
+                            "a different parser IS a different launch")
+
+    def test_is_stable_and_short(self):
+        fp = P.launch_fingerprint(self._BASE)
+        self.assertEqual(fp, P.launch_fingerprint(list(self._BASE)))
+        self.assertEqual(len(fp), 12)
