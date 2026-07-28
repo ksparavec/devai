@@ -502,9 +502,38 @@ gpu-arbiter/policy_test.go    modify -- assert the emitted SGLang reasoning wire
 - Replaying any of the seven recorded argparse dumps yields `kind: "launch_args"`, not
   `"quant"`, and writes no terminal capability.
 - The confirmation cold start shows no `<think>` in either field with reasoning off,
-  and a populated `reasoning_content` with it on.
+  and a populated `reasoning_content` with it on. **MET for the model that
+  genuinely disables** (`Qwen3.5-9B-NVFP4`: 542 -> 0 chars, no inline markers).
+  The plan named `gpt-oss-20b@131072` for this check; run there it FAILS, and
+  that failure is the finding -- Harmony reasoning is intrinsic and
+  `reasoning_effort: "none"` only shortens it. Sending it top-level does not
+  trip SGLang's Harmony guard (which reads the `chat_template_kwargs`-nested
+  value), so the request succeeds; it simply does not disable.
 - At most one of the eight re-probed SGLang rows still reports
   `disable_verified: true`, and that one is corroborated by the wire test.
+  **MET, and by measurement rather than reset.** Re-verified on the wire
+  2026-07-28 through the router (default policy vs `::nothink`), on the four
+  rows whose weights are in the SGLang store:
+
+  | Model | reasoning ON | with `::nothink` | verdict |
+  | --- | --- | --- | --- |
+  | `Qwen3.5-9B-NVFP4` | 542 chars `reasoning_content` | **0 chars**, no inline think, answer correct | **true -- genuine** |
+  | `gpt-oss-20b` | 114 chars | **77 chars, still populated** | false |
+  | `NVIDIA-Nemotron-Nano-9B-v2-NVFP4` | 433 chars | `reasoning_content` **empty**, but 446 chars of trace **moved into `content`** | false |
+  | `Ornith-1.0-9B-NVFP4` | -- | quarantined (serving_ok=false), not servable | false (reset) |
+
+  The Nemotron row is the whole argument for the falsifiability fix: its
+  `reasoning_content` IS empty with disable requested, so the OLD check would
+  have passed it -- while the model thought exactly as much as before and
+  merged the trace into the answer. Only the new inline-marker requirement
+  catches it.
+
+  The four rows with no SGLang weights (`DeepSeek-R1-Distill-Llama-8B`,
+  `DeepSeek-R1-Distill-Qwen-7B`, `Qwen3-14B-NVFP4`, `Qwen3-8B-NVFP4`) could not
+  be measured and were reset to `false` rather than left carrying a
+  manufactured `true`: `false` means the router emits no disable directive,
+  which is the safe direction. Every row records its method and evidence in
+  `evidence.disable`.
 
 ### Phase 2 risks
 
