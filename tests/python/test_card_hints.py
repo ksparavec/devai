@@ -249,3 +249,50 @@ class TestHintsForModel(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDeriveParserFallback(unittest.TestCase):
+    """Phase 3 wiring: derive_parser is what the prober calls.
+
+    The precedence itself (curated wins) lives in `run_probe_pass`; what
+    is pinned here is that the derivation returns None -- today's
+    behaviour, no parser flag emitted -- in every case where it should
+    decline, because that is what makes the fallback safe to enable.
+    """
+
+    def _checkpoint(self, tmp: str, template_name: str) -> str:
+        d = Path(tmp) / "AModel"
+        d.mkdir()
+        (d / "chat_template.jinja").write_text(_tpl(template_name))
+        return tmp
+
+    def test_derives_an_unambiguous_tool_parser(self):
+        with tempfile.TemporaryDirectory() as t:
+            root = self._checkpoint(t, "gemma4.jinja")
+            self.assertEqual(
+                CH.derive_parser("AModel", root, "vllm", "tool"), "gemma4")
+
+    def test_declines_on_the_ambiguous_class(self):
+        with tempfile.TemporaryDirectory() as t:
+            root = self._checkpoint(t, "qwen3_xml_family_coder.jinja")
+            self.assertIsNone(CH.derive_parser("AModel", root, "vllm", "tool"))
+
+    def test_declines_where_the_engine_has_no_analogue(self):
+        with tempfile.TemporaryDirectory() as t:
+            root = self._checkpoint(t, "nemotron_json.jinja")
+            self.assertEqual(
+                CH.derive_parser("AModel", root, "vllm", "tool"),
+                "nemotron_json")
+            self.assertIsNone(
+                CH.derive_parser("AModel", root, "sglang", "tool"),
+                "SGLang has no nemotron_json; emitting one would be rejected "
+                "by argparse")
+
+    def test_missing_checkpoint_returns_none_not_an_error(self):
+        with tempfile.TemporaryDirectory() as t:
+            self.assertIsNone(CH.derive_parser("Nope", t, "vllm", "tool"))
+
+    def test_checkpoint_without_metadata_returns_none(self):
+        with tempfile.TemporaryDirectory() as t:
+            (Path(t) / "Bare").mkdir()
+            self.assertIsNone(CH.derive_parser("Bare", t, "vllm", "tool"))

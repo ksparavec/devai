@@ -46,6 +46,8 @@ __all__ = [
     "REASONING_FORMAT_TO_PARSER",
     "parser_for",
     "sampling_defaults",
+    "derive_parser",
+    "hints_for_model",
 ]
 
 
@@ -291,6 +293,27 @@ def sampling_defaults(model_dir: str | Path) -> dict:
     if not isinstance(data, dict):
         return {}
     return {k: data[k] for k in _SAMPLING_KEYS if k in data}
+
+
+def derive_parser(model_name: str, models_dir: str | Path,
+                  backend: str, kind: str) -> str | None:
+    """Parser name derived from a checkpoint's own template, or None.
+
+    The single entry point the prober uses. `kind` is "tool" or
+    "reasoning". Returns None whenever the evidence does not support a
+    confident answer -- absent metadata, unrecognised markup, or a format
+    class the validation showed to be ambiguous. None is the safe value:
+    it reproduces today's behaviour exactly (no parser flag emitted).
+    """
+    model_dir = Path(models_dir) / model_name
+    template, _ = load_chat_template(model_dir)
+    if not template:
+        return None
+    if kind == "tool":
+        fmt, _ = predict_tool_format(template)
+    else:
+        fmt, _ = predict_reasoning_format(template)
+    return parser_for(fmt, backend, kind)
 
 
 def hints_for_model(model_dir: str | Path) -> dict:

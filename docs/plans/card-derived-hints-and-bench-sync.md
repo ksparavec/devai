@@ -358,6 +358,11 @@ changed to derive **no** reasoning parser, on the same principle as
 
 ## Phase 3 -- Wire derived parsers as fallback
 
+**SHIPPED 2026-07-28.** Gate satisfied by Phase 1's result (10/10
+precision with two classes explicitly declining). Three of four exit
+criteria verified live; the fourth cannot be exercised on this host and
+says so below rather than being claimed.
+
 ### Goal
 
 Uncurated and newly onboarded models get a probe-verified parser without a
@@ -407,12 +412,26 @@ CLAUDE.md                           modify   -- new script + target in the key-f
 ### Exit criteria
 
 - `make probe-vllm PROBE_REPO=<curated model> PROBE_FORCE=1` leaves the parser
-  value unchanged and records `tool_parser_source=curated`.
+  value unchanged and records `tool_parser_source=curated`. **MET** --
+  forced re-probe of `Qwen3.5-9B-NVFP4`: parsers stayed `qwen3` /
+  `qwen3_xml`, and the probe log now reads
+  `[R=qwen3(curated) T=qwen3_xml(curated)]`.
 - The same on a model with no curated parser records `tool_parser_source=card`,
   and the probe's own tool round-trip confirms the derived value.
-- A no-op re-probe diff shows only the new provenance fields.
+  **NOT EXERCISED -- no such model exists on this host.** Every downloaded
+  checkpoint belongs to a curated family, and the two gaps that do exist
+  (Gemma-4 reasoning) are cases where the derivation deliberately declines,
+  so they record `source=None`, not `card`. The `card` branch is covered by
+  unit tests on `derive_parser` and by the 10/10 report, but it has not run
+  end-to-end. It will the first time an uncurated model is onboarded --
+  which is the whole point of the phase.
+- A no-op re-probe diff shows only the new provenance fields. **MET** --
+  diffing the cache entry before/after the forced re-probe (ignoring
+  timestamps and evidence) shows exactly two added keys,
+  `tool_parser_source` and `reasoning_parser_source`, with nothing removed
+  and nothing changed.
 - `make test-probe-ollama-idempotent` remains byte-identical (the Ollama path
-  is untouched).
+  is untouched). **MET** -- 3 entries unchanged, PASS.
 
 ### Phase 3 risks
 

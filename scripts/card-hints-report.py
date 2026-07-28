@@ -136,6 +136,7 @@ def main() -> int:
         return 0
 
     matches = comparisons = 0
+    disagreed: list[tuple[str, str, str, str, str]] = []
     print(f"card-hints: {len(unique)} checkpoint(s)\n")
     for d in unique:
         h = hints_for_model(d)
@@ -166,6 +167,9 @@ def main() -> int:
                     comparisons += 1
                     if verdict == "OK":
                         matches += 1
+                    else:
+                        disagreed.append(
+                            (d.name, backend, kind, str(pred), str(curval)))
                 print(f"      {backend:6} {kind:9} pred={_fmt(pred):15}"
                       f" curated={_fmt(curval):15} probed={_fmt(pv):15} {verdict}")
         if h["sampling"]:
@@ -175,8 +179,15 @@ def main() -> int:
     if comparisons:
         print(f"agreement where both a prediction and a curated value exist: "
               f"{matches}/{comparisons}")
-    print("\nREAD-ONLY: no launch argument was changed. Wiring derived parsers "
-          "in as a fallback is Phase 3, gated on this result.")
+    if disagreed:
+        print("\nDISAGREEMENTS (curated wins at probe time; listed so curation "
+              "drift is visible rather than silent):")
+        for name, backend, kind, pred, curval in disagreed:
+            print(f"  {name} [{backend}] {kind}: curated={curval} "
+                  f"derived={pred}")
+    print("\nThis report is READ-ONLY. At PROBE time a curated value always "
+          "wins; derivation only fills gaps, and refuses to guess where the "
+          "markup does not determine the parser.")
     return 0
 
 

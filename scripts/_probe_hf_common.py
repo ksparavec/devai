@@ -58,6 +58,7 @@ from _contexts import (  # noqa: E402  — local import after sys.path fix
     standard_vram_budgets,
     vram_label,
 )
+import _card_hints  # noqa: E402
 from _capability import Capability, is_terminal  # noqa: E402
 from _probe_core import (  # noqa: E402
     has_inline_think_markers,
@@ -2182,8 +2183,59 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
         # cell record only confirms them when the backend round-trip
         # produces the expected response shape.
         row_parsers = (row.get("parsers") or {}).get(spec.name) or {}
-        row_reasoning_parser = row_parsers.get("reasoning") or None
-        row_tool_parser = row_parsers.get("tool") or None
+        curated_reasoning = row_parsers.get("reasoning") or None
+        curated_tool = row_parsers.get("tool") or None
+
+        # Card-derived fallback. A curated value ALWAYS wins -- derivation
+        # only fills gaps, so onboarding an uncurated model no longer
+        # requires hand-writing a `parsers:` block first. The derivation
+        # refuses to guess wherever validation showed the markup does not
+        # determine the parser (qwen3_xml vs qwen3_coder, bare <think>,
+        # Gemma-4's prompt-side <|think|>), so a gap it cannot fill stays
+        # exactly as it is today: no parser flag emitted.
+        parser_sources: dict[str, str | None] = {}
+        disagreements: dict[str, dict] = {}
+        row_reasoning_parser = curated_reasoning
+        row_tool_parser = curated_tool
+        for kind, curated in (("tool", curated_tool),
+                              ("reasoning", curated_reasoning)):
+            derived = None
+            try:
+                derived = _card_hints.derive_parser(
+                    name, models_dir, spec.name, kind)
+            except Exception as e:  # noqa: BLE001
+                # Never let a hint break a probe: no hint is today's
+                # behaviour, a crash is not.
+                print(f"  {name}: card-hint derivation failed ({kind}): {e}",
+                      file=sys.stderr)
+            if curated is None:
+                if kind == "tool":
+                    row_tool_parser = derived
+                else:
+                    row_reasoning_parser = derived
+                parser_sources[kind] = "card" if derived else None
+            else:
+                parser_sources[kind] = "curated"
+                if derived and derived != curated:
+                    # Behaviour is unchanged -- curated still wins -- but a
+                    # silent disagreement is how curation drifts out of
+                    # step with the checkpoints it describes.
+                    print(f"  {name}: WARNING {kind} parser disagreement -- "
+                          f"curated={curated!r} but the chat template "
+                          f"derives {derived!r}. Serving the curated value.",
+                          file=sys.stderr)
+                    disagreements[kind] = {"curated": curated,
+                                           "derived": derived}
+
+        # Provenance. Additive fields only, matching how the LOAD probe
+        # augments cells -- no schema bump. Lets a reader tell "a human
+        # chose this" from "the checkpoint's own template implied it".
+        entry["tool_parser_source"] = parser_sources.get("tool")
+        entry["reasoning_parser_source"] = parser_sources.get("reasoning")
+        if disagreements:
+            entry["parser_disagreement"] = disagreements
+        else:
+            entry.pop("parser_disagreement", None)
 
         if args.force_arch:
             entry["capability"] = Capability.UNKNOWN
@@ -2265,9 +2317,13 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
                 continue
             band.clear()
 
+            def _src(kind: str) -> str:
+                src = parser_sources.get(kind)
+                return f"({src})" if src else ""
+
             parser_label = (
-                f"R={row_reasoning_parser or '—'} "
-                f"T={row_tool_parser or '—'}"
+                f"R={row_reasoning_parser or '—'}{_src('reasoning')} "
+                f"T={row_tool_parser or '—'}{_src('tool')}"
             )
             print(f"  {name} @ {vram_label(vram_gb)}: binary-searching max "
                   f"fitting ctx over "
