@@ -900,6 +900,7 @@ help: ## Show this help message
 	@printf "  %-44s%s\n" "ollama-status    Show status" ""
 	@printf "  %-44s%s\n" "ollama-df        Disk usage" ""
 	@printf "  %s\n" "ollama-clean     Clean partials"
+	@printf "  %-44s%s\n" "card-hints       Derived parser report" "card-hints-fetch Stage metadata only"
 	@printf "\n"
 	@printf "  %s\n" "DEPLOY"
 	@printf "  %s\n" "install-systemd  Auto-start infrastructure at boot"
@@ -1446,6 +1447,13 @@ probe-check: ## Report backend image drift: compare running vLLM/SGLang image di
 	@CONTAINER_RUNTIME=$(CONTAINER_RUNTIME) \
 	  VLLM_IMAGE="$(VLLM_IMAGE)" SGLANG_IMAGE="$(SGLANG_IMAGE)" \
 	  python3 scripts/probe-check.py
+
+card-hints: ## Read-only: predicted-vs-curated parser report derived from each checkpoint's own chat template. No GPU, no launch, changes nothing.
+	@VLLM_MODELS_DIR="$(VLLM_MODELS_DIR)" SGLANG_MODELS_DIR="$(SGLANG_MODELS_DIR)" \
+	  python3 scripts/card-hints-report.py
+
+card-hints-fetch: ## Stage METADATA ONLY (chat template + tokenizer/generation config, a few hundred KB per repo, no weights) for curated families, so card-hints can be validated out-of-sample. FAMILY=<name> to scope.
+	@FAMILY="$(FAMILY)" python3 scripts/card-hints-fetch.py
 
 probe-ornith-arch: ## Tier-1 arch-support probe for the Ornith-1.0 35B (qwen3_5_moe). Cheap: introspects the running vLLM/SGLang images, no weight download.
 	@CONTAINER_RUNTIME=$(CONTAINER_RUNTIME) bash scripts/probe-ornith-arch.sh

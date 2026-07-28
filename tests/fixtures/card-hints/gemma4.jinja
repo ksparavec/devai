@@ -1,0 +1,5 @@
+{%- if tools %}
+  You have access to the following functions.
+  Emit calls as <|tool_call>call:NAME{"arg": 1}<tool_call|>
+{%- endif %}
+{%- if enable_thinking %}<|think|>{%- endif %}

@@ -108,6 +108,11 @@ Phase 3 is gated on Phase 1's out-of-sample result.
 
 ## Phase 1 -- Card-hint extraction and out-of-sample validation
 
+**SHIPPED 2026-07-28.** All four steps done, both exit criteria met. The
+out-of-sample result is a PARTIAL success with one hard negative finding
+that constrains Phase 3 -- see "Result" below. Read that before scheduling
+Phase 3.
+
 ### Goal
 
 A read-only, tested extraction module plus a report that shows predicted vs
@@ -171,14 +176,76 @@ Makefile                            modify   -- `card-hints`, `card-hints-fetch`
    `tests/fixtures/card-hints/` and assert the predicted parser for each in
    `tests/python/test_card_hints.py`.
 
+### Result (2026-07-28)
+
+`make card-hints-fetch` staged metadata for **10/10** curated families (a few
+hundred KB each, no weights, no GPU). `make card-hints` then compared
+predictions against curated AND probe-recorded values across 13 checkpoints.
+
+**In-sample first, and it was misleading exactly as feared.** On the five
+downloaded models the rules scored 10/10 -- but those five are what the rules
+were written from. The fetched families are the real test.
+
+**The hard negative finding: `qwen3_xml` vs `qwen3_coder` is NOT derivable.**
+Four probe-verified checkpoints ship byte-identical tool markup
+(`<tool_call>` + `<function=` + `<parameter=`) and split evenly between two
+different parsers:
+
+| Checkpoint | probe-verified parser |
+| --- | --- |
+| `Qwen3.5-9B-NVFP4` | `qwen3_xml` |
+| `Ornith-1.0-9B-NVFP4` | `qwen3_xml` |
+| `Qwen3-Coder-30B-A3B-Instruct-FP4` | `qwen3_coder` |
+| `NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4` | `qwen3_coder` |
+
+The token SETS are identical; only counts differ, which no template refactor
+would preserve. `<think>` does not separate them either -- Qwen3-Coder has 0
+and Nemotron-3-Nano has 12, yet both are `qwen3_coder`. So either guess is
+wrong half the time. The first implementation predicted `qwen3_xml` and the
+report scored **15/19 with 4 DIFFERs**, all of them this case.
+
+The class is therefore named `qwen3_xml_family` and derives **nothing**. A
+wrong tool parser mis-parses live tool calls; no parser merely means the
+router strips tools and chat still works. With the ambiguity declared, the
+report scores **11/11** -- 11 predictions, all correct, and an explicit
+refusal to guess where the evidence does not support one. That is the shape
+Phase 3 needs: high precision, lower recall, no false positives.
+
+**A second real defect, caught by the report on first run.** The initial
+`FORMAT_TO_PARSER` was one table keyed by (format_class, backend). Harmony's
+vLLM TOOL parser is `openai` but its vLLM REASONING parser is `openai_gptoss`,
+so a single table got one of them wrong. Tool and reasoning are now separate
+tables, with a regression test.
+
+**What derives cleanly today:** `gemma4` (inverted `<|tool_call>` delimiters),
+`harmony` (`<|channel|>commentary` / `analysis`), `nemotron_json`
+(`<TOOLCALL>`), `hermes` (`<tool_call>` WITHOUT `<function=`), and the
+`gemma4_think` reasoning class.
+
+**What deliberately does not:** `qwen3_xml_family` (above); `think_delimited`,
+since qwen3, deepseek-r1 and nemotron templates all emit bare `<think>` but
+need `qwen3` / `deepseek_r1` / `nemotron_v3`; and every SGLang gap where the
+engine has no analogue of a vLLM parser name.
+
+**Also observed, feeding Phase 2:** both Gemma-4 checkpoints
+(`Gemma-4-26B-A4B-it-NVFP4`, `gemma-4-e2b-it`) predict a `gemma4` reasoning
+parser from a `<|think|>` token gated on `enable_thinking`, while the family
+curates none and the probe recorded nothing. That is precisely the discrepancy
+Phase 2 exists to settle, now visible as data rather than suspicion.
+
 ### Exit criteria
 
 - `make card-hints` reproduces the 5/5 tool-parser match on the downloaded
-  models, each with its evidence string.
+  models, each with its evidence string. **MET** -- 10/10 on those five
+  (tool and reasoning), every prediction carrying its evidence substring.
 - `make test-python` passes the new fixture cases for every curated family,
-  including those not downloaded.
+  including those not downloaded. **MET** -- 28 new cases; 745 Python tests
+  green overall.
 - `qwen3_coder` either gains a discriminator from its fetched template, or is
   documented as requiring curation. It currently has none.
+  **MET, via the second branch.** It gains no discriminator, because none
+  exists in the markup; it is documented as requiring curation in the code,
+  the tests and the table above.
 
 ### Phase 1 risks
 
