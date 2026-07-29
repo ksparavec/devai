@@ -37,6 +37,21 @@ import (
 //     501 "Only 'auto' or 'none' tool_choice is supported in response API
 //     with Harmony", and the nested shape the router emits returns 400
 //     "Tool choice 'function' not found in 'tools' parameter".
+//     Re-measured on SGLang v0.5.16: a named pin is still rejected
+//     (400 literal_error, "Input should be 'auto', 'required' or 'none'"),
+//     and even `"required"` splits by model -- accepted on
+//     Qwen3.5-9B-NVFP4, rejected on gpt-oss-20b with 400 "Only 'auto'
+//     tool_choice is supported in response API". So the promotion skip
+//     below stays correct on both engines.
+//
+// SGLang function tools: FIXED, and this is a real capability change.
+// Custom function tools used to be unsupported on its Responses surface
+// entirely (`tools[].type` was Literal['web_search_preview',
+// 'code_interpreter']), which meant Codex could not use SGLang at all.
+// On v0.5.16 a FLAT function tool returns 200 and actually calls:
+// Qwen3.5-9B-NVFP4 answered `{"city": "Paris"}` under
+// tool_choice="required". The nested Chat shape is still rejected (400
+// "Function tools must include a name"), same as vLLM.
 //
 // Tool STRIPPING needs no change: `maybeStripTools` is not path-gated and
 // operates on the top-level `tools` / `tool_choice` keys, which the
@@ -62,34 +77,42 @@ func responsesEffort(policy string) string {
 	case "low", "medium", "high":
 		return policy
 	case "off":
-		// NOTHING is emitted. `none` is not a legal effort on this
-		// surface, and the earlier "known limitation" turned out to be a
-		// live defect when SGLang was actually tested:
+		// NOTHING is emitted -- but the reason CHANGED with the SGLang
+		// v0.5.16 bump, and the old reason was measured, so it is worth
+		// recording precisely.
 		//
-		//   vLLM    effort="none" -> 400 "reasoning_effort='none' is not
-		//           supported by Harmony. Supported values are: high,
-		//           medium, low."
-		//   SGLang  effort="none" -> 500, and the cause is schema-level
-		//           rather than model-specific:
-		//           ResponsesRequest.reasoning.effort is
-		//           Literal['low','medium','high'], so `none` is invalid
-		//           for EVERY model, not just Harmony ones.
+		// It used to be schema-level on SGLang: ResponsesRequest.reasoning
+		// .effort was Literal['low','medium','high'], so `none` was
+		// invalid for every model. v0.5.16 widened that schema (upstream
+		// #31784, "align reasoning_effort schema across chat, tokenize and
+		// responses"). Re-measured on this fleet:
 		//
-		// The disable directive is also unreachable-or-useless in
-		// practice today: 0 of 11 vLLM structured rows probe as
-		// disable_verified, and the single SGLang row that does
-		// (Qwen3.5-9B-NVFP4) returns 400 "input_ids should be a list of
-		// lists for batch processing" on EVERY /v1/responses request,
-		// minimal ones included, while /v1/chat/completions on the same
-		// model returns 200.
+		//   Qwen3.5-9B-NVFP4  effort="none"    -> 200
+		//   gpt-oss-20b       effort="none"    -> 500
+		//   gpt-oss-20b       effort="minimal" -> 500
+		//   gpt-oss-20b       low/medium/high  -> 200 (290/430/764 chars
+		//                     of reasoning; 1030 with no directive)
+		//
+		// So it is now MODEL-specific: the Harmony guard still rejects
+		// `none`, everything else accepts it. vLLM v0.22.1 (not bumped)
+		// still 400s: "reasoning_effort='none' is not supported by
+		// Harmony."
+		//
+		// Emitting `none` per-model is therefore possible but not safe on
+		// the evidence available: `disable_verified` is probed on
+		// /v1/chat/completions, and this surface demonstrably disagrees
+		// with that one (gpt-oss takes reasoning_effort="none" on chat --
+		// 802 -> 14 chars -- and 500s on responses). Gating a 500 on a
+		// verdict measured against a different endpoint is how this repo
+		// got the tautological disable_verified bug. Until the probe
+		// covers /v1/responses directly, not honouring the directive
+		// loudly beats guessing.
 		//
 		// Rejected alternatives: emitting `low` would silently answer a
 		// different question than the user asked; emitting
 		// `chat_template_kwargs.enable_thinking=false` is accepted by
 		// SGLang but only halves the trace (1104 -> 481 chars on
 		// gpt-oss-20b), i.e. a partial disable presented as a disable.
-		// Not honouring an unsupported directive, loudly, is the same
-		// call this router makes for unverified tool parsers.
 		return ""
 	}
 	return ""

@@ -26,7 +26,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _probe_core import image_digest_via_cli  # noqa: E402
+from _probe_core import (  # noqa: E402
+    image_digest_via_cli,
+    image_stamp_survey,
+)
 
 # (backend, default cache path, image-ref env var, image default). Defaults
 # mirror deploy/docker-compose.yaml so `make probe-check` matches what the
@@ -42,7 +45,7 @@ BACKENDS = (
         "sglang",
         "deploy/.sglang-reasoning-cache.json",
         "SGLANG_IMAGE",
-        "docker.io/lmsysorg/sglang:v0.5.10.post1-cu130",
+        "docker.io/lmsysorg/sglang:v0.5.16-cu130",
     ),
 )
 
@@ -122,6 +125,58 @@ def _report_fingerprints() -> bool:
     return False  # advisory only -- never fails the gate on age alone
 
 
+def _report_row_images() -> bool:
+    """Report per-ROW engine-image staleness.
+
+    `_meta.current_image_digest` is cache-wide, so it only answers "what
+    image last touched this cache". After a PARTIAL re-probe -- the normal
+    case, since only models whose weights are still on disk can be
+    re-probed -- it says "current" while most rows still hold measurements
+    from the previous engine. This is the row-level answer.
+
+    Returns True when any row is stale, which DOES fail the gate: unlike an
+    unstamped launch fingerprint (age, not proof), a row stamped with a
+    different digest is positive evidence that its fit / serving_ok /
+    parser verdicts were measured on an engine we are no longer running.
+    """
+    print("Per-row image stamps")
+    print("=" * 72)
+    any_stale = False
+    repo_root = Path(
+        os.environ.get("DEVAI_REPO_ROOT", Path(__file__).resolve().parents[1]))
+    for backend, rel_path, _env, _img in BACKENDS:
+        cache_path = repo_root / rel_path
+        if not cache_path.exists():
+            continue
+        try:
+            data = json.loads(cache_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        survey = image_stamp_survey(data, _probed_digest(cache_path))
+        total = sum(len(v) for v in survey.values())
+        if not total:
+            continue
+        if survey["stale"]:
+            any_stale = True
+            print(f"  {backend:<7} {len(survey['stale'])}/{total} row(s) STALE "
+                  f"-- measured under a different engine image")
+            for name in sorted(survey["stale"])[:8]:
+                print(f"            - {name}")
+            if len(survey["stale"]) > 8:
+                print(f"            ... and {len(survey['stale']) - 8} more")
+        if survey["unstamped"]:
+            print(f"  {backend:<7} {len(survey['unstamped'])}/{total} row(s) "
+                  f"unstamped (pre-date row stamping; re-probe to attribute)")
+        if not survey["stale"] and not survey["unstamped"]:
+            print(f"  {backend:<7} all {total} row(s) match the current image")
+    print()
+    if any_stale:
+        print("A stale row keeps serving verdicts measured on another engine. "
+              "Re-probe it, or drop it from the cache.")
+        print()
+    return any_stale
+
+
 def main() -> int:
     repo_root = Path(
         os.environ.get("DEVAI_REPO_ROOT", Path(__file__).resolve().parents[1]))
@@ -155,6 +210,7 @@ def main() -> int:
         print(f"          probed  : {probed or '(none)'}")
         print(f"          running : {running or '(none)'}\n")
 
+    stale_any = _report_row_images() or stale_any
     stale_any = _report_fingerprints() or stale_any
 
     if stale_any:

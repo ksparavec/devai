@@ -69,7 +69,11 @@ from _probe_core import (  # noqa: E402
     now_iso,
     save_cache,
     smallest_clean_probe,
+    row_image_is_stale,
     stamp_image_digest,
+    ROW_IMAGE_FIELD,
+    backfill_row_images,
+    stamp_row_image,
 )
 from _vllm_plugins import PluginEntry, PluginRegistry, get_registry  # noqa: E402
 from _model_status import (  # noqa: E402
@@ -2112,9 +2116,19 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
     # Phase C: record the backend image digest this cache is being probed
     # against so the router can detect a moved tag (drift) that silently
     # invalidates it. Guarded save lands `_meta` even on an all-cached run.
+    # Kept in a local as well: `_meta` answers "what image was this cache
+    # last touched by", which a PARTIAL re-probe makes misleading on its
+    # own. Each row this pass rewrites is stamped individually so an
+    # un-reprobed row stays distinguishable -- see stamp_row_image.
+    run_image_digest = image_digest_via_cli(args.runtime, args.image)
+    # Order matters: attribute legacy rows to the OUTGOING `_meta` digest
+    # before the pointer moves, otherwise their true provenance is lost.
+    backfilled = backfill_row_images(cache)
+    if backfilled:
+        print(f"  backfilled:     {backfilled} legacy row(s) attributed to the "
+              f"previous image digest", file=sys.stderr)
     stamp_image_digest(
-        cache, digest=image_digest_via_cli(args.runtime, args.image),
-        image_ref=args.image)
+        cache, digest=run_image_digest, image_ref=args.image)
     if not args.no_cache_write:
         save_cache(args.cache, cache)
     ledger = _load_ledger()
@@ -2273,7 +2287,25 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
         else:
             entry.pop("parser_disagreement", None)
 
-        if args.force_arch:
+        # A row measured under a DIFFERENT engine image is not evidence
+        # about this one. Unlike launch-fingerprint drift (see the long
+        # note further down, deliberately report-only), the image digest
+        # is a single value known exactly for this run, so comparing it
+        # per row cannot produce a false positive -- and an
+        # `unsupported_arch` verdict is precisely the kind that an engine
+        # bump overturns. Measured: Gemma-4 was unsupported_arch on
+        # v0.5.10.post1 and loads on v0.5.16, but the cached verdict
+        # skipped it, so the bump silently rescued nothing.
+        entry_image = entry.get(ROW_IMAGE_FIELD)
+        stale_image = row_image_is_stale(
+            entry, run_image_digest, writable=not args.no_cache_write)
+
+        if args.force_arch or stale_image:
+            if stale_image and entry.get("capability") == \
+                    Capability.UNSUPPORTED_ARCH:
+                print(f"  {name}: cached unsupported_arch was measured on a "
+                      f"different engine image — re-evaluating",
+                      file=sys.stderr)
             entry["capability"] = Capability.UNKNOWN
             entry["evidence"] = {}
 
@@ -2347,7 +2379,11 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
                 print(f"  {name}: cached band holds no fitting cell — "
                       f"re-probing rather than treating failure as complete",
                       file=sys.stderr)
-            if (band and has_fitting and not stale_schema
+            if stale_image and band:
+                print(f"  {name}: cached cells were measured on engine image "
+                      f"{(entry_image or '')[:19]} != {run_image_digest[:19]} "
+                      f"— re-probing", file=sys.stderr)
+            if (band and has_fitting and not stale_schema and not stale_image
                     and not (args.force and not args.no_cache_write)):
                 fully_cached += 1
                 continue
@@ -2430,6 +2466,7 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
                 band[str(arch_rec["ctx"])] = arch_rec
                 entry.setdefault("first_probed_at", arch_rec["probed_at"])
                 entry["last_probed_at"] = arch_rec["probed_at"]
+                stamp_row_image(entry, run_image_digest)
                 print(f"    [stop] {name}: "
                       f"{(arch_rec.get('evidence') or {}).get('kind')} — "
                       f"unsupported arch", file=sys.stderr)
@@ -2480,6 +2517,7 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
                 band[str(max_ctx)] = winner
                 entry.setdefault("first_probed_at", winner["probed_at"])
                 entry["last_probed_at"] = winner["probed_at"]
+                stamp_row_image(entry, run_image_digest)
                 if first_seen_record is None:
                     first_seen_record = winner
                 fresh_probes += 1
@@ -2491,6 +2529,7 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
                 band[str(lo)] = probed_cells[lo]
                 entry.setdefault("first_probed_at", probed_cells[lo]["probed_at"])
                 entry["last_probed_at"] = probed_cells[lo]["probed_at"]
+                stamp_row_image(entry, run_image_digest)
                 fresh_probes += 1
             else:
                 # Nothing was ever launched: every grid tier sits above the

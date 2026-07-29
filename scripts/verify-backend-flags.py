@@ -28,7 +28,7 @@ VLLM_IMAGE = os.environ.get(
     "VLLM_IMAGE", "docker.io/vllm/vllm-openai:v0.22.1-x86_64-cu129-ubuntu2404"
 )
 SGLANG_IMAGE = os.environ.get(
-    "SGLANG_IMAGE", "docker.io/lmsysorg/sglang:v0.5.10.post1-cu130"
+    "SGLANG_IMAGE", "docker.io/lmsysorg/sglang:v0.5.16-cu130"
 )
 RUNTIME = os.environ.get("CONTAINER_RUNTIME", "podman")
 

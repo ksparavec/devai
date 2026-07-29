@@ -19,12 +19,14 @@
 #
 #   VLLM_IMAGE   = docker.io/vllm/vllm-openai:v0.22.1-x86_64-cu129-ubuntu2404
 #                  (vLLM 0.19.1+, CUDA 13, Ubuntu 24.04)
-#   SGLANG_IMAGE = docker.io/lmsysorg/sglang:v0.5.10.post1-cu130
-#                  (SGLang 0.5.10.post1, CUDA 13)
+#   SGLANG_IMAGE = docker.io/lmsysorg/sglang:v0.5.16-cu130
+#                  (SGLang 0.5.16, CUDA 13)
 #
 # Verified 2026-04-29 against the images above; SGLang re-verified
 # 2026-07-28 (--tp corrected to --tp-size; served_model_name and
-# max_running_requests added).
+# max_running_requests added) and again 2026-07-29 on the v0.5.16 bump
+# (all 18 names still present -- no drift; disable_piecewise_cuda_graph
+# retired, see below).
 
 vllm:
   model:                "--model"
@@ -86,12 +88,15 @@ sglang:
   trust_remote_code:    "--trust-remote-code"
   tool_call_parser:     "--tool-call-parser"
   reasoning_parser:     "--reasoning-parser"
-  # Piecewise CUDA graph is enabled by default in v0.5.10 and torch.compiles
-  # the forward, which makes Dynamo choke on flashinfer's FP4 JIT path
-  # (modelopt_quant.py:1482) -- every NVFP4 load crashes. The router and
-  # prober always pass this to run FP4 eagerly. Drop when a future SGLang
-  # image can trace the FP4 path.
-  disable_piecewise_cuda_graph: "--disable-piecewise-cuda-graph"
+  # disable_piecewise_cuda_graph was pinned here while the router and
+  # prober passed --disable-piecewise-cuda-graph on every SGLang launch.
+  # v0.5.10's piecewise prefill graph torch.compiled the forward and
+  # Dynamo could not trace flashinfer's FP4 JIT path
+  # (modelopt_quant.py:1482), so every NVFP4 load crashed. v0.5.16
+  # replaced it with the breakable prefill graph, which does not take
+  # that path; NVFP4 now loads with no workaround (measured on this
+  # fleet). Neither caller emits the flag any more, so pinning it would
+  # assert a name nothing depends on.
   # Multi-token-prediction launch flags (pinned for forward-compat;
   # the probe driver doesn't exercise them today since SGLang's NVFP4
   # path is broken upstream -- see scripts/model-families.yaml:60-72).

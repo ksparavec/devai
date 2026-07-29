@@ -1499,16 +1499,19 @@ func sglangEntrypoint(modelName string, lc launchConfig) []string {
 		"--mem-fraction-static", fmt.Sprintf("%.4f", lc.MemFraction),
 		"--context-length", fmt.Sprintf("%d", lc.MaxContext),
 		"--trust-remote-code",
-		// SGLang v0.5.10 enables piecewise CUDA graph by default, which
-		// torch.compiles the model forward. Dynamo then cannot trace
-		// flashinfer's FP4 JIT-compile path (modelopt_quant.py:1482 ->
-		// fp4_quantize -> a subprocess/threading.Lock call), so every NVFP4
-		// load crashes with a Dynamo graph break during warmup_compile.
-		// Disabling piecewise capture runs the FP4 quantize eagerly (it JIT-
-		// compiles fine outside a compile context) -- the engine's own
-		// documented workaround. Drop this when a future SGLang image can
-		// trace the FP4 path. Pinned in deploy/backend-flags.yaml.
-		"--disable-piecewise-cuda-graph",
+		// NOTE: --disable-piecewise-cuda-graph was passed unconditionally
+		// here until the v0.5.16 bump. On v0.5.10 the piecewise prefill
+		// CUDA graph torch.compiled the forward and Dynamo could not trace
+		// flashinfer's FP4 JIT path (modelopt_quant.py:1482), so every
+		// NVFP4 load crashed during warmup. v0.5.16 replaced piecewise
+		// prefill with the BREAKABLE graph
+		// (cuda_graph_config.prefill.backend='breakable'), which does not
+		// go through that trace at all. Re-measured on this fleet:
+		// Qwen3.5-9B-NVFP4 loads WITHOUT the flag in 46s, CUDA graphs
+		// enabled, and generates coherently. The flag still exists on the
+		// image, so re-adding it is a one-line change if a future bump
+		// regresses -- but carrying a workaround for a fixed bug costs
+		// every launch the graph capture it disables.
 	}
 	// Per-model KV dtype from the probe cache. SGLang's legacy cells ran
 	// the engine default (no flag), decoded as "" — emit nothing so those
@@ -1719,7 +1722,7 @@ func buildArbiter() *arbiter {
 			ListenPort:    envInt("SGLANG_PORT", 11436),
 			BackendURL:    sglangURL,
 			ContainerName: env("SGLANG_CONTAINER", "devai-sglang"),
-			Image:         env("SGLANG_IMAGE", "docker.io/lmsysorg/sglang:v0.5.10.post1-cu130"),
+			Image:         env("SGLANG_IMAGE", "docker.io/lmsysorg/sglang:v0.5.16-cu130"),
 			ModelsDir:     env("SGLANG_MODELS_DIR", "/var/cache/devai/sglang"),
 			Network:       network,
 			HealthPath:    "/health",
@@ -3578,6 +3581,13 @@ func (a *arbiter) makeRequestHandler(backendName string) http.HandlerFunc {
 			var ctxOverride int
 			var reasoningOverride string
 			cleanName, ctxOverride, mtpOverride, reasoningOverride = peelControlSuffixes(parsed.Model)
+			// Map a `claude-` advertising alias back to the real model.
+			// Applied unconditionally, NOT gated on User-Agent: a client
+			// can persist the alias in its config and replay it later from
+			// anywhere. resolveClaudeAlias only rewrites when the stripped
+			// form names a model this backend actually has, so a model
+			// genuinely called `claude-*` is never mangled.
+			cleanName = resolveClaudeAlias(cleanName, bs.modelNames)
 			// Defense-in-depth: refuse path-traversal segments before the
 			// name flows into vllmEntrypoint/sglangEntrypoint where it is
 			// concatenated as `--model /models/<name>`. The /models bind
@@ -4116,7 +4126,12 @@ func (a *arbiter) applyVLLMPolicy(path, modelName, policy string, body []byte) [
 }
 
 // applySGLangPolicy does NOT mirror applyVLLMPolicy's wire shape, and the
-// difference is load-bearing. Verified directly against the pinned image
+// difference is load-bearing. Re-verified on the wire against
+// `lmsysorg/sglang:v0.5.16-cu130` (gpt-oss-20b, /v1/chat/completions,
+// reasoning chars): baseline 802, extra_body.chat_template_kwargs 1502
+// (i.e. NO effect -- still silently discarded), top-level
+// chat_template_kwargs 518, top-level reasoning_effort="none" 14. The
+// shapes below still hold. Originally derived against
 // `lmsysorg/sglang:v0.5.10.post1-cu130` by inspecting
 // `sglang.srt.entrypoints.openai.protocol.ChatCompletionRequest`:
 //
@@ -4741,6 +4756,18 @@ func (a *arbiter) makeModelsHandler(backendName string) http.HandlerFunc {
 			if !seen[name] {
 				all = append(all, model{ID: name, Object: "model", OwnedBy: backendName})
 			}
+		}
+
+		// Claude Code discards every id failing /^(claude|anthropic)/i, so
+		// without an alias it discovers zero models and shows an empty
+		// picker. Gated on User-Agent so every other client's listing is
+		// byte-identical. See claude_compat.go.
+		if isClaudeCodeUA(req.Header.Get("User-Agent")) {
+			for i := range all {
+				all[i].ID = claudeAliasFor(all[i].ID)
+			}
+			log.Printf("info: %s /v1/models: claude-code UA, advertising %d model(s) under the %q alias",
+				backendName, len(all), claudeAliasPrefix)
 		}
 
 		w.Header().Set("Content-Type", "application/json")

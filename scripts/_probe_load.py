@@ -60,11 +60,13 @@ from _contexts import (
     vram_label,
 )
 from _probe_core import (
+    backfill_row_images,
     image_digest_via_cli,
     load_cache,
     now_iso,
     save_cache,
     stamp_image_digest,
+    stamp_row_image,
 )
 from _probe_hf_common import (
     CHAT_TIMEOUT,
@@ -463,7 +465,18 @@ def _detect_serving_failure(
     if request_error:
         return True, f"request_error: {request_error}"
     if isinstance(chat_resp, dict) and chat_resp.get("error"):
-        return True, f"api_error: {str(chat_resp.get('error'))[:200]}"
+        # Include the response BODY, not just the status line. _post_chat
+        # already captures it; reporting only `error` reduced every 4xx to
+        # a bare "HTTP 400: Bad Request", which cannot distinguish "prompt
+        # exceeds the KV pool" (a real serving ceiling, and the verdict
+        # this probe exists to find) from a request the engine rejected on
+        # shape. Both mark serving_ok=false, so the difference is invisible
+        # in the verdict and only recoverable from the reason string.
+        reason = f"api_error: {str(chat_resp.get('error'))[:200]}"
+        body = str(chat_resp.get("body") or "").strip()
+        if body:
+            reason = f"{reason} | body: {body[:300]}"
+        return True, reason
     state = container_state(runtime, container)
     if state not in ("running",):
         return True, f"container_state={state}"
@@ -944,9 +957,12 @@ def run_load_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
     cache = load_cache(args.cache)
     # Phase C: idempotent re-stamp of the image digest (the load pass may run
     # without a fresh fit pass; keep _meta current for the router's drift check).
+    run_image_digest = image_digest_via_cli(args.runtime, args.image)
+    # See the fit prober: legacy rows are attributed to the outgoing digest
+    # before the pointer moves. No-op once every row carries its own stamp.
+    backfill_row_images(cache)
     stamp_image_digest(
-        cache, digest=image_digest_via_cli(args.runtime, args.image),
-        image_ref=args.image)
+        cache, digest=run_image_digest, image_ref=args.image)
     if not args.no_cache_write:
         save_cache(args.cache, cache)
     ledger = _load_ledger()
@@ -1092,6 +1108,7 @@ def run_load_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
                 # served.
                 entry["max_context"] = max_serving
             entry["last_load_probed_at"] = load_rec.get("serving_probed_at")
+            stamp_row_image(entry, run_image_digest)
             # A model that now serves clears a stale prober-owned oom exclusion.
             if _ledger_reason(ledger, name, spec.name) == "oom":
                 _ledger_clear(ledger, name, spec.name)
@@ -1104,6 +1121,7 @@ def run_load_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
             fit_cell.update(probed_cells[lo])
             fit_cell["serving_ok"] = False
             entry["last_load_probed_at"] = now_iso()
+            stamp_row_image(entry, run_image_digest)
             worst = probed_cells[lo]
             kinds = {
                 cell_failure_kind(c)

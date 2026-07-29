@@ -46,7 +46,7 @@ from _probe_load import run_load_probe_pass  # noqa: E402
 
 SGLANG_RESERVE_GB = 3.0  # mirrors gpu-arbiter/main.go memFraction
 DEFAULT_SGLANG_IMAGE = os.environ.get(
-    "SGLANG_IMAGE", "docker.io/lmsysorg/sglang:v0.5.10.post1-cu130"
+    "SGLANG_IMAGE", "docker.io/lmsysorg/sglang:v0.5.16-cu130"
 )
 
 
@@ -65,7 +65,7 @@ def sglang_command_args(
     Parser flags are appended only when the catalog row's
     `parsers.sglang` block supplied a value. Omitting them keeps the
     launch in inline / no-tool mode. Both flag names verified against
-    the v0.5.10.post1-cu130 image — see deploy/backend-flags.yaml.
+    the v0.5.16-cu130 image — see deploy/backend-flags.yaml.
 
     The ``*_parser_plugin`` kwargs are accepted but ignored: SGLang
     registers parsers via Python imports, not file-path args. They're
@@ -73,10 +73,10 @@ def sglang_command_args(
     probe driver can call both backends through the same kwargs shape.
 
     ``speculative_config`` is accepted but **discarded** for SGLang.
-    NVFP4 loading itself is no longer broken: --disable-piecewise-cuda-graph
-    (added to the launch args below) unblocks it -- before that flag every
-    NVFP4 cell crashed a Dynamo graph break at modelopt_quant.py:1482 during
-    piecewise CUDA-graph warmup. But the SGLang MTP / --speculative-* path is
+    NVFP4 loading itself is no longer broken: v0.5.16's breakable prefill
+    CUDA graph replaced the piecewise one whose torch.compile could not
+    trace flashinfer's FP4 JIT path (modelopt_quant.py:1482), so NVFP4
+    loads without any workaround flag. But the SGLang MTP / --speculative-* path is
     not yet validated on this fleet, so emitting it now would only produce
     noise. The kwarg stays in the signature for parity with vllm_command_args.
     To enable SGLang MTP probing later, emit the --speculative-* family
@@ -105,14 +105,13 @@ def sglang_command_args(
         "--mem-fraction-static", f"{host_frac:.4f}",
         "--context-length", str(max_ctx),
         "--trust-remote-code",
-        # SGLang v0.5.10 enables piecewise CUDA graph by default, which
-        # torch.compiles the forward; Dynamo then can't trace flashinfer's
-        # FP4 JIT path (modelopt_quant.py:1482 -> fp4_quantize -> a
-        # subprocess/threading.Lock) and every NVFP4 load crashes with a
-        # graph break. Disabling it runs FP4 eager (JITs fine) -- the
-        # engine's documented workaround. Must match gpu-arbiter
-        # sglangEntrypoint so probe and serve launch identically.
-        "--disable-piecewise-cuda-graph",
+        # NOTE: --disable-piecewise-cuda-graph was emitted here until the
+        # v0.5.16 bump; see gpu-arbiter sglangEntrypoint for the full
+        # rationale. v0.5.16's breakable prefill graph does not go through
+        # the flashinfer FP4 JIT trace that used to crash every NVFP4 load,
+        # measured on this fleet. Dropped from BOTH so probe-time and
+        # serve-time launches stay identical -- a divergence here silently
+        # invalidates every fit verdict.
     ]
     # KV-cache dtype for THIS launch. SGLang's default is auto (no flag,
     # unquantized); a PROBE_KV_CACHE_TYPE=fp8_e5m2/fp8_e4m3 pass measures

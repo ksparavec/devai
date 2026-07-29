@@ -303,6 +303,37 @@ class TestDetectServingFailure(unittest.TestCase):
         self.assertTrue(failed)
         self.assertIn("api_error", reason)
 
+    def test_api_error_includes_the_response_body(self) -> None:
+        """The status line alone cannot explain a 4xx.
+
+        `_post_chat` already captures the body, but only `error` was
+        reported -- so every rejection collapsed to a bare
+        "HTTP 400: Bad Request". That cannot distinguish "prompt exceeds
+        the KV pool" (a real serving ceiling, which is the verdict this
+        probe exists to find) from a request the engine refused on shape.
+        Both set serving_ok=false, so the difference is invisible in the
+        verdict and recoverable only from this string. Observed for real
+        on SGLang v0.5.16 with Gemma-4-26B-A4B-it-NVFP4, which returned
+        400 at every context including 32K.
+        """
+        failed, reason = L._detect_serving_failure(
+            "podman", "c",
+            {"error": "HTTP 400: Bad Request",
+             "body": '{"message":"prompt too long: 30720 > 16384"}'},
+            None, "")
+        self.assertTrue(failed)
+        self.assertIn("api_error", reason)
+        self.assertIn("prompt too long", reason)
+        self.assertIn("16384", reason)
+
+    def test_api_error_without_body_is_unchanged(self) -> None:
+        # Transport-level errors carry no body; the reason must not grow a
+        # dangling "| body:" suffix.
+        failed, reason = L._detect_serving_failure(
+            "podman", "c", {"error": "TimeoutError: timed out"}, None, "")
+        self.assertTrue(failed)
+        self.assertNotIn("body:", reason)
+
     def test_ok_path_when_container_running(self) -> None:
         # Monkeypatch container_state so no podman is required.
         orig = L.container_state

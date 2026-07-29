@@ -160,6 +160,112 @@ def stamp_image_digest(cache: dict, *, digest: str, image_ref: str) -> None:
     meta["current_image_ref"] = image_ref
 
 
+# Per-row engine-image stamp. Same field name the bench cache uses for the
+# same purpose (scripts/bench/_bench_core.py), so an operator reading either
+# cache is answering the question the same way.
+ROW_IMAGE_FIELD = "backend_image_digest"
+
+
+def stamp_row_image(entry: dict, digest: str | None) -> None:
+    """Record which engine image THIS row's verdicts were measured under.
+
+    `_meta.current_image_digest` is cache-WIDE and therefore cannot answer
+    the per-row question. Only models whose weights are still on disk can be
+    re-probed, so a partial re-probe is the normal case: it moves the
+    `_meta` pointer to the new image and leaves every un-reprobed row
+    untouched. Without this stamp those rows are indistinguishable from
+    freshly measured ones and `make probe-check` reports no drift.
+
+    No-op on a falsy digest: an absent stamp honestly reads as "unknown",
+    an empty one would read as a measurement that never happened.
+    """
+    if digest:
+        entry[ROW_IMAGE_FIELD] = digest
+
+
+def backfill_row_images(cache: dict) -> int:
+    """Attribute unstamped rows to the cache's CURRENT `_meta` digest.
+
+    A row carrying no stamp was measured under whatever
+    `_meta.current_image_digest` pointed at when it was written -- and that
+    is still what it points at, right up until the next run overwrites it.
+    Calling this immediately BEFORE stamp_image_digest therefore recovers
+    the correct attribution for every legacy row exactly once, instead of
+    stranding them as permanently "unknown".
+
+    Idempotent: rows that already carry a stamp are left alone, so this is
+    a no-op on every subsequent run. Returns the number of rows backfilled.
+    """
+    meta = cache.get("_meta")
+    if not isinstance(meta, dict):
+        return 0
+    digest = meta.get("current_image_digest")
+    if not digest:
+        return 0
+    n = 0
+    for name, entry in cache.items():
+        if name.startswith("_") or not isinstance(entry, dict):
+            continue
+        if not entry.get(ROW_IMAGE_FIELD):
+            entry[ROW_IMAGE_FIELD] = digest
+            n += 1
+    return n
+
+
+def row_image_is_stale(
+    entry: dict, run_digest: str | None, *, writable: bool = True
+) -> bool:
+    """True when this row's verdicts were measured on a DIFFERENT engine.
+
+    This is an auto-invalidation trigger for the probers, unlike
+    launch-fingerprint drift which is deliberately report-only. The
+    difference is precision: a fingerprint is per-(model, launch shape)
+    and the prober would have to rebuild each row's full argv to know
+    what today's launch hashes to, so a near-miss turns a routine probe
+    into an unrequested fleet-wide re-probe. The image digest is ONE
+    value, known exactly for the current run, so the comparison is exact.
+
+    Returns False when either side is unknown (nothing to compare) or
+    when the caller cannot persist a result anyway (`writable=False`,
+    i.e. --no-cache-write): invalidating a cell we cannot rewrite would
+    just re-probe it on every dry run.
+    """
+    if not writable:
+        return False
+    stamp = entry.get(ROW_IMAGE_FIELD)
+    if not stamp or not run_digest:
+        return False
+    return stamp != run_digest
+
+
+def image_stamp_survey(
+    cache: dict, current_digest: str | None
+) -> dict[str, list[str]]:
+    """Group model rows by the engine image their verdicts were measured under.
+
+    Buckets: "current" (stamp matches `current_digest`), "stale" (stamp
+    differs), "unstamped" (no stamp -- predates stamping, or the image
+    inspect failed).
+
+    With no `current_digest` every row lands in "unstamped": without a
+    baseline nothing can be called stale. Guessing would either force a
+    needless full re-probe or hide real drift, and bench-sync's classify()
+    already makes exactly this call for the same reason.
+    """
+    out: dict[str, list[str]] = {"current": [], "stale": [], "unstamped": []}
+    for name, entry in cache.items():
+        if name.startswith("_") or not isinstance(entry, dict):
+            continue
+        stamp = entry.get(ROW_IMAGE_FIELD)
+        if not current_digest or not stamp:
+            out["unstamped"].append(name)
+        elif stamp == current_digest:
+            out["current"].append(name)
+        else:
+            out["stale"].append(name)
+    return out
+
+
 # ── Alias selection ──────────────────────────────────────────────────────────
 
 def canonical_alias(aliases: list[str]) -> str:

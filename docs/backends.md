@@ -143,6 +143,111 @@ backends -- asking a 65K-ceiling model for 256K just asks it for 65K.
 readers; see
 [docs/mcp-model-status.md](mcp-model-status.md#list_fitting_models).
 
+### vLLM vs SGLang -- measured, 2026-07-29
+
+Both backends serve the same NVFP4 checkpoints, so "which one" is an
+empirical question. Measured on the reference 24 GiB RTX PRO 4000
+Blackwell after the SGLang v0.5.10.post1 -> v0.5.16 bump. SGLang is
+KEPT; this section records what the numbers actually say so the next
+person does not have to re-derive them.
+
+**Quality: no consistent difference.** 18 paired McNemar tests across
+gsm8k / humaneval / humaneval+ / mmlu_pro / gpqa / tools_use. Exactly one
+reached p<0.05, which is what 18 tests at alpha=0.05 produce by chance
+(~0.9 expected false positives); Bonferroni-corrected alpha is 0.0028 and
+nothing approaches it. Directions are inconsistent -- Ornith scores worse
+on SGLang, Qwen3.5 better, gpt-oss a wash. At n=50, HumanEval cannot
+resolve gaps below ~0.15: the SAME model on the SAME backend moved 0.86
+-> 0.74 across the engine bump alone.
+
+**Single-stream throughput: tie.** gpt-oss-20b at identical 131072 ctx:
+vLLM 135.0 vs SGLang 134.0 tok/s. (The ~10% SGLang deficit visible in
+older rows was a v0.5.10 property and is gone -- those rows were
+`stale_image`, which is precisely what the per-row stamps below exist to
+flag.)
+
+**Context: vLLM never worse, better on 4 of 10.** Ornith and Qwen3.5
+serve 262144 on vLLM but 196608 on SGLang; Gemma-4-26B-A4B-it serves
+262144 on vLLM and is unserveable on SGLang. Cause is KV-pool size
+(vLLM ~456K tokens vs SGLang ~150-173K), not architecture.
+
+**Prefix reuse: vLLM wins both arms**, including the concurrent case
+RadixAttention is built for. `make bench-concurrency`, gpt-oss-20b at
+131072:
+
+| concurrency | vLLM shared | disjoint | gain | SGLang shared | disjoint | gain |
+|---|---|---|---|---|---|---|
+| 1  | 309 ms | 266 ms  | 0.86x | 1310 ms | 1315 ms  | 1.00x |
+| 4  | 281 ms | 920 ms  | 3.27x | 1397 ms | 2132 ms  | 1.53x |
+| 16 | 314 ms | 2655 ms | 8.45x | 1719 ms | 5464 ms  | 3.18x |
+| 32 | 355 ms | 4477 ms | 12.6x | 1817 ms | 10010 ms | 5.51x |
+
+vLLM's shared-prefix TTFT is nearly flat across the sweep (309 -> 355 ms)
+while SGLang's climbs 39%, and vLLM leads the disjoint arm too, so this
+is not a caching artefact. Sequential multi-turn (`MODE=multiturn`) says
+the same: TTFT slope 0.824 ms per 1K tokens of history on vLLM vs 4.732
+on SGLang, over 8 turns growing to ~33K tokens.
+
+**SGLang carries a ~1.3 s fixed TTFT overhead** -- constant across
+history length and model size, reproduced independently by the leak task
+(~1040 ms warm) and the multi-turn arm (1315 ms at turn 1). Cause not
+identified. Irrelevant for a single long reasoning turn (minutes of
+decode); it accumulates across the many short turns of an agent session.
+
+Caveat: aggregate tok/s under concurrency is still UNMEASURED. The first
+sweep read `completion_tokens`, which only populates from a `usage` block
+the engine omits unless `stream_options.include_usage` is set, so every
+cell reported 0.00. Fixed to use `effective_tokens` (as
+bench_latency_leak already did) but not re-run.
+
+### Per-row engine-image stamps
+
+Every HF probe row carries `backend_image_digest`: the engine image its
+verdicts were measured under. The cache-wide `_meta.current_image_digest`
+cannot answer that question, because only models whose weights are still
+on disk can be re-probed -- so a PARTIAL re-probe is the normal case, and
+it moves the `_meta` pointer while leaving every un-reprobed row
+untouched.
+
+This is not theoretical. On the 2026-07-29 SGLang v0.5.10.post1 ->
+v0.5.16 bump, 5 of 21 rows had weights. Without per-row stamps `_meta`
+would have read v0.5.16 while 16 rows still held v0.5.10 measurements,
+and `make probe-check` -- which compared only `_meta` against the running
+image -- would have reported "No drift detected."
+
+Three pieces:
+
+- **Stamping** (`_probe_core.stamp_row_image`) -- written whenever a
+  prober rewrites a row, by both the fit and load passes.
+- **Backfill** (`backfill_row_images`) -- run immediately BEFORE the
+  `_meta` pointer moves, so legacy rows are attributed to the digest they
+  were actually measured under rather than stranded as "unknown".
+  Idempotent; a no-op once every row carries its own stamp.
+- **Invalidation** (`row_image_is_stale`) -- the probers treat a row
+  stamped with a different digest as uncached and re-probe it, including
+  re-evaluating a cached `unsupported_arch`. That last part matters: an
+  engine bump is exactly what overturns an arch verdict, and on the
+  v0.5.16 bump the first `make probe-sglang` ran **zero** probes until
+  this existed.
+
+Image drift auto-invalidates; launch-fingerprint drift deliberately does
+not (it is reported by `make probe-check` instead). The difference is
+precision -- a fingerprint is per-(model, launch shape) and the prober
+would have to rebuild each row's full argv to know what today's launch
+hashes to, so a near-miss would turn a routine probe into an unrequested
+fleet-wide re-probe. The image digest is one value, known exactly for the
+current run, so the comparison cannot produce a false positive.
+
+`make probe-check` reports rows as `current` / `stale` / `unstamped`, and
+**stale fails the gate** -- unlike an unstamped fingerprint, a mismatched
+digest is positive evidence that the verdict came from another engine.
+
+The exclusion ledger has no equivalent yet: an `unsupported_arch` or
+`manual` verdict recorded against an old engine stays in force until an
+operator clears it by hand (`make model-status CLEAR=<name>::<backend>`).
+Both Gemma-4-26B-A4B-it-NVFP4 and Ornith-1.0-9B-NVFP4 needed exactly that
+on the v0.5.16 bump.
+
 ### Exclusion ledger (`deploy/.model-status.json`)
 
 A host-local overlay (gitignored, schema v1) recording models the host

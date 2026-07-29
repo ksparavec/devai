@@ -84,19 +84,52 @@
 #
 # To add a family: add a block below, then run `make catalog-regen`.
 #
-# ── SGLang NVFP4 status (updated 2026-07-09) ─────────────────────────────
-# Image `lmsysorg/sglang:v0.5.10.post1-cu130` DOES serve NVFP4 now. The
-# earlier "every NVFP4 cell fails at modelopt_quant.py:1482 in fp4_quantize"
-# was a symptom of the piecewise CUDA-graph default: it torch.compiles the
-# forward, and Dynamo cannot trace flashinfer's FP4 JIT-compile path (a
-# subprocess/threading.Lock call), so warmup crashes. The router + prober
-# now always pass `--disable-piecewise-cuda-graph`, which runs FP4 eagerly.
-# With it, 8 models serve on SGLang (Qwen3-8B/14B, Llama-3.1-8B,
-# Nemotron-Nano-9B, gpt-oss-20b, DeepSeek distills, Qwen3-14B-FP8).
-# Genuine arch/quant gaps still fail on SGLang (Gemma-4 family, Qwen3.5/3.6
-# MoE, diffusiongemma, Qwen3-Coder-30B, Nemotron-3-Nano-30B) -- those serve
-# on vLLM, and the probe cache marks them error/unsupported so the picker
-# hides them. Drop the flag when a future SGLang image traces the FP4 path.
+# ── SGLang NVFP4 status (updated 2026-07-29, image v0.5.16-cu130) ────────
+# NVFP4 serves on SGLang with NO workaround flag. History, because the
+# reasoning changed twice:
+#   1. "every NVFP4 cell fails at modelopt_quant.py:1482 in fp4_quantize"
+#      was a symptom of v0.5.10's PIECEWISE CUDA-graph default: it
+#      torch.compiles the forward and Dynamo cannot trace flashinfer's FP4
+#      JIT path (a subprocess/threading.Lock call), so warmup crashed.
+#   2. The router + prober worked around it with
+#      `--disable-piecewise-cuda-graph`.
+#   3. v0.5.16 replaced piecewise prefill with the BREAKABLE graph
+#      (cuda_graph_config.prefill.backend='breakable'), which never takes
+#      that path. The flag was REMOVED from both callers on 2026-07-29 --
+#      measured: Qwen3.5-9B-NVFP4 loads without it in 46s, CUDA graphs on.
+#
+# What the v0.5.16 bump changed on this fleet (5 models have SGLang weights;
+# the rest cannot be probed here at all):
+#   ~ Gemma-4-26B-A4B-it-NVFP4  unsupported_arch -> LOADS (fits 256K) but
+#     serving_ok=false at every tier, so it is not advertised and stays on
+#     vLLM. Needs the recovery-flags entry (--moe-runner-backend
+#     flashinfer_cutlass, which the engine's own error names, plus
+#     --mem-fraction-static 0.80 and expandable_segments) -- the first
+#     sglang-scoped entry in that registry. The serving ceiling is the KV
+#     pool, not the flags: the engine allocates only 8312 tokens and
+#     rejects anything longer with "Input length (23453 tokens) exceeds
+#     the maximum allowed length (10384 tokens)". ~340 KB/token means 32K
+#     would need ~11 GiB of KV atop ~16 GiB of weights -- past 24 GiB at
+#     any mem fraction. A textbook fit-vs-serve gap: the fit probe says
+#     256K, the load probe says no.
+#   + Ornith-1.0-9B-NVFP4       serving_ok=false -> serves 192K, needle 1.0.
+#     The v0.5.10 device-side-assert crash loop (72 container recreates in
+#     one day, degenerate all-'!' output) is GONE.
+#   = Qwen3.5-9B-NVFP4          serves 192K, needle 1.0 (unchanged; the fit
+#                               ceiling rose 192K -> 256K but serving did not)
+#   = gpt-oss-20b               serves 128K, needle 1.0 (unchanged)
+#   - NVIDIA-Nemotron-Nano-9B-v2-NVFP4  REGRESSED. v0.5.16's
+#     ReasonerGrammarBackend refuses to init: "think_end_token '</think>'
+#     must encode to exactly one token for constrained reasoning"
+#     (reasoner_grammar_backend.py:246), triggered by the
+#     --reasoning-parser nemotron_3 we pass. Blast radius is limited to
+#     that parser -- Qwen3.5-9B uses --reasoning-parser qwen3 and loads
+#     fine. Costs nothing operationally: already bench_dropped on SGLang
+#     (HumanEval 0.64 vs 0.80 on vLLM for the same checkpoint).
+#
+# Models with no SGLang weights on this host are neither probed nor
+# advertised; their cached error/unsupported rows are historical and are
+# now stamped with the image digest they were measured under.
 
 families:
   - name: gemma4

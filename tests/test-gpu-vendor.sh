@@ -64,7 +64,7 @@ echo ">>> flipping back to nvidia"
 rendered=$(render)
 echo "${rendered}" | grep -q 'nvidia.com/gpu=all' || { echo "FAIL: nvidia.com/gpu=all not in rendered config" >&2; exit 1; }
 echo "${rendered}" | grep -q 'vllm-openai:v0.22.1-x86_64-cu129-ubuntu2404' || { echo "FAIL: original vLLM image not restored" >&2; exit 1; }
-echo "${rendered}" | grep -q 'sglang:v0.5.10.post1-cu130' || { echo "FAIL: original SGLang image not restored" >&2; exit 1; }
+echo "${rendered}" | grep -q 'sglang:v0.5.16-cu130' || { echo "FAIL: original SGLang image not restored" >&2; exit 1; }
 if echo "${rendered}" | grep -q 'amd.com/gpu=all'; then
     echo "FAIL: amd.com/gpu=all still present after flipping back to nvidia" >&2
     exit 1

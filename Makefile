@@ -57,7 +57,7 @@ export GPU_MEMORY_GB MAX_CONTEXT_LEN
 # deploy/backend-flags.yaml.
 VLLM_IMAGE ?= docker.io/vllm/vllm-openai:latest-x86_64-cu129-ubuntu2404
 export VLLM_IMAGE
-SGLANG_IMAGE ?= docker.io/lmsysorg/sglang:v0.5.10.post1-cu130
+SGLANG_IMAGE ?= docker.io/lmsysorg/sglang:v0.5.16-cu130
 export SGLANG_IMAGE
 # Exported for the same reason: the probers launch their own containers
 # on the host and must use the same CDI device string the compose
@@ -1784,6 +1784,28 @@ bench-sync: ## Closed loop: bench-plan, then bench the new/incomplete/stale rows
 	    $(if $(BENCH_TASKS),--tasks $(BENCH_TASKS),) \
 	    $(if $(BENCH_MAX_TARGETS),--max-targets $(BENCH_MAX_TARGETS),) \
 	    $(if $(RECORD_DROPS),--record-drops,)
+
+bench-concurrency: ## Sweep concurrency x prefix-sharing for ONE model (MODEL=, PORT=11435|11436)
+	@# Deliberately NOT part of `make bench`: this answers a backend
+	@# selection question (does prefix caching pay off here?), not a
+	@# per-model leaderboard question, and it is GPU-exclusive.
+	@# Requires the model to be the one already resident, or it pays a
+	@# cold start -- the warmup request absorbs that either way.
+	@if [ -z "$(MODEL)" ]; then \
+	  echo "usage: make bench-concurrency MODEL=<served-name> [PORT=11436] [MODE=sweep|multiturn] [LEVELS=1,2,4,8,16,32] [TURNS=8]"; \
+	  echo "  e.g. make bench-concurrency MODEL=gpt-oss-20b@131072 PORT=11436"; exit 2; fi
+	$(CONTAINER_RUNTIME) run --rm \
+		--network $(DEVAI_NETWORK) \
+		-v $(CURDIR)/scripts:/scripts:ro \
+		--entrypoint python3 \
+		$(IMAGE_NAME_GPU) \
+		/scripts/bench/bench_concurrency.py \
+			--model '$(MODEL)' \
+			--router-url http://devai-router:$(or $(PORT),11436) \
+			--mode $(or $(MODE),sweep) \
+			$(if $(LEVELS),--levels $(LEVELS),) \
+			$(if $(TURNS),--turns $(TURNS),) \
+			$(if $(PREFIX_TOKENS),--prefix-tokens $(PREFIX_TOKENS),)
 
 bench-report: ## Print a Markdown leaderboard from .bench-cache.json
 	@$(CONTAINER_RUNTIME) run --rm \

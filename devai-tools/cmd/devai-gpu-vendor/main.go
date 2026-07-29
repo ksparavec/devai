@@ -25,7 +25,7 @@ var vendorValues = map[string]map[string]string{
 		"DEVAI_GPU_VENDOR": "nvidia",
 		"DEVAI_GPU_DEVICE": "nvidia.com/gpu=all",
 		"VLLM_IMAGE":       "docker.io/vllm/vllm-openai:v0.22.1-x86_64-cu129-ubuntu2404",
-		"SGLANG_IMAGE":     "docker.io/lmsysorg/sglang:v0.5.10.post1-cu130",
+		"SGLANG_IMAGE":     "docker.io/lmsysorg/sglang:v0.5.16-cu130",
 	},
 	"amd": {
 		"DEVAI_GPU_VENDOR": "amd",
