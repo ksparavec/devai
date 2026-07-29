@@ -2720,6 +2720,7 @@ def _artefact_sha(m: dict) -> str | None:
 def _build_candidates(
     models: list[dict],
     bench_records: dict[tuple[str, str, int], dict] | None = None,
+    dedup: bool = True,
 ) -> tuple[list[dict], dict[str, int]]:
     """Decorate every fitting model with picker metadata and return the
     list once. Used by both ``_build_menu`` (sort/render) and the
@@ -2795,7 +2796,11 @@ def _build_candidates(
     # HF dedup -- vLLM preferred over SGLang for the same name. Ollama
     # tag names never collide with HF directory names so Ollama rows
     # pass through unchanged.
-    candidates = _dedup_hf_rows(candidates)
+    # Agent model-list injection passes dedup=False: the MENU shows one
+    # row per name, but each backend is its own provider in an agent's
+    # config, so a name serving on both vLLM and SGLang belongs to both.
+    if dedup:
+        candidates = _dedup_hf_rows(candidates)
     return candidates, hidden
 
 
@@ -2949,19 +2954,62 @@ def _format_agent_row(agent: tuple[str, str, str]) -> str:
 
 # ── Command builder ──────────────────────────────────────────────────────────
 
-def _ensure_opencode_model(backend: str, name: str) -> None:
-    """Register the chosen model in OpenCode's config so it passes validation.
+def _vetted_ids_by_backend(rows: list[dict]) -> dict[str, list[str]]:
+    """Map each backend to the router-facing model ids it currently serves.
+
+    Ids must be exactly what the router's allowlist accepts, or the agent
+    gets a 404 on a model its own UI offered:
+
+      - vLLM / SGLang: ``<name>@<ctx>``. The ctx drives ``--max-model-len``
+        / ``--context-length`` at container recreate, so it is part of the
+        identity, not decoration.
+      - Ollama: the BARE name. Ollama allocates KV per request, and the
+        router deliberately refuses to move an Ollama tier for a bare name
+        -- only an explicit ``@<ctx>`` pin does (see docs/router.md,
+        "Ollama: `@<ctx>` is what pins a tier"). Declaring per-ctx ids in a
+        model list would invite exactly the tier thrash that rule exists to
+        prevent. The mixed-KV pin stays an interactive per-session choice.
+
+    Callers pass the PRE-dedup candidate list: the picker menu collapses a
+    name that fits on both vLLM and SGLang into one row, but each backend
+    is its own provider here, so both belong.
+    """
+    out: dict[str, list[str]] = {b: [] for b in _BACKENDS}
+    for row in rows:
+        backend = str(row.get("backend") or "")
+        name = _strip_latest(str(row.get("name") or ""))
+        if not name or backend not in out:
+            continue
+        ctx = int(row.get("_picker_context") or 0)
+        ident = name if backend == "ollama" else f"{name}@{ctx}"
+        if ident not in out[backend]:
+            out[backend].append(ident)
+    return out
+
+
+def _write_opencode_providers(
+    vetted: dict[str, list[str]], backend: str, chosen: str,
+) -> None:
+    """Declare the vetted model list in OpenCode's config, replacing ours.
 
     OpenCode validates `provider/model` against the provider's declared
     `models` map -- an undeclared id fails at launch with "model is not
-    valid". The picker chooses models dynamically, so the static seeded
-    config cannot list them ahead of time. Merge the chosen model into
-    ~/.config/opencode/opencode.json under router-<backend> right before
-    launch. Idempotent; declared models accumulate harmlessly across picks
-    (they simply show up in `opencode models`).
+    valid" -- and the picker chooses dynamically, so the seeded config
+    cannot list them ahead of time.
+
+    This REPLACES the `router-*` providers rather than merging into them.
+    The previous version merged, and the config lives on the persistent
+    HOME_VOLUME, so a model later dropped by a bench verdict, excluded in
+    the ledger, or deleted from disk stayed selectable in `opencode models`
+    forever -- the "never advertise anything unvetted" rule broken one
+    layer above the router. Anything the operator wrote themselves (their
+    own providers, unrelated keys) is preserved: we own the `router-`
+    prefix and nothing else.
+
+    `chosen` is always declared even if absent from `vetted`, so a
+    cache/pick disagreement degrades to a working session instead of a
+    hard launch failure. The router still applies its own allowlist.
     """
-    _, _, port = _BACKENDS[backend]
-    provider_id = f"router-{backend}"
     cfg_home = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
     cfg_path = Path(cfg_home) / "opencode" / "opencode.json"
 
@@ -2973,21 +3021,155 @@ def _ensure_opencode_model(backend: str, name: str) -> None:
         cfg = {}
 
     cfg.setdefault("$schema", "https://opencode.ai/config.json")
-    providers = cfg.setdefault("provider", {})
-    prov = providers.get(provider_id)
-    if not isinstance(prov, dict):
-        prov = {
+    providers = cfg.get("provider")
+    if not isinstance(providers, dict):
+        providers = {}
+    # Drop only our own providers; the rebuild below re-adds them.
+    providers = {k: v for k, v in providers.items() if not k.startswith("router-")}
+
+    for bname, (_label, _url, port) in _BACKENDS.items():
+        ids = list(vetted.get(bname) or [])
+        if bname == backend and chosen and chosen not in ids:
+            ids.append(chosen)
+        providers[f"router-{bname}"] = {
             "npm": "@ai-sdk/openai-compatible",
-            "name": f"{backend} via DevAI router",
-            "options": {"baseURL": f"http://{_ROUTER}:{port}/v1", "apiKey": "local"},
+            "name": f"{bname} via DevAI router",
+            "options": {
+                "baseURL": f"http://{_ROUTER}:{port}/v1",
+                "apiKey": "local",
+            },
+            "models": {i: {"name": i} for i in ids},
         }
-        providers[provider_id] = prov
-    models = prov.setdefault("models", {})
-    if name not in models:
-        models[name] = {"name": name}
+    cfg["provider"] = providers
 
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
     cfg_path.write_text(json.dumps(cfg, indent=2) + "\n")
+
+
+# Fallback context when a vetted id carries no `@<ctx>` (Ollama rides
+# bare by design). 32K is the smallest standard tier, so it under-
+# promises rather than letting aider pack a prompt the model rejects.
+_DEFAULT_AIDER_CTX = 32768
+# Aider needs SOME output ceiling; litellm entries all carry one.
+_AIDER_MAX_OUTPUT_TOKENS = 8192
+
+
+def _aider_model_id(backend: str, ident: str) -> str:
+    """LiteLLM-qualified id for one vetted model.
+
+    Ollama keeps litellm's `ollama_chat/` provider and is NOT folded into
+    `openai/`. That is functional, not cosmetic: the router injects
+    `options.num_ctx` on Ollama's native `/api/chat` only -- upstream
+    Ollama ignores num_ctx on its `/v1` compat surface (see CLAUDE.md).
+    Routing Ollama rows through `openai/` would silently drop per-session
+    context control for every Ollama model in aider.
+    """
+    return f"{'ollama_chat' if backend == 'ollama' else 'openai'}/{ident}"
+
+
+def _write_aider_model_files(
+    vetted: dict[str, list[str]], backend: str, chosen: str,
+) -> tuple[str, str]:
+    """Declare every vetted model to aider. Returns (metadata, settings) paths.
+
+    Aider took a single `--model` plus a GLOBAL `--openai-api-base`, so a
+    session was pinned to one router port -- i.e. one backend -- and could
+    not switch models at all. Per-model `extra_params.api_base` in a
+    settings file lifts both limits at once.
+
+    Both files are REWRITTEN each launch so a model that drops out of the
+    vetted set stops being offered, matching the OpenCode writer.
+
+    Written as JSON. The settings file is `.yml` because that is what aider
+    calls it, but `register_models` parses with `yaml.safe_load`, JSON is a
+    subset of YAML, and model names like `qwen3.6:27b-q4_K_M` carry colons
+    that are genuinely unsafe unquoted in bare YAML -- so JSON is both
+    valid and safer here.
+    """
+    cfg_dir = Path(os.path.expanduser("~/.devai/aider"))
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    meta_path = cfg_dir / "model-metadata.json"
+    settings_path = cfg_dir / "model-settings.yml"
+
+    def _ctx_of(ident: str) -> int:
+        if "@" not in ident:
+            return 0
+        try:
+            return int(ident.rsplit("@", 1)[1])
+        except ValueError:
+            return 0
+
+    # Unlike OpenCode, aider has no provider namespace to hang a backend
+    # off: the model NAME is the identity, so a model served by both vLLM
+    # and SGLang collapses to one `openai/<name>@<ctx>` entry and whichever
+    # is written last silently wins the api_base. Resolve it explicitly,
+    # the same way the picker menu already does (vLLM preferred), with one
+    # exception: the model the user actually picked is declared against the
+    # backend they picked it on, so an SGLang choice is not quietly served
+    # by vLLM.
+    seen: set[str] = set()
+    pairs: list[tuple[str, str, int]] = []       # (backend, ident, ctx)
+    if chosen:
+        seen.add(_aider_model_id(backend, chosen))
+        pairs.append((backend, chosen, _ctx_of(chosen)))
+    for bname in _BACKENDS:
+        for ident in vetted.get(bname) or []:
+            mid = _aider_model_id(bname, ident)
+            if mid in seen:
+                continue
+            seen.add(mid)
+            pairs.append((bname, ident, _ctx_of(ident)))
+
+    metadata: dict[str, dict] = {}
+    settings: list[dict] = []
+    for bname, ident, ctx in pairs:
+        mid = _aider_model_id(bname, ident)
+        _, _, port = _BACKENDS[bname]
+        metadata[mid] = {
+            "max_input_tokens": ctx or _DEFAULT_AIDER_CTX,
+            "max_output_tokens": _AIDER_MAX_OUTPUT_TOKENS,
+            # Local inference is free. A nonzero cost makes aider report
+            # spend for tokens nobody is billed for.
+            "input_cost_per_token": 0,
+            "output_cost_per_token": 0,
+            "litellm_provider": "ollama" if bname == "ollama" else "openai",
+            "mode": "chat",
+        }
+        settings.append({
+            "name": mid,
+            # Only real ModelSettings dataclass fields may appear here --
+            # register_models does ModelSettings(**d), so an unknown key is
+            # a TypeError at aider startup.
+            "extra_params": {
+                # Ollama's base is the ROOT, not /v1: litellm's ollama_chat
+                # transformation builds `f"{api_base}/api/chat"`
+                # (litellm/llms/ollama/chat/transformation.py:240), so a /v1
+                # here yields /v1/api/chat and every Ollama call 404s.
+                "api_base": (f"http://{_ROUTER}:{port}" if bname == "ollama"
+                             else f"http://{_ROUTER}:{port}/v1"),
+                "api_key": "local",
+            },
+        })
+
+    meta_path.write_text(json.dumps(metadata, indent=2) + "\n")
+    settings_path.write_text(json.dumps(settings, indent=2) + "\n")
+    return str(meta_path), str(settings_path)
+
+
+def _vetted_catalog() -> dict[str, list[str]]:
+    """Best-effort scan of every model the picker would offer, per backend.
+
+    Fails SOFT: an agent launch must not die because a cache is missing or
+    malformed. An empty result degrades to declaring just the chosen model,
+    which is exactly the old behaviour.
+    """
+    try:
+        rows, _hidden = _build_candidates(
+            _discover_models(), _load_bench_records(_BENCH_CACHE_PATHS),
+            dedup=False)
+        return _vetted_ids_by_backend(rows)
+    except Exception:                                          # noqa: BLE001
+        return {}
 
 
 def _build(agent_id: str, model_name: str, backend: str) -> list[str]:
@@ -3015,15 +3197,35 @@ def _build(agent_id: str, model_name: str, backend: str) -> list[str]:
         # model so all calls hit the already-loaded backend.
         os.environ["ANTHROPIC_SMALL_FAST_MODEL"] = name
         os.environ["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = name
+        # Let Claude Code populate its own model picker from the router.
+        # Both flags are required and both were read out of the shipped
+        # binary (claude-code/2.1.220), then confirmed on the wire: with
+        # them set it issues `GET <base>/v1/models?limit=1000`; without
+        # either it never asks, so `/model` lists nothing but the one
+        # pinned below. The router answers that request with `claude-`
+        # aliases when it sees Claude Code's User-Agent, because Claude
+        # Code discards every id failing /^(claude|anthropic)/i -- which
+        # is all of ours. See gpu-arbiter/claude_compat.go.
+        os.environ.setdefault("CLAUDE_CODE_USE_GATEWAY", "1")
+        os.environ.setdefault("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", "1")
         return ["claude", "--model", name]
 
     if agent_id == "aider":
+        # Declare every vetted model with its OWN backend's api_base rather
+        # than pinning the session to one via the global --openai-api-base.
+        # That flag is deliberately not passed: it would re-pin the whole
+        # session to a single router port, which is the limitation being
+        # removed here.
+        meta_file, settings_file = _write_aider_model_files(
+            _vetted_catalog(), backend, name)
         if backend == "ollama":
-            return ["aider", "--model", f"ollama_chat/{name}"]
+            # litellm's ollama provider reads this for its native /api/chat
+            # calls; the per-model api_base covers the rest.
+            os.environ.setdefault("OLLAMA_API_BASE", base)
         return [
-            "aider", "--model", f"openai/{name}",
-            "--openai-api-base", f"{base}/v1",
-            "--openai-api-key", "local",
+            "aider", "--model", _aider_model_id(backend, name),
+            "--model-metadata-file", meta_file,
+            "--model-settings-file", settings_file,
         ]
 
     if agent_id == "codex":
@@ -3046,8 +3248,10 @@ def _build(agent_id: str, model_name: str, backend: str) -> list[str]:
         # router-ollama / router-vllm / router-sglang point at the router
         # ports. The chosen model must be declared under the provider's
         # `models` map or OpenCode rejects it ("model is not valid"), so
-        # register it just-in-time before launching.
-        _ensure_opencode_model(backend, name)
+        # declare the whole vetted set just-in-time before launching, so the
+        # user can switch models mid-session across all three backends
+        # instead of being pinned to the one they picked at the menu.
+        _write_opencode_providers(_vetted_catalog(), backend, name)
         return ["opencode", "-m", f"router-{backend}/{name}"]
 
     if agent_id == "aiagent":
