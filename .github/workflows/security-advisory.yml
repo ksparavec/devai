@@ -52,11 +52,11 @@ jobs:
         language: [go, python]
     steps:
       - uses: actions/checkout@v7
-      - uses: github/codeql-action/init@v4
+      - uses: github/codeql-action/init@v4.37.3
         with:
           languages: ${{ matrix.language }}
-      - uses: github/codeql-action/autobuild@v4
-      - uses: github/codeql-action/analyze@v4
+      - uses: github/codeql-action/autobuild@v4.37.3
+      - uses: github/codeql-action/analyze@v4.37.3
 
   trivy:
     name: trivy (devai-router image)
