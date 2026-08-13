@@ -32,7 +32,7 @@
     "typescript": "~5.8.0"
   },
   "resolutions": {
-    "fast-uri": "^3.1.4",
+    "fast-uri": "^3.1.5",
     "postcss": "^8.5.18"
   },
   "sideEffects": [
