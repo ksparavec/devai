@@ -5,7 +5,7 @@
 #
 # Build: podman build -f deploy/Dockerfile.mcp-modelstatus -t devai-mcp-modelstatus .
 
-FROM docker.io/library/golang:1.26-bookworm AS build
+FROM docker.io/library/golang:1.27-bookworm AS build
 WORKDIR /src
 COPY devai-tools/ devai-tools/
 COPY deploy/models.yaml deploy/models.yaml
