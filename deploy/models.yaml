@@ -2,7 +2,7 @@
 #
 # Regenerate with: make catalog-regen
 # Source of truth:  scripts/model-families.yaml
-# Generated at:     2026-09-19T08:20:36+00:00
+# Generated at:     2026-09-19T14:29:31+00:00
 #
 # Every 'size' and 'arch' below was fetched live from the
 # upstream provider at generation time. Do not hand-edit.
@@ -460,6 +460,8 @@ models:
     repo: "unsloth/gemma-4-31B-it-GGUF"
     source: gguf
     gguf_filename: "gemma-4-31B-it-UD-IQ3_XXS.gguf"
+    renderer: "gemma4"
+    parser: "gemma4"
     size: "11.02 GB"
     arch: { layers: 30, kv_heads: 8, head_dim: 256, k_eq_v: true }
     arch_source: "google/gemma-4-26b-a4b-it/config.json"
@@ -471,6 +473,8 @@ models:
     repo: "unsloth/gemma-4-31B-it-GGUF"
     source: gguf
     gguf_filename: "gemma-4-31B-it-UD-Q3_K_XL.gguf"
+    renderer: "gemma4"
+    parser: "gemma4"
     size: "14.32 GB"
     arch: { layers: 30, kv_heads: 8, head_dim: 256, k_eq_v: true }
     arch_source: "google/gemma-4-26b-a4b-it/config.json"
@@ -482,6 +486,8 @@ models:
     repo: "unsloth/gemma-4-26B-A4B-it-GGUF"
     source: gguf
     gguf_filename: "gemma-4-26B-A4B-it-UD-Q3_K_XL.gguf"
+    renderer: "gemma4"
+    parser: "gemma4"
     size: "12.02 GB"
     arch: { layers: 30, kv_heads: 8, head_dim: 256, k_eq_v: true }
     arch_source: "google/gemma-4-26b-a4b-it/config.json"
@@ -628,6 +634,8 @@ models:
     repo: "unsloth/Qwen3.8-27B-GGUF"
     source: gguf
     gguf_filename: "Qwen3.8-27B-UD-Q3_K_XL.gguf"
+    renderer: "qwen3.8"
+    parser: "qwen3.5"
     size: "12.24 GB"
     arch: { layers: 64, kv_layers: 16, kv_heads: 4, head_dim: 256, k_eq_v: false }
     arch_source: "nvidia/Qwen3.8-27B-NVFP4/config.json"
@@ -639,6 +647,8 @@ models:
     repo: "unsloth/Qwen3.8-27B-GGUF"
     source: gguf
     gguf_filename: "Qwen3.8-27B-UD-Q4_K_S.gguf"
+    renderer: "qwen3.8"
+    parser: "qwen3.5"
     size: "14.30 GB"
     arch: { layers: 64, kv_layers: 16, kv_heads: 4, head_dim: 256, k_eq_v: false }
     arch_source: "nvidia/Qwen3.8-27B-NVFP4/config.json"
@@ -650,6 +660,8 @@ models:
     repo: "unsloth/Qwen3.8-27B-GGUF"
     source: gguf
     gguf_filename: "Qwen3.8-27B-UD-Q4_K_XL.gguf"
+    renderer: "qwen3.8"
+    parser: "qwen3.5"
     size: "16.35 GB"
     arch: { layers: 64, kv_layers: 16, kv_heads: 4, head_dim: 256, k_eq_v: false }
     arch_source: "nvidia/Qwen3.8-27B-NVFP4/config.json"
@@ -1436,6 +1448,8 @@ models:
     repo: "unsloth/Qwen3.5-27B-GGUF"
     source: gguf
     gguf_filename: "Qwen3.5-27B-Q3_K_M.gguf"
+    renderer: "qwen3.5"
+    parser: "qwen3.5"
     size: "12.58 GB"
     arch: { layers: 32, kv_layers: 8, kv_heads: 4, head_dim: 256, k_eq_v: false }
     arch_source: "ykarout/Qwen3.5-9B-NVFP4/config.json"
@@ -1447,6 +1461,8 @@ models:
     repo: "unsloth/Qwen3.5-27B-GGUF"
     source: gguf
     gguf_filename: "Qwen3.5-27B-UD-IQ3_XXS.gguf"
+    renderer: "qwen3.5"
+    parser: "qwen3.5"
     size: "10.72 GB"
     arch: { layers: 32, kv_layers: 8, kv_heads: 4, head_dim: 256, k_eq_v: false }
     arch_source: "ykarout/Qwen3.5-9B-NVFP4/config.json"
@@ -1458,6 +1474,8 @@ models:
     repo: "unsloth/Qwen3.5-27B-GGUF"
     source: gguf
     gguf_filename: "Qwen3.5-27B-UD-Q3_K_XL.gguf"
+    renderer: "qwen3.5"
+    parser: "qwen3.5"
     size: "13.45 GB"
     arch: { layers: 32, kv_layers: 8, kv_heads: 4, head_dim: 256, k_eq_v: false }
     arch_source: "ykarout/Qwen3.5-9B-NVFP4/config.json"
@@ -1469,6 +1487,8 @@ models:
     repo: "unsloth/Qwen3.5-35B-A3B-GGUF"
     source: gguf
     gguf_filename: "Qwen3.5-35B-A3B-Q3_K_M.gguf"
+    renderer: "qwen3.5"
+    parser: "qwen3.5"
     size: "15.23 GB"
     arch: { layers: 32, kv_layers: 8, kv_heads: 4, head_dim: 256, k_eq_v: false }
     arch_source: "ykarout/Qwen3.5-9B-NVFP4/config.json"
@@ -1480,6 +1500,8 @@ models:
     repo: "unsloth/Qwen3.5-35B-A3B-GGUF"
     source: gguf
     gguf_filename: "Qwen3.5-35B-A3B-UD-IQ3_XXS.gguf"
+    renderer: "qwen3.5"
+    parser: "qwen3.5"
     size: "12.18 GB"
     arch: { layers: 32, kv_layers: 8, kv_heads: 4, head_dim: 256, k_eq_v: false }
     arch_source: "ykarout/Qwen3.5-9B-NVFP4/config.json"
@@ -1491,6 +1513,8 @@ models:
     repo: "unsloth/Qwen3.5-35B-A3B-GGUF"
     source: gguf
     gguf_filename: "Qwen3.5-35B-A3B-UD-Q3_K_XL.gguf"
+    renderer: "qwen3.5"
+    parser: "qwen3.5"
     size: "15.46 GB"
     arch: { layers: 32, kv_layers: 8, kv_heads: 4, head_dim: 256, k_eq_v: false }
     arch_source: "ykarout/Qwen3.5-9B-NVFP4/config.json"

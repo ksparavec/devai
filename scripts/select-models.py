@@ -495,9 +495,15 @@ def pull_gguf(display_name: str, repo: str, filename: str, family: str,
     detection. Without them the imported model is treated as a raw
     completion engine and Ollama refuses tool / thinking calls
     ("does not support tools" on /v1/messages, /v1/chat/completions).
-    The renderer/parser names are 1:1 with the family name in our
-    catalog (qwen3.5, gemma4, nemotron-3-nano, …) — confirmed by
-    inspecting registry-served models of those families.
+    `renderer` / `parser` come from the catalog row, where
+    generate-catalog.py recorded what the family's official Ollama
+    library config declares. They are NOT always the family name: that
+    assumption held until qwen3.8, whose parser is `qwen3.5`. An import
+    written with `PARSER qwen3.8` still made `ollama create` print
+    "success", came up with capability `completion` only, and answered
+    tool calls with 400 "does not support tools" -- on Ollama 0.31.1 and
+    0.34.2 alike. The family name remains the fallback ONLY for a family
+    with no Ollama library to consult (nothing better is knowable).
 
     `display_name` is the catalog tag (e.g. `qwen3.5:27b-ud-q3_k_xl`).
     Once `ollama create` completes, the GGUF bytes are absorbed into
@@ -521,8 +527,8 @@ def pull_gguf(display_name: str, repo: str, filename: str, family: str,
     modelfile = target_dir / f"Modelfile.{filename}"
     modelfile.write_text(
         f"FROM {filename}\n"
-        f"RENDERER {family}\n"
-        f"PARSER {family}\n"
+        f"RENDERER {renderer or family}\n"
+        f"PARSER {parser or family}\n"
     )
     container_dir = to_container_path(target_dir)
     print(f"  ollama create {display_name} -f {modelfile.name} "
@@ -548,7 +554,8 @@ def pull(model: dict) -> None:
         family = model.get("family") or ""
         if not family:
             sys.exit(f"error: gguf source row {model['name']} is missing family")
-        pull_gguf(model["name"], model["repo"], model["gguf_filename"], family)
+        pull_gguf(model["name"], model["repo"], model["gguf_filename"], family,
+                  renderer=model.get("renderer"), parser=model.get("parser"))
     else:
         sys.exit(f"error: unknown source '{src}' for {model['name']}")
 

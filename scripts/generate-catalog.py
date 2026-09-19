@@ -333,6 +333,49 @@ def ollama_manifest_size(library: str, tag: str) -> int:
     return sum(int(layer.get("size", 0)) for layer in layers)
 
 
+def ollama_modelfile_directives(library: str, tag: str) -> tuple[str | None, str | None]:
+    """(renderer, parser) the official library config declares for one tag.
+
+    These are the names `pull_gguf` must put in a GGUF import's Modelfile.
+    They are NOT derivable from the family name: qwen3.8 declares renderer
+    `qwen3.8` but parser `qwen3.5`, and an import written with `PARSER
+    qwen3.8` comes up as a raw completion engine that refuses tool calls --
+    while `ollama create` reports success. Two small requests: the manifest,
+    then the config blob it points at.
+    """
+    manifest = _http_json(
+        f"{OLLAMA_REGISTRY}/{library}/manifests/{tag}", accept=_OLLAMA_ACCEPT
+    )
+    digest = (manifest.get("config") or {}).get("digest")
+    if not digest:
+        return None, None
+    cfg = _http_json(f"{OLLAMA_REGISTRY}/{library}/blobs/{digest}")
+    return cfg.get("renderer") or None, cfg.get("parser") or None
+
+
+def family_modelfile_directives(library: str, tags: list[str],
+                                tag_prefix: str) -> tuple[str | None, str | None]:
+    """Look the directives up ONCE for a family, from one tag of its library.
+
+    One lookup, not one per tag: each costs two registry round trips and a
+    library has dozens of tags. Tags sharing the GGUF repo's `tag_prefix`
+    (same model size) are tried first. A platform-gated tag (HTTP 412, e.g.
+    the macOS-only `-mlx` builds) is skipped for the next candidate; any
+    other failure propagates, so the caller can refuse to write a catalog
+    whose GGUF rows would be imported on a guess.
+    """
+    preferred = [t for t in tags
+                 if tag_prefix and (t == tag_prefix or t.startswith(f"{tag_prefix}-"))]
+    for tag in preferred + [t for t in tags if t not in preferred]:
+        try:
+            return ollama_modelfile_directives(library, tag)
+        except urllib.error.HTTPError as e:
+            if e.code == 412:
+                continue
+            raise
+    return None, None
+
+
 # ── Architecture ─────────────────────────────────────────────────────────────
 
 @dataclass
@@ -380,6 +423,11 @@ class Entry:
                             # is determined at runtime by
                             # scripts/probe-ollama-reasoning.py
     gguf_filename: str | None = None  # set on source_kind == "gguf"
+    renderer: str | None = None  # gguf rows: Modelfile RENDERER / PARSER, read
+    parser: str | None = None    # from the family's Ollama library config by
+                                 # family_modelfile_directives. None when the
+                                 # family has no library to consult -- then
+                                 # pull_gguf falls back to the family name.
     sha: str | None = None  # short git sha (12 chars) for source_kind == "hf";
                             # cache key for the vLLM/SGLang probe — `f-...`
                             # prefix indicates a fingerprint fallback
@@ -571,7 +619,9 @@ def _gguf_tag_token(filename: str) -> str:
 
 
 def _entry_gguf(repo: str, file_meta: dict, family: str, arch: Arch,
-                tag_prefix: str, thinking: bool) -> Entry | None:
+                tag_prefix: str, thinking: bool,
+                renderer: str | None = None,
+                parser: str | None = None) -> Entry | None:
     """One catalog row per .gguf file inside an HF repo.
 
     `tag_prefix` anchors the local Ollama tag (e.g. "27b") so the
@@ -596,6 +646,8 @@ def _entry_gguf(repo: str, file_meta: dict, family: str, arch: Arch,
         source_kind="gguf",
         thinking=thinking,
         gguf_filename=file_meta["filename"],
+        renderer=renderer,
+        parser=parser,
     )
 
 
@@ -706,6 +758,9 @@ def main(argv: list[str] | None = None) -> int:
                       f"{e.arch.kv_heads}kv/{e.arch.head_dim}h{tag_suffix}")
                 all_entries.append(e)
 
+        library_tags: dict[str, list[str]] = {}
+        # (renderer, parser) for this family's gguf rows; None = not looked up yet.
+        fam_directives: tuple[str | None, str | None] | None = None
         for lib in fam.get("ollama_repos") or []:
             try:
                 tags = ollama_tags(lib)
@@ -715,6 +770,7 @@ def main(argv: list[str] | None = None) -> int:
                     f"Ollama tag list failed: {lib} "
                     f"(every tag of this library lost)", e)
                 tags = []
+            library_tags[lib] = tags
             skipped = 0
             for tag in tags:
                 e = _entry_ollama(lib, tag, name, fam_arch, thinking)
@@ -761,6 +817,24 @@ def main(argv: list[str] | None = None) -> int:
                     f"HF GGUF listing failed: {repo} "
                     f"(every quant of this repo lost)", e)
                 continue
+            if fam_directives is None:
+                fam_directives = (None, None)
+                for lib, lib_tags in library_tags.items():
+                    if not lib_tags:
+                        continue
+                    try:
+                        fam_directives = family_modelfile_directives(
+                            lib, lib_tags, tag_prefix)
+                    except Exception as e:
+                        print(f"  [warn] Ollama Modelfile directives for {lib}: {e}",
+                              file=sys.stderr)
+                        _record_fetch_failure(
+                            f"Ollama renderer/parser lookup failed: {lib} "
+                            f"(gguf rows of {name} would be imported on a guess)", e)
+                    break
+                if any(fam_directives):
+                    print(f"  GGUF Modelfile: RENDERER {fam_directives[0]} "
+                          f"PARSER {fam_directives[1]} (from the Ollama registry)")
             kept = 0
             for fmeta in files:
                 fname = fmeta["filename"]
@@ -768,7 +842,9 @@ def main(argv: list[str] | None = None) -> int:
                     fname_lc = fname.lower()
                     if not any(token in fname_lc for token in include_filter):
                         continue
-                e = _entry_gguf(repo, fmeta, name, fam_arch, tag_prefix, thinking)
+                e = _entry_gguf(repo, fmeta, name, fam_arch, tag_prefix, thinking,
+                                renderer=fam_directives[0],
+                                parser=fam_directives[1])
                 if e is None:
                     continue
                 all_entries.append(e)
@@ -835,6 +911,10 @@ def main(argv: list[str] | None = None) -> int:
             lines.append(f'    sha: "{e.sha}"')
         if e.gguf_filename:
             lines.append(f'    gguf_filename: "{e.gguf_filename}"')
+        if e.renderer:
+            lines.append(f'    renderer: "{e.renderer}"')
+        if e.parser:
+            lines.append(f'    parser: "{e.parser}"')
         lines.append(f'    size: "{e.size_gb:.2f} GB"')
         lines.append(f"    arch: {e.arch.to_yaml()}")
         lines.append(f'    arch_source: "{e.arch.source}"')
