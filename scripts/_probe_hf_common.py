@@ -1031,6 +1031,16 @@ _OOM_PATTERNS = (
     "RuntimeError: Allocator",
     "free; ",
     "no space left",
+    # vLLM's KV-pool check (kv_cache_utils._check_enough_kv_cache_memory)
+    # reports "does not fit at this ctx" without the words "out of memory":
+    # the pool left after weights + activations is smaller than one request
+    # at --max-model-len needs. Both branches are genuine memory limits.
+    # Filed as `infra` until 2026-09-19 -- run-specific, so it never reached
+    # the ledger and a model failing it at every tier was re-probed forever.
+    # Keep these SPECIFIC: a bare "larger than" also appears in config
+    # errors that really are infra (see test_unknown_is_infra).
+    "larger than the available KV cache memory",
+    "No available memory for the cache blocks",
 )
 
 

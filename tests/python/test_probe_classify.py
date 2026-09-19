@@ -86,6 +86,31 @@ class TestClassifyFailureLogs(unittest.TestCase):
                                                 "CUDA out of memory"))
         self.assertEqual(rec["kind"], "oom_startup")
 
+    def test_vllm_kv_pool_too_small_is_oom(self) -> None:
+        # vLLM's KV-pool check (kv_cache_utils._check_enough_kv_cache_memory)
+        # says the model does not fit at this ctx without ever using the
+        # words "out of memory". Captured verbatim from the 64K launch of
+        # Qwen3.8-27B-MTP-NVFP4 on 2026-09-19, where it was filed as `infra`
+        # -- which is run-specific and never reaches the ledger, so a model
+        # failing this check at every tier would be re-probed forever.
+        rec = P.classify_failure_logs(_long_log(
+            "ValueError: To serve at least one request with the model's max "
+            "seq len (65536), (2.3 GiB KV cache is needed, which is larger "
+            "than the available KV cache memory (1.76 GiB). Based on the "
+            "available memory, the estimated maximum model length is 47040."))
+        self.assertEqual(rec["kind"], "oom_startup")
+        self.assertEqual(rec["matched_pattern"],
+                         "larger than the available KV cache memory")
+
+    def test_vllm_no_memory_for_cache_blocks_is_oom(self) -> None:
+        # The same check's other branch: weights + activations already
+        # consumed the whole budget, leaving nothing for KV.
+        rec = P.classify_failure_logs(_long_log(
+            "ValueError: No available memory for the cache blocks. Try "
+            "increasing `gpu_memory_utilization` when initializing the "
+            "engine."))
+        self.assertEqual(rec["kind"], "oom_startup")
+
     def test_unknown_is_infra(self) -> None:
         # A genuine infra failure (no arch/quant/oom marker) stays infra --
         # NOT forced terminal. (gemma-4's MM-config failure is one of these:
