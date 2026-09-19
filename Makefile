@@ -59,6 +59,13 @@ VLLM_IMAGE ?= docker.io/vllm/vllm-openai:latest-x86_64-cu129-ubuntu2404
 export VLLM_IMAGE
 SGLANG_IMAGE ?= docker.io/lmsysorg/sglang:v0.5.16-cu130
 export SGLANG_IMAGE
+# The Ollama image is BUILT HERE (`make build-ollama`), not pulled: Ollama
+# compiled from source on the host, on debian:trixie-slim, CUDA 13 for this
+# GPU only (752 MB against 4.75 GB for the stock ollama/ollama image).
+# Compose uses it for devai-ollama AND forwards it to the router, which
+# recreates that container for pinned KV tiers -- both must name one image.
+OLLAMA_IMAGE ?= localhost/devai-ollama:latest
+export OLLAMA_IMAGE
 # Exported for the same reason: the probers launch their own containers
 # on the host and must use the same CDI device string the compose
 # services do (written into .env by `make gpu-vendor`). Defaulted so an
@@ -1607,6 +1614,24 @@ install: ## Install bin/devai-agent to $(INSTALL_PREFIX)/bin and stage config in
 	@echo "  installed: $(INSTALL_PREFIX)/bin/devai-agent"
 	@echo
 	@echo "Next steps:"
+# Where scripts/build-ollama.sh leaves the compiled tree. NOT under
+# $(CACHE_DIR): a new top-level directory there is not volume-backed.
+OLLAMA_DIST ?= $(HOME)/.cache/devai/ollama-build/dist
+
+build-ollama: build-ollama-dist build-ollama-image ## Compile Ollama from source on the host, then build the slim devai-ollama image from it.
+
+build-ollama-dist: ## Compile Ollama FROM SOURCE on the host for this GPU only (CUDA 13, compute capability 12.0). Needs cmake + the CUDA 13 apt packages; see scripts/build-ollama.sh. OLLAMA_VERSION=vX.Y.Z picks the release.
+	$(if $(OLLAMA_VERSION),OLLAMA_VERSION=$(OLLAMA_VERSION),) bash scripts/build-ollama.sh
+
+build-ollama-image: ## Build the devai-ollama image (debian:trixie-slim + the host-compiled Ollama). No upstream Ollama image is used, not even as a build input.
+	@test -x $(OLLAMA_DIST)/bin/ollama || { echo "error: no build at $(OLLAMA_DIST) -- run 'make build-ollama-dist' first" >&2; exit 1; }
+	$(CONTAINER_RUNTIME) build --network=host \
+		$(PROXY_BUILD_ARGS) \
+		$(APT_PROXY_ARG) \
+		-v $(OLLAMA_DIST):/var/cache/ollama-dist:ro \
+		-f deploy/Dockerfile.ollama \
+		-t devai-ollama .
+
 	@echo "  1. Add $(INSTALL_PREFIX)/bin to PATH if not already."
 	@echo "  2. devai-agent --init     # create $(DEVAI_HOME)/preferences.yaml"
 	@echo "  3. devai-agent            # launch the lab + picker"

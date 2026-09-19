@@ -34,7 +34,13 @@ services:
     restart: unless-stopped
 
   ollama:
-    image: ollama/ollama:latest
+    # Built HERE by `make build-ollama`, never pulled: Ollama compiled from
+    # source on the host, on debian:trixie-slim, with the CUDA 13 backend for
+    # this machine's GPU only (752 MB against 4.75 GB for the stock
+    # ollama/ollama image). Same entrypoint/cmd/port/env/model path as the
+    # stock image, so nothing else in this service changes.
+    # Explicit `localhost/` prefix for the same reason as the router below.
+    image: ${OLLAMA_IMAGE:-localhost/devai-ollama:latest}
     container_name: devai-ollama
     hostname: ollama
     environment:
@@ -110,6 +116,10 @@ services:
     environment:
       - OLLAMA_URL=http://ollama:11434
       - OLLAMA_PORT=11434
+      # The router RECREATES devai-ollama for pinned KV tiers. It only sees
+      # what compose hands it, so without this it would recreate from its own
+      # default and silently put the container back on a different image.
+      - OLLAMA_IMAGE=${OLLAMA_IMAGE:-localhost/devai-ollama:latest}
       - VLLM_URL=http://vllm:11434
       - VLLM_PORT=11435
       - VLLM_CONTAINER=devai-vllm

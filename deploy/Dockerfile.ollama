@@ -1,0 +1,60 @@
+# devai-ollama -- Ollama built from source on the host, on debian:trixie-slim,
+# with the CUDA 13 backend for THIS machine's GPU and nothing else.
+#
+# No upstream Ollama image is involved, not even as a build input. The stock
+# ollama/ollama image is ~4.4 GiB, of which the `ollama` binary is 36 MiB; the
+# rest is three bundled GPU runtimes (MLX-on-CUDA 2.0 GiB, CUDA 12 1.2 GiB,
+# CUDA 13 0.8 GiB) compiled for every GPU generation. This host is amd64 +
+# one NVIDIA Blackwell card, so one backend for one architecture is enough.
+#
+# Everything here is COPIED IN, already compiled, by scripts/build-ollama.sh:
+#     bin/ollama                   the Go binary
+#     lib/ollama/*.so              ggml CPU backends (every build needs one)
+#     lib/ollama/cuda_v13/         libggml-cuda.so, native code for compute
+#                                  capability 12.0, plus the cuBLAS / cudart
+#                                  runtime libraries it links against
+#
+# Build: make build-ollama      (compile on the host, then build this image)
+#        make build-ollama-image   (this image only, from an existing build)
+#
+# The runtime contract is IDENTICAL to the upstream image on purpose -- same
+# entrypoint, command, port, environment and /root/.ollama model path -- so
+# deploy/docker-compose.yaml and the router's containerRecreate need only the
+# image name changed.
+
+ARG BASE_IMAGE=docker.io/library/debian:trixie-slim
+FROM ${BASE_IMAGE}
+
+ARG APT_PROXY
+
+# ca-certificates is the ONLY package added: `ollama pull` speaks HTTPS to the
+# registry. libc, libstdc++ and libgcc already ship in debian:trixie-slim;
+# libcuda.so.1 is the host driver's and is injected by CDI at run time.
+RUN if [ -n "$APT_PROXY" ]; then echo "Acquire::http::Proxy \"$APT_PROXY\";" > /etc/apt/apt.conf.d/00cache; fi && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/* /etc/apt/apt.conf.d/00cache
+
+# The host build is bind-mounted read-only at /var/cache/ollama-dist by
+# `make build-ollama-image` (same convention as the lab image's CLI cache).
+# Fail the build, loudly, if it is absent or lacks its only GPU backend: an
+# image without one would start, fall back to CPU, and merely look "slow".
+RUN set -eu; \
+    test -x /var/cache/ollama-dist/bin/ollama \
+        || { echo "error: no bin/ollama in the mounted build -- run 'make build-ollama-dist' first" >&2; exit 1; }; \
+    test -f /var/cache/ollama-dist/lib/ollama/cuda_v13/libggml-cuda.so \
+        || { echo "error: the mounted build has no cuda_v13/libggml-cuda.so" >&2; exit 1; }; \
+    install -m 0755 /var/cache/ollama-dist/bin/ollama /usr/bin/ollama; \
+    mkdir -p /usr/lib/ollama; \
+    cp -a /var/cache/ollama-dist/lib/ollama/. /usr/lib/ollama/; \
+    /usr/bin/ollama --version
+
+# Same environment as the upstream image.
+ENV LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64 \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    NVIDIA_VISIBLE_DEVICES=all \
+    OLLAMA_HOST=0.0.0.0:11434
+
+EXPOSE 11434
+ENTRYPOINT ["/bin/ollama"]
+CMD ["serve"]

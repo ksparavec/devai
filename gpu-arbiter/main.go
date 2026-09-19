@@ -1686,13 +1686,17 @@ func buildArbiter() *arbiter {
 			ListenPort:    envInt("OLLAMA_PORT", 11434),
 			BackendURL:    ollamaURL,
 			ContainerName: env("OLLAMA_CONTAINER", "devai-ollama"),
-			Image:         env("OLLAMA_IMAGE", "docker.io/ollama/ollama:latest"),
-			ModelsDir:     env("OLLAMA_DATA_DIR", "/var/cache/devai/ollama"),
-			MountDest:     "/root/.ollama",
-			MountRW:       true,
-			Network:       network,
-			HealthPath:    "/",
-			Entrypoint:    ollamaEntrypoint,
+			// The host-built image (make build-ollama), NOT the stock
+			// ollama/ollama. Must equal the compose default: this is what
+			// containerRecreate uses, so a different value here would put a
+			// recreated devai-ollama back on another image, silently.
+			Image:      env("OLLAMA_IMAGE", "localhost/devai-ollama:latest"),
+			ModelsDir:  env("OLLAMA_DATA_DIR", "/var/cache/devai/ollama"),
+			MountDest:  "/root/.ollama",
+			MountRW:    true,
+			Network:    network,
+			HealthPath: "/",
+			Entrypoint: ollamaEntrypoint,
 			EnvVars: map[string]string{
 				"OLLAMA_KEEP_ALIVE":        env("OLLAMA_KEEP_ALIVE", "300s"),
 				"OLLAMA_MAX_LOADED_MODELS": "1",
