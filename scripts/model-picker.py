@@ -820,9 +820,11 @@ def _hf_kv_gb(arch: dict, context: int) -> float:
     if not arch:
         return 0.0
     copies = 1 if arch.get("k_eq_v") else 2
+    # kv_layers when the catalog carries it: hybrid archs hold no KV cache
+    # on most layers. Mirrors select-models.py kv_per_token_bytes.
     bytes_per_token = (
         copies
-        * int(arch.get("layers") or 0)
+        * int(arch.get("kv_layers") or arch.get("layers") or 0)
         * int(arch.get("kv_heads") or 0)
         * int(arch.get("head_dim") or 0)
         * _KV_BYTES_HF

@@ -13,7 +13,11 @@ every family, and writes deploy/models.yaml with:
                  of Ollama manifest layer sizes)
     arch       – { layers, kv_heads, head_dim, k_eq_v } from the
                  repo's own config.json if available, else from the
-                 family's arch_ref config.json
+                 family's arch_ref config.json. Hybrid architectures
+                 also carry `kv_layers`, the number of layers that
+                 actually hold a KV cache (see scripts/_kv_layers.py);
+                 it is omitted when equal to `layers`, and readers
+                 default to `layers` when it is absent.
     purpose    – short auto-generated description
 
 No hand-entered sizes. No hand-entered architectures. Run again any
@@ -43,6 +47,10 @@ from pathlib import Path
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
+
+from _kv_layers import kv_layer_count  # noqa: E402
+
 FAMILIES_YAML = REPO_ROOT / "scripts" / "model-families.yaml"
 OUTPUT_YAML = REPO_ROOT / "deploy" / "models.yaml"
 
@@ -334,10 +342,15 @@ class Arch:
     head_dim: int
     k_eq_v: bool
     source: str
+    # Layers that hold a KV cache. Equal to `layers` for a dense model.
+    kv_layers: int
 
     def to_yaml(self) -> str:
         keq = "true" if self.k_eq_v else "false"
-        return (f"{{ layers: {self.layers}, kv_heads: {self.kv_heads}, "
+        # Emitted only when it differs, so dense rows do not churn.
+        kvl = (f"kv_layers: {self.kv_layers}, "
+               if self.kv_layers != self.layers else "")
+        return (f"{{ layers: {self.layers}, {kvl}kv_heads: {self.kv_heads}, "
                 f"head_dim: {self.head_dim}, k_eq_v: {keq} }}")
 
 
@@ -349,7 +362,7 @@ def arch_from_config(cfg: dict, source: str) -> Arch:
         t.get("head_dim") or t["hidden_size"] // t["num_attention_heads"]
     )
     k_eq_v = bool(t.get("attention_k_eq_v", False))
-    return Arch(layers, kv_heads, head_dim, k_eq_v, source)
+    return Arch(layers, kv_heads, head_dim, k_eq_v, source, kv_layer_count(t))
 
 
 # ── Entry construction ───────────────────────────────────────────────────────

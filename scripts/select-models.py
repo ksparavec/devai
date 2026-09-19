@@ -161,8 +161,11 @@ def parse_size_gb(s: str) -> float:
 
 def kv_per_token_bytes(arch: dict, kv_dtype: str) -> float:
     copies = 1 if arch.get("k_eq_v") else 2
+    # kv_layers, not layers: hybrid archs (Qwen3.5+ linear attention,
+    # Nemotron-H Mamba) keep no KV cache on most layers. Absent on dense
+    # rows and on catalogs generated before the field existed.
     return (copies
-            * int(arch["layers"])
+            * int(arch.get("kv_layers") or arch["layers"])
             * int(arch["kv_heads"])
             * int(arch["head_dim"])
             * KV_BYTES[kv_dtype])

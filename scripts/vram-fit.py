@@ -31,6 +31,10 @@ from pathlib import Path
 
 import yaml
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from _kv_layers import kv_layer_count  # noqa: E402
+
 # Constants calibrated against vLLM launch behaviour on 24 GB GPU.
 CUDA_GRAPH_GB = 1.0     # CUDA graphs + compiled kernels
 ACTIVATIONS_GB = 0.5    # peak activation memory during forward
@@ -55,10 +59,14 @@ class Arch:
     head_dim: int
     k_eq_v: bool = False
     source: str = ""
+    # Layers holding a KV cache; None = every layer (dense). Hybrid archs
+    # (linear attention, Mamba) keep none on most -- see _kv_layers.py.
+    kv_layers: int | None = None
 
     def kv_per_token_bytes(self, kv_dtype: str) -> float:
         copies = 1 if self.k_eq_v else 2           # K and V, or just one when K=V
-        return copies * self.layers * self.kv_heads * self.head_dim * KV_BYTES[kv_dtype]
+        kv_layers = self.kv_layers or self.layers
+        return copies * kv_layers * self.kv_heads * self.head_dim * KV_BYTES[kv_dtype]
 
 
 def parse_size_gb(s: str) -> float:
@@ -90,6 +98,7 @@ def arch_from_config(model_dir: Path) -> Arch | None:
         head_dim=head_dim,
         k_eq_v=bool(t.get("attention_k_eq_v", False)),
         source=f"config.json ({model_dir.name})",
+        kv_layers=kv_layer_count(t),
     )
 
 
@@ -147,6 +156,8 @@ def resolve_arch(m: dict, all_models: list[dict], vllm_dir: Path) -> Arch | None
                 head_dim=int(inline["head_dim"]),
                 k_eq_v=bool(inline.get("k_eq_v", False)),
                 source=m.get("arch_source", "models.yaml (inline)"),
+                kv_layers=(int(inline["kv_layers"])
+                           if inline.get("kv_layers") else None),
             )
         except (KeyError, ValueError, TypeError):
             pass
