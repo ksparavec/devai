@@ -222,6 +222,53 @@ families:
     arch_ref: nvidia/diffusiongemma-26B-A4B-it-NVFP4
     thinking: true
 
+  - name: qwen3.8
+    # Qwen3.8-27B (2026-08). Same Qwen3_5ForConditionalGeneration arch as the
+    # qwen3.5 / qwen3.6 families (verified in config.json 2026-09-19: 64L =
+    # 48 linear-attention + 16 full-attention, 4 KV heads, head_dim 256,
+    # native max_position_embeddings 262144, mtp_num_hidden_layers=1) and the
+    # same <tool_call><function=...> XML tool markup in chat_template.jinja,
+    # so the parsers below are carried over from those families -- the probe
+    # still has to confirm them.
+    #
+    # NOT tracked, on purpose: the official Qwen/Qwen3.8-27B (51.7 GiB BF16)
+    # and Qwen/Qwen3.8-27B-FP8 (28.7 GiB). Weights alone exceed the 24G card.
+    #
+    # Expectation from the identical-arch Qwen3.6-27B rows on this host (NOT
+    # yet measured for 3.8): a 19.15 GiB NVFP4 fit 32K max on vLLM at ~32
+    # tok/s, an 18.29 GiB one hit oom_chat at 32K, and the compressed-tensors
+    # quants failed SGLang with kind=quant. nvidia's 20.4 GiB build is larger
+    # than the one that barely fit.
+    ollama_repos:
+      - qwen3.8
+    gguf_repos:
+      # K-quants only, matching what is known to `ollama create` cleanly here
+      # (qwen3.5:27b-ud-q3_k_xl precedent). A three-step ladder so the
+      # quality-vs-context trade is measured rather than guessed:
+      # 12.2 / 14.3 / 16.4 GiB.
+      - repo: unsloth/Qwen3.8-27B-GGUF
+        tag_prefix: 27b
+        include:
+          - UD-Q3_K_XL
+          - UD-Q4_K_S
+          - UD-Q4_K_XL
+    hf_repos:
+      - nvidia/Qwen3.8-27B-NVFP4
+      # NO mtp: block, on purpose -- see the Qwen3.6-27B-MTP-pi-tune-NVFP4
+      # note below: the qwen3_5_mtp draft lm_head (~2.37 GiB, vocab-sized)
+      # OOMs at model load on 24G for a ~19 GiB 27B, and nothing consumes
+      # mtp_fits, so a stray mtp block would be advertised and OOM at serve.
+      - sakamakismile/Qwen3.8-27B-MTP-NVFP4
+    parsers:
+      vllm:
+        reasoning: qwen3
+        tool: qwen3_xml
+      sglang:
+        reasoning: qwen3
+        tool: qwen
+    arch_ref: nvidia/Qwen3.8-27B-NVFP4
+    thinking: true
+
   - name: qwen3.6
     ollama_repos:
       - qwen3.6
