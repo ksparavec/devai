@@ -415,12 +415,28 @@ fetch-cli: ## Download all external binaries and packages to local cache (uses E
 # Base images used by build and infrastructure
 BASE_IMAGES = debian:trixie $(GPU_BASE_IMAGE)
 CACHE_IMAGES = $(shell $(COMPOSE) -f $(CACHE_COMPOSE) config --images 2>/dev/null | grep -v devai-)
+# Seconds between pull-images retry attempts (the attempt COUNT is fixed at 3).
+PULL_RETRY_DELAY ?= 5
 
-pull-images: ## Pull latest versions of all base and infrastructure images
-	@for img in $(BASE_IMAGES) $(CACHE_IMAGES); do \
-		echo "Pulling $$img..." \
-		&& $(CONTAINER_RUNTIME) pull "$$img" || true; \
-	done
+pull-images: ## Pull latest versions of all base and infrastructure images. IMAGES="a b" limits the run. Each pull is tried 3 times; an image that still fails aborts with a non-zero exit.
+	@# Failures are ERRORS. This used to end in `|| true`, so a pull that never
+	@# happened was indistinguishable from one that did and make exited 0.
+	@# Bail out at the first image that fails all 3 attempts -- never carry on
+	@# to the next one as if nothing happened. Pinned by
+	@# tests/python/test_pull_images_target.py (a fake runtime, no network).
+	@set -e; \
+	 for img in $(or $(IMAGES),$(BASE_IMAGES) $(CACHE_IMAGES)); do \
+		n=1; \
+		until echo "Pulling $$img (attempt $$n/3)..." \
+		      && $(CONTAINER_RUNTIME) pull "$$img"; do \
+			if [ $$n -ge 3 ]; then \
+				echo "error: pulling $$img failed after 3 attempts" >&2; \
+				exit 1; \
+			fi; \
+			n=$$((n+1)); \
+			sleep $(PULL_RETRY_DELAY); \
+		done; \
+	 done
 
 build-base-cpu: ## Build base image with system packages and runtimes (CPU)
 	$(CONTAINER_RUNTIME) build --network=host \

@@ -165,6 +165,9 @@ make prune           # Prune dangling images
 make help            # Show all targets
 ```
 
+make pull-images     # Pull base + infrastructure images. IMAGES="a b" limits the run (e.g. IMAGES=docker.io/ollama/ollama:latest upgrades Ollama alone).
+                     # Each pull is tried 3 times (PULL_RETRY_DELAY seconds apart, default 5); an image that still fails ABORTS the target non-zero.
+                     # It used to end in `|| true`, so a pull that never happened exited 0. Failures are errors now.
 ## Configuration
 
 Copy `.env.example` to `.env` before first use. Key settings:
