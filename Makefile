@@ -1226,20 +1226,51 @@ PROBE_FLASH_ATTENTION ?=
 PROBE_READY_TIMEOUT   ?= 180
 
 probe: ## Probe every downloaded ollama digest at every (VRAM, CONTEXT) tier.
-	@# Loops over PROBE_VRAMS, recreating devai-ollama with
-	@# OLLAMA_GPU_OVERHEAD set so the daemon behaves as a smaller card.
-	@# A 24G host can therefore produce cache entries valid for 16G targets.
+	@# Loops over PROBE_VRAMS, recreating devai-ollama for each band, so a 24G
+	@# host can produce cache entries valid for 16G targets.
+	@#
+	@# HOW a smaller card is simulated: PHYSICALLY. For a band smaller than
+	@# the host, scripts/vram-ballast.py holds (host - band) of VRAM through
+	@# the driver API for the duration, so the card really has only the
+	@# band's worth free. The probe loads every model with num_gpu=999 (all
+	@# layers on the GPU, or fail), and NO engine setting can make such a load
+	@# fail while the memory is physically there -- both were tried and both
+	@# are dead for it (2026-09-19, Ollama 0.34.2):
+	@#   OLLAMA_GPU_OVERHEAD   the original knob. Placement moved to llama.cpp's
+	@#                         automatic fit; this now feeds only the scheduler's
+	@#                         bookkeeping. The 16G band came out byte-identical
+	@#                         to 24G: 21.85 GiB "fully on GPU" on a 16 GB card.
+	@#   LLAMA_ARG_FIT_TARGET  llama.cpp's own knob. Ignored once the layer count
+	@#                         is pinned: fit only adjusts UNSET parameters.
+	@# With the ballast held, a load that does not fit dies with a genuine
+	@# `cudaMalloc failed: out of memory`, exactly as on the smaller card, and
+	@# it depends on no engine setting -- so an upstream release cannot quietly
+	@# break it again. Two checks back that up: free VRAM is verified to be
+	@# within the band BEFORE any cell is probed, and the prober REFUSES any
+	@# cell whose VRAM exceeds its band (band_violation).
+	@# The host-sized band runs with NO ballast: production conditions.
+	@#
 	@# Each probe pass is incremental: existing (vram, ctx) cells are
 	@# never overwritten unless PROBE_FORCE=1 or PROBE_FORCE_CTX=<list>.
 	@# The restore below runs from an EXIT trap so an aborted or failed
-	@# probe never leaves devai-ollama with the VRAM-crippling
-	@# OLLAMA_GPU_OVERHEAD still set (a later `make bench-ollama` against
-	@# such a container would record wrong numbers).
+	@# probe never leaves a ballast holding VRAM on the production GPU, nor
+	@# devai-ollama in a probe configuration (a later `make bench-ollama`
+	@# against either would record wrong numbers).
 	@set -e; \
+	 ballast_pid=""; ballast_log=""; \
+	 release_ballast() { \
+	    if [ -n "$$ballast_pid" ]; then \
+	        kill "$$ballast_pid" 2>/dev/null || true; \
+	        wait "$$ballast_pid" 2>/dev/null || true; \
+	        ballast_pid=""; \
+	    fi; \
+	    if [ -n "$$ballast_log" ]; then rm -f "$$ballast_log"; ballast_log=""; fi; \
+	 }; \
 	 restore_ollama() { \
 	    rc=$$?; \
+	    release_ballast; \
 	    echo; \
-	    echo ">>> restoring devai-ollama to host VRAM (no overhead)"; \
+	    echo ">>> restoring devai-ollama to host VRAM (no ballast)"; \
 	    $(CONTAINER_RUNTIME) rm -f $(OLLAMA_CONTAINER) >/dev/null 2>&1 || true; \
 	    OLLAMA_GPU_OVERHEAD=0 $(COMPOSE) -f $(CACHE_COMPOSE) up -d ollama || rc=$$?; \
 	    exit $$rc; \
@@ -1247,11 +1278,35 @@ probe: ## Probe every downloaded ollama digest at every (VRAM, CONTEXT) tier.
 	 trap restore_ollama EXIT; \
 	 trap 'exit 130' INT TERM; \
 	 for vram in $$(echo $(PROBE_VRAMS) | tr ',' ' '); do \
-	    overhead_bytes=$$(python3 -c "import sys; sys.path.insert(0, 'scripts'); from _contexts import parse_vram_token, vram_overhead_bytes; print(vram_overhead_bytes($(GPU_MEMORY_GB), parse_vram_token('$$vram')))"); \
+	    ballast=$$(python3 -c "import sys; sys.path.insert(0, 'scripts'); from _contexts import parse_vram_token, ballast_mib; print(ballast_mib($(GPU_MEMORY_GB), parse_vram_token('$$vram')))"); \
+	    band_mib=$$(python3 -c "import sys; sys.path.insert(0, 'scripts'); from _contexts import parse_vram_token; print(parse_vram_token('$$vram') * 1024)"); \
 	    echo; \
-	    echo ">>> probing at VRAM=$$vram (host=$(GPU_MEMORY_GB)G, OLLAMA_GPU_OVERHEAD=$$overhead_bytes bytes)"; \
+	    echo ">>> probing at VRAM=$$vram (host=$(GPU_MEMORY_GB)G, ballast=$$ballast MiB$$([ "$$ballast" -gt 0 ] || echo ' = none, full card'))"; \
+	    release_ballast; \
 	    $(CONTAINER_RUNTIME) rm -f $(OLLAMA_CONTAINER) >/dev/null 2>&1 || true; \
-	    OLLAMA_GPU_OVERHEAD=$$overhead_bytes \
+	    if [ "$$ballast" -gt 0 ]; then \
+	        ballast_log=$$(mktemp); \
+	        python3 scripts/vram-ballast.py "$$ballast" > "$$ballast_log" 2>&1 & \
+	        ballast_pid=$$!; \
+	        tries=0; \
+	        until grep -q '^ready' "$$ballast_log" 2>/dev/null; do \
+	            if ! kill -0 "$$ballast_pid" 2>/dev/null; then \
+	                echo "ERROR: the VRAM ballast failed to start: $$(cat "$$ballast_log")" >&2; \
+	                ballast_pid=""; exit 1; \
+	            fi; \
+	            tries=$$((tries + 1)); \
+	            if [ $$tries -ge 60 ]; then echo "ERROR: the VRAM ballast was not ready within 30s." >&2; exit 1; fi; \
+	            sleep 0.5; \
+	        done; \
+	        free_mib=$$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits | head -1 | tr -d ' '); \
+	        if [ "$$free_mib" -gt "$$band_mib" ]; then \
+	            echo "ERROR: band simulation is not in effect: $$free_mib MiB of VRAM is free, more than the $$vram band ($$band_mib MiB)." >&2; \
+	            echo "       Refusing to probe VRAM=$$vram -- every cell would be measured on a bigger card." >&2; \
+	            exit 1; \
+	        fi; \
+	        echo "    ballast holds $$ballast MiB; $$free_mib MiB free, within the $$vram band ($$band_mib MiB)"; \
+	    fi; \
+	    OLLAMA_GPU_OVERHEAD=0 \
 	    OLLAMA_KV_CACHE_TYPE="$(PROBE_KV_CACHE_TYPE)" \
 	    OLLAMA_FLASH_ATTENTION="$(PROBE_FLASH_ATTENTION)" \
 	      $(COMPOSE) -f $(CACHE_COMPOSE) up -d ollama; \
@@ -1272,6 +1327,7 @@ probe: ## Probe every downloaded ollama digest at every (VRAM, CONTEXT) tier.
 	        -e OLLAMA_HOST=http://devai-ollama:11434 \
 	        -e PROBE_CONTEXTS=$(PROBE_CONTEXTS) \
 	        -e OLLAMA_KV_CACHE_TYPE="$(PROBE_KV_CACHE_TYPE)" \
+	        -e OLLAMA_FLASH_ATTENTION="$(PROBE_FLASH_ATTENTION)" \
 	        --entrypoint python3 \
 	        $(IMAGE_NAME) \
 	        /scripts/probe-ollama-reasoning.py \
@@ -1362,6 +1418,9 @@ probe-load-sglang: ## Serving-time LOAD probe for SGLang: same as probe-load-vll
 	    $(if $(PROBE_NEEDLE_DEPTH),--needle-depth $(PROBE_NEEDLE_DEPTH),)
 
 model-fit: ## Print which models fit at the chosen (VRAM, CONTEXT) — diagnostic, no writes.
+	@# No store paths are passed: scripts/select-models.py hardcodes them
+	@# (DEVAI_ROOT=/var/cache/devai; ollama/, vllm/, sglang/ beneath it) and
+	@# ignores any variable that tries to move one. See its "Storage layout" block.
 	@OLLAMA_CONTAINER=$(OLLAMA_CONTAINER) CONTAINER_RUNTIME=$(CONTAINER_RUNTIME) \
 	 HF_CLI=$(HF_CLI) \
 	 GPU_MEMORY_GB=$${VRAM:-$(GPU_MEMORY_GB)} MAX_CONTEXT_LEN=$${CONTEXT:-$(MAX_CONTEXT_LEN)} \
@@ -1443,9 +1502,6 @@ catalog-discover-add: ## Discover, then CONFIRM-add candidates into scripts/mode
 	@# After adding: make catalog-regen && make probe (probe before relying on it).
 	@python3 scripts/catalog-discover.py \
 	  $(if $(ADD),--add $(ADD),--add) \
-	@# No store paths are passed: scripts/select-models.py hardcodes them
-	@# (DEVAI_ROOT=/var/cache/devai; ollama/, vllm/, sglang/ beneath it) and
-	@# ignores any variable that tries to move one. See its "Storage layout" block.
 	  $(if $(FAMILY),--family $(FAMILY),) \
 	  $(if $(YES),--yes,)
 
@@ -1558,6 +1614,24 @@ build-router: ## Build the gpu-arbiter router image
 		-f deploy/Dockerfile.router \
 		-t devai-router .
 
+# Where scripts/build-ollama.sh leaves the compiled tree. NOT under
+# $(CACHE_DIR): a new top-level directory there is not volume-backed.
+OLLAMA_DIST ?= $(HOME)/.cache/devai/ollama-build/dist
+
+build-ollama: build-ollama-dist build-ollama-image ## Compile Ollama from source on the host, then build the slim devai-ollama image from it.
+
+build-ollama-dist: ## Compile Ollama FROM SOURCE on the host for this GPU only (CUDA 13, compute capability 12.0). Needs cmake + the CUDA 13 apt packages; see scripts/build-ollama.sh. OLLAMA_VERSION=vX.Y.Z picks the release.
+	$(if $(OLLAMA_VERSION),OLLAMA_VERSION=$(OLLAMA_VERSION),) bash scripts/build-ollama.sh
+
+build-ollama-image: ## Build the devai-ollama image (debian:trixie-slim + the host-compiled Ollama). No upstream Ollama image is used, not even as a build input.
+	@test -x $(OLLAMA_DIST)/bin/ollama || { echo "error: no build at $(OLLAMA_DIST) -- run 'make build-ollama-dist' first" >&2; exit 1; }
+	$(CONTAINER_RUNTIME) build --network=host \
+		$(PROXY_BUILD_ARGS) \
+		$(APT_PROXY_ARG) \
+		-v $(OLLAMA_DIST):/var/cache/ollama-dist:ro \
+		-f deploy/Dockerfile.ollama \
+		-t devai-ollama .
+
 INSTALL_PREFIX ?= $(HOME)/.local
 DEVAI_HOME ?= $(HOME)/.devai
 
@@ -1614,24 +1688,6 @@ install: ## Install bin/devai-agent to $(INSTALL_PREFIX)/bin and stage config in
 	@echo "  installed: $(INSTALL_PREFIX)/bin/devai-agent"
 	@echo
 	@echo "Next steps:"
-# Where scripts/build-ollama.sh leaves the compiled tree. NOT under
-# $(CACHE_DIR): a new top-level directory there is not volume-backed.
-OLLAMA_DIST ?= $(HOME)/.cache/devai/ollama-build/dist
-
-build-ollama: build-ollama-dist build-ollama-image ## Compile Ollama from source on the host, then build the slim devai-ollama image from it.
-
-build-ollama-dist: ## Compile Ollama FROM SOURCE on the host for this GPU only (CUDA 13, compute capability 12.0). Needs cmake + the CUDA 13 apt packages; see scripts/build-ollama.sh. OLLAMA_VERSION=vX.Y.Z picks the release.
-	$(if $(OLLAMA_VERSION),OLLAMA_VERSION=$(OLLAMA_VERSION),) bash scripts/build-ollama.sh
-
-build-ollama-image: ## Build the devai-ollama image (debian:trixie-slim + the host-compiled Ollama). No upstream Ollama image is used, not even as a build input.
-	@test -x $(OLLAMA_DIST)/bin/ollama || { echo "error: no build at $(OLLAMA_DIST) -- run 'make build-ollama-dist' first" >&2; exit 1; }
-	$(CONTAINER_RUNTIME) build --network=host \
-		$(PROXY_BUILD_ARGS) \
-		$(APT_PROXY_ARG) \
-		-v $(OLLAMA_DIST):/var/cache/ollama-dist:ro \
-		-f deploy/Dockerfile.ollama \
-		-t devai-ollama .
-
 	@echo "  1. Add $(INSTALL_PREFIX)/bin to PATH if not already."
 	@echo "  2. devai-agent --init     # create $(DEVAI_HOME)/preferences.yaml"
 	@echo "  3. devai-agent            # launch the lab + picker"

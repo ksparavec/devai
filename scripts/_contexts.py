@@ -245,3 +245,21 @@ def vram_overhead_bytes(host_gb: int, target_gb: int) -> int:
     if target_gb == host_gb:
         return 0
     return (host_gb - target_gb) * 1024 * 1024 * 1024
+
+
+def ballast_mib(host_gb: int, target_gb: int) -> int:
+    """MiB of VRAM scripts/vram-ballast.py must HOLD so a host_gb card
+    physically has only target_gb free while that band is probed.
+
+    The probe loads models with num_gpu=999 (all layers on the GPU, or fail).
+    No engine setting can make such a load fail while the memory is there:
+    OLLAMA_GPU_OVERHEAD no longer governs placement, and llama.cpp's
+    --fit-target is ignored once the layer count is pinned (fit only adjusts
+    UNSET parameters). Taking the memory away for real is the one simulation
+    that does not depend on the engine.
+
+    Returns 0 when target == host: the host-sized band runs under production
+    conditions, with no ballast at all. Raises like vram_overhead_bytes when
+    asked to simulate a larger card on a smaller one.
+    """
+    return vram_overhead_bytes(host_gb, target_gb) // (1024 * 1024)

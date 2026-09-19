@@ -394,6 +394,31 @@ def probe_one_context(
     return record
 
 
+def band_violation(rec: dict, vram_gb: int) -> str | None:
+    """Why this cell is physically impossible on its VRAM band, or None.
+
+    Each pass simulates a `vram_gb` card on a (possibly larger) host. A cell
+    that used MORE VRAM than its band is therefore not a measurement -- it is
+    proof the simulation was not in effect and the daemon saw the whole card.
+    It must never be recorded: the 16G band would then advertise models that
+    cannot run on a 16 GB card.
+
+    Deliberately independent of HOW the band is simulated. Two engine knobs
+    have failed at it already (OLLAMA_GPU_OVERHEAD stopped governing placement
+    when llama.cpp's automatic fit took over; LLAMA_ARG_FIT_TARGET is ignored
+    under the probe's num_gpu=999), and the first failure took a human
+    noticing "21.85 GB fully on GPU at 16G". This notices first -- it is what
+    caught the second one, on its first run.
+    Applies to spilled cells too: no cell may exceed its band.
+    """
+    used = rec.get("actual_vram_gb")
+    if used is None or used <= vram_gb:
+        return None
+    return (f"measured {used} GiB of VRAM on the {vram_gb}G band -- impossible "
+            f"on a {vram_gb} GB card, so the band simulation is NOT in effect "
+            f"(the daemon can see more VRAM than the band allows)")
+
+
 def maybe_probe_disable(
     ollama_url: str,
     canonical_name: str,
@@ -918,6 +943,18 @@ def main() -> None:
                 args.num_predict, args.timeout, ctx,
             )
             rec["vram_gb"] = vram_gb
+            impossible = band_violation(rec, vram_gb)
+            if impossible:
+                # BEFORE the cell is stored or the cache saved. Everything
+                # this pass would go on to record is suspect for the same
+                # reason, so stop the whole pass, loudly.
+                sys.exit(
+                    f"error: {canonical} @ {context_label(ctx)}: {impossible}.\n"
+                    f"       Refusing to record it, and aborting this band.\n"
+                    f"       `make probe` simulates a smaller card by holding the "
+                    f"difference in VRAM with scripts/vram-ballast.py;\n"
+                    f"       check one is running and that `nvidia-smi` shows "
+                    f"no more than {vram_gb} GiB free.")
             vram_band[str(ctx)] = rec
             entry.setdefault("first_probed_at", rec["probed_at"])
             entry["last_probed_at"] = rec["probed_at"]
