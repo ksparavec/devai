@@ -1340,7 +1340,6 @@ probe-load-sglang: ## Serving-time LOAD probe for SGLang: same as probe-load-vll
 
 model-fit: ## Print which models fit at the chosen (VRAM, CONTEXT) — diagnostic, no writes.
 	@OLLAMA_CONTAINER=$(OLLAMA_CONTAINER) CONTAINER_RUNTIME=$(CONTAINER_RUNTIME) \
-	 VLLM_MODELS_DIR=$(VLLM_MODELS_DIR) SGLANG_MODELS_DIR=$(SGLANG_MODELS_DIR) \
 	 HF_CLI=$(HF_CLI) \
 	 GPU_MEMORY_GB=$${VRAM:-$(GPU_MEMORY_GB)} MAX_CONTEXT_LEN=$${CONTEXT:-$(MAX_CONTEXT_LEN)} \
 	 VERBOSE=$${VERBOSE:-0} \
@@ -1351,10 +1350,13 @@ model-fit: ## Print which models fit at the chosen (VRAM, CONTEXT) — diagnosti
 			$(if $(CONTEXTS),--contexts $(CONTEXTS),) \
 			$(if $(KV),--kv-dtype $(KV),)
 
-model-pull: ## Pull missing best-fit candidates from the catalog (catalog-driven downloads).
+model-pull: ## Pull missing best-fit candidates from the catalog (catalog-driven downloads). The ONLY sanctioned way to download a model.
+	@# No store paths are passed: scripts/select-models.py hardcodes them
+	@# (DEVAI_ROOT=/var/cache/devai; ollama/, vllm/, sglang/ beneath it) and
+	@# ignores any variable that tries to move one. See its "Storage layout" block.
+	@# Downloading a model any other way is STRICTLY FORBIDDEN (CLAUDE.md).
 	@set -e; \
 	 OLLAMA_CONTAINER=$(OLLAMA_CONTAINER) CONTAINER_RUNTIME=$(CONTAINER_RUNTIME) \
-	 VLLM_MODELS_DIR=$(VLLM_MODELS_DIR) SGLANG_MODELS_DIR=$(SGLANG_MODELS_DIR) \
 	 HF_CLI=$(HF_CLI) \
 	 GPU_MEMORY_GB=$${VRAM:-$(GPU_MEMORY_GB)} MAX_CONTEXT_LEN=$${CONTEXT:-$(MAX_CONTEXT_LEN)} \
 	 VERBOSE=$${VERBOSE:-0} \
@@ -1418,6 +1420,9 @@ catalog-discover-add: ## Discover, then CONFIRM-add candidates into scripts/mode
 	@# After adding: make catalog-regen && make probe (probe before relying on it).
 	@python3 scripts/catalog-discover.py \
 	  $(if $(ADD),--add $(ADD),--add) \
+	@# No store paths are passed: scripts/select-models.py hardcodes them
+	@# (DEVAI_ROOT=/var/cache/devai; ollama/, vllm/, sglang/ beneath it) and
+	@# ignores any variable that tries to move one. See its "Storage layout" block.
 	  $(if $(FAMILY),--family $(FAMILY),) \
 	  $(if $(YES),--yes,)
 

@@ -248,6 +248,26 @@ All services share `devai-net` network. Model data stored under `/var/cache/deva
 - Generate with `mkcert <IP>` on browser workstation, copy to container host
 
 ### Model picker (shell + Jupyter)
+### Model stores and the download rule
+
+**One root, three backend stores. These are the ONLY directories any backend's models live in:**
+
+```
+DEVAI_ROOT     /var/cache/devai
+OLLAMA_STORE   /var/cache/devai/ollama    GGUF: blobs, manifests, and GGUF staging (models/_gguf)
+VLLM_STORE     /var/cache/devai/vllm      HF safetensors served by vLLM
+SGLANG_STORE   /var/cache/devai/sglang    HF safetensors served by SGLang
+```
+
+They are defined in the "Storage layout" block at the top of `scripts/select-models.py`, and every path there is WRITTEN OUT. None is computed from another path (`.parent` and the like are banned on store paths) and none can be relocated by an environment variable -- `VLLM_MODELS_DIR`, `SGLANG_MODELS_DIR`, `OLLAMA_HOST_ROOT`, `OLLAMA_MANIFESTS_DIR` and `DEVAI_ROOT` are all ignored by that script. The Makefile's `model-fit` and `model-pull` recipes accordingly pass NO store paths to it (they used to pass `VLLM_MODELS_DIR` / `SGLANG_MODELS_DIR`, which implied the stores could be steered from there); those two variables survive in the Makefile only for the tools that still read them -- the probers, bench and compose. Pinned by `StorageLayoutTest` in `tests/python/test_select_models_stores.py`, including a source-level check that no store path uses `.parent` and a check that neither recipe passes a store variable.
+
+**DOWNLOADING A MODEL WITHOUT THE SCRIPT IS STRICTLY FORBIDDEN.** No hand-run `hf download`, `ollama pull`, `ollama create`, `curl`, `wget` or `git lfs` into any store, for any reason, including "just this once" and "it is not a catalog row yet". The only sanctioned path is `make model-pull` (which runs `scripts/select-models.py --download`), or that script directly with `--name <row> --download [--hf-store sglang]`. A model that is not in the catalog is added to `scripts/model-families.yaml` and regenerated with `make catalog-regen` FIRST; then it is pulled. The script is what enforces the catalog, the fit check, the exclusion ledger and the path rules above, and a hand-run command enforces none of them.
+
+Why this is a hard rule rather than advice -- both failures happened on 2026-09-19, in one session:
+
+- GGUF staging used to be `VLLM_MODELS.parent / "_gguf"`. That was correct only while the vLLM store sat inside the Ollama tree. The 2026-07-17 storage refactor (`21e5d4b`) moved the vLLM store to its own directory, and the derived staging path silently followed it out to `/var/cache/devai/_gguf` -- a stray top-level directory that `devai-ollama` cannot see, since it mounts `OLLAMA_STORE` and nothing else. Nothing exercised it for two months. The first GGUF pull afterwards downloaded three files (43 GiB, about three hours on that day's link) and only THEN failed at `ollama create`. The same `.parent` arithmetic had a second victim: `orphan_blob_gb()` looked for blobs under `models/manifests/blobs`, which has never existed, so it returned 0.0 for its entire life.
+- A hand-written `hf download <repo> --exclude a b c` parsed `b` and `c` as filenames, matched nothing, downloaded nothing, and exited 0 -- reported as a success. `pull_hf` in the script already carried a comment warning about exactly that pitfall.
+
 
 Interactive model -> agent selection via fzf. Used by `make shell-*` (via `agent-picker`), the standalone `devai-agent` launcher, and JupyterLab launcher cards.
 

@@ -85,29 +85,48 @@ KV_BYTES = {
 KV_DTYPE_PER_BACKEND = "per-backend"
 DEFAULT_CANDIDATE_CONTEXTS = "32768,65536,131072,262144"
 
-OLLAMA_MANIFESTS = Path(
-    os.environ.get("OLLAMA_MANIFESTS_DIR",
-                   "/var/cache/devai/ollama/models/manifests/registry.ollama.ai/library")
-)
-VLLM_MODELS = Path(
-    os.environ.get("VLLM_MODELS_DIR",
-                   "/var/cache/devai/vllm")
-)
-SGLANG_MODELS = Path(
-    os.environ.get("SGLANG_MODELS_DIR",
-                   "/var/cache/devai/sglang")
-)
+# ── Storage layout ──────────────────────────────────────────────────────────
+#
+# ONE root and THREE backend stores. These are the only directories any
+# backend's models live in, and this script is the only sanctioned way to put
+# a model into them -- downloading by hand (`hf download`, `ollama pull`,
+# curl, ...) is STRICTLY FORBIDDEN: it bypasses the catalog, the fit check,
+# the exclusion ledger and the path rules below.
+#
+#   DEVAI_ROOT     /var/cache/devai
+#   OLLAMA_STORE   /var/cache/devai/ollama    GGUF; blobs, manifests, staging
+#   VLLM_STORE     /var/cache/devai/vllm      HF safetensors served by vLLM
+#   SGLANG_STORE   /var/cache/devai/sglang    HF safetensors served by SGLang
+#
+# Every path is WRITTEN OUT. None is computed from another (`.parent` and
+# friends are banned here) and none can be moved by an environment variable.
+# That is a rule with a cost attached: GGUF staging used to be
+# `VLLM_MODELS.parent / "_gguf"`, which was right only while the vLLM store
+# sat inside the Ollama tree. When the store moved (2026-07-17) the staging
+# path silently followed it out to /var/cache/devai/_gguf, and the next GGUF
+# pull (2026-09-19) downloaded 43 GiB to a place devai-ollama cannot see before
+# failing at `ollama create`. Pinned by StorageLayoutTest.
+DEVAI_ROOT = Path("/var/cache/devai")
 
-# vLLM and SGLang read weights from SEPARATE volumes (see CLAUDE.md's
-# /var/cache/devai mount-point convention): devai-vllm mounts VLLM_MODELS_DIR,
-# devai-sglang mounts SGLANG_MODELS_DIR, and the probe targets pass each dir
-# to its own prober. A model downloaded for one backend is therefore INVISIBLE
-# to the other. They are distinct filesystems, so hardlinking across them is
-# impossible and copying doubles hundreds of GB -- which is why the download
-# destination is an explicit opt-in (--hf-store) and never an automatic
+OLLAMA_STORE = DEVAI_ROOT / "ollama"
+VLLM_STORE = DEVAI_ROOT / "vllm"
+SGLANG_STORE = DEVAI_ROOT / "sglang"
+
+# Inside the Ollama store. devai-ollama mounts OLLAMA_STORE and nothing else
+# (deploy/docker-compose.yaml: /var/cache/devai/ollama:/root/.ollama), so
+# anything it must read -- including GGUF files staged for `ollama create` --
+# has to live under it.
+OLLAMA_BLOBS = OLLAMA_STORE / "models" / "blobs"
+OLLAMA_MANIFESTS_ROOT = OLLAMA_STORE / "models" / "manifests"
+OLLAMA_MANIFESTS = OLLAMA_MANIFESTS_ROOT / "registry.ollama.ai" / "library"
+GGUF_STAGING = OLLAMA_STORE / "models" / "_gguf"
+
+# Each engine's container mounts only its own store, so a model downloaded
+# for one is INVISIBLE to the other. Putting weights in the SGLang store is
+# therefore an explicit opt-in (--hf-store) and never an automatic
 # duplication. `sglang_weight_gaps` catches the other half of the problem:
 # weights the SGLang probe cache advertises but the SGLang store does not have.
-HF_STORES = {"vllm": VLLM_MODELS, "sglang": SGLANG_MODELS}
+HF_STORES = {"vllm": VLLM_STORE, "sglang": SGLANG_STORE}
 HF_STORE = "vllm"            # active store for this run; set by main()
 
 
@@ -121,31 +140,26 @@ CONTAINER_RUNTIME = os.environ.get("CONTAINER_RUNTIME", "podman")
 HF_CLI = os.environ.get("HF_CLI", "hf")
 
 # Host → container path mapping for the devai-ollama service.
-# deploy/docker-compose.yaml mounts `/var/cache/devai/ollama:/root/.ollama`,
-# so any host path under that root has a deterministic in-container twin.
-# Used by `ollama create -w <dir>` so the daemon can resolve the GGUF file
-# referenced by FROM in the Modelfile.
-OLLAMA_HOST_ROOT = Path(
-    os.environ.get("OLLAMA_HOST_ROOT", "/var/cache/devai/ollama")
-)
-OLLAMA_CONTAINER_ROOT = Path(
-    os.environ.get("OLLAMA_CONTAINER_ROOT", "/root/.ollama")
-)
+# deploy/docker-compose.yaml mounts OLLAMA_STORE at /root/.ollama, so any host
+# path under that store has a deterministic in-container twin. Used by
+# `ollama create -w <dir>` so the daemon can resolve the GGUF file referenced
+# by FROM in the Modelfile.
+OLLAMA_CONTAINER_ROOT = Path("/root/.ollama")
 
 
 def to_container_path(host_path: Path) -> str:
-    """Map a host path under OLLAMA_HOST_ROOT to its devai-ollama path.
+    """Map a host path under OLLAMA_STORE to its devai-ollama path.
 
-    Raises ValueError when host_path is outside the mounted root, since
+    Raises ValueError when host_path is outside the mounted store, since
     `ollama create` would not be able to read the file in that case.
     """
     resolved = host_path.resolve()
     try:
-        rel = resolved.relative_to(OLLAMA_HOST_ROOT.resolve())
+        rel = resolved.relative_to(OLLAMA_STORE.resolve())
     except ValueError as exc:
         raise ValueError(
-            f"path {resolved} is not under {OLLAMA_HOST_ROOT} — devai-ollama "
-            f"cannot see it. Set OLLAMA_HOST_ROOT or move the file."
+            f"path {resolved} is not under {OLLAMA_STORE} — devai-ollama "
+            f"cannot see it. Everything Ollama reads must live in its store."
         ) from exc
     return str(OLLAMA_CONTAINER_ROOT / rel)
 
@@ -468,14 +482,8 @@ def pull_hf(display_name: str, repo: str) -> None:
         sys.exit(f"error: hf download {repo} failed with rc={rc}")
 
 
-# Staging for GGUF blobs imported into Ollama via Modelfile. Lives next to
-# VLLM_MODELS so we don't pollute Ollama's blob store with files that are
-# already absorbed there. Path is informational — Ollama hardlinks/copies
-# the file into its blob store on `ollama create`.
-GGUF_STAGING = VLLM_MODELS.parent / "_gguf"
-
-
-def pull_gguf(display_name: str, repo: str, filename: str, family: str) -> None:
+def pull_gguf(display_name: str, repo: str, filename: str, family: str,
+              renderer: str | None = None, parser: str | None = None) -> None:
     """Download one GGUF file from HF, register it in Ollama via Modelfile.
 
     Three steps:
@@ -676,11 +684,11 @@ def shadow_ollama_tags(catalog_models: list[dict]) -> list[str]:
 def orphan_blob_gb() -> float:
     """Return total GB of on-disk blobs not referenced by any manifest."""
     import json
-    blobs_dir = OLLAMA_MANIFESTS.parent.parent / "blobs"
+    blobs_dir = OLLAMA_BLOBS
     if not blobs_dir.is_dir():
         return 0.0
     referenced: set[str] = set()
-    for root, _dirs, files in os.walk(OLLAMA_MANIFESTS.parent.parent / "manifests"):
+    for root, _dirs, files in os.walk(OLLAMA_MANIFESTS_ROOT):
         for f in files:
             p = Path(root) / f
             try:
@@ -856,7 +864,7 @@ class HFProbeCaches:
 def sglang_weight_gaps(
     models: list[dict], hf_caches: HFProbeCaches,
 ) -> list[str]:
-    """Catalog rows the SGLang probe cache advertises but SGLANG_MODELS lacks.
+    """Catalog rows the SGLang probe cache advertises but SGLANG_STORE lacks.
 
     The SGLang store is a different volume from the vLLM store, so a model
     pulled by the (vLLM-defaulted) download path leaves no weights where
@@ -873,7 +881,7 @@ def sglang_weight_gaps(
         if not hf_caches.entry_fits(m.get("repo") or "", m.get("sha") or "",
                                     "sglang"):
             continue
-        if (SGLANG_MODELS / m["name"] / "config.json").is_file():
+        if (SGLANG_STORE / m["name"] / "config.json").is_file():
             continue
         gaps.append(m["name"])
     return gaps
@@ -896,7 +904,7 @@ def unrecorded_retirements(
     Not an error: a model may legitimately be mid-download, or awaiting a
     decision. It is a prompt to record one.
     """
-    stores = {"vllm": VLLM_MODELS, "sglang": SGLANG_MODELS}
+    stores = {"vllm": VLLM_STORE, "sglang": SGLANG_STORE}
     out: list[tuple[str, str]] = []
     for m in models:
         if m.get("source") != "hf":
@@ -953,7 +961,7 @@ def report_sglang_weight_gaps(gaps: list[str], fatal: bool,
     print(file=w)
     print(f"  {label}: {len(gaps)} model(s) advertised as SGLang-fitting "
           f"by {SGLANG_PROBE_CACHE.name} have no weights under "
-          f"{SGLANG_MODELS}:", file=w)
+          f"{SGLANG_STORE}:", file=w)
     for name in gaps:
         print(f"    - {name}", file=w)
     print(file=w)
@@ -1828,8 +1836,8 @@ def main() -> None:
                          "is set.")
     ap.add_argument("--hf-store", choices=sorted(HF_STORES), default="vllm",
                     help="Which HF weight store this run reads and writes: "
-                         "'vllm' ($VLLM_MODELS_DIR, the default) or 'sglang' "
-                         "($SGLANG_MODELS_DIR). They are separate volumes, so "
+                         "'vllm' (/var/cache/devai/vllm, the default) or 'sglang' "
+                         "(/var/cache/devai/sglang). Each engine mounts only its own, so "
                          "downloading for SGLang is an explicit opt-in -- it "
                          "costs a second full copy of the weights.")
     ap.add_argument("--ignore-store-gaps", action="store_true",

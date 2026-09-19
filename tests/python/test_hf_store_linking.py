@@ -160,7 +160,7 @@ class SelectModelsUsesThePeerStoreTest(unittest.TestCase):
 
         self.sm = _load("select_models", "scripts/select-models.py")
         self.sm.HF_STORES.update({"vllm": self.vllm, "sglang": self.sglang})
-        self.sm.VLLM_MODELS, self.sm.SGLANG_MODELS = self.vllm, self.sglang
+        self.sm.VLLM_STORE, self.sm.SGLANG_STORE = self.vllm, self.sglang
         self.sm.HF_STORE = "sglang"
 
     def test_links_when_the_peer_has_it(self):
