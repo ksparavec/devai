@@ -57,6 +57,41 @@
     "direct podman launch first."
   ],
   "models": {
+    "Qwen3.8-27B-MTP-NVFP4": {
+      "backends": ["vllm"],
+      "engine_flags": [
+        "--language-model-only",
+        "--max-num-seqs", "4",
+        "--gpu-memory-utilization", "0.95"
+      ],
+      "engine_env": {
+        "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS": "0"
+      },
+      "_engine_flags_comment": [
+        "Copied from Qwen3.6-27B-MTP-pi-tune-NVFP4 below, which is the same",
+        "author (sakamakismile), SAME arch Qwen3_5ForConditionalGeneration,",
+        "SAME format (compressed-tensors / nvfp4-pack-quantized, so",
+        "DELIBERATELY NO --quantization modelopt) and the same size (19.1 vs",
+        "19.15 GiB), with a resident vision tower (vision_config present).",
+        "This entry is a PREREQUISITE for a valid probe, not a tuning: per",
+        "the sibling's notes the checkpoint otherwise loads, compiles, warms",
+        "up and then OOMs inside vLLM's CUDA-graph memory profiler (the",
+        "Blackwell double-count that VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0",
+        "disables) -- which the prober would record as a false `oom` verdict.",
+        "NOT YET VERIFIED for this checkpoint; the sibling reached 32K.",
+        "",
+        "DELIBERATELY NO --mamba-ssm-cache-dtype float16. syv-ai/HyperQwen",
+        "serves this model with it and measured perplexity as unchanged, but",
+        "this checkpoint's own config.json requests mamba_ssm_dtype=float32,",
+        "and a recurrent state accumulates error with sequence length -- the",
+        "regime perplexity over short text cannot see, and the one where q8_0",
+        "KV cost GPQA 0.87 -> 0.75 here. Measure its context gain with a",
+        "dry run against a scratch registry (RECOVERY_FLAGS_REGISTRY=<copy>",
+        "plus --no-cache-write); adopt it only after a GPQA bench, as a",
+        "per-tier opt-in like the q8_0 KV tier, never as a silent default.",
+        "Verify: make probe-vllm PROBE_REPO=Qwen3.8-27B-MTP-NVFP4 PROBE_FORCE=1"
+      ]
+    },
     "Qwen3.6-27B-MTP-pi-tune-NVFP4": {
       "backends": ["vllm"],
       "engine_flags": [
