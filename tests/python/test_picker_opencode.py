@@ -186,6 +186,30 @@ class TestVettedIdShape(unittest.TestCase):
         self.assertEqual(out["vllm"], ["Qwen3-8B-NVFP4@32768"])
         self.assertEqual(out["sglang"], ["gpt-oss-20b@131072"])
 
+    def test_ids_carry_the_launch_suffixes(self) -> None:
+        """An in-session switch must launch the row as the picker would.
+
+        A bare `<name>@<ctx>` for an MTP row launched it without its
+        drafter (and recreated the container when the session had started
+        on the `::mtp` id).
+        """
+        mtp = {"method": "mtp", "num_speculative_tokens": 3}
+        rows = [
+            {"name": "Qwen3.8-27B-MTP-devai-NVFP4", "backend": "vllm-devai",
+             "_picker_context": 118784, "capability": "inline",
+             "catalog_meta": {"mtp": mtp}},
+            {"name": "Qwen3-Next-MTP", "backend": "vllm",
+             "_picker_context": 65536, "capability": "structured",
+             "catalog_meta": {"mtp": mtp}},
+            {"name": "Qwen3-8B-NVFP4", "backend": "vllm",
+             "_picker_context": 32768, "capability": "inline"},
+        ]
+        out = PICKER._vetted_ids_by_backend(rows)
+        self.assertEqual(out["vllm-devai"],
+                         ["Qwen3.8-27B-MTP-devai-NVFP4::nothink::mtp@118784"])
+        self.assertEqual(out["vllm"],
+                         ["Qwen3-Next-MTP::mtp@65536", "Qwen3-8B-NVFP4@32768"])
+
     def test_same_name_on_two_backends_is_kept_on_both(self) -> None:
         """The menu dedups vLLM/SGLang; the provider list must not."""
         rows = [

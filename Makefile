@@ -781,7 +781,7 @@ pipelock-ca-init: ## One-time: generate the pipelock MITM CA. Cert -> deploy/ (c
 	if [ ! -f "$$tmp/ca.pem" ] || [ ! -f "$$tmp/ca-key.pem" ]; then \
 	    echo "ERROR: pipelock tls init did not produce a CA." >&2; rm -rf "$$tmp"; exit 1; \
 	fi; \
-	cp "$$tmp/ca.pem" deploy/pipelock-ca.crt; \
+	install -m 644 "$$tmp/ca.pem" deploy/pipelock-ca.crt; \
 	install -m 600 "$$tmp/ca-key.pem" "$(PIPELOCK_CA_KEY)"; \
 	shred -u "$$tmp/ca-key.pem" 2>/dev/null || true; rm -rf "$$tmp"; \
 	echo ""; \

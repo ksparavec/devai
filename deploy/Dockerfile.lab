@@ -70,7 +70,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # `make pipelock-ca-init` (the shipped default's private key is intentionally
 # not distributed). Proxy env (HTTPS_PROXY/NO_PROXY) is injected at RUNTIME by
 # bin/devai-agent and the make lab/shell targets, not baked here.
-COPY deploy/pipelock-ca.crt /usr/local/share/ca-certificates/pipelock-ca.crt
+# --chmod: it is a public cert, but `make pipelock-ca-init` used to copy it
+# with pipelock's 0600, and COPY keeps the source mode -- root-only, so every
+# Node/Bun tool running as devai failed to load NODE_EXTRA_CA_CERTS below.
+COPY --chmod=0644 deploy/pipelock-ca.crt /usr/local/share/ca-certificates/pipelock-ca.crt
 RUN update-ca-certificates
 ENV NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/pipelock-ca.crt \
     REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
@@ -191,7 +194,6 @@ COPY packages/jupyter-ai-launchers/jupyter_ai_launchers/labextension /usr/local/
 # --- Runtime setup ---
 
 # Install wrapper scripts for JupyterLab launchers and shell picker
-COPY scripts/ollama-chat.sh /usr/local/bin/ollama-chat
 # aiagent shell launcher: the picker's "AIAgent (shell)" agent configures the
 # router endpoint + model, then execs this to drop the user into an interactive
 # bash shell where they run `aiagent ...` themselves. See scripts/aiagent-launcher.sh.
@@ -216,7 +218,7 @@ COPY scripts/_capability.py /usr/local/bin/_capability.py
 COPY scripts/_model_status.py /usr/local/bin/_model_status.py
 COPY scripts/vram-fit.py /usr/local/bin/vram-fit.py
 COPY deploy/models.yaml /etc/devai/models.yaml
-RUN chmod +x /usr/local/bin/ollama-chat /usr/local/bin/aiagent-shell /usr/local/bin/agent-picker /usr/local/bin/model-picker /usr/local/bin/sky-setup.sh
+RUN chmod +x /usr/local/bin/aiagent-shell /usr/local/bin/agent-picker /usr/local/bin/model-picker /usr/local/bin/sky-setup.sh
 
 # Name the GPU 'render' group in /etc/group. On the host, /dev/dri/renderD* is
 # owned by group `render` (GID 992 here); `--device nvidia.com/gpu=all` (NVIDIA

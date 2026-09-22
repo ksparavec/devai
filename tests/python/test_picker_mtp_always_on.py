@@ -65,7 +65,12 @@ class NoPreviewFlagTest(unittest.TestCase):
         # decode speed, so a supporting row always launches with ::mtp.
         src = PICKER.read_text()
         self.assertIn('mtp_suffix = "::mtp" if mtp_mode == "on" else ""', src)
-        self.assertIn('mtp_mode = "on" if _has_mtp(model) else "off"', src)
+        # The rule lives in _default_modes (shared with the vetted-id list
+        # the agents' in-session switchers read): on exactly when supported.
+        mp = _load_picker()
+        self.assertEqual(mp._default_modes(_mtp_row())[1], "on")
+        self.assertEqual(mp._default_modes({"name": "x", "backend": "vllm"})[1], "off")
+        self.assertIn("_default_modes(model)", src)
         self.assertNotIn('memory_key="mtp"', src)
         self.assertNotIn("MTP OFF", src)
 

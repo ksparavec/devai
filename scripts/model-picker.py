@@ -1782,6 +1782,21 @@ def _has_mtp(m: dict) -> bool:
     return _mtp_block(m) is not None and not _mtp_probe_unfit(m)
 
 
+def _default_modes(m: dict) -> tuple[str, str]:
+    """(reasoning_mode, mtp_mode) a row launches with before any toggle.
+
+    MTP is on for every row that supports it (no toggle), and an
+    inline-reasoning row with MTP is forced to reasoning OFF, because the
+    router refuses reasoning-ON + MTP on inline models (vllm#34650). Shared
+    by `_resolve_agent` and `_vetted_ids_by_backend`, so the ids an agent's
+    in-session model switcher offers match what the picker launches.
+    """
+    mtp_mode = "on" if _has_mtp(m) else "off"
+    if str(m.get("capability") or "") == Capability.INLINE and mtp_mode == "on":
+        return "nothink", mtp_mode
+    return "default", mtp_mode
+
+
 def _ctx_tier(ctx: int) -> int:
     """Index of `ctx` in ascending _CONTEXT_CHOICES. Larger ctx → larger tier."""
     tiers = sorted(_CONTEXT_CHOICES)
@@ -2995,6 +3010,13 @@ def _vetted_ids_by_backend(rows: list[dict]) -> dict[str, list[str]]:
     Callers pass the PRE-dedup candidate list: the picker menu collapses a
     name that fits on both vLLM and SGLang into one row, but each backend
     is its own provider here, so both belong.
+
+    Each id also carries the suffixes the picker's own launch would put on
+    that row (`_default_modes`): `::mtp` on an MTP-capable row, plus
+    `::nothink` when that row reasons inline. A bare `<name>@<ctx>` would
+    make an in-session model switch launch the row WITHOUT its drafter --
+    and, when the session started on the `::mtp` id, recreate the container
+    to drop it.
     """
     out: dict[str, list[str]] = {b: [] for b in _BACKENDS}
     for row in rows:
@@ -3003,7 +3025,13 @@ def _vetted_ids_by_backend(rows: list[dict]) -> dict[str, list[str]]:
         if not name or backend not in out:
             continue
         ctx = int(row.get("_picker_context") or 0)
-        ident = name if backend == "ollama" else f"{name}@{ctx}"
+        reasoning_mode, mtp_mode = _default_modes(row)
+        ident = _serving_name(
+            name, backend,
+            "::nothink" if reasoning_mode == "nothink" else "",
+            "::mtp" if mtp_mode == "on" else "",
+            ctx, ctx_pinned=False,
+        )
         if ident not in out[backend]:
             out[backend].append(ident)
     return out
@@ -3475,11 +3503,10 @@ def _resolve_agent(agent_filter: str | None, model: dict) -> tuple[str, str, str
     because the router refuses reasoning-ON + MTP on inline models
     (vllm#34650) and MTP is the one that stays.
     """
-    reasoning_mode = "default"
-    mtp_mode = "on" if _has_mtp(model) else "off"
+    reasoning_mode, mtp_mode = _default_modes(model)
     cap = str(model.get("capability") or "")
     if cap == Capability.INLINE and mtp_mode == "on":
-        reasoning_mode = "nothink"
+        pass  # reasoning forced OFF by _default_modes; no toggle
     elif cap == Capability.INLINE:
         toggle_lines = [
             f"  Reasoning ON   {_DIM}(default — model thinks inline){_RESET}",
