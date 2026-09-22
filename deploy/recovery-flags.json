@@ -57,17 +57,130 @@
     "direct podman launch first."
   ],
   "models": {
-    "Qwen3.8-27B-MTP-NVFP4": {
-      "backends": ["vllm"],
+    "Qwen3.8-27B-W4A16-devai-AutoRound": {
+      "backends": ["vllm-devai"],
       "engine_flags": [
         "--language-model-only",
         "--max-num-seqs", "4",
-        "--gpu-memory-utilization", "0.95"
+        "--gpu-memory-utilization", "0.93",
+        "--mamba-ssm-cache-dtype", "float16",
+        "--max-num-batched-tokens", "2048"
+      ],
+      "engine_env": {
+        "FLASHINFER_DISABLE_VERSION_CHECK": "1"
+      },
+      "_engine_flags_comment": [
+        "DERIVED row (2026-09-22): made from dbirks/Qwen3.8-27B-W4A16-AutoRound",
+        "by `make model-prepare` -- HyperQwen's CPU preparation (int8 g128",
+        "embed_tokens, lm_head and mtp.*, plus a 40,960-token int8 draft head;",
+        "18.13 -> 15.59 GiB), the source left as downloaded. Served ONLY by",
+        "the vllm-devai backend (the home-built, patched vLLM 0.28.0 image):",
+        "stock vLLM cannot load a quantized embedding for this architecture --",
+        "that is what HyperQwen's qwen3_5-embed-quant patch adds.",
+        "Flags are HyperQwen's single-user launch set (single-user/",
+        "start_qwen.sh at c0c81bb): fp16 GDN recurrent state (they measured",
+        "perplexity unchanged to 3 decimals; ~150 MB -> ~75 MB per slot),",
+        "0.93 utilisation, 2048 batched tokens (4096/8192 inflate the profiled",
+        "activation peak and do not boot there). --max-num-seqs 4 is their",
+        "long-context seat count and the article's advice for agent work.",
+        "--language-model-only drops the ~0.9 GiB vision tower."
+      ]
+    },
+    "Qwen3.8-27B-MTP-NVFP4": {
+      "backends": [
+        "vllm"
+      ],
+      "engine_flags": [
+        "--language-model-only",
+        "--max-num-seqs",
+        "4",
+        "--gpu-memory-utilization",
+        "0.95"
       ],
       "engine_env": {
         "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS": "0"
       },
       "_engine_flags_comment": [
+        "Copied from Qwen3.6-27B-MTP-pi-tune-NVFP4 below, which is the same",
+        "author (sakamakismile), SAME arch Qwen3_5ForConditionalGeneration,",
+        "SAME format (compressed-tensors / nvfp4-pack-quantized, so",
+        "DELIBERATELY NO --quantization modelopt) and the same size (19.1 vs",
+        "19.15 GiB), with a resident vision tower (vision_config present).",
+        "This entry is a PREREQUISITE for a valid probe, not a tuning: per",
+        "the sibling's notes the checkpoint otherwise loads, compiles, warms",
+        "up and then OOMs inside vLLM's CUDA-graph memory profiler (the",
+        "Blackwell double-count that VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0",
+        "disables) -- which the prober would record as a false `oom` verdict.",
+        "NOT YET VERIFIED for this checkpoint; the sibling reached 32K.",
+        "",
+        "DELIBERATELY NO --mamba-ssm-cache-dtype float16. syv-ai/HyperQwen",
+        "serves this model with it and measured perplexity as unchanged, but",
+        "this checkpoint's own config.json requests mamba_ssm_dtype=float32,",
+        "and a recurrent state accumulates error with sequence length -- the",
+        "regime perplexity over short text cannot see, and the one where q8_0",
+        "KV cost GPQA 0.87 -> 0.75 here. Measure its context gain in",
+        "isolation: RECOVERY_FLAGS_REGISTRY=<scratch registry copy> plus",
+        "--cache <scratch copy of the probe cache> plus --force, with",
+        "deploy/.model-status.json snapshotted before and restored after (the",
+        "ledger path is not redirectable). NOT --no-cache-write: it disables",
+        "--force once the band is cached, so the run silently does nothing.",
+        "Adopt fp16 state only after a GPQA bench, as a per-tier opt-in like",
+        "the q8_0 KV tier, never as a silent default.",
+        "",
+        "MEASURED 2026-09-19 (vLLM v0.22.1, these flags): fits 32K at 21.23 GB,",
+        "R=qwen3 T=qwen3_xml confirmed. Model loading 17.86 GiB; KV pool 1.76",
+        "GiB = 43,690 tokens; vLLM's own estimate of the true ceiling is 47,040",
+        "tokens, so 32K is the 32K-grid quantisation of ~47K. 64K needs 2.3 GiB",
+        "of KV and misses by 0.54 GiB. The prober reports that miss as",
+        "kind=infra because vLLM's 'larger than the available KV cache memory'",
+        "wording was not in _OOM_PATTERNS -- it is a genuine memory limit",
+        "(pattern added the same day; it now reads oom_startup).",
+        "",
+        "64K WAS ATTEMPTED AND DOES NOT FIT with quality-neutral stock flags.",
+        "Budget at DEBUG level: vLLM sees 23.43 GiB; weights 17.86 + torch peak",
+        "increase during profiling 2.53 + non-torch 0.15, the rest is KV.",
+        "  --gpu-memory-utilization 0.9688: KV 2.15 GiB, ceiling 59,584 tokens,",
+        "      still 0.15 GiB short. DO NOT ADOPT: vLLM pairs that figure with",
+        "      RE-ENABLING the CUDA-graph profiler, which must stay off on",
+        "      Blackwell, so ~0.44 GiB of graphs is unaccounted and requested +",
+        "      graphs = 23.13 of 23.2 GiB free at init.",
+        "  --max-num-batched-tokens: the default here is already 2048 (compile",
+        "      range (1, 2048)), NOT 8192. Raising it to 4096 cost only 0.06 GiB",
+        "      of KV, so the 2.53 GiB peak is barely token-proportional and",
+        "      lowering it below 2048 would recover a few hundredths of a GiB.",
+        "Steady-state use is ~21.3 of 23.43 GiB: the peak is released after",
+        "profiling but stays reserved. 128K needs ~4.3 GiB of KV, i.e. ~2.5 GiB",
+        "more than exists -- flags will not find that. It needs smaller weights",
+        "(int8 embed_tokens + lm_head are ~2.4 GiB EACH in bf16 here).",
+        "Verify: make probe-vllm PROBE_REPO=Qwen3.8-27B-MTP-NVFP4 PROBE_FORCE=1"
+      ]
+    },
+    "Qwen3.8-27B-MTP-devai-NVFP4": {
+      "backends": ["vllm-devai"],
+      "engine_flags": [
+        "--language-model-only",
+        "--max-num-seqs", "4",
+        "--gpu-memory-utilization", "0.96",
+        "--mamba-ssm-cache-dtype", "float16",
+        "--max-num-batched-tokens", "2048"
+      ],
+      "engine_env": {
+        "FLASHINFER_DISABLE_VERSION_CHECK": "1"
+      },
+      "_engine_flags_comment": [
+        "DERIVED row (2026-09-22): made from sakamakismile/Qwen3.8-27B-MTP-NVFP4",
+        "by `make model-prepare` -- bf16 embed_tokens, lm_head and mtp.* to int8",
+        "g128 (HyperQwen's quant_heads_stream.py), a 40,960-token int8 draft",
+        "head, and scripts/mixed_quant_groups.py rewriting the three new config",
+        "groups as weight-only pack-quantized (the upstream script clones the",
+        "NVFP4 body group, wrong for int8 tensors). The body stays NVFP4, so",
+        "Blackwell's native FP4 kernels serve it (prefill ~2.6x AutoRound's).",
+        "The source stays as downloaded. Served ONLY by the vllm-devai backend.",
+        "Utilisation 0.96: exact-probed to 116K with MTP (120K fits without).",
+        "The flags match the devai-AutoRound entry so the two builds compare",
+        "like for like. HISTORY below describes the as-delivered checkpoint on",
+        "stock vLLM 0.22.1.",
+        "",
         "Copied from Qwen3.6-27B-MTP-pi-tune-NVFP4 below, which is the same",
         "author (sakamakismile), SAME arch Qwen3_5ForConditionalGeneration,",
         "SAME format (compressed-tensors / nvfp4-pack-quantized, so",

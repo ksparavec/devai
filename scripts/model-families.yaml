@@ -254,11 +254,35 @@ families:
           - UD-Q4_K_XL
     hf_repos:
       - nvidia/Qwen3.8-27B-NVFP4
-      # NO mtp: block, on purpose -- see the Qwen3.6-27B-MTP-pi-tune-NVFP4
-      # note below: the qwen3_5_mtp draft lm_head (~2.37 GiB, vocab-sized)
-      # OOMs at model load on 24G for a ~19 GiB 27B, and nothing consumes
-      # mtp_fits, so a stray mtp block would be advertised and OOM at serve.
+      # NO mtp: block on the as-downloaded checkpoint: its bf16 embed_tokens
+      # and lm_head (2.37 GiB each) leave no room for the MTP drafter on 24G
+      # (measured on vLLM 0.22.1 and 0.28.0). MTP lives on the DERIVED row
+      # below, made from this one by `make model-prepare`.
       - sakamakismile/Qwen3.8-27B-MTP-NVFP4
+      # As published (bf16 embed_tokens / lm_head / mtp.*); never probed
+      # unprepared here. Its derived row below is the one that serves MTP.
+      - dbirks/Qwen3.8-27B-W4A16-AutoRound
+    # Derived checkpoints (2026-09-22): made ON THIS HOST from the hf_repos
+    # rows above by `make model-prepare NAME=<source>` -- HyperQwen's CPU
+    # preparation (int8 g128 embed_tokens / lm_head / mtp.*, 40,960-token
+    # int8 draft head; scripts/mixed_quant_groups.py on the NVFP4 body) into
+    # a NEW directory named `<source>` with `-devai` before the last term, the
+    # source left as downloaded. Only the home-built vLLM image (backend
+    # `vllm-devai`) can load them. `mtp` is the 0.28 method name
+    # (`qwen3_5_mtp` is the deprecated alias). Measured 2026-09-21/22, MTP on:
+    #   ...-MTP-devai-NVFP4     116K (exact-probed), 90 tok/s, prefill ~7,200 tok/s
+    #   ...-W4A16-devai-AutoRound  128K, 95 tok/s, prefill ~2,750 tok/s
+    derived:
+      - name: Qwen3.8-27B-MTP-devai-NVFP4
+        from: sakamakismile/Qwen3.8-27B-MTP-NVFP4
+        mtp:
+          method: mtp
+          num_speculative_tokens: 3
+      - name: Qwen3.8-27B-W4A16-devai-AutoRound
+        from: dbirks/Qwen3.8-27B-W4A16-AutoRound
+        mtp:
+          method: mtp
+          num_speculative_tokens: 3
     parsers:
       vllm:
         reasoning: qwen3

@@ -431,3 +431,39 @@ class TestPermanentHttpCodeClassifier(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DerivedRowsTest(unittest.TestCase):
+    """`derived:` entries become rows of their own (2026-09-22)."""
+
+    def _gc(self):
+        return _load_module()
+
+    def _source(self, gc, repo="sakamakismile/Qwen3.8-27B-MTP-NVFP4"):
+        arch = gc.Arch(layers=64, kv_heads=4, head_dim=256, k_eq_v=False,
+                       source=repo + "/config.json", kv_layers=16)
+        return gc.Entry(name=repo.split("/")[-1], family="qwen3.8", backend=list(gc.HF_BACKENDS),
+                        repo=repo, size_gb=19.15, arch=arch, source_kind="hf", thinking=True,
+                        sha="a0b936f0bbcb", parsers={"vllm": {"reasoning": "qwen3"}},
+                        conversational=True, mtp=None)
+
+    def test_derived_row_is_keyed_apart_from_its_source_and_serves_only_on_the_custom_image(self) -> None:
+        gc = self._gc()
+        src = self._source(gc)
+        e = gc._entry_derived({"name": "Qwen3.8-27B-MTP-devai-NVFP4", "from": src.repo,
+                               "mtp": {"method": "mtp", "num_speculative_tokens": 3}}, src, "qwen3.8")
+        self.assertEqual(e.source_kind, "derived")
+        self.assertEqual(e.derived_from, "Qwen3.8-27B-MTP-NVFP4")
+        self.assertEqual(e.backend, ["vllm-devai"])
+        self.assertEqual(e.repo, "devai/Qwen3.8-27B-MTP-devai-NVFP4")
+        self.assertEqual(e.sha, src.sha, "the sha stays the source revision")
+        self.assertNotEqual(f"{e.repo}@{e.sha}", f"{src.repo}@{src.sha}", "cache keys must differ")
+        self.assertEqual(e.arch, src.arch)
+        self.assertEqual(e.parsers, src.parsers)
+        self.assertEqual(e.mtp, {"method": "mtp", "num_speculative_tokens": 3})
+
+    def test_writer_emits_derived_from_next_to_source(self) -> None:
+        # The YAML writer is inline in main(); pin the emitted field there.
+        src = (REPO_ROOT / "scripts" / "generate-catalog.py").read_text()
+        self.assertIn("""        if e.derived_from:
+            lines.append(f'    derived_from: "{e.derived_from}"')""", src)

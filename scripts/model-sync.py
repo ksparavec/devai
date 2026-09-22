@@ -110,6 +110,10 @@ def plan_sync(catalog_rows: list[dict], ollama_cache: dict, vllm_cache: dict,
             excluded.append(row)
         elif is_probed(row, ollama_cache, vllm_cache, sglang_cache):
             evaluated.append(row)
+        elif row.get("source") == "derived":
+            # Made by `make model-prepare`, never downloaded: not the sync
+            # loop's to fetch. Reported as evaluated so it is never queued.
+            evaluated.append(row)
         else:
             new.append(row)
     return {"new": new, "evaluated": evaluated, "excluded": excluded}

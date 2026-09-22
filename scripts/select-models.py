@@ -347,7 +347,7 @@ def is_downloaded(model: dict) -> bool:
     # multiple GB on every run).
     if source == "gguf":
         return ollama_on_disk(model["name"])
-    if source == "hf":
+    if source in ("hf", "derived"):
         return hf_on_disk(model["name"])
     return False
 
@@ -584,6 +584,11 @@ def pull(model: dict) -> None:
         pull_ollama(model["name"])
     elif src == "hf":
         pull_hf(model["name"], model["repo"])
+    elif src == "derived":
+        # Not a download: made on this host from its source row.
+        sys.exit(f"error: {model['name']} is a DERIVED row (from "
+                 f"{model.get('derived_from')}); it is not downloaded but made "
+                 f"with: make model-prepare NAME={model.get('derived_from')}")
     elif src == "gguf":
         if not model.get("repo") or not model.get("gguf_filename"):
             sys.exit(f"error: gguf source row {model['name']} is missing "
@@ -612,7 +617,7 @@ def _dir_bytes(p: Path) -> int:
 
 def reclaim_bytes(model: dict) -> int:
     """Return the number of bytes that would be freed by deleting this model."""
-    if model["source"] == "hf":
+    if model["source"] in ("hf", "derived"):
         target = hf_store_dir() / model["name"]
         return _dir_bytes(target) if target.is_dir() else 0
     if model["source"] in ("ollama", "gguf"):

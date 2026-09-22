@@ -448,6 +448,45 @@ class Entry:
                              # None when the catalog declares no MTP for this
                              # row -- the router emits no speculative flags
                              # and the picker hides the `::mtp` toggle.
+    derived_from: str | None = None  # source_kind == "derived": the catalog
+                                     # NAME of the row this one was made from
+                                     # by `make model-prepare` (a local,
+                                     # non-downloadable checkpoint).
+
+
+# Derived rows: a checkpoint made on this host from a downloaded one by
+# `make model-prepare` (int8 vocabulary/MTP tensors + draft head, see
+# scripts/prepare-checkpoint.py). Declared per family as
+#     derived:
+#       - name: Qwen3.8-27B-MTP-devai-NVFP4
+#         from: sakamakismile/Qwen3.8-27B-MTP-NVFP4   # an hf_repos entry
+#         mtp: {method: mtp, num_speculative_tokens: 3}
+# and emitted as a row of its own: `source: derived`, `derived_from:` the
+# source row's name, the source's repo/arch/parsers, backend restricted to
+# the home-built vLLM image (only it can load a quantized embedding for
+# this architecture), and a repo of the form `devai/<name>` so the probe
+# and bench caches key it apart from its source (`<repo>@<sha>`). The sha
+# is the SOURCE revision: a new upstream revision means a new derivation.
+DERIVED_BACKENDS = ["vllm-devai"]
+DERIVED_REPO_PREFIX = "devai/"
+
+
+def _entry_derived(spec: dict, source: "Entry", family: str) -> "Entry":
+    return Entry(
+        name=spec["name"],
+        family=family,
+        backend=list(DERIVED_BACKENDS),
+        repo=DERIVED_REPO_PREFIX + spec["name"],
+        size_gb=source.size_gb,
+        arch=source.arch,
+        source_kind="derived",
+        thinking=source.thinking,
+        sha=source.sha,
+        parsers=source.parsers,
+        conversational=source.conversational,
+        mtp=_normalize_mtp(spec.get("mtp")),
+        derived_from=source.name,
+    )
 
 
 def _gb(bytes_: int) -> float:
@@ -763,6 +802,23 @@ def main(argv: list[str] | None = None) -> int:
                       f"{e.arch.kv_heads}kv/{e.arch.head_dim}h{tag_suffix}")
                 all_entries.append(e)
 
+        for spec in fam.get("derived") or []:
+            if not isinstance(spec, dict) or not spec.get("name") or not spec.get("from"):
+                print(f"  [warn] derived entry needs 'name' and 'from' -- "
+                      f"skipping: {spec!r}", file=sys.stderr)
+                continue
+            source = next((x for x in all_entries
+                           if x.family == name and x.source_kind == "hf"
+                           and x.repo == spec["from"]), None)
+            if source is None:
+                print(f"  [warn] derived {spec['name']}: source {spec['from']} is not "
+                      f"an emitted hf_repos row of this family -- skipping", file=sys.stderr)
+                continue
+            e = _entry_derived(spec, source, name)
+            tag = f"  mtp={e.mtp['method']}/k={e.mtp['num_speculative_tokens']}" if e.mtp else ""
+            print(f"  derived: {e.name} <- {source.name}{tag}")
+            all_entries.append(e)
+
         library_tags: dict[str, list[str]] = {}
         # (renderer, parser) for this family's gguf rows; None = not looked up yet.
         fam_directives: tuple[str | None, str | None] | None = None
@@ -912,6 +968,8 @@ def main(argv: list[str] | None = None) -> int:
         if e.repo:
             lines.append(f'    repo: "{e.repo}"')
         lines.append(f'    source: {e.source_kind}')
+        if e.derived_from:
+            lines.append(f'    derived_from: "{e.derived_from}"')
         if e.sha:
             lines.append(f'    sha: "{e.sha}"')
         if e.gguf_filename:
