@@ -596,10 +596,33 @@ def _sampling_config(alias: str = ""):
     return GenerateConfig(temperature=temperature, top_p=top_p)
 
 
+# How many requests a backend serves AT ONCE on this host. inspect_ai sends
+# 10 concurrently by default and starts each sample's `time_limit` clock when
+# the sample starts, not when the backend begins answering it -- so against a
+# backend that serves one request at a time, nine of ten samples spend their
+# clock in a queue. Ollama is that backend here (`OLLAMA_NUM_PARALLEL:1`,
+# `n_seq_max = 1` in its log; nothing in this repo sets it).
+#
+# Measured 2026-09-19, qwen3.8:27b-ud-q4_k_xl (dense, 30 tok/s) on MMLU-Pro:
+# 300-600 s of wall clock per sample for ~35 s of generation, and 5 of the
+# first 40 samples timed out at 900 s and were scored INCORRECT. Fast MoE
+# models drain the queue before the clock matters, so only slow models were
+# penalised. Capping does not cost wall time: the GPU was busy throughout.
+#
+# vLLM and SGLang batch continuously and are left on inspect's default.
+BACKEND_MAX_CONNECTIONS = {"ollama": 1}
+
+
+def max_connections_for(backend: str) -> int | None:
+    """Concurrent requests to bench `backend` with; None = inspect's default."""
+    return BACKEND_MAX_CONNECTIONS.get(backend)
+
+
 def _invoke_inspect_task(
     *,
     task_obj,
     served_model: str,
+    backend: str,
     router_url: str,
     log_dir: Path,
     timeout_s: float,
@@ -640,6 +663,9 @@ def _invoke_inspect_task(
     )
     if fail_on_error is not None:
         eval_kwargs["fail_on_error"] = fail_on_error
+    max_connections = max_connections_for(backend)
+    if max_connections is not None:
+        eval_kwargs["max_connections"] = max_connections
     logs = inspect_eval(task_obj, **eval_kwargs)
     return logs[0] if isinstance(logs, list) else logs
 
@@ -810,6 +836,33 @@ def run_for_target(
                 file=sys.stderr,
             )
 
+    persisted = 0
+
+    def _persist() -> None:
+        """Write the tasks finished so far, so a stopped run keeps them.
+
+        The row used to be written only after a model's LAST task. A full
+        sweep of a slow dense model runs ~3.5 hours, and on 2026-09-19 one
+        stopped after four completed tasks kept none of them. update_row is
+        a pure merge, so re-writing the growing dict is idempotent. Run-level
+        data (VRAM peak, sampling record, drop flag) still lands only with
+        the final write below. A failed write raises, like that final write:
+        a cache that cannot be written is an error, not something to bench
+        past.
+        """
+        nonlocal persisted
+        if len(task_results) == persisted:
+            return
+        persisted = len(task_results)
+        update_row(
+            cache, key,
+            model=target["alias"], backend=backend, router_endpoint=router_url,
+            context=int(target["ctx"]), task_results=task_results,
+            host_env_id=host_env_id,
+            backend_image_digest=backend_image_digest,
+        )
+        save_cache(cache_path, cache)
+
     try:
         if "leak" in tasks and (force or "leak_probe" not in existing_tasks):
             print(f"  [leak]    streaming {n_leak_prompts} prompts...", file=sys.stderr)
@@ -835,6 +888,7 @@ def run_for_target(
                 _print_latency_summary(latency)
             except Exception as e:  # noqa: BLE001
                 print(f"    !! leak/latency failed: {e}", file=sys.stderr)
+        _persist()
         _check_drop()
 
         if drop_flag is None and "gsm8k" in tasks and (force or "gsm8k" not in [_strip_subset(t) for t in existing_tasks]):
@@ -844,6 +898,7 @@ def run_for_target(
                 eval_log = _invoke_inspect_task(
                     task_obj=gsm8k_task(n=n_gsm8k),
                     served_model=served,
+                    backend=backend,
                     router_url=router_url,
                     log_dir=log_dir,
                     timeout_s=600.0,
@@ -861,6 +916,7 @@ def run_for_target(
                 # Immutable-on-failure: write nothing. A failed task leaves the
                 # cache untouched (prior value, if any, stands; absent stays
                 # absent so a later run retries it).
+        _persist()
         _check_drop()
 
         if drop_flag is None and "humaneval" in tasks and (force or "humaneval" not in [_strip_subset(t) for t in existing_tasks]):
@@ -870,6 +926,7 @@ def run_for_target(
                 eval_log = _invoke_inspect_task(
                     task_obj=humaneval_task(n=n_humaneval),
                     served_model=served,
+                    backend=backend,
                     router_url=router_url,
                     log_dir=log_dir,
                     timeout_s=900.0,
@@ -884,6 +941,7 @@ def run_for_target(
                 print(f"    pass@1: {score:.4f} (n={n})", file=sys.stderr)
             except Exception as e:  # noqa: BLE001
                 print(f"    !! humaneval failed: {e}", file=sys.stderr)
+        _persist()
         _check_drop()
 
         if drop_flag is None and "humaneval_plus" in tasks and (force or "humaneval_plus" not in [_strip_subset(t) for t in existing_tasks]):
@@ -893,6 +951,7 @@ def run_for_target(
                 eval_log = _invoke_inspect_task(
                     task_obj=humaneval_plus_task(n=n_humaneval),
                     served_model=served,
+                    backend=backend,
                     router_url=router_url,
                     log_dir=log_dir,
                     timeout_s=900.0,
@@ -907,6 +966,7 @@ def run_for_target(
                 print(f"    pass@1: {score:.4f} (n={n})", file=sys.stderr)
             except Exception as e:  # noqa: BLE001
                 print(f"    !! humaneval_plus failed: {e}", file=sys.stderr)
+        _persist()
 
         if drop_flag is None and "mmlu_pro" in tasks and (force or "mmlu_pro" not in [_strip_subset(t) for t in existing_tasks]):
             from bench.tasks.mmlu_pro import mmlu_pro_task
@@ -915,6 +975,7 @@ def run_for_target(
                 eval_log = _invoke_inspect_task(
                     task_obj=mmlu_pro_task(n=n_mmlu_pro),
                     served_model=served,
+                    backend=backend,
                     router_url=router_url,
                     log_dir=log_dir,
                     timeout_s=900.0,
@@ -929,6 +990,7 @@ def run_for_target(
                 print(f"    score: {score:.4f} (n={n})", file=sys.stderr)
             except Exception as e:  # noqa: BLE001
                 print(f"    !! mmlu_pro failed: {e}", file=sys.stderr)
+        _persist()
 
         if drop_flag is None and "gpqa" in tasks and (force or "gpqa" not in [_strip_subset(t) for t in existing_tasks]):
             from bench.tasks.gpqa import gpqa_task
@@ -937,6 +999,7 @@ def run_for_target(
                 eval_log = _invoke_inspect_task(
                     task_obj=gpqa_task(n=n_gpqa),
                     served_model=served,
+                    backend=backend,
                     router_url=router_url,
                     log_dir=log_dir,
                     timeout_s=900.0,
@@ -951,6 +1014,7 @@ def run_for_target(
                 print(f"    score: {score:.4f} (n={n})", file=sys.stderr)
             except Exception as e:  # noqa: BLE001
                 print(f"    !! gpqa failed: {e}", file=sys.stderr)
+        _persist()
 
         _tool_parser = (target.get("entry") or {}).get("tool_parser")
         _tools_wanted = (drop_flag is None and "tools" in tasks
@@ -993,6 +1057,7 @@ def run_for_target(
                 eval_log = _invoke_inspect_task(
                     task_obj=tools_use_task(n=n_tools, tool_mode=_tool_mode),
                     served_model=served,
+                    backend=backend,
                     router_url=router_url,
                     log_dir=log_dir,
                     timeout_s=600.0,
@@ -1023,6 +1088,7 @@ def run_for_target(
                     print(f"    by_subcase: {by_sub}", file=sys.stderr)
             except Exception as e:  # noqa: BLE001
                 print(f"    !! tools_use failed: {e}", file=sys.stderr)
+        _persist()
 
         if drop_flag is None and "longctx" in tasks and (force or "longctx_probe" not in existing_tasks):
             from bench import bench_longctx
@@ -1057,6 +1123,7 @@ def run_for_target(
                     )
             except Exception as e:  # noqa: BLE001
                 print(f"    !! longctx failed: {e}", file=sys.stderr)
+        _persist()
 
     finally:
         vram = sampler.stop()
