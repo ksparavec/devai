@@ -97,6 +97,14 @@ def stream_chat_completion(
             obj = json.loads(payload)
         except json.JSONDecodeError:
             continue
+        # `usage` is read BEFORE the choices check: with
+        # stream_options.include_usage, vLLM and SGLang send it on a
+        # trailing chunk whose choices list is EMPTY (the OpenAI shape).
+        # Reading it after `continue` left completion_tokens at 0 on
+        # those backends and every TPS row on the chars/4 fallback.
+        usage = obj.get("usage") or {}
+        if "completion_tokens" in usage:
+            completion_tokens = int(usage["completion_tokens"])
         choices = obj.get("choices") or []
         if not choices:
             continue
@@ -121,9 +129,6 @@ def stream_chat_completion(
             reasoning_pieces.append(reasoning_piece)
         if choices[0].get("finish_reason"):
             finish_reason = choices[0]["finish_reason"]
-        usage = obj.get("usage") or {}
-        if "completion_tokens" in usage:
-            completion_tokens = int(usage["completion_tokens"])
         t_done = t_event
     content = "".join(pieces)
     reasoning_content = "".join(reasoning_pieces)
