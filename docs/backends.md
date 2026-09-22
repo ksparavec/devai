@@ -606,9 +606,35 @@ PROBE_REPO=<org>/<Model> PROBE_FORCE=1 PROBE_FORCE_ARCH=1 make probe-sglang
 ```
 
 Step 2 is easy to miss because the file you edited is not the file the
-prober reads: the prober resolves `row["parsers"][<backend>]` out of
-`deploy/models.yaml`, so an un-regenerated catalog silently supplies the
-old hint (or none).
+prober reads: the prober resolves `row["parsers"][<engine>]` out of
+`deploy/models.yaml` (`_probe_hf_common.curated_parsers`), so an
+un-regenerated catalog silently supplies the old hint (or none).
+
+The block is keyed by ENGINE, not backend name: a parser is an engine
+plugin, and `vllm-devai` runs vLLM's. The prober, the card-hint tables
+(`derive_parser_for`) and the picker's TOOLS fallback all resolve the
+backend's engine first; a block under the backend's own name (e.g.
+`vllm-devai:`) still wins, per key, for a build that ships a different
+plugin. Before 2026-09-22 the lookup was by name: both derived rows were
+probed with no parsers, the router launched them without
+`--reasoning-parser` / `--tool-call-parser`, reasoning bled into content
+(45-55 % on the leak task) and the first bench early-dropped them -- a
+verdict about the launch flags, not the checkpoints. The same rule covers
+the probe's request SHAPES: `build_disable_thinking_body` /
+`build_enable_thinking_body` and the load probe's legacy KV default
+branch on `engine_of(backend)`, not on the name. Before that fix the
+disable probe sent the base body unchanged for `vllm-devai`, measured a
+model that had never been told to stop thinking, and recorded
+`disable_verified=false` for both derived rows although the engine honours
+the shape (reasoning_tokens 0) -- which in turn made `::nothink` a no-op
+on port 11437. The vLLM disable body is now the router's, field for field:
+`reasoning_effort: "none"` PLUS `extra_body.chat_template_kwargs.
+enable_thinking: false`. It used to send only the kwarg, and on Qwen3.8's
+template that alone changes nothing (175 reasoning tokens and the `xhigh`
+preamble, measured) -- the effort field is what its template honours. Any new backend name must go through the engine map in the
+prober, the card hints, the picker (`_ENGINE_OF`) and the router
+(`engineOf`, and the backend-keyed capability maps -- see docs/router.md
+"Reasoning policy").
 
 Step 3's `PROBE_FORCE=1` matters for the same class of reason. The
 band-level "fully cached" short-circuit is evaluated **before** the arch
@@ -629,6 +655,137 @@ together re-probe the cell and re-derive the capability.
 | `PROBE_FORCE=1` | Re-probe every cell even if cached |
 | `PROBE_FORCE_ARCH=1` | Re-probe top-level capability/arch fields |
 | `PROBE_NEEDLE_DEPTH=0.5` | Load probe: fractional depth (0.0 top, 1.0 bottom) of the recall needle |
+| `PROBE_CTX_EXACT=110K` | HF probers only. Probe exactly ONE context, no binary search, no 32K rounding. Requires `PROBE_REPO`. Implies `PROBE_FORCE` for the targeted rows. A hit replaces the cell (and runs the MTP pass at that ctx); a miss leaves the existing cell untouched, prints the engine's own estimate of what would have fit, and exits non-zero. See "Exact-context probing" below. |
+
+### Exact-context probing (`PROBE_CTX_EXACT`)
+
+The fit probe binary-searches a 32K grid because, for an unknown model, that
+is the cheapest way to find the ceiling. It is the wrong tool once the ceiling
+has been computed from the engine's own memory accounting. vLLM prints
+everything needed at startup -- "Actual usage is X GiB for consumed memory
+(weights + non-torch), Y GiB for peak activation, and Z GiB for CUDAGraph
+memory" plus "GPU KV cache size: N tokens" -- so bytes per KV token and the
+pool at any utilisation follow by arithmetic, and the operator knows the
+answer to within a few thousand tokens before launching anything. A 32K grid
+can only round that down (a 111K pool reads as "96K").
+
+`make probe-vllm PROBE_REPO=<repo> PROBE_CTX_EXACT=110K` launches the model
+once at 112,640 tokens (this repo's K is 1024) and:
+
+- on a HIT records that as the row's single cell, then runs the MTP pass at
+  the same ctx when the catalog declares `mtp:` for the row. The router then
+  serves any `@<ctx>` up to that value (it clamps to the probed maximum,
+  `applyProbeCeiling`), and the picker shows the tier as `110K`;
+- on a MISS restores the previous cell, prints the engine's estimate from the
+  failure ("the estimated maximum model length is N") as the value to retry
+  with, and exits non-zero. A miss is NOT "fits nowhere": the search path
+  would have written an `oom` ledger verdict and replaced the band with the
+  failing cell, which is wrong for a number that was merely a little high;
+- refuses, before launching, a value above the checkpoint's own position
+  limit -- the search path turns that into an `unsupported_arch` verdict,
+  which is a statement about the checkpoint, not about a typo.
+
+A hit must mean the row's DECLARED configuration works at that context: on
+a row with an `mtp:` block the MTP pass runs at the same ctx, and if it
+misses the whole probe is a miss -- the previous cell stays and the MTP
+pass's own estimate is printed. Without that rule a 120K fit whose MTP pass
+failed replaced a 115K cell that served MTP, and the router would have
+refused `::mtp` for the row (measured 2026-09-22).
+
+Measured 2026-09-22 on the prepared `Qwen3.8-27B-MTP-NVFP4` (see below) at
+utilisation 0.96, in three exact launches: 115K fit with MTP (the arithmetic
+had predicted a ~111K pool -- the engine's profiled activation peak is not
+constant across utilisations, so estimate, then confirm); 120K fit without
+MTP but not with it, and the MTP pass reported "estimated maximum model
+length is 118976"; 116K (118,784 tokens) is the recorded cell. Each launch
+costs one engine cold start (~5 min on this build).
+
+### The vllm-devai backend
+
+Since 2026-09-22 the router serves a FOURTH backend, `vllm-devai`, on port
+11437: the home-built, HyperQwen-patched vLLM 0.28.0 image
+(`docker.io/devai/vllm-devai:v0.28.0-cu131-debian13-hq.c0c81bb`, also tagged
+`latest`; built by `make build-vllm`, present only in the local image store,
+never pushed or pulled -- compose sets `pull_policy: never` and `make
+pull-images` filters it out). It has the same engine, launch argv and model
+store as `vllm`, and its own container (`devai-vllm-devai`), probe cache
+(`deploy/.vllm-devai-reasoning-cache.json`, `make probe-vllm-devai`), bench
+rows (`make bench-vllm-devai`) and picker backend. A per-request suffix was
+rejected in favour of this: every probe cell is stamped with the image it
+was measured on, and mixing two images in one cache is what the drift check
+treats as invalid. Everything engine-specific (reasoning-policy body shape,
+tool stripping, Anthropic normalisation, parser plugins, the legacy fp8 KV
+default, the memory heuristic) goes through `engineOf` in the router and
+`engine_of` in the probers; recovery-flag entries apply by engine OR name,
+so flags written for `vllm` apply here too, while an entry scoped to
+`vllm-devai` never applies to stock vLLM. `make cache-down` force-removes
+the router-recreated `devai-vllm-devai` by name, exactly as it does for
+`devai-vllm` / `devai-sglang` / `devai-ollama` (a recreated container has
+no compose labels, so `compose down` leaves it behind; when this name was
+missing from the list it survived holding 21.8 GiB, every probe launch
+failed `kind=infra`, and the next `cache-up` died on the name collision).
+
+### Prepared checkpoints (`make model-prepare`)
+
+A prepared checkpoint is a DERIVED row: a new directory made from a
+downloaded one, the source left byte-identical. Two exist, made on
+2026-09-21/22 with HyperQwen's CPU scripts (vendored unmodified under
+`third_party/hyperqwen/`, Apache-2.0, commit pinned there and in
+`scripts/build-vllm.sh`) and declared under the `qwen3.8` family's
+`derived:` list in `scripts/model-families.yaml`:
+
+| derived row | from | method | on disk | what changed |
+|---|---|---|---|---|
+| `Qwen3.8-27B-W4A16-devai-AutoRound` | `Qwen3.8-27B-W4A16-AutoRound` | sharded (`quant_lm_head.py`, `quant_embed.py`, `quant_mtp.py`, `build_draft_vocab.py`) | 18.13 -> 15.59 GiB | `lm_head`, `embed_tokens`, `mtp.*` bf16 -> int8 g128; 40,960-token int8 draft head added |
+| `Qwen3.8-27B-MTP-devai-NVFP4` | `Qwen3.8-27B-MTP-NVFP4` | stream (`quant_heads_stream.py`, `build_draft_vocab.py`) + `scripts/mixed_quant_groups.py` | 18.36 -> 16.03 GiB (+0.4 MTP, +0.2 draft head) | same, with the NVFP4 body untouched; the three int8 config groups rewritten as weight-only `pack-quantized` |
+
+Naming rule (operator, 2026-09-22): `-devai` goes before the LAST term of
+the source name, so the format token stays last. The derived directory is
+a copy-on-write copy (XFS reflink: no extra space until a file is
+rewritten) minus the Hugging Face download metadata, keeps no `.bak*`
+files (the source holds every original), and carries a `PREPARED.json`
+that pairs each rewritten file with the source's copy by sha256. Both
+sources were verified file by file against the checksums Hugging Face
+recorded at download time after the originals were restored.
+
+Why: Qwen3.8's 248K-token vocabulary makes `embed_tokens` and `lm_head` 2.37
+GiB EACH in bf16, and every public quantization leaves them there. On a 24
+GiB card that is the difference between MTP loading or not, and between a
+4K and a 128K context. Both prepared builds serve with MTP through the
+home-built `localhost/devai-vllm` image ONLY (stock vLLM cannot load a
+quantized embedding for this architecture; the image carries HyperQwen's
+`qwen3_5-embed-quant` and `qwen3_5-mtp-draft-vocab` patches plus devai's
+`qwen3_5-mtp-share-vocab-at-init`), selected per model by the `image` field
+of their `deploy/recovery-flags.json` entries.
+
+`make model-prepare NAME=<source row>` (`scripts/prepare-checkpoint.py
+--derive`) is the repeatable form: it looks up the derived row in the
+catalog (`derived_from: <source>`), refuses a source that is missing, not
+as downloaded (any `.bak*` or manifest), or not compressed-tensors, refuses
+an existing derived directory and refuses to run without the image; copies
+the source copy-on-write; runs upstream's recipe for the shard layout inside
+the image against the vendored scripts; runs `mixed_quant_groups.py` when
+the body is float-quantized; drops the backups; and writes the manifest --
+vendored-script commit, every step with arguments and exit code, sha256 +
+size of every rewritten or created file before and after. The two
+directories above carry manifests written by `--reconstruct --source-dir`,
+with "before" taken from the source. Reverting is deleting the derived
+directory; the source was never touched.
+
+After deriving: `make cache-down && make probe-vllm-devai
+PROBE_REPO=devai/<name> [PROBE_CTX_EXACT=<ctx>]`, `make cache-up`, a
+recovery entry for the derived name (`backends: ["vllm-devai"]`) if flags
+are needed, and `podman restart devai-router` -- the router reads the probe
+cache and the catalog only at startup.
+
+Measured 2026-09-21/22 on the 24G card, MTP on, both prepared builds: decode
+90-95 tok/s single-stream and 310-324 tok/s aggregate at 4 coding streams,
+holding 88-91 tok/s at 92K depth; HumanEval 96.3-97.6 / HumanEval+ 92.7-93.9
+on all 164 problems (a tie with the as-delivered NVFP4 checkpoint, so the
+int8 vocabulary tensors cost nothing measurable). They differ in context
+(AutoRound 128K, NVFP4 96K at 0.94 -- the NVFP4 body's per-16 fp8 scales cost
+1 GiB) and in prefill (NVFP4 ~2.2x faster; native Blackwell FP4 kernels
+against Marlin int4 compiled for sm80).
 
 ### Load probing -- serving-time VRAM under near-full context
 
