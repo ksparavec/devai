@@ -502,6 +502,19 @@ Reference implementation (volume group `vgais`):
 | `cache_npm` | `/var/cache/devai/npm` | 10G | npm package cache |
 | `cache_open_webui` | `/var/cache/devai/open-webui` | 5G | Open WebUI application data |
 
+Podman's rootless graphroot is `/var/cache/devai/registry/podman` (set in
+`~/.config/containers/storage.conf`), a subdirectory of the `cache_registry`
+volume that it shares with the registry:2 mirror's blob tree at
+`/var/cache/devai/registry/docker/`. The store uses NATIVE overlay (kernel
+overlayfs with `userxattr`), not fuse-overlayfs: with a mount program podman
+cannot use the native overlay diff, so every layer commit walks the whole
+image tree -- measured 2026-09-22 at ~12 s per single-file COPY on the lab
+image against 0.2 s native. If `podman info` ever reports
+`Native Overlay Diff: false`, the store has been initialised with
+fuse-overlayfs (sticky `.has-mount-program` flag) and must be recreated; the
+flag is never re-evaluated. Never wipe `registry/*` wholesale: it holds both
+the store and the mirror cache.
+
 `cache_logs` is the only volume that can be created entirely from the
 repo: `make setup-logs` carves the LV in the existing `vgais/cachepool`,
 mkfs.xfs, adds an `/etc/fstab` line, and mounts it. Re-running is a
