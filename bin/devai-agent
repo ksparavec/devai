@@ -86,6 +86,11 @@ PROBE_CACHES = {
 BENCH_CACHE = CONFIG_DIR / ".bench-cache.json"
 # Exclusion ledger -- the picker hides rows carrying a bench verdict.
 MODEL_STATUS_CACHE = CONFIG_DIR / ".model-status.json"
+# The catalog (deploy/models.yaml, staged by `make install`). The picker's
+# MTP offer, PARAMS/TYPE/FORMAT columns and every row added after the image
+# was built come from it; the image's baked copy is whatever the last
+# `make build-gpu` saw (2026-07-27 here: no derived rows, no `mtp:` blocks).
+CATALOG = CONFIG_DIR / "models.yaml"
 
 DEFAULTS: dict = {
     "vram": 24,
@@ -355,6 +360,11 @@ def build_run_cmd(
         if host_path.exists():
             cmd += ["-v",
                     f"{host_path}:/etc/devai/.{backend}-reasoning-cache.json:ro"]
+        else:
+            print(f"devai-agent: WARNING: no probe cache staged for backend "
+                  f"'{backend}' ({host_path}); the picker will list no "
+                  f"{backend} rows. Run `make install` (and `make probe-{backend}` "
+                  f"if the repo has none).", file=sys.stderr)
 
     # Bench cache — same /etc/devai/ prefix the picker scans. Without
     # this mount the four bench-score columns show '-' even when the
@@ -364,6 +374,15 @@ def build_run_cmd(
     if MODEL_STATUS_CACHE.is_file():
         cmd += ["-v",
                 f"{MODEL_STATUS_CACHE}:/etc/devai/.model-status.json:ro"]
+    # Catalog -- over the image's baked copy, same /etc/devai/ path the
+    # picker reads first. Absent means the picker runs on a stale catalog.
+    if CATALOG.is_file():
+        cmd += ["-v", f"{CATALOG}:/etc/devai/models.yaml:ro"]
+    else:
+        print(f"devai-agent: WARNING: no catalog (models.yaml) staged at {CATALOG}; the "
+              "picker will read the copy baked into the image, which knows "
+              "nothing added since the image was built (no MTP offer, no new "
+              "rows). Run `make install`.", file=sys.stderr)
 
     # Override the baked-in /usr/local/bin/model-picker with the host copy
     # so improvements made in the repo (and copied to ~/.devai/ by

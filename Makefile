@@ -842,7 +842,7 @@ test-models: cache-up ## Matrix test: every probed model × wire protocol × sce
 test-agents: ## Smoke-test every (agent × backend) cell against the live router
 	@# Defensive cleanup: previous probe runs may have left
 	@# vllm/sglang containers behind. Harmless when they don't exist.
-	@$(CONTAINER_RUNTIME) rm -f devai-vllm devai-sglang 2>/dev/null || true
+	@$(CONTAINER_RUNTIME) rm -f devai-vllm devai-sglang devai-vllm-devai 2>/dev/null || true
 	@$(MAKE) cache-up
 	@mkdir -p $(CURDIR)/tests/.matrix-logs
 	@# Run via the default entrypoint so codex config gets seeded into
@@ -1018,7 +1018,13 @@ cache-down: ## Stop and remove ALL infrastructure services (running, stopped, or
 	@# run that serves an Ollama model, `podman inspect devai-ollama` shows an
 	@# empty com.docker.compose.project while devai-router still shows
 	@# [deploy], and the next `cache-up` dies on the name collision.
-	@for name in devai-vllm devai-sglang devai-ollama; do \
+	@#
+	@# devai-vllm-devai: same story as devai-vllm (2026-09-22 -- it was
+	@# missing from this list after the first bench on that backend, the
+	@# recreated container survived cache-down holding 21.8 GiB, every
+	@# probe launch failed kind=infra and the next cache-up died on the
+	@# name collision).
+	@for name in devai-vllm devai-sglang devai-ollama devai-vllm-devai; do \
 		$(CONTAINER_RUNTIME) rm -f $$name >/dev/null 2>&1 || true; \
 	done
 
@@ -1549,6 +1555,10 @@ catalog-discover-add: ## Discover, then CONFIRM-add candidates into scripts/mode
 	  $(if $(FAMILY),--family $(FAMILY),) \
 	  $(if $(YES),--yes,)
 
+model-prepare: ## Prepare a downloaded HF checkpoint for MTP on 24G (int8 vocab/MTP tensors + 40K draft head, HyperQwen's vendored scripts, in place, with a PREPARED.json manifest). NAME=<catalog row>, STORE=vllm|sglang. Needs the devai-vllm image. Then re-probe + restart the router.
+	@test -n "$(NAME)" || { echo "usage: make model-prepare NAME=<catalog row> [STORE=vllm|sglang]"; exit 2; }
+	python3 scripts/prepare-checkpoint.py --name '$(NAME)' $(if $(STORE),--store $(STORE),)
+
 model-status: ## Show the host-local model exclusion ledger (too_big/too_small/unsupported_arch). CLEAR=<name[::backend]> removes an entry.
 	@python3 scripts/_model_status.py $(if $(CLEAR),--clear $(CLEAR),)
 
@@ -1722,11 +1732,15 @@ install: ## Install bin/devai-agent to $(INSTALL_PREFIX)/bin and stage config in
 	@# in-image one without bind-mounting the constants module too.
 	@ln -sf "$(CURDIR)/scripts/_capability.py" $(DEVAI_HOME)/_capability.py
 	@ln -sf "$(CURDIR)/scripts/_model_status.py" $(DEVAI_HOME)/_model_status.py
+	@# The catalog. devai-agent mounts it over the image's baked copy so the
+	@# picker sees rows and `mtp:` blocks added after the last image build.
+	@ln -sf "$(CURDIR)/deploy/models.yaml" $(DEVAI_HOME)/models.yaml
+	@echo "  linked: $(DEVAI_HOME)/models.yaml"
 	@# Symlink each backend's probe cache so it stays fresh as the prober
 	@# regenerates it. If users want a frozen snapshot they can replace the
 	@# link with a copy after install. Missing caches are warned but not
 	@# fatal — the picker tolerates absent backend caches.
-	@for cache in ollama vllm sglang; do \
+	@for cache in ollama vllm sglang vllm-devai; do \
 		src="$(CURDIR)/deploy/.$$cache-reasoning-cache.json"; \
 		dst="$(DEVAI_HOME)/.$$cache-reasoning-cache.json"; \
 		if [ -f "$$src" ]; then \
@@ -1769,6 +1783,7 @@ uninstall: ## Remove devai-agent launcher and the staged config dir
 	@rm -f $(DEVAI_HOME)/.sglang-reasoning-cache.json
 	@rm -f $(DEVAI_HOME)/.vllm-devai-reasoning-cache.json
 	@rm -f $(DEVAI_HOME)/.bench-cache.json
+	@rm -f $(DEVAI_HOME)/models.yaml
 	@rm -f $(DEVAI_HOME)/model-picker.py
 	@rm -f $(DEVAI_HOME)/_capability.py
 	@rm -f $(DEVAI_HOME)/_model_status.py

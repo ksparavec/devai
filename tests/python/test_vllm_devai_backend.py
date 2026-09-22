@@ -173,3 +173,205 @@ class ToolingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DerivedRowsAcrossToolsTest(unittest.TestCase):
+    """A derived catalog row is probed like an HF row, never downloaded."""
+
+    _ROW = {"name": "X-devai-NVFP4", "source": "derived", "derived_from": "X-NVFP4",
+            "repo": "devai/X-devai-NVFP4", "sha": "abc", "backend": ["vllm-devai"]}
+
+    def test_prober_loads_derived_rows_for_the_backend_that_serves_them(self) -> None:
+        import tempfile, yaml
+        import _probe_hf_common as hf
+        with tempfile.TemporaryDirectory() as td:
+            cat = Path(td) / "models.yaml"
+            cat.write_text(yaml.safe_dump({"models": [self._ROW]}))
+            self.assertEqual([r["name"] for r in hf.load_catalog_hf_rows(cat, "vllm-devai")], ["X-devai-NVFP4"])
+            self.assertEqual(hf.load_catalog_hf_rows(cat, "vllm"), [])
+
+    def test_select_models_refuses_to_download_a_derived_row(self) -> None:
+        sm = _load(REPO_ROOT / "scripts" / "select-models.py", "select_models_for_derived_test")
+        with self.assertRaises(SystemExit) as cm:
+            sm.pull(dict(self._ROW))
+        self.assertIn("make model-prepare NAME=X-NVFP4", str(cm.exception))
+
+    def test_model_sync_never_queues_a_derived_row(self) -> None:
+        ms = _load(REPO_ROOT / "scripts" / "model-sync.py", "model_sync_for_derived_test")
+        plan = ms.plan_sync([dict(self._ROW)], {}, {}, {}, {}, host_vram=24)
+        self.assertEqual(plan["new"], [])
+        self.assertEqual([r["name"] for r in plan["evaluated"]], ["X-devai-NVFP4"])
+
+
+class ParserHintsByEngineTest(unittest.TestCase):
+    """Curated `parsers:` blocks and card-hint tables are keyed by ENGINE.
+
+    Found 2026-09-22 by the first bench of the two derived rows: the prober
+    looked the catalog's `parsers` block up by backend NAME, `vllm-devai` has
+    no block, so both rows were probed with no parsers and the cache recorded
+    reasoning_parser / tool_parser None. The router then launched them without
+    `--reasoning-parser qwen3` / `--tool-call-parser qwen3_xml`, reasoning
+    bled into content (leak 45 % and 55 %) and the bench early-dropped both --
+    a verdict about the launch flags, not the checkpoints. The picker's
+    TOOLS fallback keyed the same way.
+    """
+
+    _PARSERS = {"vllm": {"reasoning": "qwen3", "tool": "qwen3_xml"},
+                "sglang": {"reasoning": "qwen3", "tool": "qwen"}}
+
+    def test_prober_reads_the_engine_block_for_vllm_devai(self) -> None:
+        import _probe_hf_common as hf
+        row = {"name": "X", "parsers": dict(self._PARSERS)}
+        self.assertEqual(hf.curated_parsers(row, "vllm-devai"), ("qwen3", "qwen3_xml"))
+        self.assertEqual(hf.curated_parsers(row, "vllm"), ("qwen3", "qwen3_xml"))
+        self.assertEqual(hf.curated_parsers(row, "sglang"), ("qwen3", "qwen"))
+        self.assertEqual(hf.curated_parsers({"name": "X"}, "vllm-devai"), (None, None))
+
+    def test_prober_lets_a_name_specific_block_override_per_key(self) -> None:
+        import _probe_hf_common as hf
+        row = {"parsers": {**self._PARSERS, "vllm-devai": {"tool": "hermes"}}}
+        self.assertEqual(hf.curated_parsers(row, "vllm-devai"), ("qwen3", "hermes"))
+
+    def test_prober_derives_card_hints_for_the_engine(self) -> None:
+        from unittest import mock
+        import _probe_hf_common as hf
+        with mock.patch.object(hf._card_hints, "derive_parser", return_value="qwen3") as dp:
+            self.assertEqual(hf.derive_parser_for("X", Path("/m"), "vllm-devai", "reasoning"), "qwen3")
+        dp.assert_called_once_with("X", Path("/m"), "vllm", "reasoning")
+
+    def test_run_probe_pass_uses_the_engine_keyed_helpers(self) -> None:
+        import inspect
+        import _probe_hf_common as hf
+        src = inspect.getsource(hf.run_probe_pass)
+        self.assertIn("curated_parsers(row, spec.name)", src)
+        self.assertIn("derive_parser_for(", src)
+        self.assertNotIn('("parsers") or {}).get(spec.name)', src)
+        self.assertNotIn("derive_parser(\n                    name, models_dir, spec.name", src)
+
+    def test_picker_tools_fallback_reads_the_engine_block(self) -> None:
+        mp = _load(REPO_ROOT / "scripts" / "model-picker.py", "model_picker_for_parser_test")
+        self.assertEqual(mp._resolve_tool_parser({}, self._PARSERS, "vllm-devai"), "qwen3_xml")
+        self.assertEqual(mp._resolve_tool_parser({}, self._PARSERS, "sglang"), "qwen")
+        self.assertEqual(mp._resolve_tool_parser({"tool_parser": "probed"}, self._PARSERS, "vllm-devai"), "probed")
+        self.assertEqual(mp._resolve_tool_parser({}, {**self._PARSERS, "vllm-devai": {"tool": "hermes"}}, "vllm-devai"), "hermes")
+        self.assertEqual(mp._resolve_tool_parser({}, {}, "vllm-devai"), "N/A")
+
+    def test_load_probe_uses_the_engine_keyed_helper(self) -> None:
+        import inspect
+        import _probe_load as lp
+        src = inspect.getsource(lp.run_load_probe_pass)
+        self.assertIn("curated_parsers(row, spec.name)", src)
+        self.assertNotIn('("parsers") or {}).get(spec.name)', src)
+
+
+class CacheDownRemovesTheRecreatedContainerTest(unittest.TestCase):
+    """`make cache-down` must force-remove devai-vllm-devai by name.
+
+    The router recreates every HF backend container via libpod when a
+    request arrives, and the recreated container carries no compose labels,
+    so `compose down --remove-orphans` leaves it behind. cache-down therefore
+    removes the recreated containers by NAME -- and on 2026-09-22 the list
+    still read vllm/sglang/ollama: after the first vllm-devai bench the
+    router-built `devai-vllm-devai` survived `cache-down` holding 21.8 GiB,
+    every probe launch failed `kind=infra`, and the next `cache-up` died on
+    the name collision while reporting rc=0.
+    """
+
+    _MAKEFILE = (REPO_ROOT / "Makefile").read_text()
+
+    def _recipe(self, target: str) -> str:
+        m = re.search(rf"^{re.escape(target)}:.*?(?=^\S)", self._MAKEFILE, re.M | re.S)
+        self.assertIsNotNone(m, f"no {target} recipe")
+        return m.group(0)
+
+    def test_cache_down_names_every_router_recreated_container(self) -> None:
+        loop = re.search(r"for name in ([^;]+); do", self._recipe("cache-down"))
+        self.assertIsNotNone(loop)
+        names = loop.group(1).split()
+        for n in ("devai-vllm", "devai-sglang", "devai-ollama", "devai-vllm-devai"):
+            self.assertIn(n, names)
+
+    def test_test_agents_cleanup_names_vllm_devai_too(self) -> None:
+        rm = re.search(r"rm -f ([^\n]+?) 2>/dev/null", self._recipe("test-agents"))
+        self.assertIsNotNone(rm)
+        self.assertIn("devai-vllm-devai", rm.group(1).split())
+
+    def test_install_stages_the_vllm_devai_cache_symlink(self) -> None:
+        loop = re.search(r"for cache in ([^;]+); do", self._recipe("install"))
+        self.assertIsNotNone(loop)
+        self.assertIn("vllm-devai", loop.group(1).split())
+
+
+class EngineKeyedProbeShapesTest(unittest.TestCase):
+    """The probe's request shapes and KV default are per ENGINE as well.
+
+    Third member of the same family found on 2026-09-22: the disable / enable
+    thinking bodies were built behind `if backend == "vllm" ... elif "sglang"`,
+    so for `vllm-devai` the disable probe sent the base body UNCHANGED, the
+    model kept thinking, and both derived rows were recorded
+    disable_verified=false -- which made `::nothink` a no-op on port 11437
+    although the engine honours the router's disable shape (measured:
+    reasoning_tokens 0). The load probe's legacy KV default had the same
+    `== "vllm"` test.
+    """
+
+    _BASE = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+
+    def test_disable_and_enable_bodies_match_vllm_for_vllm_devai(self) -> None:
+        import _probe_hf_common as hf
+        for build in (hf.build_disable_thinking_body, hf.build_enable_thinking_body):
+            devai = build("vllm-devai", dict(self._BASE))
+            self.assertEqual(devai, build("vllm", dict(self._BASE)), build.__name__)
+            self.assertNotEqual(devai, self._BASE, f"{build.__name__} left the body unchanged")
+        # sglang keeps its own, different shape
+        self.assertNotEqual(hf.build_disable_thinking_body("sglang", dict(self._BASE)),
+                            hf.build_disable_thinking_body("vllm", dict(self._BASE)))
+
+    def test_load_probe_legacy_kv_default_is_fp8_for_vllm_devai(self) -> None:
+        import _probe_load as lp
+        self.assertEqual(lp._cell_kv_cache_dtype({}, "vllm-devai"), "fp8")
+        self.assertEqual(lp._cell_kv_cache_dtype({}, "vllm"), "fp8")
+        self.assertEqual(lp._cell_kv_cache_dtype({}, "sglang"), "")
+        self.assertEqual(lp._cell_kv_cache_dtype({"kv_cache_type": "auto"}, "vllm-devai"), "auto")
+
+    def test_no_backend_name_comparison_survives_in_the_probers(self) -> None:
+        # Every engine-dependent branch must go through engine_of().
+        pat = re.compile(r'\b(backend|spec\.name)\s*(==|!=)\s*["\'](vllm|sglang)["\']')
+        for f in ("_probe_hf_common.py", "_probe_load.py"):
+            src = (REPO_ROOT / "scripts" / f).read_text()
+            hits = [ln for ln in src.splitlines() if pat.search(ln)]
+            self.assertEqual(hits, [], f"{f}: name-keyed engine branches: {hits}")
+
+
+class ProbeCheckCoversVLLMDevaiTest(unittest.TestCase):
+    """`make probe-check` must report image drift for the vllm-devai cache too."""
+
+    def test_probe_check_table_has_the_vllm_devai_backend(self) -> None:
+        pc = _load(REPO_ROOT / "scripts" / "probe-check.py", "probe_check_for_devai_test")
+        rows = {b[0]: b for b in pc.BACKENDS}
+        self.assertIn("vllm-devai", rows)
+        name, cache, env, image = rows["vllm-devai"]
+        self.assertEqual(cache, "deploy/.vllm-devai-reasoning-cache.json")
+        self.assertEqual(env, "VLLM_DEVAI_IMAGE")
+        self.assertEqual(image, "docker.io/devai/vllm-devai:latest")
+
+
+class ProbeDisableShapeMatchesRouterTest(unittest.TestCase):
+    """The probe's vLLM disable body must be the router's, field for field.
+
+    applyVLLMPolicy disables with `reasoning_effort: "none"` PLUS
+    `extra_body.chat_template_kwargs.enable_thinking: false`; the prober
+    sent only the second. On Qwen3.8's template the effort field is what
+    switches the think block off, so the probe kept measuring a thinking
+    model and recorded disable_verified=false for rows the router can in
+    fact silence (2026-09-22, both derived rows, re-probed twice).
+    """
+
+    def test_vllm_disable_body_carries_both_router_fields(self) -> None:
+        import _probe_hf_common as hf
+        base = {"model": "m", "messages": [{"role": "user", "content": "hi"}], "temperature": 0}
+        for backend in ("vllm", "vllm-devai"):
+            body = hf.build_disable_thinking_body(backend, dict(base))
+            self.assertEqual(body.get("reasoning_effort"), "none", backend)
+            self.assertIs(body["extra_body"]["chat_template_kwargs"]["enable_thinking"], False, backend)
+            self.assertEqual(body["temperature"], 0)
