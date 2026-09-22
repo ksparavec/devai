@@ -28,6 +28,7 @@ import datetime as dt
 import os
 import re
 import subprocess
+import time
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -350,13 +351,41 @@ def is_downloaded(model: dict) -> bool:
 
 # ── Download ─────────────────────────────────────────────────────────────────
 
+# Operator rule: every failure is an error, and a DOWNLOAD is repeated 3
+# times before bailing out. The count is fixed; only the pause is tunable.
+# The pause is long enough to outlast a devai-ollama recreate (~10 s): that is
+# what killed a pull on 2026-09-19 -- a benchmark sent the router an explicit
+# `<model>@<ctx>` pin, the router recreated the container to move the tier,
+# and the `ollama pull` running inside it died with "unexpected EOF". Partial
+# blobs live in the store, so the next attempt resumes rather than restarts.
+PULL_ATTEMPTS = 3
+PULL_RETRY_DELAY_SECONDS = int(os.environ.get("PULL_RETRY_DELAY", "15"))
+
+
+def run_download(cmd: list[str], what: str) -> None:
+    """Run a download command up to PULL_ATTEMPTS times; exit loudly if all fail.
+
+    For DOWNLOADS only. `ollama create` must not come through here: it
+    registers an already-staged file, and its failures are deterministic.
+    """
+    rc = 0
+    for attempt in range(1, PULL_ATTEMPTS + 1):
+        rc = subprocess.call(cmd)
+        if rc == 0:
+            return
+        if attempt < PULL_ATTEMPTS:
+            print(f"  {what} failed with rc={rc} (attempt {attempt}/"
+                  f"{PULL_ATTEMPTS}); retrying in {PULL_RETRY_DELAY_SECONDS}s ...",
+                  file=sys.stderr, flush=True)
+            time.sleep(PULL_RETRY_DELAY_SECONDS)
+    sys.exit(f"error: {what} failed after {PULL_ATTEMPTS} attempts (last rc={rc})")
+
+
 def pull_ollama(name: str) -> None:
     print(f"  ollama pull {name} ...", flush=True)
-    rc = subprocess.call(
-        [CONTAINER_RUNTIME, "exec", OLLAMA_CONTAINER, "ollama", "pull", name]
-    )
-    if rc != 0:
-        sys.exit(f"error: ollama pull {name} failed with rc={rc}")
+    run_download(
+        [CONTAINER_RUNTIME, "exec", OLLAMA_CONTAINER, "ollama", "pull", name],
+        f"ollama pull {name}")
 
 
 # Repo paths vLLM and SGLang never read, excluded from every HF pull.
@@ -477,9 +506,7 @@ def pull_hf(display_name: str, repo: str) -> None:
         cmd.extend(["--exclude", pattern])
     print(f"  hf download {repo} → {target} "
           f"(excluding {', '.join(excludes) or 'nothing'}) ...", flush=True)
-    rc = subprocess.call(cmd)
-    if rc != 0:
-        sys.exit(f"error: hf download {repo} failed with rc={rc}")
+    run_download(cmd, f"hf download {repo}")
 
 
 def pull_gguf(display_name: str, repo: str, filename: str, family: str,
@@ -515,11 +542,9 @@ def pull_gguf(display_name: str, repo: str, filename: str, family: str,
     target_dir.mkdir(parents=True, exist_ok=True)
     target_file = target_dir / filename
     print(f"  hf download {repo} {filename} → {target_file} ...", flush=True)
-    rc = subprocess.call(
-        [HF_CLI, "download", repo, filename, "--local-dir", str(target_dir)]
-    )
-    if rc != 0:
-        sys.exit(f"error: hf download {repo} {filename} failed with rc={rc}")
+    run_download(
+        [HF_CLI, "download", repo, filename, "--local-dir", str(target_dir)],
+        f"hf download {repo} {filename}")
     if not target_file.is_file():
         sys.exit(
             f"error: hf download claimed success but {target_file} is missing"
