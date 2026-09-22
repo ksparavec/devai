@@ -3368,12 +3368,23 @@ def _build(agent_id: str, model_name: str, backend: str) -> list[str]:
         # are. CODEX_HOME and OPENAI_API_KEY come from image ENV — no
         # overrides needed here.
         _write_codex_providers()
-        return [
+        cmd = [
             "codex",
             "--oss",
             "--local-provider", f"router-{backend}",
             "-c", f'model="{name}"',
         ]
+        # Codex 0.155 looks our id up in its bundled models.json, finds
+        # nothing, prints "Model metadata for `<id>` not found. Defaulting
+        # to fallback metadata" and runs with NO context window (RUST_LOG=
+        # debug shows none). The catalog takes no custom entries, so the
+        # warning cannot be silenced; the window can be declared, and
+        # `model_context_window` is honoured (debug log shows
+        # context_window=<ctx>). CONTEXT is the tier the picker resolved.
+        ctx = os.environ.get("CONTEXT", "")
+        if ctx.isdigit() and int(ctx) > 0:
+            cmd += ["-c", f"model_context_window={ctx}"]
+        return cmd
 
     if agent_id == "opencode":
         # OpenCode reads custom OpenAI-compatible providers from

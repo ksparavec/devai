@@ -240,6 +240,28 @@ base_url = "http://example.invalid/v1"
         self.assertEqual(provider, "router-vllm-devai")
         self.assertIn(provider, cfg["model_providers"])
 
+    def test_build_codex_declares_the_context_window(self) -> None:
+        # Codex's catalog does not know our ids and falls back to NO
+        # window; `model_context_window` is honoured (2026-09-22, 0.155.1,
+        # RUST_LOG=debug shows context_window=118784). The catalog
+        # warning itself cannot be silenced.
+        prev = os.environ.get("CONTEXT")
+        try:
+            os.environ["CONTEXT"] = "118784"
+            with _CodexHome():
+                cmd = PICKER._build("codex", "m@118784", "vllm-devai")
+            self.assertIn("model_context_window=118784", cmd)
+            self.assertEqual(cmd[cmd.index("model_context_window=118784") - 1], "-c")
+            os.environ.pop("CONTEXT", None)
+            with _CodexHome():
+                cmd = PICKER._build("codex", "m@118784", "vllm-devai")
+            self.assertFalse(any(a.startswith("model_context_window") for a in cmd))
+        finally:
+            if prev is None:
+                os.environ.pop("CONTEXT", None)
+            else:
+                os.environ["CONTEXT"] = prev
+
 
 class TestSeedsDeclareEveryBackend(unittest.TestCase):
     def test_codex_seed(self) -> None:
