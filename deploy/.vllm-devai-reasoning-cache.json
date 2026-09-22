@@ -1,0 +1,190 @@
+{
+  "_meta": {
+    "current_image_digest": "sha256:0a94e7982b85849790a0b381725644bae0e91cea5a46257843c42df69cd8a4b6",
+    "current_image_ref": "docker.io/devai/vllm-devai:latest",
+    "image_history": {
+      "sha256:0a94e7982b85849790a0b381725644bae0e91cea5a46257843c42df69cd8a4b6": {
+        "first_seen": "2026-09-22T09:53:06+00:00",
+        "image_ref": "docker.io/devai/vllm-devai:latest"
+      }
+    }
+  },
+  "devai/Qwen3.8-27B-MTP-devai-NVFP4@a0b936f0bbcb": {
+    "aliases": [
+      "Qwen3.8-27B-MTP-devai-NVFP4"
+    ],
+    "backend_image_digest": "sha256:0a94e7982b85849790a0b381725644bae0e91cea5a46257843c42df69cd8a4b6",
+    "capability": "structured",
+    "card_sampling": {
+      "eos_token_id": [
+        248046,
+        248044
+      ],
+      "temperature": 1.0,
+      "top_k": 20,
+      "top_p": 0.95
+    },
+    "disable_verified": true,
+    "evidence": {
+      "content_preview": "\n\nStep-by-step:\n\n1. **First hour:**  \n   The train travels 60 miles, so its speed in the first hour is **60 mph**.\n\n2. *",
+      "disable": {
+        "verified": true
+      },
+      "finish_reason": "stop",
+      "full_content": "\n\nStep-by-step:\n\n1. **First hour:**  \n   The train travels 60 miles, so its speed in the first hour is **60 mph**.\n\n2. **Second hour:**  \n   Speed increases by 20 mph:  \n   \\(60 + 20 = 80\\) mph  \n   Distance in the second hour = **80 miles**.\n\n3. **Third hour:**  \n   Speed increases by another 20 mph:  \n   \\(80 + 20 = 100\\) mph  \n   Distance in the third hour = **100 miles**.\n\n4. **Total distance after 3 hours:**  \n   \\(60 + 80 + 100 = 240\\) miles.\n\n**Final number: 240 miles**",
+      "full_reasoning_content": "We need answer user asks solve step by step, show reasoning, final number. Need think carefully. Problem: \"A train travels 60 miles in the first hour, then increases speed by 20 mph each hour. How far has it traveled after 3 hours?\"\n\nInterpretation: First hour: travels 60 miles, so speed first hour = 60 mph. Then increases speed by 20 mph each hour. So second hour speed = 80 mph, distance = 80 miles. Third hour speed = 100 mph, distance = 100 miles. Total after 3 hours = 60+80+100=240 miles. Need step by step. Potential ambiguity: \"travels 60 miles in the first hour\" could mean distance in first hour is 60 miles, speed 60 mph. \"increases speed by 20 mph each hour\" means each subsequent hour speed increases by 20 mph. So total 240.\n\nNeed final answer with reasoning. Ensure final number stated. Could mention assumption: constant speed within each hour. Final: 240 miles.\n",
+      "reasoning_parser_attempted": "qwen3",
+      "reasoning_preview": "We need answer user asks solve step by step, show reasoning, final number. Need think carefully. Problem: \"A train travels 60 miles in the first hour, then increases speed by 20 mph each hour. How far",
+      "structured_reason": "reasoning_content_populated",
+      "tool": {
+        "mode": "auto",
+        "verified": true
+      },
+      "tool_parser_attempted": "qwen3_xml"
+    },
+    "first_probed_at": "2026-09-22T10:03:10+00:00",
+    "last_probed_at": "2026-09-22T13:06:48+00:00",
+    "max_context": 118784,
+    "model_kind": "dense",
+    "position_limit": 262144,
+    "probes": {
+      "24": {
+        "118784": {
+          "actual_context": 118784,
+          "actual_vram_gb": 21.96,
+          "capability": "structured",
+          "ctx": 118784,
+          "disable_verified": true,
+          "evidence": {
+            "content_preview": "\n\nStep-by-step:\n\n1. **First hour:**  \n   The train travels 60 miles, so its speed in the first hour is **60 mph**.\n\n2. *",
+            "disable": {
+              "verified": true
+            },
+            "finish_reason": "stop",
+            "full_content": "\n\nStep-by-step:\n\n1. **First hour:**  \n   The train travels 60 miles, so its speed in the first hour is **60 mph**.\n\n2. **Second hour:**  \n   Speed increases by 20 mph:  \n   \\(60 + 20 = 80\\) mph  \n   Distance in the second hour = **80 miles**.\n\n3. **Third hour:**  \n   Speed increases by another 20 mph:  \n   \\(80 + 20 = 100\\) mph  \n   Distance in the third hour = **100 miles**.\n\n4. **Total distance after 3 hours:**  \n   \\(60 + 80 + 100 = 240\\) miles.\n\n**Final number: 240 miles**",
+            "full_reasoning_content": "We need answer user asks solve step by step, show reasoning, final number. Need think carefully. Problem: \"A train travels 60 miles in the first hour, then increases speed by 20 mph each hour. How far has it traveled after 3 hours?\"\n\nInterpretation: First hour: travels 60 miles, so speed first hour = 60 mph. Then increases speed by 20 mph each hour. So second hour speed = 80 mph, distance = 80 miles. Third hour speed = 100 mph, distance = 100 miles. Total after 3 hours = 60+80+100=240 miles. Need step by step. Potential ambiguity: \"travels 60 miles in the first hour\" could mean distance in first hour is 60 miles, speed 60 mph. \"increases speed by 20 mph each hour\" means each subsequent hour speed increases by 20 mph. So total 240.\n\nNeed final answer with reasoning. Ensure final number stated. Could mention assumption: constant speed within each hour. Final: 240 miles.\n",
+            "reasoning_parser_attempted": "qwen3",
+            "reasoning_preview": "We need answer user asks solve step by step, show reasoning, final number. Need think carefully. Problem: \"A train travels 60 miles in the first hour, then increases speed by 20 mph each hour. How far",
+            "structured_reason": "reasoning_content_populated",
+            "tool": {
+              "mode": "auto",
+              "verified": true
+            },
+            "tool_parser_attempted": "qwen3_xml"
+          },
+          "fits": true,
+          "kv_cache_type": "fp8",
+          "launch_fingerprint": "039324be82b4",
+          "mtp_actual_vram_gb": 22.32,
+          "mtp_fits": true,
+          "mtp_method": "mtp",
+          "mtp_overhead_gb": 0.36,
+          "probe_seconds": 289.03,
+          "probed_at": "2026-09-22T13:06:48+00:00",
+          "reasoning_parser": "qwen3",
+          "startup_seconds": 254.38,
+          "tool_parser": "qwen3_xml",
+          "vram_gb": 24
+        }
+      }
+    },
+    "reasoning_parser": "qwen3",
+    "reasoning_parser_source": "curated",
+    "repo": "devai/Qwen3.8-27B-MTP-devai-NVFP4",
+    "schema_version": 2,
+    "sha": "a0b936f0bbcb",
+    "size_gb": 19.15,
+    "tool_mode": "auto",
+    "tool_parser": "qwen3_xml",
+    "tool_parser_source": "curated"
+  },
+  "devai/Qwen3.8-27B-W4A16-devai-AutoRound@1f05c441c4e6": {
+    "aliases": [
+      "Qwen3.8-27B-W4A16-devai-AutoRound"
+    ],
+    "backend_image_digest": "sha256:0a94e7982b85849790a0b381725644bae0e91cea5a46257843c42df69cd8a4b6",
+    "capability": "structured",
+    "card_sampling": {
+      "eos_token_id": [
+        248046,
+        248044
+      ],
+      "temperature": 1.0,
+      "top_k": 20,
+      "top_p": 0.95
+    },
+    "disable_verified": true,
+    "evidence": {
+      "content_preview": "\n\nStep 1: In the first hour, the train travels **60 miles**.\n\nStep 2: In the second hour, its speed increases by 20 mph,",
+      "disable": {
+        "verified": true
+      },
+      "finish_reason": "stop",
+      "full_content": "\n\nStep 1: In the first hour, the train travels **60 miles**.\n\nStep 2: In the second hour, its speed increases by 20 mph, so it travels at **80 mph** for 1 hour, covering **80 miles**.\n\nStep 3: In the third hour, its speed increases by another 20 mph, so it travels at **100 mph** for 1 hour, covering **100 miles**.\n\nTotal distance after 3 hours:\n\n\\[\n60 + 80 + 100 = 240\n\\]\n\n**Final number: 240 miles**",
+      "full_reasoning_content": "We need answer user's simple math problem step by step. Need produce final with reasoning and final number. Let's solve: first hour 60 miles. Increases speed by 20 mph each hour. Ambiguity: after first hour, second hour speed 80 mph, third hour speed 100 mph. Distance = 60+80+100=240 miles. Need state final number. Ensure step-by-step.\n",
+      "reasoning_parser_attempted": "qwen3",
+      "reasoning_preview": "We need answer user's simple math problem step by step. Need produce final with reasoning and final number. Let's solve: first hour 60 miles. Increases speed by 20 mph each hour. Ambiguity: after firs",
+      "structured_reason": "reasoning_content_populated",
+      "tool": {
+        "mode": "auto",
+        "verified": true
+      },
+      "tool_parser_attempted": "qwen3_xml"
+    },
+    "first_probed_at": "2026-09-22T09:55:39+00:00",
+    "last_probed_at": "2026-09-22T12:59:14+00:00",
+    "max_context": 131072,
+    "model_kind": "dense",
+    "position_limit": 262144,
+    "probes": {
+      "24": {
+        "131072": {
+          "actual_context": 131072,
+          "actual_vram_gb": 21.29,
+          "capability": "structured",
+          "ctx": 131072,
+          "disable_verified": true,
+          "evidence": {
+            "content_preview": "\n\nStep 1: In the first hour, the train travels **60 miles**.\n\nStep 2: In the second hour, its speed increases by 20 mph,",
+            "disable": {
+              "verified": true
+            },
+            "finish_reason": "stop",
+            "full_content": "\n\nStep 1: In the first hour, the train travels **60 miles**.\n\nStep 2: In the second hour, its speed increases by 20 mph, so it travels at **80 mph** for 1 hour, covering **80 miles**.\n\nStep 3: In the third hour, its speed increases by another 20 mph, so it travels at **100 mph** for 1 hour, covering **100 miles**.\n\nTotal distance after 3 hours:\n\n\\[\n60 + 80 + 100 = 240\n\\]\n\n**Final number: 240 miles**",
+            "full_reasoning_content": "We need answer user's simple math problem step by step. Need produce final with reasoning and final number. Let's solve: first hour 60 miles. Increases speed by 20 mph each hour. Ambiguity: after first hour, second hour speed 80 mph, third hour speed 100 mph. Distance = 60+80+100=240 miles. Need state final number. Ensure step-by-step.\n",
+            "reasoning_parser_attempted": "qwen3",
+            "reasoning_preview": "We need answer user's simple math problem step by step. Need produce final with reasoning and final number. Let's solve: first hour 60 miles. Increases speed by 20 mph each hour. Ambiguity: after firs",
+            "structured_reason": "reasoning_content_populated",
+            "tool": {
+              "mode": "auto",
+              "verified": true
+            },
+            "tool_parser_attempted": "qwen3_xml"
+          },
+          "fits": true,
+          "kv_cache_type": "fp8",
+          "launch_fingerprint": "039324be82b4",
+          "mtp_actual_vram_gb": 21.61,
+          "mtp_fits": true,
+          "mtp_method": "mtp",
+          "mtp_overhead_gb": 0.32,
+          "probe_seconds": 162.38,
+          "probed_at": "2026-09-22T12:59:14+00:00",
+          "reasoning_parser": "qwen3",
+          "startup_seconds": 132.03,
+          "tool_parser": "qwen3_xml",
+          "vram_gb": 24
+        }
+      }
+    },
+    "reasoning_parser": "qwen3",
+    "reasoning_parser_source": "curated",
+    "repo": "devai/Qwen3.8-27B-W4A16-devai-AutoRound",
+    "schema_version": 2,
+    "sha": "1f05c441c4e6",
+    "size_gb": 18.12,
+    "tool_mode": "auto",
+    "tool_parser": "qwen3_xml",
+    "tool_parser_source": "curated"
+  }
+}

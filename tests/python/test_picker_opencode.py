@@ -79,7 +79,7 @@ class TestWriteOpencodeProviders(unittest.TestCase):
             cfg = json.loads(cfg_path.read_text())
         self.assertEqual(
             sorted(p for p in cfg["provider"] if p.startswith("router-")),
-            ["router-ollama", "router-sglang", "router-vllm"])
+            ["router-ollama", "router-sglang", "router-vllm", "router-vllm-devai"])
         self.assertEqual(
             sorted(cfg["provider"]["router-vllm"]["models"]),
             ["Qwen3-8B-NVFP4@32768", "gpt-oss-20b@131072"])
@@ -96,7 +96,8 @@ class TestWriteOpencodeProviders(unittest.TestCase):
             for pid, prov in cfg["provider"].items()
         }
         # One port per backend -- the port IS the backend selector.
-        self.assertEqual(len(set(ports.values())), 3, ports)
+        self.assertEqual(len(set(ports.values())), 4, ports)
+        self.assertEqual(ports["router-vllm-devai"], "11437")
 
     def test_replaces_rather_than_accumulates(self) -> None:
         """A model that drops out of the vetted set must disappear."""

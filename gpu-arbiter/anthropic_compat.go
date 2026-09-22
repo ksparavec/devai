@@ -199,7 +199,7 @@ func textBlock(s string) json.RawMessage {
 // maybeNormaliseAnthropic applies the rewrite on the surfaces that need
 // it: the Anthropic messages path, on vLLM and SGLang only.
 func (a *arbiter) maybeNormaliseAnthropic(backendName, path string, body []byte) []byte {
-	if backendName != "vllm" && backendName != "sglang" {
+	if e := engineOf(backendName); e != "vllm" && e != "sglang" {
 		return body
 	}
 	if path != "/v1/messages" {

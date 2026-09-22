@@ -88,6 +88,26 @@ services:
       - label=disable
     restart: "no"
 
+  # The home-built, HyperQwen-patched vLLM 0.28.0 (make build-vllm): a
+  # FOURTH backend on router port 11437 with its own probe cache, so the
+  # stock vLLM above and the custom build can be addressed side by side.
+  # The image carries a docker.io name but exists only in the local store
+  # (nothing is pushed): pull_policy never, and `make pull-images` excludes
+  # it by the `devai-` in its name.
+  vllm-devai:
+    image: ${VLLM_DEVAI_IMAGE:-docker.io/devai/vllm-devai:latest}
+    pull_policy: never
+    container_name: devai-vllm-devai
+    hostname: vllm-devai
+    volumes:
+      - /var/cache/devai/vllm:/models:ro
+    entrypoint: ["sleep", "infinity"]
+    devices:
+      - ${DEVAI_GPU_DEVICE:-nvidia.com/gpu=all}
+    security_opt:
+      - label=disable
+    restart: "no"
+
   sglang:
     image: ${SGLANG_IMAGE:-docker.io/lmsysorg/sglang:v0.5.16-cu130}
     container_name: devai-sglang
@@ -125,6 +145,10 @@ services:
       - VLLM_CONTAINER=devai-vllm
       - VLLM_IMAGE=${VLLM_IMAGE:-docker.io/vllm/vllm-openai:v0.22.1-x86_64-cu129-ubuntu2404}
       - VLLM_MODELS_DIR=/var/cache/devai/vllm
+      - VLLM_DEVAI_URL=http://vllm-devai:11434
+      - VLLM_DEVAI_PORT=11437
+      - VLLM_DEVAI_CONTAINER=devai-vllm-devai
+      - VLLM_DEVAI_IMAGE=${VLLM_DEVAI_IMAGE:-docker.io/devai/vllm-devai:latest}
       - SGLANG_URL=http://sglang:11434
       - SGLANG_PORT=11436
       - SGLANG_CONTAINER=devai-sglang
@@ -190,6 +214,7 @@ services:
       - ./.ollama-reasoning-cache.json:/etc/devai/.ollama-reasoning-cache.json:ro
       - ./.vllm-reasoning-cache.json:/etc/devai/.vllm-reasoning-cache.json:ro
       - ./.sglang-reasoning-cache.json:/etc/devai/.sglang-reasoning-cache.json:ro
+      - ./.vllm-devai-reasoning-cache.json:/etc/devai/.vllm-devai-reasoning-cache.json:ro
       # Catalog metadata side-table -- the router reads `mtp:` blocks
       # from deploy/models.yaml at startup to thread MTP launch params
       # into configModel rows (see loadCatalogMTP). Missing file = empty

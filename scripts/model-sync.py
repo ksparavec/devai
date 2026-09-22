@@ -93,7 +93,7 @@ def is_probed(row: dict, ollama_cache: dict, vllm_cache: dict,
 
 def _row_backends(row: dict) -> list[str]:
     return [b for b in (row.get("backend") or [])
-            if b in ("ollama", "vllm", "sglang")]
+            if b in ("ollama", "vllm", "vllm-devai", "sglang")]
 
 
 def plan_sync(catalog_rows: list[dict], ollama_cache: dict, vllm_cache: dict,

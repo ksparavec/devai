@@ -120,6 +120,13 @@ _SGLANG_PROBE_CACHE_PATHS = [
     str(Path(__file__).resolve().parent.parent / "deploy" / ".sglang-reasoning-cache.json"),
 ]
 
+# The home-built, HyperQwen-patched vLLM 0.28.0 (router port 11437). Own
+# cache: cells are stamped with the image they were measured on.
+_VLLM_DEVAI_PROBE_CACHE_PATHS = [
+    "/etc/devai/.vllm-devai-reasoning-cache.json",
+    str(Path(__file__).resolve().parent.parent / "deploy" / ".vllm-devai-reasoning-cache.json"),
+]
+
 _BENCH_CACHE_PATHS = [
     "/etc/devai/.bench-cache.json",
     str(Path(__file__).resolve().parent.parent / "deploy" / ".bench-cache.json"),
@@ -142,6 +149,7 @@ _STORE_GAPS: list[tuple[str, str]] = []
 _HF_STORE_BY_BACKEND: dict[str, str] = {
     "vllm": _VLLM_DIR,
     "sglang": _SGLANG_DIR,
+    "vllm-devai": _VLLM_DIR,
 }
 _OLLAMA_MANIFESTS = os.environ.get(
     "OLLAMA_MANIFESTS_DIR",
@@ -202,6 +210,7 @@ _BACKENDS: dict[str, tuple[str, str, int]] = {
     "ollama": ("Ollama", "GGUF quantized — wide compatibility, CPU+GPU",              11434),
     "vllm":   ("vLLM",   "NVFP4 tensor cores — high throughput, paged attention",     11435),
     "sglang": ("SGLang", "NVFP4 tensor cores — RadixAttention, multi-turn optimized", 11436),
+    "vllm-devai": ("vLLM devai", "home-built vLLM 0.28 + HyperQwen patches — MTP on 24G, prepared checkpoints", 11437),
 }
 
 # Backends actually surfaced as picker rows.
@@ -230,7 +239,7 @@ _BACKENDS: dict[str, tuple[str, str, int]] = {
 # Ordering matters: _dedup_hf_rows keeps one row per (model, backend)
 # and ranks vllm above sglang, so a model probed on both still leads
 # with its vLLM row while the SGLang row stays selectable.
-_PICKER_BACKENDS: tuple[str, ...] = ("ollama", "vllm", "sglang")
+_PICKER_BACKENDS: tuple[str, ...] = ("ollama", "vllm", "vllm-devai", "sglang")
 _PICKER_HF_BACKENDS: tuple[str, ...] = tuple(
     b for b in _PICKER_BACKENDS if b != "ollama"
 )
@@ -1056,6 +1065,7 @@ def _discover_models() -> list[dict]:
     # `model-picker --show` style listings.
     vllm_probes = _load_hf_probe_records(_VLLM_PROBE_CACHE_PATHS)
     sglang_probes = _load_hf_probe_records(_SGLANG_PROBE_CACHE_PATHS)
+    vllm_devai_probes = _load_hf_probe_records(_VLLM_DEVAI_PROBE_CACHE_PATHS)
     # Placeholder rows for files with no probe data anywhere are tagged
     # with DEVAI_HF_BACKEND when it is one of the picker-exposed HF
     # backends; otherwise we fall back to the first picker-exposed HF
@@ -1075,7 +1085,8 @@ def _discover_models() -> list[dict]:
         # Iterate only picker-exposed HF backends. Both caches are
         # loaded above; _PICKER_HF_BACKENDS decides which of them
         # generate menu rows.
-        store_by_backend = {"vllm": vllm_probes, "sglang": sglang_probes}
+        store_by_backend = {"vllm": vllm_probes, "sglang": sglang_probes,
+                            "vllm-devai": vllm_devai_probes}
         for backend in _PICKER_HF_BACKENDS:
             store = store_by_backend.get(backend)
             if store is None:
@@ -1962,7 +1973,7 @@ def _dedup_hf_rows(models: list[dict]) -> list[dict]:
     Ollama tag names never collide with HF directory names, so Ollama
     rows pass through unchanged.
     """
-    hf_priority = {"vllm": 2, "sglang": 1}
+    hf_priority = {"vllm": 3, "vllm-devai": 2, "sglang": 1}
     chosen: dict[tuple[str, str], dict] = {}
     for m in models:
         key = (m.get("name") or "", str(m.get("backend") or ""))
@@ -3494,6 +3505,7 @@ def _hf_probe_cache_paths(backend: str) -> list[str] | None:
     return {
         "vllm": _VLLM_PROBE_CACHE_PATHS,
         "sglang": _SGLANG_PROBE_CACHE_PATHS,
+        "vllm-devai": _VLLM_DEVAI_PROBE_CACHE_PATHS,
     }.get(backend)
 
 

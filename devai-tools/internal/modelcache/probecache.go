@@ -256,7 +256,7 @@ func hasWeights(dir, name string) bool {
 // The second return value is that set of notes; it is nil when every
 // backend was gated normally.
 func ListFitting(catalog []CatalogEntry, caches map[string]ProbeCache, vramGB, ctx int, backendFilter string, stores WeightStores) ([]FitResult, []string) {
-	backends := []string{"ollama", "vllm", "sglang"}
+	backends := []string{"ollama", "vllm", "vllm-devai", "sglang"}
 	if backendFilter != "" {
 		backends = []string{backendFilter}
 	}

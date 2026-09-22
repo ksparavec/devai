@@ -610,7 +610,7 @@ func synthesizeHFFromCache(
 			// historical hardcode), so "" decodes to fp8 there; SGLang
 			// legacy cells ran the engine default (no flag) and stay "".
 			kv := probe.KVCacheType
-			if kv == "" && backendName == "vllm" {
+			if kv == "" && engineOf(backendName) == "vllm" {
 				kv = "fp8"
 			}
 			kvByCtx[c] = kv
@@ -1096,7 +1096,22 @@ func parseSizeGB(s string) float64 {
 // change) made it load-bearing, the wrong number would have been used
 // with nothing to flag it. An unknown backend is now a caller error
 // rather than an inherited guess.
+// engineOf maps a backend NAME to the engine that serves it. Names key
+// ports, containers, probe caches and the per-backend lookup maps; the
+// engine decides behaviour -- request body shapes, tool stripping, parser
+// plugins, the legacy KV default, the memory heuristic, recovery-flag
+// scoping. `vllm-devai` is the home-built, HyperQwen-patched vLLM 0.28.0
+// image on its own port (11437) and cache, so stock and custom vLLM can be
+// addressed side by side; everything engine-specific must treat it as vLLM.
+func engineOf(backend string) string {
+	if backend == "vllm-devai" {
+		return "vllm"
+	}
+	return backend
+}
+
 func memFraction(modelSizeGB, totalVRAMGB float64, backend string) float64 {
+	backend = engineOf(backend)
 	// Per-backend runtime reserve outside the static pool. SGLang needs
 	// more: RadixAttention tree + CUDA graphs.
 	reserveByBackend := map[string]float64{
@@ -1612,6 +1627,7 @@ func main() {
 func buildArbiter() *arbiter {
 	ollamaURL, _ := url.Parse(env("OLLAMA_URL", "http://devai-ollama:11434"))
 	vllmURL, _ := url.Parse(env("VLLM_URL", "http://devai-vllm:11434"))
+	vllmDevaiURL, _ := url.Parse(env("VLLM_DEVAI_URL", "http://devai-vllm-devai:11434"))
 	sglangURL, _ := url.Parse(env("SGLANG_URL", "http://devai-sglang:11434"))
 	socketPath := env("PODMAN_SOCKET", "/run/podman/podman.sock")
 	network := env("NETWORK", "devai-net")
@@ -1679,6 +1695,11 @@ func buildArbiter() *arbiter {
 	sglangCachePath := env("SGLANG_PROBE_CACHE", "/etc/devai/.sglang-reasoning-cache.json")
 	cfg.Models = append(cfg.Models,
 		loadHFCache(sglangCachePath, "sglang", hostVRAMGB, operatorMaxCtx, catalogMTP)...)
+	// The custom vLLM build has its own cache: cells are stamped with the
+	// image they were measured on, and this backend's image is not vllm's.
+	vllmDevaiCachePath := env("VLLM_DEVAI_PROBE_CACHE", "/etc/devai/.vllm-devai-reasoning-cache.json")
+	cfg.Models = append(cfg.Models,
+		loadHFCache(vllmDevaiCachePath, "vllm-devai", hostVRAMGB, operatorMaxCtx, catalogMTP)...)
 
 	backends := []backendConfig{
 		{
@@ -1715,6 +1736,22 @@ func buildArbiter() *arbiter {
 			BackendURL:    vllmURL,
 			ContainerName: env("VLLM_CONTAINER", "devai-vllm"),
 			Image:         env("VLLM_IMAGE", "docker.io/vllm/vllm-openai:v0.22.1-x86_64-cu129-ubuntu2404"),
+			ModelsDir:     env("VLLM_MODELS_DIR", "/var/cache/devai/vllm"),
+			Network:       network,
+			HealthPath:    "/health",
+			Entrypoint:    vllmEntrypoint,
+			EnvVars:       map[string]string{"VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1"},
+		},
+		{
+			// The home-built, HyperQwen-patched vLLM 0.28.0 (make build-vllm).
+			// Same engine, entrypoint and model store as `vllm`; its own
+			// port, container, image and probe cache. Tagged with a docker.io
+			// name but present only in the local image store (never pulled).
+			Name:          "vllm-devai",
+			ListenPort:    envInt("VLLM_DEVAI_PORT", 11437),
+			BackendURL:    vllmDevaiURL,
+			ContainerName: env("VLLM_DEVAI_CONTAINER", "devai-vllm-devai"),
+			Image:         env("VLLM_DEVAI_IMAGE", "docker.io/devai/vllm-devai:latest"),
 			ModelsDir:     env("VLLM_MODELS_DIR", "/var/cache/devai/vllm"),
 			Network:       network,
 			HealthPath:    "/health",
@@ -2611,7 +2648,7 @@ func (a *arbiter) resolvePluginLaunch(
 ) (map[string]any, error) {
 	// Only vLLM honours `--*-parser-plugin <path>`. SGLang registers
 	// parsers via Python imports — file-path mounts wouldn't help.
-	if backendName != "vllm" || a.pluginRegistry == nil {
+	if engineOf(backendName) != "vllm" || a.pluginRegistry == nil {
 		return nil, nil
 	}
 	var matched bool
@@ -3943,7 +3980,7 @@ func (e *promoteToolChoiceError) JSON() []byte {
 func (a *arbiter) maybePromoteToolChoice(
 	backendName, modelName string, body []byte,
 ) ([]byte, *promoteToolChoiceError) {
-	if backendName != "vllm" && backendName != "sglang" {
+	if e := engineOf(backendName); e != "vllm" && e != "sglang" {
 		return body, nil
 	}
 	if a.modelToolMode[backendName][modelName] != "forced" {
@@ -4005,7 +4042,7 @@ func toolNameAt(tools []any, i int) string {
 }
 
 func (a *arbiter) maybeStripTools(backendName, modelName string, body []byte) []byte {
-	if backendName != "vllm" && backendName != "sglang" {
+	if e := engineOf(backendName); e != "vllm" && e != "sglang" {
 		return body
 	}
 	if a.modelToolParser[backendName][modelName] != "" {
@@ -4046,7 +4083,7 @@ const (
 // directive expected by the incoming protocol path. Per docs/ollama_models.md:
 // prefer protocol fields over prompt-text tricks.
 func (a *arbiter) applyReasoningPolicy(backendName, path, modelName, policy string, body []byte) []byte {
-	switch backendName {
+	switch engineOf(backendName) {
 	case "ollama":
 		switch strings.TrimRight(path, "/") {
 		case "/api/chat", "/api/generate":
@@ -4064,7 +4101,7 @@ func (a *arbiter) applyReasoningPolicy(backendName, path, modelName, policy stri
 		if isResponsesPath(path) {
 			return a.applyResponsesPolicy(backendName, modelName, policy, body)
 		}
-		if backendName == "vllm" {
+		if engineOf(backendName) == "vllm" {
 			return a.applyVLLMPolicy(path, modelName, policy, body)
 		}
 		return a.applySGLangPolicy(path, modelName, policy, body)

@@ -454,6 +454,11 @@ def _gb(bytes_: int) -> float:
     return bytes_ / (1024 ** 3)
 
 
+# Every HF row can be served by all three HF engines; which ones actually
+# fit is the probe caches' business, one per backend.
+HF_BACKENDS = ["vllm", "vllm-devai", "sglang"]
+
+
 def _entry_hf(repo: str, family: str, fallback_arch: Arch,
               thinking: bool, parsers: dict | None,
               mtp: dict | None = None) -> Entry | None:
@@ -493,7 +498,7 @@ def _entry_hf(repo: str, family: str, fallback_arch: Arch,
     return Entry(
         name=repo.split("/")[-1],
         family=family,
-        backend=["vllm", "sglang"],
+        backend=list(HF_BACKENDS),
         repo=repo,
         size_gb=_gb(size_bytes),
         arch=arch,
@@ -516,7 +521,7 @@ def _normalize_parsers(parsers: dict | None) -> dict | None:
     if not parsers or not isinstance(parsers, dict):
         return None
     out: dict = {}
-    for backend in ("vllm", "sglang"):
+    for backend in ("vllm", "vllm-devai", "sglang"):
         block = parsers.get(backend)
         if not isinstance(block, dict):
             continue
@@ -936,7 +941,7 @@ def main(argv: list[str] | None = None) -> int:
             # reads the probe-confirmed values back from the cache. Only
             # emitted for HF entries — Ollama handles parsing natively.
             lines.append("    parsers:")
-            for backend in ("vllm", "sglang"):
+            for backend in ("vllm", "vllm-devai", "sglang"):
                 block = e.parsers.get(backend)
                 if not block:
                     continue

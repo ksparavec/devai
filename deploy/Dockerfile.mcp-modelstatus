@@ -17,9 +17,9 @@ RUN cd devai-tools && go mod tidy && CGO_ENABLED=0 go build -ldflags="-s -w" -o 
 # read by modelcache.Load*Cache identically to "file absent") so the
 # final-stage COPY below always has a source, whether or not this host
 # has probed/benched anything yet.
-COPY deploy/.ollama-reasoning-cache.json* deploy/.vllm-reasoning-cache.json* deploy/.sglang-reasoning-cache.json* deploy/.bench-cache.json* /tmp/maybe-caches/
+COPY deploy/.ollama-reasoning-cache.json* deploy/.vllm-reasoning-cache.json* deploy/.sglang-reasoning-cache.json* deploy/.vllm-devai-reasoning-cache.json* deploy/.bench-cache.json* /tmp/maybe-caches/
 RUN mkdir -p /etc/devai && cp deploy/models.yaml /etc/devai/models.yaml && \
-    for f in .ollama-reasoning-cache.json .vllm-reasoning-cache.json .sglang-reasoning-cache.json .bench-cache.json; do \
+    for f in .ollama-reasoning-cache.json .vllm-reasoning-cache.json .sglang-reasoning-cache.json .vllm-devai-reasoning-cache.json .bench-cache.json; do \
         if [ -f "/tmp/maybe-caches/$f" ]; then cp "/tmp/maybe-caches/$f" "/etc/devai/$f"; else echo '{}' > "/etc/devai/$f"; fi; \
     done
 

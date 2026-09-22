@@ -229,8 +229,12 @@ class StorageLayoutTest(unittest.TestCase):
         self.assertEqual(sm.SGLANG_STORE, Path("/var/cache/devai/sglang"))
 
     def test_hf_stores_are_exactly_the_vllm_and_sglang_stores(self) -> None:
+        # Three HF backends, TWO directories: vllm-devai (the home-built
+        # vLLM image) serves the vLLM store. No fourth directory exists.
         self.assertEqual(sm.HF_STORES,
-                         {"vllm": sm.VLLM_STORE, "sglang": sm.SGLANG_STORE})
+                         {"vllm": sm.VLLM_STORE, "sglang": sm.SGLANG_STORE,
+                          "vllm-devai": sm.VLLM_STORE})
+        self.assertEqual(len(set(sm.HF_STORES.values())), 2)
 
     def test_gguf_staging_is_inside_the_ollama_store(self) -> None:
         self.assertEqual(sm.GGUF_STAGING,

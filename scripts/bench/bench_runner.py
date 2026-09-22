@@ -62,6 +62,7 @@ PROBE_CACHE_BY_BACKEND = {
     "ollama": REPO_ROOT / "deploy" / ".ollama-reasoning-cache.json",
     "vllm": REPO_ROOT / "deploy" / ".vllm-reasoning-cache.json",
     "sglang": REPO_ROOT / "deploy" / ".sglang-reasoning-cache.json",
+    "vllm-devai": REPO_ROOT / "deploy" / ".vllm-devai-reasoning-cache.json",
 }
 
 def probe_image_digest(backend: str) -> str | None:
@@ -109,6 +110,8 @@ def probe_image_digest(backend: str) -> str | None:
 HF_WEIGHT_STORE_BY_BACKEND = {
     "vllm": Path(os.environ.get("VLLM_MODELS_DIR", "/var/cache/devai/vllm")),
     "sglang": Path(os.environ.get("SGLANG_MODELS_DIR", "/var/cache/devai/sglang")),
+    # Same store as vllm: the custom build serves the same directory.
+    "vllm-devai": Path(os.environ.get("VLLM_MODELS_DIR", "/var/cache/devai/vllm")),
 }
 
 
@@ -146,6 +149,9 @@ BACKEND_METRICS_URL = {
         "BENCH_SGLANG_METRICS_URL", "http://devai-sglang:11434/metrics"
     ),
     "ollama": None,
+    "vllm-devai": os.environ.get(
+        "BENCH_VLLM_DEVAI_METRICS_URL", "http://devai-vllm-devai:11434/metrics"
+    ),
 }
 
 # vLLM Prometheus metrics we capture per run. The names are vLLM-side
@@ -226,7 +232,7 @@ def _fetch_backend_metrics(backend: str) -> dict[str, float]:
             text = resp.read().decode("utf-8", errors="replace")
     except (urllib.error.URLError, OSError):
         return {}
-    patterns = _VLLM_METRIC_PATTERNS if backend == "vllm" else _SGLANG_METRIC_PATTERNS
+    patterns = _VLLM_METRIC_PATTERNS if backend in ("vllm", "vllm-devai") else _SGLANG_METRIC_PATTERNS
     out: dict[str, float] = {}
     for full_name in patterns:
         v = _parse_prometheus_max(text, full_name)
@@ -1296,7 +1302,7 @@ def _check_router(router_url: str) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--backend", required=True, choices=["ollama", "vllm", "sglang"])
+    ap.add_argument("--backend", required=True, choices=["ollama", "vllm", "sglang", "vllm-devai"])
     ap.add_argument(
         "--tasks",
         default=DEFAULT_TASKS,

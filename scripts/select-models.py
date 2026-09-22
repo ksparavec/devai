@@ -45,6 +45,7 @@ CATALOG = REPO_ROOT / "deploy" / "models.yaml"
 PROBE_CACHE = REPO_ROOT / "deploy" / ".ollama-reasoning-cache.json"
 VLLM_PROBE_CACHE = REPO_ROOT / "deploy" / ".vllm-reasoning-cache.json"
 SGLANG_PROBE_CACHE = REPO_ROOT / "deploy" / ".sglang-reasoning-cache.json"
+VLLM_DEVAI_PROBE_CACHE = REPO_ROOT / "deploy" / ".vllm-devai-reasoning-cache.json"
 
 # vLLM/SGLang serve models fully in VRAM — weights + full KV cache +
 # CUDA graphs + activations. Ollama (llama.cpp) has a much smaller
@@ -127,7 +128,9 @@ GGUF_STAGING = OLLAMA_STORE / "models" / "_gguf"
 # therefore an explicit opt-in (--hf-store) and never an automatic
 # duplication. `sglang_weight_gaps` catches the other half of the problem:
 # weights the SGLang probe cache advertises but the SGLang store does not have.
-HF_STORES = {"vllm": VLLM_STORE, "sglang": SGLANG_STORE}
+# `vllm-devai` (the home-built vLLM image, its own router port + probe
+# cache) serves the vLLM store: one download, two engines.
+HF_STORES = {"vllm": VLLM_STORE, "sglang": SGLANG_STORE, "vllm-devai": VLLM_STORE}
 HF_STORE = "vllm"            # active store for this run; set by main()
 
 
@@ -418,7 +421,16 @@ def hf_exclude_patterns() -> list[str]:
 
 def _peer_hf_store(store: str) -> tuple[str, Path] | None:
     """(name, path) of the HF store this run is NOT writing to."""
-    others = [(n, p) for n, p in HF_STORES.items() if n != store]
+    # Peer = a DIFFERENT directory, not merely a different backend name:
+    # vllm and vllm-devai share one store, so linking "from vllm-devai"
+    # into vllm would be linking a directory to itself.
+    mine = HF_STORES[store]
+    others, seen = [], set()
+    for n, p in HF_STORES.items():
+        if p == mine or p in seen:
+            continue
+        seen.add(p)
+        others.append((n, p))
     return others[0] if len(others) == 1 else None
 
 
@@ -846,12 +858,15 @@ class HFProbeCaches:
 
     vllm: dict
     sglang: dict
+    vllm_devai: dict = None  # type: ignore[assignment]
 
     def cache_for(self, backend: str) -> dict:
         if backend == "vllm":
             return self.vllm
         if backend == "sglang":
             return self.sglang
+        if backend == "vllm-devai":
+            return self.vllm_devai or {}
         return {}
 
     def lookup(self, repo: str, sha: str, backend: str) -> dict:
@@ -1111,6 +1126,7 @@ def load_hf_probe_caches() -> HFProbeCaches:
         return data if isinstance(data, dict) else {}
 
     return HFProbeCaches(
+        vllm_devai=_read(VLLM_DEVAI_PROBE_CACHE),
         vllm=_read(VLLM_PROBE_CACHE),
         sglang=_read(SGLANG_PROBE_CACHE),
     )
@@ -1329,7 +1345,7 @@ def _is_eligible_backend(row: Row, hf_caches: HFProbeCaches) -> bool:
     if is_ollama_only(row.model):
         return True
     backends = row.model.get("backend") or []
-    for b in ("vllm", "sglang"):
+    for b in ("vllm", "vllm-devai", "sglang"):
         if b in backends and hf_caches.has_working_probe(b):
             return True
     return False
@@ -1418,7 +1434,7 @@ def _row_probe_entry(
         if not is_ollama_only(m):
             return {}
         return lookup_probe(m["name"], probe_cache)
-    if backend in ("vllm", "sglang"):
+    if backend in ("vllm", "vllm-devai", "sglang"):
         if is_ollama_only(m):
             return {}
         return hf_caches.lookup(m.get("repo") or "", m.get("sha") or "", backend)
@@ -1493,7 +1509,7 @@ def _backends_for(model: dict) -> list[str]:
     advertises. Each backend is its own cell axis in the matrix."""
     out: list[str] = []
     for b in model.get("backend") or []:
-        if b in ("ollama", "vllm", "sglang"):
+        if b in ("ollama", "vllm", "vllm-devai", "sglang"):
             out.append(b)
     return out
 
@@ -1544,7 +1560,7 @@ def assign_cell_candidates(
                 continue
             family = row.model.get("family") or ""
             for backend in _backends_for(row.model):
-                if backend in ("vllm", "sglang") and not hf_caches.has_working_probe(backend):
+                if backend in ("vllm", "vllm-devai", "sglang") and not hf_caches.has_working_probe(backend):
                     continue
                 bucket.setdefault((family, backend), []).append(row)
 
@@ -1624,7 +1640,7 @@ def _hf_lookup_with_priority(
     backends = m.get("backend") or []
     repo = m.get("repo") or ""
     sha = (m.get("sha") or "").strip()
-    for b in ("vllm", "sglang"):
+    for b in ("vllm", "vllm-devai", "sglang"):
         if b not in backends:
             continue
         entry = hf_caches.lookup(repo, sha, b)
@@ -1807,8 +1823,8 @@ def print_cell_matrix(
         return
     families = sorted({k[0] for k in cell_index.keys()})
     backends_seen = sorted({k[1] for k in cell_index.keys()},
-                           key=lambda b: ("ollama", "vllm", "sglang").index(b)
-                           if b in ("ollama", "vllm", "sglang") else 99)
+                           key=lambda b: ("ollama", "vllm", "vllm-devai", "sglang").index(b)
+                           if b in ("ollama", "vllm", "vllm-devai", "sglang") else 99)
 
     col_w = 22
     name_w = 18

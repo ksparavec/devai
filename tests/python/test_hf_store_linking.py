@@ -159,7 +159,8 @@ class SelectModelsUsesThePeerStoreTest(unittest.TestCase):
         _model(self.vllm, "Present-9B", {"model.safetensors": b"x" * 32})
 
         self.sm = _load("select_models", "scripts/select-models.py")
-        self.sm.HF_STORES.update({"vllm": self.vllm, "sglang": self.sglang})
+        # vllm-devai is the vllm directory under another backend name.
+        self.sm.HF_STORES.update({"vllm": self.vllm, "sglang": self.sglang, "vllm-devai": self.vllm})
         self.sm.VLLM_STORE, self.sm.SGLANG_STORE = self.vllm, self.sglang
         self.sm.HF_STORE = "sglang"
 

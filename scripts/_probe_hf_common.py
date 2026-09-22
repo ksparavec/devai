@@ -207,7 +207,10 @@ def _entry_applies_to_backend(
                   f"list, got {type(backends).__name__}; treating the entry as "
                   f"applying to all backends", file=sys.stderr)
         return True
-    return backend in backends
+    # By name or by engine (kept in sync with recovery_flags.go appliesTo):
+    # vLLM CLI flags written for `vllm` apply to the custom vLLM build too;
+    # an entry scoped to `vllm-devai` names the only image that serves it.
+    return backend in backends or engine_of(backend) in backends
 
 
 def _recovery_entry(model_name: str, backend: str) -> dict | None:
@@ -264,10 +267,24 @@ def recovery_image(model_name: str, backend: str) -> str | None:
 
 # ── Backend spec ─────────────────────────────────────────────────────────────
 
+# Backend NAME -> ENGINE. Mirrors gpu-arbiter's engineOf: names key ports,
+# containers, caches and rows; the engine decides behaviour. `vllm-devai` is
+# the home-built, HyperQwen-patched vLLM 0.28.0 image on its own port/cache.
+_ENGINE_OF = {"vllm-devai": "vllm"}
+
+
+def engine_of(backend: str) -> str:
+    return _ENGINE_OF.get(backend, backend)
+
+
 @dataclass(frozen=True)
 class BackendSpec:
     """Per-backend constants and the launch-arg builder."""
-    name: str                   # "vllm" | "sglang"
+    name: str                   # "vllm" | "vllm-devai" | "sglang"
+
+    @property
+    def engine(self) -> str:
+        return engine_of(self.name)
     image: str                  # default container image
     container_name: str         # default probe container name
     probe_port: int             # default loopback port
@@ -2476,7 +2493,7 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
             row_mtp = row.get("mtp") if isinstance(row.get("mtp"), dict) else None
             mtp_should_probe = (
                 row_mtp is not None
-                and spec.name == "vllm"
+                and engine_of(spec.name) == "vllm"
                 and not getattr(args, "no_mtp", False)
             )
 

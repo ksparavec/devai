@@ -75,6 +75,7 @@ PROBE_CACHES = {
     "ollama": CONFIG_DIR / ".ollama-reasoning-cache.json",
     "vllm":   CONFIG_DIR / ".vllm-reasoning-cache.json",
     "sglang": CONFIG_DIR / ".sglang-reasoning-cache.json",
+    "vllm-devai": CONFIG_DIR / ".vllm-devai-reasoning-cache.json",
 }
 
 # Bench cache feeds the picker's TPS/CODE/REAS/TOTAL columns. Mounted
@@ -345,7 +346,11 @@ def build_run_cmd(
     cmd += ["-v", f"{CONFIG_DIR}:/devai-host"]
 
     # Probe caches — the picker and router expect /etc/devai/<name>.json.
-    # Mount whatever exists; absent backend caches are tolerated downstream.
+    # Mount whatever exists. An absent cache is tolerated downstream, but
+    # it is SAID here: the picker then simply lists no rows for that
+    # backend, and "the picker is not showing devai models at all" was the
+    # whole symptom when the vllm-devai symlink had not been staged yet
+    # (2026-09-22; `make install` stages it).
     for backend, host_path in PROBE_CACHES.items():
         if host_path.exists():
             cmd += ["-v",

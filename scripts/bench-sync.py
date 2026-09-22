@@ -55,7 +55,7 @@ BENCH_CACHE = REPO_ROOT / "deploy" / ".bench-cache.json"
 DEFAULT_TASKS = ("gsm8k", "humaneval", "humaneval_plus", "mmlu_pro",
                  "gpqa", "tools", "leak")
 
-BACKENDS = ("vllm", "sglang", "ollama")
+BACKENDS = ("vllm", "vllm-devai", "sglang", "ollama")
 
 # Classification buckets, most-actionable first. Order matters: it is the
 # print order and the order execute() drains.

@@ -139,8 +139,12 @@ func (e recoveryEntry) appliesTo(backendName string) bool {
 	if e.Backends == nil {
 		return true
 	}
+	// By name, or by engine: vLLM CLI flags written for the stock `vllm`
+	// backend are engine flags and apply to the custom vLLM build too
+	// (`vllm-devai`). The reverse does not hold -- an entry scoped to
+	// `vllm-devai` names the only image that can serve that checkpoint.
 	for _, b := range *e.Backends {
-		if b == backendName {
+		if b == backendName || b == engineOf(backendName) {
 			return true
 		}
 	}

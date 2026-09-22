@@ -523,7 +523,9 @@ BACKEND_PORTS = {
     "ollama": 11434,
     "vllm": 11435,
     "sglang": 11436,
+    "vllm-devai": 11437,   # home-built, patched vLLM 0.28.0; own probe cache
 }
+ROUTER_PORT_BY_BACKEND = BACKEND_PORTS
 
 
 def router_url_for(backend: str) -> str:

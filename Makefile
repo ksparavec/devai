@@ -84,7 +84,7 @@ CACHE_COMPOSE = $(CURDIR)/deploy/docker-compose.yaml
 # router-managed-container note in that target. Keep in sync with
 # deploy/docker-compose.yaml; `make cache-services-check` asserts it.
 # mcp-gateway is deliberately absent: it sits behind the `mcp` profile.
-CACHE_SERVICES = apt-cache registry-cache ollama vllm sglang router \
+CACHE_SERVICES = apt-cache registry-cache ollama vllm vllm-devai sglang router \
                  open-webui webui-proxy logger pipelock
 
 # The three the router recreates on demand. cache-up skips any of these
@@ -198,6 +198,7 @@ PROBE_CACHE_MOUNT = \
 	$(if $(wildcard deploy/.ollama-reasoning-cache.json),-v $(CURDIR)/deploy/.ollama-reasoning-cache.json:/etc/devai/.ollama-reasoning-cache.json:ro) \
 	$(if $(wildcard deploy/.vllm-reasoning-cache.json),-v $(CURDIR)/deploy/.vllm-reasoning-cache.json:/etc/devai/.vllm-reasoning-cache.json:ro) \
 	$(if $(wildcard deploy/.sglang-reasoning-cache.json),-v $(CURDIR)/deploy/.sglang-reasoning-cache.json:/etc/devai/.sglang-reasoning-cache.json:ro) \
+	$(if $(wildcard deploy/.vllm-devai-reasoning-cache.json),-v $(CURDIR)/deploy/.vllm-devai-reasoning-cache.json:/etc/devai/.vllm-devai-reasoning-cache.json:ro) \
 	$(if $(wildcard deploy/.bench-cache.json),-v $(CURDIR)/deploy/.bench-cache.json:/etc/devai/.bench-cache.json:ro) \
 	$(if $(wildcard deploy/.model-status.json),-v $(CURDIR)/deploy/.model-status.json:/etc/devai/.model-status.json:ro)
 
@@ -1063,9 +1064,10 @@ cache-status: ## Show infrastructure service status and disk usage
 		echo "  (ollama not running)"; \
 	fi
 	@echo ""
-	@echo "vLLM/SGLang models:"
+	@echo "vLLM/SGLang models (BACKENDS = probe caches that hold the model):"
 	@vllm_cache=$(CURDIR)/deploy/.vllm-reasoning-cache.json; \
 	sglang_cache=$(CURDIR)/deploy/.sglang-reasoning-cache.json; \
+	devai_cache=$(CURDIR)/deploy/.vllm-devai-reasoning-cache.json; \
 	found=false; for dir in $$(ls -d $(VLLM_MODELS_DIR)/*/ 2>/dev/null | sort -V -f); do \
 		[ -f "$$dir/config.json" ] || continue; \
 		if ! $$found; then \
@@ -1085,6 +1087,7 @@ cache-status: ## Show infrastructure service status and disk usage
 		else modified="$$((diff_sec / 604800)) weeks ago"; fi; \
 		backends=""; \
 		[ -f "$$vllm_cache" ]   && grep -q "\"$$name\"" "$$vllm_cache"   && backends="vllm"; \
+		[ -f "$$devai_cache" ]  && grep -q "\"$$name\"" "$$devai_cache"  && backends="$${backends:+$$backends,}vllm-devai"; \
 		[ -f "$$sglang_cache" ] && grep -q "\"$$name\"" "$$sglang_cache" && backends="$${backends:+$$backends,}sglang"; \
 		[ -z "$$backends" ] && backends="-"; \
 		printf "%-46s%-16s%-14s%-10s%-20s\n" "$$name" "$$id" "$$backends" "$$size" "$$modified"; \
@@ -1376,6 +1379,30 @@ probe-vllm: ## Probe every downloaded vLLM/HF model per (VRAM, CONTEXT) cell.
 	    $(if $(PROBE_FORCE_ARCH),--force-arch,) \
 	    $(if $(PROBE_CTX_EXACT),--ctx-exact $(PROBE_CTX_EXACT),)
 
+probe-vllm-devai: ## Probe every downloaded HF model on the vllm-devai backend (home-built vLLM 0.28 + patches; own cache) per (VRAM, CONTEXT) cell.
+	@# Pre-condition: devai-router, devai-vllm, and devai-sglang must
+	@# be stopped — the prober launches devai-vllm-probe with explicit
+	@# GPU exclusivity. The script self-checks and aborts otherwise.
+	@# Knobs:
+	@#   PROBE_VRAMS_VLLM=16G,24G    target VRAM bands
+	@#   PROBE_CONTEXTS=32K,...      ctx tiers
+	@#   PROBE_REPO=<regex>          filter catalog rows by repo
+	@#   PROBE_FORCE=1               re-probe every cell
+	@#   PROBE_FORCE_ARCH=1          re-probe top-level capability/arch
+	@#   PROBE_KV_CACHE_TYPE=auto    KV dtype for this pass (default fp8);
+	@#                               cells are stamped so serve time
+	@#                               reproduces the measured dtype
+	PROBE_KV_CACHE_TYPE="$(PROBE_KV_CACHE_TYPE)" \
+	python3 scripts/probe-vllm-devai-reasoning.py \
+	    --host-vram-gb $(GPU_MEMORY_GB) \
+	    --models-dir $(VLLM_MODELS_DIR) \
+	    $(if $(PROBE_VRAMS_VLLM),--vram $(PROBE_VRAMS_VLLM),) \
+	    $(if $(PROBE_CONTEXTS),--ctx $(PROBE_CONTEXTS),) \
+	    $(if $(PROBE_REPO),--repo '$(PROBE_REPO)',) \
+	    $(if $(PROBE_FORCE),--force,) \
+	    $(if $(PROBE_FORCE_ARCH),--force-arch,) \
+	    $(if $(PROBE_CTX_EXACT),--ctx-exact $(PROBE_CTX_EXACT),)
+
 probe-sglang: ## Probe every downloaded SGLang/HF model per (VRAM, CONTEXT) cell.
 	@# Pre-condition: same as probe-vllm — all GPU-owning backends down.
 	@# Knobs:
@@ -1422,7 +1449,8 @@ probe-load-vllm: ## Serving-time LOAD probe for vLLM: augment fit cache with ser
 	    $(if $(PROBE_NEEDLE_DEPTH),--needle-depth $(PROBE_NEEDLE_DEPTH),)
 
 probe-load-sglang: ## Serving-time LOAD probe for SGLang: same as probe-load-vllm against the SGLang cache.
-	@# Layers onto deploy/.sglang-reasoning-cache.json — run `make probe-sglang`
+	@# Layers onto deploy/.sglang-reasoning-cache.json (the vllm-devai backend
+	@# has no load probe target yet; deploy/.vllm-devai-reasoning-cache.json) -- run `make probe-sglang`
 	@# first. Same precondition + knobs as probe-load-vllm.
 	PROBE_KV_CACHE_TYPE="$(PROBE_KV_CACHE_TYPE)" \
 	python3 scripts/probe-sglang-reasoning.py --load \
@@ -1739,6 +1767,7 @@ uninstall: ## Remove devai-agent launcher and the staged config dir
 	@rm -f $(DEVAI_HOME)/.ollama-reasoning-cache.json
 	@rm -f $(DEVAI_HOME)/.vllm-reasoning-cache.json
 	@rm -f $(DEVAI_HOME)/.sglang-reasoning-cache.json
+	@rm -f $(DEVAI_HOME)/.vllm-devai-reasoning-cache.json
 	@rm -f $(DEVAI_HOME)/.bench-cache.json
 	@rm -f $(DEVAI_HOME)/model-picker.py
 	@rm -f $(DEVAI_HOME)/_capability.py
@@ -1760,7 +1789,8 @@ install-systemd: ## Install and enable systemd service for infrastructure
 	@# `IsADirectoryError`. Idempotent.
 	@for f in deploy/.ollama-reasoning-cache.json \
 	          deploy/.vllm-reasoning-cache.json \
-	          deploy/.sglang-reasoning-cache.json ; do \
+	          deploy/.sglang-reasoning-cache.json \
+	          deploy/.vllm-devai-reasoning-cache.json ; do \
 	    test -e "$$f" || echo "{}" > "$$f" ; \
 	done
 	cp deploy/docker-compose.yaml $(HOME)/.config/devai/docker-compose.yaml
@@ -1779,6 +1809,7 @@ install-systemd: ## Install and enable systemd service for infrastructure
 	ln -sfn $(CURDIR)/deploy/.ollama-reasoning-cache.json  $(HOME)/.config/devai/.ollama-reasoning-cache.json
 	ln -sfn $(CURDIR)/deploy/.vllm-reasoning-cache.json    $(HOME)/.config/devai/.vllm-reasoning-cache.json
 	ln -sfn $(CURDIR)/deploy/.sglang-reasoning-cache.json  $(HOME)/.config/devai/.sglang-reasoning-cache.json
+	ln -sfn $(CURDIR)/deploy/.vllm-devai-reasoning-cache.json  $(HOME)/.config/devai/.vllm-devai-reasoning-cache.json
 	ln -sfn $(CURDIR)/deploy/webui-proxy                   $(HOME)/.config/devai/webui-proxy
 	cp deploy/systemd/devai-infra.service $(HOME)/.config/systemd/user/
 	systemctl --user daemon-reload
@@ -1799,6 +1830,7 @@ uninstall-systemd: ## Stop, disable and remove the systemd infrastructure unit
 	rm -f $(HOME)/.config/devai/.ollama-reasoning-cache.json
 	rm -f $(HOME)/.config/devai/.vllm-reasoning-cache.json
 	rm -f $(HOME)/.config/devai/.sglang-reasoning-cache.json
+	rm -f $(HOME)/.config/devai/.vllm-devai-reasoning-cache.json
 	rm -f $(HOME)/.config/devai/webui-proxy
 	rmdir $(HOME)/.config/devai 2>/dev/null || true
 	systemctl --user daemon-reload
@@ -1878,6 +1910,22 @@ bench-vllm: ## Bench every loaded vLLM/HF model via devai-router:11435
 		--entrypoint python3 \
 		$(IMAGE_NAME_GPU) \
 		/scripts/bench/bench_runner.py --backend vllm \
+			$(BENCH_RUN_FLAGS)
+
+bench-vllm-devai: ## Bench every loaded vLLM/HF model via devai-router:11437 (vllm-devai backend)
+	@# Pre-condition: devai-router + devai-vllm reachable on devai-net
+	@# (run 'make cache-up'). nvidia-smi must be on PATH inside the
+	@# lab image so the VRAM sampler reads memory.used.
+	@mkdir -p $(CACHE_DIR)/bench/inspect-logs
+	$(CONTAINER_RUNTIME) run --rm \
+		--network $(DEVAI_NETWORK) \
+		$(BENCH_CACHE_MOUNTS) \
+		$(GPU_FLAGS) \
+		-e GPU_MEMORY_GB=$(GPU_MEMORY_GB) \
+		-e HF_TOKEN -e HUGGING_FACE_HUB_TOKEN \
+		--entrypoint python3 \
+		$(IMAGE_NAME_GPU) \
+		/scripts/bench/bench_runner.py --backend vllm-devai \
 			$(BENCH_RUN_FLAGS)
 
 bench-sglang: ## Bench every loaded SGLang model via devai-router:11436
