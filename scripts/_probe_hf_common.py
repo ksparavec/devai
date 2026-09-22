@@ -665,7 +665,34 @@ def container_state(runtime: str, name: str) -> str:
     return (r.stdout or "").strip() or "absent"
 
 
-def container_run_detached(
+# Persistent engine caches, mirrored from gpu-arbiter/engine_cache.go: one
+# podman named volume per cache directory and backend. vLLM and SGLang
+# JIT-compile at first use (FlashInfer's nvcc-built kernels under
+# ~/.cache/flashinfer/<version>/, torch.compile under ~/.cache/vllm,
+# SGLang under ~/.cache/sglang); with nothing bound there every launch
+# re-paid the whole compile (269 s cold start measured 2026-09-22 for
+# Qwen3.8-27B-MTP-devai-NVFP4 on vllm-devai). A probe that mounts the same
+# volumes as the router warms the cache a serve-time launch then reuses.
+# Narrow on purpose -- the SGLang image carries 877 MB of HF cache under
+# /root/.cache, which podman would copy into an empty whole-directory
+# volume on first use. Keyed by BACKEND so the stock and custom vLLM
+# images never share one. Pinned to the Go side by
+# tests/python/test_engine_cache_volumes.py.
+ENGINE_CACHE_VOLUME_PREFIX = "devai-engine-cache-"
+
+
+def engine_cache_volumes(backend: str) -> list[tuple[str, str]]:
+    """(volume name, container path) pairs for an HF backend; [] otherwise."""
+    engine = engine_of(backend)
+    if engine not in ("vllm", "sglang"):
+        return []
+    return [
+        (f"{ENGINE_CACHE_VOLUME_PREFIX}{backend}-flashinfer", "/root/.cache/flashinfer"),
+        (f"{ENGINE_CACHE_VOLUME_PREFIX}{backend}-{engine}", f"/root/.cache/{engine}"),
+    ]
+
+
+def container_run_args(
     runtime: str,
     name: str,
     image: str,
@@ -675,17 +702,13 @@ def container_run_detached(
     entrypoint: str,
     command: list[str],
     extra_volumes: list[tuple[str, str, str]] | None = None,
-) -> None:
-    """Launch a probe container detached on localhost loopback.
+    backend: str | None = None,
+) -> list[str]:
+    """The `podman run` argv container_run_detached executes; pure, testable.
 
-    `--entrypoint` is mandatory: the upstream vllm and sglang images
-    ship with their own ENTRYPOINTs that swallow our CMD args (the
-    "vllm: error: unrecognized arguments" we hit on the first probe
-    run). Replace it explicitly to match the router's libpod spec.
-
-    `extra_volumes` is an optional list of (host_path, container_path,
-    mode) tuples — currently used to mount the vllm-plugins directory
-    when a model's parser resolved through the plugin registry.
+    `backend` adds that backend's persistent engine-cache volumes (see
+    engine_cache_volumes); a named volume takes the same `--volume
+    name:dest:mode` form as a bind and is created on demand.
     """
     args = [
         runtime, "run", "--detach",
@@ -698,10 +721,42 @@ def container_run_detached(
     ]
     for host, dst, mode in extra_volumes or []:
         args.extend(["--volume", f"{host}:{dst}:{mode}"])
+    for vol, dst in engine_cache_volumes(backend) if backend else []:
+        args.extend(["--volume", f"{vol}:{dst}:rw"])
     for k, v in env_vars.items():
         args.extend(["--env", f"{k}={v}"])
     args.append(image)
     args.extend(command)
+    return args
+
+
+def container_run_detached(
+    runtime: str,
+    name: str,
+    image: str,
+    publish_port: int,
+    models_dir: str,
+    env_vars: dict[str, str],
+    entrypoint: str,
+    command: list[str],
+    extra_volumes: list[tuple[str, str, str]] | None = None,
+    backend: str | None = None,
+) -> None:
+    """Launch a probe container detached on localhost loopback.
+
+    `--entrypoint` is mandatory: the upstream vllm and sglang images
+    ship with their own ENTRYPOINTs that swallow our CMD args (the
+    "vllm: error: unrecognized arguments" we hit on the first probe
+    run). Replace it explicitly to match the router's libpod spec.
+
+    `extra_volumes` is an optional list of (host_path, container_path,
+    mode) tuples — currently used to mount the vllm-plugins directory
+    when a model's parser resolved through the plugin registry.
+    """
+    args = container_run_args(
+        runtime, name, image, publish_port, models_dir, env_vars, entrypoint,
+        command, extra_volumes=extra_volumes, backend=backend,
+    )
     # Register BEFORE launching: a `podman run` that fails partway can still
     # have created the container, and the teardown hooks must know about it.
     _ACTIVE_CONTAINERS.add((runtime, name))
@@ -864,18 +919,24 @@ def build_disable_thinking_body(backend: str, base: dict) -> dict:
 
     vLLM (what applyVLLMPolicy sends):
         reasoning_effort = "none", plus
-        extra_body.chat_template_kwargs.enable_thinking = False
-      Both, not just the second: measured 2026-09-22 on Qwen3.8 (vLLM
-      0.28), `enable_thinking=false` alone still yields 175 reasoning
-      tokens and the template's `xhigh` preamble; `reasoning_effort=none`
-      is the field its template honours (0 reasoning tokens). Sending only
-      the kwarg recorded disable_verified=false for rows the router can in
-      fact silence.
+        top-level chat_template_kwargs.enable_thinking = False
+      Until 2026-09-22 the kwarg went under `extra_body`, which vLLM never
+      reads (it is the OpenAI Python client's name for "splice into the
+      body", not a wire field), so it was discarded and only
+      `reasoning_effort` did anything. The "kwarg alone still yields 175
+      reasoning tokens" measurement that justified sending both had
+      measured that inert form. Re-measured through the router on Qwen3.8
+      (vllm-devai): top-level kwarg alone 0 reasoning chars, extra_body
+      kwarg alone 121 (= baseline), reasoning_effort=none alone 0. Both
+      fields are sent because the router sends both; existing
+      disable_verified verdicts were measured with an effective
+      reasoning_effort=none alone and remain valid (this body is a
+      superset).
     SGLang:
         top-level chat_template_kwargs.enable_thinking = False, plus
         reasoning_effort = "none"
 
-    The shapes differ because the ENGINES differ, and the probe must send
+    Both engines read the kwarg at the top level; the probe must send
     exactly what the router sends or it is measuring a fiction.
 
     SGLang previously got `separate_reasoning = False` here, which made the
@@ -904,14 +965,7 @@ def build_disable_thinking_body(backend: str, base: dict) -> dict:
     # disable probe measured a model that was never told to stop thinking
     # and recorded disable_verified=false for every derived row (2026-09-22).
     engine = engine_of(backend)
-    if engine == "vllm":
-        body["reasoning_effort"] = "none"
-        extra = dict(body.get("extra_body") or {})
-        ctk = dict(extra.get("chat_template_kwargs") or {})
-        ctk["enable_thinking"] = False
-        extra["chat_template_kwargs"] = ctk
-        body["extra_body"] = extra
-    elif engine == "sglang":
+    if engine in ("vllm", "sglang"):
         ctk = dict(body.get("chat_template_kwargs") or {})
         ctk["enable_thinking"] = False
         body["chat_template_kwargs"] = ctk
@@ -942,26 +996,26 @@ def response_has_inline_reasoning(resp: dict) -> bool:
 
 
 def build_enable_thinking_body(backend: str, base: dict) -> dict:
-    """Symmetric to build_disable_thinking_body — flips the same fields
+    """Symmetric to build_disable_thinking_body -- flips the same field
     to enable structured reasoning output. Used by Probe A so models
-    with chat templates that default `enable_thinking=false` (newer
-    Qwen3, etc.) emit a reasoning trace under the curated parser.
+    with chat templates that default `enable_thinking=false` (Gemma 4,
+    etc.) emit a reasoning trace under the curated parser.
+
+    Top-level `chat_template_kwargs` on BOTH engines. Until 2026-09-22 this
+    sent the kwarg under `extra_body` for both, which neither engine reads,
+    so Probe A had always measured the template's own default: a row whose
+    template opts thinking OUT by default was classified with thinking off
+    and never asked to think. Rows in that class (Gemma-4 family) deserve
+    a re-probe now that the request reaches the template.
     """
     body = dict(base)
     engine = engine_of(backend)  # see build_disable_thinking_body
-    if engine == "vllm":
-        extra = dict(body.get("extra_body") or {})
-        ctk = dict(extra.get("chat_template_kwargs") or {})
+    if engine in ("vllm", "sglang"):
+        ctk = dict(body.get("chat_template_kwargs") or {})
         ctk["enable_thinking"] = True
-        extra["chat_template_kwargs"] = ctk
-        body["extra_body"] = extra
-    elif engine == "sglang":
+        body["chat_template_kwargs"] = ctk
+    if engine == "sglang":
         body["separate_reasoning"] = True
-        extra = dict(body.get("extra_body") or {})
-        ctk = dict(extra.get("chat_template_kwargs") or {})
-        ctk["enable_thinking"] = True
-        extra["chat_template_kwargs"] = ctk
-        body["extra_body"] = extra
     return body
 
 
@@ -1413,6 +1467,7 @@ def probe_one_cell(
             container_run_detached(
                 runtime, container_name, image, probe_port, models_dir, env_vars,
                 spec.entrypoint, cmd_args, extra_volumes=extra_volumes,
+                backend=spec.name,
             )
         except RuntimeError as e:
             return _failure_record(

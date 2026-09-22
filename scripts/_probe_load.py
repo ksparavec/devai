@@ -647,6 +647,7 @@ def load_probe_one_cell(
             container_run_detached(
                 runtime, container_name, image, probe_port, models_dir, env_vars,
                 spec.entrypoint, cmd_args, extra_volumes=extra_volumes,
+                backend=spec.name,
             )
         except RuntimeError as e:
             return {

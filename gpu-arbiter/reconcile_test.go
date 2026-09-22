@@ -73,15 +73,69 @@ func TestReconcileIgnoresAPlaceholder(t *testing.T) {
 	}
 }
 
-func TestReconcileSkipsOllama(t *testing.T) {
-	// Ollama's container is always up and always answers /health, so a
-	// probe says nothing about whether a model is resident. `running`
-	// for Ollama means "a model is loaded", which unloadOllama derives
-	// from /api/ps at switch time.
-	a := newReconcileArbiter(t, map[string]bool{"ollama": true})
+// newOllamaReconcileArbiter builds an arbiter whose ollama backend answers
+// /api/ps with `ps` (or refuses the connection when ps is nil).
+func newOllamaReconcileArbiter(t *testing.T, ps *string) *arbiter {
+	t.Helper()
+	a := &arbiter{
+		backends:     map[string]*backendState{},
+		healthClient: &http.Client{},
+	}
+	srv := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/api/ps" && ps != nil {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(*ps))
+				return
+			}
+			w.WriteHeader(http.StatusOK) // /health: always up
+		}))
+	t.Cleanup(srv.Close)
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ps == nil {
+		srv.Close() // connection refused
+	}
+	a.backends["ollama"] = &backendState{config: backendConfig{
+		Name: "ollama", BackendURL: u, HealthPath: "/health", ContainerName: "devai-ollama"}}
+	return a
+}
+
+func TestReconcileAdoptsAResidentOllamaModel(t *testing.T) {
+	// Observed 2026-09-22: qwen3.6:35b-a3b-mtp-q4_K_M resident across a
+	// `make cache-up` that recreated the router; the next vllm-devai
+	// launch died on 0.3 GiB free because stopOtherBackends never unloads
+	// a backend whose flags say idle.
+	ps := `{"models":[{"name":"qwen3.6:35b-a3b-mtp-q4_K_M","size":22000000000,"context_length":131072}]}`
+	a := newOllamaReconcileArbiter(t, &ps)
+	a.reconcileBackendState()
+	bs := a.backends["ollama"]
+	if !bs.running || !bs.containerLaunched {
+		t.Fatal("a resident ollama model must be adopted, or the next HF launch OOMs")
+	}
+	if bs.currentModel != "qwen3.6:35b-a3b-mtp-q4_K_M" || bs.currentContext != 131072 {
+		t.Fatalf("adopted model/ctx = %q/%d, want the /api/ps entry", bs.currentModel, bs.currentContext)
+	}
+}
+
+func TestReconcileLeavesOllamaIdleWhenNothingIsLoaded(t *testing.T) {
+	// The container is always up and always answers /health; only
+	// /api/ps says whether the GPU is held.
+	ps := `{"models":[]}`
+	a := newOllamaReconcileArbiter(t, &ps)
+	a.reconcileBackendState()
+	if bs := a.backends["ollama"]; bs.running || bs.containerLaunched || bs.currentModel != "" {
+		t.Fatal("ollama must not be adopted from a /health probe alone")
+	}
+}
+
+func TestReconcileUnreachableOllamaIsNotAdopted(t *testing.T) {
+	a := newOllamaReconcileArbiter(t, nil)
 	a.reconcileBackendState()
 	if bs := a.backends["ollama"]; bs.running || bs.containerLaunched {
-		t.Fatal("ollama must not be adopted from a /health probe")
+		t.Fatal("an unreachable ollama must be left idle (logged), not adopted")
 	}
 }
 

@@ -331,11 +331,9 @@ func readEnableThinking(t *testing.T, body []byte) (set bool, val bool) {
 	if err := json.Unmarshal(body, &root); err != nil {
 		t.Fatalf("body not valid JSON: %v", err)
 	}
-	eb, ok := root["extra_body"].(map[string]any)
-	if !ok {
-		return false, false
-	}
-	ctk, ok := eb["chat_template_kwargs"].(map[string]any)
+	// Top-level: the only place either engine reads it (vLLM never read
+	// `extra_body`; see applyVLLMPolicy).
+	ctk, ok := root["chat_template_kwargs"].(map[string]any)
 	if !ok {
 		return false, false
 	}
@@ -507,13 +505,16 @@ func TestPolicy_VLLMInlineOffDisables(t *testing.T) {
 	}
 }
 
-func TestPolicy_VLLMClientExtraBodyWins(t *testing.T) {
+func TestPolicy_VLLMClientExtraBodyIsPromotedAndWins(t *testing.T) {
+	// `extra_body` is what this router's docs told clients to send, and
+	// vLLM never read it. A client still sending it gets the kwarg moved
+	// to the top level and honoured over the policy's own value.
 	a := newTestArbiterHF()
 	in := []byte(`{"model":"Qwen3.5-9B-NVFP4","messages":[],"extra_body":{"chat_template_kwargs":{"enable_thinking":false}}}`)
 	out := a.applyReasoningPolicy("vllm", "/v1/chat/completions", "Qwen3.5-9B-NVFP4", "auto", in)
 	setT, valT := readEnableThinking(t, out)
 	if !setT || valT {
-		t.Fatalf("client enable_thinking=false must survive, got set=%v val=%v body=%s", setT, valT, out)
+		t.Fatalf("client enable_thinking=false must be promoted and survive, got set=%v val=%v body=%s", setT, valT, out)
 	}
 }
 
@@ -672,7 +673,7 @@ func TestPolicy_SGLangClientReasoningEffortWins(t *testing.T) {
 func TestSetNestedJSONFieldIfAbsent_CreatesPath(t *testing.T) {
 	in := []byte(`{"model":"x"}`)
 	out := setNestedJSONFieldIfAbsent(in,
-		[]string{"extra_body", "chat_template_kwargs", "enable_thinking"}, true)
+		[]string{"chat_template_kwargs", "enable_thinking"}, true)
 	setT, valT := readEnableThinking(t, out)
 	if !setT || !valT {
 		t.Fatalf("expected enable_thinking=true, got set=%v val=%v body=%s", setT, valT, out)
@@ -680,29 +681,29 @@ func TestSetNestedJSONFieldIfAbsent_CreatesPath(t *testing.T) {
 }
 
 func TestSetNestedJSONFieldIfAbsent_PreservesExistingLeaf(t *testing.T) {
-	in := []byte(`{"extra_body":{"chat_template_kwargs":{"enable_thinking":false}}}`)
+	in := []byte(`{"chat_template_kwargs":{"enable_thinking":false}}`)
 	out := setNestedJSONFieldIfAbsent(in,
-		[]string{"extra_body", "chat_template_kwargs", "enable_thinking"}, true)
-	_, valT := readEnableThinking(t, out)
-	if valT {
+		[]string{"chat_template_kwargs", "enable_thinking"}, true)
+	setT, valT := readEnableThinking(t, out)
+	if !setT || valT {
 		t.Fatalf("existing leaf must not be overwritten, got body=%s", out)
 	}
 }
 
 func TestSetNestedJSONFieldIfAbsent_PreservesSiblings(t *testing.T) {
-	in := []byte(`{"extra_body":{"cache_control":{"ttl":"1h"}}}`)
+	in := []byte(`{"chat_template_kwargs":{"reasoning_effort":"low"}}`)
 	out := setNestedJSONFieldIfAbsent(in,
-		[]string{"extra_body", "chat_template_kwargs", "enable_thinking"}, true)
+		[]string{"chat_template_kwargs", "enable_thinking"}, true)
 	var root map[string]any
 	if err := json.Unmarshal(out, &root); err != nil {
 		t.Fatalf("body not valid JSON: %v", err)
 	}
-	eb, ok := root["extra_body"].(map[string]any)
+	ctk, ok := root["chat_template_kwargs"].(map[string]any)
 	if !ok {
-		t.Fatalf("extra_body missing or not object: %v", root["extra_body"])
+		t.Fatalf("chat_template_kwargs missing or not object: %v", root["chat_template_kwargs"])
 	}
-	if cc, ok := eb["cache_control"].(map[string]any); !ok || cc["ttl"] != "1h" {
-		t.Fatalf("client cache_control must survive, got %v", eb["cache_control"])
+	if ctk["reasoning_effort"] != "low" {
+		t.Fatalf("client sibling must survive, got %v", ctk)
 	}
 	setT, valT := readEnableThinking(t, out)
 	if !setT || !valT {
@@ -944,5 +945,57 @@ func TestMaybeStripTools_BackendIsolation_NoCrossBackendOverwrite(t *testing.T) 
 	}
 	if _, ok := doc["tools"]; ok {
 		t.Errorf("sglang request must NOT inherit vLLM's parser; tools should be stripped; body=%s", out)
+	}
+}
+
+func TestPolicy_VLLMChatKwargIsTopLevel(t *testing.T) {
+	// Measured through the router on Qwen3.8 (vllm-devai, 2026-09-22):
+	// top-level chat_template_kwargs.enable_thinking=false alone -> 0
+	// reasoning chars; the same kwarg under `extra_body` -> 121 (baseline
+	// 114). vLLM never read `extra_body`; the router sent it for months.
+	a := newTestArbiter()
+	in := []byte(`{"model":"qwen3.5:9b","messages":[]}`)
+	out := a.applyReasoningPolicy("vllm", "/v1/chat/completions", "qwen3.5:9b", "auto", in)
+	var doc map[string]any
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if _, bad := doc["extra_body"]; bad {
+		t.Fatalf("extra_body is not a vLLM field; must not be sent: %s", out)
+	}
+	ctk, _ := doc["chat_template_kwargs"].(map[string]any)
+	if ctk["enable_thinking"] != true || doc["reasoning_effort"] != "medium" {
+		t.Fatalf("enable shape wrong: %s", out)
+	}
+	out = a.applyReasoningPolicy("vllm", "/v1/chat/completions", "qwen3.5:9b", "off", in)
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatal(err)
+	}
+	ctk, _ = doc["chat_template_kwargs"].(map[string]any)
+	if ctk["enable_thinking"] != false || doc["reasoning_effort"] != "none" {
+		t.Fatalf("disable shape wrong: %s", out)
+	}
+}
+
+func TestPolicy_ClientNoneIsNotUndoneByTheKwarg(t *testing.T) {
+	// Now that the kwarg reaches the template, forcing enable_thinking on
+	// for a client that sent reasoning_effort "none" would make Qwen3.8's
+	// template validate "none" as a level (400) on vLLM, and would win
+	// over SGLang's setdefault expansion of "none".
+	a := newTestArbiter()
+	a.modelCapability["sglang"] = map[string]string{"qwen3.5:9b": "structured"}
+	in := []byte(`{"model":"qwen3.5:9b","reasoning_effort":"none","messages":[]}`)
+	for _, backend := range []string{"vllm", "sglang"} {
+		out := a.applyReasoningPolicy(backend, "/v1/chat/completions", "qwen3.5:9b", "auto", in)
+		var doc map[string]any
+		if err := json.Unmarshal(out, &doc); err != nil {
+			t.Fatal(err)
+		}
+		if _, forced := doc["chat_template_kwargs"]; forced {
+			t.Fatalf("%s: client's none must not be undone by a forced kwarg: %s", backend, out)
+		}
+		if doc["reasoning_effort"] != "none" {
+			t.Fatalf("%s: client's reasoning_effort must survive: %s", backend, out)
+		}
 	}
 }

@@ -37,7 +37,8 @@ PICKER_SRC = REPO_ROOT / "scripts" / "model-picker.py"
 _ENV_KEYS = (
     "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_SMALL_FAST_MODEL",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CLAUDE_CODE_USE_GATEWAY",
-    "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
+    "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+    "CONTEXT",
 )
 
 
@@ -78,6 +79,22 @@ class ClaudeEnvContractTest(unittest.TestCase):
         self.assertTrue(os.environ["ANTHROPIC_BASE_URL"].endswith(":11437"))
         self.assertEqual(os.environ["ANTHROPIC_AUTH_TOKEN"], "local")
         self.assertEqual(cmd[:2], ["claude", "--model"])
+
+    def test_context_window_is_declared_from_the_selected_tier(self):
+        # 2.1.278 assumes 200k for an unknown model id; on a 116K row that
+        # means no auto-compact before the engine rejects the prompt. The
+        # picker sets CONTEXT right before _build.
+        os.environ["CONTEXT"] = "118784"
+        PICKER._build("claude", "Qwen3.8-27B-MTP-devai-NVFP4::mtp@118784", "vllm-devai")
+        self.assertEqual(os.environ["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "118784")
+
+    def test_context_window_is_left_alone_without_a_tier_or_when_preset(self):
+        PICKER._build("claude", "gpt-oss-20b", "ollama")
+        self.assertNotIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS", os.environ)
+        os.environ["CONTEXT"] = "32768"
+        os.environ["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = "200000"
+        PICKER._build("claude", "gpt-oss-20b", "ollama")
+        self.assertEqual(os.environ["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "200000")
 
     def test_source_never_sets_the_gateway_variable(self):
         src = PICKER_SRC.read_text()

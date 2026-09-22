@@ -2127,10 +2127,12 @@ func runSingleHost(a *arbiter) {
 // whenever compose has run, so "container is running" says nothing; only
 // an answer on /health distinguishes a live engine from a placeholder.
 //
-// Ollama is skipped deliberately. Its container is always up and always
-// answers /health, so probing tells us nothing about whether a model is
-// resident -- and `running` for Ollama means "a model is loaded", which
-// unloadOllama already establishes from /api/ps at switch time.
+// Ollama is not health-probed: its container is always up and always
+// answers /health, so that says nothing about whether a model is
+// resident. It is reconciled from /api/ps instead (reconcileOllamaState),
+// because `running` for Ollama means "a model is loaded" and a router
+// that restarted with one resident used to launch the next HF engine onto
+// a full card.
 //
 // currentModel is deliberately left empty: the reconciliation knows a
 // backend is live but not what it loaded. The cost is one extra recreate
@@ -2142,6 +2144,7 @@ func (a *arbiter) reconcileBackendState() {
 	defer a.mu.Unlock()
 	for name, bs := range a.backends {
 		if name == "ollama" {
+			a.reconcileOllamaState(bs) // see ollama_state.go
 			continue
 		}
 		if !a.backendIsServing(bs) {
@@ -2744,11 +2747,14 @@ func buildContainerSpec(
 		image = lc.RecoveryImage
 	}
 	spec := map[string]any{
-		"image":        image,
-		"name":         cfg.ContainerName,
-		"entrypoint":   cfg.Entrypoint(modelName, lc),
-		"command":      []string{},
-		"mounts":       mounts,
+		"image":      image,
+		"name":       cfg.ContainerName,
+		"entrypoint": cfg.Entrypoint(modelName, lc),
+		"command":    []string{},
+		"mounts":     mounts,
+		// Persistent JIT / torch.compile caches per backend; nil (omitted
+		// by the encoder) for Ollama. See engine_cache.go.
+		"volumes":      engineCacheVolumes(cfg.Name),
 		"hostadd":      []string{"host.containers.internal:host-gateway"},
 		"netns":        map[string]any{"nsmode": "bridge"},
 		"Networks":     map[string]any{cfg.Network: map[string]any{}},
@@ -3012,30 +3018,18 @@ const unloadOllamaTimeout = 60 * time.Second
 
 func (a *arbiter) unloadOllama() {
 	client := &http.Client{Timeout: unloadOllamaTimeout}
-	resp, err := client.Get(a.ollamaURL.String() + "/api/ps")
+	// A malformed /api/ps body must not read as "nothing loaded": the
+	// loop below would be a no-op, stopOtherBackends would believe
+	// Ollama's GPU memory was released, and the vLLM/SGLang container
+	// would start on a GPU that still has Ollama's weights resident.
+	// ollamaLoadedModelsAt returns an error for that case; refuse loudly.
+	models, err := ollamaLoadedModelsAt(client, a.ollamaURL)
 	if err != nil {
-		log.Printf("warning: cannot reach ollama: %v", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	var ps struct {
-		Models []struct {
-			Name string `json:"name"`
-		} `json:"models"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&ps); err != nil {
-		// A malformed /api/ps body would silently leave ps.Models empty,
-		// the loop below would be a no-op, and stopOtherBackends would
-		// then believe Ollama's GPU memory was released -- the vLLM/SGLang
-		// container then starts on a GPU that still has Ollama's weights
-		// resident, producing OOM or corrupted inference. Refuse to
-		// proceed and log loudly so the operator sees the real cause.
-		log.Printf("error: unloadOllama: cannot decode /api/ps: %v -- skipping unload (GPU may still be held by ollama)", err)
+		log.Printf("error: unloadOllama: %v -- skipping unload (GPU may still be held by ollama)", err)
 		return
 	}
 
-	for _, m := range ps.Models {
+	for _, m := range models {
 		log.Printf("unloading ollama model: %s", m.Name)
 		b, _ := json.Marshal(map[string]any{"model": m.Name, "keep_alive": "0"})
 		// Neither the transport error nor a non-2xx status may be
@@ -4137,15 +4131,32 @@ func (a *arbiter) applyReasoningPolicy(backendName, path, modelName, policy stri
 //
 // Enable shape:
 //
-//	extra_body.chat_template_kwargs.enable_thinking = true
 //	reasoning_effort = "low" | "medium" | "high"
+//	chat_template_kwargs.enable_thinking = true   (top-level; skipped when
+//	                                               the client itself sent
+//	                                               reasoning_effort "none")
 //
 // Disable shape (only when disable_verified is true):
 //
-//	extra_body.chat_template_kwargs.enable_thinking = false
 //	reasoning_effort = "none"
+//	chat_template_kwargs.enable_thinking = false  (top-level)
 //
 // Client-supplied fields always win.
+//
+// `chat_template_kwargs` is TOP-LEVEL, as on SGLang. Until 2026-09-22 this
+// sent it under `extra_body`, which is the OpenAI Python client's name for
+// "splice these keys into the body" and is not a field vLLM reads (grep of
+// both images: `extra_body` appears nowhere under vllm/entrypoints), so
+// that half of every rewrite was silently discarded and only
+// `reasoning_effort` did anything -- vLLM derives `enable_thinking` from
+// it when the client sent no kwarg. Measured through the router on
+// Qwen3.8 (vllm-devai): top-level kwarg alone 0 reasoning chars,
+// `extra_body` kwarg alone 121 (= baseline 114), reasoning_effort "none"
+// alone 0. The "kwarg alone leaves 175 reasoning tokens" measurement that
+// justified sending both fields had measured the inert form. Now that the
+// kwarg is live, ENABLE must not force it on for a client that sent
+// `reasoning_effort: "none"` itself: Qwen3.8's template validates the
+// effort only when thinking is on and rejects "none" as a level.
 //
 // backendName is the backend the request arrived on, NOT the engine: the
 // capability / disable_verified maps are keyed by backend, and a derived
@@ -4161,19 +4172,24 @@ func (a *arbiter) applyVLLMPolicy(backendName, path, modelName, policy string, b
 	case reasoningEnable:
 		log.Printf("info: %s/%s reasoning ENABLE (policy=%q, effort=%s)",
 			backendName, modelName, policy, openAIReasoningEffort(policy))
+		body = promoteExtraBodyKwargs(body)
 		body = setJSONFieldIfAbsent(
 			body,
 			[]string{"reasoning_effort", "reasoning"},
 			"reasoning_effort",
 			openAIReasoningEffort(policy),
 		)
+		if topJSONString(body, "reasoning_effort") == "none" {
+			return body // the client asked for no thinking; see above
+		}
 		return setNestedJSONFieldIfAbsent(
 			body,
-			[]string{"extra_body", "chat_template_kwargs", "enable_thinking"},
+			[]string{"chat_template_kwargs", "enable_thinking"},
 			true,
 		)
 	case reasoningDisable:
 		log.Printf("info: %s/%s reasoning DISABLE (policy=%q)", backendName, modelName, policy)
+		body = promoteExtraBodyKwargs(body)
 		body = setJSONFieldIfAbsent(
 			body,
 			[]string{"reasoning_effort", "reasoning"},
@@ -4182,12 +4198,39 @@ func (a *arbiter) applyVLLMPolicy(backendName, path, modelName, policy string, b
 		)
 		return setNestedJSONFieldIfAbsent(
 			body,
-			[]string{"extra_body", "chat_template_kwargs", "enable_thinking"},
+			[]string{"chat_template_kwargs", "enable_thinking"},
 			false,
 		)
 	default:
 		return body
 	}
+}
+
+// promoteExtraBodyKwargs copies any chat_template_kwargs a client placed
+// under `extra_body` to the top level, where vLLM actually reads them. That
+// spelling is what this router and docs/openai-api-and-streaming.md told
+// clients to send for months (it is the OpenAI Python client's name for
+// "splice these keys into the body", never a wire field), so a client that
+// still sends it keeps working instead of silently losing its kwarg. A
+// top-level key that already exists wins; `extra_body` itself is left in
+// place, harmlessly ignored.
+func promoteExtraBodyKwargs(body []byte) []byte {
+	var root map[string]any
+	if json.Unmarshal(body, &root) != nil {
+		return body
+	}
+	eb, ok := root["extra_body"].(map[string]any)
+	if !ok {
+		return body
+	}
+	src, ok := eb["chat_template_kwargs"].(map[string]any)
+	if !ok {
+		return body
+	}
+	for k, v := range src {
+		body = setNestedJSONFieldIfAbsent(body, []string{"chat_template_kwargs", k}, v)
+	}
+	return body
 }
 
 // applySGLangPolicy does NOT mirror applyVLLMPolicy's wire shape, and the
@@ -4242,6 +4285,12 @@ func (a *arbiter) applySGLangPolicy(backendName, path, modelName, policy string,
 				body, []string{"reasoning_effort", "reasoning"},
 				"reasoning_effort", policy,
 			)
+		}
+		// A client-sent `reasoning_effort: "none"` is its own opt-out;
+		// normalize_reasoning_inputs expands it via setdefault, so a
+		// kwarg forced on here would win over it and re-enable thinking.
+		if topJSONString(body, "reasoning_effort") == "none" {
+			return body
 		}
 		return setNestedJSONFieldIfAbsent(
 			body,
@@ -4704,14 +4753,14 @@ func setJSONFieldIfAbsent(body []byte, existingKeys []string, setKey string, val
 //
 // Returns the body unchanged on parse failure or path conflict.
 //
-// Example: path=["extra_body", "chat_template_kwargs", "enable_thinking"],
-// value=true on body {"model":"x"}
+// Example: path=["chat_template_kwargs", "enable_thinking"], value=true
+// on body {"model":"x"}
 //
-//	→ {"model":"x","extra_body":{"chat_template_kwargs":{"enable_thinking":true}}}
+//	→ {"model":"x","chat_template_kwargs":{"enable_thinking":true}}
 //
 // On body that already carries
-// {"extra_body":{"chat_template_kwargs":{"enable_thinking":false}}} the
-// leaf exists, so the client's `false` is preserved.
+// {"chat_template_kwargs":{"enable_thinking":false}} the leaf exists, so
+// the client's `false` is preserved.
 func setNestedJSONFieldIfAbsent(body []byte, path []string, value any) []byte {
 	if len(path) == 0 {
 		return body

@@ -96,8 +96,8 @@ field reference for the request body:
 | Field | Type | Purpose |
 |---|---|---|
 | `reasoning_effort` | enum | `"low"` / `"medium"` / `"high"`. Hints the model to spend more or fewer tokens reasoning. |
-| `extra_body.chat_template_kwargs.enable_thinking` | bool | per-request override of the chat template's `enable_thinking` slot. The router uses this to implement `::nothink`. |
-| `extra_body.chat_template_kwargs.separate_reasoning` | bool | (SGLang) split reasoning vs final into separate channels. |
+| `chat_template_kwargs.enable_thinking` | bool | per-request override of the chat template's `enable_thinking` slot, sent TOP-LEVEL on the wire (the OpenAI Python client's `extra_body=` splices it there; a literal `extra_body` key is not a field either engine reads). The router uses this to implement `::nothink`. |
+| `separate_reasoning` | bool | (SGLang, top-level, default true) split reasoning vs final into separate channels. |
 
 ### 2.5 Response shaping
 

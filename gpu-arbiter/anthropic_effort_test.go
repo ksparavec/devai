@@ -152,8 +152,31 @@ func TestAnthropicEffort_SGLangAutoRemovesTheClientsEffort(t *testing.T) {
 	if _, ok := topLevel(t, out)["chat_template_kwargs"]; ok {
 		t.Fatalf("no chat_template_kwargs for SGLang:\n%s", out)
 	}
-	if got := string(topLevel(t, out)["thinking"]); got != `{"type":"adaptive","display":"omitted"}` {
-		t.Fatalf("enable must leave thinking alone on SGLang, got %s", got)
+	if _, ok := topLevel(t, out)["thinking"]; ok {
+		t.Fatalf("SGLang feeds thinking.type=adaptive to apply_reasoning_enabled(true), which raises for parser-less rows; enable must drop it:\n%s", out)
+	}
+}
+
+func TestAnthropicEffort_SGLangUnknownCapabilityDropsThinkingOnly(t *testing.T) {
+	// An unprobed or `none` row is exactly the parser-less case SGLang
+	// raises on. Nothing else in the body is a policy matter here.
+	a := hfTestArbiter()
+	in := []byte(claudeCodeMessagesBody)
+	out := a.applyReasoningPolicy("sglang", "/v1/messages", "some-vllm-model", "auto", in)
+	if _, ok := topLevel(t, out)["thinking"]; ok {
+		t.Fatalf("thinking must be dropped for an unknown-capability row on SGLang:\n%s", out)
+	}
+	before, after := topLevel(t, in), topLevel(t, out)
+	for k, v := range before {
+		if k == "thinking" {
+			continue
+		}
+		if string(after[k]) != string(v) {
+			t.Fatalf("field %q changed: %s -> %s", k, v, after[k])
+		}
+	}
+	if got, _ := childString(t, out, "output_config", "effort"); got != `"high"` {
+		t.Fatalf("no policy applies to an unknown row; effort must stay the client's, got %s", got)
 	}
 }
 
@@ -168,6 +191,9 @@ func TestAnthropicEffort_SGLangExplicitLevelsAreSet(t *testing.T) {
 		}
 		if _, ok := topLevel(t, out)["chat_template_kwargs"]; ok {
 			t.Fatalf("no chat_template_kwargs for SGLang:\n%s", out)
+		}
+		if _, ok := topLevel(t, out)["thinking"]; ok {
+			t.Fatalf("thinking must be dropped on SGLang enable (policy %s)", tc.policy)
 		}
 	}
 }

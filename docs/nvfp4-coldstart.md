@@ -101,17 +101,23 @@ vLLM container -- neither has been done here.
 cutlass kernels that are JIT-compiled and autotuned the first time the
 runtime encounters a given `(GPU SM, kernel, shape)` triple. vLLM and
 SGLang write the resulting binaries to `~/.cache/{vllm,sglang}/` inside
-the container. NOTE: that cache is NOT persisted -- the router recreates
-the backend container (stop + rm + create) on every model/ctx switch and
-binds no host volume to `~/.cache`, so the compile cache is discarded each
-time and the full JIT/torch.compile cost is re-paid on every cold start.
-(Persisting it via a bound `VLLM_CACHE_ROOT` volume is a known
-optimization deferred as fragile -- it helps only same-image,
-same-(model,ctx,flags) restarts and is invalidated whenever the image tag
-moves; see the router load-latency investigation.) The keep-warm default
-(`IDLE_TIMEOUT=0`) is what actually removes the repeated cost: a loaded
-model is not torn down on idle, so the JIT is paid once per model rather
-than after every idle gap.
+the container, and FlashInfer its nvcc-built attention kernels to
+`~/.cache/flashinfer/<version>/`. Since 2026-09-22 those directories ARE
+persisted: the router mounts one podman named volume per cache and
+backend (`devai-engine-cache-<backend>-{flashinfer,vllm|sglang}`, see
+`gpu-arbiter/engine_cache.go`), and the probers mount the same ones, so
+a recreate (stop + rm + create on every model/ctx switch) no longer
+re-pays the compile. Before that, nothing under `~/.cache` was bound and
+every cold start paid it in full. Measured on Qwen3.8-27B-MTP-devai-NVFP4
+at 118784 ctx on vllm-devai that day: 275 s with empty volumes, 51 s once
+they were warm (28 MB of FlashInfer kernels, 188 MB of torch.compile
+artifacts). The earlier worry
+that a persisted cache is fragile across image bumps does not hold:
+FlashInfer namespaces its cache by version and vLLM keys torch.compile
+entries by hash, so a stale entry is unused rather than wrong; it merely
+takes disk until `podman volume rm devai-engine-cache-<backend>-*`. The
+keep-warm default (`IDLE_TIMEOUT=0`) still matters for the phases that
+are not cacheable (weight load, CUDA graph capture).
 
 **This is why `HEALTH_TIMEOUT_SECONDS` defaults to 600 s.** The
 measured 45.6 s for an 8B-class NVFP4 with a warm compile cache is

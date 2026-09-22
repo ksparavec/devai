@@ -333,9 +333,13 @@ class EngineKeyedProbeShapesTest(unittest.TestCase):
             devai = build("vllm-devai", dict(self._BASE))
             self.assertEqual(devai, build("vllm", dict(self._BASE)), build.__name__)
             self.assertNotEqual(devai, self._BASE, f"{build.__name__} left the body unchanged")
-        # sglang keeps its own, different shape
-        self.assertNotEqual(hf.build_disable_thinking_body("sglang", dict(self._BASE)),
-                            hf.build_disable_thinking_body("vllm", dict(self._BASE)))
+        # The disable shape is now the same top-level one on both engines
+        # (vLLM never read the old `extra_body` spelling); the keying is
+        # still by engine, which the enable body still shows (SGLang adds
+        # separate_reasoning) and an unknown engine, which gets nothing.
+        self.assertNotEqual(hf.build_enable_thinking_body("sglang", dict(self._BASE)),
+                            hf.build_enable_thinking_body("vllm", dict(self._BASE)))
+        self.assertEqual(hf.build_disable_thinking_body("ollama", dict(self._BASE)), self._BASE)
 
     def test_load_probe_legacy_kv_default_is_fp8_for_vllm_devai(self) -> None:
         import _probe_load as lp
@@ -370,18 +374,29 @@ class ProbeDisableShapeMatchesRouterTest(unittest.TestCase):
     """The probe's vLLM disable body must be the router's, field for field.
 
     applyVLLMPolicy disables with `reasoning_effort: "none"` PLUS
-    `extra_body.chat_template_kwargs.enable_thinking: false`; the prober
-    sent only the second. On Qwen3.8's template the effort field is what
-    switches the think block off, so the probe kept measuring a thinking
-    model and recorded disable_verified=false for rows the router can in
-    fact silence (2026-09-22, both derived rows, re-probed twice).
+    `chat_template_kwargs.enable_thinking: false`; the prober once sent
+    only the kwarg, so the probe kept measuring a thinking model and
+    recorded disable_verified=false for rows the router can in fact
+    silence (2026-09-22, both derived rows, re-probed twice). Later the
+    same day the kwarg moved from `extra_body` -- which vLLM never reads --
+    to the top level, on both the router and here; `extra_body` must not
+    reappear, or the probe is back to measuring a fiction.
     """
 
     def test_vllm_disable_body_carries_both_router_fields(self) -> None:
         import _probe_hf_common as hf
         base = {"model": "m", "messages": [{"role": "user", "content": "hi"}], "temperature": 0}
-        for backend in ("vllm", "vllm-devai"):
+        for backend in ("vllm", "vllm-devai", "sglang"):
             body = hf.build_disable_thinking_body(backend, dict(base))
             self.assertEqual(body.get("reasoning_effort"), "none", backend)
-            self.assertIs(body["extra_body"]["chat_template_kwargs"]["enable_thinking"], False, backend)
+            self.assertIs(body["chat_template_kwargs"]["enable_thinking"], False, backend)
+            self.assertNotIn("extra_body", body, backend)
             self.assertEqual(body["temperature"], 0)
+
+    def test_enable_body_is_top_level_on_every_engine(self) -> None:
+        import _probe_hf_common as hf
+        base = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+        for backend in ("vllm", "vllm-devai", "sglang"):
+            body = hf.build_enable_thinking_body(backend, dict(base))
+            self.assertIs(body["chat_template_kwargs"]["enable_thinking"], True, backend)
+            self.assertNotIn("extra_body", body, backend)

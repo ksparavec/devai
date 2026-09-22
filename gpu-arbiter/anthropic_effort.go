@@ -57,6 +57,17 @@ import (
 //     field, so the vLLM shape would be silently discarded there (the
 //     extra_body lesson again).
 //
+// SGLang additionally never sees Claude Code's `thinking` field unless
+// DISABLE is setting it. Its shim feeds `thinking.type != "disabled"` to
+// apply_reasoning_enabled(true), which RAISES for a row launched without a
+// reasoning parser ("Anthropic thinking is not supported for models
+// without a reasoning parser") and for a parser whose toggle is not
+// read-side supported -- while apply_reasoning_enabled(false) returns
+// quietly in both cases. So `thinking: {"type":"adaptive"}` is dropped
+// under ENABLE and under reasoningNoop alike (an unprobed or `none`
+// capability row is exactly the parser-less case), which also keeps
+// SGLang's auto rule intact: the template's own default decides.
+//
 // Stock vLLM v0.22.1 (port 11435) has no `output_config` field on its
 // AnthropicMessagesRequest at all -- pydantic ignores the key -- so there
 // this rewrite is inert and harmless; only vllm-devai (0.28) and SGLang
@@ -87,7 +98,9 @@ func (a *arbiter) applyHFAnthropicMessagesPolicy(backendName, modelName, policy 
 			backendName, modelName, policy, effort, clientSent)
 		if engine == "vllm" {
 			out, _ = setChildJSONField(out, "chat_template_kwargs", "enable_thinking", true, false)
+			return out
 		}
+		out, _ = deleteTopJSONField(out, "thinking")
 		return out
 	case reasoningDisable:
 		log.Printf("info: %s/%s reasoning DISABLE on /v1/messages (policy=%q)", backendName, modelName, policy)
@@ -98,8 +111,47 @@ func (a *arbiter) applyHFAnthropicMessagesPolicy(backendName, modelName, policy 
 		}
 		return setTopJSONField(out, "thinking", map[string]any{"type": "disabled"})
 	default:
-		return body
+		if engine != "sglang" {
+			return body
+		}
+		out, dropped := deleteTopJSONField(body, "thinking")
+		if dropped {
+			log.Printf("info: %s/%s dropped the Anthropic `thinking` field on /v1/messages (SGLang rejects it for rows without a reasoning toggle)",
+				backendName, modelName)
+		}
+		return out
 	}
+}
+
+// topJSONString returns body[key] when it is a JSON string, else "".
+func topJSONString(body []byte, key string) string {
+	var top map[string]json.RawMessage
+	if json.Unmarshal(body, &top) != nil {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(top[key], &s) != nil {
+		return ""
+	}
+	return s
+}
+
+// deleteTopJSONField removes body[key]; the bool says whether it was
+// there. Unchanged on a malformed body.
+func deleteTopJSONField(body []byte, key string) ([]byte, bool) {
+	var top map[string]json.RawMessage
+	if json.Unmarshal(body, &top) != nil || top == nil {
+		return body, false
+	}
+	if _, ok := top[key]; !ok {
+		return body, false
+	}
+	delete(top, key)
+	out, err := encodeJSON(top)
+	if err != nil {
+		return body, false
+	}
+	return out, true
 }
 
 // setChildJSONField sets body[parent][key] = value, creating `parent` when

@@ -3325,6 +3325,16 @@ def _build(agent_id: str, model_name: str, backend: str) -> list[str]:
         # 2.1.278 discovery runs under the first-party provider and needs
         # only the flag below; verified on the wire against the router.
         os.environ.setdefault("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", "1")
+        # Claude Code 2.1.278 knows nothing about our model ids and assumes
+        # a 200k window for an unknown one, so on a 116K row auto-compact
+        # would fire only after the engine had already rejected the prompt.
+        # Its own notice names CLAUDE_CODE_MAX_CONTEXT_TOKENS as the way to
+        # declare the real window; CONTEXT is the tier the picker just
+        # resolved for this session. Verified on the wire: with it set the
+        # unknown-model notice is gone and the turn completes.
+        ctx = os.environ.get("CONTEXT", "")
+        if ctx.isdigit() and int(ctx) > 0:
+            os.environ.setdefault("CLAUDE_CODE_MAX_CONTEXT_TOKENS", ctx)
         return ["claude", "--model", name]
 
     if agent_id == "aider":

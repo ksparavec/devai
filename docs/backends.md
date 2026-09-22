@@ -628,10 +628,16 @@ model that had never been told to stop thinking, and recorded
 `disable_verified=false` for both derived rows although the engine honours
 the shape (reasoning_tokens 0) -- which in turn made `::nothink` a no-op
 on port 11437. The vLLM disable body is now the router's, field for field:
-`reasoning_effort: "none"` PLUS `extra_body.chat_template_kwargs.
-enable_thinking: false`. It used to send only the kwarg, and on Qwen3.8's
-template that alone changes nothing (175 reasoning tokens and the `xhigh`
-preamble, measured) -- the effort field is what its template honours. Any new backend name must go through the engine map in the
+`reasoning_effort: "none"` PLUS top-level `chat_template_kwargs.
+enable_thinking: false`. It used to send only the kwarg, and under
+`extra_body` at that -- a spelling vLLM never reads, so the "175
+reasoning tokens with the kwarg alone" measurement had measured an
+unchanged request; the top-level kwarg alone does silence Qwen3.8
+(re-measured 2026-09-22: 0 reasoning chars). `build_enable_thinking_body`
+had the same defect on both engines, so Probe A always measured the
+template's own default: Gemma-4-class rows, whose templates opt thinking
+OUT by default, deserve a re-probe now that the request reaches the
+template. Any new backend name must go through the engine map in the
 prober, the card hints, the picker (`_ENGINE_OF`) and the router
 (`engineOf`, and the backend-keyed capability maps -- see docs/router.md
 "Reasoning policy").

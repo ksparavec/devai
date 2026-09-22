@@ -1698,3 +1698,45 @@ func TestBuildContainerSpecGPUDevice(t *testing.T) {
 		}
 	})
 }
+
+func TestBuildContainerSpec_HFEnginesPersistTheirCaches(t *testing.T) {
+	// Every recreate used to re-pay FlashInfer JIT + torch.compile: 269 s
+	// measured for Qwen3.8-27B-MTP-devai-NVFP4 on vllm-devai, 2026-09-22.
+	for _, tc := range []struct {
+		backend string
+		engine  string
+	}{{"vllm", "vllm"}, {"vllm-devai", "vllm"}, {"sglang", "sglang"}} {
+		cfg := backendConfig{
+			Name: tc.backend, ContainerName: "devai-" + tc.backend, Image: "img",
+			ModelsDir:  "/var/cache/devai/" + tc.backend,
+			Entrypoint: func(string, launchConfig) []string { return []string{"x"} },
+		}
+		spec := buildContainerSpec(cfg, "m", launchConfig{MaxContext: 32768}, nil, nil)
+		vols, ok := spec["volumes"].([]map[string]any)
+		if !ok || len(vols) != 2 {
+			t.Fatalf("%s: want 2 named volumes, got %#v", tc.backend, spec["volumes"])
+		}
+		want := map[string]string{
+			"devai-engine-cache-" + tc.backend + "-flashinfer":   "/root/.cache/flashinfer",
+			"devai-engine-cache-" + tc.backend + "-" + tc.engine: "/root/.cache/" + tc.engine,
+		}
+		for _, v := range vols {
+			name, _ := v["Name"].(string)
+			if dest, ok := want[name]; !ok || v["Dest"] != dest {
+				t.Errorf("%s: unexpected volume %v", tc.backend, v)
+			}
+			delete(want, name)
+		}
+		if len(want) != 0 {
+			t.Errorf("%s: missing volumes %v", tc.backend, want)
+		}
+	}
+	ollama := backendConfig{
+		Name: "ollama", ContainerName: "devai-ollama", Image: "img",
+		ModelsDir: "/var/cache/devai/ollama", MountDest: "/root/.ollama", MountRW: true,
+		Entrypoint: func(string, launchConfig) []string { return []string{"x"} },
+	}
+	if v := buildContainerSpec(ollama, "m", launchConfig{}, nil, nil)["volumes"]; v != nil && len(v.([]map[string]any)) != 0 {
+		t.Errorf("ollama must get no engine-cache volumes, got %v", v)
+	}
+}

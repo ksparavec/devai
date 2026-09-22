@@ -220,6 +220,18 @@ extra recreate if the next request happens to want the resident model,
 and the alternative -- trusting a guess -- risks serving from the wrong
 weights.
 
+Ollama is reconciled from `/api/ps` instead of `/health` (its container is
+always up), and WITH its model: `/api/ps` is authoritative, so the adopted
+`currentModel` / `currentContext` are the resident model's and a mismatch
+merely costs a reload. Until 2026-09-22 Ollama was skipped here on the
+assumption that `unloadOllama` would consult `/api/ps` at switch time --
+but `stopOtherBackends` never reaches it for a backend whose flags say
+idle, so a router recreated by `make cache-up` while Ollama held a warm
+model launched the next HF engine onto a full card ("Free memory on
+device cuda:0 (0.3/23.43 GiB) on startup is less than desired GPU memory
+utilization", observed with qwen3.6:35b-a3b-mtp-q4_K_M resident). Pinned
+by `TestReconcileAdoptsAResidentOllamaModel`.
+
 ### Backend switch (GPU exclusion)
 
 When a request hits a different backend than the one currently on the
@@ -526,8 +538,8 @@ backend's protocol path:
 | Ollama `/api/chat`, `/api/generate` | structured | inject `think: <true\|false>` |
 | Ollama `/v1/chat/completions`       | structured | inject `reasoning_effort` (`low`/`medium`/`high`, or `none` to disable) |
 | Ollama `/v1/messages`               | structured | inject `thinking.type` |
-| vLLM `/v1/chat/completions`         | structured | inject `extra_body.chat_template_kwargs.enable_thinking` + `reasoning_effort` |
-| SGLang `/v1/chat/completions`       | structured | inject `extra_body.chat_template_kwargs.enable_thinking` + `separate_reasoning` |
+| vLLM `/v1/chat/completions`         | structured | inject `reasoning_effort` + top-level `chat_template_kwargs.enable_thinking` (skipped when the client sent `reasoning_effort: none` itself) |
+| SGLang `/v1/chat/completions`       | structured | inject top-level `chat_template_kwargs.enable_thinking` (+ `reasoning_effort` when explicit; `none` to disable) |
 | vLLM `/v1/messages`                 | structured | set `output_config.effort` (REPLACES the client's) + `chat_template_kwargs.enable_thinking`; off removes the effort, sets it false |
 | SGLang `/v1/messages`               | structured | auto REMOVES the client's `output_config.effort` (model default, as on SGLang's other surfaces); low/medium/high set it; off removes it and replaces `thinking` with `{type: disabled}` |
 | Any                                 | inline + policy=off | log `reasoningDisable` (explicit user opt-out) |
@@ -552,6 +564,27 @@ is therefore NOT a byte-identical pass-through on the Chat Completions
 path: it maps to `reasoning_effort: medium`, which for Qwen3.8 means
 "no preamble" (`medium` 180 prompt tokens, `low` 206, `xhigh` 218 on
 the same messages).
+
+**`chat_template_kwargs` is top-level on vLLM too (since 2026-09-22).**
+For months `applyVLLMPolicy` put it under `extra_body`, which is the OpenAI
+Python client's name for "splice these keys into the body" and not a
+field vLLM reads: `extra_body` appears nowhere under `vllm/entrypoints` in
+either image. That half of every rewrite was silently discarded and only
+`reasoning_effort` did anything -- vLLM derives `enable_thinking` from it
+when the client sent no kwarg, which is why disable still worked and
+`disable_verified` verdicts (measured with the same effective body) remain
+valid. Measured through the router on Qwen3.8 (vllm-devai): top-level
+kwarg alone 0 reasoning chars, `extra_body` kwarg alone 121 (baseline
+114), `reasoning_effort: none` alone 0. The documented "kwarg alone leaves
+175 reasoning tokens" measurement had measured the inert form. Two
+consequences: a client that still sends the `extra_body` spelling gets its
+kwargs promoted to the top level (`promoteExtraBodyKwargs`) and honoured
+over the policy's value; and ENABLE no longer forces `enable_thinking=true`
+on a client that sent `reasoning_effort: "none"` itself (Qwen3.8's
+template validates the effort only when thinking is on and rejects "none"
+as a level) -- the same guard now applies on SGLang, whose
+`normalize_reasoning_inputs` expands "none" via setdefault and would have
+lost to a forced kwarg.
 
 ### 3c. Anthropic `/v1/messages` effort (vLLM/SGLang)
 
@@ -590,9 +623,15 @@ its shim ignores the `thinking` request field), and on SGLang the WHOLE
 `thinking.type` other than `disabled`, `adaptive` included, to reasoning
 ON; its validator rejects `disabled` combined with `display`, which Claude
 Code sends; and its request model has no `chat_template_kwargs` field --
-the `extra_body` lesson again). Only the top level and the touched
-sub-object are re-encoded; the rest of the body is preserved byte for
-byte.
+the `extra_body` lesson again). SGLang additionally never sees Claude
+Code's `thinking` field unless DISABLE is setting it: its
+`apply_reasoning_enabled(true)` RAISES for a row launched without a
+reasoning parser and for a parser whose toggle is not read-side
+supported, while `enabled=false` returns quietly in both cases, so
+`thinking: {"type":"adaptive"}` is dropped under ENABLE and under
+`reasoningNoop` alike (an unprobed or `none` row is exactly the
+parser-less case). Only the top level and the touched sub-object are
+re-encoded; the rest of the body is preserved byte for byte.
 
 Two boundaries. Stock vLLM v0.22.1 (port 11435) has no `output_config`
 field on its `AnthropicMessagesRequest`, so there the rewrite is inert and
@@ -931,7 +970,10 @@ the shell when invoking compose.
 
 The router holds a client for the whole launch window before a single
 byte moves: `makeRequestHandler -> ensureBackendRunning ->
-containerRecreate -> waitForHealthy -> proxy.ServeHTTP`. An NVFP4 cold
+containerRecreate -> waitForHealthy -> proxy.ServeHTTP` (the recreated
+container mounts the backend's persistent FlashInfer / torch.compile
+cache volumes, `gpu-arbiter/engine_cache.go`, so only the first launch
+after an image bump pays the JIT). An NVFP4 cold
 start is bounded by `HEALTH_TIMEOUT_SECONDS` (default 600s). A browser or
 corporate proxy with a 30-60s idle timeout drops the connection long
 before that, and the client's retry lands on a router that is still
