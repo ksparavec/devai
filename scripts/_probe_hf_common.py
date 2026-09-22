@@ -2030,6 +2030,45 @@ def refresh_top_level_from_cells(entry: dict) -> None:
 
 # ── Argparse builder ─────────────────────────────────────────────────────────
 
+_ENGINE_MAX_LEN_RE = re.compile(r"estimated maximum model length is (\d+)")
+
+
+def engine_max_len_estimate(evidence: dict | None) -> int | None:
+    """vLLM's own answer to "how much would have fit", parsed from the
+    failure evidence of a launch that asked for too much context. The
+    engine prints it when the KV budget cannot hold one request at
+    --max-model-len ("the estimated maximum model length is N"). None for
+    every other kind of failure (a weights OOM says nothing about context).
+    """
+    if not isinstance(evidence, dict):
+        return None
+    m = _ENGINE_MAX_LEN_RE.search(str(evidence.get("log_excerpt") or ""))
+    return int(m.group(1)) if m else None
+
+
+def exact_ctx_grid(ctx_exact: int, position_limit: int | None) -> tuple[int, ...]:
+    """The one-element search grid for --ctx-exact, or ValueError when the
+    value lies past the checkpoint's own ceiling. Refused here rather than
+    left to binary_search_max_ctx: the search path turns "every tier above
+    position_limit" into an unsupported_arch verdict, which is a statement
+    about the checkpoint, not about a mistyped number.
+    """
+    if ctx_exact <= 0:
+        raise ValueError(f"--ctx-exact must be positive, got {ctx_exact}")
+    if position_limit is not None and ctx_exact > position_limit:
+        raise ValueError(
+            f"--ctx-exact {ctx_exact} is above the model's position limit "
+            f"{position_limit}; nothing above it can serve")
+    return (ctx_exact,)
+
+
+def _parse_ctx_exact(raw: str) -> int:
+    values = parse_context_list(raw)
+    if len(values) != 1:
+        raise argparse.ArgumentTypeError("--ctx-exact takes exactly one context")
+    return values[0]
+
+
 def build_argparser(spec: BackendSpec, doc: str) -> argparse.ArgumentParser:
     """Build an argparse for a backend prober. Backend-specific defaults
     (cache path, image, container name, port) come from the spec; the
@@ -2058,6 +2097,13 @@ def build_argparser(spec: BackendSpec, doc: str) -> argparse.ArgumentParser:
                     help="comma-separated context tiers, e.g. '32K,128K' (default: standard tiers)")
     ap.add_argument("--repo", default="",
                     help="regex filter on catalog row repo")
+    ap.add_argument("--ctx-exact", type=_parse_ctx_exact, default=None,
+                    help="probe exactly ONE context (e.g. 110K or 112640) with no "
+                         "binary search and no 32K rounding, for confirming a "
+                         "ceiling computed in advance. Implies --force for the "
+                         "targeted rows and requires --repo. A miss leaves the "
+                         "existing cell in place and reports the engine's own "
+                         "estimate of what would have fit.")
     ap.add_argument("--prompt", default=DEFAULT_PROMPT,
                     help="probe prompt (kept short and deterministic)")
     ap.add_argument("--force", action="store_true",
@@ -2121,6 +2167,16 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
     search_grid = tuple(sorted(
         {c for c in BINARY_SEARCH_CONTEXTS if c <= ctx_ceiling} | set(ctxs)
     ))
+    # Read like `no_mtp`: hand-built Namespaces in the tests predate the flag.
+    ctx_exact = getattr(args, "ctx_exact", None)
+    if ctx_exact is not None:
+        # Exact mode: one launch at the requested value, nothing else. The
+        # position_limit check happens per row below (it is a per-model
+        # figure); here only the grid and the scoping rule.
+        if not args.repo:
+            sys.exit("error: --ctx-exact is a per-model operation; scope it with --repo")
+        ctxs = [ctx_exact]
+        search_grid = (ctx_exact,)
 
     cache = load_cache(args.cache)
     # Phase C: record the backend image digest this cache is being probed
@@ -2158,6 +2214,7 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
     print(file=sys.stderr)
 
     fresh_probes = 0
+    exact_misses = 0
     fully_cached = 0
     skipped_missing = 0
     skipped_arch = 0
@@ -2393,10 +2450,13 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
                 print(f"  {name}: cached cells were measured on engine image "
                       f"{(entry_image or '')[:19]} != {run_image_digest[:19]} "
                       f"— re-probing", file=sys.stderr)
+            force_this_row = args.force or ctx_exact is not None
             if (band and has_fitting and not stale_schema and not stale_image
-                    and not (args.force and not args.no_cache_write)):
+                    and not (force_this_row and not args.no_cache_write)):
                 fully_cached += 1
                 continue
+            # Exact mode keeps the previous band on a miss (see below).
+            prior_band = dict(band) if ctx_exact is not None else None
             band.clear()
 
             def _src(kind: str) -> str:
@@ -2461,6 +2521,19 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
                 return bool(rec.get("fits"))
 
             pos_cap = pos_limit if isinstance(pos_limit, int) and pos_limit > 0 else None
+            if ctx_exact is not None:
+                try:
+                    exact_ctx_grid(ctx_exact, pos_cap)
+                except ValueError as e:
+                    band.update(prior_band or {})
+                    sys.exit(f"error: {name}: {e}")
+                prior_max = max((int(c) for c, cell in (prior_band or {}).items()
+                                 if isinstance(cell, dict) and cell.get("fits")),
+                                default=0)
+                if prior_max > ctx_exact:
+                    print(f"    note: the cached cell is {context_label(prior_max)}; "
+                          f"a fit at {context_label(ctx_exact)} will REPLACE it "
+                          f"with the smaller value", file=sys.stderr)
             max_ctx = binary_search_max_ctx(
                 _fit_works, position_limit=pos_cap, grid=search_grid,
             )
@@ -2482,7 +2555,7 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
                       f"unsupported arch", file=sys.stderr)
                 arch_or_quant_seen = True
             elif max_ctx is not None:
-                winner = probed_cells[max_ctx]
+                winner = probed_cells[max_ctx]  # may be reset to None below (exact-mode MTP miss)
                 # Second pass: MTP overhead measurement on the WINNING cell
                 # only (not every probed tier). Only when the catalog
                 # declared an MTP block AND we're on vLLM AND not --no-mtp.
@@ -2524,13 +2597,50 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
                     else:
                         winner["mtp_fits"] = False
                         winner["mtp_evidence"] = mtp_rec.get("evidence", {})
-                band[str(max_ctx)] = winner
-                entry.setdefault("first_probed_at", winner["probed_at"])
-                entry["last_probed_at"] = winner["probed_at"]
-                stamp_row_image(entry, run_image_digest)
-                if first_seen_record is None:
-                    first_seen_record = winner
-                fresh_probes += 1
+                if (ctx_exact is not None and mtp_should_probe
+                        and not winner.get("mtp_fits")):
+                    # Exact mode on a row that declares MTP: a hit means the
+                    # DECLARED configuration works at this ctx. Recording a
+                    # fits=True / mtp_fits=False cell here would make the
+                    # router refuse `::mtp` for a row whose previous, smaller
+                    # cell served it (measured 2026-09-22: 120K fit, MTP did
+                    # not, and the 115K MTP cell was lost). Keep the previous
+                    # cell and report the MTP pass's own estimate.
+                    band.update(prior_band or {})
+                    est = engine_max_len_estimate(winner.get("mtp_evidence"))
+                    hint = (f"; with MTP the engine estimates {est} tokens "
+                            f"({context_label(est)}) would fit -- retry with "
+                            f"--ctx-exact {est}" if est else "")
+                    print(f"    [miss] {name}: {context_label(ctx_exact)} fits "
+                          f"without MTP but the MTP pass does not{hint}",
+                          file=sys.stderr)
+                    exact_misses += 1
+                    winner = None
+                if winner is not None:
+                    band[str(max_ctx)] = winner
+                    entry.setdefault("first_probed_at", winner["probed_at"])
+                    entry["last_probed_at"] = winner["probed_at"]
+                    stamp_row_image(entry, run_image_digest)
+                    if first_seen_record is None:
+                        first_seen_record = winner
+                    fresh_probes += 1
+            elif probed_cells and ctx_exact is not None:
+                # An exact probe missed. That is not "fits nowhere": the
+                # operator's number was a little high. Put the previous cell
+                # back untouched, say what the engine itself thinks would
+                # fit, and let the run end non-zero so nobody mistakes it
+                # for a recorded result.
+                miss = probed_cells[ctx_exact]
+                band.update(prior_band or {})
+                est = engine_max_len_estimate(miss.get("evidence"))
+                kind = (miss.get("evidence") or {}).get("kind", "?")
+                hint = (f"; the engine estimates {est} tokens "
+                        f"({context_label(est)}) would fit -- retry with "
+                        f"--ctx-exact {est}" if est else
+                        f" (kind={kind}; no engine estimate in the evidence)")
+                print(f"    [miss] {name}: {context_label(ctx_exact)} does not "
+                      f"fit{hint}", file=sys.stderr)
+                exact_misses += 1
             elif probed_cells:
                 # Fits nowhere (OOM at every probed tier). Keep the smallest
                 # probed cell as the failing evidence so _entry_oom_everywhere
@@ -2628,3 +2738,6 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
         file=sys.stderr,
     )
     print(f"  capability counts: {summary}", file=sys.stderr)
+    if exact_misses:
+        sys.exit(f"error: --ctx-exact {context_label(ctx_exact)} missed on "
+                 f"{exact_misses} row(s); nothing was recorded for them")

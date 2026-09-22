@@ -1373,7 +1373,8 @@ probe-vllm: ## Probe every downloaded vLLM/HF model per (VRAM, CONTEXT) cell.
 	    $(if $(PROBE_CONTEXTS),--ctx $(PROBE_CONTEXTS),) \
 	    $(if $(PROBE_REPO),--repo '$(PROBE_REPO)',) \
 	    $(if $(PROBE_FORCE),--force,) \
-	    $(if $(PROBE_FORCE_ARCH),--force-arch,)
+	    $(if $(PROBE_FORCE_ARCH),--force-arch,) \
+	    $(if $(PROBE_CTX_EXACT),--ctx-exact $(PROBE_CTX_EXACT),)
 
 probe-sglang: ## Probe every downloaded SGLang/HF model per (VRAM, CONTEXT) cell.
 	@# Pre-condition: same as probe-vllm — all GPU-owning backends down.
@@ -1395,7 +1396,8 @@ probe-sglang: ## Probe every downloaded SGLang/HF model per (VRAM, CONTEXT) cell
 	    $(if $(PROBE_CONTEXTS),--ctx $(PROBE_CONTEXTS),) \
 	    $(if $(PROBE_REPO),--repo '$(PROBE_REPO)',) \
 	    $(if $(PROBE_FORCE),--force,) \
-	    $(if $(PROBE_FORCE_ARCH),--force-arch,)
+	    $(if $(PROBE_FORCE_ARCH),--force-arch,) \
+	    $(if $(PROBE_CTX_EXACT),--ctx-exact $(PROBE_CTX_EXACT),)
 
 probe-load-vllm: ## Serving-time LOAD probe for vLLM: augment fit cache with serving_ok/transient/needle, ascending ctx, stop at OOM.
 	@# Layers onto deploy/.vllm-reasoning-cache.json — run `make probe-vllm`
