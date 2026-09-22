@@ -172,6 +172,15 @@ class WiringTest(unittest.TestCase):
         for var in ("OLLAMA_KV_CACHE_TYPE", "OLLAMA_FLASH_ATTENTION"):
             self.assertIn(f"-e {var}=", prober_run, f"{var} not forwarded to the prober")
 
+    def test_default_probe_band_is_the_host_card_and_nothing_else(self) -> None:
+        # The operator probes the hardware this machine HAS. Simulating a
+        # smaller card stays available on request (PROBE_VRAMS=16G,24G) but is
+        # not something `make probe` does uninvited: it costs a ballast and
+        # GPU time, and writes cells nobody on this host consumes. Tied to
+        # GPU_MEMORY_GB rather than a literal so it follows the hardware.
+        self.assertRegex(MAKEFILE, r"(?m)^PROBE_VRAMS\s*\?=\s*\$\(GPU_MEMORY_GB\)G\s*$")
+        self.assertNotRegex(MAKEFILE, r"(?m)^PROBE_VRAMS\s*\?=.*16G")
+
     def test_serving_compose_never_sets_a_fit_target(self) -> None:
         self.assertNotIn("LLAMA_ARG_FIT_TARGET", self._executed(COMPOSE))
 

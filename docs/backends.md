@@ -285,9 +285,13 @@ removal really is intended.
 
 ```bash
 # 1. Ollama probing (Make-orchestrated, runs live with Ollama container)
-#    Each PROBE_VRAMS band recreates devai-ollama with OLLAMA_GPU_OVERHEAD
-#    set so the daemon behaves as if it had only that VRAM available.
-make probe                                          # all bands x all contexts
+#    By default ONLY the host card's band is probed (PROBE_VRAMS follows
+#    GPU_MEMORY_GB, i.e. 24G here) -- production conditions, no simulation.
+#    Ask for a smaller band explicitly (PROBE_VRAMS=16G,24G) and it is
+#    simulated PHYSICALLY: scripts/vram-ballast.py holds the difference in
+#    VRAM for the duration. OLLAMA_GPU_OVERHEAD used to do this and no longer
+#    governs placement; the prober refuses any cell whose VRAM exceeds its band.
+make probe                                          # host band x all contexts
 make probe PROBE_VRAMS=24G PROBE_CONTEXTS=32K      # one band, one tier
 make probe PROBE_FORCE=1                           # re-probe everything
 
@@ -616,7 +620,7 @@ together re-probe the cell and re-derive the capability.
 
 | Env / Make var | Effect |
 |---|---|
-| `PROBE_VRAMS=16G,24G` | Ollama target bands |
+| `PROBE_VRAMS=$(GPU_MEMORY_GB)G` | Ollama target bands. Defaults to the host card ONLY (24G here). Pass e.g. `PROBE_VRAMS=16G,24G` to also measure a smaller card, which `make probe` then simulates physically with `scripts/vram-ballast.py` |
 | `PROBE_VRAMS_VLLM=24G` | vLLM target bands |
 | `PROBE_VRAMS_SGLANG=24G` | SGLang target bands |
 | `PROBE_CONTEXTS=32K,64K,128K,256K` | Context tiers. For vLLM/SGLang this **caps the binary-search ceiling** (`max()` of the listed tiers) in BOTH the fit pass and the `--load` pass; the 32K-multiple grid below that ceiling is still searched, and any listed non-grid tier is unioned in. `PROBE_CONTEXTS=32K` therefore probes exactly one tier. For Ollama it is the literal list of tiers probed. **On the load pass the cap is not just a filter -- it can MOVE the winning cell down**: the load probe keeps exactly one cell at the largest ctx that actually serves within the cap, so re-running with a narrower `--ctx` shrinks that model's advertised `max_context`. Re-run at the full ceiling to restore it. |

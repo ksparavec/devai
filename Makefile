@@ -1211,7 +1211,12 @@ vram-fit: ## Show which models from the full catalog fit in VRAM (planning aid; 
 			--models-yaml $(INFERENCE_CONFIG) \
 			--vllm-dir $(VLLM_MODELS_DIR)
 
-PROBE_VRAMS    ?= 16G,24G
+# Probe the card this machine HAS, and nothing else, by default. Bands smaller
+# than the host are still available on request -- `make probe PROBE_VRAMS=16G,24G`
+# -- and are then simulated physically by scripts/vram-ballast.py; they are
+# just not something `make probe` does uninvited. Follows GPU_MEMORY_GB
+# rather than a literal, so it tracks the hardware.
+PROBE_VRAMS    ?= $(GPU_MEMORY_GB)G
 PROBE_CONTEXTS ?= 32K,64K,128K,256K
 # KV-cache dtype for THIS probe pass (empty = daemon default f16). Cells
 # probed with PROBE_KV_CACHE_TYPE=q8_0 are stamped kv_cache_type=q8_0 in
