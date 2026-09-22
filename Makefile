@@ -87,9 +87,12 @@ CACHE_COMPOSE = $(CURDIR)/deploy/docker-compose.yaml
 CACHE_SERVICES = apt-cache registry-cache ollama vllm vllm-devai sglang router \
                  open-webui webui-proxy logger pipelock
 
-# The three the router recreates on demand. cache-up skips any of these
+# The four the router recreates on demand. cache-up skips any of these
 # that already exist rather than colliding with the router's container.
-CACHE_BACKEND_SERVICES = ollama vllm sglang
+# vllm-devai was missing here from its introduction (449270a) until
+# 2026-09-22: with a vllm-devai model loaded, every `make cache-up` died on
+# the name collision before it reached the router.
+CACHE_BACKEND_SERVICES = ollama vllm vllm-devai sglang
 INFERENCE_CONFIG = deploy/models.yaml
 HF_CLI = hf
 # vLLM and SGLang safetensors live on their OWN external volumes

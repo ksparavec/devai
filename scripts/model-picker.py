@@ -28,6 +28,7 @@ import atexit
 import json
 import os
 import re
+import tomllib
 import shutil
 import subprocess
 import sys
@@ -3066,6 +3067,92 @@ def _write_opencode_providers(
     cfg_path.write_text(json.dumps(cfg, indent=2) + "\n")
 
 
+# A TOML table header we own: `[model_providers.router-<anything>]`, bare,
+# "double"- or 'single'-quoted key, optional trailing comment. Sub-tables
+# of ours match too.
+_CODEX_ROUTER_TABLE_RE = re.compile(
+    r"""^\s*\[\s*model_providers\s*\.\s*["']?router-[^\]"']*["']?\s*\]\s*(#.*)?$""")
+# Any table header (including `[[array]]`) ends the table before it.
+_TOML_TABLE_HEADER_RE = re.compile(r"^\s*\[")
+_TOML_BLANK_OR_COMMENT_RE = re.compile(r"^\s*(#.*)?$")
+
+
+def _codex_config_path() -> Path:
+    return Path(os.environ.get("CODEX_HOME")
+                or os.path.expanduser("~/.codex")) / "config.toml"
+
+
+def _write_codex_providers() -> Path:
+    """Declare one `router-<backend>` provider per _BACKENDS entry in Codex's
+    config, replacing ours and preserving everything else. Returns the path.
+
+    Codex resolves `--local-provider <name>` against `[model_providers.*]`
+    in $CODEX_HOME/config.toml and nothing else, and that file is seeded by
+    the entrypoint ONCE -- never overwritten -- onto the persistent home
+    volume. So the seed shipping a fourth backend changed nothing for any
+    home that already had the file: every launch of a vllm-devai row died
+    with "Model provider `router-vllm-devai` not found" (2026-09-22). The
+    picker owns the `router-` prefix, exactly as it does in OpenCode's
+    config, and rewrites those tables from _BACKENDS at every launch.
+
+    Line-based on purpose: the stdlib parses TOML (tomllib) but does not
+    write it, and a round trip through a writer would drop the operator's
+    comments. A table of ours runs from its header to its last key; blank
+    and comment lines after that belong to whatever comes next -- they are
+    kept when the next header is not ours (the shipped seed documents its
+    `[projects]` table exactly there) and dropped when it is. Every kept
+    line is copied verbatim (line endings come back as LF), and our tables
+    are appended at the end. The result must parse, or nothing is written
+    -- Codex would refuse it with a less useful error.
+    """
+    cfg_path = _codex_config_path()
+    try:
+        text = cfg_path.read_text() if cfg_path.exists() else ""
+    except OSError:
+        text = ""
+
+    kept: list[str] = []
+    trailing: list[str] = []  # blank/comment run after a table of ours
+    dropping = False
+    for line in text.splitlines():
+        if _TOML_TABLE_HEADER_RE.match(line):
+            dropping = bool(_CODEX_ROUTER_TABLE_RE.match(line))
+            if not dropping:
+                kept.extend(trailing)
+            trailing = []
+        if not dropping:
+            kept.append(line)
+        elif _TOML_BLANK_OR_COMMENT_RE.match(line):
+            trailing.append(line)
+        else:
+            trailing = []  # a key of ours: the run before it was inside
+    kept.extend(trailing)  # after our last table at EOF: not ours
+    head = "\n".join(kept).rstrip("\n")
+
+    tables = [
+        f"[model_providers.router-{bname}]\n"
+        f'name = "{label} via DevAI router"\n'
+        f'base_url = "http://{_ROUTER}:{port}/v1"\n'
+        for bname, (label, _reason, port) in _BACKENDS.items()
+    ]
+    merged = (head + "\n\n" if head else "") + "\n".join(tables)
+
+    try:
+        parsed = tomllib.loads(merged)
+    except tomllib.TOMLDecodeError as exc:
+        sys.exit(f"error: {cfg_path} would not parse after adding the "
+                 f"router providers ({exc}); fix the file and retry")
+    missing = [b for b in _BACKENDS
+               if f"router-{b}" not in parsed.get("model_providers", {})]
+    if missing:
+        sys.exit(f"error: {cfg_path}: router provider(s) {missing} did "
+                 "not survive the rewrite")
+
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(merged)
+    return cfg_path
+
+
 # Fallback context when a vetted id carries no `@<ctx>` (Ollama rides
 # bare by design). 32K is the smallest standard tier, so it under-
 # promises rather than letting aider pack a prompt the model rejects.
@@ -3218,15 +3305,25 @@ def _build(agent_id: str, model_name: str, backend: str) -> list[str]:
         os.environ["ANTHROPIC_SMALL_FAST_MODEL"] = name
         os.environ["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = name
         # Let Claude Code populate its own model picker from the router.
-        # Both flags are required and both were read out of the shipped
-        # binary (claude-code/2.1.220), then confirmed on the wire: with
-        # them set it issues `GET <base>/v1/models?limit=1000`; without
-        # either it never asks, so `/model` lists nothing but the one
-        # pinned below. The router answers that request with `claude-`
-        # aliases when it sees Claude Code's User-Agent, because Claude
-        # Code discards every id failing /^(claude|anthropic)/i -- which
-        # is all of ours. See gpu-arbiter/claude_compat.go.
-        os.environ.setdefault("CLAUDE_CODE_USE_GATEWAY", "1")
+        # With this flag set, a non-Anthropic ANTHROPIC_BASE_URL and a
+        # token, it issues `GET <base>/v1/models?limit=1000` at startup;
+        # without the flag it never asks, so `/model` lists nothing but
+        # the one passed on the command line. The router answers that
+        # request with `claude-` aliases when it sees Claude Code's
+        # User-Agent, because Claude Code discards every id failing
+        # /(claude|anthropic)/i -- which is all of ours. See
+        # gpu-arbiter/claude_compat.go.
+        #
+        # CLAUDE_CODE_USE_GATEWAY is deliberately NOT set. It used to be
+        # (read out of claude-code/2.1.220, where discovery was gated on
+        # it), but from 2.1.265 that variable selects Claude Code's
+        # enterprise Cloud-gateway sign-in, and 2.1.278 validates the URL
+        # for that mode at startup: plain http:// is refused unless the
+        # hostname is literally `localhost`, `127.0.0.1` or `[::1]`, with
+        # no override -- so `http://devai-router:<port>` failed every
+        # launch with "Gateway URL must use https://" (2026-09-22). In
+        # 2.1.278 discovery runs under the first-party provider and needs
+        # only the flag below; verified on the wire against the router.
         os.environ.setdefault("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", "1")
         return ["claude", "--model", name]
 
@@ -3252,9 +3349,14 @@ def _build(agent_id: str, model_name: str, backend: str) -> list[str]:
         # Codex 0.124+ requires --oss for non-OpenAI endpoints (chat-completions
         # wire was removed). The built-in `ollama` provider is reserved and
         # hard-codes localhost, so we use custom providers `router-<backend>`
-        # defined in $CODEX_HOME/config.toml (seeded by the entrypoint).
-        # CODEX_HOME and OPENAI_API_KEY come from image ENV — no overrides
-        # needed here.
+        # defined in $CODEX_HOME/config.toml. The entrypoint seeds that file
+        # once and never overwrites it, so a backend added later never
+        # reached an existing home (vllm-devai, 2026-09-22: "Model provider
+        # `router-vllm-devai` not found") -- the router-* providers are
+        # therefore re-synced from _BACKENDS at every launch, as OpenCode's
+        # are. CODEX_HOME and OPENAI_API_KEY come from image ENV — no
+        # overrides needed here.
+        _write_codex_providers()
         return [
             "codex",
             "--oss",

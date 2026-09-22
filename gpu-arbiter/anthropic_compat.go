@@ -198,11 +198,18 @@ func textBlock(s string) json.RawMessage {
 
 // maybeNormaliseAnthropic applies the rewrite on the surfaces that need
 // it: the Anthropic messages path, on vLLM and SGLang only.
+// isAnthropicMessagesPath is the one gate shared by the normalisation
+// above and the /v1/messages reasoning policy (anthropic_effort.go), so
+// the two can never disagree on which requests they see.
+func isAnthropicMessagesPath(path string) bool {
+	return path == "/v1/messages"
+}
+
 func (a *arbiter) maybeNormaliseAnthropic(backendName, path string, body []byte) []byte {
 	if e := engineOf(backendName); e != "vllm" && e != "sglang" {
 		return body
 	}
-	if path != "/v1/messages" {
+	if !isAnthropicMessagesPath(path) {
 		return body
 	}
 	out, moved := normaliseAnthropicMessages(body)

@@ -4111,6 +4111,12 @@ func (a *arbiter) applyReasoningPolicy(backendName, path, modelName, policy stri
 		if isResponsesPath(path) {
 			return a.applyResponsesPolicy(backendName, modelName, policy, body)
 		}
+		// The Anthropic surface carries the same knob under its own name
+		// (`output_config.effort`), and both engines' shims read it --
+		// see anthropic_effort.go.
+		if isAnthropicMessagesPath(path) {
+			return a.applyHFAnthropicMessagesPolicy(backendName, modelName, policy, body)
+		}
 		if engineOf(backendName) == "vllm" {
 			return a.applyVLLMPolicy(backendName, path, modelName, policy, body)
 		}
@@ -4121,8 +4127,9 @@ func (a *arbiter) applyReasoningPolicy(backendName, path, modelName, policy stri
 
 // applyVLLMPolicy is the vLLM half of the reasoning router.
 //
-// Both vLLM and SGLang serve OpenAI-compatible /v1/chat/completions only,
-// so the rewrite operates on that surface. Models classified `structured`
+// This is the /v1/chat/completions half; the Anthropic /v1/messages surface
+// has its own field for the same knob and is handled by
+// applyHFAnthropicMessagesPolicy (anthropic_effort.go). Models classified `structured`
 // got launched with `--reasoning-parser <X>` and emit `reasoning_content`
 // when `enable_thinking` is true. `inline` and `unsupported` have no
 // reliable structured switch, so we leave the body alone — same as

@@ -291,6 +291,16 @@ class CacheDownRemovesTheRecreatedContainerTest(unittest.TestCase):
         for n in ("devai-vllm", "devai-sglang", "devai-ollama", "devai-vllm-devai"):
             self.assertIn(n, names)
 
+    def test_cache_up_leaves_the_router_built_container_alone(self) -> None:
+        # cache-up skips CACHE_BACKEND_SERVICES that already exist. With
+        # vllm-devai missing from that list, compose tried to create
+        # devai-vllm-devai itself and the whole target aborted on the name
+        # collision -- before recreating the router it was run for
+        # (2026-09-22).
+        m = re.search(r"^CACHE_BACKEND_SERVICES = ([^\n]+)", self._MAKEFILE, re.M)
+        self.assertIsNotNone(m)
+        self.assertIn("vllm-devai", m.group(1).split())
+
     def test_test_agents_cleanup_names_vllm_devai_too(self) -> None:
         rm = re.search(r"rm -f ([^\n]+?) 2>/dev/null", self._recipe("test-agents"))
         self.assertIsNotNone(rm)

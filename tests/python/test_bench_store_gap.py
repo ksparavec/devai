@@ -241,9 +241,14 @@ class CacheServicesInSyncTest(unittest.TestCase):
             f"only-in-compose={declared - listed}")
 
     def test_backend_services_are_a_subset(self):
+        # Every backend the router recreates on demand, so cache-up leaves
+        # the router's container alone instead of colliding with it. This
+        # used to pin the three-backend set, which is why vllm-devai's
+        # absence went unnoticed until a loaded vllm-devai model made
+        # `make cache-up` abort on the name collision (2026-09-22).
         backends = self._makefile_var("CACHE_BACKEND_SERVICES")
         self.assertTrue(backends <= self._makefile_var("CACHE_SERVICES"))
-        self.assertEqual(backends, {"ollama", "vllm", "sglang"})
+        self.assertEqual(backends, {"ollama", "vllm", "vllm-devai", "sglang"})
 
 
 if __name__ == "__main__":

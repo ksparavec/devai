@@ -24,6 +24,7 @@ caches consumed, and failure modes.
   - [2. Anthropic /v1/messages normalisation](#2-anthropic-v1messages-normalisation-vllmsglang)
   - [2b. Responses API reasoning](#2b-responses-api-reasoning-v1responses-vllmsglang)
   - [3. Reasoning policy](#3-reasoning-policy)
+  -   - [3c. Anthropic /v1/messages effort](#3c-anthropic-v1messages-effort-vllmsglang)
   - [4. Tool-choice promotion](#4-tool-choice-promotion-vllmsglang)
   - [5. Tool stripping](#5-tool-stripping-vllmsglang)
   - [6. Context injection](#6-context-injection-ollama-only)
@@ -400,7 +401,9 @@ beta field present) against vLLM:
 
 So folding alone is sufficient and **no field filtering is needed** --
 `context_management`, `output_config`, `thinking`, `metadata` and `tools`
-are not the blocker and are passed through untouched. SGLang was verified
+are not the blocker and pass through the normalisation untouched
+(`output_config.effort` is then rewritten by the reasoning policy, see
+3c -- a policy decision, not a shim requirement). SGLang was verified
 independently and behaves identically (see
 `docs/plans/sglang-backend-remediation.md` Phase 0, finding 11).
 
@@ -525,6 +528,8 @@ backend's protocol path:
 | Ollama `/v1/messages`               | structured | inject `thinking.type` |
 | vLLM `/v1/chat/completions`         | structured | inject `extra_body.chat_template_kwargs.enable_thinking` + `reasoning_effort` |
 | SGLang `/v1/chat/completions`       | structured | inject `extra_body.chat_template_kwargs.enable_thinking` + `separate_reasoning` |
+| vLLM `/v1/messages`                 | structured | set `output_config.effort` (REPLACES the client's) + `chat_template_kwargs.enable_thinking`; off removes the effort, sets it false |
+| SGLang `/v1/messages`               | structured | auto REMOVES the client's `output_config.effort` (model default, as on SGLang's other surfaces); low/medium/high set it; off removes it and replaces `thinking` with `{type: disabled}` |
 | Any                                 | inline + policy=off | log `reasoningDisable` (explicit user opt-out) |
 | Any                                 | none / unsupported  | noop |
 
@@ -547,6 +552,57 @@ is therefore NOT a byte-identical pass-through on the Chat Completions
 path: it maps to `reasoning_effort: medium`, which for Qwen3.8 means
 "no preamble" (`medium` 180 prompt tokens, `low` 206, `xhigh` 218 on
 the same messages).
+
+### 3c. Anthropic `/v1/messages` effort (vLLM/SGLang)
+
+`applyHFAnthropicMessagesPolicy` (`gpu-arbiter/anthropic_effort.go`, since
+2026-09-22). Both chat-path policies gate on the path being exactly
+`/v1/chat/completions`, so a `/v1/messages` body reached the engine's
+Anthropic shim as the client sent it. That was harmless until three
+things lined up:
+
+- Claude Code 2.1.278 sends `output_config: {"effort": "high"}` and
+  `thinking: {"type": "adaptive"}` on every turn (captured on the wire;
+  "high" is its default effort level, a Claude knob).
+- vLLM 0.28 (`entrypoints/anthropic/serving.py`, `_handle_output_config`)
+  and SGLang 0.5.16 (`entrypoints/anthropic/serving.py`) both copy
+  `output_config.effort` into the chat request's `reasoning_effort`.
+- Qwen3.8's chat template validates that kwarg whenever thinking is on and
+  accepts only `xhigh`/`medium`/`low`, so every turn died with
+  `400 Unexpected reasoning effort high`.
+
+The router now owns `output_config.effort` on this path as it owns
+`reasoning_effort` on chat, per engine rule. ENABLE REPLACES the client's
+value: on vLLM with the policy's effort (auto -> medium, the value its
+chat path sends); on SGLang with an explicit low/medium/high only, while
+auto REMOVES the field, because SGLang's chat and Responses paths inject
+nothing under auto (the model's own default is the right answer) and this
+surface follows the same rule. Either way Claude Code's `high` never
+reaches the template. This field, and SGLang's `thinking` object under
+DISABLE, are the two places on this path where a client-supplied value
+does not win, because the Anthropic effort is a Claude-model setting
+emitted unconditionally, not a request aimed at this model. DISABLE
+removes the effort (neither shim's Literal admits `none`) and pulls the
+lever each engine actually reads: `chat_template_kwargs.enable_thinking=
+false` on vLLM (a real top-level field on its `AnthropicMessagesRequest`;
+its shim ignores the `thinking` request field), and on SGLang the WHOLE
+`thinking` object replaced by `{"type": "disabled"}` (its shim maps any
+`thinking.type` other than `disabled`, `adaptive` included, to reasoning
+ON; its validator rejects `disabled` combined with `display`, which Claude
+Code sends; and its request model has no `chat_template_kwargs` field --
+the `extra_body` lesson again). Only the top level and the touched
+sub-object are re-encoded; the rest of the body is preserved byte for
+byte.
+
+Two boundaries. Stock vLLM v0.22.1 (port 11435) has no `output_config`
+field on its `AnthropicMessagesRequest`, so there the rewrite is inert and
+harmless -- only vllm-devai (0.28) and SGLang read it, and a non-derived
+Qwen3.8 row on 11435 still runs under its template's `xhigh` default from
+Claude Code. And unknown / `none` / `unsupported` capabilities, plus a
+`structured` model whose disable is not probe-verified under policy=off,
+stay untouched exactly as on chat -- which here means the client's effort
+reaches the template (pinned; cannot fire on today's caches). Pinned by
+`TestAnthropicEffort_*`.
 
 ### 4. Tool-choice promotion (vLLM/SGLang)
 

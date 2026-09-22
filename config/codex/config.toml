@@ -3,14 +3,19 @@
 # Codex 0.124+ removed `wire_api = "chat"` and only supports its built-in OSS
 # code path (`--oss --local-provider <name>`) for non-OpenAI endpoints. The
 # built-in `ollama` provider name is reserved and hard-codes localhost, so we
-# define custom providers (`router-ollama`, `router-vllm`, `router-sglang`)
-# pointing at the DevAI router on the appropriate port. The picker invokes
-# codex with `--oss --local-provider router-<backend>`.
+# define custom providers (`router-ollama`, `router-vllm`, `router-sglang`,
+# `router-vllm-devai`) pointing at the DevAI router on the appropriate port.
+# The picker invokes codex with `--oss --local-provider router-<backend>`.
 #
 # This file ships in the image at /etc/devai/codex-config.toml. The container
-# entrypoint copies it to ~/.codex/config.toml on first launch only. If you
-# want to pick up changes from a newer image, delete ~/.codex/config.toml
-# and restart the container.
+# entrypoint copies it to ~/.codex/config.toml on first launch only and never
+# overwrites it. The `router-*` providers below are therefore ALSO re-written
+# from the picker's backend table at every launch (model-picker.py,
+# _write_codex_providers): a backend added after the first launch would
+# otherwise never reach an existing ~/.codex/config.toml -- vllm-devai did
+# not, and every Codex launch on it failed with "Model provider
+# `router-vllm-devai` not found" (2026-09-22). Everything else in the file is
+# yours and is left alone.
 
 [model_providers.router-ollama]
 name = "Ollama via DevAI router"
@@ -23,6 +28,10 @@ base_url = "http://devai-router:11435/v1"
 [model_providers.router-sglang]
 name = "SGLang via DevAI router"
 base_url = "http://devai-router:11436/v1"
+
+[model_providers.router-vllm-devai]
+name = "vLLM devai via DevAI router"
+base_url = "http://devai-router:11437/v1"
 
 # Pre-trust the default workdir so codex doesn't prompt on first launch
 # inside a fresh shell. Codex will still prompt for any other directory.

@@ -24,6 +24,14 @@
         "baseURL": "http://devai-router:11436/v1",
         "apiKey": "local"
       }
+    },
+    "router-vllm-devai": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "vLLM devai via DevAI router",
+      "options": {
+        "baseURL": "http://devai-router:11437/v1",
+        "apiKey": "local"
+      }
     }
   }
 }

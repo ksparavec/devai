@@ -5,19 +5,25 @@ import "strings"
 // Claude Code model-list compatibility.
 //
 // Claude Code can populate its model picker from a local endpoint, but only
-// under two opt-in env vars AND only for ids matching a hard filter. All
-// three facts were read out of the shipped binary (claude-code/2.1.220) and
-// then confirmed on the wire against a stub, because guessing here is how
-// you build a feature that looks right and lists nothing:
+// under an opt-in env var AND only for ids matching a hard filter. Both
+// facts were read out of the shipped binary and then confirmed on the wire,
+// because guessing here is how you build a feature that looks right and
+// lists nothing. On claude-code/2.1.278 (2026-09-22):
 //
-//	CLAUDE_CODE_USE_GATEWAY=1                  -> builds the gateway
-//	                                              on-ramp from
-//	                                              ANTHROPIC_BASE_URL +
-//	                                              ANTHROPIC_AUTH_TOKEN
 //	CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 -> GET <base>/v1/models
 //	                                                ?limit=1000
 //
-// and then, in both the discovery and bootstrap paths:
+// under the first-party provider, whenever ANTHROPIC_BASE_URL is set to a
+// non-Anthropic host and a token is present. On 2.1.220 the request was
+// additionally gated on CLAUDE_CODE_USE_GATEWAY=1, which the picker set;
+// from 2.1.265 that variable selects the enterprise Cloud-gateway sign-in
+// instead, and 2.1.278 refuses a plain-http URL under it unless the host
+// is literally localhost / 127.0.0.1 / [::1], so the picker no longer sets
+// it. Discovery was re-verified without it: this router logged the GET
+// from the claude-code UA. (The /v1/messages POSTs arrive as
+// `claude-cli/<version>`; only the discovery GET is matched here.)
+//
+// Then, in both the discovery and bootstrap paths:
 //
 //	.filter((m) => /^(claude|anthropic)/i.test(m.id))
 //
