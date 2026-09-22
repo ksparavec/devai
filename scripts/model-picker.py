@@ -1632,7 +1632,7 @@ def _format_model_row(m: dict, idx: int = 0) -> str:
         f"{num_col:>3s}  "
         f"{ctx_str:>5s}  "
         f"{display_name:<34s}  "
-        f"{backend_col:>7s}  "
+        f"{backend_col:>10s}  "
         f"{params_col:>10s}  "
         f"{type_col:>6s}  "
         f"{fmt_col:>7s}  "
@@ -1776,8 +1776,9 @@ def _mtp_probe_unfit(m: dict) -> bool:
 def _has_mtp(m: dict) -> bool:
     """Whether MTP is OFFERABLE for this row: the catalog declares an `mtp:`
     block AND the fit probe didn't record mtp_fits=false (draft-head OOM).
-    Drives the MTP column ('Yes'/'No') and gates the sub-modal, so the picker
-    never surfaces a ::mtp that would 503 at serve."""
+    Drives the MTP column ('Yes'/'No') and the `::mtp` suffix (always on
+    for a supporting row; there is no toggle), so the picker never emits a
+    ::mtp that would 503 at serve."""
     return _mtp_block(m) is not None and not _mtp_probe_unfit(m)
 
 
@@ -2876,7 +2877,7 @@ def _build_menu(
         f"{'##':>3s}  "
         f"{_hdr('CTX', 'ctx'):>5s}  "
         f"{'TAG':<34s}  "
-        f"{'BACKEND':>7s}  "
+        f"{'BACKEND':>10s}  "
         f"{'PARAMS':>10s}  "
         f"{'TYPE':>6s}  "
         f"{'FORMAT':>7s}  "
@@ -3499,13 +3500,22 @@ def _resolve_agent(agent_filter: str | None, model: dict) -> tuple[str, str, str
 
     Returns (agent_id, reasoning_mode, mtp_mode) on launch, or None when
     the user pressed Esc and the caller should re-enter the model list.
-    mtp_mode is "off" by default; "on" only when the sub-modal explicitly
-    enables it.
+
+    mtp_mode is "on" for every row that supports MTP (_has_mtp) and there
+    is no toggle: the drafter is pure decode speed (37 vs 95 tok/s on
+    Qwen3.8-27B-MTP-devai-NVFP4), so offering OFF only ever cost it. The
+    sub-modal that used to ask was removed on 2026-09-22 by operator
+    decision. One consequence: an inline-reasoning row that supports MTP
+    is launched with reasoning OFF (`::nothink`) and no reasoning toggle,
+    because the router refuses reasoning-ON + MTP on inline models
+    (vllm#34650) and MTP is the one that stays.
     """
     reasoning_mode = "default"
-    mtp_mode = "off"
+    mtp_mode = "on" if _has_mtp(model) else "off"
     cap = str(model.get("capability") or "")
-    if cap == Capability.INLINE:
+    if cap == Capability.INLINE and mtp_mode == "on":
+        reasoning_mode = "nothink"
+    elif cap == Capability.INLINE:
         toggle_lines = [
             f"  Reasoning ON   {_DIM}(default — model thinks inline){_RESET}",
             f"  Reasoning OFF  {_DIM}(force enable_thinking=false / ::nothink){_RESET}",
@@ -3519,33 +3529,6 @@ def _resolve_agent(agent_filter: str | None, model: dict) -> tuple[str, str, str
             return None
         if idx == 1:
             reasoning_mode = "nothink"
-
-    # MTP sub-modal mirrors the reasoning one; offered whenever the
-    # catalog declares an mtp: block for this row and the probe did not
-    # record mtp_fits=false (see _has_mtp).
-    if _has_mtp(model):
-        mtp = _mtp_block(model) or {}
-        method = mtp.get("method", "?")
-        k = mtp.get("num_speculative_tokens", "?")
-        warn = ""
-        if cap == Capability.INLINE and reasoning_mode != "nothink":
-            warn = (
-                f"\n  {_DIM}note: MTP + reasoning on inline-reasoning models will be "
-                f"rejected by the router (vllm#34650). Choose ::nothink or MTP OFF.{_RESET}"
-            )
-        mtp_lines = [
-            f"  MTP OFF        {_DIM}(default — vanilla decode, no drafter){_RESET}",
-            f"  MTP ON         {_DIM}({method}, K={k} — ~2-3x decode speedup){_RESET}",
-        ]
-        mtp_header = (
-            f"MTP toggle  ▸  {_BOLD}{_strip_latest(model['name'])}{_RESET}"
-            f"   {_DIM}(Esc → back to model list){_RESET}{warn}"
-        )
-        idx = _fzf(mtp_lines, mtp_header, memory_key="mtp")
-        if idx is None:
-            return None
-        if idx == 1:
-            mtp_mode = "on"
 
     if agent_filter:
         agent = next((a for a in _AGENTS if a[0] == agent_filter), None)
@@ -3561,7 +3544,8 @@ def _resolve_agent(agent_filter: str | None, model: dict) -> tuple[str, str, str
     alines = [_format_agent_row(a) for a in _AGENTS]
     mode_notes = []
     if reasoning_mode == "nothink":
-        mode_notes.append("no reasoning")
+        mode_notes.append("no reasoning (MTP)" if mtp_mode == "on" and cap == Capability.INLINE
+                          else "no reasoning")
     if mtp_mode == "on":
         mode_notes.append("MTP")
     mode_note = f"  [{', '.join(mode_notes)}]" if mode_notes else ""
@@ -3957,8 +3941,8 @@ def main() -> None:
         # parseReasoningOverride strips it and treats the request as
         # policy=off (enable_thinking=false / per-backend disable shape).
         reasoning_suffix = "::nothink" if reasoning_mode == "nothink" else ""
-        # `::mtp` rides on the model name when MTP is opted in via the
-        # sub-modal. Canonical emit order is `<name>::<reasoning>::<mtp>@<ctx>`
+        # `::mtp` rides on the model name whenever the row supports MTP
+        # (no toggle). Canonical emit order is `<name>::<reasoning>::<mtp>@<ctx>`
         # so the router's right-to-left parse chain (ctx -> mtp ->
         # reasoning) lines up cleanly.
         mtp_suffix = "::mtp" if mtp_mode == "on" else ""

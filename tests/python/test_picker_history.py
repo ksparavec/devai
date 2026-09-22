@@ -161,8 +161,9 @@ class AllModalsOptInTest(unittest.TestCase):
 
     def test_expected_modal_keys_are_all_present(self):
         src = (REPO_ROOT / "scripts" / "model-picker.py").read_text()
-        for key in ("model", "agent", "kv_tier", "reasoning", "mtp",
-                    "aiagent_gpu"):
+        # "mtp" is deliberately absent: the MTP sub-modal was removed on
+        # 2026-09-22 (MTP is always on for a supporting row).
+        for key in ("model", "agent", "kv_tier", "reasoning", "aiagent_gpu"):
             with self.subTest(key=key):
                 self.assertIn(f'memory_key="{key}"', src)
 

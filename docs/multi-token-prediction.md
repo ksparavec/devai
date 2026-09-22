@@ -482,7 +482,9 @@ opt-in (`::mtp` suffix), the catalog `mtp:` block, the
 trigger, and the reasoning+MTP+inline guard for vllm#34650 are all
 in place. See `gpu-arbiter/main.go` (`parseMTPOverride`,
 `vllmSpeculativeJSON`, `sglangSpeculativeArgs`, `specEqual`,
-`specLabel`), `scripts/model-picker.py` (`_has_mtp`, MTP sub-modal),
+`specLabel`), `scripts/model-picker.py` (`_has_mtp`; a supporting row
+is always launched with `::mtp`, the ON/OFF sub-modal was removed on
+2026-09-22),
 and `scripts/_probe_hf_common.py` (the per-cell MTP overhead probe).
 The `RecoveryFlags` escape hatch in Sec. 7.1 remains available for
 operator-level overrides but is no longer the recommended path.
@@ -591,7 +593,9 @@ A first-class MTP integration touches four places:
 4. **`scripts/model-picker.py`**. Add an MTP toggle in the
    post-select modal, mirroring the existing reasoning ON/OFF
    sub-modal. The picker emits `::mtp` or `::nomtp` as a suffix
-   on the model name (analog to `::nothink`).
+   on the model name (analog to `::nothink`). (Superseded 2026-09-22:
+   the toggle was removed again; a supporting row always emits
+   `::mtp`, and an inline-reasoning MTP row emits `::nothink::mtp`.)
 
 ### 7.3 Per-request override -- the `::mtp` suffix
 

@@ -60,10 +60,48 @@ class NoPreviewFlagTest(unittest.TestCase):
         lines, _, _ = mp._build_menu([_mtp_row()])
         self.assertTrue(any(re.search(r"\bMTP\b", ln) for ln in lines[:3]), "menu header must carry the MTP column")
 
-    def test_suffix_emission_depends_only_on_the_sub_modal(self) -> None:
+    def test_suffix_follows_support_and_there_is_no_toggle(self) -> None:
+        # The ON/OFF sub-modal was removed on 2026-09-22: the drafter is pure
+        # decode speed, so a supporting row always launches with ::mtp.
         src = PICKER.read_text()
         self.assertIn('mtp_suffix = "::mtp" if mtp_mode == "on" else ""', src)
-        self.assertIn("if _has_mtp(model):", src)
+        self.assertIn('mtp_mode = "on" if _has_mtp(model) else "off"', src)
+        self.assertNotIn('memory_key="mtp"', src)
+        self.assertNotIn("MTP OFF", src)
+
+
+class NoMTPModalTest(unittest.TestCase):
+    def _resolve(self, row: dict):
+        mp = _load_picker()
+        headers: list[str] = []
+
+        def fake_fzf(lines, header, **kw):
+            headers.append(header)
+            return 1  # "OFF" on the reasoning toggle, if it is ever shown
+
+        with mock.patch.object(mp, "_fzf", fake_fzf), \
+                mock.patch.object(mp, "_apply_aiagent_gpu", lambda agent_id: True):
+            return mp, mp._resolve_agent("claude", row), headers
+
+    def test_supporting_row_is_mtp_on_with_no_modal(self) -> None:
+        mp, decision, headers = self._resolve(_mtp_row())
+        self.assertEqual(decision, ("claude", "default", "on"))
+        self.assertEqual(headers, [], "no sub-modal of any kind for a structured MTP row")
+
+    def test_inline_row_with_mtp_forces_reasoning_off(self) -> None:
+        # The router refuses reasoning-ON + MTP on inline models
+        # (vllm#34650); MTP is the one that stays, so no toggle is offered.
+        mp, decision, headers = self._resolve({**_mtp_row(), "capability": "inline"})
+        self.assertEqual(decision, ("claude", "nothink", "on"))
+        self.assertEqual(headers, [])
+
+    def test_inline_row_without_mtp_still_gets_the_reasoning_toggle(self) -> None:
+        row = {**_mtp_row(), "capability": "inline", "catalog_meta": {}}
+        mp, decision, headers = self._resolve(row)
+        self.assertEqual(decision, ("claude", "nothink", "off"))
+        self.assertEqual(len(headers), 1)
+        self.assertIn("Reasoning mode", headers[0])
+        self.assertFalse(any("MTP" in h for h in headers))
 
 
 if __name__ == "__main__":
