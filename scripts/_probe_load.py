@@ -86,7 +86,9 @@ from _probe_hf_common import (
     container_remove,
     container_run_detached,
     container_state,
+    curated_parsers,
     effective_position_limit,
+    engine_of,
     gpu_memory_used_mb,
     host_scaled_fraction,
     http_get,
@@ -897,7 +899,7 @@ def _cell_kv_cache_dtype(cell: dict, backend: str) -> str:
     stamped = cell.get("kv_cache_type")
     if isinstance(stamped, str) and stamped:
         return stamped
-    return "fp8" if backend == "vllm" else ""
+    return "fp8" if engine_of(backend) == "vllm" else ""
 
 
 def run_load_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
@@ -1026,13 +1028,12 @@ def run_load_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
             skipped += 1
             continue
 
-        row_parsers = (row.get("parsers") or {}).get(spec.name) or {}
         # Serve with what the router will serve with: the entry's verified
-        # parsers (set by the fit prober), catalog hint as fallback.
-        reasoning_parser = (entry.get("reasoning_parser")
-                            or row_parsers.get("reasoning") or None)
-        tool_parser = (entry.get("tool_parser")
-                       or row_parsers.get("tool") or None)
+        # parsers (set by the fit prober), catalog hint as fallback -- the
+        # hint is keyed by ENGINE (vllm-devai reads the vllm block).
+        curated_reasoning, curated_tool = curated_parsers(row, spec.name)
+        reasoning_parser = entry.get("reasoning_parser") or curated_reasoning
+        tool_parser = entry.get("tool_parser") or curated_tool
         size_gb = model_size_gb_from_row(row)
 
         # Can't serve above what fits, nor above the model's as-delivered

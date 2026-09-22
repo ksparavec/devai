@@ -277,6 +277,30 @@ def engine_of(backend: str) -> str:
     return _ENGINE_OF.get(backend, backend)
 
 
+def curated_parsers(row: dict, backend: str) -> tuple[str | None, str | None]:
+    """(reasoning, tool) from the catalog row's `parsers:` block for a backend.
+
+    The block is keyed by ENGINE (`vllm`, `sglang`): a parser name is an
+    engine plugin, and `vllm-devai` runs the same plugins as `vllm`. A block
+    under the backend's own name still wins, per key, so a build that ships
+    a different plugin can be curated explicitly. Looking this up by NAME
+    alone is how both derived rows were probed with no parsers at all on
+    2026-09-22 (no `vllm-devai:` block exists) and then served with
+    reasoning bleeding into content.
+    """
+    parsers = row.get("parsers") or {}
+    own = parsers.get(backend) or {}
+    engine = parsers.get(engine_of(backend)) or {}
+    return (own.get("reasoning") or engine.get("reasoning") or None,
+            own.get("tool") or engine.get("tool") or None)
+
+
+def derive_parser_for(name: str, models_dir: Path, backend: str,
+                      kind: str) -> str | None:
+    """Card-derived parser hint; the hint tables are keyed by engine too."""
+    return _card_hints.derive_parser(name, models_dir, engine_of(backend), kind)
+
+
 @dataclass(frozen=True)
 class BackendSpec:
     """Per-backend constants and the launch-arg builder."""
@@ -390,7 +414,10 @@ def load_catalog_hf_rows(path: Path, backend_filter: str) -> list[dict]:
         models = _parse_models_yaml_regex(text)
     out = []
     for m in models:
-        if m.get("source") != "hf":
+        # Derived rows (made by `make model-prepare`) live in the HF store
+        # and are probed like HF rows; their `repo: devai/<name>` keys them
+        # apart from their source in the cache.
+        if m.get("source") not in ("hf", "derived"):
             continue
         if backend_filter not in (m.get("backend") or []):
             continue
@@ -835,8 +862,15 @@ def validate_kv_dtype(spec: "BackendSpec", dtype: str | None) -> None:
 def build_disable_thinking_body(backend: str, base: dict) -> dict:
     """Mutate-in-place a chat body to request reasoning suppression.
 
-    vLLM (Qwen3-style template):
+    vLLM (what applyVLLMPolicy sends):
+        reasoning_effort = "none", plus
         extra_body.chat_template_kwargs.enable_thinking = False
+      Both, not just the second: measured 2026-09-22 on Qwen3.8 (vLLM
+      0.28), `enable_thinking=false` alone still yields 175 reasoning
+      tokens and the template's `xhigh` preamble; `reasoning_effort=none`
+      is the field its template honours (0 reasoning tokens). Sending only
+      the kwarg recorded disable_verified=false for rows the router can in
+      fact silence.
     SGLang:
         top-level chat_template_kwargs.enable_thinking = False, plus
         reasoning_effort = "none"
@@ -865,13 +899,19 @@ def build_disable_thinking_body(backend: str, base: dict) -> dict:
     router won't emit a disable directive at serve time.
     """
     body = dict(base)
-    if backend == "vllm":
+    # Keyed by ENGINE: vllm-devai speaks vLLM's shape. Comparing the
+    # backend NAME here sent the base body unchanged for it, so the
+    # disable probe measured a model that was never told to stop thinking
+    # and recorded disable_verified=false for every derived row (2026-09-22).
+    engine = engine_of(backend)
+    if engine == "vllm":
+        body["reasoning_effort"] = "none"
         extra = dict(body.get("extra_body") or {})
         ctk = dict(extra.get("chat_template_kwargs") or {})
         ctk["enable_thinking"] = False
         extra["chat_template_kwargs"] = ctk
         body["extra_body"] = extra
-    elif backend == "sglang":
+    elif engine == "sglang":
         ctk = dict(body.get("chat_template_kwargs") or {})
         ctk["enable_thinking"] = False
         body["chat_template_kwargs"] = ctk
@@ -908,13 +948,14 @@ def build_enable_thinking_body(backend: str, base: dict) -> dict:
     Qwen3, etc.) emit a reasoning trace under the curated parser.
     """
     body = dict(base)
-    if backend == "vllm":
+    engine = engine_of(backend)  # see build_disable_thinking_body
+    if engine == "vllm":
         extra = dict(body.get("extra_body") or {})
         ctk = dict(extra.get("chat_template_kwargs") or {})
         ctk["enable_thinking"] = True
         extra["chat_template_kwargs"] = ctk
         body["extra_body"] = extra
-    elif backend == "sglang":
+    elif engine == "sglang":
         body["separate_reasoning"] = True
         extra = dict(body.get("extra_body") or {})
         ctk = dict(extra.get("chat_template_kwargs") or {})
@@ -2302,9 +2343,7 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
         # row. The probe driver passes these to spec.build_args; the
         # cell record only confirms them when the backend round-trip
         # produces the expected response shape.
-        row_parsers = (row.get("parsers") or {}).get(spec.name) or {}
-        curated_reasoning = row_parsers.get("reasoning") or None
-        curated_tool = row_parsers.get("tool") or None
+        curated_reasoning, curated_tool = curated_parsers(row, spec.name)
 
         # Card-derived fallback. A curated value ALWAYS wins -- derivation
         # only fills gaps, so onboarding an uncurated model no longer
@@ -2321,8 +2360,7 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
                               ("reasoning", curated_reasoning)):
             derived = None
             try:
-                derived = _card_hints.derive_parser(
-                    name, models_dir, spec.name, kind)
+                derived = derive_parser_for(name, models_dir, spec.name, kind)
             except Exception as e:  # noqa: BLE001
                 # Never let a hint break a probe: no hint is today's
                 # behaviour, a crash is not.
