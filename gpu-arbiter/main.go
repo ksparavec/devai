@@ -1965,10 +1965,7 @@ func buildArbiter() *arbiter {
 	// moved tag silently invalidates fit/serving/parser data; we serve
 	// anyway but warn (loud log here + X-DevAI-Warning per response + a
 	// /health flag). Ollama (empty Image, no _meta stamp) never goes stale.
-	backendCachePath := map[string]string{
-		"vllm":   vllmCachePath,
-		"sglang": sglangCachePath,
-	}
+	backendCachePath := probeCachePathByBackend(vllmCachePath, sglangCachePath, vllmDevaiCachePath)
 	for _, bc := range backends {
 		probed := readProbedImageDigest(backendCachePath[bc.Name])
 		running := a.imageDigestFromLibpod(bc.Image)
@@ -2286,6 +2283,19 @@ func normalizeImageDigest(digest string, repoDigests []string) string {
 		return rd
 	}
 	return ""
+}
+
+// probeCachePathByBackend is the name-keyed map the drift check reads each
+// HF backend's probe cache through. Every backend that has a probe cache
+// must be here: a name that is missing reads back "" and can never be
+// reported stale -- which is how vllm-devai spent its first day with the
+// drift safety net silently off (2026-09-22).
+func probeCachePathByBackend(vllm, sglang, vllmDevai string) map[string]string {
+	return map[string]string{
+		"vllm":       vllm,
+		"sglang":     sglang,
+		"vllm-devai": vllmDevai,
+	}
 }
 
 // readProbedImageDigest extracts _meta.current_image_digest from an HF probe
@@ -4102,9 +4112,9 @@ func (a *arbiter) applyReasoningPolicy(backendName, path, modelName, policy stri
 			return a.applyResponsesPolicy(backendName, modelName, policy, body)
 		}
 		if engineOf(backendName) == "vllm" {
-			return a.applyVLLMPolicy(path, modelName, policy, body)
+			return a.applyVLLMPolicy(backendName, path, modelName, policy, body)
 		}
-		return a.applySGLangPolicy(path, modelName, policy, body)
+		return a.applySGLangPolicy(backendName, path, modelName, policy, body)
 	}
 	return body
 }
@@ -4129,14 +4139,21 @@ func (a *arbiter) applyReasoningPolicy(backendName, path, modelName, policy stri
 //	reasoning_effort = "none"
 //
 // Client-supplied fields always win.
-func (a *arbiter) applyVLLMPolicy(path, modelName, policy string, body []byte) []byte {
+//
+// backendName is the backend the request arrived on, NOT the engine: the
+// capability / disable_verified maps are keyed by backend, and a derived
+// checkpoint is probed on vllm-devai only. Keying the lookup to "vllm" here
+// made every vllm-devai model read as unknown capability -- no effort
+// injected, so the Qwen3.8 template fell back to its own `xhigh` default
+// with a 38-token preamble, and `::nothink` was a silent no-op (2026-09-22).
+func (a *arbiter) applyVLLMPolicy(backendName, path, modelName, policy string, body []byte) []byte {
 	if strings.TrimRight(path, "/") != "/v1/chat/completions" {
 		return body
 	}
-	switch a.reasoningAction("vllm", modelName, policy) {
+	switch a.reasoningAction(backendName, modelName, policy) {
 	case reasoningEnable:
-		log.Printf("info: vllm/%s reasoning ENABLE (policy=%q, effort=%s)",
-			modelName, policy, openAIReasoningEffort(policy))
+		log.Printf("info: %s/%s reasoning ENABLE (policy=%q, effort=%s)",
+			backendName, modelName, policy, openAIReasoningEffort(policy))
 		body = setJSONFieldIfAbsent(
 			body,
 			[]string{"reasoning_effort", "reasoning"},
@@ -4149,7 +4166,7 @@ func (a *arbiter) applyVLLMPolicy(path, modelName, policy string, body []byte) [
 			true,
 		)
 	case reasoningDisable:
-		log.Printf("info: vllm/%s reasoning DISABLE (policy=%q)", modelName, policy)
+		log.Printf("info: %s/%s reasoning DISABLE (policy=%q)", backendName, modelName, policy)
 		body = setJSONFieldIfAbsent(
 			body,
 			[]string{"reasoning_effort", "reasoning"},
@@ -4203,13 +4220,13 @@ func (a *arbiter) applyVLLMPolicy(path, modelName, policy string, body []byte) [
 // not the top-level field. Sending `reasoning_effort` top-level (as here)
 // does not trip that guard; nesting it inside `chat_template_kwargs`
 // would.
-func (a *arbiter) applySGLangPolicy(path, modelName, policy string, body []byte) []byte {
+func (a *arbiter) applySGLangPolicy(backendName, path, modelName, policy string, body []byte) []byte {
 	if strings.TrimRight(path, "/") != "/v1/chat/completions" {
 		return body
 	}
-	switch a.reasoningAction("sglang", modelName, policy) {
+	switch a.reasoningAction(backendName, modelName, policy) {
 	case reasoningEnable:
-		log.Printf("info: sglang/%s reasoning ENABLE (policy=%q)", modelName, policy)
+		log.Printf("info: %s/%s reasoning ENABLE (policy=%q)", backendName, modelName, policy)
 		// Only an explicitly-requested effort level is sent. Under `auto`
 		// the model's own default is the right answer, and inventing a
 		// "medium" would silently override whatever the checkpoint ships.
@@ -4225,7 +4242,7 @@ func (a *arbiter) applySGLangPolicy(path, modelName, policy string, body []byte)
 			true,
 		)
 	case reasoningDisable:
-		log.Printf("info: sglang/%s reasoning DISABLE (policy=%q)", modelName, policy)
+		log.Printf("info: %s/%s reasoning DISABLE (policy=%q)", backendName, modelName, policy)
 		// `reasoning_effort: "none"` is the lever that actually stops
 		// generation, and it covers both template key spellings. The
 		// explicit enable_thinking=false below is belt-and-braces for the

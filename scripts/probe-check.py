@@ -47,6 +47,12 @@ BACKENDS = (
         "SGLANG_IMAGE",
         "docker.io/lmsysorg/sglang:v0.5.16-cu130",
     ),
+    (
+        "vllm-devai",
+        "deploy/.vllm-devai-reasoning-cache.json",
+        "VLLM_DEVAI_IMAGE",
+        "docker.io/devai/vllm-devai:latest",
+    ),
 )
 
 

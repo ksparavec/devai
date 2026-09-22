@@ -532,6 +532,22 @@ Models with `disable_verified=False` can't reliably suppress
 reasoning -- the directive is sent, but the model may emit reasoning
 anyway (R1-Distill family is the standing example).
 
+The capability and `disable_verified` maps are keyed by the BACKEND
+the request arrived on (`ollama`, `vllm`, `vllm-devai`, `sglang`), and
+`applyVLLMPolicy` / `applySGLangPolicy` take that backend name. They
+used to look the model up under a hard-coded `"vllm"` / `"sglang"`,
+which was invisible while every model lived in the stock caches and
+broke the moment a derived checkpoint was probed on `vllm-devai` only
+(2026-09-22): its capability read as unknown, no `reasoning_effort` was
+injected, and the Qwen3.8 chat template applied its own default --
+`xhigh`, a 38-token "think carefully" system preamble. Same weights,
+same image, same flags: HumanEval 97.6 % through port 11435, 46 %
+through port 11437, and `::nothink` a silent no-op. Note that `auto`
+is therefore NOT a byte-identical pass-through on the Chat Completions
+path: it maps to `reasoning_effort: medium`, which for Qwen3.8 means
+"no preamble" (`medium` 180 prompt tokens, `low` 206, `xhigh` 218 on
+the same messages).
+
 ### 4. Tool-choice promotion (vLLM/SGLang)
 
 Fires when the probe's `tool_mode == "forced"` -- the model only

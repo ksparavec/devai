@@ -16,8 +16,11 @@ package main
 // that every such branch goes through engineOf.
 
 import (
+	"bytes"
+	"encoding/json"
 	"testing"
 )
+
 func TestEngineOf(t *testing.T) {
 	cases := map[string]string{
 		"ollama": "ollama", "vllm": "vllm", "sglang": "sglang",
@@ -28,6 +31,52 @@ func TestEngineOf(t *testing.T) {
 			t.Errorf("engineOf(%q) = %q, want %q", name, got, want)
 		}
 	}
+}
+
+// The capability and disable_verified maps are keyed by BACKEND, and a
+// derived checkpoint is probed on vllm-devai ONLY -- it has no entry under
+// "vllm". The first version of this test copied the vllm map into the
+// vllm-devai slot and so could not see that applyVLLMPolicy looked the
+// model up under "vllm" regardless of the backend it was asked about.
+// What that cost (2026-09-22, first real bench of the derived rows): the
+// capability read back as unknown, no reasoning_effort was injected, and
+// the Qwen3.8 chat template applied its OWN default -- `xhigh`, which
+// prepends a 38-token "think carefully" system preamble. HumanEval fell
+// from 97.6 % to 46 % on byte-identical weights, and `::nothink` was a
+// silent no-op on port 11437.
+func TestVLLMDevai_ReasoningPolicyReadsTheBackendsOwnCapability(t *testing.T) {
+	a := &arbiter{
+		modelCapability: map[string]map[string]string{
+			"vllm-devai": {"m-devai": CapStructured},
+		},
+		modelDisableOK: map[string]map[string]bool{
+			"vllm-devai": {"m-devai": true},
+		},
+	}
+	in := []byte(`{"model":"m-devai","messages":[]}`)
+	auto := a.applyReasoningPolicy("vllm-devai", "/v1/chat/completions", "m-devai", "auto", in)
+	if got := jsonStringField(t, auto, "reasoning_effort"); got != "medium" {
+		t.Fatalf("auto on a structured vllm-devai model must inject reasoning_effort=medium, got %q in %s", got, auto)
+	}
+	off := a.applyReasoningPolicy("vllm-devai", "/v1/chat/completions", "m-devai", "off", in)
+	if got := jsonStringField(t, off, "reasoning_effort"); got != "none" {
+		t.Fatalf("off on a disable-verified vllm-devai model must inject reasoning_effort=none, got %q in %s", got, off)
+	}
+	// And the same model name known ONLY to vllm-devai must not be
+	// rewritten when asked about on stock vllm.
+	if stock := a.applyReasoningPolicy("vllm", "/v1/chat/completions", "m-devai", "auto", in); !bytes.Equal(stock, in) {
+		t.Fatalf("vllm has no capability for m-devai and must leave the body alone: %s", stock)
+	}
+}
+
+func jsonStringField(t *testing.T, body []byte, key string) string {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil {
+		t.Fatalf("bad JSON %s: %v", body, err)
+	}
+	s, _ := m[key].(string)
+	return s
 }
 
 func TestVLLMDevai_MemoryHeuristicMatchesVLLM(t *testing.T) {
@@ -83,6 +132,21 @@ func TestVLLMDevai_LegacyCellsDecodeToFP8LikeVLLM(t *testing.T) {
 		}
 		if kv := rows[0].KVByCtx[32768]; kv != "fp8" {
 			t.Errorf("%s: unstamped cell must decode to fp8, got %q", backend, kv)
+		}
+	}
+}
+
+// Image-drift detection reads each HF backend's probe cache through a
+// name-keyed map. vllm-devai was missing from it, so readProbedImageDigest
+// got "" and the backend could never be reported stale -- the drift
+// safety net built for exactly this kind of backend was silently off
+// (found in review, 2026-09-22).
+func TestVLLMDevai_DriftCheckReadsItsOwnProbeCache(t *testing.T) {
+	m := probeCachePathByBackend("/v.json", "/s.json", "/d.json")
+	want := map[string]string{"vllm": "/v.json", "sglang": "/s.json", "vllm-devai": "/d.json"}
+	for name, path := range want {
+		if m[name] != path {
+			t.Errorf("probeCachePathByBackend[%q] = %q, want %q", name, m[name], path)
 		}
 	}
 }
