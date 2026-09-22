@@ -258,6 +258,7 @@ _AGENTS: list[tuple[str, str, str]] = [
     ("claude",      "Claude Code",       "AI coding assistant with agentic terminal"),
     ("codex",       "Codex",             "OpenAI terminal coding agent"),
     ("opencode",    "OpenCode",          "Open-source terminal agent; strong with local models"),
+    ("pi",          "Pi",                "Minimal, token-efficient terminal coding harness"),
     ("aiagent",     "AIAgent (shell)",   "DSPy agent CLI — drops to bash; run `aiagent` yourself"),
 ]
 
@@ -3067,6 +3068,71 @@ def _write_opencode_providers(
     cfg_path.write_text(json.dumps(cfg, indent=2) + "\n")
 
 
+def _pi_models_path() -> Path:
+    return Path(os.environ.get("PI_CODING_AGENT_DIR")
+                or os.path.expanduser("~/.pi/agent")) / "models.json"
+
+
+def _write_pi_models(
+    vetted: dict[str, list[str]], backend: str, chosen: str, chosen_ctx: int,
+) -> None:
+    """Declare the vetted model list in Pi's models.json, replacing ours.
+
+    Same contract as `_write_opencode_providers`: the `router-*` providers
+    are rebuilt from _BACKENDS and the vetted set at every launch (the file
+    lives on the persistent home volume, so merging would keep a dropped
+    model selectable in `/model` forever), and everything else in the file
+    is preserved -- we own the `router-` prefix and nothing else.
+
+    Pi accepts an undeclared `--model` id with a warning, but only declared
+    ids appear in `/model` and Ctrl+P, and only a declared id carries a
+    `contextWindow`. Pi defaults that to 128K and auto-compacts at
+    `contextWindow - reserveTokens`, so a wrong window compacts too late
+    and the engine rejects the prompt first. vLLM/SGLang ids carry their
+    window as `@<ctx>`; the chosen model gets `chosen_ctx` (the tier the
+    picker resolved, as Claude Code and Codex are told); a bare Ollama id
+    other than the chosen one keeps Pi's default.
+    """
+    cfg_path = _pi_models_path()
+    try:
+        cfg = json.loads(cfg_path.read_text()) if cfg_path.exists() else {}
+    except (OSError, ValueError):
+        cfg = {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+
+    providers = cfg.get("providers")
+    if not isinstance(providers, dict):
+        providers = {}
+    providers = {k: v for k, v in providers.items() if not k.startswith("router-")}
+
+    for bname, (label, _reason, port) in _BACKENDS.items():
+        ids = list(vetted.get(bname) or [])
+        if bname == backend and chosen and chosen not in ids:
+            ids.append(chosen)
+        models = []
+        for i in ids:
+            entry: dict = {"id": i}
+            if bname == backend and i == chosen and chosen_ctx > 0:
+                entry["contextWindow"] = chosen_ctx
+            else:
+                _, _, tail = i.rpartition("@")
+                if tail.isdigit() and int(tail) > 0:
+                    entry["contextWindow"] = int(tail)
+            models.append(entry)
+        providers[f"router-{bname}"] = {
+            "name": f"{label} via DevAI router",
+            "baseUrl": f"http://{_ROUTER}:{port}/v1",
+            "api": "openai-completions",
+            "apiKey": "local",
+            "models": models,
+        }
+    cfg["providers"] = providers
+
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(json.dumps(cfg, indent=2) + "\n")
+
+
 # A TOML table header we own: `[model_providers.router-<anything>]`, bare,
 # "double"- or 'single'-quoted key, optional trailing comment. Sub-tables
 # of ours match too.
@@ -3268,6 +3334,23 @@ def _build(agent_id: str, model_name: str, backend: str) -> list[str]:
         # instead of being pinned to the one they picked at the menu.
         _write_opencode_providers(_vetted_catalog(), backend, name)
         return ["opencode", "-m", f"router-{backend}/{name}"]
+
+    if agent_id == "pi":
+        # Pi reads custom OpenAI-compatible providers from
+        # ~/.pi/agent/models.json (seeded by the entrypoint): one
+        # router-<backend> provider per router port, re-synced with the
+        # vetted set at every launch exactly as OpenCode's are, so `/model`
+        # and Ctrl+P switch across every backend. The chosen id MUST be
+        # declared (the writer guarantees it): `--model` is a pattern, and
+        # one that is not an exact declared id is fuzzy-matched with a
+        # trailing `:<level>` read as a thinking level -- measured on 0.87.1,
+        # `qwen3.5:high` silently became `qwen3.5:9b-q8_0`. An exact declared
+        # id is sent verbatim as the request's `model`, `::nothink` /
+        # `::mtp` / `@<ctx>` included, so the router's suffix parsing applies.
+        ctx = os.environ.get("CONTEXT", "")
+        _write_pi_models(_vetted_catalog(), backend, name,
+                         int(ctx) if ctx.isdigit() else 0)
+        return ["pi", "--provider", f"router-{backend}", "--model", name]
 
     if agent_id == "aiagent":
         # aiagent is a CLI the user drives herself, so we do NOT exec it.

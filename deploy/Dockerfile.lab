@@ -40,6 +40,11 @@ ENV OPENAI_API_KEY=local
 # this, opencode has only webfetch (specific URLs) and the model resorts to
 # guessing URLs. opencode reads this env var at startup.
 ENV OPENCODE_ENABLE_EXA=1
+# Pi: skip its startup network calls (pi.dev version check + model-catalog
+# refresh) -- the lab egresses only through pipelock and every model it uses
+# is a local router row declared in ~/.pi/agent/models.json. The same intent
+# as DISABLE_AUTOUPDATER above; `pi update` still works when run by hand.
+ENV PI_OFFLINE=1
 ENV UV_BREAK_SYSTEM_PACKAGES=1
 ENV PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1
 # Append (not prepend) ~/.local/bin: it lives on the persistent home volume, so
@@ -87,6 +92,12 @@ ARG BIN_HASH=unknown
 RUN echo "binary cache key: BIN_HASH=$BIN_HASH" \
     && cp /var/cache/bin/uv /var/cache/bin/uvx /var/cache/bin/claude /var/cache/bin/codex /var/cache/bin/opencode /var/cache/bin/ollama /usr/local/bin/ \
     && chmod +x /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/claude /usr/local/bin/codex /usr/local/bin/opencode /usr/local/bin/ollama
+
+# Install Pi (pre-downloaded). The binary resolves its sidecar assets relative
+# to its own real path, so the tree is copied whole and only the binary is
+# symlinked onto PATH.
+RUN cp -a /var/cache/bin/pi /usr/local/lib/pi \
+    && ln -s /usr/local/lib/pi/pi /usr/local/bin/pi
 
 # Install code-server (pre-downloaded)
 RUN cp -a /var/cache/bin/code-server /usr/local/lib/code-server \
@@ -247,6 +258,7 @@ RUN set -eu; \
 # Seed config files for coding agents (copied to $HOME by entrypoint if absent)
 COPY config/codex/config.toml /etc/devai/codex-config.toml
 COPY config/opencode/opencode.json /etc/devai/opencode.json
+COPY config/pi/models.json /etc/devai/pi-models.json
 
 # Copy entrypoint script
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh

@@ -302,6 +302,24 @@ fetch-cli: ## Download all external binaries and packages to local cache (uses E
 			&& rm -f $(CACHE_DIR)/pip/bin/opencode.tar.gz && STATE="updated"; fi \
 		&& VERSION=$$($(CACHE_DIR)/pip/bin/opencode --version 2>&1 | awk '{print $$1; exit}') \
 		&& echo "OpenCode: $$STATE ($$VERSION)"
+	@# Pi (earendil-works/pi, pi.dev): Bun-compiled binary that loads sidecar
+	@# assets (wasm, themes, export-html) from its own directory, so the whole
+	@# `pi/` tree is kept together and only the binary is symlinked onto PATH
+	@# (Dockerfile.lab). The asset name carries no version: latest/download works.
+	@ARCH=$$(dpkg --print-architecture) \
+		&& case "$$ARCH" in amd64) PI_ARCH=x64;; arm64) PI_ARCH=arm64;; esac \
+		&& HTTP_CODE=$$(curl -fsSL -w '%{http_code}' -o $(CACHE_DIR)/pip/bin/pi.tar.gz \
+			--etag-compare $(ETAG_DIR)/pi.etag --etag-save $(ETAG_DIR)/pi.etag \
+			"https://github.com/earendil-works/pi/releases/latest/download/pi-linux-$${PI_ARCH}.tar.gz") \
+		&& if [ "$$HTTP_CODE" = "304" ] || [ ! -s $(CACHE_DIR)/pip/bin/pi.tar.gz ]; then \
+			rm -f $(CACHE_DIR)/pip/bin/pi.tar.gz; STATE="up to date"; \
+		else \
+			rm -rf $(CACHE_DIR)/pip/bin/pi \
+			&& tar -xzf $(CACHE_DIR)/pip/bin/pi.tar.gz -C $(CACHE_DIR)/pip/bin pi \
+			&& chmod +x $(CACHE_DIR)/pip/bin/pi/pi \
+			&& rm -f $(CACHE_DIR)/pip/bin/pi.tar.gz && STATE="updated"; fi \
+		&& VERSION=$$(PI_OFFLINE=1 $(CACHE_DIR)/pip/bin/pi/pi --version </dev/null 2>&1 | awk '{print $$1; exit}') \
+		&& echo "Pi: $$STATE ($$VERSION)"
 	@ARCH=$$(dpkg --print-architecture) \
 		&& case "$$ARCH" in amd64) OL_ARCH=amd64;; arm64) OL_ARCH=arm64;; esac \
 		&& HTTP_CODE=$$(curl -fsSL -w '%{http_code}' -o $(CACHE_DIR)/pip/bin/ollama.tar.zst \

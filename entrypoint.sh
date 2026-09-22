@@ -100,6 +100,12 @@ if [ -f /etc/devai/opencode.json ] && [ ! -f "$HOME_DIR/.config/opencode/opencod
     cp /etc/devai/opencode.json "$HOME_DIR/.config/opencode/opencode.json"
 fi
 
+# Seed pi config if absent — never overwrite an existing one.
+if [ -f /etc/devai/pi-models.json ] && [ ! -f "$HOME_DIR/.pi/agent/models.json" ]; then
+    mkdir -p "$HOME_DIR/.pi/agent"
+    cp /etc/devai/pi-models.json "$HOME_DIR/.pi/agent/models.json"
+fi
+
 # Prepare the command
 CMD=("$@")
 

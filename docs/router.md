@@ -1,7 +1,7 @@
 # DevAI Router (`gpu-arbiter`)
 
 The router is the central component of the DevAI stack. Every model
-request from agents (Claude Code, Codex, OpenCode, Open WebUI, raw curl)
+request from agents (Claude Code, Codex, OpenCode, Pi, Open WebUI, raw curl)
 goes through it. The router is responsible for: which backend serves a
 model, which model is currently loaded in that backend, what context
 length and parser flags the backend was launched with, and how every
@@ -65,7 +65,7 @@ This document covers single mode, which is all of it.
 |   agents     |                         |        devai-router          |
 | (Claude Code,|                         |                              |
 |  OpenCode,   |  POST /v1/...           |  port 11434  -->  ollama     |
-|  Codex,      | ------------------>     |  port 11435  -->  vllm       |
+|  Codex, Pi,  | ------------------>     |  port 11435  -->  vllm       |
 |  Open WebUI, |                         |  port 11436  -->  sglang     |
 |  curl, ...)  |                         |                              |
 +--------------+                         |  GPU mutex * request rewrite |

@@ -110,7 +110,7 @@ found three more findings.
 | [router-anthropic-messages-compat](./router-anthropic-messages-compat.md) | **Done**      |
 | [router-shortcircuit](./router-shortcircuit.md)                     | Draft             |
 | [odysseus-borrowed-ideas](./odysseus-borrowed-ideas.md)             | Draft (partly frozen) |
-| [pi-coding-agent](./pi-coding-agent.md)                             | Draft             |
+| [pi-coding-agent](./pi-coding-agent.md)                             | **Done**          |
 | [router-fanout](./router-fanout.md)                                 | Draft             |
 | [sops-age-secrets](./sops-age-secrets.md)                           | Non-functional    |
 | [skypilot-agent-skill](./skypilot-agent-skill.md)                   | Frozen            |
@@ -454,8 +454,8 @@ frozen (see above), most of this list is free-floating by default rather than by
   Schedule Phase 1 any time; **Phases 2-3 are blocked indefinitely --
   their prerequisite is FROZEN**, so treat them as parked too rather
   than merely unscheduled.
-- pi-coding-agent (Draft) -- lab-image + picker change, no deps and no
-  dependents; same shape as skypilot-agent-skill. Ships at any point.
+- pi-coding-agent (Done, 2026-09-23) -- lab-image + picker change, no deps and no
+  dependents; wired the same way as OpenCode.
 - card-derived-hints-and-bench-sync (In Progress) -- host-side probe/bench
   tooling only; touches no router, no picker, no container topology. Its two
   prerequisites (bench-rewrite's v3 schema, model-lifecycle-ledger's

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # DevAI agent smoke-test matrix — ollama only.
 #
-# For each agent (claude, codex), fires a one-shot "say hi" prompt
+# For each agent (claude, codex, pi), fires a one-shot "say hi" prompt
 # at the router's ollama port and classifies the outcome.
 #
 # Outcomes:
@@ -129,6 +129,24 @@ run_codex() {
         "$PROMPT" >"$log" 2>&1
 }
 
+# Pi fuzzy-matches a --model that is not a declared id (see the picker's
+# _write_pi_models), so declare the model in a throwaway agent dir rather
+# than touching the user's ~/.pi/agent. stdin must be closed: `pi -p`
+# waits on it otherwise.
+run_pi() {
+    local model="$1" log="$2"
+    local dir
+    dir=$(mktemp -d)
+    printf '{"providers":{"router-ollama":{"baseUrl":"http://%s:%s/v1","api":"openai-completions","apiKey":"local","models":[{"id":"%s"}]}}}\n' \
+        "$ROUTER" "$PORT" "$model" >"$dir/models.json"
+    PI_CODING_AGENT_DIR="$dir" PI_OFFLINE=1 timeout "$CELL_TIMEOUT" \
+        pi --provider router-ollama --model "$model" --no-session \
+        -p "$PROMPT" </dev/null >"$log" 2>&1
+    local rc=$?
+    rm -rf "$dir"
+    return $rc
+}
+
 
 # ── Cell evaluator ──────────────────────────────────────────────────────────
 evaluate_cell() {
@@ -186,7 +204,7 @@ echo
 declare -i pass=0 fail=0 skip=0
 declare -A RESULT
 
-for agent in claude codex; do
+for agent in claude codex pi; do
     cell=$(evaluate_cell "$agent" "$MODEL")
     RESULT["$agent"]="$cell"
     status="${cell%%|*}"

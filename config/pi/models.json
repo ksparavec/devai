@@ -1,0 +1,32 @@
+{
+  "providers": {
+    "router-ollama": {
+      "name": "Ollama via DevAI router",
+      "baseUrl": "http://devai-router:11434/v1",
+      "api": "openai-completions",
+      "apiKey": "local",
+      "models": []
+    },
+    "router-vllm": {
+      "name": "vLLM via DevAI router",
+      "baseUrl": "http://devai-router:11435/v1",
+      "api": "openai-completions",
+      "apiKey": "local",
+      "models": []
+    },
+    "router-sglang": {
+      "name": "SGLang via DevAI router",
+      "baseUrl": "http://devai-router:11436/v1",
+      "api": "openai-completions",
+      "apiKey": "local",
+      "models": []
+    },
+    "router-vllm-devai": {
+      "name": "vLLM devai via DevAI router",
+      "baseUrl": "http://devai-router:11437/v1",
+      "api": "openai-completions",
+      "apiKey": "local",
+      "models": []
+    }
+  }
+}

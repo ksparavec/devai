@@ -6,7 +6,32 @@ _Bundle the pi coding agent (earendil-works/pi) into the lab image and wire it t
 
 ## Status
 
-Draft. Not yet scheduled for execution.
+**Done (2026-09-23).** Shipped as a single change, wired the same way as
+OpenCode rather than as drafted below. Where the implementation differs
+from this plan:
+
+- Four providers, not three: `router-vllm-devai` (port 11437) exists now.
+- The picker REPLACES the `router-*` providers from the vetted set at every
+  launch (`_write_pi_models`, the `_write_opencode_providers` contract)
+  instead of injecting only the chosen model; anything else in the file is
+  preserved.
+- Open question 1, measured on pi 0.87.1: pi does accept an undeclared
+  `--model` for a custom provider, but only with a warning, and it treats
+  the value as a PATTERN -- one that is not an exact declared id is
+  fuzzy-matched, with a trailing `:<level>` read as a thinking level
+  (`qwen3.5:high` became `qwen3.5:9b-q8_0`). So the chosen id is always
+  declared exactly. Declared ids (with `::nothink` / `::mtp` / `@<ctx>`)
+  are sent verbatim.
+- Every declared id carries a `contextWindow` where known (pi defaults to
+  128K and compacts against it).
+- Open question 2 sub-item: resolved. The binary finds its sidecar assets
+  through a symlink on PATH.
+- `ENV PI_OFFLINE=1` in the lab image skips pi's startup version check and
+  model-catalog refresh.
+- No separate doc; CLAUDE.md carries the wiring summary.
+- Verified end to end through the live router (vllm-devai, Qwen3.8-27B,
+  from the lab image on `devai-lab-egress`): a read-tool call and the final
+  answer, with the router applying its reasoning policy.
 
 ## Dependencies
 
