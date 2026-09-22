@@ -491,7 +491,10 @@ End-to-end smoke after Phase 5 lands:
 
 ```bash
 # Confirm picker shows accurate bench data at the user's ctx
-DEVAI_MTP_PREVIEW=0 devai-agent --model Qwen3.5-9B-NVFP4@32768 --show
+# (DEVAI_MTP_PREVIEW no longer exists -- the MTP UI is unconditional
+# since 2026-09-22; the flag used to be set to 0 here only to keep the
+# smoke identical to pre-MTP builds)
+devai-agent --model Qwen3.5-9B-NVFP4@32768 --show
 # Picker preview pane for Qwen3.5-9B-NVFP4@32K should report
 # either the 32K bench (after Phase 6) or "no bench at ctx=32768"
 # (before Phase 6).

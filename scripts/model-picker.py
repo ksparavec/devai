@@ -197,13 +197,15 @@ if not _CONTEXT_CHOICES:
 # defaults match select-models defaults.
 _VRAM_BUDGET = float(os.environ.get("VRAM", os.environ.get("GPU_MEMORY_GB", "24")))
 
-# DEVAI_MTP_PREVIEW gates the multi-token-prediction UI (MTP column,
-# post-select sub-modal, and `::mtp` suffix emission). Off by default so
-# the picker behaves identically to pre-MTP builds during the Phase-3
-# rollout; turned on alongside the router's parseMTPOverride wiring in
-# Phase 5. See docs/multi-token-prediction.md Sec. 7.2 + the catalog-
-# crystalline-beaver plan.
-_MTP_PREVIEW = os.environ.get("DEVAI_MTP_PREVIEW", "0").lower() in ("1", "true", "yes", "on")
+# The multi-token-prediction UI (MTP column, post-select ON/OFF sub-modal,
+# `::mtp` suffix emission) is unconditional. It used to sit behind a
+# DEVAI_MTP_PREVIEW env flag that defaulted to off and that nothing in the
+# repo ever set, "until the router's parseMTPOverride wiring lands" -- it
+# landed in 2026-05 and the flag stayed, so every MTP-capable row was
+# launched MTP-off from the picker with no hint the mode existed (37 vs 95
+# tok/s on Qwen3.8-27B-MTP-devai-NVFP4, 2026-09-22). Removed by operator
+# decision: a row the catalog declares `mtp:` for and the probe did not
+# record mtp_fits=false on always gets the column and the sub-modal.
 
 #                     label        reason                                              port
 _BACKENDS: dict[str, tuple[str, str, int]] = {
@@ -243,6 +245,12 @@ _PICKER_BACKENDS: tuple[str, ...] = ("ollama", "vllm", "vllm-devai", "sglang")
 _PICKER_HF_BACKENDS: tuple[str, ...] = tuple(
     b for b in _PICKER_BACKENDS if b != "ollama"
 )
+# Backend name -> engine. Curated `parsers:` blocks in the catalog are keyed
+# by engine (`vllm`, `sglang`): a parser is an engine plugin, and vllm-devai
+# runs vLLM's. Kept in sync with _probe_hf_common.engine_of / the router's
+# engineOf; duplicated here because this file must not import _probe_hf_common
+# (it runs bind-mounted inside older images).
+_ENGINE_OF: dict[str, str] = {"vllm-devai": "vllm"}
 
 #                  id             display name          description
 _AGENTS: list[tuple[str, str, str]] = [
@@ -962,10 +970,13 @@ def _resolve_tool_parser(probe: dict, catalog_parsers: dict, backend: str) -> st
         probed = probe.get("tool_parser")
         if probed:
             return str(probed)
-    backend_block = (catalog_parsers or {}).get(backend) or {}
-    curated = backend_block.get("tool")
-    if curated:
-        return str(curated)
+    # The block is keyed by engine; a block under the backend's own name
+    # wins so a build shipping a different plugin can be curated explicitly.
+    parsers = catalog_parsers or {}
+    for key in (backend, _ENGINE_OF.get(backend, backend)):
+        curated = (parsers.get(key) or {}).get("tool")
+        if curated:
+            return str(curated)
     return "N/A"
 
 
@@ -1590,11 +1601,7 @@ def _format_model_row(m: dict, idx: int = 0) -> str:
     backend_col = str(m.get("backend") or "?")
     fmt_col = str(details.get("quantization") or "?")
     type_col = "MoE" if _is_moe(m) else "Dense"
-    # MTP column is only rendered when the preview flag is on; until
-    # the router's parseMTPOverride wiring lands in Phase 5 the column
-    # would be informational-only and the sub-modal would have no
-    # downstream effect, so gate them together.
-    mtp_col = ("Yes" if _has_mtp(m) else "No") if _MTP_PREVIEW else ""
+    mtp_col = "Yes" if _has_mtp(m) else "No"
 
     # Bench columns: TPS, CODE% (HumanEval), CODE+% (HumanEval+), MMLU%,
     # GPQA%. Unbenched cells render '-' so they sort to the bottom but the
@@ -1619,7 +1626,7 @@ def _format_model_row(m: dict, idx: int = 0) -> str:
     # ``00.`` is a sentinel used only when the helper is invoked
     # outside ``_build_menu`` (e.g. unit-style tests).
     num_col = f"{idx:02d}."
-    mtp_segment = f"{mtp_col:>5s}  " if _MTP_PREVIEW else ""
+    mtp_segment = f"{mtp_col:>5s}  "
     return (
         f"{num_col:>3s}  "
         f"{ctx_str:>5s}  "
@@ -2863,7 +2870,7 @@ def _build_menu(
         current sort and in which direction."""
         return f"{label}{arrow}" if mode_key == sort_mode else label
 
-    mtp_header_segment = f"{'MTP':>5s}  " if _MTP_PREVIEW else ""
+    mtp_header_segment = f"{'MTP':>5s}  "
     column_header = (
         f"{'##':>3s}  "
         f"{_hdr('CTX', 'ctx'):>5s}  "
@@ -3372,7 +3379,7 @@ def _resolve_kv_tier(model: dict) -> tuple[int, bool] | None:
 
 def _resolve_agent(agent_filter: str | None, model: dict) -> tuple[str, str, str] | None:
     """Drive reasoning toggle (inline-reasoning only) → MTP toggle (when
-    catalog declares it AND DEVAI_MTP_PREVIEW is on) → agent picker.
+    the catalog declares it and the probe did not rule it out) → agent picker.
 
     The model details are shown live in the model-list preview pane, so
     there is no separate confirmation step here — Enter on the model row
@@ -3381,7 +3388,7 @@ def _resolve_agent(agent_filter: str | None, model: dict) -> tuple[str, str, str
     Returns (agent_id, reasoning_mode, mtp_mode) on launch, or None when
     the user pressed Esc and the caller should re-enter the model list.
     mtp_mode is "off" by default; "on" only when the sub-modal explicitly
-    enables it. Always "off" when DEVAI_MTP_PREVIEW is unset.
+    enables it.
     """
     reasoning_mode = "default"
     mtp_mode = "off"
@@ -3401,11 +3408,10 @@ def _resolve_agent(agent_filter: str | None, model: dict) -> tuple[str, str, str
         if idx == 1:
             reasoning_mode = "nothink"
 
-    # MTP sub-modal mirrors the reasoning one. Two gates: the env-flag
-    # rollout switch AND the catalog actually declaring an mtp: block
-    # for this row. Without the env flag we silently keep MTP off so
-    # the picker behaves identically to pre-MTP builds.
-    if _MTP_PREVIEW and _has_mtp(model):
+    # MTP sub-modal mirrors the reasoning one; offered whenever the
+    # catalog declares an mtp: block for this row and the probe did not
+    # record mtp_fits=false (see _has_mtp).
+    if _has_mtp(model):
         mtp = _mtp_block(model) or {}
         method = mtp.get("method", "?")
         k = mtp.get("num_speculative_tokens", "?")
@@ -3840,12 +3846,10 @@ def main() -> None:
         # policy=off (enable_thinking=false / per-backend disable shape).
         reasoning_suffix = "::nothink" if reasoning_mode == "nothink" else ""
         # `::mtp` rides on the model name when MTP is opted in via the
-        # sub-modal. Guarded by the same env flag that gates the column
-        # and the sub-modal -- never emitted until Phase-5 router wiring
-        # lands. Canonical emit order is `<name>::<reasoning>::<mtp>@<ctx>`
+        # sub-modal. Canonical emit order is `<name>::<reasoning>::<mtp>@<ctx>`
         # so the router's right-to-left parse chain (ctx -> mtp ->
         # reasoning) lines up cleanly.
-        mtp_suffix = "::mtp" if (_MTP_PREVIEW and mtp_mode == "on") else ""
+        mtp_suffix = "::mtp" if mtp_mode == "on" else ""
         serving_name = _serving_name(
             base_name, model["backend"], reasoning_suffix, mtp_suffix,
             selected_context, ctx_pinned,
