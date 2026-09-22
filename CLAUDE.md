@@ -42,6 +42,9 @@ make build-router    # Build gpu-arbiter router image
 make build-ollama    # Compile Ollama FROM SOURCE on the host, then build the slim devai-ollama image (= build-ollama-dist + build-ollama-image)
 make build-ollama-dist   # Host compile only (scripts/build-ollama.sh). OLLAMA_VERSION=vX.Y.Z picks the release. ~4 min on 24 cores.
 make build-ollama-image  # Image only, from an existing host build (16 s). Uses NO upstream Ollama image, not even as a build input.
+make build-vllm      # Compile vLLM 0.28.0 FROM SOURCE on the host with the HyperQwen patch series + devai's own applied, then build the slim devai-vllm image (= build-vllm-dist + build-vllm-image). ~21 min compile on 24 cores.
+make build-vllm-dist     # Host compile only (scripts/build-vllm.sh): sdist sha256-verified, 9 external kernel repos pre-fetched at their pinned revisions, 38 HyperQwen + 1 devai patch applied with --fuzz 0, sm120 only.
+make build-vllm-image    # Image only, from the wheelhouse: debian:trixie-slim + offline pip install + the host's nvcc (FlashInfer JIT-compiles at run time). Uses NO upstream vLLM image. ~9.8 GB vs 30 GB stock.
 make build           # Build all (CPU + GPU + router)
 
 # Run

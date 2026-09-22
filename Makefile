@@ -58,6 +58,11 @@ export GPU_MEMORY_GB MAX_CONTEXT_LEN
 VLLM_IMAGE ?= docker.io/vllm/vllm-openai:latest-x86_64-cu129-ubuntu2404
 export VLLM_IMAGE
 SGLANG_IMAGE ?= docker.io/lmsysorg/sglang:v0.5.16-cu130
+# The home-built, HyperQwen-patched vLLM 0.28.0 (make build-vllm). A docker.io
+# name so it can be pushed one day; today it exists only in the local image
+# store (never pulled: pull-images filters on `devai-`).
+VLLM_DEVAI_IMAGE ?= docker.io/devai/vllm-devai:latest
+VLLM_DEVAI_IMAGE_TAG ?= docker.io/devai/vllm-devai:v0.28.0-cu131-debian13-hq.c0c81bb
 export SGLANG_IMAGE
 # The Ollama image is BUILT HERE (`make build-ollama`), not pulled: Ollama
 # compiled from source on the host, on debian:trixie-slim, CUDA 13 for this
@@ -421,7 +426,11 @@ fetch-cli: ## Download all external binaries and packages to local cache (uses E
 
 # Base images used by build and infrastructure
 BASE_IMAGES = debian:trixie $(GPU_BASE_IMAGE)
-CACHE_IMAGES = $(shell $(COMPOSE) -f $(CACHE_COMPOSE) config --images 2>/dev/null | grep -v devai-)
+# Home-built images are excluded from pulls: `devai-` (localhost/devai-ollama,
+# devai-router) and `devai/` (docker.io/devai/vllm-devai, tagged with a
+# registry name but present only locally -- a pull would fail three times
+# and abort the target).
+CACHE_IMAGES = $(shell $(COMPOSE) -f $(CACHE_COMPOSE) config --images 2>/dev/null | grep -vE 'devai-|devai/')
 # Seconds between pull-images retry attempts (the attempt COUNT is fixed at 3).
 PULL_RETRY_DELAY ?= 5
 
@@ -1633,9 +1642,35 @@ build-ollama-image: ## Build the devai-ollama image (debian:trixie-slim + the ho
 	$(CONTAINER_RUNTIME) build --network=host \
 		$(PROXY_BUILD_ARGS) \
 		$(APT_PROXY_ARG) \
+		--build-arg DIST_ID=$$(cat $(OLLAMA_DIST)/bin/ollama $(OLLAMA_DIST)/lib/ollama/cuda_v13/libggml-cuda.so | sha256sum | cut -c1-16) \
 		-v $(OLLAMA_DIST):/var/cache/ollama-dist:ro \
 		-f deploy/Dockerfile.ollama \
 		-t devai-ollama .
+
+# Where scripts/build-vllm.sh leaves the wheelhouse. NOT under $(CACHE_DIR),
+# for the same reason as OLLAMA_DIST.
+VLLM_DIST ?= $(HOME)/.cache/devai/vllm-build/dist
+# The host CUDA toolkit vLLM was compiled with. Its nvcc, nvvm, headers and
+# libcudart are copied into the image: FlashInfer JIT-compiles attention
+# kernels at first use, so the RUNTIME image needs a CUDA compiler too.
+VLLM_CUDA_HOME ?= /usr/local/cuda-13.1
+
+build-vllm: build-vllm-dist build-vllm-image ## Compile vLLM from source on the host (HyperQwen patches applied), then build the devai-vllm image from it.
+
+build-vllm-dist: ## Compile vLLM FROM SOURCE on the host for this GPU only (compute capability 12.0) with the HyperQwen patch series applied --fuzz 0. LONG. Needs the CUDA 13 dev packages, uv and a rustup toolchain; see scripts/build-vllm.sh.
+	PATH="$(HOME)/.cargo/bin:$$PATH" bash scripts/build-vllm.sh
+
+build-vllm-image: ## Build the devai-vllm image (debian:trixie-slim + the host-compiled, patched vLLM, installed offline). No upstream vLLM image is used, not even as a build input.
+	@test -f $(VLLM_DIST)/PATCHES.applied || { echo "error: no build at $(VLLM_DIST) -- run 'make build-vllm-dist' first" >&2; exit 1; }
+	@test -x $(VLLM_CUDA_HOME)/bin/nvcc || { echo "error: no nvcc under $(VLLM_CUDA_HOME) (set VLLM_CUDA_HOME)" >&2; exit 1; }
+	$(CONTAINER_RUNTIME) build --network=host \
+		$(PROXY_BUILD_ARGS) \
+		$(APT_PROXY_ARG) \
+		--build-arg DIST_ID=$$(cat $(VLLM_DIST)/wheels/vllm-*.whl $(VLLM_DIST)/PATCHES.applied | sha256sum | cut -c1-16) \
+		-v $(VLLM_DIST):/var/cache/vllm-dist:ro \
+		-v $(VLLM_CUDA_HOME):/var/cache/cuda-toolkit:ro \
+		-f deploy/Dockerfile.vllm \
+		-t $(VLLM_DEVAI_IMAGE_TAG) -t $(VLLM_DEVAI_IMAGE) .
 
 INSTALL_PREFIX ?= $(HOME)/.local
 DEVAI_HOME ?= $(HOME)/.devai

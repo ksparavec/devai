@@ -1,0 +1,4 @@
+# devai's own vLLM patches, applied by scripts/build-vllm.sh AFTER the HyperQwen
+# series, in this order, with `patch -p1 --fuzz 0` from the vllm package
+# directory. One patch name per line; `#` starts a comment.
+qwen3_5-mtp-share-vocab-at-init.patch

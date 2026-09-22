@@ -39,7 +39,12 @@ RUN if [ -n "$APT_PROXY" ]; then echo "Acquire::http::Proxy \"$APT_PROXY\";" > /
 # `make build-ollama-image` (same convention as the lab image's CLI cache).
 # Fail the build, loudly, if it is absent or lacks its only GPU backend: an
 # image without one would start, fall back to CPU, and merely look "slow".
+# DIST_ID: content hash of the mounted build, passed by the Makefile. Without it
+# this layer is cached forever (podman does not look inside a bind mount), so
+# an upgraded Ollama build would silently leave the OLD binary in the image.
+ARG DIST_ID=unset
 RUN set -eu; \
+    echo "ollama build $DIST_ID"; \
     test -x /var/cache/ollama-dist/bin/ollama \
         || { echo "error: no bin/ollama in the mounted build -- run 'make build-ollama-dist' first" >&2; exit 1; }; \
     test -f /var/cache/ollama-dist/lib/ollama/cuda_v13/libggml-cuda.so \

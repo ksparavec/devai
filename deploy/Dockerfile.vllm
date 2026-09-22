@@ -1,0 +1,85 @@
+# devai-vllm: debian:trixie-slim + a vLLM COMPILED ON THE HOST for this
+# machine's GPU, with the HyperQwen patch series applied. Nothing from the
+# upstream vllm/vllm-openai image is used, not even as a build input
+# (operator decision 2026-09-20, same as deploy/Dockerfile.ollama).
+#
+# The wheelhouse is produced by scripts/build-vllm.sh (`make build-vllm-dist`)
+# and bind-mounted read-only at /var/cache/vllm-dist. The install below is
+# OFFLINE (`--no-index`): every wheel was fetched, with retries, on the host,
+# and the vLLM wheel among them is ours. The build FAILS if the wheelhouse is
+# absent, if it still carries a PyPI vLLM wheel, or if the installed package
+# lacks the HyperQwen patches -- an image without them starts fine and merely
+# behaves like stock vLLM.
+#
+# Runtime contract matches what gpu-arbiter's vllmEntrypoint launches:
+#   python3 -m vllm.entrypoints.openai.api_server --model /models/<name> ...
+# so `python3` on PATH must be the venv's. Select the image per model through
+# the `image` field in deploy/recovery-flags.json, or globally via VLLM_IMAGE.
+#
+# Compilers stay in the image on purpose, because vLLM compiles at RUN time:
+#   * Triton builds a small C launcher per kernel at first use (gcc, Python.h);
+#   * FlashInfer JIT-compiles its attention kernels with nvcc at first use.
+#     Measured 2026-09-21: without nvcc the engine loads the weights and then
+#     dies in KV-cache init with "Could not find nvcc and default
+#     cuda_home='/usr/local/cuda' doesn't exist" -- fp8 KV on this GPU selects
+#     the FLASHINFER backend, so this is the default path, not a corner case.
+# The CUDA compiler is NOT apt-installed here: the host's toolkit -- the very
+# one vLLM was compiled with -- is bind-mounted read-only at
+# /var/cache/cuda-toolkit and only nvcc, nvvm, the headers and libcudart are
+# copied in (~300 MB; the full toolkit with its static libraries is ~1.9 GB).
+ARG BASE_IMAGE=docker.io/library/debian:trixie-slim
+FROM ${BASE_IMAGE}
+
+ARG APT_PROXY
+RUN if [ -n "$APT_PROXY" ]; then echo "Acquire::http::Proxy \"$APT_PROXY\";" > /etc/apt/apt.conf.d/00cache; fi && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates python3 python3-venv python3-dev gcc g++ libc6-dev && \
+    rm -rf /var/lib/apt/lists/* /etc/apt/apt.conf.d/00cache
+
+# DIST_ID is a content hash of the mounted wheelhouse, passed by the Makefile.
+# Without it this layer is cached FOREVER: the instruction text never changes
+# and podman does not look inside a bind mount, so a rebuilt wheel was silently
+# ignored (2026-09-21: a rebuild with a new patch produced an image that still
+# held the old vLLM). Referencing the value below puts it in the cache key.
+ARG DIST_ID=unset
+RUN set -eu; \
+    echo "wheelhouse $DIST_ID"; \
+    D=/var/cache/vllm-dist; \
+    test -f "$D/requirements.txt" && test -f "$D/PATCHES.applied" \
+        || { echo "error: no wheelhouse mounted at $D -- run 'make build-vllm-dist' first" >&2; exit 1; }; \
+    n=$(ls "$D"/wheels/vllm-*.whl | wc -l); \
+    [ "$n" -eq 1 ] || { echo "error: expected exactly one vLLM wheel in $D/wheels, found $n" >&2; exit 1; }; \
+    case "$(ls "$D"/wheels/vllm-*.whl)" in \
+        *manylinux*) echo "error: the vLLM wheel in $D/wheels is the PyPI build, not the host-compiled one" >&2; exit 1;; \
+    esac; \
+    python3 -m venv /opt/vllm; \
+    /opt/vllm/bin/pip install --no-cache-dir --no-index --find-links "$D/wheels" \
+        -r "$D/requirements.txt"; \
+    install -m 0644 "$D/PATCHES.applied" "$D/BUILD_INFO" /opt/vllm/; \
+    SP=$(/opt/vllm/bin/python -c 'import vllm, os; print(os.path.dirname(vllm.__file__))' | tail -n1); \
+    grep -q draft_vocab_ids "$SP/model_executor/models/qwen3_5_mtp.py" \
+        || { echo "error: the installed vLLM lacks the HyperQwen patches" >&2; exit 1; }; \
+    ls "$SP"/_C*.so >/dev/null \
+        || { echo "error: the installed vLLM has no compiled _C extension" >&2; exit 1; }; \
+    /opt/vllm/bin/python -c 'import vllm; print("vllm", vllm.__version__)'
+
+RUN set -eu; \
+    T=/var/cache/cuda-toolkit; \
+    test -x "$T/bin/nvcc" && test -f "$T/include/cuda_runtime_api.h" \
+        || { echo "error: no CUDA toolkit mounted at $T (nvcc + headers) -- see 'make build-vllm-image'" >&2; exit 1; }; \
+    mkdir -p /usr/local/cuda/lib64; \
+    cp -aL "$T/bin" "$T/nvvm" "$T/include" /usr/local/cuda/; \
+    cp -a "$T"/lib64/libcudart.so* /usr/local/cuda/lib64/; \
+    /usr/local/cuda/bin/nvcc --version | tail -n 2
+
+ENV PATH=/opt/vllm/bin:/usr/local/cuda/bin:$PATH \
+    CUDA_HOME=/usr/local/cuda \
+    LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64 \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    NVIDIA_VISIBLE_DEVICES=all \
+    VLLM_NO_USAGE_STATS=1 \
+    DO_NOT_TRACK=1
+
+EXPOSE 11434
+ENTRYPOINT ["python3", "-m", "vllm.entrypoints.openai.api_server"]
