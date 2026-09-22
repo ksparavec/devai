@@ -1907,7 +1907,9 @@ bench-concurrency: ## Sweep concurrency x prefix-sharing for ONE model (MODEL=, 
 			--mode $(or $(MODE),sweep) \
 			$(if $(LEVELS),--levels $(LEVELS),) \
 			$(if $(TURNS),--turns $(TURNS),) \
-			$(if $(PREFIX_TOKENS),--prefix-tokens $(PREFIX_TOKENS),)
+			$(if $(PREFIX_TOKENS),--prefix-tokens $(PREFIX_TOKENS),) \
+			$(if $(GROWTH_TOKENS),--growth-tokens $(GROWTH_TOKENS),) \
+			$(if $(MAX_TOKENS),--max-tokens $(MAX_TOKENS),)
 
 bench-report: ## Print a Markdown leaderboard from .bench-cache.json
 	@$(CONTAINER_RUNTIME) run --rm \
