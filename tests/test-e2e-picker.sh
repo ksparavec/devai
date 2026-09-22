@@ -15,12 +15,11 @@
 #   1. Import model-picker.py, run _discover_models() and _build_menu()
 #      against the live caches — this is what the picker does at startup.
 #   2. Pick the first selectable HF entry from the menu (vLLM or SGLang).
-#   3. Construct the same command the picker would hand the user via
-#      _build("aider", serving_name, backend), where serving_name carries
-#      the @<ctx> override (the per-session ctx-binding).
+#   3. Take the serving name the picker would hand the agent CLI, which
+#      carries the @<ctx> override (the per-session ctx-binding).
 #   4. Replay that exact request against the router's published port,
-#      mimicking what the agent CLI would send (OpenAI /v1/chat/completions
-#      shape because aider uses it for HF backends).
+#      mimicking what an OpenAI-compatible agent CLI (Codex, OpenCode)
+#      sends: /v1/chat/completions with model=<name>@<ctx>.
 #   5. Assert the router parses the @<ctx> override (currentContext path
 #      from Phase 0), recreates the backend container, and returns a
 #      well-formed chat response.
@@ -141,13 +140,11 @@ info ""
 info "  serving name (with @ctx override): $SERVING_NAME"
 info "  this is what the picker hands to the agent CLI verbatim"
 
-# ── Step 4+5: replay an aider-style request to the router ───────────────────
+# ── Step 4+5: replay an agent-style request to the router ───────────────────
 #
-# aider for HF backends sends OpenAI /v1/chat/completions with model=
-# openai/<name>@<ctx>. The router strips the openai/ prefix? No — that's
-# a litellm-side prefix that aider strips before sending. So the wire
-# request to the router has model=<name>@<ctx>. This is exactly what
-# the picker's _build("aider", serving_name, backend) constructs.
+# OpenAI-compatible agents (Codex, OpenCode) send /v1/chat/completions
+# with model=<name>@<ctx> on the wire -- exactly the serving name the
+# picker constructs.
 
 info ""
 info "=== Sending chat completion via $PICKED_BACKEND port $ROUTER_PORT ==="

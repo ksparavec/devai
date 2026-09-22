@@ -79,7 +79,6 @@ Examples:
 
 - Open Interpreter may use Ollama native or OpenAI-compatible requests,
   depending on invocation.
-- Aider usually uses OpenAI-compatible chat completions for non-native setups.
 - Codex uses OpenAI-compatible chat or responses semantics depending on its
   configured provider.
 - Claude Code uses Ollama's Anthropic-compatible messages endpoint.

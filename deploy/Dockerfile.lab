@@ -122,12 +122,6 @@ RUN --mount=type=bind,source=.,target=/src \
     fi
 
 
-# Install Aider in isolated venv. Python 3.13 dropped stdlib `audioop`,
-# which pydub (transitively imported by aider.voice) needs — pull
-# `audioop-lts` into the same venv so `import aider` doesn't crash.
-RUN UV_TOOL_BIN_DIR=/usr/local/bin uv tool install aider-chat \
-    --with audioop-lts
-
 # Install SkyPilot CLI (per docs/plans/skypilot-agent-skill.md).
 # Wheels pre-fetched by `make fetch-cli` into
 # /var/cache/devai/pip/wheels/skypilot/ and bind-mounted at build time
@@ -187,7 +181,6 @@ COPY packages/jupyter-ai-launchers/jupyter_ai_launchers/labextension /usr/local/
 
 # Install wrapper scripts for JupyterLab launchers and shell picker
 COPY scripts/ollama-chat.sh /usr/local/bin/ollama-chat
-COPY scripts/aider-launcher.sh /usr/local/bin/aider-launcher
 # aiagent shell launcher: the picker's "AIAgent (shell)" agent configures the
 # router endpoint + model, then execs this to drop the user into an interactive
 # bash shell where they run `aiagent ...` themselves. See scripts/aiagent-launcher.sh.
@@ -212,7 +205,7 @@ COPY scripts/_capability.py /usr/local/bin/_capability.py
 COPY scripts/_model_status.py /usr/local/bin/_model_status.py
 COPY scripts/vram-fit.py /usr/local/bin/vram-fit.py
 COPY deploy/models.yaml /etc/devai/models.yaml
-RUN chmod +x /usr/local/bin/ollama-chat /usr/local/bin/aider-launcher /usr/local/bin/aiagent-shell /usr/local/bin/agent-picker /usr/local/bin/model-picker /usr/local/bin/sky-setup.sh
+RUN chmod +x /usr/local/bin/ollama-chat /usr/local/bin/aiagent-shell /usr/local/bin/agent-picker /usr/local/bin/model-picker /usr/local/bin/sky-setup.sh
 
 # Name the GPU 'render' group in /etc/group. On the host, /dev/dri/renderD* is
 # owned by group `render` (GID 992 here); `--device nvidia.com/gpu=all` (NVIDIA

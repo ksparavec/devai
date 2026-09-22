@@ -3,7 +3,7 @@
 This page documents what is *actually on the wire* when an agent talks
 to vLLM, SGLang, Ollama, or any other server claiming OpenAI
 compatibility. Everything in this project's router code, bench
-harness, agent integrations (Claude Code, Aider, Codex, Open WebUI),
+harness, agent integrations (Claude Code, Codex, OpenCode, Open WebUI),
 and probe drivers ultimately speaks this protocol.
 
 If you can read JSON and you have ever sent an HTTP POST, you have

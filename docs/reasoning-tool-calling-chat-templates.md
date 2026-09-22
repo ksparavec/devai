@@ -183,7 +183,7 @@ decides to call a tool. The response comes back to the client as:
 }]
 ```
 
-The client (an agent like Claude Code or Aider) executes the actual
+The client (an agent like Claude Code or Codex) executes the actual
 function, then sends the result back as a new message:
 
 ```json

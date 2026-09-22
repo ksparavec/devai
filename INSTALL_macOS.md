@@ -53,7 +53,7 @@ supported but degraded -- see section 2.2) with sudo and produce:
   using unified memory directly.
 - A `podman machine` Linux VM hosting the **devai lab container** and
   optionally the **devai-router**.
-- Lab container's AI CLIs (Claude Code, Codex, Gemini, Aider, etc.)
+- Lab container's AI CLIs (Claude Code, Codex, Gemini, OpenCode, etc.)
   configured to reach host-side Ollama via `host.containers.internal`.
 - A `devai-agent` host launcher on `PATH`.
 - Optional: **MLX-LM** as a second native inference server for users

@@ -24,14 +24,6 @@ const geminiSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
   <path fill="#4285F4" d="M11.04 19.32Q12 21.51 12 24q0-2.49.93-4.68.96-2.19 2.58-3.81t3.81-2.55Q21.51 12 24 12q-2.49 0-4.68-.93a12.3 12.3 0 0 1-3.81-2.58 12.3 12.3 0 0 1-2.58-3.81Q12 2.49 12 0q0 2.49-.96 4.68-.93 2.19-2.55 3.81a12.3 12.3 0 0 1-3.81 2.58Q2.49 12 0 12q2.49 0 4.68.96 2.19.93 3.81 2.55t2.55 3.81"/>
 </svg>`;
 
-// Aider logo (green terminal cursor on dark background)
-const aiderSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
-  <rect x="2" y="3" width="20" height="18" rx="3" fill="#14532d"/>
-  <path d="M7 8l3 4-3 4" stroke="#4ade80" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
-  <line x1="12" y1="16" x2="17" y2="16" stroke="#4ade80" stroke-width="2" stroke-linecap="round"/>
-  <text x="13" y="11" font-family="monospace" font-size="5" fill="#4ade80">AI</text>
-</svg>`;
-
 // OpenCode terminal block (no official SVG available)
 const opencodeSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
   <rect x="2" y="3" width="20" height="18" rx="3" fill="#1f1f1f"/>
@@ -55,7 +47,6 @@ const TOOLS: Tool[] = [
   { id: 'claude', name: 'Claude', svg: claudeSvg, command: 'model-picker --agent claude' },
   { id: 'codex', name: 'Codex', svg: codexSvg, command: 'model-picker --agent codex' },
   { id: 'opencode', name: 'OpenCode', svg: opencodeSvg, command: 'model-picker --agent opencode' },
-  { id: 'aider', name: 'Aider', svg: aiderSvg, command: 'model-picker --agent aider' },
   { id: 'gemini', name: 'Gemini', svg: geminiSvg, command: 'gemini' },
   { id: 'ollama', name: 'Ollama', svg: ollamaSvg, command: 'model-picker --agent interpreter' }
 ];

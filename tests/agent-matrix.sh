@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # DevAI agent smoke-test matrix — ollama only.
 #
-# For each agent (claude, aider, codex), fires a one-shot "say hi" prompt
+# For each agent (claude, codex), fires a one-shot "say hi" prompt
 # at the router's ollama port and classifies the outcome.
 #
 # Outcomes:
@@ -120,15 +120,6 @@ run_claude() {
         claude -p "$PROMPT" --model "$model" >"$log" 2>&1
 }
 
-run_aider() {
-    local model="$1" log="$2"
-    OLLAMA_API_BASE="http://$ROUTER:$PORT" \
-        timeout "$CELL_TIMEOUT" aider \
-            --model "ollama_chat/$model" --no-stream --no-git \
-            --yes-always --no-auto-commits --no-show-model-warnings \
-            --message "$PROMPT" >"$log" 2>&1
-}
-
 run_codex() {
     local model="$1" log="$2"
     timeout "$CELL_TIMEOUT" codex exec \
@@ -195,7 +186,7 @@ echo
 declare -i pass=0 fail=0 skip=0
 declare -A RESULT
 
-for agent in claude aider codex; do
+for agent in claude codex; do
     cell=$(evaluate_cell "$agent" "$MODEL")
     RESULT["$agent"]="$cell"
     status="${cell%%|*}"

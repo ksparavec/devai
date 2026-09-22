@@ -123,7 +123,6 @@ CONTAINER_USER = "devai"
 AGENT_SESSION_SUFFIX = {
     "claude": ".jsonl",
     "codex":  ".jsonl",
-    "aider":  ".chat",
 }
 
 
