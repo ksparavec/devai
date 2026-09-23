@@ -102,16 +102,26 @@ cutlass kernels that are JIT-compiled and autotuned the first time the
 runtime encounters a given `(GPU SM, kernel, shape)` triple. vLLM and
 SGLang write the resulting binaries to `~/.cache/{vllm,sglang}/` inside
 the container, and FlashInfer its nvcc-built attention kernels to
-`~/.cache/flashinfer/<version>/`. Since 2026-09-22 those directories ARE
-persisted: the router mounts one podman named volume per cache and
-backend (`devai-engine-cache-<backend>-{flashinfer,vllm|sglang}`, see
-`gpu-arbiter/engine_cache.go`), and the probers mount the same ones, so
-a recreate (stop + rm + create on every model/ctx switch) no longer
-re-pays the compile. Before that, nothing under `~/.cache` was bound and
-every cold start paid it in full. Measured on Qwen3.8-27B-MTP-devai-NVFP4
-at 118784 ctx on vllm-devai that day: 275 s with empty volumes, 51 s once
-they were warm (28 MB of FlashInfer kernels, 188 MB of torch.compile
-artifacts). The earlier worry
+`~/.cache/flashinfer/<version>/`. Since 2026-09-22 FlashInfer's directory
+(and SGLang's own) IS persisted: the router mounts one podman named volume
+per cache and backend (`devai-engine-cache-<backend>-flashinfer`, plus
+`-sglang` for SGLang; see `gpu-arbiter/engine_cache.go`), and the probers
+mount the same ones, so a recreate (stop + rm + create on every model/ctx
+switch) no longer re-pays the FlashInfer JIT. Before that, nothing under
+`~/.cache` was bound and every cold start paid it in full. Measured on
+Qwen3.8-27B-MTP-devai-NVFP4 at 118784 ctx on vllm-devai: 275 s with empty
+volumes, 51 s with both caches warm (2026-09-22), about 98 s with
+FlashInfer warm and torch.compile cold (2026-09-23).
+
+vLLM's own torch.compile cache (`~/.cache/vllm`) was persisted for one
+day and is not any more. When vLLM loads EVERY compiled graph from it
+(compilation about 0.5 s instead of about 40 s), the startup profiling run
+under-measures peak activation -- 0.76 GiB instead of 1.7 GiB on the
+27B -- and the KV pool is sized from that: 145K tokens instead of 118K
+on vllm-devai, 586K instead of 492K for Qwen3.5-9B on stock vLLM. The
+first prompt that needs the real activation then OOM-kills the engine
+(1.5K tokens on the 27B, 29K on the 9B, measured 2026-09-23); the same
+load passes on a cold compile. The earlier worry
 that a persisted cache is fragile across image bumps does not hold:
 FlashInfer namespaces its cache by version and vLLM keys torch.compile
 entries by hash, so a stale entry is unused rather than wrong; it merely

@@ -1702,10 +1702,20 @@ func TestBuildContainerSpecGPUDevice(t *testing.T) {
 func TestBuildContainerSpec_HFEnginesPersistTheirCaches(t *testing.T) {
 	// Every recreate used to re-pay FlashInfer JIT + torch.compile: 269 s
 	// measured for Qwen3.8-27B-MTP-devai-NVFP4 on vllm-devai, 2026-09-22.
+	// vLLM's own cache (torch.compile) is deliberately NOT persisted: a
+	// full cache hit under-measures peak activation at startup, the KV pool
+	// is oversized and the first real request OOMs (see engine_cache.go).
 	for _, tc := range []struct {
 		backend string
-		engine  string
-	}{{"vllm", "vllm"}, {"vllm-devai", "vllm"}, {"sglang", "sglang"}} {
+		want    map[string]string
+	}{
+		{"vllm", map[string]string{"devai-engine-cache-vllm-flashinfer": "/root/.cache/flashinfer"}},
+		{"vllm-devai", map[string]string{"devai-engine-cache-vllm-devai-flashinfer": "/root/.cache/flashinfer"}},
+		{"sglang", map[string]string{
+			"devai-engine-cache-sglang-flashinfer": "/root/.cache/flashinfer",
+			"devai-engine-cache-sglang-sglang":     "/root/.cache/sglang",
+		}},
+	} {
 		cfg := backendConfig{
 			Name: tc.backend, ContainerName: "devai-" + tc.backend, Image: "img",
 			ModelsDir:  "/var/cache/devai/" + tc.backend,
@@ -1713,14 +1723,17 @@ func TestBuildContainerSpec_HFEnginesPersistTheirCaches(t *testing.T) {
 		}
 		spec := buildContainerSpec(cfg, "m", launchConfig{MaxContext: 32768}, nil, nil)
 		vols, ok := spec["volumes"].([]map[string]any)
-		if !ok || len(vols) != 2 {
-			t.Fatalf("%s: want 2 named volumes, got %#v", tc.backend, spec["volumes"])
+		if !ok || len(vols) != len(tc.want) {
+			t.Fatalf("%s: want %d named volumes, got %#v", tc.backend, len(tc.want), spec["volumes"])
 		}
-		want := map[string]string{
-			"devai-engine-cache-" + tc.backend + "-flashinfer":   "/root/.cache/flashinfer",
-			"devai-engine-cache-" + tc.backend + "-" + tc.engine: "/root/.cache/" + tc.engine,
+		want := map[string]string{}
+		for k, v := range tc.want {
+			want[k] = v
 		}
 		for _, v := range vols {
+			if v["Dest"] == "/root/.cache/vllm" {
+				t.Errorf("%s: vLLM's torch.compile cache must not be persisted: %v", tc.backend, v)
+			}
 			name, _ := v["Name"].(string)
 			if dest, ok := want[name]; !ok || v["Dest"] != dest {
 				t.Errorf("%s: unexpected volume %v", tc.backend, v)

@@ -676,7 +676,12 @@ def container_state(runtime: str, name: str) -> str:
 # Narrow on purpose -- the SGLang image carries 877 MB of HF cache under
 # /root/.cache, which podman would copy into an empty whole-directory
 # volume on first use. Keyed by BACKEND so the stock and custom vLLM
-# images never share one. Pinned to the Go side by
+# images never share one. vLLM's own cache (torch.compile) is NOT
+# persisted, only FlashInfer's: a full cache hit under-measures peak
+# activation at startup, the KV pool comes out oversized and the first
+# real prompt OOMs (measured 2026-09-23; see gpu-arbiter/engine_cache.go).
+# A probe measured against that oversized pool would record a fit the
+# engine cannot serve. Pinned to the Go side by
 # tests/python/test_engine_cache_volumes.py.
 ENGINE_CACHE_VOLUME_PREFIX = "devai-engine-cache-"
 
@@ -686,10 +691,10 @@ def engine_cache_volumes(backend: str) -> list[tuple[str, str]]:
     engine = engine_of(backend)
     if engine not in ("vllm", "sglang"):
         return []
-    return [
-        (f"{ENGINE_CACHE_VOLUME_PREFIX}{backend}-flashinfer", "/root/.cache/flashinfer"),
-        (f"{ENGINE_CACHE_VOLUME_PREFIX}{backend}-{engine}", f"/root/.cache/{engine}"),
-    ]
+    vols = [(f"{ENGINE_CACHE_VOLUME_PREFIX}{backend}-flashinfer", "/root/.cache/flashinfer")]
+    if engine == "sglang":
+        vols.append((f"{ENGINE_CACHE_VOLUME_PREFIX}{backend}-{engine}", f"/root/.cache/{engine}"))
+    return vols
 
 
 def container_run_args(

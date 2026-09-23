@@ -26,6 +26,20 @@ package main
 // image bump, `podman volume rm devai-engine-cache-<backend>-*` reclaims
 // the old entries (nothing depends on them being gone).
 //
+// vLLM's OWN cache (torch.compile, ~/.cache/vllm) is NOT persisted, only
+// FlashInfer's. Measured 2026-09-23 on both vLLM backends: once vLLM loads
+// every compiled graph from the cache (compilation ~0.5 s instead of
+// ~40 s), its startup profiling run under-measures peak activation --
+// 0.76 GiB instead of 1.7 GiB for Qwen3.8-27B-MTP-devai-NVFP4 on
+// vllm-devai -- and sizes the KV pool from that: 145K tokens instead of
+// 118K there, 586K instead of 492K for Qwen3.5-9B on stock vLLM. The
+// first prompt big enough to need the real activation (1.5K tokens on the
+// 27B, 29K on the 9B) then OOM-kills the engine. The same load passes on
+// a cold compile, and a warm FlashInfer cache alone leaves the profile
+// unchanged, so FlashInfer stays and vLLM's cache goes: a cold start pays
+// torch.compile again (~26 s for the 9B, ~41 s for the 27B) but not the
+// FlashInfer JIT. SGLang keeps both; nothing showed it affected.
+//
 // The prober launches the same images through `podman run` and mounts the
 // same volumes (scripts/_probe_hf_common.py, engine_cache_volumes), so a
 // probe warms the cache a serve-time launch then reuses. The name format
@@ -40,15 +54,21 @@ func engineCacheVolumeName(backend, cache string) string {
 }
 
 // engineCacheVolumes returns the libpod NamedVolume specs for an HF
-// backend: FlashInfer's cache and the engine's own. Ollama has none of
-// these (GGUF, no JIT) and its model store is already a rw bind.
+// backend: FlashInfer's cache, plus the engine's own for SGLang only (see
+// above for why vLLM's is left out). Ollama has none of these (GGUF, no
+// JIT) and its model store is already a rw bind.
 func engineCacheVolumes(backend string) []map[string]any {
 	engine := engineOf(backend)
 	if engine != "vllm" && engine != "sglang" {
 		return nil
 	}
-	return []map[string]any{
+	vols := []map[string]any{
 		{"Name": engineCacheVolumeName(backend, "flashinfer"), "Dest": "/root/.cache/flashinfer"},
-		{"Name": engineCacheVolumeName(backend, engine), "Dest": "/root/.cache/" + engine},
 	}
+	if engine != "sglang" {
+		return vols
+	}
+	return append(vols, map[string]any{
+		"Name": engineCacheVolumeName(backend, engine), "Dest": "/root/.cache/" + engine,
+	})
 }

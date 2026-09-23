@@ -35,16 +35,25 @@ GO_MAIN = (REPO_ROOT / "gpu-arbiter" / "main.go").read_text()
 
 class EngineCacheVolumesTest(unittest.TestCase):
     def test_hf_backends_get_flashinfer_and_engine_volumes(self) -> None:
-        self.assertEqual(hf.engine_cache_volumes("vllm-devai"), [
-            ("devai-engine-cache-vllm-devai-flashinfer", "/root/.cache/flashinfer"),
-            ("devai-engine-cache-vllm-devai-vllm", "/root/.cache/vllm"),
-        ])
         self.assertEqual(hf.engine_cache_volumes("sglang"), [
             ("devai-engine-cache-sglang-flashinfer", "/root/.cache/flashinfer"),
             ("devai-engine-cache-sglang-sglang", "/root/.cache/sglang"),
         ])
-        self.assertEqual(hf.engine_cache_volumes("vllm")[1],
-                         ("devai-engine-cache-vllm-vllm", "/root/.cache/vllm"))
+
+    def test_vllm_compile_cache_is_not_persisted(self) -> None:
+        """A full torch.compile cache hit under-measures peak activation.
+
+        Measured 2026-09-23 on both vLLM backends: a fully cached launch
+        profiled 0.76 GiB peak activation instead of 1.7 GiB (vllm-devai,
+        Qwen3.8-27B) and sized the KV pool 19-23% larger, and the first
+        prompt of 1.5K (27B) / 29K (9B) tokens OOM-killed the engine; the
+        same load passed on a cold compile. FlashInfer's kernel cache alone
+        does not change the profile.
+        """
+        for backend in ("vllm", "vllm-devai"):
+            self.assertEqual(hf.engine_cache_volumes(backend), [
+                (f"devai-engine-cache-{backend}-flashinfer", "/root/.cache/flashinfer"),
+            ])
 
     def test_ollama_gets_none(self) -> None:
         self.assertEqual(hf.engine_cache_volumes("ollama"), [])
@@ -83,6 +92,7 @@ class EngineCacheVolumesTest(unittest.TestCase):
         self.assertEqual(m.group(1), hf.ENGINE_CACHE_VOLUME_PREFIX)
         self.assertIn('"Dest": "/root/.cache/flashinfer"', GO_SRC)
         self.assertIn('"Dest": "/root/.cache/" + engine', GO_SRC)
+        self.assertIn('engine != "sglang"', GO_SRC)
         self.assertIn('backend + "-" + cache', GO_SRC)
         self.assertRegex(GO_MAIN, r'"volumes":\s+engineCacheVolumes\(cfg\.Name\)')
 
