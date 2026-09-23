@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # DevAI agent smoke-test matrix — ollama only.
 #
-# For each agent (claude, codex, pi), fires a one-shot "say hi" prompt
+# For each agent (claude, codex, pi, dsh), fires a one-shot "say hi" prompt
 # at the router's ollama port and classifies the outcome.
 #
 # Outcomes:
@@ -148,6 +148,33 @@ run_pi() {
 }
 
 
+# DeepSeek Harness has no terminal UI (the picker serves its web UI), but its
+# one-shot `headless` profile exercises the same provider config. Throwaway
+# DSH_HOME, never the user's ~/.dsh.
+run_dsh() {
+    local model="$1" log="$2"
+    local home
+    home=$(mktemp -d)
+    DSH_HOME="$home" dsh --profile headless --dump-config >/dev/null 2>&1 || { rm -rf "$home"; return 1; }
+    cat >"$home/profiles/headless/cordis.patch.yml" <<EOF
+- id: llm-pi-ai
+  config:
+    providers:
+      router-ollama:
+        api: openai-completions
+        baseURL: http://$ROUTER:$PORT/v1
+        apiKeyEnv: DEVAI_ROUTER_API_KEY
+        models:
+          - id: "$model"
+EOF
+    printf 'agent-default-model:\n  provider: router-ollama\n  model: "%s"\n' "$model" >"$home/settings.yaml"
+    DSH_HOME="$home" DEVAI_ROUTER_API_KEY=local timeout "$CELL_TIMEOUT" \
+        dsh --profile headless --patch /etc/devai/dsh-overlay.yml "$PROMPT" </dev/null >"$log" 2>&1
+    local rc=$?
+    rm -rf "$home"
+    return $rc
+}
+
 # ── Cell evaluator ──────────────────────────────────────────────────────────
 evaluate_cell() {
     local agent="$1" model="$2"
@@ -204,7 +231,7 @@ echo
 declare -i pass=0 fail=0 skip=0
 declare -A RESULT
 
-for agent in claude codex pi; do
+for agent in claude codex pi dsh; do
     cell=$(evaluate_cell "$agent" "$MODEL")
     RESULT["$agent"]="$cell"
     status="${cell%%|*}"

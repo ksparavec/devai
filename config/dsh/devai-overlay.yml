@@ -1,0 +1,27 @@
+# devai's patch layer for DeepSeek Harness, applied last via
+# `dsh --profile web --patch /etc/devai/dsh-overlay.yml` (scripts/dsh-web-launcher.sh).
+# Only entries the Settings UI never writes live here: a patch REPLACES an
+# entry's whole config, so the router providers go into the profile's own
+# cordis.patch.yml instead (model-picker.py, _write_dsh_config), where the
+# Models page keeps working. Shipped at /etc/devai/dsh-overlay.yml.
+
+# No session upload to DeepSeek: the OpenTelemetry exporter
+# (harness-telemetry.deepseeksvc.com) and the contributor that attaches
+# session logs to DeepSeek-model requests. The lab also sets
+# DSH_TELEMETRY_MODE=DISABLED.
+- id: session-telemetry-otel
+  disabled: true
+- id: session-log-deepseek
+  disabled: true
+
+# Bind every interface of the container so the published DSH_PORT reaches it.
+# `--host 0.0.0.0` is refused by the CLI, the config schema accepts it; only
+# the published port is exposed, and every request still needs the token.
+# The other keys restate upstream's defaults, because this replaces the entry.
+- id: webserver
+  config:
+    host: 0.0.0.0
+    port: 3080
+    compression: gzip
+    compressionLevel: 1
+    compressionThresholdBytes: 1024

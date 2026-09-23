@@ -45,6 +45,11 @@ ENV OPENCODE_ENABLE_EXA=1
 # is a local router row declared in ~/.pi/agent/models.json. The same intent
 # as DISABLE_AUTOUPDATER above; `pi update` still works when run by hand.
 ENV PI_OFFLINE=1
+# DeepSeek Harness: no OpenTelemetry session upload. The devai overlay
+# (config/dsh/devai-overlay.yml) also disables that plugin and the DeepSeek
+# session-log contributor outright; this covers a dsh started by hand
+# without the overlay.
+ENV DSH_TELEMETRY_MODE=DISABLED
 ENV UV_BREAK_SYSTEM_PACKAGES=1
 ENV PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1
 # Append (not prepend) ~/.local/bin: it lives on the persistent home volume, so
@@ -101,6 +106,12 @@ RUN echo "binary cache key: BIN_HASH=$BIN_HASH" \
 # symlinked onto PATH.
 RUN cp -a /var/cache/bin/pi /usr/local/lib/pi \
     && ln -s /usr/local/lib/pi/pi /usr/local/bin/pi
+
+# Install DeepSeek Harness (pre-installed by `make fetch-cli` into an npm
+# prefix). Node resolves the symlinked entry point to its real path, so the
+# package's own node_modules stay in reach.
+RUN cp -a /var/cache/bin/dsh /usr/local/lib/dsh \
+    && ln -s /usr/local/lib/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js /usr/local/bin/dsh
 
 # Install code-server (pre-downloaded)
 RUN cp -a /var/cache/bin/code-server /usr/local/lib/code-server \
@@ -198,6 +209,9 @@ COPY packages/jupyter-ai-launchers/jupyter_ai_launchers/labextension /usr/local/
 # router endpoint + model, then execs this to drop the user into an interactive
 # bash shell where they run `aiagent ...` themselves. See scripts/aiagent-launcher.sh.
 COPY scripts/aiagent-launcher.sh /usr/local/bin/aiagent-shell
+# DeepSeek Harness web launcher: the picker's "dsh" agent writes the router
+# providers + default model, then execs this to serve the web UI on DSH_PORT.
+COPY scripts/dsh-web-launcher.sh /usr/local/bin/dsh-web
 COPY scripts/agent-picker.sh /usr/local/bin/agent-picker
 COPY scripts/model-picker.py /usr/local/bin/model-picker
 # SkyPilot first-launch helper. docs/skypilot-user-guide.md instructs the
@@ -218,7 +232,7 @@ COPY scripts/_capability.py /usr/local/bin/_capability.py
 COPY scripts/_model_status.py /usr/local/bin/_model_status.py
 COPY scripts/vram-fit.py /usr/local/bin/vram-fit.py
 COPY deploy/models.yaml /etc/devai/models.yaml
-RUN chmod +x /usr/local/bin/aiagent-shell /usr/local/bin/agent-picker /usr/local/bin/model-picker /usr/local/bin/sky-setup.sh
+RUN chmod +x /usr/local/bin/aiagent-shell /usr/local/bin/dsh-web /usr/local/bin/agent-picker /usr/local/bin/model-picker /usr/local/bin/sky-setup.sh
 
 # Name the GPU 'render' group in /etc/group. On the host, /dev/dri/renderD* is
 # owned by group `render` (GID 992 here); `--device nvidia.com/gpu=all` (NVIDIA
@@ -261,6 +275,7 @@ RUN set -eu; \
 COPY config/codex/config.toml /etc/devai/codex-config.toml
 COPY config/opencode/opencode.json /etc/devai/opencode.json
 COPY config/pi/models.json /etc/devai/pi-models.json
+COPY config/dsh/devai-overlay.yml /etc/devai/dsh-overlay.yml
 
 # Copy entrypoint script
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh

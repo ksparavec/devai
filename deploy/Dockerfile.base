@@ -52,7 +52,11 @@ RUN uv python install $PYTHON_VERSION \
     && python --version
 
 # Install Node.js 22 LTS (binary tarball) -> /usr/local/bin/node, /usr/local/bin/npm
-RUN NODE_VERSION=22.16.0 \
+# >= 22.19.0 is required by DeepSeek Harness (dsh): its entry point runs only
+# `if (import.meta.main)`, which 22.16 does not define -- dsh then exits 0
+# having done nothing -- and its pi-ai / undici dependencies declare
+# node >= 22.19.0.
+RUN NODE_VERSION=22.23.2 \
     && ARCH=$(dpkg --print-architecture) \
     && case "$ARCH" in amd64) NODE_ARCH=x64;; arm64) NODE_ARCH=arm64;; *) echo "Unsupported arch: $ARCH" && exit 1;; esac \
     && curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz" \

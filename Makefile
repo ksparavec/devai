@@ -4,6 +4,10 @@
 # Defaults (override via .env)
 CONTAINER_RUNTIME ?= podman
 LAB_PORT ?= 8888
+# DeepSeek Harness web UI, published by lab-cpu/lab-gpu only (docs: CLAUDE.md "dsh").
+DSH_PORT ?= 3080
+# Pinned -- see the DeepSeek Harness block in fetch-cli.
+DSH_VERSION ?= 0.1.5-rc.2
 WEBUI_PORT ?= 8443
 HOST_WORK_DIR ?= .
 HOST_HOME_DIR ?= $(HOME)
@@ -320,6 +324,29 @@ fetch-cli: ## Download all external binaries and packages to local cache (uses E
 			&& rm -f $(CACHE_DIR)/pip/bin/pi.tar.gz && STATE="updated"; fi \
 		&& VERSION=$$(PI_OFFLINE=1 $(CACHE_DIR)/pip/bin/pi/pi --version </dev/null 2>&1 | awk '{print $$1; exit}') \
 		&& echo "Pi: $$STATE ($$VERSION)"
+	@# DeepSeek Harness (deepseek-ai/deepseek-harness): an npm app with ~500
+	@# transitive packages, so it needs a real `npm install` -- run inside the
+	@# base image (built just before this by build-cpu/build-gpu), not with a
+	@# host npm. PINNED, unlike the other CLIs: upstream is a developer preview
+	@# that announces compatibility-breaking changes, and devai's integration
+	@# names its internal config entries (webserver, llm-pi-ai, the telemetry
+	@# plugins). Bump DSH_VERSION deliberately and re-test. Installed to a temp
+	@# dir first, so a failed install leaves the previous tree in place.
+	@if [ "$$(cat $(ETAG_DIR)/dsh.version 2>/dev/null)" = "$(DSH_VERSION)" ] && [ -d $(CACHE_DIR)/pip/bin/dsh/node_modules ]; then \
+		echo "DeepSeek Harness: up to date ($(DSH_VERSION))"; \
+	else \
+		IMG=$(BASE_IMAGE_NAME); $(CONTAINER_RUNTIME) image inspect $$IMG >/dev/null 2>&1 || IMG=$(BASE_IMAGE_NAME_GPU); \
+		$(CONTAINER_RUNTIME) image inspect $$IMG >/dev/null 2>&1 || { echo "ERROR: no base image -- run 'make build-base-cpu' or 'make build-base-gpu' first (DeepSeek Harness installs with its npm)." >&2; exit 1; }; \
+		rm -rf $(CACHE_DIR)/pip/bin/dsh.tmp && mkdir -p $(CACHE_DIR)/pip/bin/dsh.tmp \
+		&& $(CONTAINER_RUNTIME) run --rm --network=host $(subst --build-arg,-e,$(PROXY_BUILD_ARGS)) \
+			-e HOME=/tmp -e NPM_CONFIG_UPDATE_NOTIFIER=false -v $(CACHE_DIR)/pip/bin/dsh.tmp:/out:z $$IMG \
+			npm install --prefix /out --no-audit --no-fund --omit=dev --loglevel=error @deepseek-ai/dsh@$(DSH_VERSION) \
+		&& [ -f $(CACHE_DIR)/pip/bin/dsh.tmp/node_modules/@deepseek-ai/dsh/lib/bin.js ] \
+		&& rm -rf $(CACHE_DIR)/pip/bin/dsh && mv $(CACHE_DIR)/pip/bin/dsh.tmp $(CACHE_DIR)/pip/bin/dsh \
+		&& echo "$(DSH_VERSION)" > $(ETAG_DIR)/dsh.version \
+		&& echo "DeepSeek Harness: updated ($(DSH_VERSION))" \
+		|| { rm -rf $(CACHE_DIR)/pip/bin/dsh.tmp; echo "ERROR: DeepSeek Harness install failed" >&2; exit 1; }; \
+	fi
 	@ARCH=$$(dpkg --print-architecture) \
 		&& case "$$ARCH" in amd64) OL_ARCH=amd64;; arm64) OL_ARCH=arm64;; esac \
 		&& HTTP_CODE=$$(curl -fsSL -w '%{http_code}' -o $(CACHE_DIR)/pip/bin/ollama.tar.zst \
@@ -539,6 +566,8 @@ lab-cpu: ## Run the container (CPU)
 		-e HOST_IP=$(HOST_IP) \
 		-e PORT=$(LAB_PORT) \
 		-p 0.0.0.0:$(LAB_PORT):8888 \
+		-e DSH_PORT=$(DSH_PORT) \
+		-p 0.0.0.0:$(DSH_PORT):3080 \
 		-v $(HOME_VOLUME):/home/$(CONTAINER_USER) \
 		$(HOME_MOUNT_ARG) \
 		$(MODEL_CACHE_MOUNT) \
@@ -566,6 +595,8 @@ lab-gpu: ## Run the container (GPU/CUDA)
 		-e HOST_IP=$(HOST_IP) \
 		-e PORT=$(LAB_PORT) \
 		-p 0.0.0.0:$(LAB_PORT):8888 \
+		-e DSH_PORT=$(DSH_PORT) \
+		-p 0.0.0.0:$(DSH_PORT):3080 \
 		-v $(HOME_VOLUME):/home/$(CONTAINER_USER) \
 		$(HOME_MOUNT_ARG) \
 		$(MODEL_CACHE_MOUNT) \

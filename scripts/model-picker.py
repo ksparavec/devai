@@ -259,6 +259,7 @@ _AGENTS: list[tuple[str, str, str]] = [
     ("codex",       "Codex",             "OpenAI terminal coding agent"),
     ("opencode",    "OpenCode",          "Open-source terminal agent; strong with local models"),
     ("pi",          "Pi",                "Minimal, token-efficient terminal coding harness"),
+    ("dsh",         "DeepSeek Harness",  "Plugin agent harness; opens a browser UI on DSH_PORT (JupyterLab only)"),
     ("aiagent",     "AIAgent (shell)",   "DSPy agent CLI — drops to bash; run `aiagent` yourself"),
 ]
 
@@ -3161,6 +3162,169 @@ def _write_pi_models(
     cfg_path.write_text(json.dumps(cfg, indent=2) + "\n")
 
 
+class _YamlTagged:
+    """A YAML node carrying a tag PyYAML does not know -- in DeepSeek
+    Harness's patch files that is `!!js <expression>` -- kept verbatim so a
+    rewrite never turns an expression into a plain string."""
+
+    def __init__(self, tag: str, value: object) -> None:
+        self.tag = tag
+        self.value = value
+
+
+class _DshLoader(yaml.SafeLoader):
+    pass
+
+
+class _DshDumper(yaml.SafeDumper):
+    pass
+
+
+def _construct_tagged(loader: yaml.SafeLoader, tag_suffix: str, node: yaml.Node) -> _YamlTagged:
+    if isinstance(node, yaml.ScalarNode):
+        value: object = loader.construct_scalar(node)
+    elif isinstance(node, yaml.SequenceNode):
+        value = loader.construct_sequence(node, deep=True)
+    else:
+        value = loader.construct_mapping(node, deep=True)
+    return _YamlTagged(node.tag, value)
+
+
+def _represent_tagged(dumper: yaml.SafeDumper, data: _YamlTagged) -> yaml.Node:
+    if isinstance(data.value, list):
+        return dumper.represent_sequence(data.tag, data.value)
+    if isinstance(data.value, dict):
+        return dumper.represent_mapping(data.tag, data.value)
+    return dumper.represent_scalar(data.tag, str(data.value))
+
+
+# An empty prefix matches every tag without an exact constructor, so the
+# standard tags still load as usual.
+_DshLoader.add_multi_constructor("", _construct_tagged)
+_DshDumper.add_representer(_YamlTagged, _represent_tagged)
+
+# The profile the web launcher boots (scripts/dsh-web-launcher.sh).
+_DSH_PROFILE = "web"
+# Entry that owns OpenAI-compatible providers in a dsh profile. Exactly one
+# may exist: a second instance fails boot with DUPLICATE_DIRECTORY.
+_DSH_LLM_ENTRY = "llm-pi-ai"
+
+
+def _dsh_home() -> Path:
+    return Path(os.environ.get("DSH_HOME") or os.path.expanduser("~/.dsh"))
+
+
+def _dsh_router_providers(
+    vetted: dict[str, list[str]], backend: str, chosen: str, chosen_ctx: int,
+) -> dict:
+    """One `router-<backend>` provider per backend with at least one model.
+
+    Each model carries its context window where known -- the `@<ctx>` of a
+    vLLM/SGLang id, or `chosen_ctx` for the chosen model -- the same rule
+    as `_write_pi_models`.
+    """
+    providers: dict = {}
+    for bname, (label, _reason, port) in _BACKENDS.items():
+        ids = list(vetted.get(bname) or [])
+        if bname == backend and chosen and chosen not in ids:
+            ids.append(chosen)
+        if not ids:
+            continue
+        models = []
+        for i in ids:
+            entry: dict = {"id": i}
+            if bname == backend and i == chosen and chosen_ctx > 0:
+                entry["contextWindow"] = chosen_ctx
+            else:
+                _, _, tail = i.rpartition("@")
+                if tail.isdigit() and int(tail) > 0:
+                    entry["contextWindow"] = int(tail)
+            models.append(entry)
+        providers[f"router-{bname}"] = {
+            # `displayName`, not `name`: dsh ignores a provider-level `name`
+            # (it is the per-model display field), measured in Settings -> Models.
+            "displayName": f"{label} via DevAI router",
+            "api": "openai-completions",
+            "baseURL": f"http://{_ROUTER}:{port}/v1",
+            "apiKeyEnv": "DEVAI_ROUTER_API_KEY",
+            "models": models,
+        }
+    return providers
+
+
+def _write_dsh_config(
+    vetted: dict[str, list[str]], backend: str, chosen: str, chosen_ctx: int,
+) -> None:
+    """Declare the router providers and the chosen model to DeepSeek Harness.
+
+    Providers go into the `llm-pi-ai` entry of the web profile's own
+    `cordis.patch.yml` -- the document the Settings -> Models page writes --
+    and not into devai's `--patch` overlay: a patch REPLACES an entry's
+    whole config, so an overlay entry would hide every provider added in the
+    UI, and a second `llm-pi-ai` instance fails boot. Same contract as
+    OpenCode and Pi: the `router-*` providers are rebuilt from the vetted set
+    at every launch, everything else in the file is preserved (other
+    providers, other entries, `!!js` expressions, the leading comment).
+
+    The default model goes into `settings.yaml`'s `agent-default-model`
+    section, which dsh reads live and which the UI's model picker also
+    writes, so switching models in the UI keeps working.
+    """
+    home = _dsh_home()
+    patch_path = home / "profiles" / _DSH_PROFILE / "cordis.patch.yml"
+    if not patch_path.exists():
+        # dsh initializes a profile from its shipped template on first use;
+        # --dump-config does that without booting anything (~0.1 s).
+        r = subprocess.run(
+            ["dsh", "--profile", _DSH_PROFILE, "--dump-config"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, check=False)
+        if r.returncode != 0 or not patch_path.exists():
+            sys.exit(f"error: could not initialize the dsh '{_DSH_PROFILE}' profile "
+                     f"under {home}: {r.stderr.strip()}")
+
+    text = patch_path.read_text()
+    header = []
+    for line in text.splitlines():
+        if not line.startswith("#"):
+            break
+        header.append(line)
+    try:
+        entries = yaml.load(text, Loader=_DshLoader) or []
+    except yaml.YAMLError as exc:
+        sys.exit(f"error: {patch_path} is not valid YAML ({exc}); fix it and retry")
+    if not isinstance(entries, list):
+        sys.exit(f"error: {patch_path} must be a YAML list of patch entries")
+
+    entry = next((e for e in entries
+                  if isinstance(e, dict) and e.get("id") == _DSH_LLM_ENTRY), None)
+    if entry is None:
+        entry = {"id": _DSH_LLM_ENTRY}
+        entries.append(entry)
+    config = entry.get("config")
+    if not isinstance(config, dict):
+        config = {}
+    providers = config.get("providers")
+    if not isinstance(providers, dict):
+        providers = {}
+    providers = {k: v for k, v in providers.items() if not str(k).startswith("router-")}
+    providers.update(_dsh_router_providers(vetted, backend, chosen, chosen_ctx))
+    config["providers"] = providers
+    entry["config"] = config
+
+    body = yaml.dump(entries, Dumper=_DshDumper, sort_keys=False, default_flow_style=False)
+    patch_path.write_text("\n".join(header) + ("\n" if header else "") + body)
+
+    settings_path = home / "settings.yaml"
+    try:
+        settings = yaml.safe_load(settings_path.read_text()) if settings_path.exists() else {}
+    except yaml.YAMLError as exc:
+        sys.exit(f"error: {settings_path} is not valid YAML ({exc}); fix it and retry")
+    if not isinstance(settings, dict):
+        settings = {}
+    settings["agent-default-model"] = {"provider": f"router-{backend}", "model": chosen}
+    settings_path.write_text(yaml.safe_dump(settings, sort_keys=False))
+
+
 # A TOML table header we own: `[model_providers.router-<anything>]`, bare,
 # "double"- or 'single'-quoted key, optional trailing comment. Sub-tables
 # of ours match too.
@@ -3380,6 +3544,16 @@ def _build(agent_id: str, model_name: str, backend: str) -> list[str]:
                          int(ctx) if ctx.isdigit() else 0)
         return ["pi", "--provider", f"router-{backend}", "--model", name]
 
+    if agent_id == "dsh":
+        # DeepSeek Harness has no terminal UI: the launcher serves its web
+        # UI on the port lab-cpu/lab-gpu publish (DSH_PORT) and prints the
+        # URL. The providers and default model are written first; see
+        # _write_dsh_config for where each goes and why.
+        ctx = os.environ.get("CONTEXT", "")
+        _write_dsh_config(_vetted_catalog(), backend, name,
+                          int(ctx) if ctx.isdigit() else 0)
+        return ["dsh-web"]
+
     if agent_id == "aiagent":
         # aiagent is a CLI the user drives herself, so we do NOT exec it.
         # Instead we configure the router endpoint + model in the environment
@@ -3483,6 +3657,16 @@ def _resolve_kv_tier(model: dict) -> tuple[int, bool] | None:
     return (tiers[idx], True)
 
 
+def _offered_agents() -> list[tuple[str, str, str]]:
+    """The agent menu. DeepSeek Harness serves a browser UI on the port that
+    only `make lab-cpu|lab-gpu` publish (DSH_PORT), so it is left out of the
+    menu anywhere else; an explicit `--agent dsh` still reaches its launcher,
+    which says why it cannot start."""
+    if os.environ.get("DSH_PORT"):
+        return list(_AGENTS)
+    return [a for a in _AGENTS if a[0] != "dsh"]
+
+
 def _resolve_agent(agent_filter: str | None, model: dict) -> tuple[str, str, str] | None:
     """Drive reasoning toggle (inline-reasoning only) → MTP toggle (when
     the catalog declares it and the probe did not rule it out) → agent picker.
@@ -3533,7 +3717,8 @@ def _resolve_agent(agent_filter: str | None, model: dict) -> tuple[str, str, str
             return None
         return (agent[0], reasoning_mode, mtp_mode)
 
-    alines = [_format_agent_row(a) for a in _AGENTS]
+    offered = _offered_agents()
+    alines = [_format_agent_row(a) for a in offered]
     mode_notes = []
     if reasoning_mode == "nothink":
         mode_notes.append("no reasoning (MTP)" if mtp_mode == "on" and cap == Capability.INLINE
@@ -3550,7 +3735,7 @@ def _resolve_agent(agent_filter: str | None, model: dict) -> tuple[str, str, str
     idx = _fzf(alines, header, memory_key="agent")
     if idx is None:
         return None
-    agent_id = _AGENTS[idx][0]
+    agent_id = offered[idx][0]
     if not _apply_aiagent_gpu(agent_id):
         return None
     return (agent_id, reasoning_mode, mtp_mode)

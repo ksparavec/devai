@@ -8,8 +8,8 @@ data processing over local LLMs. It is NOT a chat UI; basic chat is a minor
 feature. It runs against any OpenAI-compatible endpoint, so in the lab it talks
 to the devai router.
 
-Unlike the other picker agents (Claude Code, Codex, OpenCode, Pi), aiagent is
-a tool the user drives explicitly. The picker therefore
+Unlike the other picker agents (Claude Code, Codex, OpenCode, Pi, DeepSeek
+Harness), aiagent is a tool the user drives explicitly. The picker therefore
 does NOT exec it. When you choose "AIAgent (shell)", the picker configures the
 router endpoint + model in the environment and drops you into an interactive
 bash shell. You then run `aiagent ...` yourself, for example:

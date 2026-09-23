@@ -1,7 +1,7 @@
 # DevAI Router (`gpu-arbiter`)
 
 The router is the central component of the DevAI stack. Every model
-request from agents (Claude Code, Codex, OpenCode, Pi, Open WebUI, raw curl)
+request from agents (Claude Code, Codex, OpenCode, Pi, DeepSeek Harness, Open WebUI, raw curl)
 goes through it. The router is responsible for: which backend serves a
 model, which model is currently loaded in that backend, what context
 length and parser flags the backend was launched with, and how every

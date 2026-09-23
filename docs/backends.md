@@ -28,7 +28,7 @@ discussion: both emitters should move to `--tp-size` before upstream
 adds a second `--tp*` option.
 
 All three are reachable via the router from inside the `devai-net` Podman
-network. Agents (Claude Code, Codex, OpenCode, Pi, Open WebUI) talk to the
+network. Agents (Claude Code, Codex, OpenCode, Pi, DeepSeek Harness, Open WebUI) talk to the
 router on the appropriate port; the picker emits the right port based on
 the chosen model's backend.
 

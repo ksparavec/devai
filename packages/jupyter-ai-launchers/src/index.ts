@@ -37,6 +37,12 @@ const piSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
   <path d="M6.5 8.5h11M10 8.5v8M14.5 8.5v6.5q0 1.5 1.5 1.5" stroke="#e4e4e7" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
 </svg>`;
 
+// DeepSeek Harness: whale-blue terminal block with a "D" (no official SVG available)
+const dshSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <rect x="2" y="3" width="20" height="18" rx="3" fill="#4D6BFE"/>
+  <path d="M8 7.5h3.5a4.5 4.5 0 0 1 0 9H8z" stroke="white" stroke-width="2" stroke-linejoin="round" fill="none"/>
+</svg>`;
+
 interface Tool {
   id: string;
   name: string;
@@ -49,6 +55,7 @@ const TOOLS: Tool[] = [
   { id: 'codex', name: 'Codex', svg: codexSvg, command: 'model-picker --agent codex' },
   { id: 'opencode', name: 'OpenCode', svg: opencodeSvg, command: 'model-picker --agent opencode' },
   { id: 'pi', name: 'Pi', svg: piSvg, command: 'model-picker --agent pi' },
+  { id: 'dsh', name: 'DeepSeek Harness', svg: dshSvg, command: 'model-picker --agent dsh' },
   { id: 'gemini', name: 'Gemini', svg: geminiSvg, command: 'gemini' }
 ];
 
