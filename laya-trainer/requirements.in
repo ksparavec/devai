@@ -1,0 +1,18 @@
+# laya trainer image -- top-level requirements. The image installs
+# requirements.lock (hash-locked, generated from this file by
+# `make laya-trainer-lock`), never this file.
+#
+# torch comes from PyPI: its linux x86_64 wheel is the cu130 build, the same one
+# the lab image runs (2.14.0+cu130, arch list includes sm_120).
+torch==2.14.0
+laya==0.3.20
+transformers==5.17.0
+# The versions that exported and ran laya's multilingual checkpoint on this host
+# (aiagent docs/design/laya-system1, 2026-09-24).
+onnx==1.23.0
+onnxscript==0.7.2
+onnxruntime==1.30.0
+safetensors
+tokenizers
+numpy
+pyyaml

@@ -1,0 +1,47 @@
+# devai-laya-trainer: the laya trainer backend (docs/plans/laya-trainer.md).
+#
+# Built on the lab's GPU base image (Python 3.14.7 via uv) -- a separate image,
+# NOT an extension of devai-lab-gpu (owner decision D4). Build with
+# `make build-laya-trainer`, which bind-mounts the uv cache like the lab build.
+#
+# Every Python package comes from laya-trainer/requirements.lock with
+# --require-hashes: a package, version or file the lock does not name is
+# refused. Regenerate the lock with `make laya-trainer-lock`.
+#
+# The router starts this image as devai-laya-trainer with the laya store
+# mounted at /laya; compose starts it as a `sleep infinity` placeholder.
+
+ARG BASE_IMAGE=localhost/devai-base-gpu:latest
+FROM ${BASE_IMAGE}
+
+ENV HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    TOKENIZERS_PARALLELISM=false \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/opt/laya-trainer
+
+COPY laya-trainer/requirements.lock /opt/laya-trainer/requirements.lock
+# The base's uv-managed Python marks itself externally managed; this image owns
+# it outright, as the lab image does (Dockerfile.lab sets the same variable).
+RUN UV_BREAK_SYSTEM_PACKAGES=1 uv pip install --system --require-hashes \
+        -r /opt/laya-trainer/requirements.lock
+
+# This host's card is sm_120 (Blackwell). A torch build without it imports
+# fine and fails at the first kernel launch, deep inside a job; refuse it here.
+RUN python -c "import torch; a = torch.cuda.get_arch_list(); print('torch', torch.__version__, 'arch', a); assert 'sm_120' in a, 'torch build lacks sm_120'"
+
+COPY deploy/laya-models.yaml /etc/devai/laya-models.yaml
+COPY laya-trainer/laya_trainer /opt/laya-trainer/laya_trainer
+# Host-side test runs leave __pycache__ in the working tree; do not ship it.
+RUN find /opt/laya-trainer -name __pycache__ -prune -exec rm -rf {} + \
+    && python -c "import laya, onnx, onnxruntime, onnxscript, laya_trainer.controller, laya_trainer.run_job; from laya_trainer import catalog; catalog.load_catalog('/etc/devai/laya-models.yaml')"
+
+# A content hash of the lock, the catalog and the sources (passed by the
+# Makefile), recorded in every artifact manifest as trainer.build. (The COPY
+# layers above already rebuild when their content changes.)
+ARG SOURCE_ID=unknown
+ENV LAYA_TRAINER_BUILD=${SOURCE_ID}
+
+EXPOSE 11434
+CMD ["python", "-m", "laya_trainer.controller", "--store", "/laya", "--catalog", "/etc/devai/laya-models.yaml", "--port", "11434"]

@@ -248,6 +248,7 @@ endif
 # Compose settings
 
 .PHONY: all build build-cpu build-gpu build-base-cpu build-base-gpu build-router
+.PHONY: build-laya-trainer test-laya-trainer laya-trainer-lock
 .PHONY: lab-cpu lab-gpu shell-cpu shell-gpu
 .PHONY: cache-up cache-down cache-status cache-clean logs setup-logs
 .PHONY: ollama-rm ollama-list ollama-status ollama-clean ollama-df
@@ -1752,6 +1753,38 @@ vllm-df: ## Show vLLM models disk usage
 		printf "  %-45s %s\n" "$$(basename $$dir)" "$$(du -sh $$dir | cut -f1)"; \
 	done
 
+
+# laya trainer backend (docs/plans/laya-trainer.md). A separate image on the
+# lab's GPU base, NOT an extension of the lab image. Its Python packages come
+# from a hash lock (laya-trainer/requirements.lock), installed with
+# --require-hashes; SOURCE_ID is recorded in every artifact manifest.
+LAYA_TRAINER_IMAGE ?= localhost/devai-laya-trainer:latest
+
+build-laya-trainer: build-base-gpu ## Build the laya trainer image (devai-laya-trainer) on the lab's GPU base image
+	$(CONTAINER_RUNTIME) build --network=host \
+		$(PROXY_BUILD_ARGS) \
+		-v $(CACHE_DIR)/pip:/root/.cache/uv \
+		--build-arg BASE_IMAGE=$(BASE_IMAGE_NAME_GPU) \
+		--build-arg SOURCE_ID=$$(cat laya-trainer/requirements.lock deploy/laya-models.yaml laya-trainer/laya_trainer/*.py | sha256sum | cut -c1-16) \
+		-f deploy/Dockerfile.laya-trainer \
+		-t $(LAYA_TRAINER_IMAGE) .
+
+test-laya-trainer: ## Run the laya trainer's unit tests inside its image, on CPU, without network (uses the working tree's sources)
+	$(CONTAINER_RUNTIME) run --rm --network=none \
+		-e LAYA_TRAINER_DEVICE=cpu \
+		-v $(CURDIR)/laya-trainer:/opt/laya-trainer:ro \
+		-v $(CURDIR)/deploy/laya-models.yaml:/etc/devai/laya-models.yaml:ro \
+		$(LAYA_TRAINER_IMAGE) \
+		python -m unittest discover -s /opt/laya-trainer/laya_trainer/tests -t /opt/laya-trainer $(if $(VERBOSE),-v,)
+
+laya-trainer-lock: ## Regenerate laya-trainer/requirements.lock (hash-locked) from requirements.in, inside the GPU base image
+	$(CONTAINER_RUNTIME) run --rm --network=host \
+		-v $(CURDIR)/laya-trainer:/src \
+		-v $(CACHE_DIR)/pip:/root/.cache/uv \
+		$(BASE_IMAGE_NAME_GPU) \
+		uv pip compile /src/requirements.in --generate-hashes \
+			--python-version $(PYTHON_VERSION) --python-platform x86_64-manylinux_2_28 \
+			--custom-compile-command "make laya-trainer-lock" -o /src/requirements.lock
 
 build-router: ## Build the gpu-arbiter router image
 	$(CONTAINER_RUNTIME) build --network=host \
