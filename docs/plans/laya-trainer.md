@@ -4,11 +4,12 @@ _Add a GPU training backend to the router so aiagent can fine-tune laya "System 
 
 ## Status
 
-Approved -- design decisions locked by the owner on 2026-09-24. Not scheduled. One value (`LAYA_MAX_HOLD_S`) is set from the Phase 4 measurement.
+Approved -- design decisions locked by the owner on 2026-09-24, then revised the same day after a review of the plan against the code (see "Owner answers, second round"). Phases 1-3 are being implemented on branch `feat/laya-trainer`, CPU work only; nothing that evicts the teacher or trains on the GPU runs until the owner says so. One value (`LAYA_MAX_HOLD_S`) is set from the Phase 4 measurement.
 
 ## Dependencies
 
 - (placeholder) aiagent `feat/system1-distill` (devitops-com/aiagent). That branch produces the datasets this backend trains on, calls its API, and consumes its artifacts. The dataset and artifact contracts below are the interface. aiagent's design doc is `docs/design/laya-system1-distillation.md` in that repo, and this plan implements its section 6.
+  - As of 2026-09-24 that branch exists only in the owner's local clone: it has no commits beyond `main`, is not pushed, and the design doc is untracked. The contracts in this plan are therefore the ones devai implements; aiagent follows them.
 
 ## Enables / Unblocks
 
@@ -24,11 +25,27 @@ Approved -- design decisions locked by the owner on 2026-09-24. Not scheduled. O
 - **Multi-host or cluster training.** Cluster mode stays frozen.
 - **int8 or fp16 export.** Dynamic int8 was measured broken: argmax agreement with fp32 was 97/133.
 - **Auto-restore after a host reboot.** `devai-infra.service` is not installed on this host, which is an existing gap and not caused by this plan.
+- **laya rows in `deploy/models.yaml`.** Every reader of that catalog (picker, `model-fit`, `model-sync`, bench discovery, the model-status MCP server) assumes LLM rows, and `generate-catalog.py` refuses a family without an LLM `arch_ref`. laya rows live in their own file (owner answer, second round).
 
 ## Open questions
 
 1. What is `LAYA_MAX_HOLD_S`, the longest the router holds the GPU for a training job? -- recommendation: 1.5x the wall-clock of the first real job, measured in Phase 4. Until then, 7200 s.
-2. Should the router port for the trainer be 11438? -- recommendation: yes. It is the next free port after vllm-devai's 11437, and aiagent needs to know it only as a configured base URL.
+
+Resolved: the router port is 11438 (the next free port after vllm-devai's 11437; nothing in the repo uses it).
+
+## Owner answers, second round (2026-09-24)
+
+A review of the first version against the code found five problems. The owner's answers:
+
+| # | Problem found | Answer |
+| --- | --- | --- |
+| 1 | The router tracks a model per backend. A job for `laya-english` while the trainer was launched for `laya-multilingual` is a model change, so the router would recreate the trainer -- killing a running job -- before the controller could answer 409. | The trainer is **model-agnostic** in the router: one container serves every base, and a model change never recreates it. The allowlist of base names comes from the **laya catalog rows**. |
+| 2 | `make cache-down` does not know the trainer container, so a job survives it and keeps the GPU. | The trainer gets a **`sleep infinity` placeholder** in compose like the four HF backends, and joins `CACHE_BACKEND_SERVICES` and the `cache-down` removal list. `cache-down` therefore kills a running job, which keeps its last epoch checkpoint. The placeholder also makes the logger follow the container, so the trainer needs no log tee. |
+| 3 | laya rows in `model-families.yaml` / `models.yaml` break `generate-catalog.py` and every LLM reader of the catalog; `pull_hf` supports neither a revision nor a subfolder. | A **hand-written, pinned `deploy/laya-models.yaml`**, read by `select-models.py` (download) and by the router (allowlist). `models.yaml` is untouched. |
+| 4 | Both a router setting and a trainer `hold_until` claimed to own the hold; after a router restart the router could not know when the job started. | The trainer reports **`started_at`**; the router computes the deadline itself from that plus `LAYA_MAX_HOLD_S`. A router restart cannot reset the clock. The hold also covers dataset import and CPU packaging; accepted for the first version. |
+| 5 | OpenAI's cancel call has no body, and the router answers an empty-body POST with 400. | The router accepts an **empty-body POST on the trainer port only**, so a stock OpenAI client can cancel. |
+
+Also decided: the laya rows live in their own file rather than in `models.yaml` (question 1 and 3 together), implementation lands as one commit per phase on `feat/laya-trainer` with no push until the owner says so, and this session covers Phases 1-3 without GPU work.
 
 ## Context
 
@@ -44,54 +61,75 @@ A swap costs about 2 minutes for the teacher's cold start (119-124 s typical in 
 
 Making the trainer a router backend solves both problems. A request to the trainer's port is itself the GPU request, and the router's existing `stopOtherBackends` / `containerRecreate` does the swap. The protocol is OpenAI's fine-tuning jobs API, so aiagent's client is not devai-specific.
 
+**What the router already does** (read from the code on 2026-09-24):
+
+- A request with no `model` on a running backend is proxied without a lifecycle decision (`needRecreate` stays false, `gpu-arbiter/main.go:3252`); on a backend that is not running it gets 503 "model name required" (`main.go:3264`). So status reads on a resident trainer already work, and a status read can never launch it.
+- `reconcileBackendState` (`main.go:2142`) already adopts any serving non-Ollama backend at router start, with the model unknown. The busy hold (Phase 3) builds on it.
+- A POST whose body is empty gets 400, because the body is parsed as JSON (`main.go:3601`). Phase 3 changes this for the trainer port only.
+- `checkModelWeights` (`main.go:3067`) looks for `<ModelsDir>/<model>`, which does not match the laya store layout; Phase 3 exempts the model-agnostic trainer (the trainer checks its base itself, exit 4).
+
 ## Approach
 
-**The trainer.** A new image `localhost/devai-laya-trainer`, built from `deploy/Dockerfile.base` (the lab's base) with an exact torch 2.14.0 cu130 build, runs a small controller. The controller implements a subset of the OpenAI fine-tuning jobs API. It runs one job at a time: import and validate a dataset, train on the GPU, then export to ONNX, calibrate, check parity and write golden answers on the CPU.
+**The trainer.** A new image `localhost/devai-laya-trainer`, built from the lab's GPU base image (`devai-base-gpu`, from `deploy/Dockerfile.base`) with a hash-locked `torch==2.14.0` (PyPI's cu130 build, the same build the lab image has: verified `2.14.0+cu130`, arch list includes `sm_120`). It runs a small controller that implements a subset of the OpenAI fine-tuning jobs API. It runs one job at a time, in a subprocess: import and validate a dataset, train on the GPU, then export to ONNX, calibrate, check parity and write golden answers on the CPU.
 
-**The router.** It gets a fifth backend entry, `laya-trainer`, plus a busy hold. While the trainer reports `busy`, requests for other backends get 503 with `Retry-After` instead of evicting it, up to `LAYA_MAX_HOLD_S`. The router adopts a busy trainer after a restart.
+**The router.** It gets a fifth backend entry, `laya-trainer`, marked as a job runner: model-agnostic (the base model is a job setting, not a launch setting), allowlisted from the laya catalog, and holding the GPU while busy. While the trainer's `/health` says `busy`, a request that would need the GPU for another backend gets 503 with `Retry-After` instead of evicting it, until `started_at + LAYA_MAX_HOLD_S`. Because the hold is read from the trainer's own `/health`, a restarted router honours it without any extra state.
 
-**Files, not HTTP bodies.** Datasets and artifacts move through a plain directory, `/var/cache/devai/laya`, which the lab mounts: read-write on `inbox/`, read-only elsewhere. The router only accepts JSON bodies of 32 MB or less with a `model` field, so files never travel through it.
+**Files, not HTTP bodies.** Datasets and artifacts move through a plain directory, `/var/cache/devai/laya`, which the lab mounts at `/laya`: read-write on `inbox/`, read-only elsewhere. The router only accepts JSON bodies of 32 MB or less, so files never travel through it.
 
-**Base checkpoints** come in through `select-models.py`, as a new written-out `LAYA_STORE` with pinned revisions.
+**Base checkpoints** come in through `select-models.py`, from the hand-written catalog `deploy/laya-models.yaml`, into a new written-out `LAYA_STORE` with pinned revisions and a pinned sha256 for every file.
 
 ---
 
-## Phase 1 -- laya store and base checkpoints
+## Phase 1 -- laya store, catalog and base checkpoints
 
 ### Goal
 
-`/var/cache/devai/laya` exists with its layout. The pinned base checkpoints are in it, downloaded only by the sanctioned script. The lab can see the store.
+`/var/cache/devai/laya` exists with its layout. The pinned base checkpoints are in it, downloaded only by the sanctioned script and verified file by file. The lab can see the store.
 
 ### Deliverables
 
 ```
-scripts/select-models.py                    modify -- LAYA_STORE written out in the Storage layout block; laya rows download with a pinned revision + sha256
-scripts/model-families.yaml                 modify -- laya family: laya-multilingual (default student), laya-english
-tests/python/test_select_models_stores.py   modify -- StorageLayoutTest covers LAYA_STORE; revision pin required for laya rows
-bin/devai-agent                             modify -- optional_mounts: laya store (inbox/ rw, rest ro)
+deploy/laya-models.yaml                     new -- hand-written laya catalog: repo, revision, subfolder, sha256 + size per file
+scripts/select-models.py                    modify -- LAYA_STORE written out in the Storage layout block; `--name <laya row>` pulls from the laya catalog
+tests/python/test_select_models_stores.py   modify -- StorageLayoutTest covers LAYA_STORE
+tests/python/test_laya_store.py             new -- catalog validation; pull with a fake hf runner (verify, move, read-only, skip, mismatch refusal)
+bin/devai-agent                             modify -- optional_mounts: /laya (ro) and /laya/inbox (rw)
 Makefile                                    modify -- MODEL_CACHE_MOUNT: the same mounts for make lab-*/shell-*
 CLAUDE.md                                   modify -- store list and mount-point convention: laya/ is a plain directory by owner decision
 ```
 
 ### Detailed steps
 
-1. **Layout.** Create `/var/cache/devai/laya/{base,inbox,datasets,runs}` as a plain directory on the existing `vgais-cache` filesystem. The owner decided this on 2026-09-24, so no new LV is needed.
+1. **Layout.** `/var/cache/devai/laya/{base,inbox,datasets,runs}` as a plain directory on the existing `vgais-cache` filesystem. The owner decided this on 2026-09-24, so no new LV is needed. The directory already exists on this host (empty); the laya pull creates the four subdirectories idempotently.
    - Amend the mount-point convention in `CLAUDE.md`, which says every top-level folder is its own LV, to name `laya/` as the deliberate exception.
-2. **Store definition.** Add `LAYA_STORE = DEVAI_ROOT / "laya"` to the "Storage layout" block of `select-models.py`, written out like the other stores. `base/` holds `<name>@<rev12>/` checkpoint directories.
-3. **Downloads.** laya rows download with a **pinned revision**. `pull_hf` currently pins none (`select-models.py:509`). The pinned revision is `55cf4c4ebb4ebe31b2550e8bdf3bd21b99753851` (repo `convaiinnovations/laya`; subfolders `.` for English and `multilingual/` for the default student).
-   - Record the sha256 of `model.safetensors` and `tokenizer.json`.
-   - Retry 3 times, per the download rule.
-4. **Tokenizer fix at staging.** After the download, run laya's `_fix_tokenizer_config` **once**, using the trainer image, because it rewrites `tokenizer_config.json` in place (`laya/agent.py:33-84`). Then make `base/<name>@<rev12>/` read-only.
-5. **Lab mounts,** in both places the lab starts from: `bin/devai-agent` `optional_mounts` and the Makefile's `MODEL_CACHE_MOUNT`.
-   - `inbox/` is read-write, so aiagent can write datasets.
-   - `datasets/`, `runs/` and `base/` are read-only.
-   - The mount path inside the lab is `/laya`. aiagent is configured with it as its distill directory.
-6. **Ownership.** Datasets written from the lab are owned by the host user (keep-id). Check that the trainer container, also started with keep-id, can read them.
+2. **Catalog.** `deploy/laya-models.yaml`, `schema_version: 1`, one row per checkpoint:
+
+   | field | content |
+   | --- | --- |
+   | `name` | `laya-multilingual` (the default student) or `laya-english` |
+   | `repo`, `revision` | `convaiinnovations/laya` at `55cf4c4ebb4ebe31b2550e8bdf3bd21b99753851` (a full 40-hex commit; a branch or tag is refused) |
+   | `subfolder` | `multilingual` or `""` (the English checkpoint sits at the repo root) |
+   | `files` | every file of the checkpoint (`model.safetensors`, `rl_agent_config.json`, `encoder/config.json`, `tokenizer/tokenizer.json`, `tokenizer/tokenizer_config.json`) with `sha256` and `size` |
+   | `default`, `license`, `encoder` | informational; exactly one row is the default |
+
+   The sha256 values were checked against upstream on 2026-09-24: each LFS file's hash equals its LFS oid, and each small file's git blob id equals the one in the repo tree at the pinned revision.
+3. **Store definition.** `LAYA_STORE = DEVAI_ROOT / "laya"` in the "Storage layout" block of `select-models.py`, written out like the other stores, with `LAYA_BASE = LAYA_STORE / "base"`. A checkpoint lives in `base/<name>@<rev12>/` with the subfolder stripped.
+4. **Downloads.** `make model-pull NAME=laya-multilingual` reaches `select-models.py --name`, which finds the row in the laya catalog when it is not in `models.yaml`:
+   - `hf download <repo> --revision <rev> --include <subfolder>/<file> ... --local-dir <LAYA_STORE>/.staging/<name>@<rev12>`, through the existing `run_download` (3 attempts);
+   - every file is checked for size and sha256, and a mismatch deletes the staging directory and fails;
+   - only the listed files are moved into `base/<name>@<rev12>/` (so the hf CLI's own `.cache/` never lands there), then files are made 0444 and directories 0555;
+   - a checkpoint already present and verified is skipped.
+5. **No tokenizer fix.** The first version ran laya's `_fix_tokenizer_config` at staging. At the pinned revision it is a no-op: both upstream `tokenizer_config.json` files already have the shape it produces (verified by running it on copies: byte-identical before and after). The per-file sha256 pin is what keeps the base unchanged; the trainer re-verifies it at job start (exit 4). A future revision that needs the fix gets it in the pull step then.
+6. **Lab mounts,** in both places the lab starts from: `bin/devai-agent` `optional_mounts` and the Makefile's `MODEL_CACHE_MOUNT`.
+   - `/var/cache/devai/laya` -> `/laya`, read-only.
+   - `/var/cache/devai/laya/inbox` -> `/laya/inbox`, read-write, so aiagent can write datasets.
+   - Both only when the directories exist, like the other stores. aiagent is configured with `/laya` as its distill directory.
+7. **Ownership.** Rootless podman: the lab runs as `devai` with `--userns=keep-id` (host uid), and a container started by the router runs as container-root, which is also the host uid. So files either side writes are owned by the host user and readable by the other, without keep-id on the trainer. Checked on a CPU-only container in Phase 2.
 
 ### Exit criteria
 
-- `make model-pull NAME=laya-multilingual` fills `base/laya-multilingual@55cf4c4ebb4e/`, with sha256 recorded and the tokenizer fixed.
-- `StorageLayoutTest` passes and covers `LAYA_STORE`.
+- `make model-pull NAME=laya-multilingual` fills `base/laya-multilingual@55cf4c4ebb4e/` with every file verified, read-only.
+- `StorageLayoutTest` covers `LAYA_STORE`; `test_laya_store.py` passes.
 - A lab started by `devai-agent` and one started by `make lab-gpu` both see `/laya/inbox` read-write and `/laya/runs` read-only.
 
 ### Phase 1 risks
@@ -99,7 +137,7 @@ CLAUDE.md                                   modify -- store list and mount-point
 | Risk | Mitigation |
 | --- | --- |
 | The plain directory is mistaken later for a missing LV mount. | Name the exception explicitly in `CLAUDE.md`; `StorageLayoutTest` pins the path. |
-| An unpinned download silently changes the student's base. | Revision pin plus sha256 in the catalog row; the trainer refuses a base whose hash differs from the dataset manifest (exit 4). |
+| An unpinned download silently changes the student's base. | Revision pin plus a sha256 per file in the catalog; the trainer refuses a base whose hash differs from the dataset manifest (exit 4). |
 
 ---
 
@@ -107,62 +145,70 @@ CLAUDE.md                                   modify -- store list and mount-point
 
 ### Goal
 
-The trainer image runs a job end to end on the GPU when started by hand, with the teacher stopped by hand. This phase needs no router changes.
+The trainer image runs a job end to end when started by hand. CPU unit tests with a tiny model cover everything but the GPU. This phase needs no router changes.
 
 ### Deliverables
 
 ```
-laya-trainer/                               new -- Python package laya_trainer (source dir built into the image, like gpu-arbiter/)
-  laya_trainer/controller.py                new -- FastAPI app: fine-tuning jobs subset, /health, /v1/models
-  laya_trainer/dataset.py                   new -- dataset contract check (re-tokenize, compare token-id hashes)
+laya-trainer/                               new -- source dir built into the image, like gpu-arbiter/
+  laya_trainer/controller.py                new -- HTTP API: fine-tuning jobs subset, /health, /v1/models
+  laya_trainer/jobs.py                      new -- job state on the volume (job.json, events.jsonl), startup reconciliation
+  laya_trainer/catalog.py                   new -- laya catalog + base checkpoint verification
+  laya_trainer/dataset.py                   new -- dataset import and contract check (re-tokenize, compare token-id hashes)
+  laya_trainer/run_job.py                   new -- the job subprocess: import -> train -> package, exit codes
   laya_trainer/train.py                     new -- training loop (from the laya notebook's cell 8, single GPU)
   laya_trainer/export.py                    new -- ONNX export, opset 18, dynamic axes
   laya_trainer/calibrate.py                 new -- temperature fit on ONNX fp32 logits of the calib split
   laya_trainer/parity.py, golden.py         new -- torch-vs-ONNX parity; golden answers incl. input_ids
-  laya_trainer/tests/                       new -- CPU unit tests with a tiny model
-deploy/Dockerfile.laya-trainer              new -- FROM devai-base; torch step first; hash-locked rest; sm_120 build check
-deploy/laya/requirements-trainer.txt        new -- hash-locked (laya==0.3.20, transformers==5.17.0, onnx, onnxscript, onnxruntime, fastapi, uvicorn)
-Makefile                                    modify -- build-laya-trainer
+  laya_trainer/fixture.py                   new -- tiny laya checkpoint (small ModernBERT, small tokenizer) for tests and for aiagent
+  laya_trainer/tests/                       new -- unittest suite, run inside the image
+  requirements.in, requirements.lock        new -- hash-locked (torch==2.14.0, laya==0.3.20, transformers==5.17.0, onnx, onnxscript, onnxruntime)
+deploy/Dockerfile.laya-trainer              new -- FROM devai-base-gpu; hash-locked install; sm_120 build check; catalog baked in
+Makefile                                    modify -- build-laya-trainer, test-laya-trainer
 ```
 
 ### Detailed steps
 
 1. **Image.**
-   - Start from `deploy/Dockerfile.base` (Python 3.14.7).
-   - Install `torch==2.14.0` (cu130) in its own step, as `Dockerfile.lab:125-144` does, then the hash-locked requirements with `--require-hashes`. Hash-locked Python requirements are **new for devai**; the lab has no lock.
+   - `FROM devai-base-gpu` (Python 3.14.7, the lab's GPU base).
+   - `uv pip install --system --require-hashes -r requirements.lock`. The lock includes `torch==2.14.0` from PyPI (the cu130 build the lab already runs) and its CUDA libraries. Hash-locked Python requirements are **new for devai**; the lab has no lock.
    - The build **fails unless `sm_120` is in `torch.cuda.get_arch_list()`**.
+   - `deploy/laya-models.yaml` is copied in; `HF_HUB_OFFLINE=1`, so nothing is downloaded at run time.
    - laya 0.3.20 is verified on Python 3.14.7 with CPU torch 2.14.0 and transformers 5.17.0 (forward and backward). GPU training on 3.14 is verified in Phase 4.
-2. **Controller API** (OpenAI fine-tuning subset):
+2. **Controller API** (OpenAI fine-tuning subset), on port 11434 inside the container:
 
    | Method and path | Behaviour |
    | --- | --- |
-   | `POST /v1/fine_tuning/jobs` | Body `{"model": "laya-multilingual", "training_file": "<ds-id>", "hyperparameters": {...}, "suffix": "...", "metadata": {...}}`. `training_file` names a dataset directory in `inbox/` (OpenAI file ids are opaque strings, so no `/v1/files` upload is needed). |
+   | `POST /v1/fine_tuning/jobs` | Body `{"model": "laya-multilingual", "training_file": "<ds-id>", "hyperparameters": {...}, "suffix": "...", "metadata": {...}}`. `training_file` names a dataset directory in `inbox/` (OpenAI file ids are opaque strings, so no `/v1/files` upload is needed). Returns the `fine_tuning.job` object. |
    | `GET /v1/fine_tuning/jobs[/{id}]` | `fine_tuning.job` objects: `status` is validating_files / queued / running / succeeded / failed / cancelled; `fine_tuned_model`; `result_files`; `error`. |
-   | `GET /v1/fine_tuning/jobs/{id}/events` | Progress lines (epoch, loss, phase). |
-   | `POST /v1/fine_tuning/jobs/{id}/cancel` | Stops the job, keeping the last epoch checkpoint. |
-   | `GET /health` | `{"status": "ok" | "busy", "job": ..., "phase": ..., "hold_until": ...}`. The router reads this in Phase 3. |
+   | `GET /v1/fine_tuning/jobs/{id}/events` | `fine_tuning.job.event` objects (phase changes, epoch, loss). |
+   | `POST /v1/fine_tuning/jobs/{id}/cancel` | Stops the job (body optional). Epoch checkpoints already written stay in `runs/<job>/checkpoint/`. |
+   | `GET /health` | `{"status": "ok" | "busy", "job": ..., "phase": ..., "started_at": <unix seconds>}`. The router reads this in Phase 3. |
    | `GET /v1/models` | Base checkpoints plus finished runs. |
 
+   - Built on the standard library's `http.server` rather than FastAPI: six small endpoints need no framework, and it keeps three packages and their transitive dependencies out of the hash lock.
    - One job at a time; a second POST gets 409.
+   - The job runs as a **subprocess** (`python -m laya_trainer.run_job`), so a crash or OOM cannot take the controller down and GPU memory is released when it exits. Its exit code becomes the job's error code.
    - Job state is written to `runs/<job>/job.json` and `events.jsonl` on the volume, which is the source of truth. aiagent reads it from there when the trainer is not resident.
+   - At startup the controller marks any job left non-terminal as failed ("trainer stopped during the job"): that is what a router eviction at the hold cap, a `cache-down` or a crash leaves behind. On SIGTERM it stops the job subprocess and writes the same status itself.
    - `/health` reports `busy` from job acceptance until packaging finishes.
-3. **Import.** The controller copies `inbox/<ds-id>/` to `datasets/<ds-id>/` (immutable) and validates:
-   - `SHA256SUMS` and the schema version;
-   - that the base checkpoint's hash matches the manifest;
+3. **Import.** The controller copies `inbox/<ds-id>/` to `datasets/<ds-id>/` (immutable afterwards; an existing copy with different `SHA256SUMS` is a contract violation) and validates:
+   - `SHA256SUMS` and the `schema_version`;
+   - that `base_checkpoint` (name, revision, `weights_sha256`, `tokenizer_sha256`) matches the catalog row and the files on disk (exit 4 otherwise);
    - `max_len` and `head_max_len` **from the manifest only**;
-   - every row, by re-tokenizing it with laya's own `build_sequence` and comparing against the row's `student_tokens.ids_sha256`.
+   - every row: split, question shape (laya's own question check), probabilities (keys match the question type, sum to 1 +- 1e-6, `label` is the argmax), and a re-tokenization with laya's own `build_sequence` whose token-id hash must equal the row's `student_tokens.<question>.ids_sha256` (canonical hash `sha256(json.dumps(ids, separators=(",", ":")))`).
 
    Any mismatch exits 3 before training starts.
-4. **Training** (`train.py`). Start from the laya notebook's cell 8 (soft-target cross-entropy plus the policy-gradient term, using `laya.common` `build_model` / `collate_items` / `proper_reward`), with these changes:
+4. **Training** (`train.py`). Start from the laya notebook's cell 8 (soft-target cross-entropy plus the policy-gradient term, using `laya.common` `build_model` / `proper_reward`), with these changes:
    - single GPU; bf16 autocast with no GradScaler (the notebook's fp16 plus scaler was for T4s);
    - default student `laya-multilingual`;
-   - frozen 197M-parameter vocabulary embedding plus gradient checkpointing ("lean", estimated 4-5 GiB), with the "fast" mode (about 9-10 GiB) behind a hyperparameter;
-   - a per-epoch checkpoint;
-   - fp32 weights saved;
-   - non-finite loss exits 6.
+   - hyperparameters `n_epochs` (4), `batch_size` (8), `learning_rate_multiplier` (1.0, scaling the notebook's 2.5e-5 encoder / 1e-4 head rates), plus devai's `memory_mode` and `seed`; OpenAI's `"auto"` means the default;
+   - `memory_mode: lean` (default): frozen vocabulary embedding plus gradient checkpointing, estimated 4-5 GiB; `fast`: everything trainable, no checkpointing, about 9-10 GiB;
+   - a per-epoch checkpoint, fp32 weights;
+   - non-finite loss exits 6; CUDA unavailable or out of memory exits 5.
 5. **Packaging, on CPU after training.**
    - ONNX export: opset 18 with dynamic axes, traced with batch >= 2, sequence >= 300 and >= 3 markers. Upstream traces 1/16/2, and its batched export runs about 5x slower.
-   - Temperatures fitted on **ONNX fp32 logits** of the `calib` split and bounded to `[0.5, 5.0]` (laya's runtime clamp), with raw and applied values recorded. `temperature_by_options` is dropped.
+   - Temperatures fitted per question type on **ONNX fp32 logits** of the `calib` split and bounded to `[0.5, 5.0]` (laya's runtime clamp), with raw and applied values recorded. The artifact's `rl_agent_config.json` carries the applied values; `temperature_by_options` is dropped.
    - Parity, torch against ONNX Runtime on held-out: max absolute probability difference <= 1e-3, otherwise exit 7.
    - `golden.jsonl` with 40 rows, including the expected `input_ids`.
    - `manifest.json` with the fields below, `SHA256SUMS`, `NOTICE`.
@@ -176,6 +222,7 @@ Makefile                                    modify -- build-laya-trainer
    | `laya` | version and commit |
    | `trainer` | image digest, versions, GPU, hyperparameters, seed, timings |
    | `calibration`, `export`, `parity`, `golden` | as in step 5 |
+   | `metrics` | torch-side loss only, for information |
    | `files` | sha256 and size per file |
 
    devai reports only loss and parity. **The ship decision is aiagent's**, made through its ONNX runtime.
@@ -192,13 +239,14 @@ Makefile                                    modify -- build-laya-trainer
    | 7 | export or parity failure |
    | 124 | timeout |
 
-8. **Logs:** tee to `/var/cache/devai/logs/devai-laya-trainer.log`, because the logger discovers containers only when it starts (`deploy/logging.sh:50-58`).
+8. **Logs:** stdout and stderr only. The compose placeholder (Phase 3) makes the logger follow `devai-laya-trainer` like the other router-recreated backends, so no tee into the logs directory is needed.
+9. **Tests.** `make test-laya-trainer` runs the unittest suite inside the image, on CPU, with the tiny fixture checkpoint: catalog and base verification, dataset contract, the job state machine and controller API, training steps, export, parity, calibration bounds, golden answers.
 
 ### Exit criteria
 
 - `make build-laya-trainer` succeeds, and the `sm_120` check passes.
-- The CPU unit tests pass with a tiny model: contract check, export, parity, calibration bounds, job state machine.
-- With the teacher stopped by hand and the container started by hand, one real dataset from aiagent trains and packages. aiagent's `distill eval` then accepts the artifact (golden answers reproduce within 1e-3).
+- `make test-laya-trainer` passes.
+- Phase 4 (GPU): with the teacher stopped and the container started by hand, one real dataset from aiagent trains and packages, and aiagent's `distill eval` accepts the artifact (golden answers reproduce within 1e-3).
 
 ### Phase 2 risks
 
@@ -219,49 +267,55 @@ A job request on `:11438` makes the router evict the teacher, start the trainer 
 ### Deliverables
 
 ```
-gpu-arbiter/main.go                         modify -- laya-trainer backendConfig; busy hold; boot adoption; model-less proxying; /health detail
-gpu-arbiter/*_test.go                       modify -- table tests for the above (containerStateStub seam)
-deploy/docker-compose.yaml                  modify -- router env: LAYA_TRAINER_PORT, LAYA_TRAINER_IMAGE, LAYA_MAX_HOLD_S
+gpu-arbiter/laya_trainer.go                 new -- backend entry, laya catalog allowlist, busy hold
+gpu-arbiter/main.go                         modify -- JobRunner lifecycle (model-agnostic), hold check before every eviction, empty-body POST, /health detail
+gpu-arbiter/laya_trainer_test.go            new -- table tests (httptest trainer + containerStateStub)
+deploy/docker-compose.yaml                  modify -- laya-trainer placeholder service; router env + laya catalog mount
+Makefile                                    modify -- CACHE_SERVICES, CACHE_BACKEND_SERVICES, cache-down removal list; cache-up skips the placeholder while the image is not built
+deploy/logging.sh                           modify -- devai-laya-trainer in the fallback target list
 scripts/_probe_hf_common.py                 modify -- MUTEX_CONTAINERS += devai-laya-trainer, devai-vllm-devai, devai-ollama
-docs/router.md, docs/aiagent.md             modify -- the backend, the hold, the aiagent settings
+docs/router.md, docs/aiagent.md, CLAUDE.md  modify -- the backend, the hold, the aiagent settings
 ```
 
 ### Detailed steps
 
-1. **Backend entry.** Add `laya-trainer` to the backend list (`main.go` around lines 1704-1770):
-   - port `LAYA_TRAINER_PORT` (default 11438), container `devai-laya-trainer`, image `localhost/devai-laya-trainer:latest`;
+1. **Backend entry.** Add `laya-trainer` to the backend list:
+   - port `LAYA_TRAINER_PORT` (default 11438), container `devai-laya-trainer`, image `LAYA_TRAINER_IMAGE` (default `localhost/devai-laya-trainer:latest`), URL `http://laya-trainer:11434`;
    - `HealthPath: "/health"`;
-   - `ModelsDir: /var/cache/devai/laya` mounted at `/laya` with `MountRW: true`. The controller enforces the directory discipline; alternatively, extend `backendConfig` with extra mounts;
-   - an entrypoint function that starts the controller.
-
-   Register the base model names so the allowlist accepts them.
-2. **Busy hold.**
-   - When a request for another backend arrives while the trainer's `/health` says `busy`, answer **503 with `Retry-After`** and an OpenAI-style error body, instead of calling `ensureBackendRunning` / `stopOtherBackends` (`main.go:3137`, `3196`, `3545`).
-   - Past `LAYA_MAX_HOLD_S`, the router evicts anyway. The job is marked failed and keeps its last epoch checkpoint.
+   - `ModelsDir: /var/cache/devai/laya` mounted at `/laya` with `MountRW: true`;
+   - an entrypoint that starts the controller;
+   - marked as a **job runner** (`JobRunner: true` on `backendConfig`), which the steps below key on.
+2. **Allowlist from the laya catalog.** The router reads `deploy/laya-models.yaml` (mounted at `/etc/devai/laya-models.yaml`) and registers its row names as the trainer's model names. `/v1/models` on the trainer port lists them.
+3. **Model-agnostic lifecycle.** For a job runner, only "is it running" decides a launch: a different base model is never a model change, and the trainer is launched with no model. The weights-on-disk check is skipped (the trainer verifies its base, exit 4), and the launch circuit breaker counts per backend rather than per model.
+4. **Busy hold.**
+   - Immediately before any eviction (`stopOtherBackends`, from both the HF and the Ollama launch paths) and in the idle sweep, the router asks every *other* running job runner for its `/health`.
+   - If it says `busy` and `now < started_at + LAYA_MAX_HOLD_S`, the request gets **503 with `Retry-After: 30`** and an OpenAI-style error body naming the job and phase, instead of an eviction.
+   - Past the deadline the router logs it and evicts anyway; the controller marks the job failed (on SIGTERM, or at its next start).
+   - If `/health` does not answer, the last answer stands while its deadline has not passed (a controller busy packaging must not lose the GPU to a slow reply); a trainer never seen busy holds nothing.
    - Today, a request for another backend drains in-flight *requests* for up to 30 s and then stops the container, which would kill a training run.
-3. **Boot adoption.** At router start (`main.go:2112-2163`), a running `devai-laya-trainer` whose `/health` says `busy` is adopted and held, so a `make cache-up` during a job does not relaunch vLLM onto a GPU that is in use. The router's in-memory exclusivity is the only GPU lock in this design, so this step is required.
-4. **Model-less requests** (GET job status or events, POST cancel) on the trainer port go to the resident trainer with **no lifecycle decision**, and get 503 if it is not resident.
-   - Today, POST bodies must be JSON with a `model` field of 32 MB or less, and a missing model surfaces as a 503. Check this against `makeRequestHandler` before changing it.
-   - Job-create bodies do carry `model`, so they already fit the existing path.
-5. **`/health` detail.** Add `current_context` and `current_spec`, so a warm-up can recreate exactly what was running before the swap (`main.go:4949-4972`; recreate triggers at `3236-3250`).
-6. **Guard list.** Add `devai-laya-trainer` to the probers' `MUTEX_CONTAINERS`, and fix the list's existing gap: it lacks `devai-vllm-devai` and `devai-ollama` (`_probe_hf_common.py:133`).
+5. **Boot adoption.** At router start, `reconcileBackendState` already adopts a serving `devai-laya-trainer`. Because the hold is read from the trainer's `/health` (step 4), a busy trainer adopted this way is held with its original deadline, so a `make cache-up` during a job does not relaunch vLLM onto a GPU that is in use. A test covers it.
+6. **Model-less requests** (GET job status or events, POST cancel) on the trainer port go to the resident trainer with no lifecycle decision, as they already do; when the trainer is not resident they get 503 naming `/laya/runs/<job>/job.json`, and they never launch it. An empty-body POST is accepted on job-runner ports only.
+7. **`/health` detail.** Add `current_context` and `current_spec` per backend, so a warm-up can recreate exactly what was running before the swap.
+8. **Compose and Makefile.** A `laya-trainer` placeholder service (`sleep infinity`, `pull_policy: never`); the service joins `CACHE_SERVICES` and `CACHE_BACKEND_SERVICES`, and `devai-laya-trainer` joins the `cache-down` removal list. `cache-up` skips the placeholder, with a note, while the trainer image is not built, so hosts without it keep working.
+9. **Guard list.** Add `devai-laya-trainer` to the probers' `MUTEX_CONTAINERS`, and fix the list's existing gap: it lacks `devai-vllm-devai` and `devai-ollama` (`_probe_hf_common.py:133`).
 
 ### Exit criteria
 
 - Go table tests pass (`go test -race`) for:
-  - busy -> 503 on the other ports;
+  - busy -> 503 with `Retry-After` on the other ports, from both the HF and the Ollama launch paths;
   - hold cap -> eviction;
   - boot adoption of a busy trainer;
-  - model-less proxying;
+  - model-agnostic launch (a second base name does not recreate), model-less proxying, empty-body POST;
   - the normal swap after the job ends.
-- Live: a job request from the lab evicts the teacher, and the job runs to the end while a concurrent teacher request gets 503 with `Retry-After`. After the job, a warm-up with the exact labeling model string brings the teacher back in its previous configuration.
+- Phase 4 (GPU): a job request from the lab evicts the teacher, and the job runs to the end while a concurrent teacher request gets 503 with `Retry-After`. After the job, a warm-up with the exact labeling model string brings the teacher back in its previous configuration.
 
 ### Phase 3 risks
 
 | Risk | Mitigation |
 | --- | --- |
 | Other lab users are blocked for the whole job. | By design (owner accepted); the 503 carries `Retry-After`; `LAYA_MAX_HOLD_S` caps it. |
-| A router restart mid-job relaunches vLLM into a used GPU. | Boot adoption (step 3), covered by a test. |
+| A router restart mid-job relaunches vLLM into a used GPU. | Boot adoption plus the `/health`-read hold (steps 4-5), covered by a test. |
+| A hung controller holds the GPU. | The deadline is computed by the router from `started_at`; past it the router evicts regardless of what `/health` says. |
 | The launch breaker (`DEVAI_MAX_FAILED_LAUNCHES=3`) trips on an OOM during a race. | A hold makes the race impossible while busy; the Phase 4 run checks it. |
 
 ---
@@ -270,7 +324,7 @@ docs/router.md, docs/aiagent.md             modify -- the backend, the hold, the
 
 ### Goal
 
-One real aiagent campaign round runs on this host, and the measurements that set the remaining values are taken.
+One real aiagent campaign round runs on this host, and the measurements that set the remaining values are taken. Needs the owner's go-ahead: it evicts the teacher.
 
 ### Detailed steps
 
@@ -294,26 +348,26 @@ One real aiagent campaign round runs on this host, and the measurements that set
 | --- | --- | --- |
 | The contract drifts between aiagent (producer and consumer) and the trainer. | 2 | devai owns a minimal laya-generic dataset schema; aiagent's metadata travels as an opaque `producer` object; golden answers plus hash bindings are checked on the aiagent side. |
 | The stack stays down after a crash or reboot. | 3 | Existing gap (no `devai-infra.service`); recovery is `make cache-up`, which is documented in `docs/router.md`. |
-| HF download of base checkpoints. | 1 | Only through `select-models.py` on the host (not the locked lab); revision pin and sha256. |
+| HF download of base checkpoints. | 1 | Only through `select-models.py` on the host (not the locked lab); revision pin and sha256 per file. |
 
 ## Migration / rollback story
 
-- **Rollback:** revert the PRs. The new backend is opt-in: it is used only when something requests `:11438`, and nothing else changes when it is idle.
-- **Existing installs** see one extra router port and a new store directory. Phase 3 has a behaviour change for everyone: requests get 503 while a training job holds the GPU. That only happens during a job an agent started explicitly.
+- **Rollback:** revert the commits. The new backend is opt-in: it is used only when something requests `:11438`, and nothing else changes when it is idle.
+- **Existing installs** see one extra router port, one placeholder container (skipped while its image is not built) and a new store directory. Phase 3 has a behaviour change for everyone: requests get 503 while a training job holds the GPU. That only happens during a job an agent started explicitly.
 
 ## Estimated effort
 
 | Phase | Engineering effort | Wall-clock |
 | --- | --- | --- |
-| Phase 1 | 1 PR, ~150 LoC plus tests | 0.5 day |
-| Phase 2 | 1-2 PRs, ~800 LoC Python plus tests, Dockerfile, lock | 3-4 days |
-| Phase 3 | 1 PR, ~250 LoC Go plus table tests | 2 days |
+| Phase 1 | 1 commit, ~250 LoC plus tests | 0.5 day |
+| Phase 2 | 1 commit, ~1200 LoC Python plus tests, Dockerfile, lock | 3-4 days |
+| Phase 3 | 1 commit, ~400 LoC Go plus table tests, compose, Makefile | 2 days |
 | Phase 4 | measurements only, 1 GPU window | 0.5 day |
-| Total | 3-4 PRs | ~1.5 weeks |
+| Total | 3 commits + a measurement | ~1.5 weeks |
 
 ## References
 
 - aiagent design: `docs/design/laya-system1-distillation.md` in devitops-com/aiagent (branch `feat/system1-distill`). Section 6 is this plan; sections 8-9 hold the contracts and the ship gate. Measurements are in its appendix A and in `docs/design/laya-system1/`.
-- laya: github.com/NandhaKishorM/laya, commit 23a1752 (v0.3.20). `laya/common.py` (`build_sequence`, `collate_items`, `proper_reward`), `scripts/export_onnx.py`, `notebooks/laya_finetune_typed_decisions_2xT4_kaggle.ipynb` cell 8, `docs/finetune_browser_agent.md` (fully local single-GPU precedent).
-- OpenAI fine-tuning jobs API: `POST /v1/fine_tuning/jobs`, the `fine_tuning.job` object.
+- laya: github.com/NandhaKishorM/laya, commit 23a1752 (v0.3.20). `laya/common.py` (`build_sequence`, `collate_items`, `proper_reward`), `laya/agent.py` (`_fix_tokenizer_config`, question validation), `scripts/export_onnx.py`, `notebooks/laya_finetune_typed_decisions_2xT4_kaggle.ipynb` cell 8, `docs/finetune_browser_agent.md` (fully local single-GPU precedent).
+- OpenAI fine-tuning jobs API: `POST /v1/fine_tuning/jobs`, the `fine_tuning.job` and `fine_tuning.job.event` objects.
 - devai precedents: `scripts/model-sync.py` (restore in `finally`), `scripts/prepare-checkpoint.py` (torch job image plus manifest), `scripts/_probe_hf_common.py` (GPU mutual exclusion).
