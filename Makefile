@@ -22,7 +22,9 @@ IMAGE_NAME_GPU = devai-lab-gpu
 BASE_IMAGE_NAME = devai-base-cpu
 BASE_IMAGE_NAME_GPU = devai-base-gpu
 CONTAINER_USER = devai
-PYTHON_VERSION = 3.13
+# EXACT pin (not "latest patch of 3.x"): the base image and the SkyPilot wheel
+# pre-fetch must agree. Bump deliberately; tests/python/test_lab_python_and_torch.py.
+PYTHON_VERSION = 3.14.7
 HOST_IP = $(shell hostname -I | awk '{print $$1}')
 OLLAMA_CONTAINER = devai-ollama
 OLLAMA_EXEC = $(CONTAINER_RUNTIME) exec $(OLLAMA_CONTAINER) ollama
@@ -133,8 +135,13 @@ PYTHON_VERSION_ARG = --build-arg PYTHON_VERSION=$(PYTHON_VERSION)
 BIN_HASH = $(shell cat $(CACHE_DIR)/pip/bin/.etags/* 2>/dev/null | md5sum | cut -c1-12)
 
 # Cache mount args (bind host cache dirs into build for pip/uv, npm, and binaries)
+# The SkyPilot wheels arrive by bind mount, which podman's layer cache never
+# looks into: key that layer on the wheel set itself, or a changed wheel set is
+# silently NOT installed (happened 2026-09-24: cache held 0.13.0, image 0.11.1).
+SKY_HASH = $(shell ls $(CACHE_DIR)/pip/wheels/skypilot 2>/dev/null | md5sum | cut -c1-12)
 CACHE_BUILD_ARGS = \
 	--build-arg BIN_HASH=$(BIN_HASH) \
+	--build-arg SKY_HASH=$(SKY_HASH) \
 	-v $(CACHE_DIR)/pip:/root/.cache/uv \
 	-v $(CACHE_DIR)/npm:/root/.npm \
 	-v $(CACHE_DIR)/pip/bin:/var/cache/bin:ro \
@@ -417,24 +424,38 @@ fetch-cli: ## Download all external binaries and packages to local cache (uses E
 	@# SkyPilot wheels (per docs/plans/skypilot-agent-skill.md
 	@# decision 1+5). Track upstream PyPI metadata so the lab's `sky`
 	@# CLI follows the fast-moving release train without manual
-	@# bumps. Same version-stamp pattern the Gemini CLI uses.
+	@# bumps. Same version-stamp pattern the Gemini CLI uses. The stamp
+	@# carries the Python version too, so wheels fetched for another
+	@# Python count as stale. The closure is RESOLVED by uv (the cached
+	@# binary above) and only DOWNLOADED by pip (--no-deps): pip's own
+	@# resolver fails on it for Python 3.14 with resolution-too-deep.
+	@# python-hostlist (the slurm extra's dependency) ships only as source,
+	@# so its wheel is built here first; without it a binary-only resolve
+	@# silently fell back to SkyPilot 0.11.1. The resolve is pinned to
+	@# ==LATEST, so it now fails loudly instead of falling back.
 	@LATEST=$$(curl -fsSL "https://pypi.org/pypi/skypilot/json" \
 	            | python3 -c "import sys,json; print(json.load(sys.stdin)['info']['version'])" 2>/dev/null) \
 	    && CACHED=$$(cat $(ETAG_DIR)/skypilot.version 2>/dev/null || echo "none") \
 	    && if [ -z "$$LATEST" ]; then echo "SkyPilot: PyPI fetch failed; skipping"; \
-	       elif [ "$$LATEST" = "$$CACHED" ]; then echo "SkyPilot: up to date ($$CACHED)"; \
+	       elif [ "$$LATEST py$(PYTHON_VERSION)" = "$$CACHED" ]; then echo "SkyPilot: up to date ($$CACHED)"; \
 	       else \
 	           echo "SkyPilot: fetching $$LATEST wheels..." \
 	           && SKY_TMP=$(CACHE_DIR)/pip/wheels/.skypilot.tmp \
 	           && rm -rf "$$SKY_TMP" \
 	           && mkdir -p "$$SKY_TMP" \
-	           && if python3 -m pip download \
-	                  'skypilot[aws,gcp,azure,kubernetes,slurm,runpod,lambda]' \
-	                  --python-version 3.13 --only-binary=:all: \
-	                  --dest "$$SKY_TMP"; then \
+	           && if python3 -m pip wheel -q --no-deps python-hostlist -w "$$SKY_TMP" \
+	              && printf '%s\n' "skypilot[aws,gcp,azure,kubernetes,slurm,runpod,lambda]==$$LATEST" \
+	                  | $(CACHE_DIR)/pip/bin/uv pip compile -q - --find-links "$$SKY_TMP" \
+	                      --python-version $(PYTHON_VERSION) --python-platform x86_64-manylinux_2_28 \
+	                      --only-binary :all: -o "$$SKY_TMP/.pins.txt" \
+	              && grep -vi '^python-hostlist==' "$$SKY_TMP/.pins.txt" > "$$SKY_TMP/.download.txt" \
+	              && python3 -m pip download --no-deps -r "$$SKY_TMP/.download.txt" \
+	                  --python-version $(PYTHON_VERSION) --only-binary=:all: \
+	                  --dest "$$SKY_TMP" \
+	              && rm -f "$$SKY_TMP/.pins.txt" "$$SKY_TMP/.download.txt"; then \
 	                  rm -rf $(CACHE_DIR)/pip/wheels/skypilot \
 	                  && mv "$$SKY_TMP" $(CACHE_DIR)/pip/wheels/skypilot \
-	                  && echo "$$LATEST" > $(ETAG_DIR)/skypilot.version \
+	                  && echo "$$LATEST py$(PYTHON_VERSION)" > $(ETAG_DIR)/skypilot.version \
 	                  && echo "SkyPilot: updated to $$LATEST"; \
 	              else \
 	                  rm -rf "$$SKY_TMP"; \
@@ -472,6 +493,21 @@ fetch-cli: ## Download all external binaries and packages to local cache (uses E
 			mv $(CACHE_DIR)/pip/bin/aiagent-install.sh.tmp $(CACHE_DIR)/pip/bin/aiagent-install.sh \
 			&& chmod +x $(CACHE_DIR)/pip/bin/aiagent-install.sh && STATE="updated"; fi \
 		&& echo "aiagent: $$STATE ($$AIAGENT_VERSION)"
+	@# dstui (ksparavec/dstui): a Textual TUI for DeepSeek Harness, shipped as a
+	@# makeself installer (~22 MB) that brings its own CPython 3.14.7 and NO
+	@# dsh runtime -- the picker points it at the lab's own npm dsh with
+	@# --dsh-bin, so the TUI and the web UI run the same backend. Same
+	@# ETag/BIN_HASH pattern as aiagent. Linux x86_64 (glibc) only.
+	@DSTUI_VERSION=$$(curl -fsSL https://api.github.com/repos/ksparavec/dstui/releases/latest | python3 -c "import sys,json; print(json.load(sys.stdin).get('tag_name','?'))" 2>/dev/null || echo "?") \
+		&& HTTP_CODE=$$(curl -fsSL -w '%{http_code}' -o $(CACHE_DIR)/pip/bin/dstui-install.sh.tmp \
+			--etag-compare $(ETAG_DIR)/dstui.etag --etag-save $(ETAG_DIR)/dstui.etag \
+			"https://github.com/ksparavec/dstui/releases/latest/download/dstui-install.sh") \
+		&& if [ "$$HTTP_CODE" = "304" ] || [ ! -s $(CACHE_DIR)/pip/bin/dstui-install.sh.tmp ]; then \
+			rm -f $(CACHE_DIR)/pip/bin/dstui-install.sh.tmp; STATE="up to date"; \
+		else \
+			mv $(CACHE_DIR)/pip/bin/dstui-install.sh.tmp $(CACHE_DIR)/pip/bin/dstui-install.sh \
+			&& chmod +x $(CACHE_DIR)/pip/bin/dstui-install.sh && STATE="updated"; fi \
+		&& echo "dstui: $$STATE ($$DSTUI_VERSION)"
 
 # Base images used by build and infrastructure
 BASE_IMAGES = debian:trixie $(GPU_BASE_IMAGE)

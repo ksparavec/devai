@@ -41,7 +41,10 @@ spacy
 
 # Computer Vision
 pillow
-opencv-python
+# Headless build: the GUI build (opencv-python) needs libGL, glib, gthread and
+# libxcb, none of which the lab has, so `import cv2` failed; its window
+# functions could not open a window in a container anyway.
+opencv-python-headless
 
 # Utilities
 httpx<0.28

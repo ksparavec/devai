@@ -2,7 +2,7 @@
 
 Source of truth for every "structured"/"inline"/... string previously
 spread as magic literals across the probers and consumers. StrEnum
-(Python 3.11+; this project uses 3.13) makes each member a real `str`,
+(Python 3.11+; the lab image uses 3.14) makes each member a real `str`,
 so `json.dumps`, dict-key lookups, and `==` against legacy literals
 continue to work unchanged. Wire format on disk is identical -- the
 on-disk JSON still contains lowercase strings like "structured".

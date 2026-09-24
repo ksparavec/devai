@@ -122,23 +122,26 @@ RUN cp -a /var/cache/bin/gemini/lib/node_modules/@google /usr/local/lib/node_mod
     && ln -sf ../lib/node_modules/@google/gemini-cli/bundle/gemini.js /usr/local/bin/gemini
 
 # --- Package installs (change more often, cached after binaries) ---
-# All Python packages in a single resolve to avoid version conflicts.
+# Torch first, from the index that carries the right build, then the rest from
+# PyPI alone. NOT one resolve with PyTorch's index added: uv's default index
+# strategy then takes every package that index carries (numpy, jinja2, certifi,
+# idna, fsspec, ...) from it ONLY, and the resolver backtracked the whole lab to
+# old releases -- the 3.13 CPU image shipped JupyterLab 4.1.6 (2024) and
+# inspect-ai 0.3.69, 33 packages behind; on 3.14 the resolve failed outright.
+# The installed torch satisfies every later `torch>=`, so step two keeps it.
 # Host cache dirs are bind-mounted via -v at build time (see Makefile).
+# tests/python/test_lab_python_and_torch.py.
 
 COPY requirements-base.txt /tmp/requirements-base.txt
 RUN if [ "$GPU_BUILD" = "true" ] && [ "$GPU_VENDOR" = "amd" ]; then \
-        # Full index-url replacement, not --extra-index-url like the CPU
-        # branch below: default PyPI would still be consulted first and
-        # could resolve a CUDA wheel on an AMD host.
-        TORCH_ARGS="torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm6.4"; \
+        TORCH_INDEX="--index-url https://download.pytorch.org/whl/rocm6.4"; \
     elif [ "$GPU_BUILD" = "true" ]; then \
-        TORCH_ARGS="torch torchvision torchaudio"; \
+        TORCH_INDEX=""; \
     else \
-        TORCH_ARGS="torch torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/cpu"; \
+        TORCH_INDEX="--index-url https://download.pytorch.org/whl/cpu"; \
     fi \
-    && uv pip install --system \
-        $TORCH_ARGS \
-        -r /tmp/requirements-base.txt
+    && uv pip install --system torch torchvision torchaudio $TORCH_INDEX \
+    && uv pip install --system -r /tmp/requirements-base.txt
 
 # Optional project-specific dependencies (create requirements.txt to use)
 RUN --mount=type=bind,source=.,target=/src \
@@ -163,7 +166,11 @@ RUN --mount=type=bind,source=.,target=/src \
 # who skipped `make fetch-cli` for skypilot get a working lab without
 # the `sky` binary; they can install it later via
 # `uv pip install --system 'skypilot[aws,gcp,azure,kubernetes,slurm,runpod,lambda]'`.
+# SKY_HASH (a hash of the wheel file list, from the Makefile) must be USED in
+# the RUN: the wheels come in by bind mount, which the layer cache ignores.
+ARG SKY_HASH=unknown
 RUN --mount=type=bind,source=.,target=/src \
+    echo "skypilot wheels: SKY_HASH=$SKY_HASH" && \
     if [ -d /var/cache/wheels/skypilot ] && [ -n "$(ls -A /var/cache/wheels/skypilot 2>/dev/null)" ]; then \
         uv pip install --system --offline --no-index \
             --find-links /var/cache/wheels/skypilot \
@@ -195,6 +202,19 @@ RUN if [ -f /var/cache/bin/aiagent-install.sh ]; then \
         || echo "WARN: aiagent install completed but 'aiagent version' failed; investigate"; \
     else \
         echo "INFO: /var/cache/bin/aiagent-install.sh missing; skipping aiagent install. Run 'make fetch-cli' to populate."; \
+    fi
+
+# Install dstui (ksparavec/dstui): a makeself installer that brings its own
+# CPython 3.14.7 into an ISOLATED prefix, like aiagent above, and no DeepSeek
+# Harness runtime: the picker runs it with --dsh-bin /usr/local/bin/dsh, the
+# npm dsh the web UI uses. Pre-fetched by `make fetch-cli`; optional.
+RUN if [ -f /var/cache/bin/dstui-install.sh ]; then \
+        DSTUI_PREFIX=/opt/dstui sh /var/cache/bin/dstui-install.sh </dev/null \
+        && ln -sf /opt/dstui/bin/dstui /usr/local/bin/dstui \
+        && dstui --version >/dev/null 2>&1 \
+        || echo "WARN: dstui install completed but 'dstui --version' failed; investigate"; \
+    else \
+        echo "INFO: /var/cache/bin/dstui-install.sh missing; skipping dstui install. Run 'make fetch-cli' to populate."; \
     fi
 
 # --- JupyterLab extension (depends on jupyterlab being installed above) ---

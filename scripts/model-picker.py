@@ -260,6 +260,7 @@ _AGENTS: list[tuple[str, str, str]] = [
     ("opencode",    "OpenCode",          "Open-source terminal agent; strong with local models"),
     ("pi",          "Pi",                "Minimal, token-efficient terminal coding harness"),
     ("dsh",         "DeepSeek Harness",  "Plugin agent harness; opens a browser UI on DSH_PORT (JupyterLab only)"),
+    ("dstui",       "dstui",             "Terminal UI for DeepSeek Harness; same dsh backend as the web UI"),
     ("aiagent",     "AIAgent (shell)",   "DSPy agent CLI — drops to bash; run `aiagent` yourself"),
 ]
 
@@ -3325,6 +3326,37 @@ def _write_dsh_config(
     settings_path.write_text(yaml.safe_dump(settings, sort_keys=False))
 
 
+# The lab's npm DeepSeek Harness. dstui must run THIS one, never an SDK-bundled
+# runtime, so the TUI and the web UI share one backend (version, Node, overlay).
+_DSH_BIN = "/usr/local/bin/dsh"
+_DSH_OVERLAY = "/etc/devai/dsh-overlay.yml"
+
+
+def _dstui_patch_path() -> Path:
+    cfg_home = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return Path(cfg_home) / "devai" / "dstui-router.yml"
+
+
+def _write_dstui_patch(
+    vetted: dict[str, list[str]], backend: str, chosen: str, chosen_ctx: int,
+) -> Path:
+    """Write the runtime patch that declares the router providers to dstui.
+
+    dstui has no settings UI, so unlike the web agent this is a devai-owned
+    file rewritten whole at every launch: one `llm-pi-ai` entry with the same
+    `router-*` providers `_write_dsh_config` declares. A patch replaces the
+    entry's whole config, which is exactly what is wanted here.
+    """
+    path = _dstui_patch_path()
+    entries = [{"id": _DSH_LLM_ENTRY, "config": {
+        "providers": _dsh_router_providers(vetted, backend, chosen, chosen_ctx)}}]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "# Written by the devai model picker at every dstui launch; edits are lost.\n"
+        + yaml.dump(entries, Dumper=_DshDumper, sort_keys=False, default_flow_style=False))
+    return path
+
+
 # A TOML table header we own: `[model_providers.router-<anything>]`, bare,
 # "double"- or 'single'-quoted key, optional trailing comment. Sub-tables
 # of ours match too.
@@ -3553,6 +3585,19 @@ def _build(agent_id: str, model_name: str, backend: str) -> list[str]:
         _write_dsh_config(_vetted_catalog(), backend, name,
                           int(ctx) if ctx.isdigit() else 0)
         return ["dsh-web"]
+
+    if agent_id == "dstui":
+        # dstui drives its own dsh process over stdio (the SDK profile), not
+        # the web server: `--dsh-bin` makes that process the lab's npm dsh,
+        # the same backend the web UI runs. The router providers arrive as a
+        # patch; devai's overlay keeps both upload paths off.
+        ctx = os.environ.get("CONTEXT", "")
+        patch = _write_dstui_patch(_vetted_catalog(), backend, name,
+                                   int(ctx) if ctx.isdigit() else 0)
+        os.environ.setdefault("DEVAI_ROUTER_API_KEY", "local")
+        return ["dstui", "--dsh-bin", _DSH_BIN,
+                "--provider", f"router-{backend}", "-m", name,
+                "--patch", _DSH_OVERLAY, "--patch", str(patch)]
 
     if agent_id == "aiagent":
         # aiagent is a CLI the user drives herself, so we do NOT exec it.

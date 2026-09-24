@@ -116,10 +116,16 @@ conservative, already-proven pairing for a first cut.
 `Dockerfile.lab`'s torch-install step gained a third branch, gated on
 a new `ARG GPU_VENDOR=nvidia` (separate from the existing `ARG
 GPU_BUILD=false`, which stays "is this a GPU build at all"): AMD gets
-`--index-url https://download.pytorch.org/whl/rocm6.4` -- a full
-index-url **replacement**, not `--extra-index-url` like the CPU
-branch. That distinction matters: `--extra-index-url` still consults
-default PyPI first, which could resolve a CUDA wheel on an AMD host.
+`--index-url https://download.pytorch.org/whl/rocm6.4` for the torch
+packages. Since 2026-09-24 torch is installed in its OWN step (from
+that index for AMD, from PyTorch's CPU index for CPU builds, from PyPI
+for NVIDIA) and the requirements resolve against PyPI alone in a
+second step. Before that, AMD passed the ROCm index as the ONLY index
+for the whole requirement set, and CPU added PyTorch's index to it
+with `--extra-index-url`; with uv's default index strategy every
+package that index carries was then taken from it only, which dragged
+the CPU image's resolve back to 2024 releases and fails outright on
+Python 3.14. See CLAUDE.md, "Torch is installed in its own step".
 
 Two things that turned out to need **no** change, confirmed by reading
 the actual Dockerfile logic (not just by lineage reasoning):

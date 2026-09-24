@@ -8,7 +8,7 @@ FROM ${BASE_IMAGE}
 ARG HTTP_PROXY
 ARG HTTPS_PROXY
 ARG NO_PROXY
-ARG PYTHON_VERSION=3.13
+ARG PYTHON_VERSION=3.14.7
 
 ENV SHELL=/bin/bash
 ENV DEBIAN_FRONTEND=noninteractive
@@ -41,7 +41,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN curl -fsSL https://astral.sh/uv/install.sh | sh \
     && mv /root/.local/bin/uv /root/.local/bin/uvx /usr/local/bin/
 
-# Install Python via uv (latest patch of PYTHON_VERSION, e.g. 3.13 -> 3.13.x)
+# Install Python via uv: exactly PYTHON_VERSION (pinned in the Makefile, e.g. 3.14.7)
 # uv creates /usr/local/python/cpython-X.Y.Z-<platform>/ — symlink to /usr/local/python/current
 ENV UV_PYTHON_INSTALL_DIR=/usr/local/python
 ENV PATH="/usr/local/python/current/bin:${PATH}"

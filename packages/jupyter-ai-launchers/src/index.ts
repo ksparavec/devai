@@ -43,6 +43,13 @@ const dshSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
   <path d="M8 7.5h3.5a4.5 4.5 0 0 1 0 9H8z" stroke="white" stroke-width="2" stroke-linejoin="round" fill="none"/>
 </svg>`;
 
+// dstui: DeepSeek Harness terminal UI -- the DSH block with a prompt caret
+const dstuiSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <rect x="2" y="3" width="20" height="18" rx="3" fill="#1e2a78"/>
+  <path d="M6.5 9l3 3-3 3" stroke="#8fa2ff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  <line x1="11.5" y1="15" x2="17.5" y2="15" stroke="#8fa2ff" stroke-width="2" stroke-linecap="round"/>
+</svg>`;
+
 interface Tool {
   id: string;
   name: string;
@@ -56,6 +63,7 @@ const TOOLS: Tool[] = [
   { id: 'opencode', name: 'OpenCode', svg: opencodeSvg, command: 'model-picker --agent opencode' },
   { id: 'pi', name: 'Pi', svg: piSvg, command: 'model-picker --agent pi' },
   { id: 'dsh', name: 'DeepSeek Harness', svg: dshSvg, command: 'model-picker --agent dsh' },
+  { id: 'dstui', name: 'dstui', svg: dstuiSvg, command: 'model-picker --agent dstui' },
   { id: 'gemini', name: 'Gemini', svg: geminiSvg, command: 'gemini' }
 ];
 
