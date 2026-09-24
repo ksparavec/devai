@@ -29,6 +29,7 @@ page is the reference for what is built.
 | Trainer unit tests (`make test-laya-trainer`, CPU) | 77 pass, as root and as uid 1000: job store, controller API and lifecycle (incl. stop/finish races), dataset contract, a whole job on a tiny fixture model. |
 | A whole job on the real `laya-multilingual` base, **CPU** | Verified 2026-09-24 through the controller in the image: import, validation, 1 training epoch, ONNX export (batch-2 trace), calibration, parity (max abs difference 8.3e-7, 18/18 argmax), golden answers (reproduced by onnxruntime alone within 4.5e-8), sealed artifact. |
 | Router job-runner behaviour (hold, adoption, model-agnostic launch, empty-body POST) | Go table tests (`make test-router`). |
+| **Round trip with aiagent's own code** (devitops-com/aiagent PR #15, `feat/system1-distill` at 7573715), **CPU** | Verified 2026-09-24: aiagent's `write_dataset` built an 80-row dataset (English, German, Croatian) for the real laya-multilingual base; the trainer accepted it -- every `student_tokens` hash from aiagent's torch-free tokenizer port matched laya's `build_sequence` -- trained 1 epoch through the controller, and aiagent's `verify_artifact` accepted the artifact (hashes, binds, 1024/256 limits) and reproduced all 12 golden rows through its onnxruntime runtime. |
 | **GPU training, the live router swap, `LAYA_MAX_HOLD_S`** | **Not verified.** Plan Phase 4: needs a GPU window (it evicts the teacher). |
 
 ## API (OpenAI fine-tuning jobs subset)
