@@ -112,7 +112,7 @@ found three more findings.
 | [odysseus-borrowed-ideas](./odysseus-borrowed-ideas.md)             | Draft (partly frozen) |
 | [pi-coding-agent](./pi-coding-agent.md)                             | **Done**          |
 | [router-fanout](./router-fanout.md)                                 | Draft             |
-| [laya-trainer](./laya-trainer.md)                                   | Approved          |
+| [laya-trainer](./laya-trainer.md)                                   | In Progress       |
 | [sops-age-secrets](./sops-age-secrets.md)                           | Non-functional    |
 | [skypilot-agent-skill](./skypilot-agent-skill.md)                   | Frozen            |
 | [gpu-arbiter-cluster-mode](./gpu-arbiter-cluster-mode.md)           | **Frozen**        |

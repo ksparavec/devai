@@ -19,6 +19,7 @@ caches consumed, and failure modes.
 - [Port layout](#port-layout)
 - [What the router advertises](#what-the-router-advertises)
 - [Backend lifecycle](#backend-lifecycle)
+  - [Job runners (the laya trainer)](#job-runners-the-laya-trainer)
 - [Request rewrite chain](#request-rewrite-chain)
   - [1. Override parsing](#1-override-parsing-namectxreasoning)
   - [2. Anthropic /v1/messages normalisation](#2-anthropic-v1messages-normalisation-vllmsglang)
@@ -123,6 +124,8 @@ when they were parked.
 | 11434 | Ollama  | always live  | GGUF only                   |
 | 11435 | vLLM    | recreated on demand | NVFP4, FP8, AWQ, BF16 safetensors |
 | 11436 | SGLang  | recreated on demand | NVFP4 (arch-dependent), BF16 safetensors |
+| 11437 | vllm-devai | recreated on demand | the home-built, HyperQwen-patched vLLM (same store as vLLM) |
+| 11438 | laya-trainer | recreated on the first job | a job runner, not an engine: laya fine-tuning jobs (see [Job runners](#job-runners-the-laya-trainer)) |
 
 The router is internal to `devai-net`. It is **not** published to the
 host. Reach it from sibling containers (`devai-open-webui`,
@@ -236,6 +239,10 @@ by `TestReconcileAdoptsAResidentOllamaModel`.
 
 When a request hits a different backend than the one currently on the
 GPU:
+0. Job runners first: if one is resident, drain its in-flight requests,
+   then read its `/health`. While it reports `busy` (within its hold cap),
+   the switch is refused with 503 + `Retry-After` and nothing is stopped
+   -- see [Job runners](#job-runners-the-laya-trainer).
 1. Wait for the active backend's in-flight requests to drain
    (`DRAIN_TIMEOUT`, default 30s). "In-flight" means *already proxied
    upstream* (`upstreamReqs`), not every request the arbiter has
@@ -246,6 +253,66 @@ GPU:
 2. Ollama: send `keep_alive=0` to all loaded models so it releases
    VRAM. Other backends: stop their container.
 3. Recreate the target backend with the new model.
+
+### Job runners (the laya trainer)
+
+`laya-trainer` (port 11438, `gpu-arbiter/job_runner.go`) holds the GPU for a
+JOB, not for requests: a request to its port starts a fine-tuning job that runs
+for minutes to hours after the request returned. Everything above assumes the
+opposite, so a backend with `JobRunner` set differs in three ways. The trainer
+itself, its API and its contracts are in [laya-trainer.md](laya-trainer.md).
+
+- **Model-agnostic.** The request's `model` names a job setting (the base
+  checkpoint), never a launch setting: a different name never recreates the
+  container, only "is it running" decides a launch. The allowlist comes from
+  `deploy/laya-models.yaml` (`LAYA_CATALOG_FILE`), not a probe cache; an
+  unknown name is 404 before anything is launched. The weights-on-disk check is
+  skipped (the trainer verifies its base itself), and the launch circuit
+  breaker counts per backend.
+- **Requests without a model never launch it.** Status reads (GET job, events,
+  list) are proxied to a resident trainer and answered 503 otherwise -- the job
+  records are on the volume. An empty-body POST (OpenAI's cancel call) is
+  accepted on this port only; every other port still answers it 400.
+- **The busy hold.** Every eviction goes through `stopOtherBackends`, which
+  now returns an error. Before stopping anything it takes each resident job
+  runner, waits out its recreate, **drains its in-flight requests** (a job
+  submission still in flight may be what makes it busy), and reads its
+  `/health`. While that says `busy`, the switch returns a `gpuHeldError`:
+  `writeLaunchError` answers **503, `Retry-After: 30`, `error.code =
+  "gpu_held_by_job"`**, and nothing is stopped. This covers the vLLM, SGLang
+  and vllm-devai launch paths, Ollama's model and model-less paths, and the
+  idle sweep.
+  - Deadline: the runner's own `started_at` + `LAYA_MAX_HOLD_S` (default
+    7200; 0 = no cap). Past it the router evicts anyway.
+  - Silence is not absence. A refused connection means nothing listens (the
+    compose placeholder, or a controller still starting) and holds nothing. A
+    `/health` that times out or errors on all 3 attempts while podman reports
+    the container running HOLDS (a controller packaging on every core may
+    answer late) -- as its last busy answer, or from the moment it went
+    silent -- bounded by the cap (with `LAYA_MAX_HOLD_S=0`, a hung controller
+    holds until it is stopped). A DNS failure is silence too, not absence: one
+    resolver hiccup must not evict a job. Podman reporting the container gone
+    (exited/stopped/dead/created, or a 404) holds nothing.
+  - `backendVanished` never condemns a listening job runner from `/health`;
+    only "nothing listens" (the placeholder back under a router that still
+    thinks the runner is up) or podman's state makes it vanish. (A request on
+    the trainer's own port used to run the engine liveness probe, which could
+    declare a busy, silent trainer dead -- and the next switch then launched an
+    engine onto its GPU.)
+  - A hold verdict is reused for 30 s (`holdCacheTTL` = `Retry-After`): the
+    probe runs under the arbiter mutex and takes up to about 7 s for a silent
+    runner, and a burst of refused requests costs one probe, not one each. A streaming request refused after the SSE keepalive grace gets the
+    hold in-band (`code: gpu_held_by_job`, `retry_after`).
+  - Boot adoption: `reconcileBackendState` adopts a job runner unless nothing
+    listens or podman reports it gone (a busy one that is silent at boot is
+    still adopted), and the hold is read live from its `/health`, so a router
+    restarted mid-job keeps the original deadline.
+
+The router's own `GET /health` on port 11438 relays the trainer's state as
+`job_runner {status, job, phase, started_at, hold_until}`. On every port it now
+also reports `current_context` and `current_spec`, so a client can recreate the
+exact configuration that was resident before a swap (the teacher after a
+training job).
 
 ---
 
@@ -951,6 +1018,12 @@ the shell when invoking compose.
 | `SGLANG_CONTAINER`   | `devai-sglang`                                             | name to recreate              |
 | `SGLANG_IMAGE`       | `docker.io/lmsysorg/sglang:v0.5.10.post1-cu130`            | image to launch               |
 | `SGLANG_MODELS_DIR`  | `/var/cache/devai/sglang`                                  | host path bound to `/models`  |
+| `LAYA_TRAINER_URL`   | `http://laya-trainer:11434`                                | upstream (job runner)         |
+| `LAYA_TRAINER_PORT`  | `11438`                                                    | router listen                 |
+| `LAYA_TRAINER_CONTAINER` | `devai-laya-trainer`                                   | name to recreate              |
+| `LAYA_TRAINER_IMAGE` | `localhost/devai-laya-trainer:latest`                      | image to launch               |
+| `LAYA_STORE_DIR`     | `/var/cache/devai/laya`                                    | host path bound to `/laya` (read-write) |
+| `LAYA_CATALOG_FILE`  | `/etc/devai/laya-models.yaml`                              | the trainer's model allowlist |
 | `NETWORK`            | `devai-net`                                                | podman network name           |
 | `PODMAN_SOCKET`      | `/run/podman/podman.sock`                                  | libpod socket inside router   |
 
@@ -964,6 +1037,8 @@ the shell when invoking compose.
 | `MAX_CONCURRENT_REQUESTS`| `32`    | max in-flight requests per backend before HTTP 429; `0` = unlimited **and** omits `--max-num-seqs` / `--max-running-requests` entirely (engine default). Any positive value is also passed to the engine as that flag. |
 | `DEVAI_SSE_KEEPALIVE_SECONDS` | `10` | interval between `: keepalive` SSE comment frames during a slow launch; `0` disables the feature |
 | `DEVAI_SSE_KEEPALIVE_GRACE_SECONDS` | `5` | how long a launch may take before the first frame is sent (and the response is committed as SSE) |
+| `LAYA_MAX_HOLD_S`         | `7200`  | longest a busy job runner may refuse other backends, counted from its job's `started_at`; `0` = no cap. To be set from the first measured job (docs/plans/laya-trainer.md, Phase 4). |
+| `LAYA_JOB_TIMEOUT_S`      | `0`     | forwarded to the trainer: per-job wall-clock limit (exit 124); `0` = none |
 | `DEVAI_MAX_FAILED_LAUNCHES` | `3` | consecutive launches of the same `(model, ctx)` that may fail to produce a real engine response before the router refuses; `0` disables the breaker. See [Launch circuit breaker](#launch-circuit-breaker-engine-dies-after-passing-health). |
 
 ### SSE keepalive during cold start
@@ -1086,6 +1161,19 @@ consumer GPUs; sometimes longer on first-ever load (kernel
 JIT-compilation cached afterwards). Fix: bump
 `HEALTH_TIMEOUT_SECONDS=900` and retry, or rerun the request -- the
 second attempt usually hits warm caches.
+
+### GPU held by a training job (HTTP 503, `gpu_held_by_job`)
+
+```
+the GPU is held by laya-trainer: training job ftjob-... (phase training) holds it
+until the job ends, at the latest 2026-09-24T20:00:00Z (LAYA_MAX_HOLD_S); retry later
+```
+
+Cause: a laya fine-tuning job is running (see
+[Job runners](#job-runners-the-laya-trainer)). Expected, and bounded by
+`LAYA_MAX_HOLD_S`. The response carries `Retry-After: 30`. To end it early,
+cancel the job (`POST :11438/v1/fine_tuning/jobs/<id>/cancel`); `make
+cache-down` also stops the trainer (the job is recorded as `trainer_stopped`).
 
 ### Launch circuit breaker (engine dies after passing `/health`)
 

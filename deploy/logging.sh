@@ -63,7 +63,7 @@ if [ -z "$LOG_TARGETS" ]; then
   # placeholders and are RECREATED by the router on first request, so
   # a logger that started before either was ever used would otherwise
   # never follow the engine whose crash logs matter most.
-  LOG_TARGETS="devai-ollama devai-router devai-vllm devai-sglang devai-open-webui devai-webui-proxy"
+  LOG_TARGETS="devai-ollama devai-router devai-vllm devai-sglang devai-laya-trainer devai-open-webui devai-webui-proxy"
 fi
 
 echo "[$(stamp)] [logger] following: $LOG_TARGETS"

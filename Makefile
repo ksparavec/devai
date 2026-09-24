@@ -90,15 +90,16 @@ CACHE_COMPOSE = $(CURDIR)/deploy/docker-compose.yaml
 # router-managed-container note in that target. Keep in sync with
 # deploy/docker-compose.yaml; `make cache-services-check` asserts it.
 # mcp-gateway is deliberately absent: it sits behind the `mcp` profile.
-CACHE_SERVICES = apt-cache registry-cache ollama vllm vllm-devai sglang router \
+CACHE_SERVICES = apt-cache registry-cache ollama vllm vllm-devai laya-trainer sglang router \
                  open-webui webui-proxy logger pipelock
 
-# The four the router recreates on demand. cache-up skips any of these
+# The five the router recreates on demand. cache-up skips any of these
 # that already exist rather than colliding with the router's container.
 # vllm-devai was missing here from its introduction (449270a) until
 # 2026-09-22: with a vllm-devai model loaded, every `make cache-up` died on
-# the name collision before it reached the router.
-CACHE_BACKEND_SERVICES = ollama vllm vllm-devai sglang
+# the name collision before it reached the router. laya-trainer is the job
+# runner (docs/plans/laya-trainer.md).
+CACHE_BACKEND_SERVICES = ollama vllm vllm-devai laya-trainer sglang
 INFERENCE_CONFIG = deploy/models.yaml
 HF_CLI = hf
 # vLLM and SGLang safetensors live on their OWN external volumes
@@ -1069,6 +1070,10 @@ cache-up: ## Start all infrastructure (caches + Ollama + router + Open WebUI; vL
 	  if [ "$$key" = /dev/null ]; then echo "NOTE: pipelock CA key not found ($(PIPELOCK_CA_KEY)); devai-pipelock stays unhealthy until 'make pipelock-ca-init'."; fi; \
 	  svcs=""; \
 	  for s in $(CACHE_SERVICES); do \
+	    if [ "$$s" = laya-trainer ] && ! $(CONTAINER_RUNTIME) image exists $(LAYA_TRAINER_IMAGE); then \
+	      echo "  note: $(LAYA_TRAINER_IMAGE) not built ('make build-laya-trainer'); skipping the laya-trainer placeholder"; \
+	      continue; \
+	    fi; \
 	    case " $(CACHE_BACKEND_SERVICES) " in \
 	      *" $$s "*) \
 	        if $(CONTAINER_RUNTIME) container exists devai-$$s 2>/dev/null; then \
@@ -1084,6 +1089,7 @@ cache-up: ## Start all infrastructure (caches + Ollama + router + Open WebUI; vL
 	@echo "  Router:            devai-router:11434 (unified endpoint)"
 	@echo "  Ollama:            devai-ollama:11434 (GGUF models)"
 	@echo "  vLLM/SGLang:       devai-router:11435 / 11436 (recreated on first request — see docs/backends.md)"
+	@echo "  laya trainer:      devai-router:11438 (job runner, recreated on the first job -- see docs/laya-trainer.md)"
 	@echo "  Open WebUI:        https://localhost:$(WEBUI_PORT)"
 	@echo "  Logger:            $(CACHE_DIR)/logs/<container>.log (per-service stdout)"
 	@echo ""
@@ -1115,7 +1121,11 @@ cache-down: ## Stop and remove ALL infrastructure services (running, stopped, or
 	@# recreated container survived cache-down holding 21.8 GiB, every
 	@# probe launch failed kind=infra and the next cache-up died on the
 	@# name collision).
-	@for name in devai-vllm devai-sglang devai-ollama devai-vllm-devai; do \
+	@#
+	@# devai-laya-trainer: the job runner. Removing it kills a running
+	@# training job (its epoch checkpoints stay in the run directory) -- the
+	@# alternative, a job outliving cache-down with the GPU, is worse.
+	@for name in devai-vllm devai-sglang devai-ollama devai-vllm-devai devai-laya-trainer; do \
 		$(CONTAINER_RUNTIME) rm -f $$name >/dev/null 2>&1 || true; \
 	done
 

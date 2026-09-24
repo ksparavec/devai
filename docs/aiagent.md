@@ -141,6 +141,25 @@ The launcher still omits `AIAGENT_CONTEXT` (see above) -- not because of #3 (now
 fixed) but because the context is already conveyed per backend and a duplicate
 would risk `@<ctx>@<ctx>` on vLLM.
 
+## laya System 1 distillation (the laya trainer)
+
+aiagent's `distill` commands fine-tune laya "System 1" students on labels from the
+27B teacher and then answer confident cases on CPU in front of the LLM. devai's
+side is the laya trainer backend: see [laya-trainer.md](laya-trainer.md) for the
+API, the dataset and artifact contracts and the GPU hold.
+
+- Trainer API base: `http://devai-router:11438/v1` (aiagent's default).
+- Distill directory: `/laya` in the lab (aiagent's default; `AIAGENT_DISTILL_DIR`
+  overrides). Read-only, except `/laya/inbox`, where aiagent writes datasets.
+  Both `devai-agent` and `make lab-*/shell-*` mount it when
+  `/var/cache/devai/laya` exists (`make model-pull NAME=laya-multilingual`
+  creates it).
+- Installed students live under `~/.local/share/aiagent` (about 1.3 GB each),
+  on the lab's persistent home volume.
+- A training job evicts the teacher and holds the GPU until it ends (or
+  `LAYA_MAX_HOLD_S`): other requests get 503 with `Retry-After` meanwhile. After
+  the job, the next teacher request swaps it back (about 2 minutes).
+
 ## Files
 
 - `scripts/aiagent-launcher.sh` -- shell launcher (installed as `aiagent-shell`).
