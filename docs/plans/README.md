@@ -112,6 +112,7 @@ found three more findings.
 | [odysseus-borrowed-ideas](./odysseus-borrowed-ideas.md)             | Draft (partly frozen) |
 | [pi-coding-agent](./pi-coding-agent.md)                             | **Done**          |
 | [router-fanout](./router-fanout.md)                                 | Draft             |
+| [laya-trainer](./laya-trainer.md)                                   | Approved          |
 | [sops-age-secrets](./sops-age-secrets.md)                           | Non-functional    |
 | [skypilot-agent-skill](./skypilot-agent-skill.md)                   | Frozen            |
 | [gpu-arbiter-cluster-mode](./gpu-arbiter-cluster-mode.md)           | **Frozen**        |
@@ -368,8 +369,9 @@ probably do them in series rather than context-switching.
 | 13   | card-derived-hints-and-bench-sync             | ~1.5 weeks | No        | Both prerequisites already satisfied, so it can ship at any point. Appended rather than inserted because it is off the critical path entirely. Phases 1-4 (hints) and Phase 5 (bench loop) are independent tracks and can be split across people or releases. |
 | 14   | router-anthropic-messages-compat              | ~half a day | No       | No dependencies, off the critical path, but the only entry here that fixes a CURRENT user-facing break (Claude Code cannot complete a turn against any vLLM row). Numbered last only because this table is ordered by dependency, not priority -- in practice it should be done first. Its one open question is a ~30 min GPU-exclusive replay that gates the code. Note its open questions 1 and 4 (does SGLang expose `/v1/messages`; does its shim behave like vLLM's) are already ANSWERED in sglang-backend-remediation Phase 0 -- yes, and folding the stray system message is sufficient for both HF backends. |
 | 15   | sglang-backend-remediation                    | ~2 weeks + 1 GPU window | No | No dependencies. Off the dependency critical path, but **Phase 1 should be run before anything else in this table**: the fleet is currently burning GPU on a crash loop (72 router recreates of one model in a day, 93% of SGLang's server errors from that single model). Phases 2-3 are mostly backend-agnostic and improve vLLM too -- 12 of its 19 HIGH findings are owed whether SGLang is kept or frozen. Phase 4 needs the GPU window; Phase 5 is the optional keep-or-freeze adjudication. |
+| 16   | laya-trainer                                  | ~1.5 weeks + 1 GPU window | No | No devai dependencies; its only prerequisite is aiagent `feat/system1-distill`, which produces the datasets and consumes the artifacts. Phases 1-3 are code; Phase 4 needs one GPU window and sets `LAYA_MAX_HOLD_S` from the measured job time. Off the critical path. |
 
-**Eight of these fifteen steps are FROZEN** (4, 5, 6, 8, 9, 10, 11, 12) -- their plans
+**Eight of these sixteen steps are FROZEN** (4, 5, 6, 8, 9, 10, 11, 12) -- their plans
 were parked on 2026-07-25 and their sources moved to `attic/`. They are kept in this
 table as the design record of the intended sequence, not as schedulable work. See
 `attic/README.md`, and `attic/cluster-mode/RESTORE.md` for the defects open at freeze
