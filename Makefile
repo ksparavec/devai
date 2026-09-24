@@ -198,6 +198,8 @@ RUN_FLAGS =
 MODEL_CACHE_MOUNT = $(if $(wildcard $(CACHE_DIR)/ollama),-v $(CACHE_DIR)/ollama:/var/cache/devai/ollama:ro) \
 	$(if $(wildcard $(VLLM_MODELS_DIR)),-v $(VLLM_MODELS_DIR):/var/cache/devai/vllm:ro) \
 	$(if $(wildcard $(SGLANG_MODELS_DIR)),-v $(SGLANG_MODELS_DIR):/var/cache/devai/sglang:ro) \
+	$(if $(wildcard $(CACHE_DIR)/laya),-v $(CACHE_DIR)/laya:/laya:ro) \
+	$(if $(wildcard $(CACHE_DIR)/laya/inbox),-v $(CACHE_DIR)/laya/inbox:/laya/inbox) \
 	-e VLLM_MODELS_DIR=/var/cache/devai/vllm -e SGLANG_MODELS_DIR=/var/cache/devai/sglang
 
 # Read-only mount of the probe caches so the in-container picker can
