@@ -25,9 +25,9 @@ jobs:
           # Both modules consolidated to the current stable Go release
           # (see gpu-arbiter/go.mod, devai-tools/go.mod).
           - module: gpu-arbiter
-            go-version: "1.26"
+            go-version: "1.27"
           - module: devai-tools
-            go-version: "1.26"
+            go-version: "1.27"
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7

@@ -72,10 +72,10 @@ jobs:
           # itself built with -- goinstall sidesteps that mismatch for
           # both modules, not just whichever one currently runs ahead.
           - module: gpu-arbiter
-            go-version: "1.26"
+            go-version: "1.27"
             install-mode: goinstall
           - module: devai-tools
-            go-version: "1.26"
+            go-version: "1.27"
             install-mode: goinstall
     steps:
       - uses: actions/checkout@v7
