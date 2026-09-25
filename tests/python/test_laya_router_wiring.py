@@ -58,7 +58,7 @@ class ComposeTest(unittest.TestCase):
         self.assertIn("devai-laya-trainer", env["LAYA_TRAINER_IMAGE"])
         self.assertEqual(env["LAYA_STORE_DIR"], "/var/cache/devai/laya")
         self.assertEqual(env["LAYA_CATALOG_FILE"], "/etc/devai/laya-models.yaml")
-        self.assertEqual(env["LAYA_MAX_HOLD_S"], "${LAYA_MAX_HOLD_S:-7200}")
+        self.assertEqual(env["LAYA_MAX_HOLD_S"], "${LAYA_MAX_HOLD_S:-900}")
 
     def test_router_reads_the_laya_catalog(self) -> None:
         self.assertIn("./laya-models.yaml:/etc/devai/laya-models.yaml:ro",

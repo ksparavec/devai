@@ -31,7 +31,7 @@ page is the reference for what is built.
 | Router job-runner behaviour (hold, adoption, model-agnostic launch, empty-body POST) | Go table tests (`make test-router`). |
 | **Round trip with aiagent's own code** (devitops-com/aiagent PR #15, `feat/system1-distill` at 7573715), **CPU** | Verified 2026-09-24: aiagent's `write_dataset` built an 80-row dataset (English, German, Croatian) for the real laya-multilingual base; the trainer accepted it -- every `student_tokens` hash from aiagent's torch-free tokenizer port matched laya's `build_sequence` -- trained 1 epoch through the controller, and aiagent's `verify_artifact` accepted the artifact (hashes, binds, 1024/256 limits) and reproduced all 12 golden rows through its onnxruntime runtime. |
 | **GPU training, the live router swap and the hold**, on the reference dataset | Verified 2026-09-25 (see "Reference check" below): the job request evicted the teacher (trainer ready 14 s after it), a teacher request during training got 503 + `Retry-After: 30` + `gpu_held_by_job`, the job succeeded on the GPU (sm_120, torch 2.14.0+cu130, Python 3.14.7, lean mode) in 31 s of phases, parity 5.7e-7 with 12/12 argmax, the lab's aiagent 0.5.0 accepted the artifact and reproduced 12 golden rows, and the teacher came back as it was (engine cold start 2 min 5 s; the warm-up request 126.6 s). |
-| **`LAYA_MAX_HOLD_S` from a real aiagent job** | **Not verified.** Plan Phase 4: needs a real dataset from aiagent; the reference job is too small to size the cap. |
+| **A real aiagent campaign** (aiagent 0.5.0 in the lab image, plan Phase 4) | Verified 2026-09-25: 2,400 multilingual documents labeled by the teacher (6,177 calls, 23.6 min), three training rounds through `:11438` (1,448 / 1,704 / 1,789 train rows x 4 epochs, lean): **holds 123 / 136 / 140 s**, peak VRAM 3.2 GiB torch / 3.7 GiB nvidia-smi, parity <= 1.4e-5 with 334/334 argmax, the 503 hold seen live, the teacher restored exactly after every round. A `fast`-mode job held 126 s at 6.7 / 8.0 GiB (no faster). aiagent verified all three artifacts; its gate said repair, repair, stop at precision 0.95; at 0.90 (owner decision) round 1 shipped (CP-lower 0.910, coverage 0.25) and `distill install` accepted it. `LAYA_MAX_HOLD_S` set to 900 s from these numbers (owner decision). |
 
 ## API (OpenAI fine-tuning jobs subset)
 
@@ -72,7 +72,7 @@ GPU for any other backend gets **503 with `Retry-After: 30`** and
 every eviction path (vLLM, SGLang, vllm-devai, Ollama including its model-less
 surfaces) and to the idle sweep.
 
-- **Deadline:** `started_at + LAYA_MAX_HOLD_S` (default 7200 s; 0 = no cap),
+- **Deadline:** `started_at + LAYA_MAX_HOLD_S` (default 900 s; 0 = no cap),
   computed by the router from the trainer's own `started_at`. Past it the router
   evicts anyway; the trainer marks the job failed (`trainer_stopped`).
 - **Boot adoption:** a restarted router adopts the trainer unless nothing listens
@@ -277,5 +277,5 @@ all). That is the case the retry exists for.
 | `LAYA_TRAINER_IMAGE` | `localhost/devai-laya-trainer:latest` | image to launch (also recorded in manifests) |
 | `LAYA_STORE_DIR` | `/var/cache/devai/laya` | host path bound to `/laya` (read-write) |
 | `LAYA_CATALOG_FILE` | `/etc/devai/laya-models.yaml` | allowlist of base names |
-| `LAYA_MAX_HOLD_S` | `7200` | hold cap from the job's start; 0 = none. To be set from the first measured job. |
+| `LAYA_MAX_HOLD_S` | `900` | hold cap from the job's start; 0 = none. About 6x the measured jobs (123-140 s, see "Verification status"); a job past it fails as `trainer_stopped` -- raise it for much larger datasets. |
 | `LAYA_JOB_TIMEOUT_S` | `0` | per-job wall-clock limit inside the trainer (exit 124); 0 = none |
