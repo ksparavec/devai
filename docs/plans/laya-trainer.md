@@ -9,7 +9,7 @@ In Progress. Design decisions locked by the owner on 2026-09-24, revised the sam
 ## Dependencies
 
 - aiagent `feat/system1-distill` (devitops-com/aiagent PR #15). That branch produces the datasets this backend trains on, calls its API, and consumes its artifacts. The dataset and artifact contracts below are the interface. aiagent's design doc is `docs/design/laya-system1-distillation.md` in that repo, and this plan implements its section 6.
-  - On 2026-09-24 that branch existed only in the owner's local clone; it was pushed as PR #15 on 2026-09-25. The code form of the contract is its `src/aiagent/system1/contract.py` and `src/aiagent/distill/dataset.py`.
+  - On 2026-09-24 that branch existed only in the owner's local clone; it was pushed as PR #15 on 2026-09-25 with the contracts agreed with devai (see "Implementation notes"). The code form of the contract is its `src/aiagent/system1/contract.py` and `src/aiagent/distill/dataset.py`.
 
 ## Enables / Unblocks
 
