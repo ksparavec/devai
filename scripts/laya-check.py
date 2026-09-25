@@ -172,8 +172,10 @@ def evaluate(drive: dict, manifest: dict | None, verify: dict | None) -> list[di
     post = drive.get("post") or {}
     before = drive.get("teacher_health_before") or {}
     # Without a resident teacher the job request evicts nothing, and the
-    # swap this check exists for is not exercised.
-    resident = bool(before.get("running")) and bool(before.get("current_model"))
+    # swap this check exists for is not exercised. `running` is the test: a
+    # router restarted since the teacher loaded adopts it with the model
+    # unknown (current_model empty), and the job request still evicts it.
+    resident = bool(before.get("running"))
     out.append(_check(
         "swap", post.get("status") == 200 and resident,
         f"job request -> {post.get('status', 'not sent')}"

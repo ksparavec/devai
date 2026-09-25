@@ -114,11 +114,18 @@ class VerdictTest(unittest.TestCase):
 
     def test_a_swap_with_no_resident_teacher_evicted_nothing(self):
         # The job request then evicts nothing: the path is not exercised.
-        for before in ({"running": False, "current_model": ""},
-                       {"running": True, "current_model": ""}, {}):
+        for before in ({"running": False, "current_model": ""}, {}):
             d = passing_drive()
             d["teacher_health_before"] = before
             self.assertEqual(failed(self.evaluate(drive=d)), {"swap"}, before)
+
+    def test_a_teacher_adopted_with_its_model_unknown_is_resident(self):
+        # A restarted router adopts the running engine without knowing its
+        # model; the job request evicts it all the same (seen live 2026-09-25).
+        d = passing_drive()
+        d["teacher_health_before"] = {"running": True, "current_model": "",
+                                      "current_context": 0, "current_spec": "off"}
+        self.assertEqual(failed(self.evaluate(drive=d)), set())
 
     def test_a_teacher_served_during_the_job_fails_the_hold(self):
         # A 200 here means the router evicted a running training job.

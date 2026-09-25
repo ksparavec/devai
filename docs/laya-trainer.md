@@ -220,7 +220,7 @@ dataset output changed: the check stops before touching the GPU.
 | Check | Passes when |
 | --- | --- |
 | `dataset` | the reference dataset is present, or rewritten under its id, and the base checkpoint it was built for is staged in `base/` (checked before anything is evicted: the trainer would refuse the job only after the swap) |
-| `swap` | a teacher was resident on the teacher port, and the job request is accepted (the router evicted it and started the trainer); with no resident teacher nothing is evicted and the check fails as not exercised |
+| `swap` | the teacher port reported `running` before the job request (a teacher adopted by a restarted router, model unknown, counts), and the request is accepted (the router evicted it and started the trainer); with nothing running there nothing is evicted and the check fails as not exercised |
 | `hold` | a teacher request, sent the first time the job is seen running, gets 503 with `Retry-After` and `gpu_held_by_job` -- a 200 means the router evicted a running job |
 | `job` | the job succeeds, exit code 0, within 30 minutes (otherwise it is cancelled) |
 | `data` | the manifest names the reference dataset, its split counts (50/10/12/8) and 8172 trained tokens |
