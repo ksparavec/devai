@@ -30,7 +30,8 @@ page is the reference for what is built.
 | A whole job on the real `laya-multilingual` base, **CPU** | Verified 2026-09-24 through the controller in the image: import, validation, 1 training epoch, ONNX export (batch-2 trace), calibration, parity (max abs difference 8.3e-7, 18/18 argmax), golden answers (reproduced by onnxruntime alone within 4.5e-8), sealed artifact. |
 | Router job-runner behaviour (hold, adoption, model-agnostic launch, empty-body POST) | Go table tests (`make test-router`). |
 | **Round trip with aiagent's own code** (devitops-com/aiagent PR #15, `feat/system1-distill` at 7573715), **CPU** | Verified 2026-09-24: aiagent's `write_dataset` built an 80-row dataset (English, German, Croatian) for the real laya-multilingual base; the trainer accepted it -- every `student_tokens` hash from aiagent's torch-free tokenizer port matched laya's `build_sequence` -- trained 1 epoch through the controller, and aiagent's `verify_artifact` accepted the artifact (hashes, binds, 1024/256 limits) and reproduced all 12 golden rows through its onnxruntime runtime. |
-| **GPU training, the live router swap, `LAYA_MAX_HOLD_S`** | **Not verified.** Plan Phase 4: needs a GPU window (it evicts the teacher). |
+| **GPU training, the live router swap and the hold**, on the reference dataset | Verified 2026-09-25 (see "Reference check" below): the job request evicted the teacher (trainer ready 14 s after it), a teacher request during training got 503 + `Retry-After: 30` + `gpu_held_by_job`, the job succeeded on the GPU (sm_120, torch 2.14.0+cu130, Python 3.14.7, lean mode) in 31 s of phases, parity 5.7e-7 with 12/12 argmax, the lab's aiagent 0.5.0 accepted the artifact and reproduced 12 golden rows, and the teacher came back as it was (engine cold start 2 min 5 s; the warm-up request 126.6 s). |
+| **`LAYA_MAX_HOLD_S` from a real aiagent job** | **Not verified.** Plan Phase 4: needs a real dataset from aiagent; the reference job is too small to size the cap. |
 
 ## API (OpenAI fine-tuning jobs subset)
 
@@ -192,8 +193,79 @@ make model-pull NAME=laya-multilingual   # base checkpoint (default student); la
 make build-laya-trainer                  # the image (needs devai-base-gpu; builds it via build-base-gpu)
 make test-laya-trainer [VERBOSE=1]       # unit tests in the image, CPU, no network
 make laya-trainer-lock                   # regenerate the hash lock from laya-trainer/requirements.in
+make laya-check [TEACHER=...] [KEEP_RUN=1]  # GPU, evicts the teacher ~3 min: the reference check below
 python -m laya_trainer.fixture <dir>     # (in the image) a tiny laya checkpoint for aiagent's tests
 ```
+
+## Reference check (`make laya-check`)
+
+One small, known job run through the router the way aiagent runs one, to check
+every hand-off between the teacher and the trainer. Run it after rebuilding the
+router or the trainer image, after an aiagent upgrade in the lab image, or
+whenever the two sides seem out of step. **It is GPU-exclusive and evicts the
+teacher for about three minutes** (the job about 1 minute, the teacher's cold
+start about 2); teacher requests in that window get 503 with `Retry-After`.
+
+The reference dataset is `ds-a6c9c8248242`, kept in the store (`datasets/`, and
+`inbox/`) since 2026-09-25: 80 synthetic sentences in English, German and
+Croatian for aiagent's `polarity` skill, labelled by construction, with
+placeholder binds and teacher `"interop"`. **Never train a real student on it,
+evaluate it with `aiagent distill eval`, or install its artifact.** It was written
+by aiagent's own writer (`scripts/laya_check/write_dataset.py`); when it is gone
+from both `inbox/` and `datasets/`, the check rewrites it the same way, and the
+rewrite must come out under the same id (the id hashes the content; verified
+byte-identical with the lab's aiagent 0.5.0). A different id means aiagent's
+dataset output changed: the check stops before touching the GPU.
+
+| Check | Passes when |
+| --- | --- |
+| `dataset` | the reference dataset is present, or rewritten under its id, and the base checkpoint it was built for is staged in `base/` (checked before anything is evicted: the trainer would refuse the job only after the swap) |
+| `swap` | a teacher was resident on the teacher port, and the job request is accepted (the router evicted it and started the trainer); with no resident teacher nothing is evicted and the check fails as not exercised |
+| `hold` | a teacher request, sent the first time the job is seen running, gets 503 with `Retry-After` and `gpu_held_by_job` -- a 200 means the router evicted a running job |
+| `job` | the job succeeds, exit code 0, within 30 minutes (otherwise it is cancelled) |
+| `data` | the manifest names the reference dataset, its split counts (50/10/12/8) and 8172 trained tokens |
+| `parity` | torch-vs-ONNX difference within the manifest's tolerance, argmax agreement n/n |
+| `aiagent` | the lab's aiagent `verify_artifact` accepts the artifact and `check_golden` reproduces all 12 golden rows |
+| `teacher` | the warm-up returns 200 and `/health` on the teacher port shows the model, context and MTP spec of the teacher string. The router keeps a hold verdict for `Retry-After` (30 s) after a job ends, so a warm-up refused with `gpu_held_by_job` is retried per `Retry-After`, within the launch timeout (900 s) |
+
+The teacher string is `TEACHER=` when given, else what the teacher port's
+`/health` reports as loaded (model, context, MTP on/off). Its suffixes are read
+in any order, as the router reads them. When nothing is known -- the router
+adopted the teacher at boot with the model unknown -- the check stops before the
+job request; pass `TEACHER=` (for aiagent's labeling:
+`Qwen3.8-27B-MTP-devai-NVFP4::nothink::mtp@118784`). `TEACHER_PORT` (default
+11437) is the teacher's router port. The check also stops before the job request
+when a job is already running on the trainer. After the job request it always
+restores the teacher -- on success, failure, a 30-minute timeout (which cancels
+the job) or an error in the driver -- except after a 409, when another job holds
+the trainer. It stops polling when the router serves the teacher during the job
+(the job was evicted) or when five polls in a row are not answered with the
+job, and then reads the job's final record from the volume.
+
+Measured on the first run, 2026-09-25, and printed next to every run's own
+numbers (informational; they depend on the host and its caches):
+
+| Measure | Reference |
+| --- | --- |
+| Job request, including the swap (drain, stop teacher, start trainer) | 13.6 s |
+| Phases: validating / training / exporting / calibrating / checking_parity / packaging | 5.5 / 4.1 / 12.2 / 1.8 / 4.9 / 2.1 s (total 30.7 s) |
+| Peak VRAM, torch (`max_memory_allocated`, printed) / nvidia-smi (sampled by hand on the first run, not measured by the check) | 3.17 / 3.6 GiB |
+| Parity, max abs probability difference | 5.7e-7 |
+| Teacher warm-up (vllm-devai, Qwen3.8-27B-MTP-devai-NVFP4, 118784, MTP) | 126.6 s |
+
+The job is driven from a container on `devai-net` (the router publishes no host
+ports; `scripts/laya_check/drive_job.py`, stdlib only, in the trainer image), and
+aiagent's steps run in the lab image with aiagent's own Python, without network
+or GPU, `/laya` read-only. A passing run deletes its own run directory (about
+1.3 GB); a failing one keeps it, as does `KEEP_RUN=1`. The first run's directory,
+`runs/ftjob-f91b6d747c913af35c209ad9`, is kept as the reference artifact and is
+never removed by the check. Pinned by `tests/python/test_laya_check.py`.
+
+First `make laya-check`, 2026-09-25: PASS, every check. The job request with the
+swap took 3.4 s, the phases 30.2 s, peak VRAM 3.17 GiB, parity 5.7e-7. The first
+warm-up got the router's cached hold (503 `gpu_held_by_job`, sent 2 s after the
+job ended); the second, 31 s later, brought the teacher back as it was (159 s in
+all). That is the case the retry exists for.
 
 ## Configuration (router env, set in deploy/docker-compose.yaml)
 

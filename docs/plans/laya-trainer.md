@@ -4,7 +4,7 @@ _Add a GPU training backend to the router so aiagent can fine-tune laya "System 
 
 ## Status
 
-In Progress. Design decisions locked by the owner on 2026-09-24, revised the same day after a review of the plan against the code (see "Owner answers, second round"). **Phases 1-3 are implemented** on branch `feat/laya-trainer` and verified on CPU only (see "Implementation notes"). Phase 4 -- GPU training, the live swap, and the measurement that sets `LAYA_MAX_HOLD_S` -- needs a GPU window and the owner's go-ahead, because it evicts the teacher.
+In Progress. Design decisions locked by the owner on 2026-09-24, revised the same day after a review of the plan against the code (see "Owner answers, second round"). **Phases 1-3 are implemented** (merged in PR #21) and verified on CPU (see "Implementation notes"). Phase 4 has the owner's go-ahead (2026-09-25): GPU training, the live swap and the 503 hold are verified on the synthetic reference dataset (`make laya-check`); the real aiagent campaign and the `LAYA_MAX_HOLD_S` measurement are still open (see Phase 4, "Progress").
 
 ## Dependencies
 
@@ -349,6 +349,11 @@ One real aiagent campaign round runs on this host, and the measurements that set
 ### Exit criteria
 
 - One artifact is produced and accepted by aiagent. The measured numbers are recorded in this plan and in `docs/router.md`, and `LAYA_MAX_HOLD_S` is set.
+
+### Progress (2026-09-25)
+
+- Owner go-ahead given. Before the real campaign, a GPU smoke job ran on aiagent's synthetic 80-row interop dataset (`ds-a6c9c8248242`): the live swap, the 503 hold and GPU training on Python 3.14.7 with the sm_120 torch build (step 4) are verified, and the lab's aiagent 0.5.0 accepted the artifact. Numbers: docs/laya-trainer.md, "Reference check". The owner kept that dataset as the reference for teacher/trainer coordination; `make laya-check` reruns it.
+- Still open: steps 1-3 and 5 with a real aiagent corpus, and `LAYA_MAX_HOLD_S` from that job -- the reference job is too small to size the cap.
 
 ---
 

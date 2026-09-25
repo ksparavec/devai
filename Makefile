@@ -249,7 +249,7 @@ endif
 # Compose settings
 
 .PHONY: all build build-cpu build-gpu build-base-cpu build-base-gpu build-router
-.PHONY: build-laya-trainer test-laya-trainer laya-trainer-lock
+.PHONY: build-laya-trainer test-laya-trainer laya-trainer-lock laya-check
 .PHONY: lab-cpu lab-gpu shell-cpu shell-gpu
 .PHONY: cache-up cache-down cache-status cache-clean logs setup-logs
 .PHONY: ollama-rm ollama-list ollama-status ollama-clean ollama-df
@@ -1795,6 +1795,12 @@ laya-trainer-lock: ## Regenerate laya-trainer/requirements.lock (hash-locked) fr
 		uv pip compile /src/requirements.in --generate-hashes \
 			--python-version $(PYTHON_VERSION) --python-platform x86_64-manylinux_2_28 \
 			--custom-compile-command "make laya-trainer-lock" -o /src/requirements.lock
+
+laya-check: ## GPU-exclusive, evicts the teacher ~3 min: run the reference laya job (ds-a6c9c8248242) through :11438 and check the teacher/trainer hand-off (swap, 503 hold, job, parity, aiagent verify + golden, teacher restored). TEACHER=<model string> (default: what TEACHER_PORT has loaded), TEACHER_PORT=11437, KEEP_RUN=1.
+	python3 scripts/laya-check.py --lab-image $(IMAGE_NAME_GPU) --trainer-image $(LAYA_TRAINER_IMAGE) \
+	  $(if $(TEACHER),--teacher '$(TEACHER)',) \
+	  $(if $(TEACHER_PORT),--teacher-port $(TEACHER_PORT),) \
+	  $(if $(KEEP_RUN),--keep-run,)
 
 build-router: ## Build the gpu-arbiter router image
 	$(CONTAINER_RUNTIME) build --network=host \
