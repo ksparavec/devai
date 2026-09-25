@@ -1,21 +1,39 @@
 # gitleaks config for devai (see docs/security-ci.md).
 #
-# Extends gitleaks' default ruleset. The only allowlist entries are
-# path-scoped, not a blanket exemption for deploy/:
+# Extends gitleaks' default ruleset. The allowlist is narrow -- two paths,
+# not a blanket exemption for deploy/, and one secret-value pattern:
 #   - deploy/*.sops.env          already-encrypted ciphertext (sops+age);
 #                                 high-entropy blobs that read as false
 #                                 positives against generic secret rules.
 #   - deploy/*.sops.env.example  dummy placeholder tokens by design, meant
 #                                 to be copied and encrypted by the operator.
+#   - Hugging Face architecture class names (e.g. NemotronHForCausalLM)
+#     matched as a secret in prose; see below.
 
 title = "devai gitleaks config"
 
 [extend]
 useDefault = true
 
-[[allowlists]]
-description = "sops-encrypted ciphertext and its example templates"
+# ONE [allowlist] table, not [[allowlists]]: the pinned gitleaks (8.21.2,
+# .github/workflows/security-blocking.yml) silently ignores the newer array
+# form, so the sops path rule below never took effect while it was written
+# that way. Criteria in this table are OR'ed: a finding is allowed when its
+# path OR its secret matches.
+#
+# Hugging Face model-architecture class names in prose: generic-api-key
+# fires on a keyword ("token", "key", ...) followed by a long identifier,
+# so CLAUDE.md's "... not a per-token cache: Qwen3_5ForConditionalGeneration"
+# (commit 6c00258, 2026-09-19) failed every PR's full-history scan from then
+# on. Matched against the secret value only, anchored to the whole value: a
+# class name like this is never a credential. No other file is exempted.
+[allowlist]
+description = "sops ciphertext + example templates; Hugging Face architecture class names"
 paths = [
   '''deploy/[^/]+\.sops\.env$''',
   '''deploy/[^/]+\.sops\.env\.example$''',
+]
+regexTarget = "secret"
+regexes = [
+  '''^[A-Za-z][A-Za-z0-9_]*For(ConditionalGeneration|CausalLM|MaskedLM)$''',
 ]
