@@ -8,8 +8,8 @@ Approved -- design decisions locked by the owner on 2026-09-24, then revised the
 
 ## Dependencies
 
-- (placeholder) aiagent `feat/system1-distill` (devitops-com/aiagent). That branch produces the datasets this backend trains on, calls its API, and consumes its artifacts. The dataset and artifact contracts below are the interface. aiagent's design doc is `docs/design/laya-system1-distillation.md` in that repo, and this plan implements its section 6.
-  - As of 2026-09-24 that branch exists only in the owner's local clone: it has no commits beyond `main`, is not pushed, and the design doc is untracked. The contracts in this plan are therefore the ones devai implements; aiagent follows them.
+- aiagent `feat/system1-distill` (devitops-com/aiagent PR #15). That branch produces the datasets this backend trains on, calls its API, and consumes its artifacts. The dataset and artifact contracts below are the interface. aiagent's design doc is `docs/design/laya-system1-distillation.md` in that repo, and this plan implements its section 6.
+  - On 2026-09-24 that branch existed only in the owner's local clone; it was pushed as PR #15 on 2026-09-25. The code form of the contract is its `src/aiagent/system1/contract.py` and `src/aiagent/distill/dataset.py`.
 
 ## Enables / Unblocks
 
@@ -367,7 +367,7 @@ One real aiagent campaign round runs on this host, and the measurements that set
 
 ## References
 
-- aiagent design: `docs/design/laya-system1-distillation.md` in devitops-com/aiagent (branch `feat/system1-distill`). Section 6 is this plan; sections 8-9 hold the contracts and the ship gate. Measurements are in its appendix A and in `docs/design/laya-system1/`.
+- aiagent design: `docs/design/laya-system1-distillation.md` in devitops-com/aiagent (PR #15, branch `feat/system1-distill`). Section 6 is this plan; sections 8-9 hold the contracts and the ship gate; the measurements are in its Appendix A. The architecture diagram is `docs/design/laya-system1-architecture.svg`. (aiagent's research folder `docs/design/laya-system1/` is not published.)
 - laya: github.com/NandhaKishorM/laya, commit 23a1752 (v0.3.20). `laya/common.py` (`build_sequence`, `collate_items`, `proper_reward`), `laya/agent.py` (`_fix_tokenizer_config`, question validation), `scripts/export_onnx.py`, `notebooks/laya_finetune_typed_decisions_2xT4_kaggle.ipynb` cell 8, `docs/finetune_browser_agent.md` (fully local single-GPU precedent).
 - OpenAI fine-tuning jobs API: `POST /v1/fine_tuning/jobs`, the `fine_tuning.job` and `fine_tuning.job.event` objects.
 - devai precedents: `scripts/model-sync.py` (restore in `finally`), `scripts/prepare-checkpoint.py` (torch job image plus manifest), `scripts/_probe_hf_common.py` (GPU mutual exclusion).
