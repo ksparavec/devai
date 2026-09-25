@@ -729,9 +729,10 @@ func TestLayaTrainerBackendConfig(t *testing.T) {
 	}
 }
 
-func TestLayaTrainerBackendConfig_DefaultHoldIsTwoHours(t *testing.T) {
+// 900 s: about 6x the jobs measured in plan Phase 4 (123-140 s).
+func TestLayaTrainerBackendConfig_DefaultHoldIsFifteenMinutes(t *testing.T) {
 	t.Setenv("LAYA_MAX_HOLD_S", "") // empty = unset: the default applies
-	if bc := layaTrainerBackend("devai-net"); bc.MaxHold != 2*time.Hour {
+	if bc := layaTrainerBackend("devai-net"); bc.MaxHold != 15*time.Minute {
 		t.Fatalf("default MaxHold %s", bc.MaxHold)
 	}
 }

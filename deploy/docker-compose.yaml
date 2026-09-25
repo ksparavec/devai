@@ -177,14 +177,15 @@ services:
       # The laya trainer, a job runner (gpu-arbiter/job_runner.go). While a
       # job runs, requests that need the GPU for another backend get 503 +
       # Retry-After instead of evicting it, for at most LAYA_MAX_HOLD_S
-      # counted from the job's start (0 = no cap).
+      # counted from the job's start (0 = no cap). 900 s: about 6x the measured
+      # jobs (123-140 s, plan Phase 4, 2026-09-25), owner decision.
       - LAYA_TRAINER_URL=http://laya-trainer:11434
       - LAYA_TRAINER_PORT=11438
       - LAYA_TRAINER_CONTAINER=devai-laya-trainer
       - LAYA_TRAINER_IMAGE=${LAYA_TRAINER_IMAGE:-localhost/devai-laya-trainer:latest}
       - LAYA_STORE_DIR=/var/cache/devai/laya
       - LAYA_CATALOG_FILE=/etc/devai/laya-models.yaml
-      - LAYA_MAX_HOLD_S=${LAYA_MAX_HOLD_S:-7200}
+      - LAYA_MAX_HOLD_S=${LAYA_MAX_HOLD_S:-900}
       - LAYA_JOB_TIMEOUT_S=${LAYA_JOB_TIMEOUT_S:-0}
       - NETWORK=devai-net
       - IDLE_TIMEOUT=${IDLE_TIMEOUT:-0}

@@ -283,7 +283,7 @@ itself, its API and its contracts are in [laya-trainer.md](laya-trainer.md).
   and vllm-devai launch paths, Ollama's model and model-less paths, and the
   idle sweep.
   - Deadline: the runner's own `started_at` + `LAYA_MAX_HOLD_S` (default
-    7200; 0 = no cap). Past it the router evicts anyway.
+    900; 0 = no cap). Past it the router evicts anyway.
   - Silence is not absence. A refused connection means nothing listens (the
     compose placeholder, or a controller still starting) and holds nothing. A
     `/health` that times out or errors on all 3 attempts while podman reports
@@ -1037,7 +1037,7 @@ the shell when invoking compose.
 | `MAX_CONCURRENT_REQUESTS`| `32`    | max in-flight requests per backend before HTTP 429; `0` = unlimited **and** omits `--max-num-seqs` / `--max-running-requests` entirely (engine default). Any positive value is also passed to the engine as that flag. |
 | `DEVAI_SSE_KEEPALIVE_SECONDS` | `10` | interval between `: keepalive` SSE comment frames during a slow launch; `0` disables the feature |
 | `DEVAI_SSE_KEEPALIVE_GRACE_SECONDS` | `5` | how long a launch may take before the first frame is sent (and the response is committed as SSE) |
-| `LAYA_MAX_HOLD_S`         | `7200`  | longest a busy job runner may refuse other backends, counted from its job's `started_at`; `0` = no cap. To be set from the first measured job (docs/plans/laya-trainer.md, Phase 4). |
+| `LAYA_MAX_HOLD_S`         | `900`   | longest a busy job runner may refuse other backends, counted from its job's `started_at`; `0` = no cap. Measured jobs held 123-140 s (1,448-1,789 training rows x 4 epochs, 2026-09-25, docs/plans/laya-trainer.md Phase 4); 900 s leaves room for datasets several times larger (owner decision). A job past it fails as `trainer_stopped`. |
 | `LAYA_JOB_TIMEOUT_S`      | `0`     | forwarded to the trainer: per-job wall-clock limit (exit 124); `0` = none |
 | `DEVAI_MAX_FAILED_LAUNCHES` | `3` | consecutive launches of the same `(model, ctx)` that may fail to produce a real engine response before the router refuses; `0` disables the breaker. See [Launch circuit breaker](#launch-circuit-breaker-engine-dies-after-passing-health). |
 

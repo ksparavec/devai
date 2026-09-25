@@ -268,8 +268,9 @@ func layaTrainerBackend(network string) backendConfig {
 			"LAYA_JOB_TIMEOUT_S": env("LAYA_JOB_TIMEOUT_S", "0"),
 		},
 		JobRunner: true,
-		// 0 disables the cap. Set from the first measured job (plan Phase 4).
-		MaxHold: time.Duration(envIntAllowZero("LAYA_MAX_HOLD_S", 7200)) * time.Second,
+		// 0 disables the cap. 900 s: about 6x the jobs measured in plan
+		// Phase 4 (123-140 s), headroom for larger datasets (owner decision).
+		MaxHold: time.Duration(envIntAllowZero("LAYA_MAX_HOLD_S", 900)) * time.Second,
 	}
 }
 

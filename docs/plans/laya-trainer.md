@@ -4,7 +4,7 @@ _Add a GPU training backend to the router so aiagent can fine-tune laya "System 
 
 ## Status
 
-In Progress. Design decisions locked by the owner on 2026-09-24, revised the same day after a review of the plan against the code (see "Owner answers, second round"). **Phases 1-3 are implemented** on branch `feat/laya-trainer` and verified on CPU only (see "Implementation notes"). Phase 4 -- GPU training, the live swap, and the measurement that sets `LAYA_MAX_HOLD_S` -- needs a GPU window and the owner's go-ahead, because it evicts the teacher.
+In Progress. Design decisions locked by the owner on 2026-09-24, revised the same day after a review of the plan against the code (see "Owner answers, second round"). **Phases 1-3 are implemented** (merged in PR #21) and verified on CPU (see "Implementation notes"). Phase 4 has the owner's go-ahead (2026-09-25): GPU training, the live swap and the 503 hold are verified on the synthetic reference dataset (`make laya-check`); the real aiagent campaign and the `LAYA_MAX_HOLD_S` measurement are still open (see Phase 4, "Progress").
 
 ## Dependencies
 
@@ -349,6 +349,17 @@ One real aiagent campaign round runs on this host, and the measurements that set
 ### Exit criteria
 
 - One artifact is produced and accepted by aiagent. The measured numbers are recorded in this plan and in `docs/router.md`, and `LAYA_MAX_HOLD_S` is set.
+
+### Progress (2026-09-25)
+
+- Owner go-ahead given. Before the real campaign, a GPU smoke job ran on aiagent's synthetic 80-row interop dataset (`ds-a6c9c8248242`): the live swap, the 503 hold and GPU training on Python 3.14.7 with the sm_120 torch build (step 4) are verified, and the lab's aiagent 0.5.0 accepted the artifact. Numbers: docs/laya-trainer.md, "Reference check". The owner kept that dataset as the reference for teacher/trainer coordination; `make laya-check` reruns it.
+- The real campaign ran the same day from aiagent's runbook (aiagent 0.5.0 in the lab image; corpus of 2,400 openly licensed multilingual documents; teacher `Qwen3.8-27B-MTP-devai-NVFP4::mtp::nothink@118784`):
+  - Label: 6,177 teacher calls in 23.6 min (k=3, concurrency 4), 0 parse failures; splits 1,448 / 277 / 334 / 341.
+  - Train, three rounds (repair adds the pool rows the student is least sure of): 1,448 / 1,704 / 1,789 train rows x 4 epochs, lean. **Hold (started -> finished) 123 / 136 / 140 s**; of that, training 39 / 45 / 47 s, and parity (334 held-out rows on the CPU) 45 / 50 / 47 s. The job request with the swap: about 3 s; the teacher's cold start afterwards: 2 min 5 s each time, back in exactly the configuration it had.
+  - Peak VRAM: lean 3.2 GiB (torch) / 3.7 GiB (nvidia-smi); fast (one extra job, not evaluated) 6.7 / 8.0 GiB with no speed gain -- lean stays the default.
+  - aiagent verified all three artifacts. Gate at precision 0.95: repair (accuracy 0.731, CP-lower 0.892), repair (0.743, 0.910), stop (0.755, 0.934, no rounds left). The owner then had round 1 re-certified at 0.90: ship, and `distill install` accepted it; 100 shadow calls agreed with the teacher on 0.94 of rows and on all 69 the student would have answered.
+  - Step 3: `LAYA_MAX_HOLD_S` = **900 s** (owner decision): the plan's 1.5x would be 210 s, which a dataset 1.5-2x larger would already exceed; 900 s is about 6x the measured holds.
+- Status stays In Progress (owner decision, taken before the 0.90 re-certification).
 
 ---
 
