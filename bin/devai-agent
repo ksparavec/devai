@@ -115,6 +115,10 @@ NO_PROXY_HOSTS = "devai-router,router,apt-cache,registry-cache,ollama,devai-mcp-
 OLLAMA_HOST = "http://devai-router:11434"
 FALLBACK_MODEL = "qwen3.5:9b-q8_0"
 CONTAINER_USER = "devai"
+# laya trainer store (docs/plans/laya-trainer.md), mounted at /laya: aiagent
+# reads base checkpoints, datasets and runs there and writes datasets to
+# /laya/inbox -- the only model-store mount the lab may write to.
+LAYA_STORE_DIR = Path("/var/cache/devai/laya")
 
 # Agents whose CLI accepts a session file we can persist across runs.
 # Suffix is informational; current agents all use plain text/JSONL.
@@ -284,6 +288,10 @@ def optional_mounts() -> list[str]:
     ):
         if Path(host_path).is_dir():
             out += ["-v", f"{host_path}:{host_path}:ro"]
+    if LAYA_STORE_DIR.is_dir():
+        out += ["-v", f"{LAYA_STORE_DIR}:/laya:ro"]
+        if (LAYA_STORE_DIR / "inbox").is_dir():
+            out += ["-v", f"{LAYA_STORE_DIR / 'inbox'}:/laya/inbox"]
     return out
 
 

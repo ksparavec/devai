@@ -246,9 +246,10 @@ class CacheServicesInSyncTest(unittest.TestCase):
         # used to pin the three-backend set, which is why vllm-devai's
         # absence went unnoticed until a loaded vllm-devai model made
         # `make cache-up` abort on the name collision (2026-09-22).
+        # laya-trainer (the job runner) is recreated the same way.
         backends = self._makefile_var("CACHE_BACKEND_SERVICES")
         self.assertTrue(backends <= self._makefile_var("CACHE_SERVICES"))
-        self.assertEqual(backends, {"ollama", "vllm", "vllm-devai", "sglang"})
+        self.assertEqual(backends, {"ollama", "vllm", "vllm-devai", "laya-trainer", "sglang"})
 
 
 if __name__ == "__main__":

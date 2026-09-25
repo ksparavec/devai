@@ -131,6 +131,14 @@ type backendConfig struct {
 	// launch config (e.g. Ollama's OLLAMA_CONTEXT_LENGTH baked from the
 	// probed ctx). Merged over EnvVars at buildContainerSpec time.
 	DynamicEnv func(lc launchConfig) map[string]string
+	// JobRunner marks a backend that holds the GPU for a JOB, not for
+	// requests (the laya trainer): model-agnostic, accepts an empty-body
+	// POST, and holds the GPU while its /health says busy. See
+	// job_runner.go.
+	JobRunner bool
+	// MaxHold caps how long a busy job runner may refuse other backends,
+	// counted from the job's started_at. 0 = no cap.
+	MaxHold time.Duration
 }
 
 type configModel struct {
@@ -869,6 +877,16 @@ type backendState struct {
 	imageStale         bool
 	probedImageDigest  string
 	runningImageDigest string
+	// Job runners only (guarded by arbiter.mu; see gpuHeldBy): the last
+	// busy /health answer, kept so a missed probe does not hand the GPU
+	// away mid-job; when that job was first seen busy and when the runner
+	// went silent (the hold deadline's fallback starts); and the last hold
+	// verdict with its time, so a burst of refused requests costs one probe.
+	lastBusy      *jobRunnerHealth
+	busySeenAt    time.Time
+	silentSince   time.Time
+	heldVerdict   *gpuHeldError
+	holdCheckedAt time.Time
 }
 
 type arbiter struct {
@@ -985,6 +1003,12 @@ type arbiter struct {
 	// containerState. Tests only -- see backend_vanished_test.go. nil in
 	// production, so the real path is what ships.
 	containerStateStub func(name string) (string, int, bool)
+	// holdCacheTTL is how long a job runner's hold verdict is reused
+	// before its /health is probed again (job_runner.go); 0 = never. In
+	// production it equals Retry-After (30 s), comfortably longer than
+	// the worst-case probe (~7 s under a.mu for a silent runner). Only
+	// holds are cached, so this never delays an eviction.
+	holdCacheTTL time.Duration
 	// weightWarned tracks which backends have already logged the
 	// "models dir not visible" degradation in checkModelWeights, so an
 	// unmounted store costs one log line rather than one per request.
@@ -1769,7 +1793,11 @@ func buildArbiter() *arbiter {
 			HealthPath:    "/health",
 			Entrypoint:    sglangEntrypoint,
 		},
+		// The laya trainer: a job runner, not an inference engine. See
+		// job_runner.go and docs/plans/laya-trainer.md.
+		layaTrainerBackend(network),
 	}
+	layaCatalogPath := env("LAYA_CATALOG_FILE", "/etc/devai/laya-models.yaml")
 
 	// Build model size, context, and reasoning capability lookups from catalog.
 	// Reasoning capability comes from the runtime probe written by
@@ -1958,6 +1986,7 @@ func buildArbiter() *arbiter {
 		pluginRegistry:       pluginRegistry,
 		recoveryRegistry:     recoveryRegistry,
 		healthClient:         &http.Client{Timeout: 2 * time.Second},
+		holdCacheTTL:         jobHoldRetryAfter * time.Second,
 	}
 
 	// Image-drift detection (Phase C): compare each HF backend's running
@@ -1982,6 +2011,12 @@ func buildArbiter() *arbiter {
 			probedImageDigest:  probed,
 			runningImageDigest: running,
 		}
+		if bc.JobRunner {
+			// Base checkpoints come from their own catalog, not from a
+			// probe cache (there is nothing to probe: a job runner holds
+			// the whole GPU for its job).
+			bs.modelNames = loadLayaModelNames(layaCatalogPath)
+		}
 		// Every backend gets the credit callback, Ollama included: the
 		// breaker is generic over backendState, so a backend whose proxy
 		// never credited would be refused after maxFailedLaunches
@@ -1993,9 +2028,14 @@ func buildArbiter() *arbiter {
 			bs.proxy = newSmartProxy(bc.BackendURL, stale, onServed)
 		}
 		// Vetted advertisement subset. Computed after modelNames and the
-		// weight/bench indexes exist; see advertise.go.
-		bs.advertised = a.advertisedNames(bs)
-		a.logAdvertisementGap(bs, bs.advertised)
+		// weight/bench indexes exist; see advertise.go. A job runner has
+		// no bench rows to vet by: its catalog is the whole offer.
+		if bc.JobRunner {
+			bs.advertised = bs.modelNames
+		} else {
+			bs.advertised = a.advertisedNames(bs)
+			a.logAdvertisementGap(bs, bs.advertised)
+		}
 		a.backends[bc.Name] = bs
 	}
 
@@ -2147,7 +2187,12 @@ func (a *arbiter) reconcileBackendState() {
 			a.reconcileOllamaState(bs) // see ollama_state.go
 			continue
 		}
-		if !a.backendIsServing(bs) {
+		// A job runner is adopted unless nothing listens: one that is busy
+		// and slow to answer at this very moment still holds the GPU.
+		if bs.config.JobRunner && !a.jobRunnerPresent(bs) {
+			continue
+		}
+		if !bs.config.JobRunner && !a.backendIsServing(bs) {
 			continue
 		}
 		bs.running = true
@@ -2223,6 +2268,16 @@ func (a *arbiter) containerState(name string) (status string, exitCode int, ok b
 		return "", 0, false
 	}
 	defer resp.Body.Close()
+	// 404: no such container -- known, and not running (status ""). Any other
+	// error status is podman failing to answer: unknown, not gone. (An error
+	// body used to decode to status "", which read as gone.)
+	if resp.StatusCode == http.StatusNotFound {
+		return "", 0, true
+	}
+	if resp.StatusCode >= 300 {
+		log.Printf("warning: containerState %s: podman answered %s", name, resp.Status)
+		return "", 0, false
+	}
 	var info struct {
 		State struct {
 			Status   string `json:"Status"`
@@ -2630,6 +2685,20 @@ func (a *arbiter) backendVanished(bs *backendState) (bool, string) {
 	if status != "running" {
 		return true, fmt.Sprintf("container %s", status)
 	}
+	// A job runner's running container holds the GPU whether or not its
+	// /health answers in time: a controller busy packaging on every core
+	// can miss probes mid-job, and declaring it gone would let the next
+	// switch launch an engine onto its GPU -- or recreate it under its job.
+	// Only "nothing listens" means gone: compose put the `sleep infinity`
+	// placeholder back under a router that still thinks the runner is up.
+	// A controller mid-job always listens. Whether it HOLDS the GPU is
+	// gpuHeldBy's question, not this one.
+	if bs.config.JobRunner {
+		if _, err := a.probeJobRunner(bs); err != nil && probeRefused(err) {
+			return true, "nothing listens on its port (placeholder)"
+		}
+		return false, ""
+	}
 
 	// Container is up: is the engine answering? Retry before condemning
 	// it -- see healthProbeAttempts.
@@ -2853,6 +2922,13 @@ func (a *arbiter) containerRecreate(bs *backendState, modelName string, desiredC
 	a.containerStop(cfg.ContainerName)
 	a.containerRemove(cfg.ContainerName)
 
+	if cfg.JobRunner {
+		// Nothing to size: a job runner takes the whole GPU for its job and
+		// has no model, context or parser to launch with (job_runner.go).
+		log.Printf("  %s launch (job runner)", cfg.Name)
+		return 0, a.createAndStart(cfg, buildContainerSpec(cfg, modelName, launchConfig{}, nil, nil))
+	}
+
 	modelSizeGB := a.modelSizes[cfg.Name][modelName]
 	requestedCtx := a.requestedContext(cfg.Name, modelName, desiredCtx)
 	lc := computeLaunchConfig(modelSizeGB, a.totalVRAMGB, cfg.Name, requestedCtx)
@@ -2911,13 +2987,21 @@ func (a *arbiter) containerRecreate(bs *backendState, modelName string, desiredC
 		lc.ReasoningParser, lc.ToolParser, lc.ToolParserPlugin)
 
 	spec := buildContainerSpec(cfg, modelName, lc, pluginVolume, recoveryEnv)
+	if err := a.createAndStart(cfg, spec); err != nil {
+		return 0, err
+	}
+	return lc.MaxContext, nil
+}
 
+// createAndStart creates the backend container from `spec` through libpod
+// and starts it.
+func (a *arbiter) createAndStart(cfg backendConfig, spec map[string]any) error {
 	body, err := json.Marshal(spec)
 	if err != nil {
 		// A marshal failure would otherwise POST a nil body to libpod,
 		// which silently creates a container with no entrypoint -- the
 		// next request then 502s with no obvious cause. Fail loud.
-		return 0, fmt.Errorf("marshal container spec for %s: %w", cfg.ContainerName, err)
+		return fmt.Errorf("marshal container spec for %s: %w", cfg.ContainerName, err)
 	}
 	resp, err := a.podmanClient.Post(
 		"http://d/v4.0.0/libpod/containers/create",
@@ -2925,25 +3009,25 @@ func (a *arbiter) containerRecreate(bs *backendState, modelName string, desiredC
 		bytes.NewReader(body),
 	)
 	if err != nil {
-		return 0, fmt.Errorf("podman create %s: %w", cfg.ContainerName, err)
+		return fmt.Errorf("podman create %s: %w", cfg.ContainerName, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
 		respBody, _ := io.ReadAll(resp.Body)
-		return 0, fmt.Errorf("podman create %s: %s %s", cfg.ContainerName, resp.Status, respBody)
+		return fmt.Errorf("podman create %s: %s %s", cfg.ContainerName, resp.Status, respBody)
 	}
 
 	startURL := fmt.Sprintf("http://d/v4.0.0/libpod/containers/%s/start", cfg.ContainerName)
 	resp2, err := a.podmanClient.Post(startURL, "", nil)
 	if err != nil {
-		return 0, fmt.Errorf("podman start %s: %w", cfg.ContainerName, err)
+		return fmt.Errorf("podman start %s: %w", cfg.ContainerName, err)
 	}
 	defer resp2.Body.Close()
 	if resp2.StatusCode >= 300 && resp2.StatusCode != http.StatusNotModified {
 		respBody, _ := io.ReadAll(resp2.Body)
-		return 0, fmt.Errorf("podman start %s: %s %s", cfg.ContainerName, resp2.Status, respBody)
+		return fmt.Errorf("podman start %s: %s %s", cfg.ContainerName, resp2.Status, respBody)
 	}
-	return lc.MaxContext, nil
+	return nil
 }
 
 func (a *arbiter) waitForHealthy(bs *backendState, timeout time.Duration) error {
@@ -2990,6 +3074,20 @@ func (a *arbiter) waitForHealthy(bs *backendState, timeout time.Duration) error 
 // timeout (or any other error) stays 503, which clients may legitimately retry.
 func (a *arbiter) writeLaunchError(w http.ResponseWriter, err error) {
 	log.Printf("error: %v", err)
+	// A training job holds the GPU (job_runner.go): retryable, and the
+	// client is told when to come back.
+	var held *gpuHeldError
+	if errors.As(err, &held) {
+		body, _ := json.Marshal(map[string]any{
+			"error": map[string]any{"type": "server_error", "code": "gpu_held_by_job",
+				"message": err.Error()},
+		})
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", strconv.Itoa(jobHoldRetryAfter))
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write(body)
+		return
+	}
 	status := http.StatusServiceUnavailable
 	errType := "server_error"
 	var lf *launchFailure
@@ -3134,7 +3232,33 @@ func (a *arbiter) drainBackend(bs *backendState) {
 	}
 }
 
-func (a *arbiter) stopOtherBackends(targetName string) {
+// stopOtherBackends frees the GPU for `targetName`, or returns a
+// *gpuHeldError when a busy job runner holds it (see job_runner.go); in
+// that case nothing has been stopped.
+func (a *arbiter) stopOtherBackends(targetName string) error {
+	// Job runners first, so a hold refuses the switch before anything is
+	// touched. Each is DRAINED before its /health is read: a job
+	// submission in flight to it may be the very request that makes it
+	// busy, and reading "ok" before it landed would kill the job it was
+	// about to start.
+	for name, bs := range a.backends {
+		if name == targetName || !bs.config.JobRunner {
+			continue
+		}
+		for bs.recreating {
+			bs.recreateCond.Wait()
+		}
+		if !bs.running && !bs.containerLaunched {
+			continue
+		}
+		if held := a.cachedHold(bs); held != nil {
+			return held
+		}
+		a.drainBackend(bs)
+		if held := a.gpuHeldBy(bs); held != nil {
+			return held
+		}
+	}
 	for name, bs := range a.backends {
 		if name == targetName {
 			continue
@@ -3172,10 +3296,12 @@ func (a *arbiter) stopOtherBackends(targetName string) {
 		bs.running = false
 		bs.currentModel = ""
 		bs.currentContext = 0
+		bs.clearHold()
 		if stopped {
 			bs.containerLaunched = false
 		}
 	}
+	return nil
 }
 
 // ensureBackendRunning makes sure the target backend is up with the given
@@ -3230,6 +3356,7 @@ func (a *arbiter) ensureBackendRunning(bs *backendState, modelName string, desir
 			bs.currentModel = ""
 			bs.currentContext = 0
 			bs.currentSpec = nil
+			bs.clearHold()
 		}
 	}
 
@@ -3242,9 +3369,13 @@ func (a *arbiter) ensureBackendRunning(bs *backendState, modelName string, desir
 	// The context test compares LAUNCHED against LAUNCHED: bs.currentContext
 	// holds the ctx the running container was actually built with, so the
 	// candidate must be run through the same clamps before comparing.
-	modelChanged := modelName != "" && bs.currentModel != modelName
+	//
+	// A job runner is model-agnostic: the name is a job setting, never a
+	// launch setting, so only "is it running" decides (job_runner.go).
+	jobRunner := bs.config.JobRunner
+	modelChanged := !jobRunner && modelName != "" && bs.currentModel != modelName
 	resolvedCtx := 0
-	if modelName != "" {
+	if modelName != "" && !jobRunner {
 		resolvedCtx = a.resolveLaunchContext(bs.config.Name, modelName, desiredCtx)
 	}
 	contextChanged := resolvedCtx > 0 && bs.currentContext > 0 && bs.currentContext != resolvedCtx
@@ -3262,6 +3393,14 @@ func (a *arbiter) ensureBackendRunning(bs *backendState, modelName string, desir
 	// (the mux catch-all never runs the POST-body block, so modelName is
 	// ""), so that eviction was reachable from any liveness checker.
 	if modelName == "" {
+		if jobRunner {
+			// Status reads (GET job, events, list) carry no model. They
+			// never launch the runner: that would evict the teacher to
+			// answer what the volume already answers.
+			return fmt.Errorf("%s is not running, and a request without a model never "+
+				"launches it; job records are on the volume at /laya/runs/<job>/job.json",
+				bs.config.Name)
+		}
 		return fmt.Errorf("model name required for %s", bs.config.Name)
 	}
 
@@ -3270,7 +3409,18 @@ func (a *arbiter) ensureBackendRunning(bs *backendState, modelName string, desir
 	// request is not going to succeed on attempt N+1, and each attempt
 	// costs a full cold start. Refuse with a message that names the
 	// model and the remedy instead of looping. See maxFailedLaunches.
-	if key := launchKey(modelName, resolvedCtx); bs.launchBudgetExhausted(key) {
+	// A job runner's launch does not depend on the model, so its budget
+	// is per backend.
+	breakerKey := launchKey(modelName, resolvedCtx)
+	if jobRunner {
+		breakerKey = launchKey(bs.config.Name, 0)
+	}
+	if bs.launchBudgetExhausted(breakerKey) {
+		if jobRunner {
+			return fmt.Errorf("%s: its last launches never answered a request, so it is now "+
+				"refused; see `make logs SERVICE=%s`. DEVAI_MAX_FAILED_LAUNCHES=0 disables the guard",
+				bs.config.Name, bs.config.ContainerName)
+		}
 		return fmt.Errorf("%s", refusalMessage(bs, modelName, resolvedCtx))
 	}
 
@@ -3279,12 +3429,18 @@ func (a *arbiter) ensureBackendRunning(bs *backendState, modelName string, desir
 	// the engine would burn a full HEALTH_TIMEOUT_SECONDS cold start and
 	// then die with an opaque "repo not found". This is the live
 	// SGLANG_MODELS_DIR gap (nothing populates that store), so the check
-	// pays for itself there, but it is backend-agnostic.
-	if err := a.checkModelWeights(bs.config, modelName); err != nil {
-		return err
+	// pays for itself there, but it is backend-agnostic. A job runner
+	// verifies its own base checkpoints (and its store is not laid out
+	// one directory per name).
+	if !jobRunner {
+		if err := a.checkModelWeights(bs.config, modelName); err != nil {
+			return err
+		}
 	}
 
-	a.stopOtherBackends(bs.config.Name)
+	if err := a.stopOtherBackends(bs.config.Name); err != nil {
+		return err
+	}
 
 	if bs.currentModel != "" && bs.currentModel != modelName {
 		log.Printf("switching %s model: %s → %s", bs.config.Name, bs.currentModel, modelName)
@@ -3320,7 +3476,7 @@ func (a *arbiter) ensureBackendRunning(bs *backendState, modelName string, desir
 	// (model, ctx) -- reaching /health is not enough, because the failure
 	// this guards against is precisely an engine that becomes healthy and
 	// then dies serving. See maxFailedLaunches.
-	bs.noteLaunchAttempt(launchKey(modelName, resolvedCtx))
+	bs.noteLaunchAttempt(breakerKey)
 
 	launchedCtx, err := a.containerRecreate(bs, modelName, desiredCtx, desiredSpec)
 	if err != nil {
@@ -3350,6 +3506,12 @@ func (a *arbiter) ensureBackendRunning(bs *backendState, modelName string, desir
 	}
 
 	bs.running = true
+	if jobRunner {
+		// Nothing model-specific was launched; the first job's base name
+		// would only mislead /health. A fresh container has no job yet.
+		bs.clearHold()
+		return nil
+	}
 	bs.currentModel = modelName
 	// Record the context the launch config actually settled on (after the
 	// MAX_CONTEXT_LEN clamp, the memory heuristic in computeLaunchConfig,
@@ -3394,7 +3556,9 @@ func (a *arbiter) ensureOllamaRunning(bs *backendState, modelName string, desire
 	// the GPU is ours; there is nothing to load or recreate.
 	if modelName == "" {
 		if !bs.running {
-			a.stopOtherBackends("ollama")
+			if err := a.stopOtherBackends("ollama"); err != nil {
+				return err
+			}
 			bs.running = true
 		}
 		return nil
@@ -3450,7 +3614,9 @@ func (a *arbiter) ensureOllamaRunning(bs *backendState, modelName string, desire
 		return nil
 	}
 
-	a.stopOtherBackends("ollama")
+	if err := a.stopOtherBackends("ollama"); err != nil {
+		return err
+	}
 	if bs.currentModel != "" && modelChanged {
 		log.Printf("switching ollama model: %s → %s", bs.currentModel, modelName)
 	}
@@ -3598,7 +3764,12 @@ func (a *arbiter) makeRequestHandler(backendName string) http.HandlerFunc {
 			var parsed struct {
 				Model string `json:"model"`
 			}
-			if err := json.Unmarshal(body, &parsed); err != nil {
+			// OpenAI's fine-tuning cancel call has no body; a job runner
+			// takes it as a model-less request (job_runner.go). Every other
+			// backend keeps refusing an empty body below.
+			if bs.config.JobRunner && len(bytes.TrimSpace(body)) == 0 {
+				body = nil
+			} else if err := json.Unmarshal(body, &parsed); err != nil {
 				// Malformed JSON would otherwise leave parsed.Model="",
 				// flow through to ensureBackendRunning, and surface as
 				// a confusing HTTP 503 ("model name required"). Fail
@@ -4952,23 +5123,46 @@ func (a *arbiter) makeHealthHandler(backendName string) http.HandlerFunc {
 		a.mu.Lock()
 		running := bs.running
 		model := bs.currentModel
+		// current_context + current_spec let a client recreate exactly the
+		// configuration that was resident before a swap (e.g. the teacher
+		// after a training job).
+		ctx := bs.currentContext
+		spec := specLabel(bs.currentSpec)
 		active := atomic.LoadInt64(&bs.activeReqs)
 		a.mu.Unlock()
 
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"status":        "ok",
-			"backend":       backendName,
-			"running":       running,
-			"current_model": model,
-			"active_reqs":   active,
+		out := map[string]any{
+			"status":          "ok",
+			"backend":         backendName,
+			"running":         running,
+			"current_model":   model,
+			"current_context": ctx,
+			"current_spec":    spec,
+			"active_reqs":     active,
 			// imageStale/probed/running digests are set once in main() before
 			// any listener goroutine starts, so this lock-free read is safe.
 			// If these ever become runtime-mutable, move them under a.mu above.
 			"image_stale":          bs.imageStale,
 			"probed_image_digest":  bs.probedImageDigest,
 			"running_image_digest": bs.runningImageDigest,
-		})
+		}
+		// The router answers /health on every port itself, so a job
+		// runner's own state is relayed: busy or not, and until when it
+		// would hold the GPU. Probed live, outside a.mu.
+		if bs.config.JobRunner && running {
+			if h, err := a.probeJobRunner(bs); err == nil {
+				jr := map[string]any{"status": h.Status, "job": h.Job, "phase": h.Phase,
+					"started_at": h.StartedAt}
+				if h.Status == "busy" && bs.config.MaxHold > 0 && h.StartedAt > 0 {
+					jr["hold_until"] = time.Unix(h.StartedAt, 0).Add(bs.config.MaxHold).Unix()
+				}
+				out["job_runner"] = jr
+			} else {
+				out["job_runner"] = map[string]any{"status": "unreachable", "error": err.Error()}
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(out)
 	}
 }
 
@@ -5006,6 +5200,11 @@ func (a *arbiter) idleSweepOnce() {
 			continue
 		}
 		if atomic.LoadInt64(&bs.activeReqs) > 0 {
+			continue
+		}
+		// A job runner's work is its job, not requests: no request for an
+		// hour says nothing about whether it is still training.
+		if bs.config.JobRunner && a.gpuHeldBy(bs) != nil {
 			continue
 		}
 		log.Printf("%s idle for %s, stopping",

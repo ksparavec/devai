@@ -27,6 +27,7 @@ import argparse
 import datetime as dt
 import os
 import re
+import shutil
 import subprocess
 import time
 import sys
@@ -37,9 +38,11 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
+sys.path.insert(0, str(REPO_ROOT / "laya-trainer"))
 from _capability import Capability  # noqa: E402
 from _contexts import effective_targets as _ctx_effective_targets  # noqa: E402
 import _model_status  # noqa: E402
+from laya_trainer import catalog as _laya  # noqa: E402
 
 CATALOG = REPO_ROOT / "deploy" / "models.yaml"
 PROBE_CACHE = REPO_ROOT / "deploy" / ".ollama-reasoning-cache.json"
@@ -100,6 +103,14 @@ DEFAULT_CANDIDATE_CONTEXTS = "32768,65536,131072,262144"
 #   VLLM_STORE     /var/cache/devai/vllm      HF safetensors served by vLLM
 #   SGLANG_STORE   /var/cache/devai/sglang    HF safetensors served by SGLang
 #
+# Plus one store that no inference engine reads:
+#
+#   LAYA_STORE     /var/cache/devai/laya      laya trainer: base checkpoints,
+#                                             datasets, runs (docs/plans/
+#                                             laya-trainer.md). A plain
+#                                             directory, not its own LV, by
+#                                             owner decision (2026-09-24).
+#
 # Every path is WRITTEN OUT. None is computed from another (`.parent` and
 # friends are banned here) and none can be moved by an environment variable.
 # That is a rule with a cost attached: GGUF staging used to be
@@ -113,6 +124,17 @@ DEVAI_ROOT = Path("/var/cache/devai")
 OLLAMA_STORE = DEVAI_ROOT / "ollama"
 VLLM_STORE = DEVAI_ROOT / "vllm"
 SGLANG_STORE = DEVAI_ROOT / "sglang"
+LAYA_STORE = DEVAI_ROOT / "laya"
+
+# Inside the laya store. base/ holds `<name>@<revision[:12]>/` checkpoints,
+# read-only once verified; .staging/ is where a download lands before it is
+# verified, so a bad or partial download never appears under base/. inbox/,
+# datasets/ and runs/ belong to aiagent (writes datasets) and the trainer.
+LAYA_BASE = LAYA_STORE / "base"
+LAYA_STAGING = LAYA_STORE / ".staging"
+LAYA_LAYOUT = ("base", "inbox", "datasets", "runs")
+# laya rows are NOT in deploy/models.yaml, whose readers all assume LLM rows.
+LAYA_CATALOG = REPO_ROOT / "deploy" / "laya-models.yaml"
 
 # Inside the Ollama store. devai-ollama mounts OLLAMA_STORE and nothing else
 # (deploy/docker-compose.yaml: /var/cache/devai/ollama:/root/.ollama), so
@@ -519,6 +541,66 @@ def pull_hf(display_name: str, repo: str) -> None:
     print(f"  hf download {repo} → {target} "
           f"(excluding {', '.join(excludes) or 'nothing'}) ...", flush=True)
     run_download(cmd, f"hf download {repo}")
+
+
+def pull_laya(row: dict) -> Path:
+    """Download one laya base checkpoint (a deploy/laya-models.yaml row).
+
+    Unlike pull_hf, everything is pinned: the commit (`--revision`) and the
+    exact file list (passed as FILENAMES, so no glob can widen it). The files
+    land in .staging/ first and are checked for size and sha256 BEFORE any of
+    them reaches base/; only the listed files are moved (the repo subfolder is
+    stripped, hf's own `.cache/` stays behind), then the checkpoint is made
+    read-only. Returns the checkpoint directory.
+    """
+    for sub in LAYA_LAYOUT:
+        (LAYA_STORE / sub).mkdir(parents=True, exist_ok=True)
+    dirname = _laya.checkpoint_dirname(row)
+    target = LAYA_BASE / dirname
+    staging = LAYA_STAGING / dirname
+    if target.is_dir():
+        problems = _laya.verify_dir(target, row)
+        if not problems:
+            # A run killed between the rename below and its cleanup leaves the
+            # (now empty) staging dir behind; this is the next chance to drop it.
+            shutil.rmtree(staging, ignore_errors=True)
+            print(f"  {row['name']}: already present and verified at {target}", flush=True)
+            return target
+        sys.exit(f"error: {target} exists but does not match the catalog "
+                 f"({'; '.join(problems)}). It is never overwritten in place: "
+                 f"remove it (`chmod -R u+w` first) and pull again.")
+
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True)
+    rev12 = row["revision"][:12]
+    cmd = [HF_CLI, "download", row["repo"], *_laya.repo_paths(row),
+           "--revision", row["revision"], "--local-dir", str(staging)]
+    print(f"  hf download {row['repo']}@{rev12} ({row['subfolder'] or 'repo root'}, "
+          f"{len(row['files'])} files) → {staging} ...", flush=True)
+    run_download(cmd, f"hf download {row['repo']}@{rev12}")
+
+    src = staging / row["subfolder"] if row["subfolder"] else staging
+    problems = _laya.verify_dir(src, row)
+    if problems:
+        shutil.rmtree(staging)
+        sys.exit(f"error: {row['name']}@{rev12} does not match the catalog: "
+                 f"{'; '.join(problems)}. Nothing was installed.")
+
+    # Assemble under a hidden name in base/ and rename into place, so a
+    # half-moved checkpoint can never be mistaken for a real one.
+    incoming = LAYA_BASE / f".incoming-{dirname}"
+    if incoming.exists():
+        _laya.make_writable(incoming)
+        shutil.rmtree(incoming)
+    for rel in row["files"]:
+        os.makedirs(os.path.dirname(incoming / rel), exist_ok=True)
+        os.replace(src / rel, incoming / rel)
+    _laya.make_read_only(incoming)
+    os.rename(incoming, target)
+    shutil.rmtree(staging)
+    print(f"  {row['name']}: verified and installed read-only at {target}", flush=True)
+    return target
 
 
 def pull_gguf(display_name: str, repo: str, filename: str, family: str,
@@ -1957,7 +2039,22 @@ def main() -> None:
     if args.name:
         match = [m for m in models if m.get("name") == args.name]
         if not match:
-            sys.exit(f"error: no model named '{args.name}' in catalog")
+            try:
+                laya_row = _laya.find(_laya.load_catalog(LAYA_CATALOG), args.name)
+            except (OSError, _laya.CatalogError) as e:
+                sys.exit(f"error: no model named '{args.name}' in {CATALOG.name}, and "
+                         f"{LAYA_CATALOG.name} could not be read to look further: {e}")
+            if laya_row is None:
+                sys.exit(f"error: no model named '{args.name}' in {CATALOG.name} "
+                         f"or {LAYA_CATALOG.name}")
+            if not args.download:
+                sys.exit("error: --name requires --download (the Makefile passes it)")
+            if args.dry_run:
+                print(f"  --dry-run: would pull laya base {args.name} "
+                      f"({laya_row['repo']}@{laya_row['revision'][:12]})")
+            else:
+                pull_laya(laya_row)
+            return
         if not args.download:
             sys.exit("error: --name requires --download (the Makefile passes it)")
         # After the name is known to be real, before anything is pulled: this

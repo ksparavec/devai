@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"strings"
@@ -193,12 +194,20 @@ func (k *sseKeepalive) stop() bool {
 func writeSSELaunchError(w http.ResponseWriter, path string, err error) {
 	log.Printf("error (in-band, response already committed as SSE): %v", err)
 
+	errBody := map[string]any{
+		"type":    "server_error",
+		"message": err.Error(),
+	}
+	// Headers are committed, so a GPU hold cannot send Retry-After; the
+	// code and the interval travel in the payload instead (job_runner.go).
+	var held *gpuHeldError
+	if errors.As(err, &held) {
+		errBody["code"] = "gpu_held_by_job"
+		errBody["retry_after"] = jobHoldRetryAfter
+	}
 	payload, _ := json.Marshal(map[string]any{
-		"type": "error",
-		"error": map[string]any{
-			"type":    "server_error",
-			"message": err.Error(),
-		},
+		"type":  "error",
+		"error": errBody,
 	})
 
 	var frame string

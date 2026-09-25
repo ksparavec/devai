@@ -129,8 +129,11 @@ MEM_BUDGET_SLACK = 1.05
 
 # Containers that must be down before a probe runs — they all hold the
 # single GPU and would race the prober's launch. Keep this list in sync
-# with deploy/docker-compose.yaml service names.
-MUTEX_CONTAINERS = ("devai-router", "devai-vllm", "devai-sglang")
+# with deploy/docker-compose.yaml service names: every container that can
+# hold the GPU belongs here. devai-vllm-devai and devai-ollama were missing
+# until the laya trainer (devai-laya-trainer) was added (2026-09-24).
+MUTEX_CONTAINERS = ("devai-router", "devai-vllm", "devai-vllm-devai", "devai-sglang",
+                    "devai-ollama", "devai-laya-trainer")
 
 
 # ── Recovery flags registry ──────────────────────────────────────────────────

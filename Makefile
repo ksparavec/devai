@@ -90,15 +90,16 @@ CACHE_COMPOSE = $(CURDIR)/deploy/docker-compose.yaml
 # router-managed-container note in that target. Keep in sync with
 # deploy/docker-compose.yaml; `make cache-services-check` asserts it.
 # mcp-gateway is deliberately absent: it sits behind the `mcp` profile.
-CACHE_SERVICES = apt-cache registry-cache ollama vllm vllm-devai sglang router \
+CACHE_SERVICES = apt-cache registry-cache ollama vllm vllm-devai laya-trainer sglang router \
                  open-webui webui-proxy logger pipelock
 
-# The four the router recreates on demand. cache-up skips any of these
+# The five the router recreates on demand. cache-up skips any of these
 # that already exist rather than colliding with the router's container.
 # vllm-devai was missing here from its introduction (449270a) until
 # 2026-09-22: with a vllm-devai model loaded, every `make cache-up` died on
-# the name collision before it reached the router.
-CACHE_BACKEND_SERVICES = ollama vllm vllm-devai sglang
+# the name collision before it reached the router. laya-trainer is the job
+# runner (docs/plans/laya-trainer.md).
+CACHE_BACKEND_SERVICES = ollama vllm vllm-devai laya-trainer sglang
 INFERENCE_CONFIG = deploy/models.yaml
 HF_CLI = hf
 # vLLM and SGLang safetensors live on their OWN external volumes
@@ -198,6 +199,8 @@ RUN_FLAGS =
 MODEL_CACHE_MOUNT = $(if $(wildcard $(CACHE_DIR)/ollama),-v $(CACHE_DIR)/ollama:/var/cache/devai/ollama:ro) \
 	$(if $(wildcard $(VLLM_MODELS_DIR)),-v $(VLLM_MODELS_DIR):/var/cache/devai/vllm:ro) \
 	$(if $(wildcard $(SGLANG_MODELS_DIR)),-v $(SGLANG_MODELS_DIR):/var/cache/devai/sglang:ro) \
+	$(if $(wildcard $(CACHE_DIR)/laya),-v $(CACHE_DIR)/laya:/laya:ro) \
+	$(if $(wildcard $(CACHE_DIR)/laya/inbox),-v $(CACHE_DIR)/laya/inbox:/laya/inbox) \
 	-e VLLM_MODELS_DIR=/var/cache/devai/vllm -e SGLANG_MODELS_DIR=/var/cache/devai/sglang
 
 # Read-only mount of the probe caches so the in-container picker can
@@ -246,6 +249,7 @@ endif
 # Compose settings
 
 .PHONY: all build build-cpu build-gpu build-base-cpu build-base-gpu build-router
+.PHONY: build-laya-trainer test-laya-trainer laya-trainer-lock
 .PHONY: lab-cpu lab-gpu shell-cpu shell-gpu
 .PHONY: cache-up cache-down cache-status cache-clean logs setup-logs
 .PHONY: ollama-rm ollama-list ollama-status ollama-clean ollama-df
@@ -1066,6 +1070,10 @@ cache-up: ## Start all infrastructure (caches + Ollama + router + Open WebUI; vL
 	  if [ "$$key" = /dev/null ]; then echo "NOTE: pipelock CA key not found ($(PIPELOCK_CA_KEY)); devai-pipelock stays unhealthy until 'make pipelock-ca-init'."; fi; \
 	  svcs=""; \
 	  for s in $(CACHE_SERVICES); do \
+	    if [ "$$s" = laya-trainer ] && ! $(CONTAINER_RUNTIME) image exists $(LAYA_TRAINER_IMAGE); then \
+	      echo "  note: $(LAYA_TRAINER_IMAGE) not built ('make build-laya-trainer'); skipping the laya-trainer placeholder"; \
+	      continue; \
+	    fi; \
 	    case " $(CACHE_BACKEND_SERVICES) " in \
 	      *" $$s "*) \
 	        if $(CONTAINER_RUNTIME) container exists devai-$$s 2>/dev/null; then \
@@ -1081,6 +1089,7 @@ cache-up: ## Start all infrastructure (caches + Ollama + router + Open WebUI; vL
 	@echo "  Router:            devai-router:11434 (unified endpoint)"
 	@echo "  Ollama:            devai-ollama:11434 (GGUF models)"
 	@echo "  vLLM/SGLang:       devai-router:11435 / 11436 (recreated on first request — see docs/backends.md)"
+	@echo "  laya trainer:      devai-router:11438 (job runner, recreated on the first job -- see docs/laya-trainer.md)"
 	@echo "  Open WebUI:        https://localhost:$(WEBUI_PORT)"
 	@echo "  Logger:            $(CACHE_DIR)/logs/<container>.log (per-service stdout)"
 	@echo ""
@@ -1112,7 +1121,11 @@ cache-down: ## Stop and remove ALL infrastructure services (running, stopped, or
 	@# recreated container survived cache-down holding 21.8 GiB, every
 	@# probe launch failed kind=infra and the next cache-up died on the
 	@# name collision).
-	@for name in devai-vllm devai-sglang devai-ollama devai-vllm-devai; do \
+	@#
+	@# devai-laya-trainer: the job runner. Removing it kills a running
+	@# training job (its epoch checkpoints stay in the run directory) -- the
+	@# alternative, a job outliving cache-down with the GPU, is worse.
+	@for name in devai-vllm devai-sglang devai-ollama devai-vllm-devai devai-laya-trainer; do \
 		$(CONTAINER_RUNTIME) rm -f $$name >/dev/null 2>&1 || true; \
 	done
 
@@ -1750,6 +1763,38 @@ vllm-df: ## Show vLLM models disk usage
 		printf "  %-45s %s\n" "$$(basename $$dir)" "$$(du -sh $$dir | cut -f1)"; \
 	done
 
+
+# laya trainer backend (docs/plans/laya-trainer.md). A separate image on the
+# lab's GPU base, NOT an extension of the lab image. Its Python packages come
+# from a hash lock (laya-trainer/requirements.lock), installed with
+# --require-hashes; SOURCE_ID is recorded in every artifact manifest.
+LAYA_TRAINER_IMAGE ?= localhost/devai-laya-trainer:latest
+
+build-laya-trainer: build-base-gpu ## Build the laya trainer image (devai-laya-trainer) on the lab's GPU base image
+	$(CONTAINER_RUNTIME) build --network=host \
+		$(PROXY_BUILD_ARGS) \
+		-v $(CACHE_DIR)/pip:/root/.cache/uv \
+		--build-arg BASE_IMAGE=$(BASE_IMAGE_NAME_GPU) \
+		--build-arg SOURCE_ID=$$(cat laya-trainer/requirements.lock deploy/laya-models.yaml laya-trainer/laya_trainer/*.py | sha256sum | cut -c1-16) \
+		-f deploy/Dockerfile.laya-trainer \
+		-t $(LAYA_TRAINER_IMAGE) .
+
+test-laya-trainer: ## Run the laya trainer's unit tests inside its image, on CPU, without network (uses the working tree's sources)
+	$(CONTAINER_RUNTIME) run --rm --network=none \
+		-e LAYA_TRAINER_DEVICE=cpu \
+		-v $(CURDIR)/laya-trainer:/opt/laya-trainer:ro \
+		-v $(CURDIR)/deploy/laya-models.yaml:/etc/devai/laya-models.yaml:ro \
+		$(LAYA_TRAINER_IMAGE) \
+		python -m unittest discover -s /opt/laya-trainer/laya_trainer/tests -t /opt/laya-trainer $(if $(VERBOSE),-v,)
+
+laya-trainer-lock: ## Regenerate laya-trainer/requirements.lock (hash-locked) from requirements.in, inside the GPU base image
+	$(CONTAINER_RUNTIME) run --rm --network=host \
+		-v $(CURDIR)/laya-trainer:/src \
+		-v $(CACHE_DIR)/pip:/root/.cache/uv \
+		$(BASE_IMAGE_NAME_GPU) \
+		uv pip compile /src/requirements.in --generate-hashes \
+			--python-version $(PYTHON_VERSION) --python-platform x86_64-manylinux_2_28 \
+			--custom-compile-command "make laya-trainer-lock" -o /src/requirements.lock
 
 build-router: ## Build the gpu-arbiter router image
 	$(CONTAINER_RUNTIME) build --network=host \

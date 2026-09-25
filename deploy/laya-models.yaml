@@ -1,0 +1,72 @@
+# laya base checkpoints -- the ONLY catalog for the laya trainer backend.
+#
+# Hand-written, deliberately NOT part of deploy/models.yaml: every reader of
+# that catalog (model-picker, model-fit, model-sync, bench discovery, the
+# model-status MCP server) assumes LLM rows, and generate-catalog.py refuses a
+# family without an LLM arch_ref. See docs/plans/laya-trainer.md.
+#
+# Read by:
+#   scripts/select-models.py   `make model-pull NAME=<name>` downloads a row into
+#                              /var/cache/devai/laya/base/<name>@<revision[:12]>/
+#   gpu-arbiter                the trainer backend's model allowlist
+#   laya-trainer               base checkpoint verification (baked into the image)
+#
+# Every row pins a full commit and the sha256 + size of every file, so a
+# download can never silently change a student's base. Values checked against
+# upstream on 2026-09-24: each LFS file's sha256 equals its LFS oid, and each
+# small file's git blob id equals the repo tree's at this revision.
+#
+# The tokenizer_config.json files at this revision already have the shape
+# laya's _fix_tokenizer_config() produces (verified: it leaves them
+# byte-identical), so the read-only base needs no fix-up at staging.
+
+schema_version: 1
+
+models:
+  - name: laya-multilingual
+    default: true
+    repo: convaiinnovations/laya
+    revision: 55cf4c4ebb4ebe31b2550e8bdf3bd21b99753851
+    subfolder: multilingual
+    encoder: jhu-clsp/mmBERT-base
+    license: Apache-2.0
+    files:
+      model.safetensors:
+        sha256: 9d628fd971b700382ac6f65920a86f149777b2e748e0c955fb3b19695aa8f204
+        size: 643835514
+      rl_agent_config.json:
+        sha256: 25061739243b617ad88d1219ba6f8a9c86c5881ca28df024fa2d9b3b2fcc30c6
+        size: 472
+      encoder/config.json:
+        sha256: 83f6916d13ef0f556ac461f28308dc2bffa7ebeadee8ec9e2db5812020ea5bb4
+        size: 1938
+      tokenizer/tokenizer.json:
+        sha256: 609d8f4c067cd3950f88594c5a802616cea245823836ef5848ee4fc40aab5b6f
+        size: 34363188
+      tokenizer/tokenizer_config.json:
+        sha256: 6c6b2d8e3c84ce0e671c129cd6b374b235d6f9863042a5836358d00a89bbb5a1
+        size: 524
+
+  - name: laya-english
+    default: false
+    repo: convaiinnovations/laya
+    revision: 55cf4c4ebb4ebe31b2550e8bdf3bd21b99753851
+    subfolder: ""
+    encoder: answerdotai/ModernBERT-large
+    license: Apache-2.0
+    files:
+      model.safetensors:
+        sha256: 891102d372688fc2a094dac56a384bc537b87c63f21f9f3dac0be2b7cbc8d86c
+        size: 842609210
+      rl_agent_config.json:
+        sha256: ae287b56bbcf5f8c4f4541ae9dfd00c914c4c48b940b8398c3058af37ba92bbd
+        size: 745
+      encoder/config.json:
+        sha256: bf3ab80598fdccf414855a2ce80f22859e4492d06ca8a62ddd1cfb63972f8979
+        size: 2083
+      tokenizer/tokenizer.json:
+        sha256: 6c8aaa9a542084f2457eab775d4eeb51f92a70c0fd9de28d5edb0ddec3c08d30
+        size: 3583228
+      tokenizer/tokenizer_config.json:
+        sha256: 50044de60daaa73df97d262e15a40d4faf0160e7d742df64b377877a1320dd12
+        size: 308

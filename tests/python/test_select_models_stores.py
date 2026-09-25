@@ -228,6 +228,15 @@ class StorageLayoutTest(unittest.TestCase):
         self.assertEqual(sm.VLLM_STORE, Path("/var/cache/devai/vllm"))
         self.assertEqual(sm.SGLANG_STORE, Path("/var/cache/devai/sglang"))
 
+    def test_the_laya_store(self) -> None:
+        # Not a backend store for an engine: the laya trainer's base
+        # checkpoints, datasets and runs. A plain directory by owner decision
+        # (2026-09-24), but written out like the others all the same.
+        self.assertEqual(sm.LAYA_STORE, Path("/var/cache/devai/laya"))
+        self.assertEqual(sm.LAYA_BASE, Path("/var/cache/devai/laya/base"))
+        self.assertEqual(sm.LAYA_STAGING, Path("/var/cache/devai/laya/.staging"))
+        self.assertEqual(sm.LAYA_CATALOG, REPO_ROOT / "deploy" / "laya-models.yaml")
+
     def test_hf_stores_are_exactly_the_vllm_and_sglang_stores(self) -> None:
         # Three HF backends, TWO directories: vllm-devai (the home-built
         # vLLM image) serves the vLLM store. No fourth directory exists.
@@ -284,6 +293,7 @@ class StorageLayoutTest(unittest.TestCase):
         self.assertEqual(fresh.SGLANG_STORE, Path("/var/cache/devai/sglang"))
         self.assertEqual(fresh.GGUF_STAGING,
                          Path("/var/cache/devai/ollama/models/_gguf"))
+        self.assertEqual(fresh.LAYA_STORE, Path("/var/cache/devai/laya"))
 
     def test_makefile_does_not_pretend_to_steer_the_stores(self) -> None:
         # The script ignores these variables, so a recipe that passes them

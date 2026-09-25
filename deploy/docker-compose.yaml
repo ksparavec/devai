@@ -108,6 +108,26 @@ services:
       - label=disable
     restart: "no"
 
+  # The laya trainer (docs/plans/laya-trainer.md): a JOB runner on router
+  # port 11438, not an inference engine. Same placeholder pattern as the HF
+  # backends -- the router recreates it with the controller on the first job
+  # request -- so the logger follows it and cache-up/-down know it.
+  # `make build-laya-trainer` builds the image (local only, never pulled);
+  # cache-up skips this placeholder until it exists.
+  laya-trainer:
+    image: ${LAYA_TRAINER_IMAGE:-localhost/devai-laya-trainer:latest}
+    pull_policy: never
+    container_name: devai-laya-trainer
+    hostname: laya-trainer
+    volumes:
+      - /var/cache/devai/laya:/laya
+    entrypoint: ["sleep", "infinity"]
+    devices:
+      - ${DEVAI_GPU_DEVICE:-nvidia.com/gpu=all}
+    security_opt:
+      - label=disable
+    restart: "no"
+
   sglang:
     image: ${SGLANG_IMAGE:-docker.io/lmsysorg/sglang:v0.5.16-cu130}
     container_name: devai-sglang
@@ -154,6 +174,18 @@ services:
       - SGLANG_CONTAINER=devai-sglang
       - SGLANG_IMAGE=${SGLANG_IMAGE:-docker.io/lmsysorg/sglang:v0.5.16-cu130}
       - SGLANG_MODELS_DIR=/var/cache/devai/sglang
+      # The laya trainer, a job runner (gpu-arbiter/job_runner.go). While a
+      # job runs, requests that need the GPU for another backend get 503 +
+      # Retry-After instead of evicting it, for at most LAYA_MAX_HOLD_S
+      # counted from the job's start (0 = no cap).
+      - LAYA_TRAINER_URL=http://laya-trainer:11434
+      - LAYA_TRAINER_PORT=11438
+      - LAYA_TRAINER_CONTAINER=devai-laya-trainer
+      - LAYA_TRAINER_IMAGE=${LAYA_TRAINER_IMAGE:-localhost/devai-laya-trainer:latest}
+      - LAYA_STORE_DIR=/var/cache/devai/laya
+      - LAYA_CATALOG_FILE=/etc/devai/laya-models.yaml
+      - LAYA_MAX_HOLD_S=${LAYA_MAX_HOLD_S:-7200}
+      - LAYA_JOB_TIMEOUT_S=${LAYA_JOB_TIMEOUT_S:-0}
       - NETWORK=devai-net
       - IDLE_TIMEOUT=${IDLE_TIMEOUT:-0}
       - DRAIN_TIMEOUT=${DRAIN_TIMEOUT:-30}
@@ -220,6 +252,9 @@ services:
       # into configModel rows (see loadCatalogMTP). Missing file = empty
       # registry = MTP off for everyone; safe degradation.
       - ./models.yaml:/etc/devai/models.yaml:ro
+      # The laya catalog: the trainer's model allowlist (base checkpoint
+      # names). Not part of models.yaml, whose readers assume LLM rows.
+      - ./laya-models.yaml:/etc/devai/laya-models.yaml:ro
       # Plugin registry — the JSON map of parser-name → plugin-file.
       # The host plugin directory is NOT mounted into the router itself;
       # the router only needs the host path string (passed via env) to
