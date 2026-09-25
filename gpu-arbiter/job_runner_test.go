@@ -36,7 +36,7 @@ func newFakeTrainer(t *testing.T, health string) *fakeTrainer {
 		if down {
 			if hj, ok := w.(http.Hijacker); ok {
 				if conn, _, err := hj.Hijack(); err == nil {
-					conn.Close()
+					_ = conn.Close()
 				}
 			}
 			return
@@ -730,7 +730,7 @@ func TestLayaTrainerBackendConfig(t *testing.T) {
 }
 
 func TestLayaTrainerBackendConfig_DefaultHoldIsTwoHours(t *testing.T) {
-	os.Unsetenv("LAYA_MAX_HOLD_S")
+	t.Setenv("LAYA_MAX_HOLD_S", "") // empty = unset: the default applies
 	if bc := layaTrainerBackend("devai-net"); bc.MaxHold != 2*time.Hour {
 		t.Fatalf("default MaxHold %s", bc.MaxHold)
 	}

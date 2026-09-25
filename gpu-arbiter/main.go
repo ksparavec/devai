@@ -3085,7 +3085,7 @@ func (a *arbiter) writeLaunchError(w http.ResponseWriter, err error) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Retry-After", strconv.Itoa(jobHoldRetryAfter))
 		w.WriteHeader(http.StatusServiceUnavailable)
-		w.Write(body)
+		_, _ = w.Write(body)
 		return
 	}
 	status := http.StatusServiceUnavailable
@@ -5162,7 +5162,7 @@ func (a *arbiter) makeHealthHandler(backendName string) http.HandlerFunc {
 			}
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(out)
+		_ = json.NewEncoder(w).Encode(out)
 	}
 }
 

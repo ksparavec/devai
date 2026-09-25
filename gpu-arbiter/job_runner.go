@@ -76,7 +76,7 @@ func (a *arbiter) probeJobRunner(bs *backendState) (*jobRunnerHealth, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("health %s", resp.Status)
