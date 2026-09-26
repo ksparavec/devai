@@ -26,7 +26,7 @@ Given in devai's session unless marked otherwise.
 | D12 | **Rejected items keep a verdict record and no artifacts.** "A negative answer is as valuable as a positive one." |
 | D13 | **Verdict stamps.** Every verdict records the profile version and the model or student that decided. Nothing is re-judged automatically; an item is re-judged on request, or when it comes up again. Accepted items are never deleted silently. Some verdicts will go stale, or turn wrong, over time. How "comes up again" works is narrowed by aiagent's O1 (below): a resurfaced item is judged again without an owner override only when its current verdict is an `off_topic` reject for another topic; any other re-judge is an owner-requested override (O8). |
 | D14 | **Latest version only**, for papers and for code: a stored repository's excerpts stay pinned to the commit they were taken from; a refresh to a newer commit happens on request, and afterwards only the latest accepted commit's excerpts are kept. |
-| D15 | **Storage: one configurable directory**, configured once and used everywhere. Its type, backups and exports are out of this project's scope. Plain files, organised in a hierarchy like git's object store, fast for standard Linux tools, planned for millions of files. |
+| D15 | **Storage: one configurable directory**, configured once and used everywhere. Its type, backups and exports are out of this project's scope. Plain files, organised in a hierarchy like git's object store, fast for standard Linux tools, planned for millions of files. The directory may be any local path, not only under `/var/cache/devai/`, and exactly three things are required of it (2026-09-26): it is an absolute path, it already exists, and the owner can read and write it. Nothing else is a requirement: not whether it is its own volume, not its filesystem, not its size. |
 | D16 | **English only**, for everything stored. A non-English source is machine-translated first (by aiagent), marked as such with the model named; the original is kept as a link, and citations point to the original. |
 | D17 | **Search** is keyword plus vector, with an English embedding model on the CPU. Indexes are derived and rebuildable. |
 | D18 | **Citations:** section, paragraph and equation, plus the PDF page. PDF pages alone are good enough. |
@@ -43,7 +43,7 @@ Given in devai's session unless marked otherwise.
 
 **Relayed from aiagent's session.** The owner answered aiagent's O1-O14 there on 2026-09-26 with "go with recommendations" (aiagent's session reported it; the owner has not said it in devai's session). Those that shape devai's rules: an `off_topic` reject is scoped to its topic, so the same item may be judged again for another topic, while `out_of_bounds`, `low_quality` and `duplicate` rejects stay final (O1); a new arXiv version is reported as `latest_seen` and refreshed only on request, and the old version's text units are kept while its PDF and HTML are dropped, which is a small, owner-approved exception to D14 so that old citations still resolve (O2); only the owner overrides a verdict (O8); every metadata-only rejection keeps a record (O9); the staging TTL for fetched items that were never judged is 30 days (O11). O13's original recommendation (arXiv only first) is superseded by D23.
 
-**devai's own safety rules** (not owner decisions): the service makes no external request while the contact address is unset; it refuses to run on a library directory that was not initialised explicitly.
+**devai's own safety rules** (not owner decisions): the service makes no external request while the contact address is unset; it refuses to start when `LIBRARY_DIR` fails one of D15's three requirements, and it never creates that directory.
 
 ## Dependencies
 
@@ -142,7 +142,7 @@ robots.txt is parsed with Protego and fetched by the service's own wrapper, foll
 
 - **`LIBRARY_DIR` in `.env`**, set once (D15). Compose and the Makefile read it from `.env`. `bin/devai-agent` does not read `.env` by design, so `make install` stages it as `~/.devai/library`, a symlink to the directory, exactly as it stages the probe caches; the launcher mounts it and prints a warning naming `make install` when it is missing. A test checks that compose, the Makefile and the launcher resolve the same path.
 - **Optional everywhere except in the service.** The lab mounts `/library` (read-only) only when the library is configured, as it mounts `/laya` only when that exists. `devai-library`, `devai-library-extract` and `devai-grobid` are in a compose profile, `library`, which `make cache-up` enables only when `LIBRARY_DIR` is set (as it already skips `laya-trainer` without its image); compose gets an inert default for the variable (the `${MCP_SECRETS_FILE:-/dev/null}` pattern), so an unset key never breaks other compose commands. A host that starts the stack without `.env` (the systemd unit, where installed) simply runs without the library.
-- **Explicit initialisation.** `make library-init` writes `LAYOUT.json` into an empty directory, recording the layout version and the filesystem's id. The service refuses to start on a directory without `LAYOUT.json`, or whose filesystem id differs, so an unmounted volume or a mistyped path cannot silently become a new, empty library on the root filesystem. Under `/var/cache/devai/` the mount-point convention applies (CLAUDE.md): a new top-level directory there needs its own volume.
+- **Three checks, no more (D15).** `make cache-up` and the service check that `LIBRARY_DIR` is an absolute path, that the directory exists, and that it is readable and writable; a failure refuses the library's start and names the requirement that failed. Nothing creates the directory, and nothing checks where it lives, whether it is its own volume, its filesystem or its free space. The service's containers run with the owner's host uid, so the owner's read and write permission is all they need. On its first start in a directory the service writes `LAYOUT.json` (the layout version) and its own top-level directories beside whatever is already there, and it never touches a file it did not write.
 - **`LIBRARY_CONTACT`** in `.env`: the contact address (D21). Unset, the service answers but makes no external request.
 
 ### The store (`LIBRARY_DIR`)
@@ -151,7 +151,7 @@ The service owns the layout; aiagent uses only paths the API returns (its princi
 
 ```
 <LIBRARY_DIR>/
-  LAYOUT.json                    layout version and filesystem id, written by make library-init
+  LAYOUT.json                    layout version, written by the service on its first start
   objects/aa/bb/<sha256>         artifact bytes (PDF, HTML), content-addressed, write-once, 0444
   items/aa/bb/itm-<24 hex>/      one directory per item; aa/bb = the first 4 hex of the id
     key.json                     canonical key and first-seen time, write-once
@@ -167,7 +167,7 @@ The service owns the layout; aiagent uses only paths the API returns (its princi
 ```
 
 - **The plain files are the only source of truth.** An item's current state is the fold of its `records/`; everything under `index/` is derived and can be deleted and rebuilt (aiagent's acceptance check 6).
-- **Fan-out.** Two levels of two hex digits, as in git's object store but one level deeper: 65,536 leaf directories, so ten million items or objects leave about 150 entries per directory. XFS and ext4 both index large directories; the fan-out keeps `ls`, `find` and shell globs fast.
+- **Fan-out.** Two levels of two hex digits, as in git's object store but one level deeper: 65,536 leaf directories, so ten million items or objects leave about 150 entries per directory. The fan-out keeps every directory small whatever the filesystem, so `ls`, `find` and shell globs stay fast.
 - **Writes are atomic** (write to a temporary name, then rename); files are 0444 and directories 0555 once final, as on the laya store. Standard tools work directly: `find items -name key.json`, `jq` over `records/`, `grep` over `units.jsonl`.
 - **English only (D16) in what stays.** Permanent records hold English only: for a non-English item, aiagent submits English metadata (`metadata_en`) with its verdict, and English renderings of evidence quotes (`quote_en`); the service stores those and keeps the original only as a link with its sha256. Staging, which is temporary, holds the original-language text until the verdict or the TTL.
 - **Rejects and purges.** A reject deletes the item's staged artifacts and texts and writes tombstone records; unit addresses of a purged text answer 410 `text_purged` with the tombstone. A purge after the staging TTL is done by a maintenance job, which emits `item.purged` events like any other job.
@@ -240,7 +240,7 @@ Also agreed with aiagent: fetch keys `arxiv:`, `doi:` and `ssrn:` (an `ssrn:` ke
 **Goal:** a running service that searches arXiv and fetches PDFs and HTML politely, stages English text units, and records verdicts, with jobs, progress and ETA.
 
 **Deliverables:**
-- Configuration: `LIBRARY_DIR` and `LIBRARY_CONTACT` in `.env.example`; the compose profile with the inert default; `make install` staging `~/.devai/library`; the optional lab mount in the Makefile and `bin/devai-agent`; `make library-init`.
+- Configuration: `LIBRARY_DIR` and `LIBRARY_CONTACT` in `.env.example`; the compose profile with the inert default; `make install` staging `~/.devai/library`; the optional lab mount in the Makefile and `bin/devai-agent`; D15's three checks in `make cache-up` and the service.
 - Images and services: `deploy/Dockerfile.library` and `deploy/Dockerfile.library-extract` (hash-locked), `devai-library`, `devai-library-extract`, `devai-grobid`, the `devai-library-internal` network; `make build-library`, `make test-library`.
 - `deploy/library-sources.yaml` with the arXiv rate groups; the politeness engine, the RFC 9309 wrapper with the stricter 4xx rule, the redirect and address checks, the breakers, the stops, recognition of pipelock's responses.
 - The store: layout, append-only records and their fold, alias resolution with a single writer, tombstones, the maintenance job (staging TTL, and the 30-day trash of revoked items, D28).
@@ -251,7 +251,7 @@ Also agreed with aiagent: fetch keys `arxiv:`, `doi:` and `ssrn:` (an `ssrn:` ke
 - Docs: `docs/library.md` (reference), CLAUDE.md, `docs/pipelock.md` (the finding that it does not restrict destinations).
 
 **Exit criteria:**
-- Unit tests with a fake upstream: intervals and crawl delays per rate group (search and OAI-PMH never overlap); 429 and 503 with and without `Retry-After` (a wait, never a breaker); sustained 429s (the self-clearing overload pause) and an origin 403 (the denial breaker, cleared only by the operator); a fake pipelock block that must not open arXiv's breaker; robots outcomes (`robots_disallowed`, `robots_denied`, `robots_unreachable`, 404 as allow) and the D5 exemption; the stops' 503 and per-source error shapes; a cross-host redirect and a redirect to an internal name, both refused; every per-item outcome in aiagent's section 3.1; HTML present, absent and broken; verdict rules and the fold; the stops as `/health` and ETA show them; `LIBRARY_DIR` unset, set, and set but uninitialised.
+- Unit tests with a fake upstream: intervals and crawl delays per rate group (search and OAI-PMH never overlap); 429 and 503 with and without `Retry-After` (a wait, never a breaker); sustained 429s (the self-clearing overload pause) and an origin 403 (the denial breaker, cleared only by the operator); a fake pipelock block that must not open arXiv's breaker; robots outcomes (`robots_disallowed`, `robots_denied`, `robots_unreachable`, 404 as allow) and the D5 exemption; the stops' 503 and per-source error shapes; a cross-host redirect and a redirect to an internal name, both refused; every per-item outcome in aiagent's section 3.1; HTML present, absent and broken; verdict rules and the fold; the stops as `/health` and ETA show them; `LIBRARY_DIR` unset, relative, missing, and not writable (each refused, naming the requirement), and valid on an empty and on a non-empty directory (the layout written on first start, other files left alone).
 - A layout test at scale: synthetic items and objects in the hundreds of thousands, timing `find` and a full fold.
 - A live smoke run, once the contact address exists: one small arXiv query, a fetch of two papers (one with HTML, one without), units with anchors and pages, a reject that purges and answers 410, an accept that keeps, all within arXiv's limits.
 
@@ -307,7 +307,7 @@ None for the owner: the plan's five open questions were answered on 2026-09-26 (
 | Parser exploits in PDFs or HTML. | 1 | Parsing only in `devai-library-extract` and GROBID: no secrets, no store, internal network only; the service validates their JSON. |
 | The service used to reach internal hosts (SSRF). | 1 | No URLs from aiagent; every redirect hop checked; internal names and private addresses refused; default-deny host admission. |
 | arXiv HTML missing or broken for a paper. | 1 | Format checks; GROBID over the PDF; `quality.warnings` in `text.json`. |
-| An unmounted volume becomes an empty library. | 1 | `make library-init`, `LAYOUT.json` and the filesystem id checked at every start. |
+| The library is written somewhere unintended (an unmounted mount point, a mistyped but existing path). | 1 | Accepted by the owner (D15): only the three requirements are checked. The service logs the resolved path and its layout version at every start. |
 | Real credentials blocked by pipelock's DLP. | 2, 4, 5 | Per-pattern exemptions limited to each issuer's API host, added in the phase that sends the credential. |
 | Author metrics wrong (split or merged profiles). | 2 | Advisory only, with source, as-of date and match method (O5). |
 | Millions of files slow the tools. | 1 | Two-level fan-out, measured in the layout test; indexes derived. |
