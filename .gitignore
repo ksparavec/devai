@@ -111,6 +111,7 @@ deploy/.sglang-reasoning-cache.json
 deploy/.bench-cache.json
 deploy/.bench-cache.json.bak-*
 deploy/.model-status.json
+.playwright-mcp/
 
 # Go build artifacts (router binary built by `make build-router` lands here
 # on hosts that compile outside the container; the repo only tracks source).

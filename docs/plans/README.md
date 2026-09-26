@@ -113,6 +113,7 @@ found three more findings.
 | [pi-coding-agent](./pi-coding-agent.md)                             | **Done**          |
 | [router-fanout](./router-fanout.md)                                 | Draft             |
 | [laya-trainer](./laya-trainer.md)                                   | In Progress       |
+| [library-service](./library-service.md)                             | Draft             |
 | [sops-age-secrets](./sops-age-secrets.md)                           | Non-functional    |
 | [skypilot-agent-skill](./skypilot-agent-skill.md)                   | Frozen            |
 | [gpu-arbiter-cluster-mode](./gpu-arbiter-cluster-mode.md)           | **Frozen**        |
