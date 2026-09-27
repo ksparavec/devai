@@ -1,3 +1,9 @@
+# INPUT of requirements-lab.lock, which is what the lab image installs
+# (hash-checked, exact versions). After editing this file run
+# `make lab-lock` and commit both. torch/torchvision/torchaudio are pinned
+# in requirements-torch.txt and installed first, from their own index;
+# SkyPilot has its own lock and venv (requirements-skypilot.in).
+
 # Jupyter
 jupyterlab
 ipywidgets
@@ -11,9 +17,11 @@ jupyter-server-proxy
 jupyter-vscode-proxy
 
 # Benchmark harness — used by scripts/bench/. inspect-ai pulls in its
-# own openai/anthropic providers transitively; keep it pinned so
-# scorer/solver API changes don't silently break the runner.
-inspect-ai
+# own openai/anthropic providers transitively. Pinned exactly (it was
+# not, despite this comment saying so): its eval()/GenerateConfig API
+# and scorers change between releases, and every bench row must be
+# attributable to one harness version. Bump deliberately, re-bench.
+inspect-ai==0.3.271
 # inspect_ai validates the Anthropic SDK version at provider init when
 # ANTHROPIC_BASE_URL is set (the lab image sets it for Claude Code).
 # Older anthropic (0.37.x, transitive) crashes inspect_ai with

@@ -1,0 +1,9 @@
+# INPUT of requirements-skypilot.lock: the SkyPilot CLI (`sky`), installed
+# into its OWN venv, /opt/skypilot, with only `sky` linked onto PATH
+# (deploy/Dockerfile.lab). Not part of the lab resolve: SkyPilot 0.13.0 caps
+# click (<8.2) and websocket-client (==1.3.3), and resolved together with
+# the lab it drags jupyterlab back to 4.5 and llm to 0.31; installed on top
+# of the lab (the old offline-wheels step) it downgraded those packages
+# under the lab's feet. Nothing in the lab imports `sky`.
+# Bump the version, then `make lab-lock`.
+skypilot[aws,gcp,azure,kubernetes,slurm,runpod,lambda]==0.13.0

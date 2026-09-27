@@ -128,11 +128,20 @@ RUN cp -a /var/cache/bin/gemini/lib/node_modules/@google /usr/local/lib/node_mod
 # idna, fsspec, ...) from it ONLY, and the resolver backtracked the whole lab to
 # old releases -- the 3.13 CPU image shipped JupyterLab 4.1.6 (2024) and
 # inspect-ai 0.3.69, 33 packages behind; on 3.14 the resolve failed outright.
-# The installed torch satisfies every later `torch>=`, so step two keeps it.
+# Both steps are PINNED: torch/torchvision/torchaudio exactly
+# (requirements-torch.txt; the CUDA wheel's own == pins then fix nvidia-* and
+# triton), everything else from requirements-lab.lock -- exact versions with
+# hashes, the complete closure of requirements-base.txt resolved against that
+# torch (`make lab-lock`). The lock goes in with --no-deps: nothing outside it
+# is resolved or fetched, and it replaces whatever versions of shared
+# dependencies (numpy, filelock, ...) the torch step pulled from its index.
+# `uv pip check` then fails the build on any unmet requirement.
 # Host cache dirs are bind-mounted via -v at build time (see Makefile).
 # tests/python/test_lab_python_and_torch.py.
+# ROCm: the rocm6.4 index carries no cp314 torch at all (checked 2026-09-27;
+# rocm7.2 has 2.14.0), so the amd path cannot build on Python 3.14 as is.
 
-COPY requirements-base.txt /tmp/requirements-base.txt
+COPY requirements-torch.txt requirements-lab.lock /tmp/
 RUN if [ "$GPU_BUILD" = "true" ] && [ "$GPU_VENDOR" = "amd" ]; then \
         TORCH_INDEX="--index-url https://download.pytorch.org/whl/rocm6.4"; \
     elif [ "$GPU_BUILD" = "true" ]; then \
@@ -140,8 +149,9 @@ RUN if [ "$GPU_BUILD" = "true" ] && [ "$GPU_VENDOR" = "amd" ]; then \
     else \
         TORCH_INDEX="--index-url https://download.pytorch.org/whl/cpu"; \
     fi \
-    && uv pip install --system torch torchvision torchaudio $TORCH_INDEX \
-    && uv pip install --system -r /tmp/requirements-base.txt
+    && uv pip install --system -r /tmp/requirements-torch.txt $TORCH_INDEX \
+    && uv pip install --system --no-deps --require-hashes -r /tmp/requirements-lab.lock \
+    && uv pip check --system
 
 # Optional project-specific dependencies (create requirements.txt to use)
 RUN --mount=type=bind,source=.,target=/src \
@@ -150,36 +160,20 @@ RUN --mount=type=bind,source=.,target=/src \
     fi
 
 
-# Install SkyPilot CLI (per docs/plans/skypilot-agent-skill.md).
-# Wheels pre-fetched by `make fetch-cli` into
-# /var/cache/devai/pip/wheels/skypilot/ and bind-mounted at build time
-# under /var/cache/wheels/skypilot. Offline install with --find-links
-# keeps the build network-free, matching the existing CLI pattern.
-# --no-index is REQUIRED (not just --offline): without it uv resolves
-# against its cached PyPI metadata and can pick a dependency version
-# (e.g. a newer fastapi) whose wheel was never pre-fetched, failing the
-# build. --no-index restricts the package universe to exactly the
-# wheels `make fetch-cli` downloaded -- a consistent, complete closure.
-#
-# The wheel directory is OPTIONAL at build time -- the lab image still
-# builds without it (the `if` skips the install gracefully). Operators
-# who skipped `make fetch-cli` for skypilot get a working lab without
-# the `sky` binary; they can install it later via
-# `uv pip install --system 'skypilot[aws,gcp,azure,kubernetes,slurm,runpod,lambda]'`.
-# SKY_HASH (a hash of the wheel file list, from the Makefile) must be USED in
-# the RUN: the wheels come in by bind mount, which the layer cache ignores.
-ARG SKY_HASH=unknown
-RUN --mount=type=bind,source=.,target=/src \
-    echo "skypilot wheels: SKY_HASH=$SKY_HASH" && \
-    if [ -d /var/cache/wheels/skypilot ] && [ -n "$(ls -A /var/cache/wheels/skypilot 2>/dev/null)" ]; then \
-        uv pip install --system --offline --no-index \
-            --find-links /var/cache/wheels/skypilot \
-            'skypilot[aws,gcp,azure,kubernetes,slurm,runpod,lambda]' \
-        && sky --version >/dev/null 2>&1 \
-        || echo "WARN: skypilot install completed but 'sky --version' failed; investigate"; \
-    else \
-        echo "INFO: /var/cache/wheels/skypilot empty; skipping SkyPilot install. Run 'make fetch-cli' to populate."; \
-    fi
+# Install the SkyPilot CLI (`sky`; docs/skypilot-user-guide.md) into its OWN
+# venv, from its own hash lock (requirements-skypilot.lock, `make lab-lock`),
+# with only `sky` linked onto PATH -- the aiagent pattern below. It used to be
+# installed into the system Python AFTER the lab, offline from wheels
+# pre-fetched at the newest release, and SkyPilot 0.13.0's caps (click <8.2,
+# websocket-client ==1.3.3, protobuf <7, ...) then silently downgraded packages
+# the lab had already resolved. Nothing in the lab imports `sky`.
+COPY requirements-skypilot.lock /tmp/requirements-skypilot.lock
+RUN uv venv --python "$(command -v python3)" /opt/skypilot \
+    && uv pip install --python /opt/skypilot/bin/python --no-deps --require-hashes \
+        -r /tmp/requirements-skypilot.lock \
+    && uv pip check --python /opt/skypilot/bin/python \
+    && ln -s /opt/skypilot/bin/sky /usr/local/bin/sky \
+    && sky --version
 
 # Install aiagent (devitops-com/aiagent): a self-extracting makeself bundle that
 # ships its OWN bundled CPython 3.13, used by aiagent ONLY. Installed to an

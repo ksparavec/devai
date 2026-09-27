@@ -44,11 +44,14 @@ Security tab) without blocking anything.
 
 **No `pip` ecosystem entry.** devai has no `pyproject.toml` or
 `requirements.txt` at a location Dependabot's pip ecosystem recognizes
--- only `requirements-base.txt` (image-build-only, non-standard name,
-resolved via `uv` rather than pip directly). Rather than force a
-`package-ecosystem: pip` entry that would silently fail to resolve
-correctly, this gap is left visible here: Python dependency bumps in
-`requirements-base.txt` are a manual review item, not automated.
+-- only the lab image's inputs `requirements-base.txt`,
+`requirements-torch.txt` and `requirements-skypilot.in` and their
+hash locks `requirements-lab.lock` / `requirements-skypilot.lock`
+(image-build-only, non-standard names, resolved by `uv` via
+`make lab-lock`). Rather than force a `package-ecosystem: pip` entry
+that would silently fail to resolve correctly, this gap is left visible
+here: Python dependency bumps are a manual review item, not automated
+(`make lab-lock UPGRADE=1`, review the diff, rebuild, re-bench).
 
 ## Branch protection
 

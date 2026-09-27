@@ -136,17 +136,11 @@ PYTHON_VERSION_ARG = --build-arg PYTHON_VERSION=$(PYTHON_VERSION)
 BIN_HASH = $(shell cat $(CACHE_DIR)/pip/bin/.etags/* 2>/dev/null | md5sum | cut -c1-12)
 
 # Cache mount args (bind host cache dirs into build for pip/uv, npm, and binaries)
-# The SkyPilot wheels arrive by bind mount, which podman's layer cache never
-# looks into: key that layer on the wheel set itself, or a changed wheel set is
-# silently NOT installed (happened 2026-09-24: cache held 0.13.0, image 0.11.1).
-SKY_HASH = $(shell ls $(CACHE_DIR)/pip/wheels/skypilot 2>/dev/null | md5sum | cut -c1-12)
 CACHE_BUILD_ARGS = \
 	--build-arg BIN_HASH=$(BIN_HASH) \
-	--build-arg SKY_HASH=$(SKY_HASH) \
 	-v $(CACHE_DIR)/pip:/root/.cache/uv \
 	-v $(CACHE_DIR)/npm:/root/.npm \
-	-v $(CACHE_DIR)/pip/bin:/var/cache/bin:ro \
-	$(if $(wildcard $(CACHE_DIR)/pip/wheels/skypilot),-v $(CACHE_DIR)/pip/wheels/skypilot:/var/cache/wheels/skypilot:ro,)
+	-v $(CACHE_DIR)/pip/bin:/var/cache/bin:ro
 
 # Proxy runtime env (passed to all container runs)
 PROXY_RUN_ENV = \
@@ -249,7 +243,7 @@ endif
 # Compose settings
 
 .PHONY: all build build-cpu build-gpu build-base-cpu build-base-gpu build-router
-.PHONY: build-laya-trainer test-laya-trainer laya-trainer-lock laya-check
+.PHONY: build-laya-trainer test-laya-trainer laya-trainer-lock lab-lock laya-check
 .PHONY: lab-cpu lab-gpu shell-cpu shell-gpu
 .PHONY: cache-up cache-down cache-status cache-clean logs setup-logs
 .PHONY: ollama-rm ollama-list ollama-status ollama-clean ollama-df
@@ -425,46 +419,6 @@ fetch-cli: ## Download all external binaries and packages to local cache (uses E
 			&& chmod +x $(CACHE_DIR)/pip/bin/sops && STATE="updated"; fi \
 		&& VERSION=$$($(CACHE_DIR)/pip/bin/sops --version 2>&1 | awk '{print $$2; exit}' || echo "?") \
 		&& echo "sops: $$STATE ($$VERSION)"
-	@# SkyPilot wheels (per docs/plans/skypilot-agent-skill.md
-	@# decision 1+5). Track upstream PyPI metadata so the lab's `sky`
-	@# CLI follows the fast-moving release train without manual
-	@# bumps. Same version-stamp pattern the Gemini CLI uses. The stamp
-	@# carries the Python version too, so wheels fetched for another
-	@# Python count as stale. The closure is RESOLVED by uv (the cached
-	@# binary above) and only DOWNLOADED by pip (--no-deps): pip's own
-	@# resolver fails on it for Python 3.14 with resolution-too-deep.
-	@# python-hostlist (the slurm extra's dependency) ships only as source,
-	@# so its wheel is built here first; without it a binary-only resolve
-	@# silently fell back to SkyPilot 0.11.1. The resolve is pinned to
-	@# ==LATEST, so it now fails loudly instead of falling back.
-	@LATEST=$$(curl -fsSL "https://pypi.org/pypi/skypilot/json" \
-	            | python3 -c "import sys,json; print(json.load(sys.stdin)['info']['version'])" 2>/dev/null) \
-	    && CACHED=$$(cat $(ETAG_DIR)/skypilot.version 2>/dev/null || echo "none") \
-	    && if [ -z "$$LATEST" ]; then echo "SkyPilot: PyPI fetch failed; skipping"; \
-	       elif [ "$$LATEST py$(PYTHON_VERSION)" = "$$CACHED" ]; then echo "SkyPilot: up to date ($$CACHED)"; \
-	       else \
-	           echo "SkyPilot: fetching $$LATEST wheels..." \
-	           && SKY_TMP=$(CACHE_DIR)/pip/wheels/.skypilot.tmp \
-	           && rm -rf "$$SKY_TMP" \
-	           && mkdir -p "$$SKY_TMP" \
-	           && if python3 -m pip wheel -q --no-deps python-hostlist -w "$$SKY_TMP" \
-	              && printf '%s\n' "skypilot[aws,gcp,azure,kubernetes,slurm,runpod,lambda]==$$LATEST" \
-	                  | $(CACHE_DIR)/pip/bin/uv pip compile -q - --find-links "$$SKY_TMP" \
-	                      --python-version $(PYTHON_VERSION) --python-platform x86_64-manylinux_2_28 \
-	                      --only-binary :all: -o "$$SKY_TMP/.pins.txt" \
-	              && grep -vi '^python-hostlist==' "$$SKY_TMP/.pins.txt" > "$$SKY_TMP/.download.txt" \
-	              && python3 -m pip download --no-deps -r "$$SKY_TMP/.download.txt" \
-	                  --python-version $(PYTHON_VERSION) --only-binary=:all: \
-	                  --dest "$$SKY_TMP" \
-	              && rm -f "$$SKY_TMP/.pins.txt" "$$SKY_TMP/.download.txt"; then \
-	                  rm -rf $(CACHE_DIR)/pip/wheels/skypilot \
-	                  && mv "$$SKY_TMP" $(CACHE_DIR)/pip/wheels/skypilot \
-	                  && echo "$$LATEST py$(PYTHON_VERSION)" > $(ETAG_DIR)/skypilot.version \
-	                  && echo "SkyPilot: updated to $$LATEST"; \
-	              else \
-	                  rm -rf "$$SKY_TMP"; \
-	                  echo "SkyPilot: download failed (check network / pip); existing cache preserved"; \
-	              fi; fi
 	@# age + age-keygen ship in one tarball.
 	@ARCH=$$(dpkg --print-architecture) \
 		&& case "$$ARCH" in amd64) AGE_ARCH=amd64;; arm64) AGE_ARCH=arm64;; esac \
@@ -1795,6 +1749,23 @@ laya-trainer-lock: ## Regenerate laya-trainer/requirements.lock (hash-locked) fr
 		uv pip compile /src/requirements.in --generate-hashes \
 			--python-version $(PYTHON_VERSION) --python-platform x86_64-manylinux_2_28 \
 			--custom-compile-command "make laya-trainer-lock" -o /src/requirements.lock
+
+lab-lock: ## Regenerate the lab image's hash locks inside the GPU base image: requirements-lab.lock from requirements-base.txt (against the torch pins in requirements-torch.txt) and requirements-skypilot.lock from requirements-skypilot.in. Keeps every locked version the inputs still allow (uv treats the existing lock as preferences); UPGRADE=1 re-resolves to the newest releases. Review the diff, rebuild, re-bench.
+	$(CONTAINER_RUNTIME) run --rm --network=host --entrypoint uv \
+		-v $(CURDIR):/src -w /src \
+		-v $(CACHE_DIR)/pip:/root/.cache/uv \
+		$(BASE_IMAGE_NAME_GPU) \
+		pip compile requirements-base.txt -c requirements-torch.txt --torch-backend cpu \
+			--no-emit-package torch --no-emit-package torchvision --no-emit-package torchaudio \
+			--generate-hashes $(if $(UPGRADE),--upgrade,) --python-version $(PYTHON_VERSION) --python-platform x86_64-manylinux_2_28 \
+			--custom-compile-command "make lab-lock" -o requirements-lab.lock
+	$(CONTAINER_RUNTIME) run --rm --network=host --entrypoint uv \
+		-v $(CURDIR):/src -w /src \
+		-v $(CACHE_DIR)/pip:/root/.cache/uv \
+		$(BASE_IMAGE_NAME_GPU) \
+		pip compile requirements-skypilot.in \
+			--generate-hashes $(if $(UPGRADE),--upgrade,) --python-version $(PYTHON_VERSION) --python-platform x86_64-manylinux_2_28 \
+			--custom-compile-command "make lab-lock" -o requirements-skypilot.lock
 
 laya-check: ## GPU-exclusive, evicts the teacher ~3 min: run the reference laya job (ds-a6c9c8248242) through :11438 and check the teacher/trainer hand-off (swap, 503 hold, job, parity, aiagent verify + golden, teacher restored). TEACHER=<model string> (default: what TEACHER_PORT has loaded), TEACHER_PORT=11437, KEEP_RUN=1.
 	python3 scripts/laya-check.py --lab-image $(IMAGE_NAME_GPU) --trainer-image $(LAYA_TRAINER_IMAGE) \

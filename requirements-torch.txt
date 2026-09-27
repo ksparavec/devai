@@ -1,0 +1,10 @@
+# PyTorch stack of the lab image, installed on its own from the index that
+# carries the right build (CPU / ROCm index, PyPI for CUDA) BEFORE
+# requirements-lab.lock. `==2.14.0` also matches the CPU index's
+# `2.14.0+cpu` (PEP 440 ignores a candidate's local label when the
+# specifier has none). Also a constraint of `make lab-lock`, so the lock is
+# resolved against this exact torch. Bump the three together, then
+# `make lab-lock`.
+torch==2.14.0
+torchvision==0.29.0
+torchaudio==2.11.0
