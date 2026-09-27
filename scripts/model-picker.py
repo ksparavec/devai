@@ -1863,9 +1863,13 @@ def _max_fitting_ctx_info(m: dict) -> dict | None:
 
 
 # KV dtypes that mean "unquantized / engine default" for label purposes.
-# Anything else (q8_0, fp8, fp8_e5m2, ...) is a quantized-KV tier and
-# carries the weaker-long-form-reasoning caveat.
-_KV_FULL_QUALITY = ("", "f16", "auto")
+# Anything else (q8_0, fp8, fp8_e5m2, ...) is a quantized-KV tier. Its
+# quality cost is NOT measured on this fleet: the "GPQA ~-10 pts for q8_0"
+# these labels used to print was not distinguishable from zero (exact
+# McNemar p = 0.17-0.18 on 60 items) and is confounded by time-outs
+# (docs/backends.md "Per-tier KV-cache dtype"), so the labels say
+# "unmeasured" rather than claim a cost or its absence.
+_KV_UNQUANTIZED = ("", "f16", "auto")
 
 
 def _kv_legacy_default(m: dict) -> str:
@@ -1957,7 +1961,7 @@ def _kv_mixed(m: dict) -> bool:
     count as one kind.
     """
     kinds = {
-        "default" if t in _KV_FULL_QUALITY else t
+        "default" if t in _KV_UNQUANTIZED else t
         for t in _kv_cells(m).values()
     }
     return len(kinds) > 1
@@ -2385,21 +2389,16 @@ def _capability_summary_text(
     kv_line = ""
     if _kv_mixed(m):
         cells = _kv_cells(m)
-        quant = {t: k for t, k in cells.items() if k not in _KV_FULL_QUALITY}
-        f16_tiers = sorted(t for t, k in cells.items() if k in _KV_FULL_QUALITY)
+        quant = {t: k for t, k in cells.items() if k not in _KV_UNQUANTIZED}
+        f16_tiers = sorted(t for t, k in cells.items() if k in _KV_UNQUANTIZED)
         quant_label = "/".join(
             f"{_context_label(t)} ({quant[t]})" for t in sorted(quant)
         )
         f16_max = _context_label(max(f16_tiers)) if f16_tiers else "?"
-        gpqa_note = (
-            " (GPQA drops\n           ~10 points measured for q8_0)"
-            if "q8_0" in quant.values()
-            else ""
-        )
         kv_line = (
-            f"KV cache:  {quant_label} serves with quantized KV --\n"
-            f"           reasoning is WEAKER on long chains{gpqa_note};\n"
-            f"           up to {f16_max} serves f16 (full quality).\n"
+            f"KV cache:  {quant_label} serves with quantized KV; its\n"
+            f"           quality cost is not measured on this fleet;\n"
+            f"           up to {f16_max} serves unquantized (f16) KV.\n"
             f"           Pick the tier at launch.\n"
         )
     # Long-context recall, warning only. The LOAD probe buries one needle at
@@ -3685,12 +3684,10 @@ def _resolve_kv_tier(model: dict) -> tuple[int, bool] | None:
     lines = []
     for t in tiers:
         kv = _kv_for_ctx(model, t)
-        if kv not in _KV_FULL_QUALITY:
-            note = f"KV {kv} -- weaker long-form reasoning"
-            if kv == "q8_0":
-                note += " (GPQA ~-10 pts)"
+        if kv not in _KV_UNQUANTIZED:
+            note = f"KV {kv} -- quantized, quality cost unmeasured"
         else:
-            note = f"KV {kv or 'f16'} -- full quality"
+            note = f"KV {kv or 'f16'} -- unquantized"
         lines.append(f"  {_context_label(t):>5s}  {_DIM}({note}){_RESET}")
     header = (
         f"Context tier  ▸  {_BOLD}{_strip_latest(model['name'])}{_RESET}"
@@ -3914,8 +3911,9 @@ def _serving_name(
     rides bare. EXCEPTION: mixed-KV models (some tiers only fit with
     quantized KV) pin ``@<ctx>`` so the router launches the chosen tier
     with its probed KV dtype instead of defaulting to the largest
-    (quantized) tier -- dropping that pin silently costs long-chain
-    reasoning quality (GPQA ~-10 pts measured for q8_0).
+    (quantized) tier -- dropping that pin silently serves quantized KV,
+    whose quality cost is unmeasured here (docs/backends.md "Per-tier
+    KV-cache dtype").
 
     vLLM / SGLang: ``@<ctx>`` is always pinned; it drives
     ``--max-model-len`` / ``--context-length`` at container recreate.

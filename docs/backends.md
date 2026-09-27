@@ -1068,11 +1068,12 @@ dtype-scoped:
 - **picker** (`_kv_cells` / `_kv_mixed`): a model whose fitting tiers
   span both dtypes gets a context-tier sub-modal and pins `@<ctx>` on
   the emitted name, so the router serves exactly the chosen tier. The
-  tier fixes context length and KV dtype together. The preview pane and
-  the tier modal currently warn that quantized tiers have "weaker
-  long-form reasoning (GPQA ~-10 pts)". **That warning is not supported
-  by the data** (next paragraph); correcting its text is an open
-  follow-up.
+  tier fixes context length and KV dtype together. Until 2026-09-27 the
+  preview pane and the tier modal warned that quantized tiers have
+  "weaker long-form reasoning (GPQA ~-10 pts)". **That warning was not
+  supported by the data** (next paragraph); they now say a quantized
+  tier's quality cost is unmeasured, and label f16/auto tiers
+  "unquantized" rather than "full quality".
 
 **Evidence on the quality cost of quantized KV (re-analysed
 2026-09-27).** The definitions and methods are in
@@ -1181,10 +1182,11 @@ global KV dtype policy:
   dtype, and `sglangEntrypoint` emits the flag only for stamped,
   non-default cells.
 - **picker**: `_kv_cells` decodes unstamped cells per backend (vllm ->
-  fp8, others -> f16) and the mixed-KV sub-modal/warning generalizes:
-  f16/auto are labelled "full quality", and any other dtype carries the
-  weaker-long-form-reasoning caveat. As shown above, the data establish
-  neither label.
+  fp8, others -> f16) and the mixed-KV sub-modal/label generalizes:
+  f16/auto are labelled "unquantized", and any other dtype "quantized,
+  quality cost unmeasured" (since 2026-09-27; the labels were "full
+  quality" and a weaker-long-form-reasoning caveat, which the data
+  above do not establish).
 
 One informal vLLM fp8-vs-auto comparison exists:
 

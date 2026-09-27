@@ -373,9 +373,12 @@ class TestMixedKVContextPin(unittest.TestCase):
         self.assertEqual(PICKER._resolve_kv_tier(m), (131072, True))
         joined = "\n".join(seen["lines"])
         self.assertIn("q8_0", joined)
-        self.assertIn("weaker long-form reasoning", joined)
-        self.assertIn("GPQA", joined)
-        self.assertIn("full quality", joined)
+        self.assertIn("quality cost unmeasured", joined)
+        self.assertIn("unquantized", joined)
+        # The "GPQA ~-10 pts" claim was not supported by the data
+        # (docs/backends.md "Per-tier KV-cache dtype"); it must not come back.
+        self.assertNotIn("GPQA", joined)
+        self.assertNotIn("full quality", joined)
 
     def test_resolve_kv_tier_second_row_selects_f16_tier(self) -> None:
         m = self._row({
