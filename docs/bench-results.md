@@ -1002,11 +1002,14 @@ applied to a noisy score misclassifies near the cut-off).
     regressions" is a hypothesis nothing here tests
     ([statistics-primer.md](statistics-primer.md) Sec. 7, "Explaining
     after the fact").
-12. **Open harness defects D1-D4** ("Methodology"): pass sampling as
-    `eval()` keywords; record time-outs as their own outcome and stop
-    counting queueing against the limit; stop the extractor consuming
-    indentation (done 2026-09-27); request `stream_options.include_usage`. Rows measured
-    before a fix are not comparable with rows measured after it.
+12. ~~**Harness defects D1-D4** ("Methodology")~~ **Fixed 2026-09-27**,
+    each in its own commit: sampling passed as `eval()` keywords through
+    the generic OpenAI-compatible provider (D1); a queue-free working-time
+    limit, with time-outs recorded apart from wrong answers (D2; still
+    scored wrong in the headline, by design); the HumanEval extractor
+    keeps indentation (D3); `stream_options.include_usage` requested and
+    the engine's token count used (D4). Rows measured before the fixes are
+    not comparable with rows measured after them.
 13. **Replication.** At least two runs per cell, or report every run,
     so run-to-run variation is measured rather than inferred from
     incidental re-runs.
