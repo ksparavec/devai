@@ -138,9 +138,12 @@ def _fmt(v: object, suffix: str = "") -> str:
 
 def _kv_pressure_pct(peak_vram_gb: float | None, host_vram_gb: float) -> float | None:
     """``peak_vram_gb / host_vram_gb`` as a percentage, or None if peak
-    is missing. The bench's "KV-pressure observations" section in
-    ``docs/bench-results.md`` calls 95 % the threshold where KV paging
-    starts to bite -- this column makes that visible per row.
+    is missing. How full the card got -- NOT a measure of KV pressure:
+    vLLM and SGLang preallocate their pool at launch, so this mostly
+    reflects --gpu-memory-utilization / --mem-fraction-static. The "95 %
+    threshold where KV paging starts to bite" this column used to be
+    read against had no data behind it and is withdrawn
+    (docs/bench-results.md "KV-pressure observations").
     """
     if peak_vram_gb is None or host_vram_gb <= 0:
         return None
@@ -236,7 +239,7 @@ def render(cache: dict, host_vram_gb: float = DEFAULT_HOST_VRAM_GB) -> str:
     lines.append(
         "| Model | Backend | CTX | Env | Agg | GSM8K | HumanEval | "
         "HumanEval+ | Tools | "
-        "Leak rate | TTFT first | TTFT p50 | TPS | Peak VRAM | KV % |"
+        "Leak rate | TTFT first | TTFT p50 | TPS | Peak VRAM | VRAM % |"
     )
     lines.append(
         "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
@@ -255,7 +258,7 @@ def render(cache: dict, host_vram_gb: float = DEFAULT_HOST_VRAM_GB) -> str:
         tps = metrics.get("tps_sustained_p50")
         peak = metrics.get("peak_vram_gb")
         kv_pct = _kv_pressure_pct(peak, host_vram_gb)
-        # Round KV % to one decimal so the column stays narrow.
+        # Round VRAM % to one decimal so the column stays narrow.
         kv_str = "-" if kv_pct is None else f"{kv_pct:.1f}%"
         env_id = _env_label(row)
         lines.append(
@@ -281,10 +284,12 @@ def render(cache: dict, host_vram_gb: float = DEFAULT_HOST_VRAM_GB) -> str:
     )
     lines.append("")
     lines.append(
-        f"_KV % = `peak_vram_gb / {host_vram_gb:g}` (host VRAM cap, "
-        f"override via `GPU_MEMORY_GB`). 95 % is the rule-of-thumb "
-        f"threshold where KV paging starts to bite -- see "
-        f"`docs/bench-results.md` > 'KV-pressure observations'._"
+        f"_VRAM % = `peak_vram_gb / {host_vram_gb:g}` (host VRAM cap, "
+        f"override via `GPU_MEMORY_GB`): how full the card got, not KV "
+        f"pressure -- vLLM and SGLang preallocate their pool at launch. No "
+        f"threshold is implied; the '95 % where KV paging starts to bite' "
+        f"once quoted here had no data behind it and is withdrawn (see "
+        f"`docs/bench-results.md` > 'KV-pressure observations')._"
     )
     lines.extend(_sampling_footnote(cache))
     return "\n".join(lines) + "\n"
@@ -297,7 +302,7 @@ def main() -> None:
         "--host-vram-gb",
         type=float,
         default=DEFAULT_HOST_VRAM_GB,
-        help="host VRAM cap used to compute the KV %% column",
+        help="host VRAM cap used to compute the VRAM %% column",
     )
     args = ap.parse_args()
     cache = load_cache(args.cache)

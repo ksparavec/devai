@@ -231,3 +231,15 @@ class TimeoutCellTest(unittest.TestCase):
         self.assertEqual(R._fmt_score(tasks, "gsm8k_", "score"), "0.600 (t=40)")
         self.assertEqual(R._fmt_score(tasks, "humaneval_subset_", "pass@1"), "0.900")
         self.assertEqual(R._fmt_score({}, "gsm8k_", "score"), "-")
+
+
+class VramFootnoteTest(unittest.TestCase):
+    def test_no_kv_paging_threshold_is_claimed(self) -> None:
+        # The 95 % threshold had no data behind it (docs/bench-results.md
+        # "KV-pressure observations"); the report must not present it.
+        from bench import bench_report as R
+        out = R.render({"_meta": {}}, host_vram_gb=24.0)
+        self.assertIn("VRAM %", out)
+        self.assertNotIn("KV %", out)
+        self.assertNotIn("rule-of-thumb", out)
+        self.assertIn("withdrawn", out)

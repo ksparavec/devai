@@ -944,8 +944,10 @@ applied to a noisy score misclassifies near the cut-off).
    and GPQA 39/60 (07-19) before it. Single runs under open defects
    D1-D3; no time-outs in this row.
 5. ~~**Add a KV-pressure column to `make bench-report`**~~ **Done**
-   (`KV %` = `peak_vram_gb / GPU_MEMORY_GB`). The 95 % threshold it
-   footnotes is withdrawn ("KV-pressure observations"); the
+   (`peak_vram_gb / GPU_MEMORY_GB`; renamed `VRAM %` on 2026-09-27,
+   since it measures how full the card got, not KV pressure). The 95 %
+   threshold it footnoted is withdrawn ("KV-pressure observations"), and
+   since 2026-09-27 the footnote says so; the
    "Qwen3.5-9B-NVFP4 at 95.7 %" once quoted here is not retained and
    is inconsistent with the 21.54 GiB measured on 2026-05-05 (89.8 % of
    24, 90.2 % of the card's 23.89 GiB).
