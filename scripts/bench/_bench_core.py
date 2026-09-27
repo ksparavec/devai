@@ -95,6 +95,7 @@ def stream_chat_completion(
     pieces: list[str] = []
     reasoning_pieces: list[str] = []
     completion_tokens = 0
+    prompt_tokens: int | None = None
     usage_seen = False
     finish_reason: str | None = None
     t_done = t_open
@@ -115,6 +116,8 @@ def stream_chat_completion(
         if "completion_tokens" in usage:
             completion_tokens = int(usage["completion_tokens"])
             usage_seen = True
+        if "prompt_tokens" in usage:
+            prompt_tokens = int(usage["prompt_tokens"])
         choices = obj.get("choices") or []
         if not choices:
             continue
@@ -158,6 +161,7 @@ def stream_chat_completion(
         "content": content,
         "reasoning_content": reasoning_content,
         "completion_tokens": completion_tokens,
+        "prompt_tokens": prompt_tokens,
         "effective_tokens": effective_tokens,
         "token_source": "usage" if usage_seen else "chars/4",
         "t_open": t_open,

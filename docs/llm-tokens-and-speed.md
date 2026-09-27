@@ -658,6 +658,11 @@ caveats apply:
   hit rates suggest, the rate on the newly computed tokens was about
   1 100-1 400 (W4A16) and 1 960-3 190 (NVFP4) tokens/s
   (`scripts/stats/perf_engine_runs.py`, `doc_figures.depth_prefix_cache`).
+  Since 2026-09-27 the builder opens every prompt with a salt unique to
+  the request (`_build_long_prompt(..., salt=...)`), so a repeat of this
+  measurement shares no prefix across requests beyond what the chat
+  template puts first, and the long-context probe records the engine's
+  own prompt-token count (`input_tokens`).
 - **The ratio between builds is less affected**, because both runs
   received the same prompts in the same order and reused the prefix
   cache identically. It is 2.58 on the clean first prompt and 2.64,

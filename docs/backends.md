@@ -877,7 +877,8 @@ figure is one run, and the definitions are in
   - The deeper prompts (7.9K-68.7K tokens) each extend the previous one,
     and vLLM's prefix cache served 18.7% and then 34.6% of prompt tokens,
     identically in both runs. So prompt tokens / TTFT overstates their
-    prefill rates.
+    prefill rates. (The prompt builder salts each prompt at its start
+    since 2026-09-27, so a repeat would not share prefixes.)
   - The TTFT ratio between the builds is less affected, because both saw
     the same prompts in the same order: 2.58 on the clean prompt, then
     2.64, 2.19 and 1.78.
