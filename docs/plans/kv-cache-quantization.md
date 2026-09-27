@@ -7,10 +7,16 @@
 > with no global policy (commits 8325255, 664bc76, 38facb5).
 >
 > **Phase 2 must NOT be executed.** Its headline -- flip the Ollama
-> default to `q8_0` globally -- is now contradicted by the project's own
-> measurement: q8_0 costs roughly 12 GPQA points on long reasoning
-> chains, which is why it shipped as a per-tier opt-in with a picker
-> warning instead. See `docs/backends.md`.
+> default to `q8_0` globally -- conflicts with the per-cell KV-dtype
+> design that shipped: fit cells are dtype-scoped, so a global flip
+> silently invalidates every f16 cell. An earlier version of this banner
+> said q8_0 "costs roughly 12 GPQA points". A 2026-09-27 re-analysis
+> found that gap not distinguishable from zero at the 5% level (exact
+> McNemar p = 0.17-0.18, n = 60; 95% intervals down to about -0.25). The
+> net gap is more than accounted for by extra time-outs under q8_0, which
+> may themselves be a q8_0 effect (runaway generations). A quality cost
+> of q8_0 KV on this fleet is neither shown nor excluded. See
+> `docs/backends.md`, "Per-tier KV-cache dtype".
 >
 > The one part that had not shipped, backend-aware fit math (Phase 1
 > step 4), was extracted and shipped on 2026-07-25: `select-models.py`

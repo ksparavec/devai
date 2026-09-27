@@ -159,6 +159,22 @@ already covers parts of Phase 1, 4, 5, 6 and 8.
    is why they went. Re-benching that model restores an auditable per-tier
    record.
 
+   **Correction, 2026-09-27.**
+   - The four rows are present in `deploy/.bench-cache.json` again,
+     byte-identical to the backup above. How they returned is not
+     recorded.
+   - The router and Ollama logs confirm the tier each run was served at:
+     64K/f16 and 128K/q8_0, with flash attention on in both. The
+     q8_0 runs were back-to-back in one container on 2026-07-21, not two
+     days apart.
+   - The conclusion is nevertheless **not supported by these data**. The
+     0.8667 vs 0.75 gap is not distinguishable from zero at the 5% level
+     (exact McNemar p = 0.17). The net gap (7 items) is more than
+     accounted for by the net time-outs (9 more under q8_0: 3 vs 12 of
+     60). 6 of the 19 discordant items were completed answers (4 vs 2).
+     The time-outs may themselves be a q8_0 effect.
+   - See docs/backends.md, "Per-tier KV-cache dtype".
+
 ## Unverified
 
 The plan requires live-GPU test output before Phase 3 (router hot path)

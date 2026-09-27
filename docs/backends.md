@@ -146,34 +146,89 @@ readers; see
 ### vLLM vs SGLang -- measured, 2026-07-29
 
 Both backends serve the same NVFP4 checkpoints, so "which one" is an
-empirical question. Measured on the reference 24 GiB RTX PRO 4000
+empirical question. It was measured on the reference 24 GiB RTX PRO 4000
 Blackwell after the SGLang v0.5.10.post1 -> v0.5.16 bump. SGLang is
-KEPT; this section records what the numbers actually say so the next
-person does not have to re-derive them.
+KEPT. This section records what the numbers do and do not show. The
+statistical terms are defined in
+[statistics-primer.md](statistics-primer.md); the numbers are recomputed
+by `scripts/stats/bench_stats.py` (see `scripts/stats/README.md`).
 
-**Quality: no consistent difference.** 18 paired McNemar tests across
-gsm8k / humaneval / humaneval+ / mmlu_pro / gpqa / tools_use. Exactly one
-reached p<0.05, which is what 18 tests at alpha=0.05 produce by chance
-(~0.9 expected false positives); Bonferroni-corrected alpha is 0.0028 and
-nothing approaches it. Directions are inconsistent -- Ornith scores worse
-on SGLang, Qwen3.5 better, gpt-oss a wash. At n=50, HumanEval cannot
-resolve gaps below ~0.15: the SAME model on the SAME backend moved 0.86
--> 0.74 across the engine bump alone.
+**Quality: no difference is established, in either direction.** Three
+models (Ornith-1.0-9B, Qwen3.5-9B, gpt-oss-20b) x six tasks (GSM8K,
+HumanEval, HumanEval+, MMLU-Pro, GPQA, tool use) give 18 paired
+comparisons. Each pairs one SGLang run (2026-07-29) with one vLLM run
+(2026-07-16..22) on the same items (exact McNemar test, primer Sec. 4.1).
+For MMLU-Pro and GPQA, SGLang ran 100 items and vLLM 60; they are paired
+on the first 60.
 
-**Single-stream throughput: tie.** gpt-oss-20b at identical 131072 ctx:
-vLLM 135.0 vs SGLang 134.0 tok/s. (The ~10% SGLang deficit visible in
-older rows was a v0.5.10 property and is gone -- those rows were
-`stale_image`, which is precisely what the per-row stamps below exist to
-flag.)
+- **As cached,** no test has p < 0.05. If the two tool-use tests are
+  paired in the same tool-calling protocol instead, exactly one does:
+  Ornith tool use, 12/20 on SGLang vs 19/20 on vLLM (b = 1, c = 8,
+  p = 0.039). About one false positive in 18 tests is what chance alone
+  produces.
+- **After Holm correction over the 18 tests,** no p-value is below 0.70.
+- **Directions are mixed.** Qwen3.5 scored higher on SGLang for HumanEval,
+  HumanEval+ and tool use, and lower for MMLU-Pro and GPQA. No direction
+  is established for any model.
+- **The comparison is confounded** (primer Sec. 4.3) by five differences
+  besides the engine:
+  - context length (Ornith and Qwen3.5 ran at 262144 on vLLM, 196608 on
+    SGLang);
+  - KV dtype for Ornith and Qwen3.5 (vLLM launches logged fp8, SGLang
+    `auto`); gpt-oss's vLLM run used `auto` too;
+  - run date and the tool-calling protocol;
+  - GPQA time-outs scored as wrong answers (on the first 60 items, Ornith
+    19 on SGLang vs 16 on vLLM; Qwen3.5 10 vs 6; see
+    [bench-results.md](bench-results.md));
+  - a HumanEval extractor defect that produces candidate false failures
+    unevenly: Ornith has 4 on SGLang and none on vLLM, and Qwen3.5 has
+    some on both.
+- **How much n = 50 can resolve.** The 95% half-width of an unpaired
+  difference between two 50-item HumanEval scores is about 0.16 near a
+  pass rate of 0.8, and 0.12 near 0.9. A paired comparison with 10-20%
+  disagreeing items narrows that to about 0.09-0.12.
+- **Run-to-run noise.** In clean HumanEval re-runs (no change in
+  between), 5% of items changed outcome (pooled; 6.7% without one
+  degenerate 0/50 pair). At n = 50 that is a run-to-run difference of a
+  few points.
+  - An earlier version of this section cited Qwen3.5 on SGLang: 43/50,
+    then 37/50, three days apart (b = 5, c = 11, p = 0.21).
+  - That is not a clean re-run: the engine image AND the router's SGLang
+    request path (commit c9ad978) both changed in between. The gap is
+    not distinguishable from zero, and it is not evidence about the
+    engine bump alone.
+
+**Single-stream throughput: no difference detected.** gpt-oss-20b at
+131072 ctx ran 135.0 tok/s on vLLM and 134.0 on SGLang.
+
+- **Measurement:** one run each, the median over 40 short prompts, with
+  tokens estimated as characters/4 (see bench-results.md).
+- **Noise:** the 0.7% gap is inside the 3% spread of three vLLM runs of
+  this model.
+- **Not a tie:** the data cannot show "equal" without a stated
+  equivalence margin (primer Sec. 5).
+- **Older rows:** they showed an SGLang deficit of about 10%. Those rows
+  were stamped `stale_image`, from before the v0.5.16 bump; that is
+  exactly what the per-row stamps below exist to flag. Whether that
+  deficit was real cannot be tested from the retained data.
 
 **Context: vLLM never worse, better on 4 of 10.** Ornith and Qwen3.5
 serve 262144 on vLLM but 196608 on SGLang; Gemma-4-26B-A4B-it serves
-262144 on vLLM and is unserveable on SGLang. Cause is KV-pool size
-(vLLM ~456K tokens vs SGLang ~150-173K), not architecture.
+262144 on vLLM and is unserveable on SGLang. The cause is KV-pool size
+(vLLM ~456K tokens vs SGLang ~150-173K, from the engines' own logs), not
+architecture.
 
-**Prefix reuse: vLLM wins both arms**, including the concurrent case
-RadixAttention is built for. `make bench-concurrency`, gpt-oss-20b at
-131072:
+**Prefix reuse (`make bench-concurrency`, gpt-oss-20b at 131072):** the
+table below is what one run of the tool printed. It is recorded, but its
+raw per-request data were not kept, and it has these limits:
+
+- one run per engine;
+- each cell averages c requests, so the c = 1 row is a single pair;
+- prompt sizes are nominal: the tool assumes 3.5 characters per token,
+  and for the Qwen tokenizer that yields about 0.57x the nominal tokens
+  (not checked for gpt-oss);
+- "gain" is the ratio of disjoint to shared TTFT p50, not the tool's own
+  `prefix_gain_by_level`, which is an aggregate-throughput ratio.
 
 | concurrency | vLLM shared | disjoint | gain | SGLang shared | disjoint | gain |
 |---|---|---|---|---|---|---|
@@ -182,23 +237,31 @@ RadixAttention is built for. `make bench-concurrency`, gpt-oss-20b at
 | 16 | 314 ms | 2655 ms | 8.45x | 1719 ms | 5464 ms  | 3.18x |
 | 32 | 355 ms | 4477 ms | 12.6x | 1817 ms | 10010 ms | 5.51x |
 
-vLLM's shared-prefix TTFT is nearly flat across the sweep (309 -> 355 ms)
-while SGLang's climbs 39%, and vLLM leads the disjoint arm too, so this
-is not a caching artefact. Sequential multi-turn (`MODE=multiturn`) says
-the same: TTFT slope 0.824 ms per 1K tokens of history on vLLM vs 4.732
-on SGLang, over 8 turns growing to ~33K tokens.
+The pattern is consistent: vLLM's shared-prefix TTFT stays within 309-355
+ms, SGLang's rises by 39%, and vLLM also leads the disjoint arm. But with
+one run per engine it is a description, not a tested difference.
 
-**SGLang carries a ~1.3 s fixed TTFT overhead** -- constant across
-history length and model size, reproduced independently by the leak task
-(~1040 ms warm) and the multi-turn arm (1315 ms at turn 1). Cause not
-identified. Irrelevant for a single long reasoning turn (minutes of
-decode); it accumulates across the many short turns of an agent session.
+The sequential multi-turn mode (`MODE=multiturn`) was also one run: a TTFT
+slope of 0.824 ms per 1K tokens of history on vLLM vs 4.732 on SGLang, over
+8 turns growing to about 33K nominal tokens. The slopes carry no
+uncertainty, and the x-axis uses estimated tokens.
+
+**SGLang adds about 1.0 s to TTFT on short prompts.** Its steady-state
+TTFT p50 was 1038-1052 ms on four models, with p95 within 5 ms of p50. On
+vLLM the same models measured 33-52 ms. Each is one run of 39 prompts.
+The 1.3 s seen at the first turn of the multi-turn run is a first turn of
+about 4K tokens, so it includes prefill. The cause is not identified. The
+cost is irrelevant for a single long reasoning turn but accumulates across
+the many short turns of an agent session.
 
 Caveat: aggregate tok/s under concurrency is still UNMEASURED. The first
-sweep read `completion_tokens`, which only populates from a `usage` block
-the engine omits unless `stream_options.include_usage` is set, so every
-cell reported 0.00. Fixed to use `effective_tokens` (as
-bench_latency_leak already did) but not re-run.
+sweep read `completion_tokens`, which is only populated from a `usage`
+block that the engine omits unless `stream_options.include_usage` is set,
+so every cell reported 0.00. The tool was changed to use the characters/4
+estimate (as bench_latency_leak already did), but was not re-run. The
+2026-09-21 sweeps that did report aggregate figures used max_tokens 64 and
+1-4 requests per cell. Those numbers are dominated by prefill and are not
+a decode-throughput measure.
 
 ### Per-row engine-image stamps
 
@@ -618,7 +681,9 @@ backend's engine first; a block under the backend's own name (e.g.
 plugin. Before 2026-09-22 the lookup was by name: both derived rows were
 probed with no parsers, the router launched them without
 `--reasoning-parser` / `--tool-call-parser`, reasoning bled into content
-(45-55 % on the leak task) and the first bench early-dropped them -- a
+(18 and 22 `</think>` marker matches in the leak task's 40 prompts, i.e.
+0.45 and 0.55 matches per prompt -- a count rate, not a share of prompts)
+and the first bench early-dropped them -- a
 verdict about the launch flags, not the checkpoints. The same rule covers
 the probe's request SHAPES: `build_disable_thinking_body` /
 `build_enable_thinking_body` and the load probe's legacy KV default
@@ -704,7 +769,8 @@ had predicted a ~111K pool -- the engine's profiled activation peak is not
 constant across utilisations, so estimate, then confirm); 120K fit without
 MTP but not with it, and the MTP pass reported "estimated maximum model
 length is 118976"; 116K (118,784 tokens) is the recorded cell. Each launch
-costs one engine cold start (~5 min on this build).
+costs one engine cold start (the prober's start took 249-285 s in three
+launches, before the engine caches were persisted).
 
 ### The vllm-devai backend
 
@@ -784,14 +850,52 @@ recovery entry for the derived name (`backends: ["vllm-devai"]`) if flags
 are needed, and `podman restart devai-router` -- the router reads the probe
 cache and the catalog only at startup.
 
-Measured 2026-09-21/22 on the 24G card, MTP on, both prepared builds: decode
-90-95 tok/s single-stream and 310-324 tok/s aggregate at 4 coding streams,
-holding 88-91 tok/s at 92K depth; HumanEval 96.3-97.6 / HumanEval+ 92.7-93.9
-on all 164 problems (a tie with the as-delivered NVFP4 checkpoint, so the
-int8 vocabulary tensors cost nothing measurable). They differ in context
-(AutoRound 128K, NVFP4 96K at 0.94 -- the NVFP4 body's per-16 fp8 scales cost
-1 GiB) and in prefill (NVFP4 ~2.2x faster; native Blackwell FP4 kernels
-against Marlin int4 compiled for sm80).
+Measured 2026-09-21/22 on the 24G card, MTP on, both prepared builds. Each
+figure is one run, and the definitions are in
+[statistics-primer.md](statistics-primer.md) Sec. 9. They are recomputed by
+`scripts/stats/perf_engine_runs.py` and `bench_stats.py`.
+
+- **Single-stream decode:** the bench median over 40 short prompts was
+  95.1 tok/s (AutoRound) and 90.4 tok/s (NVFP4). The engine-counted medians
+  for outputs of at least 128 tokens are 93.1 and 91.8 tok/s. The paired
+  AutoRound/NVFP4 ratio is 1.034 (95% CI 1.003-1.065, excluding 1). The
+  interval covers prompt-to-prompt variation within one run per build.
+- **Aggregate:** one batch of 4 concurrent 700-token completions gave 325
+  and 311 tok/s, with each stream running 81-84 and 78-84 tok/s, at the
+  model's default sampling. It is a single batch, so no interval is
+  possible.
+- **Long context:** one request with 68,663 prompt tokens decoded at 88.5
+  and 90.5 tok/s. That depth was requested as "92K" but came out 25% smaller,
+  because the prompt builder assumes 3.5 characters per token.
+- **Prefill:** only the first long prompt is a clean measurement: 2,958
+  tokens with nothing cached, one request per build. On it, NVFP4 reached
+  the first token in 0.71 s against 1.84 s for AutoRound, about 4,150 vs
+  1,600 prompt tokens/s.
+  - The deeper prompts (7.9K-68.7K tokens) each extend the previous one,
+    and vLLM's prefix cache served 18.7% and then 34.6% of prompt tokens,
+    identically in both runs. So prompt tokens / TTFT overstates their
+    prefill rates.
+  - The TTFT ratio between the builds is less affected, because both saw
+    the same prompts in the same order: 2.58 on the clean prompt, then
+    2.64, 2.19 and 1.78.
+  - NVFP4 runs on native Blackwell FP4 kernels, AutoRound on Marlin int4
+    compiled for sm80. See llm-tokens-and-speed.md for the cache-adjusted
+    estimates.
+- **Quality:** HumanEval 158-160/164 and HumanEval+ 152-154/164 on all 164
+  problems. For the prepared NVFP4 build against the as-delivered NVFP4
+  checkpoint, the paired differences are -0.006 (95% CI -0.045 to
+  +0.031) on HumanEval and +0.012 (-0.025 to +0.052) on HumanEval+, p >=
+  0.73. The prepared AutoRound build gives +0.006 (p = 1.0) and +0.024
+  (p = 0.34).
+  - None of these is distinguishable, and for the prepared NVFP4 build a
+    HumanEval loss larger than about 4.5 points is excluded.
+  - The prepared builds differ from the delivered one in several ways (the
+    int8 vocabulary tensors, the draft head, the context length), so the
+    result says the preparation as a whole costs nothing measurable at
+    this resolution.
+  - These are single runs at the engine's default sampling.
+- **Context:** the builds differ here: AutoRound 128K, NVFP4 96K at 0.94.
+  The NVFP4 body's per-16 fp8 scales cost 1 GiB.
 
 ### Load probing -- serving-time VRAM under near-full context
 
@@ -930,7 +1034,13 @@ were measured in:
   from the `OLLAMA_KV_CACHE_TYPE` env of the probe pass (absent/empty
   = `f16`, which is also what pre-field legacy cells mean).
 - `flash_attention` -- the `OLLAMA_FLASH_ATTENTION` setting of the same
-  pass. Absent on pre-stamp cells.
+  pass. Absent on pre-stamp cells. It records the environment variable,
+  not what the runner did: under Ollama 0.31.1 an unset or false value
+  reached the runner as `--flash-attn auto`, which it logged as "Flash
+  Attention was auto, set to enabled" on this GPU. So f16 cells stamped
+  `false` were measured and served with flash attention on (re-checked
+  in the 2026-07 runner logs). How the current build resolves `auto` has
+  not been re-checked.
 
 Both are resolved at serve time from the **same** covering tier, so a
 launch always reproduces one probe cell rather than mixing two. A cell
@@ -953,13 +1063,91 @@ dtype-scoped:
   measured in. f16/unstamped tiers emit nothing -- the container spec
   is byte-identical to pre-field builds.
 - **picker** (`_kv_cells` / `_kv_mixed`): a model whose fitting tiers
-  span both dtypes gets a context-tier sub-modal (tier choice = quality
-  choice) and pins `@<ctx>` on the emitted name so the router serves
-  exactly the chosen tier; the preview pane warns that quantized tiers
-  have measurably weaker long-form reasoning (qwen3.6:35b-a3b-mtp:
-  GPQA 0.8667 at 64K/f16 vs 0.75-0.77 at 128K/q8_0, two runs; all
-  short-chain metrics unaffected -- see `.bench-cache.json` row
-  `...::ollama::131072`).
+  span both dtypes gets a context-tier sub-modal and pins `@<ctx>` on
+  the emitted name, so the router serves exactly the chosen tier. The
+  tier fixes context length and KV dtype together. The preview pane and
+  the tier modal currently warn that quantized tiers have "weaker
+  long-form reasoning (GPQA ~-10 pts)". **That warning is not supported
+  by the data** (next paragraph); correcting its text is an open
+  follow-up.
+
+**Evidence on the quality cost of quantized KV (re-analysed
+2026-09-27).** The definitions and methods are in
+[statistics-primer.md](statistics-primer.md). The analysis scripts are
+in `scripts/stats/`.
+
+- **The only Ollama measurement** is one bench run per tier of
+  `qwen3.6:35b-a3b-mtp-q4_K_M`, all on the same 60 GPQA-Diamond items
+  (a seeded random sample of the 198) under the backends' default,
+  stochastic decoding (temperature 1.0 on this runner):
+  - 64K/f16 scored 52/60 = 0.867 (95% Clopper-Pearson interval
+    0.754-0.941), on 2026-07-19.
+  - 128K/q8_0 scored 46/60 = 0.767 (0.640-0.866) and 45/60 = 0.750
+    (0.621-0.853). These were two back-to-back runs in one container on
+    2026-07-21, not independent runs on different days.
+- **The paired differences are not distinguishable from zero at the 5%
+  level.** Against f16 they are -0.100 (Newcombe 95% interval -0.222
+  to +0.022; exact McNemar b = 4, c = 10, p = 0.18) and -0.117 (-0.255
+  to +0.026; b = 6, c = 13, p = 0.17). The intervals still allow a true
+  loss of up to 22-25 points. At n = 60 the design had about 27-29% power
+  to detect a true 10-point drop. The p-values assume independent items,
+  which the queue cascades described next violate. Positive dependence
+  makes the true uncertainty larger, so "not distinguishable" stands.
+- **The net gap is more than accounted for by time-outs.**
+  - **The mechanism:** a sample that reached the harness's 900 s
+    wall-clock limit was scored wrong without an answer. Before
+    2026-09-19 that clock also counted time spent queued behind up to 9
+    other samples on Ollama's single slot.
+  - **The counts:** the q8_0 runs reached the limit on 11 and 12 items,
+    the f16 run on 3. Against f16, q8_0 was behind by a net 6 and 7
+    items, while it had a net 8 and 9 more time-outs.
+  - **The time-outs may themselves be an effect of q8_0.** The q8_0 runs
+    produced the two longest generations: about 42K and 63K tokens,
+    against at most about 28K under f16. One of them held the single
+    serving slot for 494 s and set off the cascade.
+  - **Whether q8_0 causes such runaway generations is not determined by
+    these data.** On items completed in both runs, q8_0's output was
+    longer on 25 of 46 and 27 of 46 items (sign test p = 0.66 and
+    0.30).
+  - Among completed items, accuracy was 52/57 = 0.912 for f16 against
+    46/49 = 0.939 and 45/48 = 0.938 for q8_0.
+  - On the items completed in both runs, q8_0 scored 0.94 vs 0.91 and
+    0.93 vs 0.89. That is not significant, and it conditions on an
+    outcome, so it is descriptive only.
+- **The tiers differed in more than the KV dtype:** context length
+  (64K vs 128K), date and container. Flash attention, Ollama version,
+  GGUF, sampler and items were the same.
+- **Test-retest:** the two q8_0 runs disagreed with each other on 13 of
+  60 items, a noise level similar to how often either disagreed with f16
+  (14 and 19). Their *net* difference was only 1 item, however, against
+  6 and 7 for q8_0 vs f16. So the retest does not show that the q8_0 gap
+  is within noise; the McNemar tests above are the relevant comparison.
+- **Short-chain tasks** (GSM8K, HumanEval, HumanEval+, MMLU-Pro, tool
+  use): no paired difference is distinguishable at the 5% level. The
+  intervals are too wide to show that any loss is below 2 points. The
+  data rule out losses larger than about 2.6 points on GSM8K and 2.7 on
+  MMLU-Pro, but only larger than 7-18 points on the other tasks.
+- **gemma4:26b-a4b** (q8_0 at 256K against f16 at 128K): no difference
+  is distinguishable at the 5% level on any of six tasks (raw exact
+  McNemar p = 0.23-1.0), and no task shows non-inferiority within 2
+  points. Its GPQA rows are dominated by time-outs (20/60 under f16,
+  16/60 under q8_0), and the comparison again spans two context tiers
+  and two dates. Contrary to an earlier note, gemma4 is a reasoning
+  model here: every completed GPQA sample carries a reasoning block, and
+  its outputs were longer than qwen3.6's.
+
+Conclusion: a quality cost of q8_0 KV on this fleet is **neither shown
+nor excluded**. The retained data are compatible with anything from no
+loss to a loss of more than 20 GPQA points, and they cannot separate a
+correctness effect from a speed effect (runaway generations that time
+out). The hypothesis that the cost grows with generation
+length is not tested by these data. q4_0 KV was never run here.
+Settling the question needs a paired design at one context length, with
+flash attention on in both arms and no wall-clock limit that counts
+queueing (truncation recorded as its own outcome). It also needs all
+198 items and either greedy decoding or about 7-22 replicate runs per
+arm to establish a 2-point non-inferiority margin. Detecting a 10-point
+drop alone needs one run per arm on all 198 items (about 84% power).
 
 Do NOT set `OLLAMA_KV_CACHE_TYPE` globally in `.env`: fit cells are
 dtype-scoped, and a global flip silently invalidates every f16 cell.
@@ -991,15 +1179,26 @@ global KV dtype policy:
   non-default cells.
 - **picker**: `_kv_cells` decodes unstamped cells per backend (vllm ->
   fp8, others -> f16) and the mixed-KV sub-modal/warning generalizes:
-  f16/auto count as "full quality", any other dtype carries the
-  weaker-long-form-reasoning caveat (with the measured GPQA numbers
-  cited only for q8_0, the dtype they were measured on).
+  f16/auto are labelled "full quality", and any other dtype carries the
+  weaker-long-form-reasoning caveat. As shown above, the data establish
+  neither label.
 
-Nothing has measured vLLM's fp8-vs-auto quality delta on this fleet
-yet -- every existing vLLM bench row (including GPQA) was measured
-under fp8 KV, so displayed scores are honest for what serves today.
-An fp8-vs-auto A/B on a slack model (fit + LOAD probe + full bench
-with GPQA both ways) is the open follow-up.
+One informal vLLM fp8-vs-auto comparison exists:
+
+- **Setup:** gpt-oss-20b@131072 on stock vLLM 0.22.1. fp8 KV ran on
+  2026-07-17 and 2026-07-19, auto on 2026-07-22. One run each, same
+  items, no time-outs.
+- **Result:** no difference is distinguishable at the 5% level on any
+  of six tasks (raw exact McNemar p = 0.29-1.0). For example, GPQA was
+  0.58 under fp8 against 0.60 under auto (n = 100; fp8 minus auto
+  -0.02, 95% interval -0.125 to +0.086; b = 14, c = 16, p = 0.86).
+- **What it does not show:** the intervals are far wider than 2
+  points, so it does **not** show that fp8 costs at most 2 points.
+
+gpt-oss-20b now serves with KV `auto`, and its displayed vLLM bench row
+was measured under auto. Every other vLLM row was measured under fp8,
+which is also what serves, so the displayed scores match the served
+configuration.
 
 ### Custom vLLM parser plugins
 

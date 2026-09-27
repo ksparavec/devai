@@ -171,8 +171,31 @@ agent --> router (port 11435 or 11436)
               +- proxy the original request through
 ```
 
-Cold start typically takes 60-90s for BF16 weights, up to 300s for
-NVFP4 with CUDA graph capture.
+Cold start (router launch to ready, 1 s log resolution, successful
+launches only) depends on the model and on the engine's caches:
+
+- BF16 8B: medians of 68 and 69 s (9 and 10 launches, 2026-05).
+- 4-bit 8B-30B (NVFP4, and MXFP4 for gpt-oss): medians of 40-143 s by
+  model (5-35 launches each, 2026-04/05).
+- The 27B builds on vllm-devai:
+  - NVFP4-devai: 252-278 s with empty cache volumes (10 launches), and a
+    125 s median with the FlashInfer cache warm (13 launches);
+  - AutoRound-devai: 137-143 s with empty volumes (4 launches).
+
+Between 2026-04-28 and 2026-09-26 there were 742 distinct launches. The
+persisted log repeats whole blocks of lines, so it shows 3,245 "starting"
+lines. Of the 742:
+
+- 673 reached ready;
+- 11 never did: 10 real launches (9 at the 10-minute health timeout, 1 at
+  an earlier 5-minute one) and 1 request naming a client model;
+- 36 were engine failures;
+- 7 were superseded by a new start;
+- 15 were abandoned by a router restart, 7 of them after more than 278 s.
+
+The durations above are for successful launches only. The slowest was
+278 s, and the tail beyond it is censored, not observed. Recomputed by `scripts/stats/perf_coldstart.py` and
+`perf_phases.py`.
 
 ### Subsequent requests, same model
 
@@ -625,8 +648,11 @@ broke the moment a derived checkpoint was probed on `vllm-devai` only
 (2026-09-22): its capability read as unknown, no `reasoning_effort` was
 injected, and the Qwen3.8 chat template applied its own default --
 `xhigh`, a 38-token "think carefully" system preamble. Same weights,
-same image, same flags: HumanEval 97.6 % through port 11435, 46 %
-through port 11437, and `::nothink` a silent no-op. Note that `auto`
+same image, same flags: HumanEval 160/164 (97.6 %) through port 11435
+against 23/50 (46 %) through port 11437. On the 50 problems both runs
+share, that is 47/50 vs 23/50 (exact McNemar b = 25, c = 1, p < 1e-6;
+single runs at the model's default sampling). `::nothink` was a silent
+no-op. Note that `auto`
 is therefore NOT a byte-identical pass-through on the Chat Completions
 path: it maps to `reasoning_effort: medium`, which for Qwen3.8 means
 "no preamble" (`medium` 180 prompt tokens, `low` 206, `xhigh` 218 on
@@ -884,9 +910,14 @@ recovery registry: entry for <model> is scoped to [vllm] -- not applied to sglan
 `--enforce-eager` disables CUDA graph capture entirely, reclaiming the
 ~4 GiB workspace vLLM otherwise pre-reserves. The model then loads
 with the fp8 KV cache fitting comfortably and 128K-context Q&A works
-end-to-end (probe records `fits=true, vram=22.79 GiB`). Cost is a
-~10-20% decode throughput hit from losing graph batching -- the going
-trade to reach 128K on a 24 GiB card.
+end-to-end (probe records `fits=true, vram=22.79 GiB`). The decode cost
+depends on the model and can be far larger than the 10-20% often quoted.
+The one retained measurement here is Nemotron-3-Nano-30B-A3B-NVFP4: 143.8
+tok/s with CUDA graphs (the 2026-05-05 sweep) against 40.3 tok/s eager (the
+current cache row), a 3.5x lower decode rate. That is one run per mode,
+confounded by context length, max-num-seqs and date. Further values of
+144.8 and 42.9 tok/s are quoted from a run whose data were not retained. Other models were not measured. Check the decode
+rate before accepting eager mode as the price of 128K on a 24 GiB card.
 
 `scripts/_probe_hf_common.py` reads the same JSON so the vLLM/SGLang
 probers launch with the same flags. Without this symmetry the probe
@@ -1037,7 +1068,7 @@ the shell when invoking compose.
 | `MAX_CONCURRENT_REQUESTS`| `32`    | max in-flight requests per backend before HTTP 429; `0` = unlimited **and** omits `--max-num-seqs` / `--max-running-requests` entirely (engine default). Any positive value is also passed to the engine as that flag. |
 | `DEVAI_SSE_KEEPALIVE_SECONDS` | `10` | interval between `: keepalive` SSE comment frames during a slow launch; `0` disables the feature |
 | `DEVAI_SSE_KEEPALIVE_GRACE_SECONDS` | `5` | how long a launch may take before the first frame is sent (and the response is committed as SSE) |
-| `LAYA_MAX_HOLD_S`         | `900`   | longest a busy job runner may refuse other backends, counted from its job's `started_at`; `0` = no cap. Measured jobs held 123-140 s (1,448-1,789 training rows x 4 epochs, 2026-09-25, docs/plans/laya-trainer.md Phase 4); 900 s leaves room for datasets several times larger (owner decision). A job past it fails as `trainer_stopped`. |
+| `LAYA_MAX_HOLD_S`         | `900`   | longest a busy job runner may refuse other backends, counted from its job's `started_at`; `0` = no cap. An engineering margin set by the owner, not an estimate: the three measured campaign jobs held 123.3 / 135.2 / 140.4 s (1,448-1,789 training rows x 4 epochs, single runs, 2026-09-25; docs/laya-trainer.md "Measurements"). A straight line through two job sizes puts 900 s at roughly 10x that dataset at the same short texts, 4 epochs and lean mode -- an extrapolation the two points cannot test. A job past it fails as `trainer_stopped`. |
 | `LAYA_JOB_TIMEOUT_S`      | `0`     | forwarded to the trainer: per-job wall-clock limit (exit 124); `0` = none |
 | `DEVAI_MAX_FAILED_LAUNCHES` | `3` | consecutive launches of the same `(model, ctx)` that may fail to produce a real engine response before the router refuses; `0` disables the breaker. See [Launch circuit breaker](#launch-circuit-breaker-engine-dies-after-passing-health). |
 
@@ -1350,6 +1381,29 @@ Lives at `scripts/bench/`, runs in the lab container, talks to the
 router exactly the way Claude Code does. Built to answer "which model
 should I use for X?" with evidence rather than vibes.
 
+**Read its numbers with these limits** (details and the statistics in
+[bench-results.md](bench-results.md) and
+[statistics-primer.md](statistics-primer.md)):
+
+- **One run per cell.** There is no replication, so run-to-run variation
+  is not measured per row.
+- **Stochastic sampling.** The harness's temperature setting never reaches
+  the model (`inspect_ai.eval()` has no `config` parameter), so every
+  score was measured at the engine's default sampling (temperature
+  0.6-1.0, model-dependent).
+- **Subset selection differs by task.** GSM8K and HumanEval use the first
+  n items; MMLU-Pro and GPQA use one seeded random sample.
+- **Time-outs are scored as wrong answers.** A sample that exceeds the
+  per-sample time limit is scored wrong, and before 2026-09-19 that clock
+  included queueing on Ollama.
+- **TPS is estimated.** The request never sets
+  `stream_options.include_usage`. The vLLM 0.28 and Ollama 0.34 sources
+  omit `usage` without it, so tokens are counted as characters/4. For
+  SGLang and stock vLLM 0.22.1 this is inferred from the cached values,
+  not checked in their source.
+- **Scorer defect.** The HumanEval extractor de-indents fenced function
+  bodies, which turns some correct answers into syntax errors.
+
 ### What it measures
 
 Per (model, backend) pair, per run:
@@ -1363,10 +1417,10 @@ Per (model, backend) pair, per run:
 | Hard reasoning | GPQA-Diamond accuracy | inspect_ai task `gpqa_subset_<n>` |
 | Tool use | Score + per-subcase breakdown | inspect_ai task `tools_use_<n>` (empty-schema, single-arg, multi-tool pick, result follow-up) |
 | Output cleanliness | Leak rate + per-marker hits | regex sweep over response bodies via `bench_latency_leak.py` |
-| Cold start | `ttft_ms_first` | First request to a freshly-recreated backend (cold container + weight load + KV alloc + prefill + first token) |
-| Steady-state latency | `ttft_ms_steady_p50/p95` | Subsequent prompts in the same model session |
-| Throughput | `tps_sustained_p50` | Tokens-per-second during streamed body |
-| Memory | `peak_vram_gb`, `mean_vram_gb` | nvidia-smi sampler thread, 1Hz |
+| Cold start | `ttft_ms_first` | TTFT of the run's first prompt (max_tokens 32). It includes the launch only when that request made the router start the backend: in 3 of 27 current rows the backend was already warm (36-374 ms). One observation per run. |
+| Steady-state latency | `ttft_ms_steady_p50/p95` | Type-7 quantiles of TTFT over prompts 2..40 of the same run (n = 39), measured at the client through the router. At n = 39 no distribution-free 95% interval exists for p95 (that needs n >= 59). |
+| Throughput | `tps_sustained_p50` | Type-7 median, over up to 40 prompts, of each request's tokens / (t_done - t_first_token). Tokens are always characters/4, because usage is never requested. The cold first request is included. One run; per-request values are not stored. |
+| Memory | `peak_vram_gb`, `mean_vram_gb` | Device-wide nvidia-smi `memory.used` sampled at 1 Hz, from before the first request (so it includes the launch) to the end of the run. The values are MiB/1024, i.e. GiB despite the name. The peak is a lower bound on the true peak, and the mean depends on run length. |
 
 ### Cache file
 

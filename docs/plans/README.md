@@ -62,8 +62,12 @@ What changed on 2026-07-25:
 - **`kv-cache-quantization` -> Superseded.** Its engine-side substance
   shipped independently under a better per-probe-cell design
   (664bc76 / 8325255). Its Phase 2 headline -- flip Ollama to q8_0
-  globally -- is now contradicted by the repo's own measured GPQA
-  regression and must NOT be executed. The one part that had not
+  globally -- conflicts with the per-cell KV-dtype design and must NOT
+  be executed. (The GPQA "regression" once cited against it is not
+  supported by the data: not distinguishable from zero, p = 0.17-0.18,
+  with intervals that still allow a large loss, and confounded by extra
+  time-outs under q8_0; a quality cost is neither shown nor excluded.) The
+  one part that had not
   shipped, backend-aware fit math, was extracted and shipped on
   2026-07-25.
 - **`skypilot-agent-skill` -> Frozen.** Its Phase 1 shipped documentation
@@ -473,8 +477,10 @@ frozen (see above), most of this list is free-floating by default rather than by
   previously read `(Draft)`, contradicting the status table; the status
   table wins, per the rule above. Its engine-side substance shipped under
   a better per-probe-cell design, and its Phase 2 headline (flip Ollama
-  to q8_0 globally) is contradicted by this repo's own measured GPQA
-  regression and must NOT be executed.
+  to q8_0 globally) conflicts with that design and must NOT be executed.
+  The GPQA "regression" once cited against it is not supported by the
+  data (not distinguishable from zero, and confounded by extra time-outs
+  under q8_0; see docs/backends.md, "Per-tier KV-cache dtype").
 
 ## When this file becomes stale
 
