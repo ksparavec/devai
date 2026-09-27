@@ -61,6 +61,12 @@ def r4(x):
 # Loading
 # --------------------------------------------------------------------------
 
+def served_model_name(logged: str) -> str:
+    """The router alias from an inspect log's model: `openai/<alias>` (the
+    harness until 2026-09-27) or `openai-api/<service>/<alias>` (after)."""
+    return re.sub(r"^(?:openai-api/[^/]+|openai)/", "", logged)
+
+
 def load_runs(path: Path) -> list[dict]:
     runs = []
     for r in json.loads(path.read_text()):
@@ -74,7 +80,7 @@ def load_runs(path: Path) -> list[dict]:
             continue  # an aborted run (every sample errored) is not a measurement
         runs.append({
             "file": r["file"], "created": r["created"], "completed": r.get("completed_at"),
-            "task": task, "model": (r.get("model") or "").split("/", 1)[-1],
+            "task": task, "model": served_model_name(r.get("model") or ""),
             "backend": PORT_BACKEND.get(m.group(1)) if m else None,
             "n": len(items), "x": sum(v for v in vals if v is not None),
             "n_unscored": sum(v is None for v in vals),

@@ -589,17 +589,21 @@ def sampling_record(alias: str, overrides: dict | None = None) -> dict:
     }
 
 
-def _sampling_config(alias: str = ""):
-    """GenerateConfig pinning sampling for the scored tasks.
+def sampling_kwargs(alias: str = "") -> dict:
+    """Sampling for the scored tasks, as inspect_ai.eval() KEYWORDS.
 
-    Imported lazily, like inspect_eval itself, so the module stays
-    importable without inspect_ai installed (the unit tests rely on
-    that).
+    eval() takes generation settings as plain keywords (its **kwargs are
+    GenerateConfigArgs). It has no `config` parameter: the harness passed
+    `config=GenerateConfig(...)` until 2026-09-27, eval() folded that into
+    a GenerateConfig as an unknown field, and pydantic dropped it -- so no
+    sampling setting ever reached a backend, every scored row ran at the
+    engine's own default sampler, and the `greedy_default` stamp was false
+    (docs/bench-results.md D1: `model_generate_config` is {} in every
+    retained log, and none of 16,565 logged request bodies carries a
+    temperature).
     """
-    from inspect_ai.model import GenerateConfig
-
     temperature, top_p = sampling_for(alias)
-    return GenerateConfig(temperature=temperature, top_p=top_p)
+    return {"temperature": temperature, "top_p": top_p}
 
 
 # How many requests a backend serves AT ONCE on this host. inspect_ai sends
@@ -622,6 +626,19 @@ BACKEND_MAX_CONNECTIONS = {"ollama": 1}
 def max_connections_for(backend: str) -> int | None:
     """Concurrent requests to bench `backend` with; None = inspect's default."""
     return BACKEND_MAX_CONNECTIONS.get(backend)
+
+
+# inspect_ai provider for the router: the GENERIC OpenAI-compatible one
+# (`openai-api/<service>/<model>`), not `openai/<model>`. inspect_ai 0.3.271's
+# `openai` provider applies OpenAI model-name heuristics to our served names:
+# it classifies Qwen3.5-9B-NVFP4, qwen3.8:27b-... and Nemotron-Nano-9B-v2 as
+# GPT-5 models, sends them to /v1/responses with a `reasoning` object, and
+# drops temperature/top_p ("reasoning models always sample at 1"); forcing
+# responses_api=False still drops temperature on the chat path. The generic
+# provider sends /v1/chat/completions with exactly the sampling given --
+# checked on the wire against 0.3.271 on 2026-09-27, the same endpoint the
+# 0.3.158 harness used for every retained log. It reads <SERVICE>_API_KEY.
+INSPECT_SERVICE = "devai"
 
 
 def _invoke_inspect_task(
@@ -649,8 +666,9 @@ def _invoke_inspect_task(
     # via /v1. Auth doesn't matter — router is internal — but the SDK
     # complains if API key is empty, so set a placeholder.
     os.environ.setdefault("OPENAI_API_KEY", "devai-router-no-auth")
+    os.environ.setdefault(f"{INSPECT_SERVICE.upper()}_API_KEY", "devai-router-no-auth")
     eval_kwargs = dict(
-        model=f"openai/{served_model}",
+        model=f"openai-api/{INSPECT_SERVICE}/{served_model}",
         model_base_url=router_url + "/v1",
         log_dir=str(log_dir),
         # message_limit caps the assistant <-> tool turn-loop length
@@ -664,8 +682,9 @@ def _invoke_inspect_task(
         # Explicit sampling. Without this the backend's own default
         # applies and differs per engine -- see BENCH_TEMPERATURE above.
         # Keyed on the served model so deploy/bench-sampling.json can
-        # exempt the models that cannot be benched greedily.
-        config=_sampling_config(served_model),
+        # exempt the models that cannot be benched greedily. Keywords,
+        # not `config=`: see sampling_kwargs.
+        **sampling_kwargs(served_model),
     )
     if fail_on_error is not None:
         eval_kwargs["fail_on_error"] = fail_on_error

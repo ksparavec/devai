@@ -422,7 +422,7 @@ all 131 current entries match their log exactly.
 
 ### Harness defects
 
-D3 was fixed on 2026-09-27; the others are open until marked fixed.
+D1 and D3 were fixed on 2026-09-27; the others are open until marked fixed.
 
 - **D1 -- sampling is never applied.** `_invoke_inspect_task` passes
   `config=GenerateConfig(...)` to `inspect_ai.eval()`, which has no
@@ -433,7 +433,21 @@ D3 was fixed on 2026-09-27; the others are open until marked fixed.
   temperature, top_p, top_k, seed or min_p, while `max_connections=1`,
   passed as a keyword, does appear. The `sampling: {temperature: 0.0,
   source: greedy_default}` stamp on 8 cache rows is false, and
-  `deploy/bench-sampling.json` overrides never took effect.
+  `deploy/bench-sampling.json` overrides never took effect. **FIXED
+  2026-09-27:** sampling now goes in as `eval()` keywords, through
+  inspect's generic OpenAI-compatible provider (`openai-api/devai/<alias>`).
+  Both halves were needed with the inspect-ai 0.3.271 pin: 0.3.271
+  rejects `config=` outright (ValidationError), and its `openai`
+  provider takes aliases such as `Qwen3.5-9B-NVFP4`, `qwen3.8:27b-...`
+  and `NVIDIA-Nemotron-Nano-9B-v2-NVFP4` for GPT-5 models, sends them to
+  `/v1/responses` and drops temperature and top_p (even with
+  `responses_api=False`). Checked on the wire in the lab image against
+  a fake server: every alias tried now sends `/v1/chat/completions` --
+  the endpoint of every retained 0.3.158 log -- with the configured
+  temperature and top_p, and the log's `model_generate_config` records
+  them. Rows benched after the fix decode greedily (or at their
+  `deploy/bench-sampling.json` override) and are not comparable with
+  earlier rows.
 - **D2 -- time-outs are scored wrong.** A sample over its time limit is
   recorded incorrect with an empty answer. 65 eval logs contain such
   samples; 33 of 131 current cache task entries have at least one (e.g.
