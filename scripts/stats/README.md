@@ -32,6 +32,18 @@ starts a container, touches the GPU or uses the network.
 
 ## Benchmark scores (docs/bench-results.md, docs/backends.md, docs/router.md)
 
+**Log format changed with the inspect-ai 0.3.271 pin (2026-09-27).** Logs
+written by 0.3.158 (every log before that date) are deflate-compressed
+zip files; 0.3.271 writes its `.eval` archives with **zstd** (zip
+compression method 93), which Python's `zipfile` reads only from Python
+3.14 on. The host's Python 3.13 raises `NotImplementedError: That
+compression method is not supported` on them, so run the log readers
+(`bench_extract_logs.py`, `bench_stats.py`, `kvquant_*`, ...) inside the
+lab image (Python 3.14.7) once logs from the re-bench are in the
+directory, e.g. `podman run --rm --network=none --entrypoint python3
+-v $PWD:/repo:ro -v $L:$L:ro -v $O:$O localhost/devai-lab-gpu:latest
+/repo/scripts/stats/bench_extract_logs.py $L $O/logs_extracted.json`.
+
 ```bash
 L=/var/cache/devai/bench/inspect-logs; O=~/.cache/devai/stats/bench; mkdir -p $O
 python3 scripts/stats/bench_extract_logs.py $L $O/logs_extracted.json
