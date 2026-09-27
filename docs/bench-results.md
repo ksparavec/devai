@@ -422,7 +422,7 @@ all 131 current entries match their log exactly.
 
 ### Harness defects
 
-D1 and D3 were fixed on 2026-09-27; the others are open until marked fixed.
+D1 and D3 were fixed on 2026-09-27, D2 in part; the others are open until marked fixed.
 
 - **D1 -- sampling is never applied.** `_invoke_inspect_task` passes
   `config=GenerateConfig(...)` to `inspect_ai.eval()`, which has no
@@ -453,7 +453,20 @@ D1 and D3 were fixed on 2026-09-27; the others are open until marked fixed.
   samples; 33 of 131 current cache task entries have at least one (e.g.
   Nemotron-3-Nano GPQA 48/100 with 40 time-outs, 0.80 among completed;
   qwen3.5:27b GSM8K 60/100 with 40; Ornith-1.0-9B GPQA on SGLang 63/100
-  with 33). Listing: `scripts/stats/bench_timeouts.py`.
+  with 33). Listing: `scripts/stats/bench_timeouts.py`. **Changed
+  2026-09-27:** the limit is on inspect's *working* time
+  (`working_limit`), which excludes waiting for one of the harness's
+  connections, so queueing is no longer charged to a sample; every
+  backend gets an explicit static `max_connections` (Ollama 1, others
+  10 -- inspect 0.3.271 would otherwise use adaptive concurrency up to
+  100, past the router's cap of 32); and each task entry records
+  `n_timeouts` (plus `n_limited`, `n_errors`), which `make bench-report`
+  prints as `(t=N)`. A time-out is still scored as a wrong answer in the
+  headline score, deliberately: dropping it would select on the outcome
+  (primer Sec. 7, "Informative truncation"); `[x/n, (x + t)/n]` bounds
+  it. Checked with inspect 0.3.271 against a slow fake server: samples
+  queued behind one connection finish, a 5 s answer under a 3 s limit
+  is stopped (`limit: working`) and counted.
 - **D3 -- the HumanEval extractor stripped the first line's
   indentation. FIXED 2026-09-27.** Two paths did it. In `_FENCE_BLOCK_RX`
   (```` ```(?:python|py)?\s*\n?(.*?)``` ````) the `\s*` consumed the

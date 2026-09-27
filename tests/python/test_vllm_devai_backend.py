@@ -134,7 +134,9 @@ class ToolingTest(unittest.TestCase):
                          bench_runner.HF_WEIGHT_STORE_BY_BACKEND["vllm"])
         self.assertIn("vllm-devai", bench_runner.BACKEND_METRICS_URL)
         self.assertEqual(_bench_core.ROUTER_PORT_BY_BACKEND["vllm-devai"], 11437)
-        self.assertIsNone(bench_runner.max_connections_for("vllm-devai"))
+        # A batching engine: the same static cap as vllm (not Ollama's 1).
+        self.assertEqual(bench_runner.max_connections_for("vllm-devai"),
+                         bench_runner.max_connections_for("vllm"))
 
     def test_bench_sync_iterates_it(self) -> None:
         bs = _load(REPO_ROOT / "scripts" / "bench-sync.py", "bench_sync_for_devai_test")

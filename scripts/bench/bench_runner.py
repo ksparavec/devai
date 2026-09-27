@@ -619,13 +619,24 @@ def sampling_kwargs(alias: str = "") -> dict:
 # models drain the queue before the clock matters, so only slow models were
 # penalised. Capping does not cost wall time: the GPU was busy throughout.
 #
-# vLLM and SGLang batch continuously and are left on inspect's default.
+# vLLM and SGLang batch continuously; they get DEFAULT_MAX_CONNECTIONS, set
+# EXPLICITLY. inspect 0.3.158 (every retained log) used a static 10; 0.3.271
+# defaults to ADAPTIVE concurrency (start 20, up to 100), past the router's
+# per-backend cap (MAX_CONCURRENT_REQUESTS, default 32 -> HTTP 429) and
+# vLLM's --max-num-seqs / SGLang's --max-running-requests, which sit on the
+# same cap. An explicit max_connections switches adaptive concurrency off.
+#
+# With the per-sample limit on WORKING time (see _invoke_inspect_task), a
+# request waiting for one of these connections is not charged to its sample;
+# a request queued INSIDE the engine would be, so the cap must stay at or
+# below what the engine serves at once.
 BACKEND_MAX_CONNECTIONS = {"ollama": 1}
+DEFAULT_MAX_CONNECTIONS = 10
 
 
-def max_connections_for(backend: str) -> int | None:
-    """Concurrent requests to bench `backend` with; None = inspect's default."""
-    return BACKEND_MAX_CONNECTIONS.get(backend)
+def max_connections_for(backend: str) -> int:
+    """Concurrent requests to bench `backend` with."""
+    return BACKEND_MAX_CONNECTIONS.get(backend, DEFAULT_MAX_CONNECTIONS)
 
 
 # inspect_ai provider for the router: the GENERIC OpenAI-compatible one
@@ -675,10 +686,16 @@ def _invoke_inspect_task(
         # (relevant for tools_use; conservative cap keeps a misbehaving
         # model from running forever).
         message_limit=20,
-        # time_limit is per-sample wall clock. Generous because cold-
-        # start vLLM can need 90+ seconds on first request and the
-        # sample-level timeout fires AFTER the model is loaded.
-        time_limit=int(timeout_s),
+        # Per-sample limit on WORKING time, not wall clock (time_limit).
+        # Working time excludes waiting for one of max_connections, so a
+        # sample queued behind others is no longer charged for the wait:
+        # with time_limit, 300-600 s of queueing on Ollama's single slot
+        # timed samples out that generated for ~35 s (2026-09-19), and
+        # time-outs were concentrated on slow models. Generous because
+        # cold-start vLLM can need 90+ seconds on the first request.
+        # Samples that still hit it are counted, not hidden: see
+        # _outcome_counts.
+        working_limit=int(timeout_s),
         # Explicit sampling. Without this the backend's own default
         # applies and differs per engine -- see BENCH_TEMPERATURE above.
         # Keyed on the served model so deploy/bench-sampling.json can
@@ -688,9 +705,7 @@ def _invoke_inspect_task(
     )
     if fail_on_error is not None:
         eval_kwargs["fail_on_error"] = fail_on_error
-    max_connections = max_connections_for(backend)
-    if max_connections is not None:
-        eval_kwargs["max_connections"] = max_connections
+    eval_kwargs["max_connections"] = max_connections_for(backend)
     logs = inspect_eval(task_obj, **eval_kwargs)
     return logs[0] if isinstance(logs, list) else logs
 
@@ -715,6 +730,31 @@ def _aggregate_score(eval_log) -> tuple[float, int]:
         return (float(val), n)
     except (TypeError, ValueError):
         return (0.0, n)
+
+
+TIMEOUT_LIMIT_TYPES = ("time", "working")
+
+
+def _outcome_counts(eval_log) -> dict[str, int]:
+    """Samples that did not end with a model answer, per the eval log.
+
+    A sample stopped by the working-time limit is still SCORED -- as wrong,
+    on an empty answer -- so the headline score cannot tell a time-out from
+    a wrong answer. It is recorded separately here: `n_timeouts` samples hit
+    the time limit, `n_limited` hit another limit (message/token/...), and
+    `n_errors` raised (tools_use runs with fail_on_error=False). The score
+    stays correct/n; a reader can bound it as [x/n, (x + n_timeouts)/n]
+    (docs/statistics-primer.md Sec. 3, "time-out bounds").
+    """
+    counts = {"n_timeouts": 0, "n_limited": 0, "n_errors": 0}
+    for sample in getattr(eval_log, "samples", None) or []:
+        limit = getattr(sample, "limit", None)
+        if limit is not None:
+            kind = str(getattr(limit, "type", ""))
+            counts["n_timeouts" if kind in TIMEOUT_LIMIT_TYPES else "n_limited"] += 1
+        if getattr(sample, "error", None):
+            counts["n_errors"] += 1
+    return counts
 
 
 def _by_subcase_breakdown(eval_log) -> dict[str, float]:
@@ -934,6 +974,7 @@ def run_for_target(
                     "n": n,
                     "ran_at": _now_iso(),
                     "inspect_log_dir": str(log_dir),
+                    **_outcome_counts(eval_log),
                 }
                 print(f"    score: {score:.4f} (n={n})", file=sys.stderr)
             except Exception as e:  # noqa: BLE001 — inspect_ai surfaces many error shapes
@@ -962,6 +1003,7 @@ def run_for_target(
                     "n": n,
                     "ran_at": _now_iso(),
                     "inspect_log_dir": str(log_dir),
+                    **_outcome_counts(eval_log),
                 }
                 print(f"    pass@1: {score:.4f} (n={n})", file=sys.stderr)
             except Exception as e:  # noqa: BLE001
@@ -987,6 +1029,7 @@ def run_for_target(
                     "n": n,
                     "ran_at": _now_iso(),
                     "inspect_log_dir": str(log_dir),
+                    **_outcome_counts(eval_log),
                 }
                 print(f"    pass@1: {score:.4f} (n={n})", file=sys.stderr)
             except Exception as e:  # noqa: BLE001
@@ -1011,6 +1054,7 @@ def run_for_target(
                     "n": n,
                     "ran_at": _now_iso(),
                     "inspect_log_dir": str(log_dir),
+                    **_outcome_counts(eval_log),
                 }
                 print(f"    score: {score:.4f} (n={n})", file=sys.stderr)
             except Exception as e:  # noqa: BLE001
@@ -1035,6 +1079,7 @@ def run_for_target(
                     "n": n,
                     "ran_at": _now_iso(),
                     "inspect_log_dir": str(log_dir),
+                    **_outcome_counts(eval_log),
                 }
                 print(f"    score: {score:.4f} (n={n})", file=sys.stderr)
             except Exception as e:  # noqa: BLE001
@@ -1107,6 +1152,7 @@ def run_for_target(
                     "tool_parser": _tool_parser,
                     "ran_at": _now_iso(),
                     "inspect_log_dir": str(log_dir),
+                    **_outcome_counts(eval_log),
                 }
                 print(f"    score: {score:.4f} (n={n})", file=sys.stderr)
                 if by_sub:

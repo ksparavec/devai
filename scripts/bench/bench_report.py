@@ -92,6 +92,23 @@ def _pick_score(tasks: dict, prefix: str, key: str) -> float | None:
     return None
 
 
+def _pick_timeouts(tasks: dict, prefix: str) -> int:
+    """``n_timeouts`` of the entry ``_pick_score`` reads (0 when absent:
+    rows benched before 2026-09-27 did not record time-outs)."""
+    for tname, tdata in tasks.items():
+        if tname.startswith(prefix) and isinstance(tdata, dict):
+            return int(tdata.get("n_timeouts") or 0)
+    return 0
+
+
+def _fmt_score(tasks: dict, prefix: str, key: str) -> str:
+    """Score cell; a task with time-outs shows them, since a time-out is
+    scored as a wrong answer and the score alone cannot tell them apart."""
+    cell = _fmt(_pick_score(tasks, prefix, key))
+    t = _pick_timeouts(tasks, prefix)
+    return f"{cell} (t={t})" if t else cell
+
+
 def _aggregate(row: dict) -> float | None:
     """Composite score = unweighted mean of available correctness
     scores. None when a row has no scored tasks (latency-only run).
@@ -228,10 +245,10 @@ def render(cache: dict, host_vram_gb: float = DEFAULT_HOST_VRAM_GB) -> str:
         row = r["row"]
         tasks = row.get("tasks") or {}
         metrics = row.get("metrics") or {}
-        gsm = _pick_score(tasks, "gsm8k_", "score")
-        he = _pick_score(tasks, "humaneval_subset_", "pass@1")
-        hep = _pick_score(tasks, "humaneval_plus_subset_", "pass@1")
-        tools = _pick_score(tasks, "tools_use", "score")
+        gsm = _fmt_score(tasks, "gsm8k_", "score")
+        he = _fmt_score(tasks, "humaneval_subset_", "pass@1")
+        hep = _fmt_score(tasks, "humaneval_plus_subset_", "pass@1")
+        tools = _fmt_score(tasks, "tools_use", "score")
         leak = (tasks.get("leak_probe") or {}).get("leak_rate")
         ttft_first = metrics.get("ttft_ms_first")
         ttft_p50 = metrics.get("ttft_ms_steady_p50")
@@ -244,8 +261,8 @@ def render(cache: dict, host_vram_gb: float = DEFAULT_HOST_VRAM_GB) -> str:
         lines.append(
             f"| {r['model']} | {r['backend']} | {_ctx_label(r['ctx'])} | "
             f"{env_id} | {_fmt(r['agg'])} | "
-            f"{_fmt(gsm)} | {_fmt(he)} | {_fmt(hep)} | "
-            f"{_fmt(tools)} | {_fmt(leak)} | "
+            f"{gsm} | {he} | {hep} | "
+            f"{tools} | {_fmt(leak)} | "
             f"{_fmt(ttft_first, ' ms')} | {_fmt(ttft_p50, ' ms')} | "
             f"{_fmt(tps, ' tok/s')} | {_fmt(peak, ' GB')} | {kv_str} |"
         )
@@ -254,6 +271,13 @@ def render(cache: dict, host_vram_gb: float = DEFAULT_HOST_VRAM_GB) -> str:
         "_Schema v3: each row reflects one (model, backend, ctx) cell. "
         "Rows are grouped by (model, ctx); `-` means no bench data at "
         "that cell. Re-run `make bench --ctx <N>` to fill missing tiers._"
+    )
+    lines.append("")
+    lines.append(
+        "_`(t=N)`: N samples hit the per-sample working-time limit and are "
+        "scored as wrong answers; the score with them counted right is an "
+        "upper bound. Rows benched before 2026-09-27 did not record "
+        "time-outs (and their limit also counted queueing)._"
     )
     lines.append("")
     lines.append(
