@@ -184,7 +184,10 @@ launches only) depends on the model and on the engine's caches:
 
 Between 2026-04-28 and 2026-09-26 there were 742 distinct launches. The
 persisted log repeats whole blocks of lines, so it shows 3,245 "starting"
-lines. Of the 742:
+lines: until 2026-09-27 the logger sidecar re-appended a container's
+whole history whenever it restarted (`deploy/logging.sh` now resumes
+from the newest stamp in the file; older duplicates remain, so log
+analyses still count distinct lines). Of the 742:
 
 - 673 reached ready;
 - 11 never did: 10 real launches (9 at the 10-minute health timeout, 1 at

@@ -650,9 +650,11 @@ launch from "starting" to "ready" (2026-04-28 to 2026-09-26), with times
 quantised by the router's 2 s `/health` poll.
 
 **The persisted log repeats whole blocks of lines.** The logger sidecar
-re-appends history, mostly in 2026-05. So it holds 3,245 "starting"
-lines but only 742 distinct launches, which is what `perf_coldstart.py`
-counts. Of the 742:
+re-appended a container's whole history each time it restarted, mostly
+in 2026-05 (fixed 2026-09-27: a follower now resumes from the newest
+stamp already in its file; lines written before the fix keep their
+duplicates). So it holds 3,245 "starting" lines but only 742 distinct
+launches, which is what `perf_coldstart.py` counts. Of the 742:
 
 - **673** reached "ready";
 - **11** never did: 10 real launches (9 hit a 10-minute health timeout,
