@@ -422,7 +422,7 @@ all 131 current entries match their log exactly.
 
 ### Harness defects
 
-D1 and D3 were fixed on 2026-09-27, D2 in part; the others are open until marked fixed.
+D1, D3 and D4 were fixed on 2026-09-27, D2 in part.
 
 - **D1 -- sampling is never applied.** `_invoke_inspect_task` passes
   `config=GenerateConfig(...)` to `inspect_ai.eval()`, which has no
@@ -501,7 +501,18 @@ D1 and D3 were fixed on 2026-09-27, D2 in part; the others are open until marked
   0.93-1.01 of the engine median over all prompts, in the same four runs
   (Qwen3.8 tokenizer). The harness stores no per-request character
   counts. The 10-25 % shortfall on code reported in commit 5832174 is not
-  retained and was not reproduced.
+  retained and was not reproduced. **FIXED 2026-09-27:** the streaming
+  helper sets `stream_options.include_usage`, and `effective_tokens` is
+  the engine's own count whenever the stream carries one; chars/4 is
+  only the fallback for a stream without usage, labelled
+  `token_source: chars/4` (per request) and counted in the latency
+  task's `tps_token_sources`. It used to be `max(usage, chars/4)`, on
+  the belief that vLLM's qwen3 parser leaves reasoning out of usage:
+  the vLLM 0.22.1 and 0.28 sources count every generated token id
+  (`previous_num_tokens[i] += len(output.token_ids)`), SGLang reports
+  its engine's output count, and a max of an exact count and a noisy
+  estimate is biased upward. Rows benched before and after are not
+  comparable on TPS.
 
 ## TPS counting fix
 

@@ -133,13 +133,9 @@ def _one_request(router_url: str, model: str, prompt: str,
         "ok": True,
         "capped": False,
         "ttft_ms": ((t_first - res["t_open"]) * 1000) if t_first else None,
-        # effective_tokens, NOT completion_tokens: the latter is populated
-        # only from a `usage` block, which the engine omits unless the
-        # request sets stream_options.include_usage -- so on a reasoning
-        # model it reads 0 and aggregate throughput comes out as 0.00 for
-        # every cell. _bench_core already computes effective_tokens as
-        # max(usage, char-based estimate) for exactly this reason; the
-        # leak task uses it and this one must too.
+        # effective_tokens: the engine's usage count (the helper requests
+        # stream_options.include_usage), falling back to a chars/4
+        # estimate only for a stream that carried no usage.
         "tokens": res.get("effective_tokens") or res.get("completion_tokens") or 0,
         "wall_s": res["t_done"] - res["t_open"],
     }
