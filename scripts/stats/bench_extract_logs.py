@@ -73,6 +73,10 @@ def sample_meta(z, names):
             "subcase": (s.get("metadata") or {}).get("subcase"),
             "task_id": (s.get("metadata") or {}).get("task_id"),
             "question_id": (s.get("metadata") or {}).get("question_id"),
+            # Per-question tags the use-case scores group by
+            # (usecase_scores.py): MMLU-Pro category, GPQA subdomain.
+            "category": (s.get("metadata") or {}).get("category"),
+            "subdomain": (s.get("metadata") or {}).get("subdomain"),
             "input_head": (s.get("input") if isinstance(s.get("input"), str) else "")[:80],
             # Content key: sample ids are positional (1..n) and do NOT
             # identify an item across runs when the dataset was shuffled.
@@ -145,7 +149,7 @@ def extract(path):
     meta = sample_meta(z, names)
     for it in items:
         m = meta.get(it["id"]) or {}
-        it.update({k: m.get(k) for k in ("subcase", "task_id", "question_id", "input_head", "item_key", "target")})
+        it.update({k: m.get(k) for k in ("subcase", "task_id", "question_id", "category", "subdomain", "input_head", "item_key", "target")})
         if m.get("error") and not it.get("error"):
             it["error"] = m.get("error")
     n_ev, keys_seen, cfgs = scan_requests(z, names)

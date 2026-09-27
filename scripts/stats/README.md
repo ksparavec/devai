@@ -75,6 +75,31 @@ python3 scripts/stats/bench_timeouts.py $L $O/timeouts.tsv
 - `bench_timeouts.py`: every log with a sample that hit the per-sample time
   limit.
 
+## Use-case scores (owner's four use cases)
+
+```bash
+L=/var/cache/devai/bench/inspect-logs; O=~/.cache/devai/stats/usecase; mkdir -p $O
+podman run --rm --network=none --entrypoint python3 -v $PWD:/repo:ro -v $L:$L:ro -v $O:$O \
+    localhost/devai-lab-gpu:latest /repo/scripts/stats/bench_extract_logs.py $L $O/logs_extracted.json
+python3 scripts/stats/usecase_scores.py $O/logs_extracted.json deploy/.bench-cache.json $O
+```
+
+- `usecase_scores.py` regroups benchmark ITEMS by use case, using the
+  per-question tags the extractor keeps (MMLU-Pro `category`, GPQA
+  `subdomain`). Mapping ("Scheme A", owner's choice 2026-09-27; no item
+  counts twice, every MMLU-Pro category exactly once): coding =
+  HumanEval+ and HumanEval (one cluster per problem) + MMLU-Pro computer
+  science; general reasoning = MMLU-Pro law, history, philosophy,
+  psychology, economics, business, health, other; problem analysis =
+  GSM8K + MMLU-Pro math, physics, chemistry, engineering; complex systems
+  = GPQA-Diamond + MMLU-Pro biology. Score = pooled share correct
+  (time-outs scored wrong, counted beside it); Clopper-Pearson, or a
+  cluster bootstrap for coding; winner vs runner-up paired on identical
+  items (cluster bootstrap interval, sign-flip test, Holm over the four
+  use cases). Ranked by quality, never by speed; the runner-up is the
+  best row of a different base model. Writes `usecase_scores.{json,md}`.
+  Tested by `tests/python/test_stats_usecase_scores.py`.
+
 ## KV-cache dtype (docs/backends.md "Per-tier KV-cache dtype")
 
 ```bash
