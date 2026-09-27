@@ -1291,6 +1291,9 @@ def _latency_metrics_into_row(
             "ttft_ms_steady_p50": latency.get("ttft_ms_steady_p50"),
             "ttft_ms_steady_p95": latency.get("ttft_ms_steady_p95"),
             "tps_sustained_p50": latency.get("tps_sustained_p50"),
+            # How the tokens behind the TPS were counted: {"usage": n} =
+            # the engine's own count for every request.
+            "tps_token_sources": latency.get("tps_token_sources"),
             "n_latency_samples": latency.get("n_samples"),
         },
         host_env_id=host_env_id,
@@ -1306,7 +1309,7 @@ def _print_latency_summary(latency: dict) -> None:
     nleak = sum(latency.get("leaked_markers", {}).values())
     print(
         f"    ttft_first={f}ms  steady_p50={p50}ms  steady_p95={p95}ms  "
-        f"tps={tps}/s  leaks={nleak}",
+        f"tps={tps}/s ({latency.get('tps_token_sources')})  leaks={nleak}",
         file=sys.stderr,
     )
 

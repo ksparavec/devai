@@ -142,3 +142,14 @@ class IncludeUsageRequestedTest(unittest.TestCase):
         _, res = self._capture({"model": "m"}, [_chunk({"content": "x" * 40}, finish="stop"), "[DONE]"])
         self.assertEqual(res["effective_tokens"], 10)
         self.assertEqual(res["token_source"], "chars/4")
+
+
+class TokenSourceReachesTheRowTest(unittest.TestCase):
+    def test_latency_metrics_keep_the_token_sources(self) -> None:
+        from bench import bench_runner
+        cache: dict = {}
+        latency = {"ttft_ms_first": 1.0, "ttft_ms_steady_p50": 2.0, "ttft_ms_steady_p95": 3.0,
+                   "tps_sustained_p50": 40.0, "n_samples": 5, "tps_token_sources": {"usage": 5}}
+        bench_runner._latency_metrics_into_row(
+            cache, "k", latency, {"alias": "m", "ctx": 32768}, "vllm", "http://r")
+        self.assertEqual(cache["k"]["metrics"]["tps_token_sources"], {"usage": 5})
