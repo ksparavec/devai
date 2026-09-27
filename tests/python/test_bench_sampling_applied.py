@@ -83,6 +83,11 @@ class ProviderTest(unittest.TestCase):
         self.assertEqual(kw["model"], "openai-api/devai/qwen3.8:27b-ud-q4_k_xl")
         self.assertEqual(kw["model_base_url"], "http://r/v1")
 
+    def test_tools_are_not_sent_strict(self) -> None:
+        # strict:true would turn on vLLM 0.28's grammar-constrained
+        # tool-call decoding for tool_choice="auto" (vllm-devai).
+        self.assertEqual(_invoke("m")["model_args"], {"strict_tools": False})
+
     def test_the_provider_finds_its_api_key(self) -> None:
         self.assertTrue(_invoke("m")["_env_key"])
 

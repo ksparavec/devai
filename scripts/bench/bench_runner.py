@@ -681,6 +681,15 @@ def _invoke_inspect_task(
     eval_kwargs = dict(
         model=f"openai-api/{INSPECT_SERVICE}/{served_model}",
         model_base_url=router_url + "/v1",
+        # The generic provider marks every tool `"strict": true` by default
+        # (strict_tools=True). vLLM 0.28 (vllm-devai; VLLM_ENFORCE_STRICT_
+        # TOOL_CALLING defaults on) then builds an xgrammar structural tag
+        # for tool_choice="auto" and CONSTRAINS the tool-call arguments to
+        # the tool's schema while decoding -- which, e.g., makes inventing
+        # arguments for a parameterless tool (tools_use's empty_schema case)
+        # impossible. The `openai` provider every retained log used sent no
+        # `strict` at all, so tool calls stay unconstrained, as measured.
+        model_args={"strict_tools": False},
         log_dir=str(log_dir),
         # message_limit caps the assistant <-> tool turn-loop length
         # (relevant for tools_use; conservative cap keeps a misbehaving

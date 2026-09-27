@@ -445,7 +445,13 @@ D1, D3 and D4 were fixed on 2026-09-27, D2 in part.
   a fake server: every alias tried now sends `/v1/chat/completions` --
   the endpoint of every retained 0.3.158 log -- with the configured
   temperature and top_p, and the log's `model_generate_config` records
-  them. Rows benched after the fix decode greedily (or at their
+  them. The generic provider also marks every tool `"strict": true`
+  unless told otherwise, and vLLM 0.28 (vllm-devai) answers that with
+  grammar-constrained tool-call decoding for `tool_choice="auto"`; the
+  harness passes `strict_tools=False`, so tools go out non-strict as
+  before (found in review, before any vllm-devai row was re-benched;
+  Ollama's chat path has no `strict` field, SGLang's defaults to false).
+  Rows benched after the fix decode greedily (or at their
   `deploy/bench-sampling.json` override) and are not comparable with
   earlier rows.
 - **D2 -- time-outs are scored wrong.** A sample over its time limit is
