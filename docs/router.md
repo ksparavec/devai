@@ -647,12 +647,15 @@ which was invisible while every model lived in the stock caches and
 broke the moment a derived checkpoint was probed on `vllm-devai` only
 (2026-09-22): its capability read as unknown, no `reasoning_effort` was
 injected, and the Qwen3.8 chat template applied its own default --
-`xhigh`, a 38-token "think carefully" system preamble. Same weights,
-same image, same flags: HumanEval 160/164 (97.6 %) through port 11435
-against 23/50 (46 %) through port 11437. On the 50 problems both runs
-share, that is 47/50 vs 23/50 (exact McNemar b = 25, c = 1, p < 1e-6;
-single runs at the model's default sampling). `::nothink` was a silent
-no-op. Note that `auto`
+`xhigh`, a 38-token "think carefully" system preamble. `::nothink` was
+a silent no-op. The defect is established by the code, not by a score:
+the HumanEval gap first cited as its symptom (160/164 through port 11435
+against 23/50 through port 11437; 47/50 vs 23/50 on the 50 shared
+problems, exact McNemar b = 25, c = 1) was an extractor artifact. 25 of
+the 27 port-11437 failures were function bodies the v2 extractor had
+dedented ([bench-results.md](bench-results.md) D3); re-executed with
+the fixed extractor, the same logged answers score 47/50 vs 48/50
+(b = 1, c = 2, p = 1.0; single runs at the model's default sampling). Note that `auto`
 is therefore NOT a byte-identical pass-through on the Chat Completions
 path: it maps to `reasoning_effort: medium`, which for Qwen3.8 means
 "no preamble" (`medium` 180 prompt tokens, `low` 206, `xhigh` 218 on

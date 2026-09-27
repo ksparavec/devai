@@ -44,7 +44,9 @@ with the page that gives the details.
     the 36 pairwise comparisons (smallest raw p = 0.024; Holm-adjusted
     0.26). Two rows score below all others.
   - **Limits:** time-outs were scored as wrong answers, and the HumanEval
-    scorer has a known defect.
+    extractor failed 10 correct answers in three rows of that sweep
+    (fixed 2026-09-27; [bench-results.md](bench-results.md) D3). The
+    re-bench under the fixed harness supersedes these rows.
 - **q8_0 vs f16 KV cache** ([backends.md](backends.md), "Per-tier
   KV-cache dtype").
   - **Result:** on 60 GPQA items, 0.767 and 0.750 (two q8_0 runs) against

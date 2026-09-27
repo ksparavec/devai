@@ -15,8 +15,13 @@
 >   900 s otherwise, queueing included). Column t counts them; a score
 >   means "correct within the time limit under the harness's queueing".
 > - **TPS is characters/4**, one median from one run (D4).
-> - **The HumanEval extractor can fail correct fenced function bodies**
->   (D3).
+> - **HumanEval and HumanEval+ values here were scored by the v2
+>   extractor, which failed correct answers** (D3, fixed 2026-09-27).
+>   Re-executing every logged answer with the fixed extractor turns 116
+>   failures in 33 of the 91 v2-scored runs into passes and no pass into
+>   a failure (`scripts/stats/bench_rescore_humaneval.py` lists every
+>   run's corrected value). Every HumanEval comparison on this page is
+>   superseded by the re-bench under the fixed harness.
 > - Intervals are 95 % Clopper-Pearson unless named; comparisons are
 >   paired on identical items. Methods: [statistics-primer.md](statistics-primer.md)
 >   (Sec. 1-3 estimates and intervals, 4-6 comparisons and multiple
@@ -62,7 +67,8 @@ coarsely:
 - **Qwen3.5-9B (0.903)** differs from Nemotron-3-Nano (raw p = 0.0016,
   Holm p = 0.027) and from the bottom two rows; no other difference is
   established. Its HumanEval shortfall is partly a scorer artifact
-  (defect D3).
+  (defect D3): 5 of its 11 failures were extractor false failures, and
+  re-executed it scores 44/50.
 - **R1-Distill-Qwen-7B (0.803) and Llama-3.1-8B (0.760)** are below
   Nemotron-3-Nano and Qwen3-14B, and Llama-3.1-8B also below Qwen3-8B
   and gpt-oss-20b: six pairs with raw p <= 0.0024 and Holm p <= 0.039.
@@ -117,7 +123,7 @@ samples in flight; GSM8K first 100 of 1319 test items, HumanEval first
 | | HumanEval | 50 | 49 | 0 | 0.98 | [0.894, 0.999] | - | |
 | | tools_use | 20 | 17 | 0 | 0.85 | [0.621, 0.968] | - | 2/5/5/5; 3 empty_schema answers invented arguments |
 | Qwen3.5-9B-NVFP4@131072 | GSM8K | 100 | 98 | 0 | 0.98 | [0.930, 0.998] | - | |
-| | HumanEval | 50 | 39 | 0 | 0.78 | [0.640, 0.885] | - | 5 of 11 failures are extractor-defect candidates (D3) |
+| | HumanEval | 50 | 39 | 0 | 0.78 | [0.640, 0.885] | - | 5 of 11 failures are extractor false failures (D3): 44/50 re-executed |
 | | tools_use | 20 | 19 | 1 | 0.95 | [0.751, 0.999] | 0.95-1.00 [0.751, 1.000] | 4/5/5/5; the one failure is the time-out |
 | DeepSeek-R1-Distill-Qwen-7B@65536 | GSM8K | 100 | 87 | 0 | 0.87 | [0.788, 0.929] | - | |
 | | HumanEval | 50 | 47 | 1 | 0.94 | [0.835, 0.987] | 0.94-0.96 [0.835, 0.995] | |
@@ -414,7 +420,9 @@ the raw p and an interval (Sec. 6). Latency quantiles are type 7 (Sec.
 inspect log behind an entry is found by (task, n, completion time), and
 all 131 current entries match their log exactly.
 
-### Open harness defects (documented, not fixed)
+### Harness defects
+
+D3 was fixed on 2026-09-27; the others are open until marked fixed.
 
 - **D1 -- sampling is never applied.** `_invoke_inspect_task` passes
   `config=GenerateConfig(...)` to `inspect_ai.eval()`, which has no
@@ -432,16 +440,27 @@ all 131 current entries match their log exactly.
   Nemotron-3-Nano GPQA 48/100 with 40 time-outs, 0.80 among completed;
   qwen3.5:27b GSM8K 60/100 with 40; Ornith-1.0-9B GPQA on SGLang 63/100
   with 33). Listing: `scripts/stats/bench_timeouts.py`.
-- **D3 -- the HumanEval extractor strips the first line's indentation.**
-  In `_FENCE_BLOCK_RX` (```` ```(?:python|py)?\s*\n?(.*?)``` ````) the
-  `\s*` consumes the newline and the first code line's leading spaces,
-  and `\n?` then matches nothing. A fenced *function body* fails with
-  IndentationError or "'return' outside function"; a fenced full
-  definition is unaffected. A parse-only scan of all 91 v2-scored
-  HumanEval/HumanEval+ runs found 30 failures that would parse under a
-  corrected extractor, in 10 runs of Qwen3.5-9B, Ornith-1.0-9B and
-  qwen3.6:35b; whether they would pass the tests is unknown without
-  executing them (`scripts/stats/bench_scorer_scan.py`).
+- **D3 -- the HumanEval extractor stripped the first line's
+  indentation. FIXED 2026-09-27.** Two paths did it. In `_FENCE_BLOCK_RX`
+  (```` ```(?:python|py)?\s*\n?(.*?)``` ````) the `\s*` consumed the
+  newline and the first code line's leading spaces; and for an unfenced
+  answer, `str.strip()` on the whole completion did the same. A function
+  *body* then failed with IndentationError or "'return' outside
+  function"; a full definition was unaffected. The fixed extractor
+  starts a fenced body right after the newline that ends the fence line
+  and removes leading blank lines only (tests:
+  `tests/python/test_bench_humaneval_extract.py`). **Measured effect:**
+  re-executing every logged answer of the 91 v2-scored
+  HumanEval/HumanEval+ runs with the fixed extractor, in the scorer's
+  own sandbox (`scripts/stats/bench_rescore_humaneval.py`), turns 116
+  failures into passes -- 89 unfenced bodies and 27 fenced ones, none of
+  whose v2 programs even compiled -- and no pass into a failure. They
+  sit in 33 runs of 11 models, from 1 to 25 per run; the largest are
+  Qwen3.8-27B-W4A16-devai-AutoRound HumanEval on vllm-devai (23/50 ->
+  48/50) and Qwen3.8-27B-MTP-devai-NVFP4 (HumanEval 41 -> 50/50,
+  HumanEval+ 38 -> 48/50). The earlier parse-only scan
+  (`scripts/stats/bench_scorer_scan.py`) found 30 candidates because it
+  checked only the fence path.
 - **D4 -- TPS is characters/4.** The stream parser uses
   `usage.completion_tokens` only if the engine sends it, and the bench
   never sets `stream_options.include_usage`. The engine sources checked
@@ -729,10 +748,10 @@ cleaner (commit ad597ca, 2026-05-02) works in four steps:
 fence regex strips the indentation of the first line of a fenced block
 (defect D3). One item that passed under v1 in the 2026-05-02
 Qwen3.5-9B run (HumanEval/40) no longer parses under v2. Later runs
-contain 30 candidate false failures of the same kind, so the cached
-scores of models that emit fenced function bodies can be biased
-downwards. That includes the 2026-05-05 Qwen3.5-9B HumanEval, 39/50,
-which could be up to 44/50 with a corrected extractor (unverified).
+contain 116 false failures of the same kind (re-executed; D3), so the
+cached scores of models that emit function bodies are biased downwards.
+That includes the 2026-05-05 Qwen3.5-9B HumanEval: 39/50 as cached,
+44/50 re-executed with the fixed extractor.
 
 ### 5. TPS undercounted for reasoning parsers (historical)
 Superseded by "TPS counting fix" above. The "5-10x too low" written
@@ -943,8 +962,8 @@ applied to a noisy score misclassifies near the cut-off).
     after the fact").
 12. **Open harness defects D1-D4** ("Methodology"): pass sampling as
     `eval()` keywords; record time-outs as their own outcome and stop
-    counting queueing against the limit; stop the fence regex consuming
-    indentation; request `stream_options.include_usage`. Rows measured
+    counting queueing against the limit; stop the extractor consuming
+    indentation (done 2026-09-27); request `stream_options.include_usage`. Rows measured
     before a fix are not comparable with rows measured after it.
 13. **Replication.** At least two runs per cell, or report every run,
     so run-to-run variation is measured rather than inferred from
@@ -952,7 +971,8 @@ applied to a noisy score misclassifies near the cut-off).
 
 ## Reproducing the statistics
 
-All scripts are stdlib-only Python 3, deterministic (fixed seeds, B =
+All scripts except `bench_rescore_humaneval.py` (which runs the bench
+scorer, inside the lab image) are stdlib-only Python 3, deterministic (fixed seeds, B =
 10000) and read-only on their inputs; full commands and inputs are in
 [scripts/stats/README.md](../scripts/stats/README.md). The shared
 library `scripts/stats/statlib.py` is tested against published values by
@@ -963,6 +983,10 @@ L=/var/cache/devai/bench/inspect-logs; O=~/.cache/devai/stats/bench; mkdir -p $O
 python3 scripts/stats/bench_extract_logs.py $L $O/logs_extracted.json
 python3 scripts/stats/bench_stats.py $O/logs_extracted.json $L deploy/.bench-cache.json $O
 python3 scripts/stats/bench_scorer_scan.py $O/logs_extracted.json $L $O/scorer_artifact_scan.json   # D3, parse-only
+# D3, executed with the fixed extractor -- runs model code, so inside the lab image:
+podman run --rm --network=none --entrypoint python3 -v $PWD:/repo:ro -v $L:/logs:ro -v $O:/o \
+    localhost/devai-lab-gpu:latest /repo/scripts/stats/bench_rescore_humaneval.py \
+    /o/logs_extracted.json /logs /o/humaneval_rescore.json
 python3 scripts/stats/bench_engine_facts.py /var/cache/devai/logs $O/engine_log_facts.json          # D1 samplers, KV dtype
 python3 scripts/stats/bench_timeouts.py $L $O/timeouts.tsv                                          # D2
 grep -E "^=== |ttft_first|score:|pass@1:|by_subcase|done in|/metrics" \

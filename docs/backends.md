@@ -180,9 +180,12 @@ on the first 60.
   - GPQA time-outs scored as wrong answers (on the first 60 items, Ornith
     19 on SGLang vs 16 on vLLM; Qwen3.5 10 vs 6; see
     [bench-results.md](bench-results.md));
-  - a HumanEval extractor defect that produces candidate false failures
-    unevenly: Ornith has 4 on SGLang and none on vLLM, and Qwen3.5 has
-    some on both.
+  - a HumanEval extractor defect (fixed 2026-09-27;
+    [bench-results.md](bench-results.md) D3). Re-executed with the fixed
+    extractor, these runs had 1-4 false failures each on both engines
+    (Ornith: 3 on vLLM HumanEval+, 4 and 2 on SGLang HumanEval and
+    HumanEval+), so the HumanEval and HumanEval+ pairs above were
+    computed on biased scores; the re-bench supersedes them.
 - **How much n = 50 can resolve.** The 95% half-width of an unpaired
   difference between two 50-item HumanEval scores is about 0.16 near a
   pass rate of 0.8, and 0.12 near 0.9. A paired comparison with 10-20%

@@ -47,7 +47,17 @@ python3 scripts/stats/bench_timeouts.py $L $O/timeouts.tsv
   threshold checks, change claims, vLLM-vs-SGLang tests, incidental
   replications and the current-cache table with time-out bounds.
 - `bench_scorer_scan.py`: HumanEval failures caused by the v2 extractor's
-  indentation stripping (parse-only; model code is never executed).
+  indentation stripping (parse-only; model code is never executed; fence
+  path only, so it undercounts).
+- `bench_rescore_humaneval.py`: re-executes every logged HumanEval /
+  HumanEval+ answer whose extraction the fixed extractor changes, in the
+  scorer's own sandbox, and reports each run's corrected value and the
+  port-11435 vs 11437 AutoRound pair (docs/router.md). It EXECUTES model
+  code and imports inspect_ai, so run it inside the lab image:
+  `podman run --rm --network=none --entrypoint python3 -v $PWD:/repo:ro
+  -v $L:/logs:ro -v $O:/o localhost/devai-lab-gpu:latest
+  /repo/scripts/stats/bench_rescore_humaneval.py /o/logs_extracted.json
+  /logs /o/humaneval_rescore.json`.
 - `bench_engine_facts.py`: the sampler defaults and KV dtype each engine
   applied, from its own log.
 - `bench_timeouts.py`: every log with a sample that hit the per-sample time
