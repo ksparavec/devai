@@ -716,6 +716,10 @@ def _invoke_inspect_task(
         eval_kwargs["fail_on_error"] = fail_on_error
     eval_kwargs["max_connections"] = max_connections_for(backend)
     logs = inspect_eval(task_obj, **eval_kwargs)
+    if isinstance(logs, list) and not logs:
+        # What inspect returns when the eval was interrupted (SIGINT at a
+        # task deadline): no log object; the log file itself is written.
+        raise RuntimeError("inspect returned no log (eval interrupted); not scored")
     log = logs[0] if isinstance(logs, list) else logs
     # An eval that ended in "error" (inspect aborts after failed requests,
     # unless fail_on_error=False) is NOT a score. Its accuracy covers only

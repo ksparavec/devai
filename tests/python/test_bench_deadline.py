@@ -56,6 +56,14 @@ class ErroredEvalTest(unittest.TestCase):
             self._invoke(log)
         self.assertIn("ModelGenerateError", str(ctx.exception))
 
+    def test_an_interrupted_eval_with_no_log_says_so(self) -> None:
+        fake = types.ModuleType("inspect_ai")
+        fake.eval = lambda task_obj, **kw: []
+        with mock.patch.dict(sys.modules, {"inspect_ai": fake}), tempfile.TemporaryDirectory() as tmp, \
+                self.assertRaisesRegex(RuntimeError, "interrupted"):
+            bench_runner._invoke_inspect_task(task_obj=object(), served_model="m", backend="vllm",
+                                              router_url="http://r", log_dir=Path(tmp), timeout_s=60.0)
+
     def test_success_and_cancelled_are_distinguished(self) -> None:
         ok = types.SimpleNamespace(status="success", error=None)
         self.assertIs(self._invoke(ok), ok)
