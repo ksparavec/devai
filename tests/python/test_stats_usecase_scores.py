@@ -21,7 +21,8 @@ MMLU_CATEGORIES = {"math", "physics", "chemistry", "law", "engineering", "other"
 
 def _run(task, model, backend, items, completed="2026-09-28T10:00:00+00:00"):
     return {"file": f"{task}-{model}-{backend}.eval", "created": completed, "completed": completed,
-            "task": task, "model": model, "backend": backend, "n": len(items), "items": items}
+            "task": task, "model": model, "backend": backend, "n": len(items), "items": items,
+            "status": "success"}
 
 
 def _item(i, y, **kw):
@@ -127,6 +128,18 @@ class RankTest(unittest.TestCase):
         c = res["winner_vs_runner_up"]
         self.assertEqual(c["shared"], 14)
         self.assertAlmostEqual(c["diff"], (13 - 9) / 14)
+
+    def test_an_explicit_log_link_wins_and_a_truncated_task_counts_its_prefix_only(self) -> None:
+        # A task stopped at its deadline: cancelled log, 10 questions in it,
+        # the cache entry scored on the unbroken prefix 1..6.
+        runs = [dict(_run("gpqa", "m@131072", "vllm", [_item(i, i % 2) for i in range(1, 11)]),
+                     file="cut.eval", status="cancelled"),
+                _run("mmlu_pro", "m@131072", "vllm", [_item(100, 1, category="biology")])]
+        row = _row("m", "vllm", {"gpqa_subset_100": 6, "mmlu_pro_subset_1": 1})
+        row["tasks"]["gpqa_subset_100"].update({"inspect_log": "cut.eval", "truncated": {"prefix": 6}})
+        items, comps = U.row_items(runs, row, "complex_systems")
+        self.assertEqual(comps["gpqa"], [3, 6])          # questions 1..6: 1, 3, 5 right
+        self.assertEqual(len(items), 7)
 
     def test_markdown_renders(self) -> None:
         runs, cache = self._fixture()

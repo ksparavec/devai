@@ -420,6 +420,50 @@ the raw p and an interval (Sec. 6). Latency quantiles are type 7 (Sec.
 inspect log behind an entry is found by (task, n, completion time), and
 all 131 current entries match their log exactly.
 
+### Run protocol (since 2026-09-28)
+
+`make bench-sync` (scripts/bench-sync.py) benches one model at a time
+under three rules set by the owner after the incident below:
+
+- **A clean slate before every model** (scripts/bench/clean_slate.py).
+  Any other bench run is stopped (its process group, and every
+  `bench_runner.py` process: SIGINT, then SIGKILL), every inference
+  engine container is stopped, and whatever still holds the GPU is killed
+  (a laya-trainer job included). The result is verified with the host's
+  own `ps` and `nvidia-smi` -- no bench or engine process, no GPU compute
+  process, VRAM at idle -- not with `podman ps`. No clean slate, no
+  bench. Each model's first request therefore pays one cold start, which
+  lands in `ttft_ms_first` as before.
+- **30 minutes per task** (`BENCH_TASK_DEADLINE_S`, default 1800). Each
+  task runs as its own bench run; at the deadline the runner gets SIGINT
+  (inspect writes a `cancelled` log with every finished question), then
+  SIGKILL after 30 s.
+- **A stopped task is scored on its unbroken prefix**
+  (scripts/bench/harvest_truncated.py): questions 1..k in the task's
+  fixed order, k+1 being the first without a result. Questions still
+  running at the cut are disproportionately the long, hard ones, so
+  keeping whatever finished would inflate a slow model's score; a prefix
+  of the benchmark's seeded random order is an unbiased sample, only a
+  smaller one. The task entry records `n` = k, `n_planned`, and a
+  `truncated` block; comparisons between models then use the questions
+  both answered.
+
+Also since then: an evaluation that ends in error is not scored (it wrote
+0.0 and a drop flag before), every task entry names its inspect log
+(`inspect_log`), and peak VRAM is kept per task with the row holding the
+maximum.
+
+**The incident (2026-09-27/28).** A switch-over between two re-bench runs
+stopped the old run's `podman run` client but not its container -- a
+watcher script looked for leftover containers in `podman ps` output, whose
+truncated command column hid `bench_runner.py`. The old container benched
+on for nine hours beside the new run. The router serves one model at a
+time, so the two evicted each other's models: three gsm8k evaluations
+aborted on request errors after 11-29 questions and were scored 0 and
+drop-flagged, latency figures included cold starts, and both processes
+rewrote the bench cache from their own copies, so finished rows vanished.
+Everything benched in that window was discarded and re-run.
+
 ### Harness defects
 
 D1, D3 and D4 were fixed on 2026-09-27, D2 in part.

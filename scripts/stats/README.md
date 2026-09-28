@@ -97,7 +97,11 @@ python3 scripts/stats/usecase_scores.py $O/logs_extracted.json deploy/.bench-cac
   cluster bootstrap for coding; winner vs runner-up paired on identical
   items (cluster bootstrap interval, sign-flip test, Holm over the four
   use cases). Ranked by quality, never by speed; the runner-up is the
-  best row of a different base model. Writes `usecase_scores.{json,md}`.
+  best row of a different base model. Each task entry is joined to its
+  log by the entry's `inspect_log` name (older entries: by completion
+  time); a task stopped at its deadline counts only its unbroken prefix
+  (`truncated.prefix`). The extractor also reads header-less logs (left
+  by SIGKILL). Writes `usecase_scores.{json,md}`.
   Tested by `tests/python/test_stats_usecase_scores.py`.
 
 ## KV-cache dtype (docs/backends.md "Per-tier KV-cache dtype")

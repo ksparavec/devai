@@ -251,7 +251,7 @@ endif
 .PHONY: clean clean-cpu clean-gpu clean-router prune
 .PHONY: fetch-cli pull-images install install-systemd uninstall test test-router test-ollama test-agents test-models test-probe-vllm test-probe-sglang test-probe-ollama-idempotent test-vllm test-sglang test-e2e test-full help
 .PHONY: catalog-regen catalog-suggest catalog-discover catalog-discover-add probe probe-vllm probe-sglang probe-load-vllm probe-load-sglang probe-check probe-ornith-arch model-fit model-pull model-status model-sync vram-fit verify-backend-flags ollama-cleanup-ctx-variants
-.PHONY: bench bench-vllm bench-sglang bench-ollama bench-report test-bench-smoke
+.PHONY: bench bench-vllm bench-sglang bench-ollama bench-report bench-harvest test-bench-smoke
 .PHONY: secrets-tmpfs secrets-edit secrets-render secrets-rotate age-keygen-host test-python
 .PHONY: build-backup-tool build-gpu-vendor-tool build-mcp-modelstatus build-mcp-modelstatus-image build-devai-tools test-devai-tools
 .PHONY: gpu-vendor test-gpu-vendor
@@ -2101,6 +2101,13 @@ bench-sync: ## Closed loop: bench-plan, then bench the new/incomplete/stale rows
 	    $(if $(BENCH_TASKS),--tasks $(BENCH_TASKS),) \
 	    $(if $(BENCH_MAX_TARGETS),--max-targets $(BENCH_MAX_TARGETS),) \
 	    $(if $(RECORD_DROPS),--record-drops,)
+
+bench-harvest: ## (used by bench-sync) Score a task stopped at its deadline from its partial inspect log: prefix-only, written to the bench cache. HARVEST_ARGS='--log ... --key ... --model ... --backend ... --ctx ... --task ... --planned-n ... --deadline-s ...'
+	$(CONTAINER_RUNTIME) run --rm --network=none \
+		$(BENCH_CACHE_MOUNTS) \
+		--entrypoint python3 \
+		$(IMAGE_NAME_GPU) \
+		/scripts/bench/harvest_truncated.py $(HARVEST_ARGS)
 
 bench-concurrency: ## Sweep concurrency x prefix-sharing for ONE model (MODEL=, PORT=11435|11436)
 	@# Deliberately NOT part of `make bench`: this answers a backend

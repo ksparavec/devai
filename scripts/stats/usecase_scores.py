@@ -89,22 +89,31 @@ def load_runs(path: Path) -> list[dict]:
     """Runs with their items, in the shape bench_stats.cache_task_run expects."""
     runs = []
     for r in json.loads(path.read_text()):
-        if r.get("status") != "success" or not r.get("items"):
+        # Every log with items, whatever its status: a task stopped at its
+        # deadline has a `cancelled` (or, after SIGKILL, header-less) log,
+        # and its cache entry names that log explicitly.
+        if not r.get("items"):
             continue
         m = re.search(r":(\d+)/", r.get("model_base_url") or "")
         runs.append({"file": r["file"], "created": r["created"], "completed": r.get("completed_at"),
                      "task": A.TASK_SHORT.get(r.get("task")),
                      "model": A.served_model_name(r.get("model") or ""),
                      "backend": A.PORT_BACKEND.get(m.group(1)) if m else None,
-                     "n": len(r["items"]), "items": r["items"]})
+                     "n": len(r["items"]), "items": r["items"], "status": r.get("status")})
     return runs
 
 
-def items_for(task: str, run: dict, cats: set | None) -> list[dict]:
-    """Scorable items of one run for one component: (cluster, key, y, timeout)."""
+def items_for(task: str, run: dict, cats: set | None, max_id: int | None = None) -> list[dict]:
+    """Scorable items of one run for one component: (cluster, key, y, timeout).
+
+    max_id: for a task stopped at its deadline, the unbroken prefix its cache
+    entry was scored on (harvest_truncated.py) -- questions 1..max_id only.
+    """
     out = []
     for it in run["items"]:
         if cats is not None and (it.get("category") or "") not in cats:
+            continue
+        if max_id is not None and int(it.get("id") or 0) > max_id:
             continue
         y = 1 if it.get("value") == 1.0 else 0
         if task in ("humaneval", "humaneval_plus"):
@@ -123,10 +132,16 @@ def row_items(runs: list[dict], row: dict, use_case: str) -> tuple[list[dict] | 
         key = next((k for k in row.get("tasks", {}) if k.startswith(
             {"humaneval": "humaneval_subset_", "humaneval_plus": "humaneval_plus_subset_",
              "gsm8k": "gsm8k_subset_", "mmlu_pro": "mmlu_pro_subset_", "gpqa": "gpqa_subset_"}[task])), None)
-        run = A.cache_task_run(runs, row, key, row.get("backend")) if key else None
+        entry = row["tasks"][key] if key else {}
+        run = None
+        if entry.get("inspect_log"):
+            run = next((r for r in runs if r["file"] == entry["inspect_log"]), None)
+        elif key:
+            run = A.cache_task_run([r for r in runs if r.get("status") == "success"],
+                                   row, key, row.get("backend"))
         if run is None:
             return None, comps
-        got = items_for(task, run, cats)
+        got = items_for(task, run, cats, max_id=(entry.get("truncated") or {}).get("prefix"))
         if not got:
             return None, comps
         name = task if cats is None else f"{task}[{','.join(sorted(cats))}]"

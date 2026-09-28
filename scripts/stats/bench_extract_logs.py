@@ -86,6 +86,15 @@ def sample_meta(z, names):
     return out
 
 
+def _attach_meta(z, names, items):
+    meta = sample_meta(z, names)
+    for it in items:
+        m = meta.get(it["id"]) or {}
+        it.update({k: m.get(k) for k in ("subcase", "task_id", "question_id", "category", "subdomain", "input_head", "item_key", "target")})
+        if m.get("error") and not it.get("error"):
+            it["error"] = m.get("error")
+
+
 def extract(path):
     z = zipfile.ZipFile(path)
     names = z.namelist()
@@ -94,7 +103,21 @@ def extract(path):
         rec["status"] = "no_header"
         start = json.loads(z.read("_journal/start.json")) if "_journal/start.json" in names else {}
         ev = start.get("eval") or {}
-        rec.update({"task": ev.get("task"), "model": ev.get("model"), "created": ev.get("created")})
+        rec.update({"task": ev.get("task"), "model": ev.get("model"), "created": ev.get("created"),
+                    "model_base_url": ev.get("model_base_url")})
+        # A log cut off by SIGKILL (bench-sync's task deadline) has no header,
+        # but every sample it flushed is complete: read them directly.
+        items = []
+        for nm in names:
+            if not nm.startswith("samples/"):
+                continue
+            s = json.loads(z.read(nm))
+            sc = next((v for v in (s.get("scores") or {}).values() if v is not None), None)
+            raw = sc.get("value") if sc else None
+            items.append({"id": str(s.get("id")), "value": to_num(raw), "raw": raw,
+                          "error": s.get("error"), "limit": s.get("limit")})
+        rec["items"] = sorted(items, key=lambda i: int(i["id"]))
+        _attach_meta(z, names, rec["items"])
         return rec
     h = json.loads(z.read("header.json"))
     ev = h.get("eval") or {}
@@ -146,12 +169,7 @@ def extract(path):
         items.append({"id": str(s.get("id")), "value": val, "raw": raw,
                       "error": s.get("error"), "limit": s.get("limit")})
     rec["items"] = items
-    meta = sample_meta(z, names)
-    for it in items:
-        m = meta.get(it["id"]) or {}
-        it.update({k: m.get(k) for k in ("subcase", "task_id", "question_id", "category", "subdomain", "input_head", "item_key", "target")})
-        if m.get("error") and not it.get("error"):
-            it["error"] = m.get("error")
+    _attach_meta(z, names, items)
     n_ev, keys_seen, cfgs = scan_requests(z, names)
     rec["n_model_events"] = n_ev
     rec["request_sampling_keys"] = keys_seen

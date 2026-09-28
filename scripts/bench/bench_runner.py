@@ -716,7 +716,20 @@ def _invoke_inspect_task(
         eval_kwargs["fail_on_error"] = fail_on_error
     eval_kwargs["max_connections"] = max_connections_for(backend)
     logs = inspect_eval(task_obj, **eval_kwargs)
-    return logs[0] if isinstance(logs, list) else logs
+    log = logs[0] if isinstance(logs, list) else logs
+    # An eval that ended in "error" (inspect aborts after failed requests,
+    # unless fail_on_error=False) is NOT a score. Its accuracy covers only
+    # the samples that ran before the abort -- 0/11 or 0/29 on 2026-09-28,
+    # when two benches fought over the GPU -- and scoring it wrote 0.0 into
+    # the cache and drop-flagged the model. Raising here lands in each
+    # task's `except`, which writes nothing (the prior value, if any,
+    # stands; an absent task is retried by the next run).
+    status = getattr(log, "status", "success")
+    if status != "success":
+        err = getattr(getattr(log, "error", None), "message", "") or ""
+        first = next((ln for ln in err.splitlines() if ln.strip()), "")
+        raise RuntimeError(f"inspect eval ended with status {status!r}; not scored: {first[:200]}")
+    return log
 
 
 def _aggregate_score(eval_log) -> tuple[float, int]:
@@ -742,6 +755,26 @@ def _aggregate_score(eval_log) -> tuple[float, int]:
 
 
 TIMEOUT_LIMIT_TYPES = ("time", "working")
+
+# Items a task runs unless told otherwise -- the argparse defaults below, and
+# what bench-sync records as `n_planned` when it has to stop a task at its
+# deadline (harvest_truncated.py).
+PLANNED_N_ENV = {"gsm8k": ("BENCH_N_GSM8K", 100), "humaneval": ("BENCH_N_HUMANEVAL", 50),
+                 "humaneval_plus": ("BENCH_N_HUMANEVAL", 50), "mmlu_pro": ("BENCH_N_MMLU_PRO", 100),
+                 "gpqa": ("BENCH_N_GPQA", 100), "tools": ("BENCH_N_TOOLS", 20)}
+
+
+def planned_n(task: str) -> int:
+    var, default = PLANNED_N_ENV[task]
+    return int(os.environ.get(var, str(default)))
+
+
+def _log_name(eval_log) -> str | None:
+    """File name of the inspect log behind a task entry. An explicit link:
+    matching entries to logs by completion time breaks for a task stopped at
+    its deadline, whose log never completes."""
+    loc = getattr(eval_log, "location", None)
+    return Path(str(loc)).name if loc else None
 
 
 def _outcome_counts(eval_log) -> dict[str, int]:
@@ -984,6 +1017,7 @@ def run_for_target(
                     "ran_at": _now_iso(),
                     "inspect_log_dir": str(log_dir),
                     **_outcome_counts(eval_log),
+                    "inspect_log": _log_name(eval_log),
                 }
                 print(f"    score: {score:.4f} (n={n})", file=sys.stderr)
             except Exception as e:  # noqa: BLE001 — inspect_ai surfaces many error shapes
@@ -1013,6 +1047,7 @@ def run_for_target(
                     "ran_at": _now_iso(),
                     "inspect_log_dir": str(log_dir),
                     **_outcome_counts(eval_log),
+                    "inspect_log": _log_name(eval_log),
                 }
                 print(f"    pass@1: {score:.4f} (n={n})", file=sys.stderr)
             except Exception as e:  # noqa: BLE001
@@ -1039,6 +1074,7 @@ def run_for_target(
                     "ran_at": _now_iso(),
                     "inspect_log_dir": str(log_dir),
                     **_outcome_counts(eval_log),
+                    "inspect_log": _log_name(eval_log),
                 }
                 print(f"    pass@1: {score:.4f} (n={n})", file=sys.stderr)
             except Exception as e:  # noqa: BLE001
@@ -1064,6 +1100,7 @@ def run_for_target(
                     "ran_at": _now_iso(),
                     "inspect_log_dir": str(log_dir),
                     **_outcome_counts(eval_log),
+                    "inspect_log": _log_name(eval_log),
                 }
                 print(f"    score: {score:.4f} (n={n})", file=sys.stderr)
             except Exception as e:  # noqa: BLE001
@@ -1089,6 +1126,7 @@ def run_for_target(
                     "ran_at": _now_iso(),
                     "inspect_log_dir": str(log_dir),
                     **_outcome_counts(eval_log),
+                    "inspect_log": _log_name(eval_log),
                 }
                 print(f"    score: {score:.4f} (n={n})", file=sys.stderr)
             except Exception as e:  # noqa: BLE001
@@ -1162,6 +1200,7 @@ def run_for_target(
                     "ran_at": _now_iso(),
                     "inspect_log_dir": str(log_dir),
                     **_outcome_counts(eval_log),
+                    "inspect_log": _log_name(eval_log),
                 }
                 print(f"    score: {score:.4f} (n={n})", file=sys.stderr)
                 if by_sub:
@@ -1211,8 +1250,16 @@ def run_for_target(
         print(f"  done in {elapsed:.1f}s; peak VRAM {vram['peak_vram_gb']} GB",
               file=sys.stderr)
 
+    # Peak VRAM is recorded per task and the row keeps the maximum over its
+    # tasks: bench-sync runs each task as its own run, so a run-level value
+    # would be whichever task ran last.
+    for tres in task_results.values():
+        if isinstance(tres, dict) and vram["peak_vram_gb"] is not None:
+            tres["peak_vram_gb"] = vram["peak_vram_gb"]
+    task_peaks = [t.get("peak_vram_gb") for t in {**existing_tasks, **task_results}.values()
+                  if isinstance(t, dict) and t.get("peak_vram_gb") is not None]
     metrics = {
-        "peak_vram_gb": vram["peak_vram_gb"],
+        "peak_vram_gb": max(task_peaks) if task_peaks else vram["peak_vram_gb"],
         "mean_vram_gb": vram["mean_vram_gb"],
         "vram_samples": vram["n_samples"],
     }
@@ -1391,11 +1438,11 @@ def main() -> None:
     ap.add_argument("--repo", default="", help="regex filter on probe-cache top-level key")
     ap.add_argument("--force", action="store_true", help="re-run tasks even if cached")
     ap.add_argument("--host-vram-gb", type=int, default=DEFAULT_HOST_VRAM_GB)
-    ap.add_argument("--n-gsm8k", type=int, default=int(os.environ.get("BENCH_N_GSM8K", "100")))
-    ap.add_argument("--n-humaneval", type=int, default=int(os.environ.get("BENCH_N_HUMANEVAL", "50")))
-    ap.add_argument("--n-tools", type=int, default=int(os.environ.get("BENCH_N_TOOLS", "20")))
-    ap.add_argument("--n-mmlu-pro", type=int, default=int(os.environ.get("BENCH_N_MMLU_PRO", "100")))
-    ap.add_argument("--n-gpqa", type=int, default=int(os.environ.get("BENCH_N_GPQA", "100")))
+    ap.add_argument("--n-gsm8k", type=int, default=planned_n("gsm8k"))
+    ap.add_argument("--n-humaneval", type=int, default=planned_n("humaneval"))
+    ap.add_argument("--n-tools", type=int, default=planned_n("tools"))
+    ap.add_argument("--n-mmlu-pro", type=int, default=planned_n("mmlu_pro"))
+    ap.add_argument("--n-gpqa", type=int, default=planned_n("gpqa"))
     ap.add_argument(
         "--drop-threshold", type=float,
         default=float(os.environ.get("BENCH_DROP_THRESHOLD", "0.70")),
