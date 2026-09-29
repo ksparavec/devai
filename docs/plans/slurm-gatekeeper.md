@@ -4,7 +4,7 @@ _Slurm, in containers, becomes the only thing that starts GPU work in devai; the
 
 ## Status
 
-In Progress -- Phase 0 (spike) 2026-09-29: S1-S5 answered (see "Spike results"); one item open (a real engine inside a job). Decisions D1-D5 below are the operator's.
+In Progress -- Phase 0 (spike) done 2026-09-29: S1-S7 answered on a free GPU with no nested containers (see "Spike results, round 2"). Decisions D1-D6 below are the operator's.
 
 ## Dependencies
 
@@ -36,13 +36,15 @@ None. The plan replaces parts of the router's launch layer (docs/router.md) and 
 - **D3 -- Job results live in `/var/cache/devai/jobs`** (its own volume, per the mount-point convention in CLAUDE.md).
 - **D4 -- Use a published image if one exists.** Docker Hub has none that is maintained (2026-09-29: the `slurm/` namespace holds two repositories last updated in 2017 and 2018; the rest are personal images). SchedMD, Slurm's maintainer, publishes official images on GHCR (`ghcr.io/slinkyproject/{slurmctld,slurmd,slurmdbd,slurmrestd}:26.05-ubuntu26.04`, Slurm 26.05.4, recipe github.com/SlinkyProject/containers). Its `slurmd` is built without the `gpu_nvml` plugin, which GPU accounting needs (see S3).
 - **D5 -- Not a separate project.** One consumer, contracts that change together with the router and the workloads, no product without devai; a second repository would make every change a cross-repo release (the aiagent experience). It stays extractable: own directory, own tests, config under `deploy/slurm/`, a written job/result format.
+- **D6 -- No containers inside containers.** Ruled out after spike round 1, which ran engines as podman containers nested in the slurmd container. Engines run as the job's own process on a node built from the backend's image.
 
 ## Open questions
 
-1. ~~Where does an engine run inside a job, so that cancelling the job frees its VRAM and Slurm can account its GPU use?~~ Answered by S2/S3: a nested container inside the job, under `tini -s`.
-2. ~~Can `slurmd` get the cgroup control it needs under rootless podman, or does it need a rootful container?~~ Answered by S1: rootless works.
-3. ~~`gpu_nvml`: rebuild SchedMD's `slurmd` image from its own recipe with the NVML headers added, or something else?~~ Answered by S3: rebuild the full Slurm package set with the NVML headers; a plugin alone is not enough.
-4. Does a real engine (vLLM on vllm-devai, Ollama) serve from inside a job with its model store and engine-cache volumes, and does the router reach it? -- needs the GPU free; last spike item.
+1. ~~Where does an engine run, so that cancelling the job frees its VRAM and Slurm can account its GPU use?~~ As the job's own process on a node built from its backend's image (S2, D6).
+2. ~~Does `slurmd` need a rootful container?~~ No; rootless with a cgroup nesting step (S1).
+3. ~~How does `gpu_nvml` get into the node?~~ devai builds the whole Slurm package set with the NVML headers from SchedMD's recipe (S3).
+4. ~~Does a real engine serve from inside a job?~~ Yes, vLLM and Ollama (S2, S6).
+5. The node images sit on two distributions: Debian trixie (`vllm-devai`, `devai-ollama`) and Ubuntu 24.04 (stock vLLM 0.22.1, SGLang 0.5.16, the laya trainer; checked 2026-09-29). One Slurm package build per distribution from the same recipe, or one relocatable build? -- recommendation: per distribution (two builds); decide in Phase 1.
 
 ## Context
 
@@ -63,17 +65,19 @@ Writing a process manager for this in the router was the first idea; Slurm alrea
 
 ## Approach
 
-Slurm (controller, node daemon, REST daemon, accounting daemon + MariaDB) runs as containers next to the router. Three kinds of job:
+Slurm runs as containers on `devai-net` at fixed addresses: controller, REST daemon, accounting daemon + MariaDB, and one **node per backend**. A node is that backend's engine image with Slurm added (`slurmd`, the client tools, `tini`, devai's guard scripts); the engine runs as the job's own process, so Slurm's cgroup, signals and accounting cover it directly and no container runtime runs inside a container (D6). The node containers are permanent and keep what today's recreated engine containers get: the GPU, the model store, the engine-cache volumes. All nodes see the same GPU, so a cluster-wide license (`gpu0:1`) lets one GPU job hold it at a time. Nodes are configless: they fetch `slurm.conf`, `gres.conf` and `cgroup.conf` from the controller.
 
-- **Engine job** -- holds one GPU (`gres/gpu:1`) and runs one engine (backend, model, context, MTP). Only the router submits and cancels these, through slurmrestd. No time limit unless one is given (keep-warm).
-- **Workload job** -- a bench, probe or test client. Holds no GPU; declares the engine it needs and talks to the router like any client. At most one active workload per GPU (a Slurm license or GRES), so two benches can no longer contend.
-- **Trainer job** -- the laya trainer; holds the GPU itself.
+Three kinds of job:
 
-Suspend has to be built from parts, because suspending a process (SIGSTOP) does not free its VRAM: suspend = suspend the workload job, and only if the interrupting job needs a different engine, stop the engine job (its epilog verifies the GPU is empty); resume = start the engine the suspended workload needs, then resume the workload. With the same engine, only the workload is suspended and resumed, which is the fast path D1 asks for.
+- **Engine job** -- runs on its backend's node, takes the `gpu0` license and `gres/gpu:1`, and `exec`s one engine (backend, model, context, MTP). Only the router submits and cancels these, through slurmrestd. No time limit unless one is given (keep-warm). The router reaches the engine at `<node container>:<port>`.
+- **Workload job** -- a bench, probe or test client, on a work node (the lab image as a node). Holds no GPU; talks to an engine like any client.
+- **Trainer job** -- the laya trainer on its own node; takes the license like an engine.
 
-Every GPU job ends with an epilog that removes the job's containers, kills anything left on the GPU, and polls until VRAM is back at idle; if it cannot, the node is set to DRAIN with the reason, so nothing else starts on a dirty GPU. This is the guarantee the router lacks today.
+Suspend has to be built from parts, because a suspended job keeps its GPU allocation (S5) and a stopped process keeps its VRAM: suspend = suspend the workload job, and only if the interrupting job needs a different engine, cancel the engine job; resume = start the engine the suspended workload needs, then resume the workload. With the same engine only the workload is suspended and resumed, which is the fast path D1 asks for.
 
-History: slurmdbd keeps every job (state, exit code, times, TRES including GPU memory and utilisation via `gpu_nvml`, the job script, and a JSON comment carrying model, backend, context and git commit). GPU energy is not available from Slurm on NVIDIA (S3) and is recorded by devai. Each job writes `result.json`, its logs and artifacts to `/var/cache/devai/jobs/<jobid>/`. A `devai-jobs` CLI (devai-tools) joins the two: `devai-jobs --since yesterday`.
+The guarantee the router lacks today is the **prolog** of every GPU job: it waits up to 30 s for the card to be idle (no compute process, at most 512 MiB used) and otherwise fails, which makes Slurm drain the node and hold the job, naming the holder, so no engine can start on a card another process still holds. The epilog checks only the finished job's own leftovers (see the race in S7).
+
+History: slurmdbd keeps every job (state, exit code, times, suspended time, TRES including GPU memory and utilisation via `gpu_nvml`, the job script, and a JSON comment carrying model, backend, context and git commit). GPU energy is not available from Slurm on NVIDIA (S3) and is recorded by devai from NVML's energy counter. Each job writes `result.json`, its logs and artifacts to `/var/cache/devai/jobs/<jobid>/`. A `devai-jobs` CLI (devai-tools) joins the two: `devai-jobs --since yesterday`.
 
 Code we expect to delete once this works: `scripts/bench/clean_slate.py`, the deadline/SIGINT/SIGKILL handling in `scripts/bench-sync.py`, the router's `stopOtherBackends` / `containerRecreate` bookkeeping and `backendVanished` heuristics, and the job-runner hold in `gpu-arbiter/job_runner.go`.
 
@@ -83,56 +87,60 @@ Code we expect to delete once this works: `scripts/bench/clean_slate.py`, the de
 
 ### Goal
 
-Answer the questions that decide the design, with the official images, before writing anything permanent.
+Answer the questions that decide the design before writing anything permanent.
 
 ### Questions
 
-- **S1** -- Do slurmctld and slurmd run under rootless podman (privileged as needed) with cgroup v2 (`IgnoreSystemd=yes`, no systemd in the container), see the GPU as `gres/gpu:1`, and run `srun --gres=gpu:1 nvidia-smi`?
-- **S2** -- Where does the engine run? (a) as a nested container inside the slurmd container (image store shared read-only via podman `additionalimagestores`; the engine's processes stay in the job's cgroup), or (b) created by the host's podman over its socket, outside the job's cgroup, with the epilog as the only cleanup. Must hold: `scancel` leaves VRAM empty.
-- **S3** -- GPU accounting: with `gpu_nvml` built in, do `sacct` / `sstat` show `gres/gpumem` and `gres/gpuutil` for the job? NVML reports host PIDs, so the slurmd container probably needs `--pid=host`. Does `acct_gather_energy/gpu` record energy?
-- **S4** -- slurmrestd reachable from the router container with JWT auth; job start latency from submit to running.
-- **S5** -- `scontrol suspend` / `resume` on a workload job, `scontrol requeue` on an engine job, `scancel` of a pending job and of the whole queue.
+- **S1** -- Do the Slurm daemons run under rootless podman with cgroup v2 (`IgnoreSystemd=yes`, no systemd in the container), see the GPU as `gres/gpu:1`, and run a GPU job?
+- **S2** -- Where does the engine run, so that `scancel` leaves VRAM empty? Must hold: no container inside a container (D6).
+- **S3** -- GPU accounting: do `sstat` / `sacct` show `gres/gpumem` and `gres/gpuutil` for the engine? Energy?
+- **S4** -- slurmrestd reachable from `devai-net` with JWT auth, the router's path; submit-to-running latency.
+- **S5** -- queueing, suspend/resume, hold/release, requeue, cancel, clearing the queue, and D1's two interruption paths.
+- **S6** -- an engine switch between two backends' nodes under the license.
+- **S7** -- the 2026-09-28 failure: a process outside Slurm holds VRAM when an engine job is submitted.
 
 ### Deliverables
 
-Findings written into this plan (a "Spike results" section), each answer with the command that showed it. Throwaway config lives in the session scratch directory, not in the tree.
+Findings written into this plan, each answer with the command that showed it. Throwaway config lives in the session scratch directory, not in the tree.
 
 ### Exit criteria
 
-S1-S5 answered; Open questions 1-3 closed; Phase 1 deliverables fixed.
+S1-S7 answered; Open questions closed; Phase 1 deliverables fixed.
 
-### Spike results (2026-09-29)
+### Spike results, round 2 (2026-09-29, GPU free, no nested containers)
 
-All on this host (RTX PRO 4000 Blackwell, rootless podman 5, cgroup v2), Slurm 26.05.4, five spike containers on `devai-net` (`spike-slurmctld`, `-slurmd`, `-slurmrestd`, `-slurmdbd`, `-mariadb`). The router's own vllm-devai engine held 21.8 GiB of the card throughout; every GPU test below ran beside it in the remaining ~2.6 GiB.
+Stack: SchedMD's official `slurmctld`, `slurmdbd`, `slurmrestd` images (Ubuntu 26.04, Slurm 26.05.4), MariaDB 11.8, and three nodes -- `vllm-devai` (from `docker.io/devai/vllm-devai`, +~90 MB), `ollama` (from `localhost/devai-ollama`, +82 MB) and a GPU-less work node -- all on `devai-net` at fixed IPs, the engine nodes built with devai's own Slurm packages for Debian trixie (below). `make cache-down` had stopped the router and every engine, and the card was idle (2 MiB). Engine under test: `Qwen3.8-27B-W4A16-devai-AutoRound` @131072 with exactly the arguments and environment of the router's last launch (vLLM's own "non-default args" line, `deploy/recovery-flags.json`, the backend's `EnvVars`); and `qwen3.8:27b-mtp-q4_K_M` on Ollama.
 
-- **S1 -- yes, rootless.** slurmctld runs unprivileged; slurmd runs `--privileged --cgroupns=private`, with the GPU through CDI. Three things were needed:
-  - slurmd failed at first ("Controller memory is not enabled") because the container's processes sat in its cgroup root; an entrypoint hook moves them to a child cgroup first and enables the delegated controllers (the docker-in-docker recipe). After that, jobs run in their own cgroup (`/system.slice/slurmstepd.scope/<job>/step_0/...`) with `CUDA_VISIBLE_DEVICES=0`.
-  - `cpuset` is not delegated to user sessions here (systemd `DelegateControllers=cpu memory pids`), so Slurm cannot pin cores. Not needed.
-  - slurmctld and slurmdbd drop to the `slurm` user and cannot create their run directories under podman; a two-line entrypoint wrapper creates them.
-- **S2 -- the engine runs as a nested container inside the job, (a).** Podman inside the slurmd container, with the host's image store mounted read-only as an `additionalimagestores` entry (no image copy; a 1 GiB-VRAM PyTorch holder started 3 s after submit). Needed:
-  - the host's `/usr/bin/nvidia-cdi-hook` mounted into the slurmd container (the CDI spec calls it; it depends on glibc only);
-  - `podman run --cgroups=disabled` so the engine's processes stay in the job's cgroup (checked in `/proc/<pid>/cgroup` of the GPU process);
-  - `--init --init-path /usr/bin/tini`. Without it the engine is PID 1, ignores SIGTERM, and `scancel` took 30.1 s (Slurm's default `KillWait`, then SIGKILL). With it, VRAM was released **0.2 s** after `scancel`;
-  - an epilog that removes the job's containers by label: a SIGKILLed conmon left podman's record ("Up 44 seconds") behind, and the next launch under that name would collide.
-  - Network: `--network host` inside the job is the slurmd container's network, so the router reaches an engine at `<slurmd container>:<port>` (HTTP 200 in 4 ms from another `devai-net` container).
+- **S1 -- yes, rootless.** Controller, REST and accounting daemons run unprivileged; nodes run `--privileged --cgroupns=private --pid=host` with the GPU through CDI. Needed:
+  - an entrypoint step that moves the container's processes out of its cgroup root and enables the delegated controllers (without it: "Controller memory is not enabled"); jobs then get their own cgroup (`.../slurmstepd.scope/<job>/step_0/user/task_0`) with `CUDA_VISIBLE_DEVICES=0`;
+  - run directories created for the `slurm` user in the controller and accounting containers (they drop privileges and cannot create them);
+  - fixed IPs: a node recreated with a new IP went NOT_RESPONDING until the controller restarted (round 1); on a fixed IP it re-registered by itself;
+  - configless nodes (`SlurmctldParameters=enable_configless`, `slurmd --conf-server`): in round 1 a changed `slurm.conf` drained the node;
+  - `cpuset` is not delegated to user sessions here (`DelegateControllers=cpu memory pids`), so no core pinning; `slurmd -C` counts 8 of 24 CPUs, so `CPUs=` is set in the config with `SlurmdParameters=config_overrides`.
+- **S2 -- the engine as the job's own process on its backend's node.** The engine job `exec`s `python3 -m vllm...` (or `ollama serve`); `VLLM::EngineCore` (21.4 GiB) and Ollama's `llama-server` (18.6 GiB) sat in the job's cgroup. vLLM: submit -> RUNNING 1.0 s, `/health` 95.5 s after submit (a cold start). A chat request over `devai-net` to `spike-node-vllm-devai:11434` returned 1,200 tokens at 38.6 tok/s (MTP off). `scancel` -> no GPU process **0.30 s**, vLLM shut down gracefully, 4 MiB left. Two things matter:
+  - a job carries only the environment its submitter gives it, so a REST-submitted vLLM job failed with `No module named 'vllm'` (the image's `PATH` includes `/opt/vllm/bin`); the node entrypoint now writes its image environment to `/run/devai/node-env.sh` and every engine script sources it, so the router passes only what is job-specific;
+  - the node container outlives its jobs, so vLLM's compile caches did too: a restart on the same node reached `/health` in 27-29 s instead of 95 s. That is the cache docs/router.md says must NOT persist (it under-measured activation memory and OOM-killed engines, 2026-09-23). The prolog has to wipe `/root/.cache/vllm` and `/tmp/torchinductor_*` before an engine job (the FlashInfer cache stays, as today).
 - **S3 -- GPU memory and utilisation per job, yes; energy, no.**
-  - The official `slurmd` lacks `gpu_nvml`, and adding the plugin file is not enough: NVML autodetection is compiled into Slurm's core ("configured to autodetect nvml functionality, but we weren't able to find that lib when Slurm was configured"). The whole package set has to be built with the NVML headers: SchedMD's own `debuild` step on `ubuntu:26.04` plus `libnvidia-ml-dev` (Ubuntu multiverse, 12.4 headers), source `slurm-26-05-4-1` (sha256 `0e522d39324b7b7da5e8096c678c4af00500ca4c3fe2e6da7e4f8d01f7082ec7`), installed over the official image's packages.
-  - GPU TRES need slurmdbd ("slurmdbd is required to run with TRES gres/gpu"), so the accounting database is part of the base. MariaDB 11.8 enables `innodb_snapshot_isolation` by default, which slurmdbd warns will make it fatal on a write conflict: run MariaDB with `--innodb-snapshot-isolation=OFF`.
-  - slurmd needs `--pid=host`: NVML reports host PIDs, and Slurm matches them against the job's processes.
-  - Slurm sums GPU use over the task's process tree by parent PID. podman's conmon double-forks and is re-parented away, so the engine was not counted (`gres/gpumem=0` while the debug log showed "pid 301001 has GPUUtil=100 and MemMB=1354"). Running the job under `tini -s` (a child subreaper) re-parents conmon to the task: **`gres/gpumem=1354M`, `gres/gpuutil=100`**, live in `sstat` and afterwards in `sacct`.
-  - Energy: Slurm 26.05's NVML plugin does not read energy at all (`gpu_p_energy_read` returns success with no data), so `acct_gather_energy/gpu` reports 0 on NVIDIA. GPU energy has to come from devai: NVML's cumulative energy counter read at job start and end, written to the job record.
-  - `AccountingStoreFlags=job_comment` is needed for `--comment` to reach `sacct` (it came back empty without it).
-- **S4 -- yes.** slurmrestd (official image, run as `nobody`, `-a rest_auth/jwt`) on `devai-net`, token from `scontrol token`. Through REST: submit to RUNNING 0.9 / 1.4 / 2.9 s, DELETE to CANCELLED 15-19 ms (three runs).
-- **S5 -- all work; suspend keeps the GPU.** Queueing, `scancel` of one job, `scontrol hold` / `release`, `scontrol requeue` of a running job, and `scancel --user` of everything behaved as documented. A suspended job's output stopped (4 -> 4 lines) and continued on resume. But a suspended job **keeps its GPU allocation**: a queued GPU job stayed `PENDING (Resources)` throughout. So D1's "suspend, run a quick job on another engine, resume" is: suspend the workload job, stop the engine job, run the quick job, restart the engine, resume. With the same engine it is the workload suspend alone.
+  - The official `slurmd` lacks `gpu_nvml`, and the plugin file alone is not enough (NVML autodetection is compiled into Slurm's core: "configured to autodetect nvml functionality, but we weren't able to find that lib when Slurm was configured"). devai builds the whole package set with the NVML headers: SchedMD's `debuild` step, source `slurm-26-05-4-1` (sha256 `0e522d39324b7b7da5e8096c678c4af00500ca4c3fe2e6da7e4f8d01f7082ec7`), on `debian:trixie` with `libnvidia-ml-dev` from non-free, for the trixie-based engine images.
+  - GPU TRES need slurmdbd ("slurmdbd is required to run with TRES gres/gpu"). MariaDB 11.8 enables `innodb_snapshot_isolation`, which slurmdbd warns will make it fatal on a write conflict: `--innodb-snapshot-isolation=OFF`.
+  - Nodes need `--pid=host`: NVML reports host PIDs and Slurm matches them against the job's processes, summed over the task's process tree -- which the engine is part of, because the job `exec`s it.
+  - Result: vLLM job `gres/gpumem=21794M`, `gres/gpuutil=99-100` live in `sstat` during generation and in `sacct` afterwards; Ollama job `gres/gpumem=18570M`.
+  - Energy: Slurm 26.05's NVML plugin does not read it (`gpu_p_energy_read` returns success with no data), so `acct_gather_energy/gpu` reports 0 on NVIDIA. NVML's own counter works (`nvmlDeviceGetTotalEnergyConsumption` read through `pynvml` in the vLLM node: 14,323,881,481 mJ since driver load); `nvidia-smi` on this driver does not expose it. devai reads it at job start and end, which needs a small NVML reader in every node image (the Ollama image has no Python).
+  - `AccountingStoreFlags=job_comment` is needed for comments to reach `sacct`. A JSON comment submitted through REST arrives intact; `#SBATCH --comment` strips the quotes.
+- **S4 -- yes.** slurmrestd (run as `nobody`, `-a rest_auth/jwt`, token from `scontrol token`), called from another `devai-net` container. Round 1: submit -> RUNNING 0.9 / 1.4 / 2.9 s, DELETE -> CANCELLED 15-19 ms. Round 2 (the real engine through REST): submit -> RUNNING 1.26 s, `/health` 95.3 s.
+- **S5 -- all work; a suspended job keeps its GPU.**
+  - A second engine job waits as `PENDING (Licenses)` while one holds `gpu0`; a deferred job (`--begin=now+1hour`) waits as `BeginTime`; `scontrol hold` / `release`, `scontrol top` (move to the front), `scancel` of one job and `scancel --state=PENDING` (clear the queue, running job untouched) behave as documented.
+  - Round 1: a suspended GPU job kept its allocation -- a queued GPU job stayed `PENDING (Resources)` throughout.
+  - Same-engine interruption: a bench-like workload (20 requests to vLLM) suspended after 3, a one-request job ran on the same engine, the workload resumed -- **2.9 s** in all; no request while suspended (3 -> 3), 20/20 done, 0 retries; `sacct` records the suspended time.
+  - Different-engine interruption: workload suspended, vLLM cancelled and Ollama started (3.0 s), a quick job on Ollama including its model load (done at 10.4 s), Ollama cancelled and vLLM resubmitted, healthy at 37.6 s (27 s of it the start that the cache wipe above will lengthen to ~95 s), workload resumed: 20/20 done, 0 retries.
+  - A job held after a prolog failure (S7) started 130 s after release: Slurm delays requeued jobs (reason `BeginTime`, also seen in round 1). The router should cancel and resubmit instead; a fresh job started in ~1 s every time.
+- **S6 -- engine switch under the license, through REST.** vLLM running, Ollama job pending on `Licenses`; cancel vLLM -> vLLM off the GPU 0.23 s -> Ollama job RUNNING 1.22 s -> Ollama answering 2.79 s. The epilog confirmed vLLM left the card idle and Ollama's prolog confirmed it before starting.
+- **S7 -- the 2026-09-28 failure cannot recur.** A container outside Slurm allocated 4 GiB; an engine job submitted through REST was refused: the prolog waited 30 s ("gpu NOT idle after 30s: 4328 MiB used; holders: 723061, python3, 4318 MiB"), Slurm drained the node ("Prolog error") and held the job, and no vLLM process ever reached the GPU. After the holder was removed, the node resumed and the job released, it started and served.
+  - Race to design out: the previous engine's epilog and the next engine's prolog ran in the same second (13:27:28) on two nodes. Both saw an idle card here, but an epilog that demands a globally idle card can see the next engine already allocating and drain its own node. So the prolog carries the global check and the epilog checks the finished job's own leftovers only.
 
-Also found:
+Round 1 (earlier the same day, the router's engine holding 21.8 GiB) ran engines as podman containers nested inside the slurmd container. It worked -- VRAM released 0.2 s after `scancel` with `tini` as the container's init, GPU accounting after a `tini -s` subreaper -- but needed the host's `nvidia-cdi-hook` and image store inside the node, and the operator ruled out containers inside containers (D6). Its S1, S4, S5 and S3 findings on the Slurm side carried over and are folded in above.
 
-- Recreating the slurmd container gives it a new IP and slurmctld keeps the old one (the node went NOT_RESPONDING and a batch job was requeued). Phase 1 needs stable addresses (fixed IPs on `devai-net`, or restart ordering).
-- A changed `slurm.conf` drains the node ("appears to have a different slurm.conf"). Phase 1 should use configless mode (slurmd fetches its config from slurmctld), so there is one copy.
-- `slurmd -C` reports 8 CPUs where the host has 24; set `CPUs=` explicitly.
-- Not tested yet: a real inference engine (vLLM, Ollama) inside a job, with its model store and engine-cache volumes. It needs the GPU, which the router's warm engine held during the spike.
-
-Open questions 1 and 2 are answered: nested containers in the job, rootless. Open question 3: rebuild the full Slurm package set with NVML (not only the plugin).
+Open questions 1-4 are answered.
 
 ---
 
@@ -162,10 +170,11 @@ GPU device removed from devai application containers (lab, bench, probers); the 
 
 | Risk | Phase | Mitigation |
 | ---- | ----- | ---------- |
-| slurmd cannot manage cgroups under rootless podman | 0 | resolved by S1 (cgroup nesting hook) |
-| engine escapes the job's process tree (conmon double-fork) and is not accounted | 0 | resolved by S3 (`tini -s` subreaper); the epilog still removes leftovers by label |
-| `gpu_nvml` absent from the official image | 1 | build the full Slurm package set from SchedMD's recipe with the NVML headers (S3) |
-| the nested setup depends on host paths (`nvidia-cdi-hook`, CDI spec, image store) | 1 | check them at start-up and fail with the path named |
+| slurmd cannot manage cgroups under rootless podman | 0 | resolved by S1 (cgroup nesting step) |
+| `gpu_nvml` absent from the official image | 1 | build the full Slurm package set from SchedMD's recipe with the NVML headers (S3), per base distribution |
+| vLLM compile caches outlive the job in the long-lived node and under-measure activation memory (the 2026-09-23 OOMs) | 1 | the prolog wipes them before every engine job |
+| a job held after a prolog failure starts only after Slurm's requeue delay | 2 | the router cancels and resubmits |
+| an epilog demanding a globally idle card races the next engine on another node | 1 | global check in the prolog only |
 | Slurm reports no GPU energy on NVIDIA | 1 | devai reads NVML's energy counter at job start and end |
 | Slurm down means nothing can launch | 2 | router reports it plainly (503 naming Slurm); compose restarts the daemons |
 | suspend with a different engine costs a cold start (25-125 s measured for Qwen3.8-27B on vllm-devai) | 3 | the same-engine fast path; operators choose |
