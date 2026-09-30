@@ -1,8 +1,8 @@
-# Multi-token prediction (MTP) -- a 2-3x decode speedup with the same model
+# Multi-token prediction (MTP) -- faster decode with the same model
 
 This page covers the trick that lets a model emit several tokens per
-forward pass instead of one, without changing the model's outputs at
-all. The canonical name on Google's product pages is **multi-token
+forward pass instead of one, without changing the distribution of the
+model's outputs (Sec. 6). The canonical name on Google's product pages is **multi-token
 prediction (MTP)**; the canonical name in the literature is
 **speculative decoding**. They are *almost* the same thing -- they
 differ in *who proposes the next K tokens* (a separate drafter model
@@ -11,8 +11,19 @@ math is identical.
 
 Both names show up in vLLM / SGLang / HuggingFace / Ollama flag docs
 because both shapes are live in 2026. This doc explains which one
-each provider ships and what it would take to wire MTP into this
-project's router.
+each provider ships, how this project's router serves it, and what it
+measured on this project's card: about **2.5x** faster decode for the
+Qwen3.8-27B builds on the bench's fixed set of short prompts at
+temperature 0 (paired over 34 prompts, one run per arm; Sec. 7.1), at a
+cost of 0.60 GiB more weights and a 24 % smaller KV pool on the NVFP4
+build (Sec. 9.3).
+
+Numbers in this doc are of three kinds, and each is labelled: figures
+**measured** on this project's RTX PRO 4000 Blackwell (with n, number
+of runs and date), figures **derived** from a model with stated
+assumptions, and **external** figures reported by vendors or papers and
+not reproduced here. [statistics-primer.md](statistics-primer.md)
+Sec. 9 and 14 explain how the measured ones are reported.
 
 If you have not yet internalised the prefill / decode split,
 [`llm-tokens-and-speed.md`](llm-tokens-and-speed.md) Sec. 5-7 is the
@@ -32,11 +43,13 @@ A modern LLM emits **one token per forward pass**.
 the ceiling: each decode step reads every weight and every cached KV
 slot once, then writes one new token plus its KV row. For
 `Qwen3-8B-NVFP4` on this project's RTX PRO 4000 Blackwell card the
-ceiling is `640 GB/s / 5.1 GB ~ 125 tok/s` and the measured number
-is `98.3 tok/s` -- ~78 % bandwidth utilisation. There is no way to
+derived ceiling is about `640 GB/s / 5.15 GB ~ 124 tok/s` (assuming
+the repo's unsourced 640 GB/s peak), and three single bench runs
+measured 98.3-110.9 tok/s, roughly 79-89 % of it. There is no way to
 push past that ceiling *as long as the model emits one token per
 forward pass*. The GPU is not compute-starved; it is memory-bandwidth
-starved.
+starved (the paired two-build test in `llm-tokens-and-speed.md` Sec. 7
+supports this).
 
 MTP attacks the problem from a different angle. Instead of trying to
 go faster per pass, it produces **K tokens per pass** in the common
@@ -84,12 +97,14 @@ the time of one big-model decode step.
 
 Why is step 2 cheap? Because **K extra tokens through the verifier
 cost roughly the same as one token** in decode mode. Decode is
-bandwidth-bound; you pay the same ~5 GB-per-step weight read whether
-you process 1 or 16 positions in that step (small K does not push
-into compute-bound territory). The drafter's K serial passes are
-cheap because the drafter is tiny.
+bandwidth-bound; you pay the same weight read per step (~5 GB for an
+8B NVFP4 model) whether you process 1 or 16 positions in that step
+(small K does not push into compute-bound territory). The drafter's K
+serial passes are cheap because the drafter is tiny.
 
-End-to-end: ~2-3x decode speedup at typical acceptance rates.
+End-to-end: published speedups are about 1.7-3x depending on drafter,
+K and content (external, Sec. 4-5). On this card the Qwen3.8-27B builds
+measured 2.52x and 2.60x on short prompts (paired, Sec. 7.1).
 
 ---
 
@@ -123,14 +138,17 @@ both the "main" prediction path (one token at a time) and the "MTP"
 prediction path (K tokens at a time). No separate drafter file. No
 extra HuggingFace repo. From `ls -lh`, the only sign is a small
 extra block of weights -- roughly 850 MB BF16 for Qwen3.6's
-`mtp_num_hidden_layers=1` arrangement on a 27 B target.
+`mtp_num_hidden_layers=1` arrangement on a 27 B target (external). It
+is not free at run time, though: the prepared Qwen3.8-27B NVFP4 build
+here loaded 0.60 GiB more with MTP on, and its KV pool shrank by 24 %
+(measured, Sec. 9.3).
 
 The two shapes are summarised:
 
 | Aspect | External drafter | Built-in MTP head |
 |---|---|---|
 | Where weights live | separate repo (`-assistant`, `-eagle3`) | same checkpoint as target |
-| Extra VRAM cost | drafter weights + drafter KV (sharable) | small (~1 GB), already counted in checkpoint |
+| Extra VRAM cost | drafter weights + drafter KV (sharable) | head weights (in the checkpoint, but loaded only with MTP on) + KV for the head's own layer; measured here: +0.60 GiB weights, KV pool -24 % (Sec. 9.3) |
 | Training | independent (distil from target) | jointly trained with target |
 | Example checkpoint | `google/gemma-4-26B-A4B-it-assistant` (801 MB) | `Qwen3.6-27B-Text-NVFP4-MTP` (built into 18 GB) |
 | vLLM flag shape | `'{"method":"mtp","model":"<repo>","num_speculative_tokens":N}'` | `'{"method":"deepseek_mtp"/"qwen3_5_mtp","num_speculative_tokens":N}'` (no `model` field) |
@@ -180,10 +198,11 @@ Two extra optimisations are baked in:
    assistant checkpoint advertises `use_ordered_embeddings: true`;
    the 26B-A4B and 31B assistants don't use it.
 
-Google's published headline: **up to 3x decoding speedup on NVIDIA
-RTX PRO 6000**, with bit-exact identity to the unaccelerated path
-(see Sec. 6). On Apple Silicon at batch 4-8 they report ~2.2x for
-the 26 B MoE. Same model, same outputs, ~half the wait.
+Google's published headline (external, not reproduced here): **up to
+3x decoding speedup on NVIDIA RTX PRO 6000**, with bit-exact identity
+to the unaccelerated path (a vendor claim; Sec. 6 explains why exact
+identity holds in exact arithmetic but is not guaranteed on a GPU). On Apple Silicon at batch 4-8
+they report ~2.2x for the 26 B MoE.
 
 The vLLM serve command from Google's reference recipe page
 ([docs.vllm.ai .../Gemma4.html](https://docs.vllm.ai/projects/recipes/en/latest/Google/Gemma4.html)):
@@ -227,8 +246,9 @@ plus a shared embedding/output head, predicting the next D tokens
 in parallel. The same checkpoint serves both as a one-token-per-pass
 generator (main path) and a multi-token drafter (MTP path).
 
-The official acceptance rate on MTP-1 is **>80 %**, yielding
-**~1.8x** decode throughput. vLLM flag:
+The reported acceptance rate on MTP-1 is **>80 %**, yielding
+**~1.8x** decode throughput (external, DeepSeek-V3 technical report).
+vLLM flag:
 
 ```
     --speculative-config '{"method": "deepseek_mtp",
@@ -241,11 +261,29 @@ does not include DeepSeek-V3 base.
 
 ### 5.2 Qwen3.6 -- built-in MTP at 24 GB-friendly sizes
 
-Qwen3.6 (released 2026-Q1) ships **`mtp_num_layers=1`** -- a single
-MTP module that can be applied recursively up to N speculative
-steps. Per-position acceptance is reported as ~87 % / 72 % / 61 %
-for positions 1/2/3 with `num_speculative_tokens=3`, giving 3-4
-mean accepted tokens per draft pass.
+Qwen3.6 (released 2026-Q1) ships a single MTP module
+(**`mtp_num_hidden_layers=1`** in `text_config`, as the Qwen3.8
+checkpoints here also record it) that can be applied recursively up to
+N speculative steps. Per-position acceptance is reported as ~87 % /
+72 % / 61 % for positions 1/2/3 with `num_speculative_tokens=3`
+(external). How many tokens a verification step yields on average
+depends on what those rates mean, and the source does not say:
+
+- if each is the probability that positions 1 to i are **all**
+  accepted (unconditional; this is how vLLM counts), the verifier's
+  guaranteed token plus the plain sum gives 1 + 0.87 + 0.72 + 0.61 ~
+  3.2 tokens per step;
+- if each is the probability of acceptance **given** that the previous
+  position was accepted (conditional), it is 1 + 0.87 + 0.87 x 0.72 +
+  0.87 x 0.72 x 0.61 ~ 2.88.
+
+For comparison, this project's Qwen3.8-27B builds logged unconditional
+per-position rates of about 0.84 / 0.66 / 0.51 (medians over fourteen
+10-s windows, two runs; windows ranged 0.75-0.98 / 0.51-0.90 /
+0.37-0.83). Pooled over all windows, vLLM accepted 66 % of drafted
+tokens, so a verification step yielded 1 + 3 x 0.66 = 2.98 tokens on
+average on the short bench prompts (vLLM's own counters; its logged
+mean acceptance length had a per-window median of 3.0; Sec. 7.1).
 
 The catch: stock NVFP4 quantization scripts **drop the MTP head**
 because `AutoModelForCausalLM.from_pretrained` doesn't load it.
@@ -256,8 +294,8 @@ checkpoint:
 |---|---|---|
 | `sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP` | 18.3 GB (NVFP4 weights + ~850 MB BF16 MTP head) | fits with `--kv-cache-dtype fp8 --max-num-seqs 2` |
 
-The author's reported speedup: **1.74x** on long-form decode
-(207 vs 119 tok/s) with `num_speculative_tokens=3`. vLLM flag:
+The author's reported speedup (external): **1.74x** on long-form
+decode (207 vs 119 tok/s) with `num_speculative_tokens=3`. vLLM flag:
 
 ```
     --speculative-config '{"method": "qwen3_5_mtp",
@@ -274,8 +312,9 @@ EAGLE3 are *training recipes* for community-built drafters that
 target any open model. Within four days of Gemma 4's release, a
 community member trained an EAGLE3 head for Gemma-4-31B
 ([`lujangusface/tw-eagle3-gemma4`](https://huggingface.co/blog/lujangusface/tw-eagle3-gemma4))
-and reported a **1.72x speedup** -- slightly slower than Google's
-official assistant, but trained with a fraction of the compute.
+and reported a **1.72x speedup** (external) -- slightly slower than
+Google's official assistant, but trained with a fraction of the
+compute.
 
 SGLang flag shape:
 
@@ -340,7 +379,8 @@ The NVIDIA-published, MTP-relevant artifacts:
 
 **Nemotron 3 Super** is genuinely interesting on paper: it ships
 MTP with the highest reported acceptance length (3.45 mean
-accepted tokens, beating DeepSeek-R1 in NVIDIA's own benchmarks)
+accepted tokens, beating DeepSeek-R1 in NVIDIA's own benchmarks;
+external)
 and a shared-weight head design that stays stable at longer draft
 lengths. vLLM flag shape (from NVIDIA's deployment cookbook):
 
@@ -365,23 +405,23 @@ hybrid, both of which would fit the project's hardware
 comfortably. The PayPal commerce-agent paper
 ([arXiv:2604.19767](https://arxiv.org/abs/2604.19767)) trained
 their *own* EAGLE3 against `Llama-3.1-Nemotron-Nano-8B-v1` and
-report 22-49 % throughput gain at gamma=3 -- but that draft head
+report 22-49 % throughput gain at gamma=3 (external) -- but that draft head
 is not publicly released as of 2026-05.
 
 **Net for this project:** the NVIDIA-branded fit-the-card MTP
 path today goes through *NVIDIA's NVFP4 quantization of Google's
 Gemma 4* (`nvidia/Gemma-4-26B-A4B-NVFP4`, already in the catalog
-and downloaded). A pure-NVIDIA MTP pair will require either
+and downloaded in 2026-05). A pure-NVIDIA MTP pair will require either
 NVIDIA shipping a Nemotron-Nano MTP variant in a future release,
 or the project training its own EAGLE3 head against
 `Llama-3.1-Nemotron-Nano-8B-v1` or `Llama-3.1-8B-Instruct-NVFP4`
-(both already on disk per `ls /var/cache/devai/vllm/`).
+(both were on disk in 2026-05).
 
 ### 5.7 Summary table -- what runs on 24 GB
 
 For this project's RTX PRO 4000 Blackwell, the 2026-05 shortlist:
 
-| Provider | Target | Drafter | Total VRAM est. | Status today |
+| Provider | Target | Drafter | Total VRAM est. | Status (2026-05) |
 |---|---|---|---|---|
 | Google | `gemma-4-E2B-it` (5 GB BF16) | `gemma-4-E2B-it-assistant` (0.15 GB) | ~6 GB + KV | downloaded |
 | Google | `gemma-4-E4B-it` (15 GB BF16) | `gemma-4-E4B-it-assistant` (0.15 GB) | ~16 GB + KV | drafter downloaded; target not on disk |
@@ -392,10 +432,11 @@ For this project's RTX PRO 4000 Blackwell, the 2026-05 shortlist:
 | NVIDIA (first-party) | `meta-llama/Llama-3.3-70B-Instruct` (~40 GB NVFP4) | `nvidia/Llama-3.3-70B-Instruct-Eagle3` (3.2 B) | ~45 GB | out of scope (target too big) |
 | DeepSeek | DeepSeek-V3 (~671 B) | built-in MTP | ~330 GB+ | out of scope |
 
-The two **prime candidates** for this project are
-`nvidia/Gemma-4-26B-A4B-NVFP4` + assistant (lossless 2-3x speedup
-on a quality-tier model) and `sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP`
-(self-contained, no drafter to manage).
+The two **prime candidates** in 2026-05 were
+`nvidia/Gemma-4-26B-A4B-NVFP4` + assistant (a lossless speedup, 2-3x
+by the vendor's figures) and `sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP`
+(self-contained, no drafter to manage). What was eventually measured
+here is the Qwen3.8-27B built-in head (Sec. 7.1).
 
 A live caveat for the Google + NVFP4 path: the target's BF16
 distribution is not bit-exact equal to the NVFP4-quantised target's
@@ -445,8 +486,18 @@ A few consequences worth internalising:
 - **Greedy decode is a special case.** When the target samples
   greedily (temperature 0), acceptance reduces to "did the drafter
   predict the target's argmax?". Yes -> accept; no -> reject and
-  emit the target's argmax. Output is bit-exact identical to the
-  unaccelerated path.
+  emit the target's argmax. In exact arithmetic the output is
+  identical to the unaccelerated path. On a GPU the verifier scores
+  K+1 positions at once, and floating-point results can depend on such
+  batch shapes, so near-ties can in principle resolve differently.
+  What this project's data can show is limited: vLLM's log records
+  output lengths, not text, and in 27 of the 34 temperature-0 pairs
+  both arms stopped at the `max_tokens` limit, where equal lengths say
+  nothing. In the 7 pairs where length is informative, 3 (AutoRound)
+  and 6 (NVFP4) had a different length with MTP on than off. So at
+  least 3 and 6 of 34 outputs changed; how many of the other 27 did is
+  unknown. The MTP-on and MTP-off runs also differed in day, image and
+  checkpoint copy, so the cause is not known either (Sec. 7.1).
 
 - **Temperature sampling is also a special case.** With softmax
   temperatures applied to both target and drafter, the same
@@ -465,163 +516,171 @@ A few consequences worth internalising:
   reproducible seed, that seed sequence won't match the
   unaccelerated path on a per-position basis. The marginal output
   distribution is identical; the specific samples differ. For
-  agents this is invisible; for `temperature: 0` evaluation this is
-  often bit-exact (because argmax is deterministic).
+  agents this is invisible. At `temperature: 0` argmax is
+  deterministic, so the output is identical in exact arithmetic; on a
+  GPU it can still change (previous bullet), so do not expect bit-exact
+  reproduction when MTP is switched on or off.
 
 This is why a vendor can ship MTP behind a flag and not call it
 "a different model". It is the same model, served faster.
 
 ---
 
-## 7. How this project's router supports MTP
+## 7. MTP on this project
 
-**Update 2026-05 (catalog-crystalline-beaver):** the clean
-implementation outlined below in Sec. 7.2 has shipped. The picker
-opt-in (`::mtp` suffix), the catalog `mtp:` block, the
-`--speculative-config` emission, the `currentSpec` recreate
-trigger, and the reasoning+MTP+inline guard for vllm#34650 are all
-in place. See `gpu-arbiter/main.go` (`parseMTPOverride`,
-`vllmSpeculativeJSON`, `sglangSpeculativeArgs`, `specEqual`,
-`specLabel`), `scripts/model-picker.py` (`_has_mtp`; a supporting row
-is always launched with `::mtp`, the ON/OFF sub-modal was removed on
-2026-09-22),
-and `scripts/_probe_hf_common.py` (the per-cell MTP overhead probe).
-The `RecoveryFlags` escape hatch in Sec. 7.1 remains available for
-operator-level overrides but is no longer the recommended path.
+### 7.1 What MTP measured on this card
 
-### 7.1 Minimum-viable: ride the `RecoveryFlags` escape hatch
+The Qwen3.8-27B builds served on this project (AutoRound W4A16 and
+NVFP4 bodies, both prepared with int8 vocabulary tensors and a
+40,960-token draft head; built-in MTP head, `num_speculative_tokens` 3)
+were run over the bench's 40 short latency prompts once with MTP on and
+once with MTP off. Because the prompts are the same in both arms, the
+comparison is **paired**: one speedup per prompt.
 
-`gpu-arbiter/main.go` already has a per-model CLI-args bag called
-`RecoveryFlags`, sourced from `deploy/recovery-flags.json` and
-appended verbatim to the backend container's entrypoint at launch.
-Today that bag carries things like `--enforce-eager` for models
-whose CUDA-graph workspace pushes them past 24 GB.
+| Build | Prompts (pairs) | Geometric mean of per-prompt speedups (95 % CI) | Median (95 % CI) | Range |
+|---|---|---|---|---|
+| AutoRound (W4A16) | 34 | **2.52x** (2.42-2.61) | 2.54x (2.40-2.68) | 2.01-3.16x |
+| NVFP4 | 34 | **2.60x** (2.50-2.70) | 2.64x (2.38-2.80) | 2.10-3.20x |
 
-Speculative-decoding flags drop straight in. For
-`Gemma-4-26B-A4B-NVFP4`, the recovery JSON entry would carry:
+What this buys and what it costs: decode about 2.5x faster on these
+prompts, for 0.60 GiB more weights and a KV pool 24 % smaller (measured
+on the NVFP4 build), which limits the context the build can serve
+(Sec. 9.3).
 
-```
-    "engine_flags": [
-      "--speculative-config",
-      "{\"method\":\"mtp\",\"model\":\"/models/gemma-4-26B-A4B-it-assistant\",\"num_speculative_tokens\":4}"
-    ]
-```
+How to read it:
 
-For `Qwen3.6-27B-Text-NVFP4-MTP` (built-in MTP head):
+- **Definition.** Per request, decode rate = generated tokens /
+  (elapsed time - the run's median time to first token). Generated
+  tokens and elapsed time come from vLLM's per-request log lines; the
+  elapsed time runs from the request's arrival to its end, so it also
+  contains any queueing and the prefill. The subtracted time to first
+  token is not a per-request engine value but the client harness's median
+  over the run's prompts 2-40: 70.7 ms (AutoRound) and 72.3 ms (NVFP4)
+  with MTP on, 60.1 and 84.5 ms with MTP off. Speedup = MTP-on rate /
+  MTP-off rate for the same prompt.
+- **Pairing.** The engine log carries no prompt identifier.
+  `perf_engine_runs.py` assigns log records to prompts in send order,
+  using each prompt's `max_tokens` (a request that stopped on the length
+  limit must have generated exactly that many tokens). The
+  reconstruction is consistent: the prompt-token counts of the two arms
+  match in all 34 pairs; no record was set aside in the MTP-on runs, and
+  1 (NVFP4) and 8 (AutoRound) records of other clients were set aside in
+  the MTP-off runs (the script lists them).
+- **n and exclusions.** 40 prompts per arm; the first prompt is
+  excluded (its engine time contains 11-15 s of first-request
+  initialisation), as are prompts with fewer than 64 generated tokens
+  in either arm, leaving 34 pairs. That filter depends on the outcome.
+  With all 39 prompts the geometric means are 2.59x (2.48-2.70,
+  AutoRound) and 2.68x (2.56-2.81, NVFP4), so the result does not hinge
+  on it.
+- **What the prompts represent.** The 40 prompts are a fixed,
+  hand-written set of short English questions with at most 256 output
+  tokens, run at temperature 0 with reasoning on. The intervals describe
+  a notional population of similar prompts under these conditions
+  ([statistics-primer.md](statistics-primer.md) Sec. 1); they say
+  nothing about long outputs, other content or other temperatures.
+- **Intervals.** Geometric-mean interval: percentile bootstrap over
+  prompts (B = 10000, seed 20260927); median interval: order
+  statistics (primer Sec. 8 and 9). They cover prompt-to-prompt
+  variation only: each arm is **one run**, so run-to-run variation is
+  not in them.
+- **Conditions.** Temperature 0, reasoning on at `medium`, max_tokens
+  16-256 per prompt. MTP on: 2026-09-21, prepared checkpoints in
+  place, port 11435, image `localhost/devai-vllm` (vLLM 0.28.0; digest
+  not recorded), ctx 131072 (AutoRound) and 98304 (NVFP4). MTP off:
+  2026-09-22, the derived `-devai` copies on the vllm-devai backend
+  (image `sha256:0a94e7982b85...`, vLLM 0.28.0), ctx 131072 and
+  118784.
+- **Confounders** (primer Sec. 4.3). Besides MTP, the arms differ in
+  day, image tag, checkpoint copy, NVFP4 context and run order. How
+  large is run-to-run variation? Single bench runs of eight models three
+  days apart differed by -1.6 % to +3.8 % (implied single-run
+  coefficient of variation about 1.3 %, 95 % CI roughly 0.8-2.6 %), and
+  runs of one model differed by up to 13 % when image and context also
+  changed (`llm-tokens-and-speed.md` Sec. 7; primer Sec. 9, "the unit of
+  replication"). That is far less than a 2.5x effect, so the size of the
+  speedup is robust; its second significant digit is not.
+- **What varies.** Without MTP the decode rate hardly depends on the
+  prompt (median 38.9 tok/s AutoRound, 36.4 NVFP4 over the 34 pairs;
+  SD 0.35-0.38 tok/s across prompts). With MTP it does (SD about
+  12 tok/s), because the share of drafted tokens accepted differs from
+  prompt to prompt. vLLM counted 66 % of drafted tokens accepted over
+  these runs, about 3.0 tokens per verification step out of a possible
+  4 (Sec. 5.2).
 
-```
-    "engine_flags": [
-      "--speculative-config",
-      "{\"method\":\"qwen3_5_mtp\",\"num_speculative_tokens\":3}"
-    ]
-```
+Other MTP numbers quoted in this repo, and what they are:
 
-Pros:
-- Zero Go code changes.
-- Zero probe-cache schema changes.
-- Per-model opt-in / opt-out via a single JSON file.
+- **Two different "95 tok/s" figures.** (a) 95.2 tok/s:
+  Qwen3.8-27B-MTP-devai-NVFP4, `::nothink::mtp`, 2026-09-22, the engine
+  median of 6 replicate requests of **one** code prompt (range
+  85.3-97.5; ratio of summed tokens to summed time 93.8). One prompt,
+  one run. (b) 95.13 tok/s: the bench harness's median for the
+  **AutoRound** build with MTP on over the 40 short prompts (2026-09-21,
+  characters/4 token count; the engine median of the same run is
+  101.7 tok/s). CLAUDE.md's "95 tok/s single" for the AutoRound build is
+  (b); the "37 vs 95 tok/s" quoted for the NVFP4 build is (a).
+- **"37 vs 95 tok/s"**: 36.8 is the bench's MTP-off median on the short
+  prompts with reasoning on (characters/4 token count), 95 the code
+  prompt (a). Different prompts, reasoning modes and token counters:
+  an unpaired, confounded comparison that happens to land near the
+  paired result. Quote the table above instead.
+- **Other workloads.** On a code prompt with thinking unintentionally
+  on (router policy bug, 2026-09-22; 3 runs of 5-6 replicates) MTP-on
+  medians were 73.0-78.4 tok/s, about 2.0-2.2x the MTP-off rate *if*
+  that rate is as prompt-independent there as above (an assumption; no
+  MTP-off run of that prompt exists). On the aiagent sentiment workload
+  (2026-09-26, NVFP4 build, temperature 0.7, prompts of about 330
+  tokens) vLLM counted 46 % of drafted tokens accepted. That run differs
+  from the bench prompts in task, temperature, prompt length and build,
+  so the lower rate cannot be attributed to content alone; and
+  acceptance is not speedup: with no MTP-off control, the speedup on
+  that workload was not measured.
+- The picker launches every MTP-capable row with `::mtp`, but the bench
+  never sends `::mtp`: the picker's TPS column is the MTP-off number.
 
-Cons:
-- The drafter must be mounted into the vLLM container under
-  `/models/...`. The compose file's volume mount already covers
-  `VLLM_MODELS_DIR`, so this works as long as the drafter directory
-  sits next to the target inside that tree -- which is where we
-  just downloaded them.
-- The probe's VRAM-fit data was measured *without* the drafter
-  loaded. The drafter adds 150 MB - 900 MB of weight VRAM and some
-  drafter-KV (small thanks to KV sharing). At 24 GB this is usually
-  a no-op for fit but it is unmeasured -- you would learn whether
-  it OOMs at long context only when you tried.
-- The picker shows one row per `(model, backend)`. There's no way
-  to expose an "MTP on / off" toggle in the UI without a code
-  change.
+Reproduce with `scripts/stats/perf_engine_runs.py` (reads
+`/var/cache/devai/logs/devai-vllm.log` and `devai-vllm-devai.log`; the
+paired table, the all-39 sensitivity, per-position and pooled acceptance,
+the output-length comparison of Sec. 6 and the 2.0-2.2x ratios are in its
+output), `perf_phases.py` (the memory cost in Sec. 9.3) and `perf_ts.py`
+(the 46 % sentiment-workload acceptance).
 
-This is the recommended path for an initial trial.
+### 7.2 How the router serves MTP
 
-### 7.2 Catalog + probe + entrypoint -- the clean implementation
+MTP has been supported end to end since 2026-05 (the design notes are
+kept in Appendix A):
 
-A first-class MTP integration touches four places:
+- **Catalog.** A model family's entry in `scripts/model-families.yaml`
+  (an `hf_repos:` entry or a derived row) may carry an `mtp:` block:
+  `method` (`mtp`, `qwen3_5_mtp`, ...), `num_speculative_tokens`, and a
+  `drafter` repo for an external drafter. `generate-catalog.py` copies it
+  into `deploy/models.yaml`. The Qwen3.8 derived rows declare
+  `method: mtp`, `num_speculative_tokens: 3`.
+- **Probe.** For a model with an `mtp:` block the HF prober
+  (`scripts/_probe_hf_common.py`) also launches with MTP and records per
+  cell whether it still fits; a cell that does not records
+  `mtp_fits=false`.
+- **Router.** `peelControlSuffixes` strips `@<ctx>`, `::mtp` /
+  `::nomtp` and `::<reasoning>` from the model name in **any order** (it
+  peels whichever suffix is trailing until none is left).
+  `parseMTPOverride` reads the MTP token. For vLLM the router emits
+  `--speculative-config '<json>'` (`vllmSpeculativeJSON`), for SGLang the
+  `--speculative-*` flags (`sglangSpeculativeArgs`). The MTP setting is
+  tracked per backend (`currentSpec`, compared with `specEqual`), so
+  changing it recreates the container, like a model or `@<ctx>` change.
+  Reasoning on + MTP on an inline-reasoning model is refused with HTTP
+  400 ([vllm #34650](https://github.com/vllm-project/vllm/issues/34650)).
+- **Picker.** `scripts/model-picker.py` (`_has_mtp`) launches every row
+  that supports MTP with `::mtp`; the ON/OFF sub-modal was removed on
+  2026-09-22. An inline-reasoning row that supports MTP is launched
+  `::nothink::mtp`.
 
-1. **`scripts/model-families.yaml`**. Add a new optional sub-block
-   per `hf_repos:` entry recording the matched drafter and the
-   recommended `num_speculative_tokens`. Example:
+Example: `Qwen3.8-27B-MTP-devai-NVFP4::nothink::mtp@118784` -> ctx
+118784, reasoning off, MTP on; the router recreates vllm-devai with
+`--speculative-config` if the running container was launched without
+it.
 
-   ```yaml
-       hf_repos:
-         - repo: nvidia/Gemma-4-26B-A4B-NVFP4
-           mtp:
-             method: mtp
-             drafter: google/gemma-4-26B-A4B-it-assistant
-             num_speculative_tokens: 4
-         - repo: sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP
-           mtp:
-             method: qwen3_5_mtp
-             num_speculative_tokens: 3
-   ```
-
-   `generate-catalog.py` propagates this into `deploy/models.yaml`.
-
-2. **`scripts/probe-vllm-reasoning.py`** (and SGLang counterpart).
-   When a model declares an MTP block, the probe launches vLLM
-   with `--speculative-config` so peak VRAM and `fits=true` reflect
-   the drafter's footprint. Bump cache schema v2 -> v3; add a new
-   per-cell field `mtp_overhead_gb` so downstream consumers can
-   show "fits at 128K with MTP" alongside "fits at 256K without
-   MTP". Probe-cache writers and readers must stay in lock-step --
-   see [`probe-cache-schema-reviewer`](../scripts/probe-vllm-reasoning.py)
-   for the project's standing guidance on schema drift.
-
-3. **`gpu-arbiter/main.go`** entrypoints. Three small additions:
-
-   - A `Speculative *configSpeculative` field on `configModel` and
-     `launchConfig`, parsed from the catalog and the per-request
-     suffix override (Sec. 7.3 below).
-   - In `vllmEntrypoint`, if `lc.Speculative != nil`, emit
-     `--speculative-config '<json>'` after the parser flags and
-     before `RecoveryFlags...`.
-   - In `sglangEntrypoint`, the equivalent: emit
-     `--speculative-algorithm`, `--speculative-num-steps`,
-     `--speculative-num-draft-tokens`, `--speculative-eagle-topk`,
-     and optionally `--speculative-draft-model-path` for external
-     drafters.
-
-   `containerRecreate` already tracks `currentModel` and
-   `currentContext` -- add `currentSpec` so a request that toggles
-   `::mtp` recreates the backend (each change is a recreate trigger
-   the same way `@<ctx>` overrides already are).
-
-4. **`scripts/model-picker.py`**. Add an MTP toggle in the
-   post-select modal, mirroring the existing reasoning ON/OFF
-   sub-modal. The picker emits `::mtp` or `::nomtp` as a suffix
-   on the model name (analog to `::nothink`). (Superseded 2026-09-22:
-   the toggle was removed again; a supporting row always emits
-   `::mtp`, and an inline-reasoning MTP row emits `::nothink::mtp`.)
-
-### 7.3 Per-request override -- the `::mtp` suffix
-
-The router already parses two suffixes on the model name:
-`@<ctx>` (context cap) and `::<reasoning>` (e.g. `::nothink`). A
-third suffix, `::mtp` / `::nomtp`, fits the same chain.
-
-Parsing order needs to be stable. The current order is:
-`parseCtxOverride` first (strips `@<ctx>`), `parseReasoningOverride`
-second (strips `::<reasoning>`). MTP slots in between -- it is more
-specific than the reasoning override and shares the `::` separator.
-The natural rule: any `::<token>` that matches `mtp` or `nomtp` is
-the MTP override; anything else falls through to the reasoning
-parser.
-
-The picker emits, e.g.:
-
-```
-    gemma-4-26B-A4B-NVFP4::mtp@131072
-```
-
-Router parses: `@131072` -> ctx=128K; `::mtp` -> MTP on for this
-session. `containerRecreate` sees `currentSpec` differs, recreates
-the vLLM container with the MTP flag, and serves.
-
-### 7.4 What does NOT need to change
+### 7.3 What does NOT need to change
 
 For completeness, two things stay the same:
 
@@ -630,9 +689,9 @@ For completeness, two things stay the same:
   -- all unchanged. See
   [`openai-api-and-streaming.md`](openai-api-and-streaming.md).
 - **The reasoning / tool parsers.** A model that streams `<think>`
-  tags streams them at the same positions whether MTP is on or
-  off (the verifier is the same model). Same goes for tool calls
-  and structured output. There is **one known issue** in vLLM
+  tags emits the same kinds of tags whether MTP is on or off (the
+  verifier is the same model), so the parsers need no change. Same
+  goes for tool calls and structured output. There is **one known issue** in vLLM
   combining MTP with structured output + reasoning mode -- see
   [vllm #34650](https://github.com/vllm-project/vllm/issues/34650);
   the `</think>` token detection drops under MTP. Tracked, not
@@ -662,11 +721,15 @@ adaptation in HuggingFace Transformers
 acceptance and lowers by 1 on rejection; vLLM does not (yet) ship
 the adaptive scheduler -- you pick K statically per model.
 
-For first probing on this project's RTX PRO 4000 Blackwell:
+For first probing on this project's RTX PRO 4000 Blackwell (2026-05
+plan):
 - `Gemma-4-26B-A4B-NVFP4` with assistant: start at `K=4`.
-- `Qwen3.6-27B-Text-NVFP4-MTP`: start at `K=3` (the model card's
-  measured-best value).
+- `Qwen3.6-27B-Text-NVFP4-MTP`: start at `K=3` (the value the model
+  card reports as best; external).
 - Re-probe at K=2 and K=6 if first results are interesting.
+
+The Qwen3.8-27B builds measured in Sec. 7.1 ran at K=3; no other K was
+measured here.
 
 ---
 
@@ -683,25 +746,51 @@ forward-pass cost for nothing. Adaptive K schedules help; a
 "detect and disable" fallback (drop K to 0 after N consecutive
 rejections) is on the SGLang roadmap and not yet shipped.
 
+Measured here (one run each): vLLM counted 66 % of drafted tokens
+accepted on the bench's short English prompts and 46 % on the aiagent
+sentiment workload (Sec. 7.1). This does not measure what content alone
+does: the two runs also differ in temperature (0 vs 0.7), prompt length
+(tens vs about 330 tokens), task and build. And acceptance is not
+speedup; the sentiment workload's speedup was not measured.
+
 ### 9.2 Quantization mismatch can degrade acceptance
 
 A drafter trained against the BF16 target sees slightly different
 logits when paired with an NVFP4 target. Output remains
 correct-by-construction (Sec. 6), but acceptance can drop several
-percentage points. The right answer is to (re)train the drafter
+percentage points (expected from how drafters are trained; not
+measured here). The right answer is to (re)train the drafter
 on the *quantised* target's logits -- which is exactly what
 production EAGLE3 recipes prescribe. Until then, expect Gemma 4
 + NVFP4 to show somewhat lower acceptance than Gemma 4 + BF16.
 
-### 9.3 KV-cache pressure increases
+### 9.3 MTP costs memory: more weights, a smaller KV pool
 
-The drafter does fewer FLOPs but consumes some KV slots. For
-Gemma 4 the drafter *shares* the target's KV blocks, which is a
-massive saving, but you still pay for the verifier's K extra
-positions per round -- those K positions need K KV entries each
-layer. For decode at 128K context this is sub-1 % of pool capacity;
-for batched serving with many sequences in flight it can become a
-real constraint on `--max-num-seqs`.
+The drafter does fewer FLOPs, but it needs memory. For Gemma 4 the
+drafter *shares* the target's KV blocks, which is a large saving. A
+built-in head is not free either. Measured for the prepared
+Qwen3.8-27B NVFP4 build on vllm-devai (vLLM log, 2026-09-22; same
+image, `--gpu-memory-utilization` 0.96 and `--max-model-len` 118784 in
+both arms, graphs compiled at launch; 7 launches with MTP on and 3
+off, each arm giving the same values every time):
+
+| | Weights loaded | KV memory available | KV pool |
+|---|---|---|---|
+| MTP off | 15.53 GiB | 4.99 GiB | 156,335 tokens |
+| MTP on | 16.13 GiB | 4.28 GiB | 118,784 tokens |
+
+MTP costs 0.60 GiB of weights and about 13 % more KV bytes per cached
+token (38.7 vs 34.3 KB: KV memory divided by pool tokens), which fits
+the MTP layer keeping KV of its own; the log does not break the
+difference down. Together they shrink the KV pool by 24 %. The pool is
+what bounds the context: this build's 118,784-token context is the
+largest that fits with MTP on (found with an exact-context probe),
+while the same settings without MTP leave a pool of 156,335 tokens.
+With several sequences in flight the same pool also bounds
+`--max-num-seqs`. The verifier's K extra positions per round are a
+further, much smaller cost (derived: 3 positions per sequence).
+Reproduce with `scripts/stats/perf_phases.py`
+(`mtp_memory_cost_nvfp4_devai_2026_09_22`).
 
 ### 9.4 Streaming with `reasoning_parser` is fragile
 
@@ -720,61 +809,60 @@ hardware.**
 
 ### 9.6 Cold-start adds drafter load time
 
-For Gemma 4 the drafter is ~150 MB - 900 MB BF16, ~0.5-2 s of
-extra load time on this card -- a rounding error against the
-~30-60 s NVFP4 cold-start path
-([`nvfp4-coldstart.md`](nvfp4-coldstart.md) Sec. 2). For DeepSeek
-V3 / Qwen3.6 built-in heads the drafter weights are already in
-the target's checkpoint and there is no extra load step.
+For Gemma 4 the drafter is ~150 MB - 900 MB BF16; at the few GB/s
+the weight-load phase achieves on this card (1.5-4.9 s for 14.5-16.1
+GiB over all 37 vllm-devai launches,
+[`nvfp4-coldstart.md`](nvfp4-coldstart.md) Sec. 1) that is well under
+a second of extra load (derived, not measured). For built-in heads
+the drafter weights are already in the target's checkpoint. Measured
+for the Qwen3.8-27B NVFP4 build on vllm-devai (vLLM log, 2026-09-22):
+model loading took 7.9-8.8 s with MTP on (7 launches) against
+about 7.5 s off (3 launches), and MTP added one extra torch.compile
+range of 3.2-3.4 s (`perf_phases.py`). Both are small next to the
+whole cold start: router launch-to-ready medians range from 40-45 s
+(8B-class NVFP4, 2026-04/05) to 125-271 s (these 27B builds, depending
+on which caches were warm), see `nvfp4-coldstart.md` Sec. 1.
 
 ---
 
 ## 10. Practical recipe
 
-Once the router changes from Sec. 7 land (or with the
-`RecoveryFlags` minimum path), the fastest way to evaluate MTP on
-this project:
+Using MTP on this project needs no configuration beyond the catalog:
 
 ```
-    # 1. Make sure drafter is on disk next to the target
-    ls /var/cache/devai/vllm/Gemma-4-26B-A4B-NVFP4
-    ls /var/cache/devai/vllm/gemma-4-26B-A4B-it-assistant
+    # 1. A row whose catalog entry has an `mtp:` block (and whose probe
+    #    cell did not record mtp_fits=false) is always launched by the
+    #    picker as <name>::mtp@<ctx>; the router recreates the backend
+    #    with --speculative-config.
+    devai-agent            # pick the row; MTP is on
 
-    # 2. Add an entry to deploy/recovery-flags.json:
-    #    {
-    #      "Gemma-4-26B-A4B-NVFP4": {
-    #        "engine_flags": [
-    #          "--speculative-config",
-    #          "{\"method\":\"mtp\",\"model\":\"/models/gemma-4-26B-A4B-it-assistant\",\"num_speculative_tokens\":4}"
-    #        ]
-    #      }
-    #    }
-
-    # 3. Re-probe to measure VRAM with the drafter loaded:
-    make probe-vllm
-
-    # 4. Launch the agent at a chosen context:
-    devai-agent --model Gemma-4-26B-A4B-NVFP4@32768
-
-    # 5. Compare decode tok/s against the same model WITHOUT
-    #    recovery-flags entry (i.e. plain serving). Difference =
-    #    MTP speedup on real workload.
+    # 2. Or address it directly:
+    #    model = "Qwen3.8-27B-MTP-devai-NVFP4::nothink::mtp@118784"
+    #    (inline-reasoning rows need ::nothink with ::mtp, see Sec. 7.2)
 ```
 
-For the built-in MTP case (Qwen3.6):
+To **measure** the speedup for a new model or workload, use a paired
+design rather than comparing two unrelated numbers
+([statistics-primer.md](statistics-primer.md) Sec. 9):
 
-```
-    # Same recipe, but no drafter directory needed -- the MTP head
-    # is inside the same checkpoint:
-    {
-      "Qwen3.6-27B-Text-NVFP4-MTP": {
-        "engine_flags": [
-          "--speculative-config",
-          "{\"method\":\"qwen3_5_mtp\",\"num_speculative_tokens\":3}"
-        ]
-      }
-    }
-```
+- the same prompt list in both arms (`<name>@<ctx>` vs
+  `<name>::mtp@<ctx>`), temperature 0 for the rate itself and, if the
+  workload samples, a second pass at its own temperature (acceptance
+  depends on sampling and content);
+- engine-counted tokens (request `stream_options.include_usage`, or
+  read vLLM's per-request `Request finished` log lines); discard the
+  first request after each launch;
+- fixed `max_tokens` large enough that most requests stop on length;
+- several launches per arm, alternated: A B B A gives two per arm,
+  A B B A A B B A four, so drift and launch-to-launch variation are not
+  confounded with MTP;
+- report the geometric mean of per-prompt speedups with a bootstrap
+  interval, and say what it covers.
+
+`scripts/stats/perf_engine_runs.py` performs this analysis on the
+2026-09-21/22 logs (Sec. 7.1). For an external drafter that the catalog
+does not describe, the `RecoveryFlags` JSON in Appendix A.1 still works
+as an operator override.
 
 ---
 
@@ -787,26 +875,33 @@ For the built-in MTP case (Qwen3.6):
   verifying them in one big-model forward pass. Acceptance is
   guaranteed-correct by rejection sampling.
 - Two architectures in 2026: **external drafter** (Gemma 4, EAGLE,
-  Medusa) and **built-in MTP head** (DeepSeek V3, Qwen3.6). The
-  verification math is identical; the difference is where the
+  Medusa) and **built-in MTP head** (DeepSeek V3, Qwen3.6, Qwen3.8).
+  The verification math is identical; the difference is where the
   drafter's weights live.
-- For this project's 24 GB RTX PRO 4000 Blackwell, the two prime
-  candidates are **`nvidia/Gemma-4-26B-A4B-NVFP4` +
-  `google/gemma-4-26B-A4B-it-assistant`** (lossless 2-3x speedup
-  expected) and **`sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP`**
-  (self-contained, built-in MTP head). Both downloaded;
-  `nvidia/Gemma-4-31B-IT-NVFP4` is the stretch candidate (tight
-  on 24 GB at long context).
-- The router does **not** currently support MTP. The cheapest path
-  to evaluate is to drop the `--speculative-config` JSON into the
-  existing `deploy/recovery-flags.json` per-model bag; the clean
-  implementation adds a first-class `Speculative` field on
-  `configModel` / `launchConfig`, an `::mtp` suffix override
-  parser, and a probe-cache schema bump to record drafter VRAM
-  overhead.
-- "Lossless" is real: the output *distribution* is bit-identical
-  to the unaccelerated model. Specific samples differ when
-  temperature > 0 due to RNG ordering, but no quality is lost.
+- Vendors and papers report about 1.7-3x (external). On this
+  project's RTX PRO 4000 Blackwell, the Qwen3.8-27B builds with their
+  built-in head (K=3) decoded **2.52x** (AutoRound, 95 % CI 2.42-2.61)
+  and **2.60x** (NVFP4, 2.50-2.70) faster than without MTP: paired
+  over 34 prompts of the bench's fixed set of short prompts at
+  temperature 0, one run per arm, per-prompt range 2.0-3.2x; 2.59x and
+  2.68x with all 39 prompts (Sec. 7.1). vLLM accepted 66 % of drafted
+  tokens on those prompts; on the aiagent sentiment workload (other
+  temperature, prompt length and build) it accepted 46 %, and the
+  speedup there was not measured.
+- MTP costs memory: on the prepared Qwen3.8-27B NVFP4 build, 0.60 GiB
+  more weights and a 24 % smaller KV pool, which limits the servable
+  context (Sec. 9.3).
+- The router supports MTP since 2026-05: an `::mtp` suffix, a catalog
+  `mtp:` block, `--speculative-config` emission and a recreate when the
+  MTP setting changes (Sec. 7.2). The picker launches every MTP-capable
+  row with `::mtp`; the bench's TPS column is still measured without
+  MTP.
+- "Lossless" holds for the output *distribution* (Sec. 6). Specific
+  samples differ when temperature > 0 due to RNG ordering, and at
+  temperature 0 outputs can still change on a GPU: here at least 3
+  (AutoRound) and 6 (NVFP4) of 34 outputs had a different length with
+  MTP on, out of the 7 pairs in which length could show it; the rest
+  could not be checked, and the cause is not isolated.
 
 ---
 
@@ -906,11 +1001,189 @@ For the built-in MTP case (Qwen3.6):
   proves.
 - [`router.md`](router.md) -- the request rewrite chain (override
   parsing -> reasoning policy -> tool_choice promotion -> tool
-  stripping -> ctx injection) which an MTP-aware router would
-  extend with an `::mtp`/`::nomtp` override parser.
+  stripping -> ctx injection), including the `::mtp` / `::nomtp`
+  override parser.
 - [`backends.md`](backends.md) -- backend lifecycle, where any
   `--speculative-config` flag must be injected before container
   start (a backend recreate is required to change the MTP
   configuration, same as for `currentModel` and `currentContext`).
-- [`bench-results.md`](bench-results.md) -- the baseline tok/s
-  numbers MTP would be compared against.
+- [`bench-results.md`](bench-results.md) -- the bench's MTP-off tok/s
+  numbers (dated single runs, characters/4 token counts).
+- [statistics-primer.md](statistics-primer.md) Sec. 4.3 (confounding),
+  Sec. 8 (quantiles and the median interval), Sec. 9 (per-request
+  rates, what counts as a token, ratios and the bootstrap, drift and
+  replication), Sec. 14 (reporting layout).
+- `scripts/stats/perf_engine_runs.py` -- reproduces Sec. 7.1 from the
+  persisted vLLM logs; `scripts/stats/perf_phases.py` -- the launch
+  phases and the memory cost in Sec. 9.3; `scripts/stats/perf_ts.py` --
+  the sentiment-workload acceptance.
+
+---
+
+## Appendix A. 2026-05 design notes
+
+These are the design notes written before MTP support shipped in
+2026-05, kept for history. Where they describe something as missing or
+planned, Sec. 7.2 describes what exists. The `RecoveryFlags` route in
+A.1 still works as an operator override for a drafter the catalog does
+not describe.
+
+### A.1 Minimum-viable: ride the `RecoveryFlags` escape hatch
+
+`gpu-arbiter/main.go` already has a per-model CLI-args bag called
+`RecoveryFlags`, sourced from `deploy/recovery-flags.json` and
+appended verbatim to the backend container's entrypoint at launch.
+Today that bag carries things like `--enforce-eager` for models
+whose CUDA-graph workspace pushes them past 24 GB.
+
+Speculative-decoding flags drop straight in. For
+`Gemma-4-26B-A4B-NVFP4`, the recovery JSON entry would carry:
+
+```
+    "engine_flags": [
+      "--speculative-config",
+      "{\"method\":\"mtp\",\"model\":\"/models/gemma-4-26B-A4B-it-assistant\",\"num_speculative_tokens\":4}"
+    ]
+```
+
+For `Qwen3.6-27B-Text-NVFP4-MTP` (built-in MTP head):
+
+```
+    "engine_flags": [
+      "--speculative-config",
+      "{\"method\":\"qwen3_5_mtp\",\"num_speculative_tokens\":3}"
+    ]
+```
+
+Pros:
+- Zero Go code changes.
+- Zero probe-cache schema changes.
+- Per-model opt-in / opt-out via a single JSON file.
+
+Cons:
+- The drafter must be mounted into the vLLM container under
+  `/models/...`. The compose file's volume mount already covers
+  `VLLM_MODELS_DIR`, so this works as long as the drafter directory
+  sits next to the target inside that tree -- which is where we
+  just downloaded them.
+- The probe's VRAM-fit data was measured *without* the drafter
+  loaded. The drafter adds 150 MB - 900 MB of weight VRAM and some
+  drafter-KV (small thanks to KV sharing). At 24 GB this is usually
+  a no-op for fit but it is unmeasured -- you would learn whether
+  it OOMs at long context only when you tried.
+- The picker shows one row per `(model, backend)`. There's no way
+  to expose an "MTP on / off" toggle in the UI without a code
+  change.
+
+This is the recommended path for an initial trial.
+
+### A.2 Catalog + probe + entrypoint -- the clean implementation
+
+A first-class MTP integration touches four places:
+
+1. **`scripts/model-families.yaml`**. Add a new optional sub-block
+   per `hf_repos:` entry recording the matched drafter and the
+   recommended `num_speculative_tokens`. Example:
+
+   ```yaml
+       hf_repos:
+         - repo: nvidia/Gemma-4-26B-A4B-NVFP4
+           mtp:
+             method: mtp
+             drafter: google/gemma-4-26B-A4B-it-assistant
+             num_speculative_tokens: 4
+         - repo: sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP
+           mtp:
+             method: qwen3_5_mtp
+             num_speculative_tokens: 3
+   ```
+
+   `generate-catalog.py` propagates this into `deploy/models.yaml`.
+
+2. **`scripts/probe-vllm-reasoning.py`** (and SGLang counterpart).
+   When a model declares an MTP block, the probe launches vLLM
+   with `--speculative-config` so peak VRAM and `fits=true` reflect
+   the drafter's footprint. Bump cache schema v2 -> v3; add a new
+   per-cell field `mtp_overhead_gb` so downstream consumers can
+   show "fits at 128K with MTP" alongside "fits at 256K without
+   MTP". Probe-cache writers and readers must stay in lock-step --
+   see [`probe-cache-schema-reviewer`](../scripts/probe-vllm-reasoning.py)
+   for the project's standing guidance on schema drift.
+
+3. **`gpu-arbiter/main.go`** entrypoints. Three small additions:
+
+   - A `Speculative *configSpeculative` field on `configModel` and
+     `launchConfig`, parsed from the catalog and the per-request
+     suffix override (A.3 below).
+   - In `vllmEntrypoint`, if `lc.Speculative != nil`, emit
+     `--speculative-config '<json>'` after the parser flags and
+     before `RecoveryFlags...`.
+   - In `sglangEntrypoint`, the equivalent: emit
+     `--speculative-algorithm`, `--speculative-num-steps`,
+     `--speculative-num-draft-tokens`, `--speculative-eagle-topk`,
+     and optionally `--speculative-draft-model-path` for external
+     drafters.
+
+   `containerRecreate` already tracks `currentModel` and
+   `currentContext` -- add `currentSpec` so a request that toggles
+   `::mtp` recreates the backend (each change is a recreate trigger
+   the same way `@<ctx>` overrides already are).
+
+4. **`scripts/model-picker.py`**. Add an MTP toggle in the
+   post-select modal, mirroring the existing reasoning ON/OFF
+   sub-modal. The picker emits `::mtp` or `::nomtp` as a suffix
+   on the model name (analog to `::nothink`). (Superseded 2026-09-22:
+   the toggle was removed again; a supporting row always emits
+   `::mtp`, and an inline-reasoning MTP row emits `::nothink::mtp`.)
+
+### A.3 Per-request override -- the `::mtp` suffix
+
+The router already parses two suffixes on the model name:
+`@<ctx>` (context cap) and `::<reasoning>` (e.g. `::nothink`). A
+third suffix, `::mtp` / `::nomtp`, fits the same chain.
+
+Parsing order needs to be stable. The order at the time was:
+`parseCtxOverride` first (strips `@<ctx>`), `parseReasoningOverride`
+second (strips `::<reasoning>`). MTP slots in between -- it is more
+specific than the reasoning override and shares the `::` separator.
+The natural rule: any `::<token>` that matches `mtp` or `nomtp` is
+the MTP override; anything else falls through to the reasoning
+parser. (Superseded: the shipped `peelControlSuffixes` strips the three
+suffixes in any order, because some clients append `::<reasoning>`
+after `@<ctx>`; see Sec. 7.2 and `router.md`.)
+
+The picker emits, e.g.:
+
+```
+    gemma-4-26B-A4B-NVFP4::mtp@131072
+```
+
+Router parses: `@131072` -> ctx=128K; `::mtp` -> MTP on for this
+session. `containerRecreate` sees `currentSpec` differs, recreates
+the vLLM container with the MTP flag, and serves.
+
+---
+
+---
+
+## Changes to this page (2026-09-27)
+
+Earlier versions of this page stated, and this version corrects:
+
+- a general "2-3x decode speedup" (external figures are 1.7-3x; what
+  was measured here is 2.52x and 2.60x on one fixed set of short
+  prompts, Sec. 7.1), and bit-exact identical output at temperature 0
+  (not guaranteed on a GPU; at least 3 and 6 of 34 outputs changed
+  here, Sec. 6);
+- an MTP memory cost that was "small (~1 GB)" or "sub-1 % of pool
+  capacity" (the engine log shows +0.60 GiB of weights and a KV pool
+  24 % smaller, Sec. 9.3);
+- "3-4 mean accepted tokens per draft pass" from per-position rates
+  whose definition was not stated (Sec. 5.2), and the config key
+  `mtp_num_layers` (it is `mtp_num_hidden_layers`);
+- a drafter load time compared against a 30-60 s cold start (the 27B
+  builds here take 125-271 s; Sec. 9.6).
+
+The 2026-05 design notes that used to open Sec. 7 are now Appendix A;
+Sec. 7.2 describes what shipped, including the order-independent
+suffix parsing.

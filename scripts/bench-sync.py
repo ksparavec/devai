@@ -37,8 +37,10 @@ import argparse
 import importlib.util
 import json
 import os
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -261,15 +263,107 @@ def _run(cmd: list[str]) -> int:
     return subprocess.call(cmd, cwd=str(REPO_ROOT))
 
 
-def execute(plan: dict, *, max_targets: int, tasks: tuple[str, ...],
-            record_drops: bool = False) -> int:
-    """Bench the queued targets, grouped by backend.
+# Order the runner itself uses within a model.
+TASK_ORDER = ("leak", "gsm8k", "humaneval", "humaneval_plus", "mmlu_pro", "gpqa", "tools", "longctx")
+# Owner's rule (2026-09-28): every task is stopped after this long, whatever
+# it has done; its partial log is then scored on the unbroken prefix.
+TASK_DEADLINE_S = int(os.environ.get("BENCH_TASK_DEADLINE_S", "1800"))
+INSPECT_LOG_DIR = Path("/var/cache/devai/bench/inspect-logs")
+LOG_MARKER = {"gsm8k": "_gsm8k-task_", "humaneval": "_humaneval-task_",
+              "humaneval_plus": "_humaneval-plus-task_", "mmlu_pro": "_mmlu-pro-task_",
+              "gpqa": "_gpqa-task_", "tools": "_tools-use-task_"}
 
-    Grouping matters: each backend switch costs a full model load, so a
-    mixed queue interleaved by model would thrash the GPU. One `make
-    bench-<backend>` per backend, filtered to the queued rows, keeps that
-    to one switch per backend.
+
+def _load_clean_slate():
+    spec = importlib.util.spec_from_file_location(
+        "bench_clean_slate", REPO_ROOT / "scripts" / "bench" / "clean_slate.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _cache_row(key: str) -> dict:
+    try:
+        row = json.loads(BENCH_CACHE.read_text()).get(key)
+    except (OSError, ValueError):
+        return {}
+    return row if isinstance(row, dict) else {}
+
+
+def tasks_to_run(target: dict, tasks: tuple[str, ...], runner) -> list[str]:
+    """In the runner's order: every task for a stale row (it is forced), the
+    ones the row lacks otherwise."""
+    wanted = [t for t in TASK_ORDER if t in tasks]
+    if target.get("class") in ("stale_env", "stale_image"):
+        return wanted
+    have = _row_tasks(_cache_row(target["key"]), runner)
+    return [t for t in wanted if t not in have]
+
+
+def partial_log(task: str, started: float) -> Path | None:
+    """The inspect log a stopped task was writing: newest of its kind since it started."""
+    marker = LOG_MARKER.get(task)
+    if not marker or not INSPECT_LOG_DIR.is_dir():
+        return None
+    logs = [f for f in INSPECT_LOG_DIR.glob("*.eval")
+            if marker in f.name and f.stat().st_mtime >= started - 5]
+    return max(logs, key=lambda f: f.stat().st_mtime) if logs else None
+
+
+def run_task(target: dict, task: str, *, force: bool, deadline_s: int, cs, runner) -> str:
+    """One task of one model as its own bench run, stopped at its deadline.
+
+    Returns "ok", "failed", or "deadline". At the deadline the runner gets
+    SIGINT (inspect writes a `cancelled` log with every finished question),
+    SIGKILL after 30 s, and the run's process group (make, podman client) is
+    killed; the partial log is then scored by harvest_truncated.py.
     """
+    backend = target["backend"]
+    cmd = ["make", f"bench-{backend}",
+           f"BENCH_REPO={_escape(probe_key(target['key']))}", f"BENCH_TASKS={task}"]
+    if force:
+        cmd.append("BENCH_FORCE=1")
+    print(f"\n$ {' '.join(cmd)}   (deadline {deadline_s} s)", flush=True)
+    started = time.time()
+    p = subprocess.Popen(cmd, cwd=str(REPO_ROOT), start_new_session=True)
+    try:
+        return "ok" if p.wait(timeout=deadline_s) == 0 else "failed"
+    except subprocess.TimeoutExpired:
+        pass
+    print(f"  deadline: {task} of {target['alias']} stopped after {deadline_s} s", flush=True)
+    left = cs.stop_bench_runners(grace_s=30.0)
+    try:
+        os.killpg(p.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    p.wait()
+    if left:
+        raise cs.CleanSlateError(f"bench_runner processes survived SIGKILL: {left}")
+    log = partial_log(task, started)
+    if log is None:
+        print(f"  no inspect log to score for {task} (nothing written)", flush=True)
+        return "deadline"
+    args = (f"--log {log} --key {target['key']} --model {target['alias']} "
+            f"--backend {backend} --ctx {int(target.get('ctx') or 0)} --task {task} "
+            f"--planned-n {runner.planned_n(task)} --deadline-s {deadline_s}")
+    _run(["make", "bench-harvest", f"HARVEST_ARGS={args}"])
+    return "deadline"
+
+
+def execute(plan: dict, *, max_targets: int, tasks: tuple[str, ...],
+            record_drops: bool = False, deadline_s: int = TASK_DEADLINE_S,
+            runner=None, cs=None) -> int:
+    """Bench the queued targets: per model a clean slate, per task a deadline.
+
+    Owner's rules (2026-09-28): before EVERY model, any other bench run is
+    stopped, every inference engine is stopped and the GPU is verified empty
+    with the host's ps and nvidia-smi (scripts/bench/clean_slate.py); no
+    clean slate, no bench. Then each task runs as its own bench run and is
+    stopped after deadline_s whatever it has done. A drop flag on the row
+    ends the model's remaining tasks.
+    """
+    runner = runner or _load_bench_runner()
+    cs = cs or _load_clean_slate()
     queue = needs_bench(plan)
     if not queue:
         print("\nnothing to bench.")
@@ -280,40 +374,37 @@ def execute(plan: dict, *, max_targets: int, tasks: tuple[str, ...],
         print(f"\nbudget: benching {max_targets}, leaving {dropped} for a "
               f"later run (BENCH_MAX_TARGETS)")
 
-    # Group by (backend, force). Backend grouping keeps GPU switches to
-    # one per backend. The force split matters for correctness: update_row
-    # is a pure MERGE, so re-benching a stale row without --force
-    # overwrites only the tasks that actually re-ran and leaves the rest
-    # of the row's metrics behind -- producing a row that is half old
-    # host-env/image and half new, with a single fresh stamp claiming all
-    # of it. `new` and `incomplete` rows have nothing stale to merge into
-    # and must NOT be forced, or every partially-benched row restarts from
-    # scratch and the resumability the planner exists for is lost.
+    # Stale rows are re-benched with BENCH_FORCE=1, every task: update_row
+    # is a pure MERGE, so a partial re-run would leave a row half old
+    # host-env/image and half new under one fresh stamp. new/incomplete
+    # rows run only what they lack, or resumability is lost.
     _FORCE_CLASSES = ("stale_env", "stale_image")
-    by_group: dict[tuple[str, bool], list[dict]] = {}
-    for r in queue:
-        force = r.get("class") in _FORCE_CLASSES
-        by_group.setdefault((r["backend"], force), []).append(r)
-
     rc = 0
-    for (backend, force), rows in sorted(by_group.items()):
-        # BENCH_REPO is a regex over the PROBE-cache key, so the bench
-        # key's ::<backend>::<ctx> suffix has to come off first -- see
-        # probe_key(). An alternation of the de-suffixed keys reproduces
-        # this selection inside the runner. Duplicates collapse because
-        # two ctx tiers of one model share a probe key.
-        pattern = "|".join(sorted({_escape(probe_key(r["key"])) for r in rows}))
-        cmd = ["make", f"bench-{backend}",
-               f"BENCH_REPO={pattern}",
-               f"BENCH_TASKS={','.join(tasks)}"]
-        if force:
-            cmd.append("BENCH_FORCE=1")
-            print(f"  ({backend}: {len(rows)} stale row(s) -> BENCH_FORCE=1, "
-                  f"so the whole row is re-measured rather than merged)")
-        step = _run(cmd)
-        if step != 0:
-            print(f"\nstep failed (rc={step}): {' '.join(cmd)}", file=sys.stderr)
-            rc = step
+    for target in sorted(queue, key=lambda r: BACKENDS.index(r["backend"])
+                         if r["backend"] in BACKENDS else len(BACKENDS)):
+        todo = tasks_to_run(target, tasks, runner)
+        if not todo:
+            continue
+        print(f"\n=== {target['alias']} [{target['backend']}] @ {target.get('ctx')}: "
+              f"{', '.join(todo)}", flush=True)
+        try:
+            cs.clean_slate()
+        except (cs.CleanSlateError, subprocess.CalledProcessError, OSError) as e:
+            print(f"\nno clean slate, not benching: {e}", file=sys.stderr)
+            return 4
+        force = target.get("class") in _FORCE_CLASSES
+        for task in todo:
+            try:
+                outcome = run_task(target, task, force=force, deadline_s=deadline_s,
+                                   cs=cs, runner=runner)
+            except cs.CleanSlateError as e:
+                print(f"\ncould not stop a task: {e}", file=sys.stderr)
+                return 4
+            if outcome == "failed":
+                rc = rc or 1
+            if _cache_row(target["key"]).get("drop_recommendation"):
+                print(f"  drop flag on {target['alias']}: skipping its remaining tasks")
+                break
 
     if record_drops:
         rc_drop = _record_drops(plan)

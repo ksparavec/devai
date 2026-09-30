@@ -92,6 +92,23 @@ def _pick_score(tasks: dict, prefix: str, key: str) -> float | None:
     return None
 
 
+def _pick_timeouts(tasks: dict, prefix: str) -> int:
+    """``n_timeouts`` of the entry ``_pick_score`` reads (0 when absent:
+    rows benched before 2026-09-27 did not record time-outs)."""
+    for tname, tdata in tasks.items():
+        if tname.startswith(prefix) and isinstance(tdata, dict):
+            return int(tdata.get("n_timeouts") or 0)
+    return 0
+
+
+def _fmt_score(tasks: dict, prefix: str, key: str) -> str:
+    """Score cell; a task with time-outs shows them, since a time-out is
+    scored as a wrong answer and the score alone cannot tell them apart."""
+    cell = _fmt(_pick_score(tasks, prefix, key))
+    t = _pick_timeouts(tasks, prefix)
+    return f"{cell} (t={t})" if t else cell
+
+
 def _aggregate(row: dict) -> float | None:
     """Composite score = unweighted mean of available correctness
     scores. None when a row has no scored tasks (latency-only run).
@@ -121,9 +138,12 @@ def _fmt(v: object, suffix: str = "") -> str:
 
 def _kv_pressure_pct(peak_vram_gb: float | None, host_vram_gb: float) -> float | None:
     """``peak_vram_gb / host_vram_gb`` as a percentage, or None if peak
-    is missing. The bench's "KV-pressure observations" section in
-    ``docs/bench-results.md`` calls 95 % the threshold where KV paging
-    starts to bite -- this column makes that visible per row.
+    is missing. How full the card got -- NOT a measure of KV pressure:
+    vLLM and SGLang preallocate their pool at launch, so this mostly
+    reflects --gpu-memory-utilization / --mem-fraction-static. The "95 %
+    threshold where KV paging starts to bite" this column used to be
+    read against had no data behind it and is withdrawn
+    (docs/bench-results.md "KV-pressure observations").
     """
     if peak_vram_gb is None or host_vram_gb <= 0:
         return None
@@ -219,7 +239,7 @@ def render(cache: dict, host_vram_gb: float = DEFAULT_HOST_VRAM_GB) -> str:
     lines.append(
         "| Model | Backend | CTX | Env | Agg | GSM8K | HumanEval | "
         "HumanEval+ | Tools | "
-        "Leak rate | TTFT first | TTFT p50 | TPS | Peak VRAM | KV % |"
+        "Leak rate | TTFT first | TTFT p50 | TPS | Peak VRAM | VRAM % |"
     )
     lines.append(
         "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
@@ -228,24 +248,24 @@ def render(cache: dict, host_vram_gb: float = DEFAULT_HOST_VRAM_GB) -> str:
         row = r["row"]
         tasks = row.get("tasks") or {}
         metrics = row.get("metrics") or {}
-        gsm = _pick_score(tasks, "gsm8k_", "score")
-        he = _pick_score(tasks, "humaneval_subset_", "pass@1")
-        hep = _pick_score(tasks, "humaneval_plus_subset_", "pass@1")
-        tools = _pick_score(tasks, "tools_use", "score")
+        gsm = _fmt_score(tasks, "gsm8k_", "score")
+        he = _fmt_score(tasks, "humaneval_subset_", "pass@1")
+        hep = _fmt_score(tasks, "humaneval_plus_subset_", "pass@1")
+        tools = _fmt_score(tasks, "tools_use", "score")
         leak = (tasks.get("leak_probe") or {}).get("leak_rate")
         ttft_first = metrics.get("ttft_ms_first")
         ttft_p50 = metrics.get("ttft_ms_steady_p50")
         tps = metrics.get("tps_sustained_p50")
         peak = metrics.get("peak_vram_gb")
         kv_pct = _kv_pressure_pct(peak, host_vram_gb)
-        # Round KV % to one decimal so the column stays narrow.
+        # Round VRAM % to one decimal so the column stays narrow.
         kv_str = "-" if kv_pct is None else f"{kv_pct:.1f}%"
         env_id = _env_label(row)
         lines.append(
             f"| {r['model']} | {r['backend']} | {_ctx_label(r['ctx'])} | "
             f"{env_id} | {_fmt(r['agg'])} | "
-            f"{_fmt(gsm)} | {_fmt(he)} | {_fmt(hep)} | "
-            f"{_fmt(tools)} | {_fmt(leak)} | "
+            f"{gsm} | {he} | {hep} | "
+            f"{tools} | {_fmt(leak)} | "
             f"{_fmt(ttft_first, ' ms')} | {_fmt(ttft_p50, ' ms')} | "
             f"{_fmt(tps, ' tok/s')} | {_fmt(peak, ' GB')} | {kv_str} |"
         )
@@ -257,10 +277,19 @@ def render(cache: dict, host_vram_gb: float = DEFAULT_HOST_VRAM_GB) -> str:
     )
     lines.append("")
     lines.append(
-        f"_KV % = `peak_vram_gb / {host_vram_gb:g}` (host VRAM cap, "
-        f"override via `GPU_MEMORY_GB`). 95 % is the rule-of-thumb "
-        f"threshold where KV paging starts to bite -- see "
-        f"`docs/bench-results.md` > 'KV-pressure observations'._"
+        "_`(t=N)`: N samples hit the per-sample working-time limit and are "
+        "scored as wrong answers; the score with them counted right is an "
+        "upper bound. Rows benched before 2026-09-27 did not record "
+        "time-outs (and their limit also counted queueing)._"
+    )
+    lines.append("")
+    lines.append(
+        f"_VRAM % = `peak_vram_gb / {host_vram_gb:g}` (host VRAM cap, "
+        f"override via `GPU_MEMORY_GB`): how full the card got, not KV "
+        f"pressure -- vLLM and SGLang preallocate their pool at launch. No "
+        f"threshold is implied; the '95 % where KV paging starts to bite' "
+        f"once quoted here had no data behind it and is withdrawn (see "
+        f"`docs/bench-results.md` > 'KV-pressure observations')._"
     )
     lines.extend(_sampling_footnote(cache))
     return "\n".join(lines) + "\n"
@@ -273,7 +302,7 @@ def main() -> None:
         "--host-vram-gb",
         type=float,
         default=DEFAULT_HOST_VRAM_GB,
-        help="host VRAM cap used to compute the KV %% column",
+        help="host VRAM cap used to compute the VRAM %% column",
     )
     args = ap.parse_args()
     cache = load_cache(args.cache)

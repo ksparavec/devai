@@ -589,17 +589,21 @@ def sampling_record(alias: str, overrides: dict | None = None) -> dict:
     }
 
 
-def _sampling_config(alias: str = ""):
-    """GenerateConfig pinning sampling for the scored tasks.
+def sampling_kwargs(alias: str = "") -> dict:
+    """Sampling for the scored tasks, as inspect_ai.eval() KEYWORDS.
 
-    Imported lazily, like inspect_eval itself, so the module stays
-    importable without inspect_ai installed (the unit tests rely on
-    that).
+    eval() takes generation settings as plain keywords (its **kwargs are
+    GenerateConfigArgs). It has no `config` parameter: the harness passed
+    `config=GenerateConfig(...)` until 2026-09-27, eval() folded that into
+    a GenerateConfig as an unknown field, and pydantic dropped it -- so no
+    sampling setting ever reached a backend, every scored row ran at the
+    engine's own default sampler, and the `greedy_default` stamp was false
+    (docs/bench-results.md D1: `model_generate_config` is {} in every
+    retained log, and none of 16,565 logged request bodies carries a
+    temperature).
     """
-    from inspect_ai.model import GenerateConfig
-
     temperature, top_p = sampling_for(alias)
-    return GenerateConfig(temperature=temperature, top_p=top_p)
+    return {"temperature": temperature, "top_p": top_p}
 
 
 # How many requests a backend serves AT ONCE on this host. inspect_ai sends
@@ -615,13 +619,37 @@ def _sampling_config(alias: str = ""):
 # models drain the queue before the clock matters, so only slow models were
 # penalised. Capping does not cost wall time: the GPU was busy throughout.
 #
-# vLLM and SGLang batch continuously and are left on inspect's default.
+# vLLM and SGLang batch continuously; they get DEFAULT_MAX_CONNECTIONS, set
+# EXPLICITLY. inspect 0.3.158 (every retained log) used a static 10; 0.3.271
+# defaults to ADAPTIVE concurrency (start 20, up to 100), past the router's
+# per-backend cap (MAX_CONCURRENT_REQUESTS, default 32 -> HTTP 429) and
+# vLLM's --max-num-seqs / SGLang's --max-running-requests, which sit on the
+# same cap. An explicit max_connections switches adaptive concurrency off.
+#
+# With the per-sample limit on WORKING time (see _invoke_inspect_task), a
+# request waiting for one of these connections is not charged to its sample;
+# a request queued INSIDE the engine would be, so the cap must stay at or
+# below what the engine serves at once.
 BACKEND_MAX_CONNECTIONS = {"ollama": 1}
+DEFAULT_MAX_CONNECTIONS = 10
 
 
-def max_connections_for(backend: str) -> int | None:
-    """Concurrent requests to bench `backend` with; None = inspect's default."""
-    return BACKEND_MAX_CONNECTIONS.get(backend)
+def max_connections_for(backend: str) -> int:
+    """Concurrent requests to bench `backend` with."""
+    return BACKEND_MAX_CONNECTIONS.get(backend, DEFAULT_MAX_CONNECTIONS)
+
+
+# inspect_ai provider for the router: the GENERIC OpenAI-compatible one
+# (`openai-api/<service>/<model>`), not `openai/<model>`. inspect_ai 0.3.271's
+# `openai` provider applies OpenAI model-name heuristics to our served names:
+# it classifies Qwen3.5-9B-NVFP4, qwen3.8:27b-... and Nemotron-Nano-9B-v2 as
+# GPT-5 models, sends them to /v1/responses with a `reasoning` object, and
+# drops temperature/top_p ("reasoning models always sample at 1"); forcing
+# responses_api=False still drops temperature on the chat path. The generic
+# provider sends /v1/chat/completions with exactly the sampling given --
+# checked on the wire against 0.3.271 on 2026-09-27, the same endpoint the
+# 0.3.158 harness used for every retained log. It reads <SERVICE>_API_KEY.
+INSPECT_SERVICE = "devai"
 
 
 def _invoke_inspect_task(
@@ -649,31 +677,63 @@ def _invoke_inspect_task(
     # via /v1. Auth doesn't matter — router is internal — but the SDK
     # complains if API key is empty, so set a placeholder.
     os.environ.setdefault("OPENAI_API_KEY", "devai-router-no-auth")
+    os.environ.setdefault(f"{INSPECT_SERVICE.upper()}_API_KEY", "devai-router-no-auth")
     eval_kwargs = dict(
-        model=f"openai/{served_model}",
+        model=f"openai-api/{INSPECT_SERVICE}/{served_model}",
         model_base_url=router_url + "/v1",
+        # The generic provider marks every tool `"strict": true` by default
+        # (strict_tools=True). vLLM 0.28 (vllm-devai; VLLM_ENFORCE_STRICT_
+        # TOOL_CALLING defaults on) then builds an xgrammar structural tag
+        # for tool_choice="auto" and CONSTRAINS the tool-call arguments to
+        # the tool's schema while decoding -- which, e.g., makes inventing
+        # arguments for a parameterless tool (tools_use's empty_schema case)
+        # impossible. The `openai` provider every retained log used sent no
+        # `strict` at all, so tool calls stay unconstrained, as measured.
+        model_args={"strict_tools": False},
         log_dir=str(log_dir),
         # message_limit caps the assistant <-> tool turn-loop length
         # (relevant for tools_use; conservative cap keeps a misbehaving
         # model from running forever).
         message_limit=20,
-        # time_limit is per-sample wall clock. Generous because cold-
-        # start vLLM can need 90+ seconds on first request and the
-        # sample-level timeout fires AFTER the model is loaded.
-        time_limit=int(timeout_s),
+        # Per-sample limit on WORKING time, not wall clock (time_limit).
+        # Working time excludes waiting for one of max_connections, so a
+        # sample queued behind others is no longer charged for the wait:
+        # with time_limit, 300-600 s of queueing on Ollama's single slot
+        # timed samples out that generated for ~35 s (2026-09-19), and
+        # time-outs were concentrated on slow models. Generous because
+        # cold-start vLLM can need 90+ seconds on the first request.
+        # Samples that still hit it are counted, not hidden: see
+        # _outcome_counts.
+        working_limit=int(timeout_s),
         # Explicit sampling. Without this the backend's own default
         # applies and differs per engine -- see BENCH_TEMPERATURE above.
         # Keyed on the served model so deploy/bench-sampling.json can
-        # exempt the models that cannot be benched greedily.
-        config=_sampling_config(served_model),
+        # exempt the models that cannot be benched greedily. Keywords,
+        # not `config=`: see sampling_kwargs.
+        **sampling_kwargs(served_model),
     )
     if fail_on_error is not None:
         eval_kwargs["fail_on_error"] = fail_on_error
-    max_connections = max_connections_for(backend)
-    if max_connections is not None:
-        eval_kwargs["max_connections"] = max_connections
+    eval_kwargs["max_connections"] = max_connections_for(backend)
     logs = inspect_eval(task_obj, **eval_kwargs)
-    return logs[0] if isinstance(logs, list) else logs
+    if isinstance(logs, list) and not logs:
+        # What inspect returns when the eval was interrupted (SIGINT at a
+        # task deadline): no log object; the log file itself is written.
+        raise RuntimeError("inspect returned no log (eval interrupted); not scored")
+    log = logs[0] if isinstance(logs, list) else logs
+    # An eval that ended in "error" (inspect aborts after failed requests,
+    # unless fail_on_error=False) is NOT a score. Its accuracy covers only
+    # the samples that ran before the abort -- 0/11 or 0/29 on 2026-09-28,
+    # when two benches fought over the GPU -- and scoring it wrote 0.0 into
+    # the cache and drop-flagged the model. Raising here lands in each
+    # task's `except`, which writes nothing (the prior value, if any,
+    # stands; an absent task is retried by the next run).
+    status = getattr(log, "status", "success")
+    if status != "success":
+        err = getattr(getattr(log, "error", None), "message", "") or ""
+        first = next((ln for ln in err.splitlines() if ln.strip()), "")
+        raise RuntimeError(f"inspect eval ended with status {status!r}; not scored: {first[:200]}")
+    return log
 
 
 def _aggregate_score(eval_log) -> tuple[float, int]:
@@ -696,6 +756,51 @@ def _aggregate_score(eval_log) -> tuple[float, int]:
         return (float(val), n)
     except (TypeError, ValueError):
         return (0.0, n)
+
+
+TIMEOUT_LIMIT_TYPES = ("time", "working")
+
+# Items a task runs unless told otherwise -- the argparse defaults below, and
+# what bench-sync records as `n_planned` when it has to stop a task at its
+# deadline (harvest_truncated.py).
+PLANNED_N_ENV = {"gsm8k": ("BENCH_N_GSM8K", 100), "humaneval": ("BENCH_N_HUMANEVAL", 50),
+                 "humaneval_plus": ("BENCH_N_HUMANEVAL", 50), "mmlu_pro": ("BENCH_N_MMLU_PRO", 100),
+                 "gpqa": ("BENCH_N_GPQA", 100), "tools": ("BENCH_N_TOOLS", 20)}
+
+
+def planned_n(task: str) -> int:
+    var, default = PLANNED_N_ENV[task]
+    return int(os.environ.get(var, str(default)))
+
+
+def _log_name(eval_log) -> str | None:
+    """File name of the inspect log behind a task entry. An explicit link:
+    matching entries to logs by completion time breaks for a task stopped at
+    its deadline, whose log never completes."""
+    loc = getattr(eval_log, "location", None)
+    return Path(str(loc)).name if loc else None
+
+
+def _outcome_counts(eval_log) -> dict[str, int]:
+    """Samples that did not end with a model answer, per the eval log.
+
+    A sample stopped by the working-time limit is still SCORED -- as wrong,
+    on an empty answer -- so the headline score cannot tell a time-out from
+    a wrong answer. It is recorded separately here: `n_timeouts` samples hit
+    the time limit, `n_limited` hit another limit (message/token/...), and
+    `n_errors` raised (tools_use runs with fail_on_error=False). The score
+    stays correct/n; a reader can bound it as [x/n, (x + n_timeouts)/n]
+    (docs/statistics-primer.md Sec. 3, "time-out bounds").
+    """
+    counts = {"n_timeouts": 0, "n_limited": 0, "n_errors": 0}
+    for sample in getattr(eval_log, "samples", None) or []:
+        limit = getattr(sample, "limit", None)
+        if limit is not None:
+            kind = str(getattr(limit, "type", ""))
+            counts["n_timeouts" if kind in TIMEOUT_LIMIT_TYPES else "n_limited"] += 1
+        if getattr(sample, "error", None):
+            counts["n_errors"] += 1
+    return counts
 
 
 def _by_subcase_breakdown(eval_log) -> dict[str, float]:
@@ -915,6 +1020,8 @@ def run_for_target(
                     "n": n,
                     "ran_at": _now_iso(),
                     "inspect_log_dir": str(log_dir),
+                    **_outcome_counts(eval_log),
+                    "inspect_log": _log_name(eval_log),
                 }
                 print(f"    score: {score:.4f} (n={n})", file=sys.stderr)
             except Exception as e:  # noqa: BLE001 — inspect_ai surfaces many error shapes
@@ -943,6 +1050,8 @@ def run_for_target(
                     "n": n,
                     "ran_at": _now_iso(),
                     "inspect_log_dir": str(log_dir),
+                    **_outcome_counts(eval_log),
+                    "inspect_log": _log_name(eval_log),
                 }
                 print(f"    pass@1: {score:.4f} (n={n})", file=sys.stderr)
             except Exception as e:  # noqa: BLE001
@@ -968,6 +1077,8 @@ def run_for_target(
                     "n": n,
                     "ran_at": _now_iso(),
                     "inspect_log_dir": str(log_dir),
+                    **_outcome_counts(eval_log),
+                    "inspect_log": _log_name(eval_log),
                 }
                 print(f"    pass@1: {score:.4f} (n={n})", file=sys.stderr)
             except Exception as e:  # noqa: BLE001
@@ -992,6 +1103,8 @@ def run_for_target(
                     "n": n,
                     "ran_at": _now_iso(),
                     "inspect_log_dir": str(log_dir),
+                    **_outcome_counts(eval_log),
+                    "inspect_log": _log_name(eval_log),
                 }
                 print(f"    score: {score:.4f} (n={n})", file=sys.stderr)
             except Exception as e:  # noqa: BLE001
@@ -1016,6 +1129,8 @@ def run_for_target(
                     "n": n,
                     "ran_at": _now_iso(),
                     "inspect_log_dir": str(log_dir),
+                    **_outcome_counts(eval_log),
+                    "inspect_log": _log_name(eval_log),
                 }
                 print(f"    score: {score:.4f} (n={n})", file=sys.stderr)
             except Exception as e:  # noqa: BLE001
@@ -1088,6 +1203,8 @@ def run_for_target(
                     "tool_parser": _tool_parser,
                     "ran_at": _now_iso(),
                     "inspect_log_dir": str(log_dir),
+                    **_outcome_counts(eval_log),
+                    "inspect_log": _log_name(eval_log),
                 }
                 print(f"    score: {score:.4f} (n={n})", file=sys.stderr)
                 if by_sub:
@@ -1137,8 +1254,16 @@ def run_for_target(
         print(f"  done in {elapsed:.1f}s; peak VRAM {vram['peak_vram_gb']} GB",
               file=sys.stderr)
 
+    # Peak VRAM is recorded per task and the row keeps the maximum over its
+    # tasks: bench-sync runs each task as its own run, so a run-level value
+    # would be whichever task ran last.
+    for tres in task_results.values():
+        if isinstance(tres, dict) and vram["peak_vram_gb"] is not None:
+            tres["peak_vram_gb"] = vram["peak_vram_gb"]
+    task_peaks = [t.get("peak_vram_gb") for t in {**existing_tasks, **task_results}.values()
+                  if isinstance(t, dict) and t.get("peak_vram_gb") is not None]
     metrics = {
-        "peak_vram_gb": vram["peak_vram_gb"],
+        "peak_vram_gb": max(task_peaks) if task_peaks else vram["peak_vram_gb"],
         "mean_vram_gb": vram["mean_vram_gb"],
         "vram_samples": vram["n_samples"],
     }
@@ -1226,6 +1351,9 @@ def _latency_metrics_into_row(
             "ttft_ms_steady_p50": latency.get("ttft_ms_steady_p50"),
             "ttft_ms_steady_p95": latency.get("ttft_ms_steady_p95"),
             "tps_sustained_p50": latency.get("tps_sustained_p50"),
+            # How the tokens behind the TPS were counted: {"usage": n} =
+            # the engine's own count for every request.
+            "tps_token_sources": latency.get("tps_token_sources"),
             "n_latency_samples": latency.get("n_samples"),
         },
         host_env_id=host_env_id,
@@ -1241,7 +1369,7 @@ def _print_latency_summary(latency: dict) -> None:
     nleak = sum(latency.get("leaked_markers", {}).values())
     print(
         f"    ttft_first={f}ms  steady_p50={p50}ms  steady_p95={p95}ms  "
-        f"tps={tps}/s  leaks={nleak}",
+        f"tps={tps}/s ({latency.get('tps_token_sources')})  leaks={nleak}",
         file=sys.stderr,
     )
 
@@ -1314,11 +1442,11 @@ def main() -> None:
     ap.add_argument("--repo", default="", help="regex filter on probe-cache top-level key")
     ap.add_argument("--force", action="store_true", help="re-run tasks even if cached")
     ap.add_argument("--host-vram-gb", type=int, default=DEFAULT_HOST_VRAM_GB)
-    ap.add_argument("--n-gsm8k", type=int, default=int(os.environ.get("BENCH_N_GSM8K", "100")))
-    ap.add_argument("--n-humaneval", type=int, default=int(os.environ.get("BENCH_N_HUMANEVAL", "50")))
-    ap.add_argument("--n-tools", type=int, default=int(os.environ.get("BENCH_N_TOOLS", "20")))
-    ap.add_argument("--n-mmlu-pro", type=int, default=int(os.environ.get("BENCH_N_MMLU_PRO", "100")))
-    ap.add_argument("--n-gpqa", type=int, default=int(os.environ.get("BENCH_N_GPQA", "100")))
+    ap.add_argument("--n-gsm8k", type=int, default=planned_n("gsm8k"))
+    ap.add_argument("--n-humaneval", type=int, default=planned_n("humaneval"))
+    ap.add_argument("--n-tools", type=int, default=planned_n("tools"))
+    ap.add_argument("--n-mmlu-pro", type=int, default=planned_n("mmlu_pro"))
+    ap.add_argument("--n-gpqa", type=int, default=planned_n("gpqa"))
     ap.add_argument(
         "--drop-threshold", type=float,
         default=float(os.environ.get("BENCH_DROP_THRESHOLD", "0.70")),

@@ -1,9 +1,10 @@
 """Tests for the skypilot-agent-skill scaffold.
 
 Covers:
-  - Makefile fetch-cli has the SkyPilot wheel-download block.
-  - CACHE_BUILD_ARGS conditionally mounts the SkyPilot wheel dir.
-  - Dockerfile.lab installs SkyPilot via uv pip --offline --find-links.
+  - SkyPilot is pinned (requirements-skypilot.in) and hash-locked
+    (requirements-skypilot.lock, `make lab-lock`).
+  - Dockerfile.lab installs it into its own venv (/opt/skypilot), not the
+    lab's Python, and links only `sky` onto PATH.
   - scripts/sky-setup.sh exists and is bash-syntax-valid.
   - docs/skypilot-user-guide.md covers the operator surface.
 
@@ -13,6 +14,7 @@ tests -- they require network access and ~30 min of build time.
 
 from __future__ import annotations
 
+import re
 import subprocess
 import unittest
 from pathlib import Path
@@ -20,64 +22,53 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
-class TestMakefileFetchCli(unittest.TestCase):
-    def setUp(self) -> None:
-        self.text = (REPO_ROOT / "Makefile").read_text()
+EXTRAS = "skypilot[aws,gcp,azure,kubernetes,slurm,runpod,lambda]"
 
-    def test_skypilot_wheel_block_present(self) -> None:
-        self.assertIn("skypilot.version", self.text)
-        self.assertIn("pip/wheels/skypilot", self.text)
-        # The wheel fetch uses `python3 -m pip download` (not `uv pip
-        # download`, which has no `download` subcommand) with
-        # `--only-binary=:all:` so only stable pre-built wheels are
-        # pulled. See commit 91d8e15 (repair SkyPilot wheel fetch).
-        self.assertIn("python3 -m pip download", self.text)
-        self.assertIn("--only-binary=:all:", self.text)
 
-    def test_broad_cloud_extras(self) -> None:
+class TestSkypilotLock(unittest.TestCase):
+    def test_version_is_pinned_with_the_broad_cloud_extras(self) -> None:
         # Per skypilot-agent-skill plan decision 2: broad set so the
         # lab image can drive any cloud the operator has creds for.
-        for extra in ("aws", "gcp", "azure", "kubernetes", "slurm", "runpod", "lambda"):
-            self.assertIn(extra, self.text, msg=f"missing extra: {extra}")
+        src = (REPO_ROOT / "requirements-skypilot.in").read_text()
+        self.assertRegex(src, r"(?m)^" + re.escape(EXTRAS) + r"==\d+\.\d+\.\d+$")
 
-    def test_cache_build_args_includes_skypilot_wheel_mount(self) -> None:
-        # The mount is conditional on the wheel dir existing on the
-        # host -- so the build doesn't fail when fetch-cli was skipped.
-        self.assertIn("/var/cache/wheels/skypilot", self.text)
-        self.assertIn(
-            "$(if $(wildcard $(CACHE_DIR)/pip/wheels/skypilot)", self.text
-        )
+    def test_lock_pins_that_version_with_hashes(self) -> None:
+        src = (REPO_ROOT / "requirements-skypilot.in").read_text()
+        version = re.search(re.escape(EXTRAS) + r"==(\S+)", src).group(1)
+        lock = (REPO_ROOT / "requirements-skypilot.lock").read_text()
+        self.assertRegex(lock, r"(?m)^skypilot==" + re.escape(version) + r" \\$")
+        self.assertIn("--hash=sha256:", lock)
+
+    def test_make_lab_lock_writes_it(self) -> None:
+        make = (REPO_ROOT / "Makefile").read_text()
+        self.assertIn("pip compile requirements-skypilot.in", make)
+        self.assertIn("-o requirements-skypilot.lock", make)
+
+    def test_the_old_offline_wheel_prefetch_is_gone(self) -> None:
+        # It fetched the NEWEST release, i.e. nothing was pinned.
+        make = (REPO_ROOT / "Makefile").read_text()
+        self.assertNotIn("pip/wheels/skypilot", make)
+        self.assertNotIn("SKY_HASH", make)
 
 
 class TestDockerfileLabSkypilotInstall(unittest.TestCase):
     def setUp(self) -> None:
         self.text = (REPO_ROOT / "deploy" / "Dockerfile.lab").read_text()
 
-    def test_uv_pip_install_offline_block(self) -> None:
-        self.assertIn("uv pip install --system --offline", self.text)
-        self.assertIn("--find-links /var/cache/wheels/skypilot", self.text)
-        # The exact extras string must match the fetch-cli block.
+    def test_installed_into_its_own_venv_from_the_lock(self) -> None:
+        self.assertIn('uv venv --python "$(command -v python3)" /opt/skypilot', self.text)
         self.assertIn(
-            "'skypilot[aws,gcp,azure,kubernetes,slurm,runpod,lambda]'",
-            self.text,
-        )
+            "uv pip install --python /opt/skypilot/bin/python --no-deps --require-hashes",
+            self.text)
+        self.assertIn("-r /tmp/requirements-skypilot.lock", self.text)
+        self.assertIn("uv pip check --python /opt/skypilot/bin/python", self.text)
+        self.assertIn("ln -s /opt/skypilot/bin/sky /usr/local/bin/sky", self.text)
 
-    def test_install_is_optional(self) -> None:
-        # Per the plan: the build still succeeds when the wheel cache
-        # is empty (a CI/firewalled environment with no fetch-cli run).
-        self.assertIn(
-            "/var/cache/wheels/skypilot", self.text
-        )
-        # Skip-block lives inside an `if [ -d ... ]` guard. re.search
-        # with DOTALL because the block spans multiple lines.
-        import re
-        self.assertIsNotNone(
-            re.search(
-                r"if \[ -d /var/cache/wheels/skypilot \].*?else.*?skipping",
-                self.text,
-                re.DOTALL,
-            )
-        )
+    def test_never_installed_into_the_lab_python(self) -> None:
+        # SkyPilot's caps (click <8.2, websocket-client ==1.3.3, ...)
+        # downgraded lab packages when it shared the system Python.
+        self.assertNotRegex(self.text, r"uv pip install --system[^\n]*skypilot")
+        self.assertNotIn("/var/cache/wheels/skypilot", self.text)
 
 
 class TestSkySetupScript(unittest.TestCase):
@@ -101,7 +92,7 @@ class TestSkySetupScript(unittest.TestCase):
     def test_handles_sky_missing_with_clear_error(self) -> None:
         text = (REPO_ROOT / "scripts" / "sky-setup.sh").read_text()
         self.assertIn("sky CLI not on PATH", text)
-        self.assertIn("uv pip install", text)
+        self.assertIn("/opt/skypilot", text)
 
 
 class TestDocsSkypilotUserGuide(unittest.TestCase):

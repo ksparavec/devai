@@ -17,9 +17,11 @@ ceiling:
 What we capture per run:
 
   - ``input_tokens``         -- request body's prompt token count, as
-                               reported by vLLM in usage.prompt_tokens
-                               (or `None` if the response didn't carry
-                               it)
+                               reported by the engine in
+                               usage.prompt_tokens (or `None` if the
+                               response didn't carry it; recorded since
+                               2026-09-27, the field was documented
+                               but never written before)
   - ``output_tokens``        -- usage.completion_tokens
   - ``ttft_ms``              -- ``t_first_token - t_open`` in ms; the
                                prefill cost we wanted to measure
@@ -46,6 +48,7 @@ to know how vLLM /metrics endpoints are addressed.
 from __future__ import annotations
 
 import time
+import uuid
 from typing import Callable
 
 from bench._bench_core import stream_chat_completion
@@ -92,21 +95,33 @@ _TAIL_INSTRUCTION = (
 )
 
 
-def _build_long_prompt(target_input_tokens: int) -> str:
+def _build_long_prompt(target_input_tokens: int, salt: str = "") -> str:
     """Build a prompt of approximately ``target_input_tokens`` tokens.
 
     Repeats ``_FILLER_CHUNK`` enough times to fill (target * chars-per-
     token) characters, then appends the tail instruction. Slight
     under-estimate is preferred over an overflow; vLLM rejects requests
     that exceed ``--max-model-len`` and the run is wasted.
+
+    ``salt`` goes FIRST. vLLM and SGLang cache KV by prefix (hashes that
+    chain from the first block), so without it every prompt from this
+    builder shared its opening blocks with every other: a re-run on a warm
+    engine, or a series of depths each extending the last, was served
+    partly from the prefix cache (18.7-34.6 % of prompt tokens in the
+    2026-09-21 depth runs), and TTFT stopped measuring prefill. A salt
+    unique to the request changes the first block, and so every block
+    after it. Only what the chat template puts before the user message is
+    still shared -- the same for every request, and for most templates less
+    than one block.
     """
+    head = f"[run {salt}]\n" if salt else ""
     target_chars = max(0, target_input_tokens) * _CHARS_PER_TOKEN
-    target_chars -= len(_TAIL_INSTRUCTION)
+    target_chars -= len(_TAIL_INSTRUCTION) + len(head)
     if target_chars <= 0:
-        return _TAIL_INSTRUCTION.lstrip()
+        return head + _TAIL_INSTRUCTION.lstrip()
     repeats = max(1, int(target_chars // len(_FILLER_CHUNK)) + 1)
     body = (_FILLER_CHUNK * repeats)[: int(target_chars)]
-    return body + _TAIL_INSTRUCTION
+    return head + body + _TAIL_INSTRUCTION
 
 
 def run(
@@ -137,7 +152,7 @@ def run(
     single bad row doesn't void the run.
     """
     target_in = int(ctx_target * fraction)
-    prompt = _build_long_prompt(target_in)
+    prompt = _build_long_prompt(target_in, salt=uuid.uuid4().hex)
     body = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
@@ -201,6 +216,11 @@ def run(
     return {
         "input_tokens_target": target_in,
         "input_tokens_chars": len(prompt),
+        # The engine's own count (usage.prompt_tokens), when it sent one:
+        # the builder's 3.5 chars/token guess came out 25 % high on
+        # Qwen3.8 (docs/llm-tokens-and-speed.md), so TTFT must be read
+        # against this, not the target.
+        "input_tokens": res.get("prompt_tokens"),
         "ttft_ms": ttft_ms,
         "tps_during_decode": tps_decode,
         "output_tokens": res.get("completion_tokens") or res.get("effective_tokens"),

@@ -82,6 +82,7 @@ def run(
     ttft_first_ms: float | None = None
     ttft_steady_ms: list[float] = []
     tps_list: list[float] = []
+    tps_token_sources: dict[str, int] = {}
     content_blobs: list[str] = []
     errors: list[dict] = []
 
@@ -105,12 +106,13 @@ def run(
             else:
                 ttft_steady_ms.append(ttft_ms)
             stream_seconds = res["t_done"] - res["t_first_token"]
-            # Use effective_tokens (max of usage.completion_tokens and
-            # char-based estimate) so reasoning-heavy streams under the
-            # qwen3 parser don't report 1/10th the real decode rate.
+            # effective_tokens: the engine's usage count, or chars/4 when
+            # the stream carried none (token_source says which).
             tokens = res.get("effective_tokens") or res["completion_tokens"]
             if stream_seconds > 0 and tokens > 0:
                 tps_list.append(tokens / stream_seconds)
+                src = res.get("token_source", "chars/4")
+                tps_token_sources[src] = tps_token_sources.get(src, 0) + 1
 
         # Sweep both content AND reasoning_content for leaks — template
         # markers can leak into either field on misconfigured parsers.
@@ -130,6 +132,9 @@ def run(
         "ttft_ms_steady_p50": round(p50(ttft_steady_ms), 1),
         "ttft_ms_steady_p95": round(p95(ttft_steady_ms), 1),
         "tps_sustained_p50": round(p50(tps_list), 2),
+        # How the tokens behind tps_sustained_p50 were counted, per
+        # request: {"usage": n} = the engine's own count throughout.
+        "tps_token_sources": tps_token_sources,
         "n_samples": len(prompts) - len(errors),
         "n_errors": len(errors),
         "errors": errors[:5],  # cap so cache rows stay small

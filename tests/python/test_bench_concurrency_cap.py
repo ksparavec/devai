@@ -48,11 +48,13 @@ class MaxConnectionsTest(unittest.TestCase):
     def test_ollama_is_benched_one_request_at_a_time(self) -> None:
         self.assertEqual(bench_runner.max_connections_for("ollama"), 1)
 
-    def test_batching_backends_keep_inspects_own_default(self) -> None:
-        # vLLM and SGLang batch continuously; nothing measured says their
-        # queue distorts the clock, so nothing is changed for them.
-        for backend in ("vllm", "sglang"):
-            self.assertIsNone(bench_runner.max_connections_for(backend), backend)
+    def test_batching_backends_get_an_explicit_static_cap(self) -> None:
+        # vLLM and SGLang batch continuously. inspect 0.3.271 would
+        # otherwise use ADAPTIVE concurrency (start 20, up to 100), past the
+        # router's per-backend cap of 32; the explicit value is the static
+        # 10 that inspect 0.3.158 used for every retained log.
+        for backend in ("vllm", "vllm-devai", "sglang"):
+            self.assertEqual(bench_runner.max_connections_for(backend), 10, backend)
 
 
 class InvokeWiringTest(unittest.TestCase):
@@ -78,8 +80,15 @@ class InvokeWiringTest(unittest.TestCase):
     def test_ollama_eval_is_capped_at_one_connection(self) -> None:
         self.assertEqual(self._invoke("ollama").get("max_connections"), 1)
 
-    def test_vllm_eval_is_left_alone(self) -> None:
-        self.assertNotIn("max_connections", self._invoke("vllm"))
+    def test_vllm_eval_gets_the_static_cap(self) -> None:
+        self.assertEqual(self._invoke("vllm").get("max_connections"), 10)
+
+    def test_limit_is_on_working_time_not_wall_clock(self) -> None:
+        # Working time excludes waiting for a connection, so queueing is
+        # no longer charged to the sample.
+        kw = self._invoke("ollama")
+        self.assertEqual(kw.get("working_limit"), 900)
+        self.assertNotIn("time_limit", kw)
 
     def test_every_call_site_says_which_backend_it_is_benching(self) -> None:
         # The calls sit inside `except Exception`, so a call site that forgot
@@ -88,6 +97,34 @@ class InvokeWiringTest(unittest.TestCase):
         self.assertGreaterEqual(len(calls), 6)
         for body in calls:
             self.assertIn("backend=backend", body, body)
+
+
+class OutcomeCountsTest(unittest.TestCase):
+    """A time-out is scored as a wrong answer; it must be counted apart."""
+
+    @staticmethod
+    def _log(*samples):
+        return types.SimpleNamespace(samples=list(samples))
+
+    @staticmethod
+    def _sample(limit_type=None, error=None):
+        limit = None if limit_type is None else types.SimpleNamespace(type=limit_type, limit=900.0)
+        return types.SimpleNamespace(limit=limit, error=error)
+
+    def test_time_and_working_limits_count_as_timeouts(self) -> None:
+        log = self._log(self._sample("working"), self._sample("time"),
+                        self._sample(), self._sample("message"),
+                        self._sample(error="boom"))
+        self.assertEqual(bench_runner._outcome_counts(log),
+                         {"n_timeouts": 2, "n_limited": 1, "n_errors": 1})
+
+    def test_clean_run_records_zeros(self) -> None:
+        self.assertEqual(bench_runner._outcome_counts(self._log(self._sample())),
+                         {"n_timeouts": 0, "n_limited": 0, "n_errors": 0})
+
+    def test_every_scored_task_entry_records_the_counts(self) -> None:
+        # gsm8k, humaneval, humaneval_plus, mmlu_pro, gpqa, tools_use.
+        self.assertEqual(SOURCE.count("**_outcome_counts(eval_log),"), 6)
 
 
 class PersistAfterEveryTaskTest(unittest.TestCase):

@@ -159,18 +159,17 @@ Spot instances are scarce in popular regions. Try:
 - A different region with `--region us-east-1`.
 - A different cloud with `--cloud lambda` instead of `--cloud aws`.
 
-### Image build complains "skypilot wheels not found"
+### Which SkyPilot version is in the image, and how to change it
 
-The wheel cache is populated by `make fetch-cli` on the build host.
-Re-run that, then `make build-gpu` (or `make build-cpu`).
-
-If the wheel cache is empty for a network-firewalled environment,
-the lab image will still build but without `sky` -- install
-post-launch with:
-
-```bash
-uv pip install --system 'skypilot[aws,gcp,azure,kubernetes,slurm,runpod,lambda]'
-```
+The version is pinned in `requirements-skypilot.in` (0.13.0 as of
+2026-09-27) and installed from the hash lock `requirements-skypilot.lock`
+into its own venv, `/opt/skypilot`, with only `sky` linked onto PATH.
+It is kept out of the lab's own Python because SkyPilot's version caps
+(click, websocket-client, protobuf, ...) would otherwise downgrade lab
+packages. To upgrade: edit the version in `requirements-skypilot.in`, run
+`make lab-lock`, then `make build-gpu` (or `make build-cpu`). Do not
+`uv pip install --system skypilot` inside the lab: that puts the caps
+back into the lab's environment.
 
 ## References
 

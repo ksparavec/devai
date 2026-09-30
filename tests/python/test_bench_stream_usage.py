@@ -103,3 +103,53 @@ class TrailingUsageChunkTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class IncludeUsageRequestedTest(unittest.TestCase):
+    """The bench asks for usage; without it vLLM and Ollama send none."""
+
+    def _capture(self, body: dict, payloads: list[str]) -> tuple[dict, dict]:
+        seen: dict = {}
+
+        def fake(url: str, sent: dict, timeout: float = 600.0):
+            seen.update(sent)
+            yield from _fake_stream(payloads)(url, sent, timeout)
+
+        with mock.patch.object(_bench_core, "http_post_stream", fake):
+            res = _bench_core.stream_chat_completion("http://r", body)
+        return seen, res
+
+    def test_request_sets_include_usage(self):
+        seen, _ = self._capture({"model": "m", "messages": []}, ["[DONE]"])
+        self.assertTrue(seen["stream"])
+        self.assertEqual(seen["stream_options"], {"include_usage": True})
+
+    def test_callers_stream_options_are_kept(self):
+        seen, _ = self._capture(
+            {"model": "m", "stream_options": {"continuous_usage_stats": True}}, ["[DONE]"])
+        self.assertEqual(seen["stream_options"],
+                         {"continuous_usage_stats": True, "include_usage": True})
+
+    def test_engine_count_wins_over_a_larger_char_estimate(self):
+        # 60 characters -> chars/4 = 15, but the engine generated 10 tokens.
+        payloads = [_chunk({"content": "x" * 60}, finish="stop"),
+                    _chunk(None, usage={"completion_tokens": 10}), "[DONE]"]
+        _, res = self._capture({"model": "m"}, payloads)
+        self.assertEqual(res["effective_tokens"], 10)
+        self.assertEqual(res["token_source"], "usage")
+
+    def test_fallback_is_labelled(self):
+        _, res = self._capture({"model": "m"}, [_chunk({"content": "x" * 40}, finish="stop"), "[DONE]"])
+        self.assertEqual(res["effective_tokens"], 10)
+        self.assertEqual(res["token_source"], "chars/4")
+
+
+class TokenSourceReachesTheRowTest(unittest.TestCase):
+    def test_latency_metrics_keep_the_token_sources(self) -> None:
+        from bench import bench_runner
+        cache: dict = {}
+        latency = {"ttft_ms_first": 1.0, "ttft_ms_steady_p50": 2.0, "ttft_ms_steady_p95": 3.0,
+                   "tps_sustained_p50": 40.0, "n_samples": 5, "tps_token_sources": {"usage": 5}}
+        bench_runner._latency_metrics_into_row(
+            cache, "k", latency, {"alias": "m", "ctx": 32768}, "vllm", "http://r")
+        self.assertEqual(cache["k"]["metrics"]["tps_token_sources"], {"usage": 5})

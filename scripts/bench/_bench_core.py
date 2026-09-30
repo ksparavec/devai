@@ -80,13 +80,23 @@ def stream_chat_completion(
     measurement on plain text answers, ``t_first_token`` is the
     relevant event.
     """
-    streamed_body = {**body, "stream": True}
+    # include_usage: without it vLLM (0.22.1, 0.28) and Ollama send no
+    # `usage` at all, so completion_tokens stayed 0 and every bench TPS was
+    # the chars/4 estimate (docs/bench-results.md D4). With it, the engine
+    # ends the stream with its own count of generated tokens.
+    streamed_body = {
+        **body,
+        "stream": True,
+        "stream_options": {**(body.get("stream_options") or {}), "include_usage": True},
+    }
     url = base_url.rstrip("/") + "/v1/chat/completions"
     t_open = time.time()
     t_first_token: float | None = None
     pieces: list[str] = []
     reasoning_pieces: list[str] = []
     completion_tokens = 0
+    prompt_tokens: int | None = None
+    usage_seen = False
     finish_reason: str | None = None
     t_done = t_open
     for t_event, payload in http_post_stream(url, streamed_body, timeout):
@@ -105,6 +115,9 @@ def stream_chat_completion(
         usage = obj.get("usage") or {}
         if "completion_tokens" in usage:
             completion_tokens = int(usage["completion_tokens"])
+            usage_seen = True
+        if "prompt_tokens" in usage:
+            prompt_tokens = int(usage["prompt_tokens"])
         choices = obj.get("choices") or []
         if not choices:
             continue
@@ -132,23 +145,25 @@ def stream_chat_completion(
         t_done = t_event
     content = "".join(pieces)
     reasoning_content = "".join(reasoning_pieces)
-    # Token-count reconciliation: vLLM with --reasoning-parser qwen3
-    # populates usage.completion_tokens with ONLY content tokens —
-    # reasoning_content tokens (which can dominate the stream for
-    # thinking-heavy prompts) are excluded. The deepseek_r1 and
-    # harmony parsers include reasoning. To get a parser-agnostic
-    # decode-rate metric, fall back to a character-based estimate
-    # (≈ 4 chars/token, the standard rough heuristic) over BOTH
-    # content and reasoning_content streams. Take the max so that
-    # accurate parsers aren't penalised by the heuristic's noise on
-    # short outputs.
+    # Token count: the ENGINE's own, whenever it reported one. vLLM (0.22.1
+    # and 0.28: `previous_num_tokens[i] += len(output.token_ids)`), SGLang
+    # (meta_info completion_tokens) and Ollama (eval_count) all count every
+    # generated token, reasoning included -- a reasoning parser only splits
+    # the text. The chars/4 estimate over content AND reasoning is a
+    # FALLBACK for a stream without usage, labelled as such in
+    # token_source. It used to be max(usage, chars/4), on the belief that
+    # vLLM's qwen3 parser left reasoning out of usage (never observed: the
+    # bench never requested usage); a max of an exact count and a noisy
+    # estimate is biased upward.
     char_based_tokens = (len(content) + len(reasoning_content)) // 4
-    effective_tokens = max(completion_tokens, char_based_tokens)
+    effective_tokens = completion_tokens if usage_seen else char_based_tokens
     return {
         "content": content,
         "reasoning_content": reasoning_content,
         "completion_tokens": completion_tokens,
+        "prompt_tokens": prompt_tokens,
         "effective_tokens": effective_tokens,
+        "token_source": "usage" if usage_seen else "chars/4",
         "t_open": t_open,
         "t_first_token": t_first_token,
         "t_done": t_done,

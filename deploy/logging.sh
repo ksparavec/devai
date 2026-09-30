@@ -47,6 +47,18 @@ rotate_if_big() {
   fi
 }
 
+# last_podman_stamp prints the newest `podman logs --timestamps` stamp in a
+# persisted log (RFC3339, with or without fractional seconds), or nothing
+# when the file is absent or holds none. The logger's own "[...] [logger]"
+# lines are bracketed and never match. Read from the END (tac), so the cost
+# does not grow with the file.
+last_podman_stamp() {
+  [ -f "$1" ] || return 0
+  tac "$1" 2>/dev/null \
+    | grep -Eo -m1 '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})' \
+    || true
+}
+
 discover_targets() {
   # Names of every running devai-* container at this moment.
   $PODMAN ps --all --format '{{.Names}}' 2>/dev/null \
@@ -72,12 +84,17 @@ follow() {
   name=$1
   out="$LOG_DIR/$name.log"
   echo "[$(stamp)] [logger] starting follower for $name -> $out" >> "$out"
-  # since="" on the first connect captures the container's full history;
-  # after any disconnect we set it to the disconnect time so a reconnect
-  # streams ONLY new lines. Without this, `--follow` re-reads the whole
-  # backlog from byte 0 on every transient stream drop or container recreate
-  # -- the root cause of the multi-GB log growth.
-  since=""
+  # On the first connect, resume from the newest stamp already in the file:
+  # `--follow` without --since streams the container's WHOLE history, so every
+  # logger restart (each `make cache-up` recreates it) appended that history
+  # again -- the persisted router log held 3,245 launch lines for 742
+  # distinct launches (2026-09-27 re-analysis). --since is inclusive at the
+  # stamp's precision (whole seconds here), so up to one second of lines can
+  # repeat at the seam; none are lost. An empty file (or none) still gets the
+  # full history. After a disconnect we set since to the disconnect time, so
+  # a reconnect streams ONLY new lines rather than re-reading the backlog on
+  # every transient stream drop or container recreate.
+  since="$(last_podman_stamp "$out")"
   while true; do
     rotate_if_big "$out"
     if [ -n "$since" ]; then set -- --since "$since"; else set --; fi

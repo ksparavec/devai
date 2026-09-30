@@ -72,10 +72,18 @@ _BLAS_ENV = {
     "NUMEXPR_NUM_THREADS": "1",
 }
 
-# Match any fenced code block (with optional ``python|py`` info-string)
-# anywhere in the text. Non-greedy body so multiple fences round-trip
-# correctly via ``findall`` (caller takes the last match).
-_FENCE_BLOCK_RX = re.compile(r"```(?:python|py)?\s*\n?(.*?)```", re.DOTALL)
+# Match any fenced code block (optional ``python`` / ``python3`` / ``py``
+# info-string, any case) anywhere in the text. Non-greedy body so multiple
+# fences round-trip correctly via ``findall`` (caller takes the last match).
+# Only blanks may sit between the info-string and the newline that opens
+# the body, and the body starts right AFTER that newline: the v2 pattern
+# (``\s*\n?``) let ``\s*`` swallow the newline AND the first body line's
+# indentation, so a fenced function BODY lost its first indent and became
+# a syntax error once appended to the prompt (30 candidate false failures
+# in the 2026-09-27 re-analysis); ``python3`` also left a stray ``3``.
+_FENCE_BLOCK_RX = re.compile(
+    r"```[ \t]*(?:[Pp]ython3?|[Pp]y)?[ \t]*\r?\n(.*?)```", re.DOTALL
+)
 # Strip ``<think>...</think>`` reasoning preambles that inline-reasoning
 # models (Nemotron-Nano, R1-Distill-Llama-8B) emit before the actual
 # code. Models with a probe-verified reasoning parser (Qwen3, deepseek_r1
@@ -83,6 +91,10 @@ _FENCE_BLOCK_RX = re.compile(r"```(?:python|py)?\s*\n?(.*?)```", re.DOTALL)
 # server-side, so this regex is a no-op for them; it only fires for the
 # inline-reasoning case.
 _THINK_RX = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+# Leading BLANK LINES only. ``str.strip()`` also removed the first code
+# line's indentation, which broke an unfenced function body the same way
+# the v2 fence regex broke a fenced one.
+_LEADING_BLANK_LINES_RX = re.compile(r"\A(?:[ \t]*\r?\n)+")
 
 
 def _clean_completion(text: str, entry_point: str = "") -> str:
@@ -115,7 +127,7 @@ def _clean_completion(text: str, entry_point: str = "") -> str:
     """
     if not text:
         return ""
-    cleaned = _THINK_RX.sub("", text).strip()
+    cleaned = _LEADING_BLANK_LINES_RX.sub("", _THINK_RX.sub("", text)).rstrip()
     fences = _FENCE_BLOCK_RX.findall(cleaned)
     if fences:
         return fences[-1].rstrip("\n")
