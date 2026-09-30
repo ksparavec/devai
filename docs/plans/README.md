@@ -118,7 +118,7 @@ found three more findings.
 | [router-fanout](./router-fanout.md)                                 | Draft             |
 | [laya-trainer](./laya-trainer.md)                                   | In Progress       |
 | [library-service](./library-service.md)                             | Draft             |
-| [slurm-gatekeeper](./slurm-gatekeeper.md)                           | Draft (redesigned 2026-09-30) |
+| [slurm-gatekeeper](./slurm-gatekeeper.md)                           | Draft (redesigned 2026-10-01) |
 | [minimal-external-images](./minimal-external-images.md)             | Draft             |
 | [devai-operator](./devai-operator.md)                               | Draft             |
 | [sops-age-secrets](./sops-age-secrets.md)                           | Non-functional    |

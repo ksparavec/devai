@@ -27,7 +27,7 @@ Draft (2026-09-30). Decisions O1-O9 below are the operator's. Nothing is built.
 ## Operator decisions (2026-09-30)
 
 - **O1 -- Apache with mod_wsgi.** Debian's `apache2` (2.4.68) and `libapache2-mod-wsgi-py3` (5.0.2): the Python app runs in Apache's own daemon processes, so TLS, login and the app are one server.
-- **O2 -- Every action runs as a Slurm job.** It is queued, can be cancelled and suspended, has a time limit, and lands in the job history with its log; GPU actions take the engine license. The exception is the actions that start or stop the stack itself (bring the services up or down, rebuild or restart `devai-slurm`): Slurm may be down for those, so they run directly and are logged by the operator.
+- **O2 -- Every action runs as a Slurm job.** It is queued, can be cancelled and suspended, has a time limit, and lands in the job history with its log; actions that use the GPU directly (probes) take the engine license, while a bench uses it through the router and keeps its engine with a hold. The exception is the actions that start or stop the stack itself (bring the services up or down, rebuild or restart `devai-slurm`): Slurm may be down for those, so they run directly and are logged by the operator.
 - **O3 -- Host root stays host-shell setup.** `setup-logs` (LVM, mkfs, `/etc/fstab`) and `secrets-tmpfs` (a tmpfs mount) need `sudo`; `install` / `uninstall` write `~/.local/bin`. They stay one-time host setup: the web shows whether each is done and prints the exact command.
 - **O4 -- Interactive targets become links.** The web starts and stops JupyterLab lab containers and shows their links; a shell is a JupyterLab terminal.
 - **O5 -- The operator runs the scripts, not `make`.** Each action is a script with declared parameters. The Makefile stays as a development convenience that calls the same scripts.
@@ -60,13 +60,13 @@ Everything devai can do is a Makefile target run in a host shell: 124 documented
 - the host's podman socket, read-write (`CONTAINER_HOST`), so the scripts' `podman` calls, builds and compose runs reach the host's podman;
 - **path identity:** the repository, `/var/cache/devai` and the home volume are mounted at the same paths as on the host, because the scripts pass host paths to podman (`-v $(CURDIR)/scripts:/scripts`, `-v $(CACHE_DIR)/pip:...`), and podman resolves them on the host;
 - the GPU device when the host has one (probes read `nvidia-smi`; the VRAM ballast allocates);
-- the Slurm JWT key (read-only), to call slurmrestd;
+- the Slurm JWT key (read-only), to call slurmrestd, and its bus password (read-only), for `devai-control` and the job pages;
 - TLS certificate and key, the htpasswd file;
-- `tini` as PID 1, then Apache.
+- `tini` as PID 1, then supervisord, which runs Apache and `devai-control`.
 
-**Actions.** A registry, `deploy/operator/actions.yaml`, lists every action: an id and group, the script and its fixed arguments, its parameters (name, type, allowed values or pattern, default, help, and how each maps to a flag or an environment variable), its kind (`job`, `direct`, `host`, `lab`), whether it needs the GPU (engine license), its time limit, whether it asks for confirmation (destructive actions such as clean, restore, stack down), and the Makefile targets it covers. A test fails when a documented Makefile target is covered by no action and not listed as not offered with a reason, so "everything the Makefile offers" stays true as the Makefile changes.
+**Actions.** A registry, `deploy/operator/actions.yaml`, lists every action: an id and group, the script and its fixed arguments, its parameters (name, type, allowed values or pattern, default, help, and how each maps to a flag or an environment variable), its kind (`job`, `direct`, `host`, `lab`), whether it takes the engine license (probes), its time limit, whether it asks for confirmation (destructive actions such as clean, restore, stack down), and the Makefile targets it covers. A test fails when a documented Makefile target is covered by no action and not listed as not offered with a reason, so "everything the Makefile offers" stays true as the Makefile changes.
 
-**Running an action.** The app validates each parameter against the registry and builds an argument list; nothing passes through a shell. A `job` action is submitted to slurmrestd with a script that runs `podman exec devai-operator devai-run <jobid> <script> <args...>` -- the same exec path as the engines ([docs/slurm.md](../slurm.md) Sec. 4). Containers a script starts are labelled with the job id, so a cancel or the epilog can remove them. A `direct` action is started by the app with `setsid`, outside Apache's processes (an Apache restart must not kill it), and logs to `/var/cache/devai/jobs/operator/`.
+**Running an action.** The app validates each parameter against the registry and builds an argument list; nothing passes through a shell. A `job` action is submitted to slurmrestd with a script that sends `devai.operator.actions.run {job, action, params}` over the bus and holds a lease while it runs, the same pattern as an engine job ([docs/slurm.md](../slurm.md) Sec. 4). `devai-control` in this container checks the action and its parameters against the registry again, runs the script, and reports its exit; `stop`, or a lease that runs out, stops it. Containers a script starts are labelled with the job id, so `devai-control` can remove them when the action stops. A `direct` action is started by the app with `setsid`, outside Apache's processes (an Apache restart must not kill it), and logs to `/var/cache/devai/jobs/operator/`.
 
 **Pages:** the stack at a glance (containers, the GPU holder, the running engine, the queue); actions by group, each with its form; jobs (queue and history, from Slurm's REST API) and a job page with its log (polled), cancel, hold, suspend and resume; the lab (start, stop, link); host setup (what is done, and the command for what is not).
 
@@ -86,7 +86,7 @@ Move each inline recipe into a script under `scripts/ops/` and make the Makefile
 
 ## Phase 3 -- Actions as Slurm jobs (O2)
 
-After slurm-gatekeeper Phase 1: `job` actions submitted through slurmrestd, the job pages, cancel, hold, suspend and resume; GPU actions take the engine license; only the stack-lifecycle actions stay `direct`. Exit: an action started from the browser appears in `devai-jobs list` with its log, and cancelling it removes the containers it started.
+After slurm-gatekeeper Phase 1: `job` actions submitted through slurmrestd, the job pages, cancel, hold, suspend and resume; probe actions take the engine license; only the stack-lifecycle actions stay `direct`. Exit: an action started from the browser appears in `devai-jobs list` with its log, and cancelling it removes the containers it started.
 
 ## Phase 4 -- Lab and host setup (O3, O4)
 
@@ -127,4 +127,4 @@ Estimates, not measurements.
 ## References
 
 - Apache mod_wsgi (Debian `libapache2-mod-wsgi-py3`), Flask (Debian `python3-flask`)
-- [docs/slurm.md](../slurm.md) -- the exec path and the job history the actions use
+- [docs/slurm.md](../slurm.md) -- the bus, the jobs and the job history the actions use

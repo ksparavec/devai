@@ -93,7 +93,7 @@ End state:
 | Image | Built from | Containers |
 | ----- | ---------- | ---------- |
 | `debian:trixie-slim` | pulled, digest-pinned | -- |
-| `devai-engines` | trixie-slim + host builds | today's ollama / vllm / sglang containers; after Slurm, one permanent idle container (Slurm plan) |
+| `devai-engines` | trixie-slim + host builds | today's ollama / vllm / sglang containers; after Slurm, one permanent container whose supervisord keeps the engines running (Slurm plan, D15) |
 | `devai-slurm` | trixie-slim + Debian's Slurm 24.11.5 and MariaDB packages (Slurm plan, D12) | one |
 | `devai-router` | empty image + host-built static binary | router |
 | `devai-laya-trainer` | devai-base | laya-trainer |
@@ -232,7 +232,7 @@ Makefile                        modify -- devai-base / devai-lab only; build-bas
 deploy/Dockerfile.lab           modify -- CPU torch index branch removed; the workaround for the Ubuntu
                                           base's `ubuntu` user at uid 1000 removed
 deploy/Dockerfile.laya-trainer  modify -- FROM devai-base; tini (Debian package) as PID 1; default command
-                                          an idle loop (Slurm plan)
+                                          an idle loop (the Slurm plan later runs supervisord)
 bin/devai-agent                 modify -- --cpu removed; image devai-lab; GPU per the host check
 scripts/model-picker.py, scripts/dsh-web-launcher.sh, packages/jupyter-ai-launchers
                                 modify -- messages naming lab-cpu|lab-gpu
@@ -244,7 +244,7 @@ scripts/sky-setup.sh            modify -- one lab image; macOS builds it for arm
 
 1. Build `devai-base` and `devai-lab` on trixie-slim with the CUDA torch. torch 2.14.0 from PyPI brings the CUDA 13.0 runtime libraries itself (`laya-trainer/requirements.lock` pins `nvidia-cuda-runtime==13.0.96`), so the old base's system CUDA 12.9 may be unused. If something needs system CUDA, it comes from NVIDIA's debian13 apt repository (the host's CUDA 13.1 packages), never from an image.
 2. The host check decides the device for `make lab`, `make shell` and devai-agent. The same image runs in both cases; CUDA torch runs on the CPU when no device is attached.
-3. The laya trainer image gets `tini` and an idle default command, so the Slurm plan can run it as a permanent container; the router's current launch overrides the command, as today.
+3. The laya trainer image gets `tini` and an idle default command, so it can run as a permanent container; the router's current launch overrides the command, as today. The Slurm plan later makes supervisord and `devai-control` the default command (its D15).
 4. macOS: `INSTALL_macOS.md` builds the one lab image natively for arm64 in `podman machine` instead of the CPU image.
 
 ### Exit criteria
@@ -275,7 +275,7 @@ One image holds every inference engine, each compiled here for CUDA 13.1 on sm12
 ```
 scripts/build-sglang.sh              new    -- host build of SGLang 0.5.16 and its kernel packages (M3, M5), like build-vllm.sh
 deploy/Dockerfile.engines            new    -- trixie-slim; tini; Ollama, vLLM env, SGLang env, one CUDA 13.1 toolkit,
-                                               launcher, per-engine labels; default command an idle loop (Slurm plan)
+                                               launcher, per-engine labels; default command an idle loop (the Slurm plan later runs supervisord)
 scripts/devai-engine                 new    -- the launcher: `devai-engine <backend> <args>`
 gpu-arbiter/*.go                     modify -- entrypoints via the launcher; one engines image; vllm-devai removed; per-engine drift
 scripts/_probe_core.py, _probe_hf_common.py, _probe_load.py, probe-check.py,
@@ -291,7 +291,7 @@ deploy/recovery-flags.json, deploy/docker-compose.yaml, Makefile, tests/
 
 1. **4a -- SGLang build spike.** List SGLang 0.5.16's dependencies with compiled code and sort them by M3. Its pins include `sglang-kernel==0.4.5`, `sgl-deep-gemm==0.1.4.post1`, `humming-kernels[cu13]==0.1.10`, `flash-attn-4>=4.0.0b18`, `quack-kernels>=0.6.1` and `flashinfer_python[cu13]==0.6.14` (PyPI metadata); those that are SGLang's own kernel packages are compiled, the rest come from Debian if its version satisfies the pin, else PyPI. Build for sm120 with nvcc 13.1 against the pinned `torch==2.11.0`, install in a trixie-slim environment with the host toolkit, serve one model. The spike also settles how a Debian package satisfies a pin inside the engine's environment (Debian's python3 with system site-packages, or none used). If SGLang cannot be built and no upgrade builds either, it is dropped (M2) and the rest of this phase proceeds without it.
 2. **4b -- `scripts/build-sglang.sh`** on the pattern of `build-vllm.sh`: sources sha256-pinned, external repositories fetched once at the revisions the source names, every network step tried 3 times, sm120 only, output a wheelhouse plus a content hash, and a record of where each dependency came from (compiled, Debian, PyPI).
-3. **4c -- `Dockerfile.engines`.** One stage per engine, copied into the final stage least-changed first. The CUDA 13.1 compiler pieces are copied once from the host toolkit, as `Dockerfile.vllm` does today (FlashInfer needs nvcc at run time). Each engine gets an image label, `devai.engine.<backend>`, set to its build's content hash (the `DIST_ID` idea already used for vLLM). `tini` is PID 1 and the default command is an idle loop, so the Slurm plan can run the image as one permanent container; the router's current launch overrides the command. The Slurm plan's own scripts (`devai-run`, `devai-kill`) are added to this image and to the laya trainer image by that plan.
+3. **4c -- `Dockerfile.engines`.** One stage per engine, copied into the final stage least-changed first. The CUDA 13.1 compiler pieces are copied once from the host toolkit, as `Dockerfile.vllm` does today (FlashInfer needs nvcc at run time). Each engine gets an image label, `devai.engine.<backend>`, set to its build's content hash (the `DIST_ID` idea already used for vLLM). `tini` is PID 1 and the default command is an idle loop, so the Slurm plan can run the image as one permanent container; the router's current launch overrides the command. The Slurm plan adds supervisord and its `devai-control` to this image and to the laya trainer image (its D15, D16); they replace the idle loop then.
 4. **4d -- Launcher.** `devai-engine <backend>` sets `PATH`, `CUDA_HOME` and `LD_LIBRARY_PATH` for that engine and `exec`s it. The router's `vllmEntrypoint` / `sglangEntrypoint` (`gpu-arbiter/main.go:1381`, `:1523`) and Ollama's launch call it instead of a bare `python3`; so do the probers. One `ENGINES_IMAGE` replaces `OLLAMA_IMAGE`, `VLLM_IMAGE`, `VLLM_DEVAI_IMAGE` and `SGLANG_IMAGE`.
 5. **4e -- `vllm-devai` -> `vllm`.** Router backend table, compose, the picker's backend lists and agent provider sets (`router-vllm-devai`), the probers, derived catalog rows (`backend: [vllm]`), tests that pin the vllm-devai registration points. Port 11437 retired.
 6. **4f -- Per-engine staleness.** Today the HF probe caches stamp `_meta.current_image_digest`, and `make probe-check`, the router's drift check (`probeCachePathByBackend`, `readProbedImageDigest`) and `make bench-plan` (`stale_image`) compare it. With one image for every backend, rebuilding it for an Ollama change would mark every vLLM and SGLang cell and bench row stale. Stamp and compare the engine's `devai.engine.<backend>` label instead; Ollama's cache gets the same stamp (it has none today).

@@ -17,12 +17,12 @@ import argparse
 from pathlib import Path
 from xml.sax.saxutils import escape
 
-W, H = 1500, 1090
+W, H = 1500, 1130
 FONT = "Helvetica, Arial, sans-serif"
 
 # Interaction colours (also the legend).
-BLUE, ORANGE, PURPLE, GREEN, GREY, RED = "#2F6FD1", "#D98A1C", "#7A52B3", "#2E8B3E", "#7A7A7A", "#C73A3A"
-COLOURS = {"data": BLUE, "control": ORANGE, "slurm": PURPLE, "gpu": GREEN, "storage": GREY, "kill": RED}
+BLUE, ORANGE, PURPLE, GREEN, GREY, RED, TEAL = "#2F6FD1", "#D98A1C", "#7A52B3", "#2E8B3E", "#7A7A7A", "#C73A3A", "#178A8A"
+COLOURS = {"data": BLUE, "control": ORANGE, "slurm": PURPLE, "bus": TEAL, "gpu": GREEN, "storage": GREY, "kill": RED}
 
 out: list[str] = []
 
@@ -107,17 +107,18 @@ def draw() -> str:
     markers()
     out.append(f'<rect width="{W}" height="{H}" fill="#FFFFFF"/>')
     text(W / 2, 30, "devai Slurm gatekeeper -- proposed architecture", size=20, weight="bold", anchor="middle")
-    text(W / 2, 50, "single host, rootless podman; no Slurm in the backend containers; the GPU is optional. "
+    text(W / 2, 50, "single host, rootless podman; engines always run, with no Slurm in them; the GPU is optional. "
          "Numbered arrows = the table in docs/slurm.md Sec. 2", size=12, colour="#555", anchor="middle")
 
     # ---------------------------------------------------------- row A
     box(20, 100, 220, 70, "Browser (LAN)", ["devai-operator over HTTPS", "(login)"], fill="#F4F4F4")
     box(260, 92, 260, 88, "Host shell", ["development (make)", "one-time root setup:", "logs volume, tmpfs, installer"], fill="#FAFAFA")
     zone(540, 72, 430, 120, "Legend", "#FFFFFF", "#BBBBBB")
-    for i, (kind, what) in enumerate([("data", "inference data path"), ("control", "control: operator / router -> Slurm"),
-                                      ("slurm", "Slurm internal / podman exec"), ("gpu", "GPU use (CUDA)"),
-                                      ("storage", "volume mount / file write"), ("kill", "GPU guard kills a holder")]):
-        cx, cy = 558 + (i // 3) * 214, 108 + (i % 3) * 28
+    for i, (kind, what) in enumerate([("data", "inference data path"), ("slurm", "Slurm internal"),
+                                      ("bus", "bus (NATS): commands, state"), ("gpu", "GPU use (CUDA)"),
+                                      ("control", "control -> Slurm (REST)"), ("storage", "volume mount / file write"),
+                                      ("kill", "guard kills a stray holder")]):
+        cx, cy = 558 + (i // 4) * 214, 104 + (i % 4) * 24
         arrow([(cx, cy), (cx + 34, cy)], kind)
         text(cx + 42, cy + 4, what, size=10.2, colour="#333")
     zone(990, 72, 480, 120, "devai-lab-egress  (internal, no internet)", "#F4F8FD", "#8AA4C8")
@@ -126,84 +127,93 @@ def draw() -> str:
         "no GPU device; they talk only to the router (D1)"], fill="#E8F0FC", stroke=BLUE)
 
     # -------------------------------------------------------- devai-net
-    zone(20, 215, 1450, 625, "", "#FCFCF8", "#B9B08A")
+    zone(20, 215, 1450, 665, "", "#FCFCF8", "#B9B08A")
     text(1456, 234, "devai-net", size=12, weight="bold", colour="#333", anchor="end")
     box(40, 240, 460, 100, "devai-operator  (image + container)", [
         "web service: Apache + mod_wsgi, login over TLS",
-        "devai's scripts and their tools; target of operator jobs",
+        "devai-control: runs registered actions for jobs",
         "podman socket (its scripts); GPU when present (probes)"],
         fill="#FDF6EC", stroke=ORANGE, width=2.2)
     box(620, 240, 640, 90, "devai-router  (own unprivileged container, small image)", [
         ":11434 ollama    :11435 vllm    :11436 sglang    :11438 laya-trainer",
         "request path unchanged; launch layer = Slurm client (REST + self-signed JWT)",
-        "reads the GPU holder from Slurm; holds for bench jobs; no podman socket"],
+        "engine state from the bus; blocks engine control routes; no podman socket"],
         fill="#FFF3DC", stroke=ORANGE, width=2.2)
 
-    # devai-slurm: all of Slurm, one image, one container
+    # devai-slurm: all of Slurm and the bus, one image, one container
     zone(40, 360, 460, 470, "devai-slurm  (one image, one container)", "#F5F0FB", PURPLE)
-    text(54, 397, "privileged, --pid=host, podman socket; GPU (NVML) if present", size=10.2, colour=PURPLE)
+    text(54, 397, "--pid=host; GPU (NVML) if present; no podman socket", size=10.2, colour=PURPLE)
     cp = dict(fill="#EFE7F8", stroke=PURPLE)
+    bus = dict(fill="#E3F3F3", stroke=TEAL)
     box(60, 410, 420, 42, "slurmrestd  :6820", ["REST API v0.0.42, auth/jwt  (Slurm 24.11, Debian)"], **cp)
-    box(60, 475, 420, 60, "slurmctld", ["queue, priorities, holds; state -> jobs/slurmctld/"], width=2.2, **cp)
-    box(60, 560, 420, 40, "slurmdbd", ["accounting, job scripts, comments"], **cp)
-    cylinder(60, 620, 420, 70, "MariaDB  (Debian package)", ["data -> jobs/mariadb/"])
-    box(60, 712, 420, 108, "slurmd  --  the only node;  license engine:1", [
+    box(60, 470, 420, 42, "slurmctld", ["queue, priorities, holds; state -> jobs/slurmctld/"], width=2.2, **cp)
+    box(60, 530, 420, 40, "slurmdbd", ["accounting, job scripts, comments"], **cp)
+    cylinder(60, 586, 420, 60, "MariaDB  (Debian package)", ["data -> jobs/mariadb/"])
+    box(60, 662, 420, 56, "nats-server  :4222  --  the bus", [
+        "commands and state between containers",
+        "Debian 2.10.27; each user limited to its subjects"], width=2.2, **bus)
+    box(60, 734, 420, 86, "slurmd  --  the only node;  license engine:1", [
         "one engine / trainer / probe job at a time",
-        "job = podman exec <container> devai-run <jobid> ...",
-        "GPU host: guard (idle card, kill holder, or drain)",
+        "job = load, lease, unload through the bus (devai-bus)",
+        "GPU host: guard (unload, kill stray holder, or drain)",
         "   and sampler (NVML) -> results/<jobid>/gpu.json"], fill="#EDE3F7", stroke=PURPLE, width=2.2)
 
-    # backend containers, no Slurm
+    # backend containers: always running, no Slurm
     zone(580, 360, 440, 240, "devai-engines  (image + container; no Slurm)", "#EEF7EE", "#4F9A5A")
-    job = dict(fill="#E0F1E0", stroke="#4F9A5A")
-    box(600, 392, 400, 44, "ollama serve  :11434", ["Ollama, compiled here"], **job)
-    box(600, 444, 400, 44, "vLLM 0.28 + HyperQwen  :11435", ["own env; CUDA 13.1, compiled here"], **job)
-    box(600, 496, 400, 44, "SGLang 0.5.16  :11436", ["own env; sglang-kernel compiled for sm120"], **job)
-    text(610, 562, "idle until a job runs one engine with devai-run;", size=10.5, colour="#2E6A2E")
-    text(610, 577, "devai-kill stops it (TERM, then KILL)", size=10.5, colour="#2E6A2E")
+    eng = dict(fill="#E0F1E0", stroke="#4F9A5A")
+    box(600, 390, 400, 44, "ollama serve  :11434", ["always running; loads and unloads on a job's command"], **eng)
+    box(600, 440, 400, 44, "vLLM 0.28 + HyperQwen  :11435", ["one model process while loaded; sleep = fast path"], **eng)
+    box(600, 490, 400, 44, "SGLang 0.5.16  :11436", ["one model process while loaded; sleep = fast path"], **eng)
+    box(600, 540, 400, 48, "supervisord + devai-control", ["keeps the engines running; takes commands from the bus"], **bus)
     zone(1040, 360, 410, 240, "devai-laya-trainer  (own image; no Slurm)", "#EEF7EE", "#4F9A5A")
-    box(1060, 400, 370, 64, "trainer runs", ["one fine-tuning job per trainer job", "started with devai-run, stopped with devai-kill"], **job)
+    box(1060, 400, 370, 64, "trainer runs", ["one fine-tuning run per trainer job", "started and stopped by devai-control"], **eng)
+    box(1060, 540, 370, 48, "supervisord + devai-control", ["keeps the trainer running; bus commands"], **bus)
+
+    # the bus, drawn as a bar every devai-control hangs off
+    out.append(f'<path d="M30 855 H1440" fill="none" stroke="{TEAL}" stroke-width="5"/>')
+    out.append(f'<path d="M480 690 H490 V855" fill="none" stroke="{TEAL}" stroke-width="3"/>')
+    text(240, 874, "the bus: NATS in devai-slurm, :4222", size=11, weight="bold", colour=TEAL)
 
     # -------------------------------------------------- below devai-net
-    out.append(f'<path d="M58 870 h116 l18 18 v30 l-18 18 h-116 l-18 -18 v-30 z" fill="#FDECEC" stroke="{RED}" '
+    out.append(f'<path d="M58 905 h116 l18 18 v30 l-18 18 h-116 l-18 -18 v-30 z" fill="#FDECEC" stroke="{RED}" '
                f'stroke-width="1.6" stroke-dasharray="5 3"/>')
-    text(116, 895, "GPU process", size=11, weight="bold", colour=RED, anchor="middle")
-    text(116, 909, "outside Slurm", size=11, weight="bold", colour=RED, anchor="middle")
-    text(116, 922, "(not allowed)", size=10, colour=RED, anchor="middle")
-    box(240, 868, 280, 68, "podman service", ["host user, rootless", "reached through its socket"], fill="#F4F4F4")
-    gpu_box(1020, 872, 430, 58, "GPU 0  (optional)", ["RTX PRO 4000 Blackwell, 24 GB; without one: Ollama, trainer on CPU"])
-    zone(20, 958, 1450, 120, "/var/cache/devai   (host volumes)", "#F6F6F6", "#999999", label_dx=1060)
-    folder(40, 985, 480, 80, "jobs/   (new volume)", [
-        "results/<jobid>/  result.json, gpu.json, logs", "mariadb/  history database    slurmctld/  state"], width=2.2)
-    folder(580, 985, 240, 80, "model stores", ["ollama/ vllm/ sglang/ laya/", "+ vLLM parser plugins"])
-    folder(840, 985, 180, 80, "engine caches", ["FlashInfer, SGLang", "(named volumes)"])
+    text(116, 930, "GPU process", size=11, weight="bold", colour=RED, anchor="middle")
+    text(116, 944, "outside devai", size=11, weight="bold", colour=RED, anchor="middle")
+    text(116, 957, "(not allowed)", size=10, colour=RED, anchor="middle")
+    box(240, 903, 280, 68, "podman service", ["host user, rootless", "used only by devai-operator (15)"], fill="#F4F4F4")
+    gpu_box(960, 905, 480, 58, "GPU 0  (optional)", ["RTX PRO 4000 Blackwell, 24 GB; without one: Ollama, trainer on CPU"])
+    zone(20, 990, 1450, 125, "/var/cache/devai   (host volumes)", "#F6F6F6", "#999999", label_dx=1060)
+    folder(40, 1017, 480, 80, "jobs/   (new volume)", [
+        "results/<jobid>/  result.json, gpu.json, logs",
+        "mariadb/  history    slurmctld/  state    bus/  bus log"], width=2.2)
+    folder(580, 1017, 240, 80, "model stores", ["ollama/ vllm/ sglang/ laya/", "+ vLLM parser plugins"])
+    folder(840, 1017, 180, 80, "engine caches", ["FlashInfer, SGLang", "(named volumes)"])
 
     # ----------------------------------------------------------------- arrows
     arrow([(1100, 178), (1100, 240)], "data", 1, (1100, 207), "inference API; fine-tuning jobs on :11438", (1116, 211))
     arrow([(1000, 330), (1000, 360)], "data", 2, (1000, 345), "proxied requests to devai-engines:<port>", (988, 350),
           anchor="end", width=2.4)
     arrow([(620, 300), (540, 300), (540, 431), (480, 431)], "control", 3, (540, 380), width=2.2)
-    arrow([(270, 452), (270, 475)], "slurm", 4, (270, 463))
-    arrow([(60, 505), (48, 505), (48, 766), (60, 766)], "slurm", 5, (48, 640), both=True, width=2.2)
-    arrow([(270, 535), (270, 560)], "slurm", 6, (270, 547))
-    arrow([(270, 600), (270, 620)], "slurm")
-    arrow([(380, 820), (380, 868)], "slurm", 7, (380, 846), "podman socket (rw)", (396, 850), width=2.2)
-    arrow([(520, 900), (560, 900), (560, 615), (800, 615), (800, 600)], "slurm", 7, (560, 760), width=2.0)
-    arrow([(800, 615), (1245, 615), (1245, 600)], "slurm", width=2.0)
-    arrow([(560, 615), (560, 352), (470, 352), (470, 340)], "slurm", width=2.0)
-    text(1262, 632, "exec devai-run / devai-kill <jobid>", size=10.5, colour=PURPLE)
-    text(1262, 646, "(also into devai-operator)", size=10.5, colour=PURPLE)
-    arrow([(1000, 600), (1000, 850), (1060, 850), (1060, 872)], "gpu", 8, (1000, 780), width=2.4)
-    arrow([(1245, 600), (1245, 872)], "gpu", 8, (1245, 780), "CUDA (engines, trainer)", (1261, 784), width=2.4)
+    arrow([(270, 452), (270, 470)], "slurm", 4, (270, 461))
+    arrow([(60, 491), (48, 491), (48, 777), (60, 777)], "slurm", 5, (48, 640), both=True, width=2.2)
+    arrow([(270, 512), (270, 530)], "slurm", 6, (270, 521))
+    arrow([(270, 570), (270, 586)], "slurm")
+    arrow([(380, 734), (380, 718)], "bus", width=2.2)
+    arrow([(800, 855), (800, 588)], "bus", 7, (800, 720), "7, 17 in; 16 out", (812, 724), both=True, width=2.2)
+    arrow([(1150, 855), (1150, 588)], "bus", 7, (1150, 720), both=True, width=2.2)
+    arrow([(1030, 855), (1030, 330)], "bus", 16, (1030, 650), width=2.2)
+    arrow([(30, 855), (30, 300), (40, 300)], "bus", 17, (30, 560), both=True, width=2.2)
+    arrow([(980, 600), (980, 905)], "gpu", 8, (980, 760), width=2.4)
+    arrow([(1245, 600), (1245, 905)], "gpu", 8, (1245, 760), "CUDA (engines, trainer)", (1261, 764), width=2.4)
     arrow([(500, 262), (620, 262)], "data", 9, (560, 262), dashed=True)
     text(506, 236, "9: bench requests, holds", size=9.8, colour=BLUE)
     arrow([(400, 340), (400, 410)], "control", 10, (400, 375), "REST", (416, 379), width=2.0)
-    arrow([(125, 820), (125, 870)], "kill", 11, (125, 845))
-    arrow([(680, 985), (680, 602)], "storage", 12, (680, 800), "mounts", (696, 804))
-    arrow([(930, 985), (930, 602)], "storage", 12, (930, 800))
-    arrow([(225, 820), (225, 993)], "storage", 13, (225, 950), "results, DB, state", (160, 972), anchor="end")
+    arrow([(125, 820), (125, 905)], "kill", 11, (125, 885))
+    arrow([(680, 1017), (680, 602)], "storage", 12, (680, 800), "mounts", (696, 804))
+    arrow([(930, 1017), (930, 602)], "storage", 12, (930, 800))
+    arrow([(225, 820), (225, 1025)], "storage", 13, (225, 945), "results, DB, state, bus log", (212, 1006), anchor="end")
     arrow([(130, 170), (130, 240)], "data", 14, (130, 206), "HTTPS", (146, 210), width=2.0)
-    text(40, 355, "15: its scripts' podman calls go to the same socket (not drawn)", size=9.8, colour=GREY)
+    text(40, 355, "15: podman calls from its scripts (not drawn)", size=9.8, colour=GREY)
 
     out.append("</svg>")
     return "\n".join(out) + "\n"
