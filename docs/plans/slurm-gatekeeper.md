@@ -65,6 +65,8 @@ Writing a process manager for this in the router was the first idea; Slurm alrea
 
 ## Approach
 
+The full proposed architecture -- components, interfaces, flows, history, failure modes, with a diagram of every component and interaction -- is [docs/slurm.md](../slurm.md). This section is its summary.
+
 Slurm runs as containers on `devai-net` at fixed addresses: controller, REST daemon, accounting daemon + MariaDB, and one **node per backend**. A node is that backend's engine image with Slurm added (`slurmd`, the client tools, `tini`, devai's guard scripts); the engine runs as the job's own process, so Slurm's cgroup, signals and accounting cover it directly and no container runtime runs inside a container (D6). The node containers are permanent and keep what today's recreated engine containers get: the GPU, the model store, the engine-cache volumes. All nodes see the same GPU, so a cluster-wide license (`gpu0:1`) lets one GPU job hold it at a time. Nodes are configless: they fetch `slurm.conf`, `gres.conf` and `cgroup.conf` from the controller.
 
 Three kinds of job:
