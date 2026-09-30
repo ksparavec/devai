@@ -1,21 +1,18 @@
 # Slurm gatekeeper -- architecture
 
-**Status: proposed (2026-10-01), not built.** This is the design the phases of
+**Status: proposed (2026-09-30), not built.** This is the design the phases of
 [the plan](plans/slurm-gatekeeper.md) implement; the plan holds the operator's
-decisions (D1-D9) and the Phase 0 spike. **(measured)** marks what the spike or
-the follow-up checks measured on this host; everything else is proposal. Once
-built, this document is the source of truth for Slurm in devai, as
-[router.md](router.md) is for the router.
+decisions (D1-D11) and the Phase 0 spike. **(measured)** marks what the spike or
+the follow-up checks measured on this host; **(untested)** marks the parts the
+spike did not cover; everything else is proposal. Once built, this document is
+the source of truth for Slurm in devai, as [router.md](router.md) is for the
+router.
 
-This revision replaces the first one (2026-09-30), which ran one Slurm node per
-backend image. The operator judged that too many moving parts and set three
-rules (D7-D9): one version per backend, all backends in one Debian trixie
-image, and as few images as possible, following the parallel image-reduction
-proposal (only `debian:trixie` pulled from upstream; everything else built
-here). That removes most of what the first revision needed: several node
-containers, a cluster-wide GPU license, configless config, fixed addresses,
-per-distribution Slurm builds, and a race between one node's epilog and
-another node's prolog.
+This is the third layout. The first (one Slurm node per backend image) had far
+too many moving parts; the second put Slurm and every backend into one image.
+The operator then decided (D9-D10): the backends image carries **no Slurm at
+all**, and Slurm runs in its **own image and container**. A job therefore
+starts its process inside the backend's container with `podman exec`.
 
 ## 1. What changes
 
@@ -26,19 +23,20 @@ holds -- the failure that cost the re-bench of 2026-09-28 a day.
 
 Proposed:
 
-- **All backends live in one image, `devai-engines`**, run as **one privileged
-  container**. The same container runs Slurm -- controller, accounting
-  (with MariaDB), REST API and the node daemon -- as a single-node cluster.
-- **Slurm is the only thing that starts GPU work.** An engine is a Slurm job
-  that `exec`s the backend's server; Slurm runs one GPU job at a time, kills a
-  job's whole process tree on cancel, refuses to start on a card someone else
-  holds, queues and suspends work, and records every job with its GPU use.
-- **The router stays a separate, unprivileged container.** It is still the only
-  entry point for inference; its launch layer becomes a Slurm client.
-- **One version per backend** (D8). A model that does not run on its backend's
-  one version is dropped.
-- devai application containers (the lab and its agents) talk to the router and
-  never use the GPU (D1).
+- **Slurm is the only thing that starts GPU work.** It runs in one container,
+  `devai-slurm`: controller, accounting with MariaDB, REST API and the node
+  daemon, a single-node cluster whose node has one GPU. It therefore runs one
+  GPU job at a time, queues and suspends work, and records every job.
+- **Backends carry no Slurm.** `devai-engines` (Ollama, vLLM, SGLang; built by
+  the [image-reduction plan](plans/minimal-external-images.md)) and
+  `devai-laya-trainer` are permanent, idle containers. A Slurm job starts its
+  engine or training run inside them with `podman exec` and stops it the same
+  way.
+- **The router** stays a separate, unprivileged container and the only entry
+  point for inference; its launch layer becomes a Slurm client.
+- **The GPU guard** in `devai-slurm` checks the card before every GPU job and
+  kills or refuses anything that holds it.
+- **One version per backend, CUDA 13.1, everything compiled here** (D8, D11).
 
 ## 2. Architecture at a glance
 
@@ -51,263 +49,265 @@ Source: [`scripts/diagrams/slurm_architecture.py`](../scripts/diagrams/slurm_arc
 | # | From -> to | What | How | Status |
 |---|---|---|---|---|
 | 1 | lab agents -> router | inference (OpenAI, Anthropic, Ollama APIs); fine-tuning jobs on :11438 | HTTP, `devai-lab-egress` | unchanged |
-| 2 | router -> engine | proxied requests to `devai-engines:<port>` | HTTP, `devai-net` | measured (spike: a job's vLLM served over `devai-net`) |
-| 3 | router -> slurmrestd | submit, cancel, signal, job and node state | REST v0.0.44, JWT the router signs itself | measured |
-| 4 | slurmrestd -> slurmctld | the same, as Slurm RPC | inside the container, `auth/slurm` | measured |
-| 5 | slurmctld <-> slurmd | launch, signal, kill; slurmd runs each job's process in its own cgroup and accounts it (the jobs drawn inside the node) | inside the container | measured |
-| 6 | slurmctld -> slurmdbd -> MariaDB | accounting records | inside the container | measured |
-| 7 | engine job -> GPU | CUDA; the guard and accounting read NVML | device via CDI | measured |
-| 8 | workload job -> router | inference requests; hold / release | HTTP | requests measured; holds proposed (Sec. 6.3) |
-| 9 | operator -> Slurm, results | queue and history (REST); `scontrol suspend` / `resume`; result files | `devai-jobs` | proposed |
-| 10 | GPU guard -> stray process | SIGTERM, then SIGKILL; if still busy, drain | signals (`--pid=host`) | measured |
-| 11 | host volumes -> `devai-engines` | model stores, engine caches, parser plugins | mounts | measured (model store, FlashInfer cache) |
-| 12 | `devai-engines` -> `jobs/` | results, MariaDB files, controller state | files | proposed |
+| 2 | router -> engine | proxied requests to `devai-engines:<port>` | HTTP, `devai-net` | today's path, new host name |
+| 3 | router -> slurmrestd | submit, cancel, job and node state | REST v0.0.44, JWT the router signs itself | measured |
+| 4 | slurmrestd -> slurmctld | the same, as Slurm RPC | inside `devai-slurm` | measured |
+| 5 | slurmctld <-> slurmd | launch, signal, kill the job script; node health | inside `devai-slurm` | measured |
+| 6 | slurmctld -> slurmdbd -> MariaDB | accounting records | inside `devai-slurm` | measured |
+| 7 | job script -> podman -> target container | `podman exec <container> devai-run <jobid> ...`; `devai-kill <jobid> <signal>` | the host's podman socket | untested |
+| 8 | engine, trainer -> GPU | CUDA | device via CDI | measured (engines on this card today) |
+| 9 | workload -> router | inference requests; hold / release | HTTP | requests measured; holds proposed |
+| 10 | operator -> Slurm, results | queue and history (REST); `scontrol suspend` / `resume`; result files | `devai-jobs` | proposed |
+| 11 | GPU guard -> stray process | SIGTERM, then SIGKILL; if still busy, drain | signals (`--pid=host`) | measured |
+| 12 | host volumes -> containers | model stores, engine caches, the laya store | mounts | measured (model store, FlashInfer cache) |
+| 13 | `devai-slurm` -> `jobs/` | results, GPU samples, MariaDB files, controller state | files | proposed |
 
-## 3. The `devai-engines` image
+## 3. Containers and images
 
-Built here on `debian:trixie-slim`, the only upstream image (D9):
+| Container | Image | Holds | Privileges |
+|---|---|---|---|
+| `devai-slurm` | `devai-slurm` (new, built here on `debian:trixie-slim`) | slurmctld, slurmdbd, slurmrestd, MariaDB, slurmd, the GPU guard, the GPU sampler, a podman client | `--privileged --cgroupns=private --pid=host`; GPU via CDI (NVML only); the host's podman socket read-write |
+| `devai-engines` | `devai-engines` (image-reduction plan) | Ollama, vLLM 0.28 + HyperQwen, SGLang 0.5.16, each in its own env; `devai-run`, `devai-kill` | GPU via CDI |
+| `devai-laya-trainer` | `devai-laya-trainer` (its own image, as today; its base is the image-reduction plan's call) | the laya trainer; `devai-run`, `devai-kill` | GPU via CDI |
+| `devai-workload` | the lab image | bench and test clients | none; no GPU |
+| `devai-router` | its own small image | the router | none |
 
-| Part | Source | Where |
-|---|---|---|
-| Slurm 26.05.4, all daemons, with `gpu_nvml` | SchedMD source `slurm-26-05-4-1` (sha256 `0e522d39324b7b7da5e8096c678c4af00500ca4c3fe2e6da7e4f8d01f7082ec7`), SchedMD's own `debuild` step plus `libnvidia-ml-dev` (measured: builds on trixie) | Debian packages |
-| MariaDB 11.8, supervisor, tini | Debian trixie packages | system |
-| Ollama | our build (`make build-ollama-dist`) | `/usr/lib/ollama`, `/usr/bin/ollama` |
-| vLLM 0.28.0 + HyperQwen | our build (`make build-vllm-dist`), today's `vllm-devai` | venv `/opt/vllm` |
-| SGLang 0.5.16 | PyPI, hash-locked | venv `/opt/sglang` |
-| laya trainer | `laya-trainer/` + its lock | venv `/opt/laya` |
-| workload clients (bench, probe) | a hash-locked subset of the lab lock (inspect-ai ...) | venv `/opt/workload` |
-| nvcc and headers for FlashInfer's JIT | the host toolkit, as `Dockerfile.vllm` copies it today | `/usr/local/cuda` |
-| devai scripts | `deploy/engines/`: entrypoint, prolog, epilog, GPU guard | `/usr/local/lib/devai/` |
+No Slurm package is installed in `devai-engines`, `devai-laya-trainer` or the
+lab image; `devai-run` and `devai-kill` are two short devai shell scripts.
+`devai-engines` and `devai-laya-trainer` run `tini` and an idle loop as PID 1
+and do nothing until a job execs into them.
 
-Each engine keeps its own venv because each pins its own torch. The repo's
-`scripts/` are mounted read-only, so bench and probe code changes need no
-rebuild.
+### 3.1 `devai-slurm`
 
-**It replaces eight images and four planned ones:** `devai-ollama`,
-`devai/vllm-devai`, `vllm-openai` 0.22.1 / 0.25.1 / gemma, `lmsysorg/sglang`,
-`devai-laya-trainer` and its `nvidia/cuda` base; plus the
-three SchedMD images and `mariadb` the first revision planned. The inference
-stack then has two images: `devai-engines` and the router's (a static binary on
-an empty base, per the image-reduction proposal).
+- **Image:** devai's Slurm 26.05.4 build -- SchedMD's source
+  `slurm-26-05-4-1` (sha256
+  `0e522d39324b7b7da5e8096c678c4af00500ca4c3fe2e6da7e4f8d01f7082ec7`),
+  SchedMD's own `debuild` step plus `libnvidia-ml-dev` (measured: builds on
+  trixie) -- MariaDB 11.8, supervisor, tini and podman from Debian, and
+  devai's scripts in `/usr/local/lib/devai/`.
+- **Why each privilege:** `--privileged --cgroupns=private` gives slurmd the
+  cgroup control it needs (measured, rootless); `--pid=host` lets the guard and
+  the sampler see and signal GPU processes, whose PIDs NVML reports in the host
+  namespace (measured); the GPU device is there only for NVML (Slurm's GRES
+  detection, the guard, the sampler), no CUDA work runs here; the podman socket
+  is how jobs reach the backend containers.
+- **Entrypoint:** move the container's processes out of its cgroup root so
+  controllers can be delegated (without it slurmd stops with "Controller memory
+  is not enabled"; measured), then start supervisord, which runs MariaDB,
+  slurmdbd, slurmctld, slurmrestd and slurmd.
+- **Slurm configuration:** one node with `Gres=gpu:1` (`AutoDetect=nvml`) and
+  explicit `CPUs=` / `RealMemory=` (`slurmd -C` counts 8 of 24 CPUs; measured);
+  one partition; `auth/slurm` plus `auth/jwt`; `proctrack/cgroup`,
+  `task/cgroup` with `IgnoreSystemd=yes` and no `Constrain*` (`cpuset` is not
+  delegated here); `AccountingStoreFlags=job_comment,job_script`;
+  `KillWait=30`; `Prolog` / `Epilog` = the guard. MariaDB runs with
+  `--innodb-snapshot-isolation=OFF` (measured: 11.8's default makes slurmdbd
+  warn it will die on a write conflict).
+- **Ports on `devai-net`:** 6820 (slurmrestd). Nothing else is exposed.
 
-## 4. The `devai-engines` container
+## 4. How a job runs a process in another container (untested)
 
-| Setting | Value | Why |
-|---|---|---|
-| flags | `--privileged --cgroupns=private --pid=host`, GPU via CDI | cgroup control for slurmd (rootless is enough); NVML reports host PIDs; the guard must see and signal GPU holders (all measured) |
-| network | `devai-net` only | the lab reaches engines only through the router |
-| ports on `devai-net` | 11434 Ollama, 11435 vLLM, 11436 SGLang, 11438 laya trainer, 6820 slurmrestd | one fixed port per backend |
-| mounts | model stores (Ollama and laya read-write, vLLM / SGLang read-only), engine-cache volumes, vLLM parser plugins, `/var/cache/devai/jobs`, keys (read-only), repo `scripts/` (read-only) | |
-| PID 1 | `tini` -> entrypoint -> `supervisord` | |
+Every job script is a thin wrapper around two helpers that live in each target
+image:
 
-The entrypoint does three things, each needed in the spike: move the
-container's processes out of its cgroup root so controllers can be delegated
-(without it slurmd stops with "Controller memory is not enabled"); write the
-image environment to `/run/devai/node-env.sh`, which every job sources (a job
-gets only what its submitter passes: without it a REST-submitted vLLM job
-failed with `No module named 'vllm'`); start supervisord, which runs MariaDB,
-slurmdbd, slurmctld, slurmrestd and slurmd.
+- `devai-run <jobid> <command...>` starts `command` in a new process group,
+  records the group under `/run/devai/jobs/<jobid>` inside the container, and
+  waits for it; its exit status is the command's.
+- `devai-kill <jobid> <signal>` sends `signal` to that process group.
 
-**Slurm configuration, single node:** one node `engines` with `Gres=gpu:1`
-(`AutoDetect=nvml`) and explicit `CPUs=` / `RealMemory=` (`slurmd -C` counts 8
-of 24 CPUs; measured); one partition; `auth/slurm` plus `auth/jwt` for the REST
-API; `proctrack/cgroup`, `task/cgroup`, `jobacct_gather/cgroup` with
-`IgnoreSystemd=yes` and no `Constrain*` (`cpuset` is not delegated here);
-accounting TRES `gres/gpu,gres/gpumem,gres/gpuutil`;
-`AccountingStoreFlags=job_comment,job_script`; `KillWait=10`;
-`Prolog` / `Epilog` = the guard. MariaDB runs with
-`--innodb-snapshot-isolation=OFF` (measured: 11.8's default makes slurmdbd warn
-it will die on a write conflict).
-
-## 5. Jobs
-
-| Kind | GPU | Runs | Time limit | Submitted by |
-|---|---|---|---|---|
-| engine | `--gres=gpu:1` | `exec` the backend's server on its port | none (keep-warm) | router only |
-| trainer | `--gres=gpu:1` | the laya trainer on one fine-tuning job | `LAYA_MAX_HOLD_S` (900 s) | router (:11438 API) |
-| probe | `--gres=gpu:1` | the engine plus the prober client | 60 min | `make probe-*` |
-| workload | none | bench and test clients, from `/opt/workload` | bench: `--time=32 --signal=B:INT@120` | bench-sync, `devai-jobs`, make |
-
-**One GPU job at a time comes from the node having one GPU:** a second GPU job
-waits as `PENDING (Resources)` (measured). CPU-only workload jobs run beside
-it. Because there is one node, the node stays `COMPLETING` until the previous
-job's epilog has finished, so the next job's prolog always follows it (Slurm's
-documented behaviour; not measured here).
-
-Every job carries a JSON comment (kind, backend, model, context, MTP, hold,
-requester, git commit), recorded by slurmdbd; submitted through REST it arrives
-intact (measured).
-
-An **engine job script** is the launch the router builds today, as a script
-instead of a container spec (measured with the router's exact vLLM arguments
-for Qwen3.8-27B-W4A16-devai-AutoRound):
+An engine job script, as the router would submit it (the arguments are the
+router's launch configuration, as today):
 
 ```bash
 #!/bin/bash
-. /run/devai/node-env.sh
-export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 FLASHINFER_DISABLE_VERSION_CHECK=1
-exec /opt/vllm/bin/python3 -m vllm.entrypoints.openai.api_server \
-  --model /models/Qwen3.8-27B-W4A16-devai-AutoRound --host 0.0.0.0 --port 11435 \
-  --max-model-len 131072 --kv-cache-dtype fp8 --gpu-memory-utilization 0.93 ...
+C=devai-engines
+stop() { podman --remote exec "$C" devai-kill "$SLURM_JOB_ID" TERM
+         sleep 10; podman --remote exec "$C" devai-kill "$SLURM_JOB_ID" KILL; }
+trap stop TERM INT
+podman --remote exec "$C" devai-run "$SLURM_JOB_ID" \
+  /opt/vllm/bin/python3 -m vllm.entrypoints.openai.api_server \
+  --model /models/Qwen3.8-27B-W4A16-devai-AutoRound --port 11435 ... &
+wait $!
 ```
 
-`exec` makes the engine the job's own process, so Slurm's cgroup, signals and
-accounting cover it: `scancel` left no GPU process 0.23-0.30 s later, vLLM shut
-down gracefully, and Slurm recorded `gres/gpumem=21794M`, `gres/gpuutil=99-100`
-(measured).
+What follows from this, because Slurm now owns only the local `podman exec`
+client and not the engine:
 
-**GPU guard.** The prolog of every GPU job waits up to 10 s for an idle card
-(no compute process, at most 512 MiB used); if something still holds it, it
-sends the holder SIGTERM, then SIGKILL after 5 s (measured: it killed a PyTorch
-process in another container and the card returned to 2 MiB); if the card is
-still busy, or the holder belongs to another user, it exits 1, and Slurm drains
-the node and holds the job, so nothing starts on a busy card (measured). The
-prolog also deletes vLLM's compile cache (`/root/.cache/vllm`,
-`/tmp/torchinductor_*`): the container outlives its jobs, and a restart with
-that cache reached `/health` in 27-29 s instead of 95 s (measured) -- the cache
-docs/router.md says must not persist, because it under-measures activation
-memory and OOM-killed engines on 2026-09-23. Prolog and epilog read NVML's
-energy counter (Slurm reads none on NVIDIA; measured) into
-`results/<jobid>/gpu.json`.
+| Concern | Who does it |
+|---|---|
+| start | the job script, through `podman exec` |
+| cancel (`scancel`, time limit) | Slurm signals the job script; its trap runs `devai-kill ... TERM`, then `KILL`. `KillWait` (30 s) must exceed the trap's 10 s. The epilog repeats `devai-kill ... KILL` as a backstop |
+| engine exits by itself | `devai-run` returns its status; `podman exec` returns it; the job ends with it |
+| suspend / resume | `devai-jobs`: `scontrol suspend` (Slurm's state and clock) **and** `devai-kill ... STOP`; resume is `CONT` then `scontrol resume`. Slurm's own suspend freezes only the local client |
+| GPU memory and utilisation | a sampler started by the prolog polls NVML every 5 s and writes `results/<jobid>/gpu.json`; the epilog stores its peak and mean in the job's `AdminComment`. There is one GPU job at a time, so the whole card is the job's |
+| GPU energy | NVML's energy counter at prolog and epilog (Slurm reads none on NVIDIA; measured) |
 
-## 6. Router
+The spike measured the other model, the engine as the job's own process on a
+Slurm node (`scancel` freed the GPU in 0.23-0.30 s; Slurm accounted
+`gres/gpumem=21794M`). None of the exec path has been run yet: whether
+`podman exec` passes the exit status and survives a long run, what it adds to
+start-up, and whether the trap, the kill helpers and the sampler behave as
+described.
 
-### 6.1 What changes in it
+## 5. Jobs
+
+| Kind | GPU | Target container | Runs | Time limit | Submitted by |
+|---|---|---|---|---|---|
+| engine | `--gres=gpu:1` | `devai-engines` | the backend's server on its port (11434 Ollama, 11435 vLLM, 11436 SGLang) | none (keep-warm) | router only |
+| trainer | `--gres=gpu:1` | `devai-laya-trainer` | one fine-tuning job | `LAYA_MAX_HOLD_S` (900 s) | router (:11438 API) |
+| probe | `--gres=gpu:1` | `devai-engines` | the engine plus the prober client | 60 min | `make probe-*` |
+| workload | none | `devai-workload` | bench and test clients | bench: `--time=32 --signal=B:INT@120` | bench-sync, `devai-jobs`, make |
+
+One node with one GPU means a second GPU job waits as `PENDING (Resources)`
+(measured), and the node stays `COMPLETING` until a job's epilog has finished,
+so the next GPU job's prolog always follows it (Slurm's documented behaviour).
+Every job carries a JSON comment (kind, backend, model, context, MTP, hold,
+requester, git commit); submitted through REST it arrives intact (measured).
+
+## 6. GPU guard
+
+The prolog of every GPU job, in `devai-slurm`:
+
+1. waits up to 10 s for an idle card (no compute process, at most 512 MiB
+   used);
+2. otherwise sends each holder SIGTERM, then SIGKILL after 5 s (measured from a
+   privileged container with `--pid=host`: a PyTorch process in another
+   container died and the card went back to 2 MiB);
+3. if the card is still busy, or a holder belongs to another user, exits 1:
+   Slurm drains the node and holds the job, so nothing starts on a busy card
+   (measured);
+4. for vLLM jobs, deletes vLLM's compile cache inside `devai-engines`
+   (`/root/.cache/vllm`, `/tmp/torchinductor_*`): the container outlives its
+   jobs, a restart with that cache reached `/health` in 27-29 s instead of 95 s
+   (measured), and docs/router.md explains why it must not persist -- it
+   under-measures activation memory and OOM-killed engines on 2026-09-23;
+5. starts the GPU sampler and reads the energy counter.
+
+The epilog stops the sampler, writes `gpu.json`, kills any leftover of the job
+(`devai-kill ... KILL`) and checks the card is idle again; if not, it exits 1
+and the node drains. With one node this check cannot race the next job.
+
+## 7. Router
 
 The request path stays: listeners, override parsing, API normalisation,
-reasoning policy, tool stripping, admission, SSE keepalive, drain, the
-mutation guard, and the launch configuration it computes from the probe caches.
-The launch layer is replaced: no more podman API calls (`containerRecreate`,
-`stopOtherBackends`, `unloadOllama`, `backendVanished`, the job-runner hold);
-instead a Slurm client and one GPU record, rebuilt from Slurm on boot and
-refreshed on every decision. The router signs its own HS256 JWT with the shared
-key (measured: slurmrestd accepts it), so there are no token files.
+reasoning policy, tool stripping, admission, SSE keepalive, drain, the mutation
+guard, and the launch configuration it computes from the probe caches. The
+podman launch layer goes (`containerRecreate`, `stopOtherBackends`,
+`unloadOllama`, `backendVanished`, the job-runner hold), and with it the
+router's podman socket, which moves to `devai-slurm`. Instead: a Slurm client
+and one GPU record, rebuilt from Slurm on boot and refreshed on every decision.
+The router signs its own HS256 JWT with the shared key (measured: slurmrestd
+accepts it).
 
-| Router needs | REST call |
-|---|---|
-| start / stop a GPU job | `POST /slurm/v0.0.44/job/submit`, `DELETE /slurm/v0.0.44/job/{id}` |
-| pause / continue a workload | `DELETE .../job/{id}?signal=SIGSTOP` / `SIGCONT` (measured) |
-| job state, node reason | `GET .../job/{id}`, `GET .../jobs/`, `GET .../node/engines` |
-| history | `GET /slurmdb/v0.0.44/jobs/` |
+A request that needs an engine:
 
-REST has no suspend operation (checked in its OpenAPI spec). True suspend, which
-also stops the job's clock, is `scontrol suspend`, run by `devai-jobs`.
+1. the right engine job is running and healthy: proxy;
+2. it is pending or starting: wait, with SSE keepalive;
+3. the GPU holds something else: a trainer job, or an engine bound to an active
+   hold, gets the client a 503 with `Retry-After`; an ordinary engine is
+   drained, cancelled and replaced;
+4. the new job is refused by the guard: cancel it and return 503 naming the
+   holder, without charging the launch breaker, and resubmit rather than
+   release (Slurm delays a released job by about 2 minutes; measured); it dies
+   before it is healthy: 502 with the tail of its log, breaker charged.
 
-### 6.2 A request that needs an engine
-
-1. The right engine job is running and healthy: proxy.
-2. It is pending or starting: wait, with SSE keepalive.
-3. The GPU holds something else: a trainer job or an engine bound to an active
-   hold gets the client a 503 with `Retry-After`; an ordinary engine is
-   drained, cancelled and replaced.
-4. The submitted job waits for the previous one to finish (pending, keepalive);
-   is refused by the guard (the router cancels it and returns 503 naming the
-   holder, without charging the launch breaker -- it resubmits rather than
-   releasing, because Slurm delays a released job by about 2 minutes;
-   measured); runs (the router polls `/health`); or dies before it is healthy
-   (502 with the tail of its log; the breaker is charged).
-
-Measured: submit to running 1.0-1.26 s; the 27B engine healthy 95 s after
-submit on a cold start; after cancelling vLLM the next engine job ran 1.2 s
-later and answered at 2.8 s.
-
-### 6.3 Holds
-
-A workload keeps its engine for its whole run through a small router API:
+**Holds.** A workload keeps its engine for its whole run:
 `POST /devai/v1/holds {job_id, model}` starts or keeps the engine and answers
 when it is healthy; `DELETE /devai/v1/holds/{job_id}` releases it. A hold is
-active while its workload job runs, paused while the job is suspended, and
-dropped by the router when the job ends. The workload's inference requests are
-ordinary requests.
+active while its workload job runs, paused while it is suspended, and dropped
+when the job ends.
 
-## 7. Flows
+Measured timings that carry over: REST submit to running 1.0-1.3 s; the 27B
+engine healthy about 95 s after a cold start.
 
-- **Switch.** Drain the current engine, cancel its job, submit the new one; the
-  guard checks the card; the engine starts.
-- **Bench.** One workload job per (model, task): take a hold, run the task,
+## 8. Flows
+
+- **Switch:** drain the current engine, cancel its job (the trap kills the
+  engine), submit the new one; the guard checks the card; the engine starts.
+- **Bench:** one workload job per (model, task): take a hold, run the task,
   write `result.json`, release. At 30 minutes Slurm sends SIGINT and the job
-  scores the unbroken prefix, as `harvest_truncated.py` does today. Two benches
-  cannot overlap: the second one's hold waits.
-- **Interrupt, same engine** (D1): `scontrol suspend` the workload, run the
-  quick job, `scontrol resume` -- 2.9 s in all (measured; 20/20 requests, no
-  retries).
+  scores the unbroken prefix, as `harvest_truncated.py` does today.
+- **Interrupt, same engine** (D1): suspend the workload, run the quick job,
+  resume.
 - **Interrupt, another engine:** suspend the workload, run the quick job on its
-  engine, re-take the workload's hold (the engine switches back), resume --
-  38 s measured with a warm compile cache; about 95 s for the 27B once the
-  prolog wipes it.
-- **Restarts.** Router: rebuilds its record from Slurm; engines keep serving,
-  because requests never pass through Slurm. `devai-engines`: running jobs die
-  with it and the card is freed; the controller's state and the history are on
-  the `jobs` volume.
+  engine, re-take the workload's hold (the engine switches back), resume.
+- **Restarts:** the router rebuilds its record from Slurm, and engines keep
+  serving meanwhile; if `devai-slurm` restarts, running jobs lose their script
+  and the epilog never runs, so the entrypoint kills every process group under
+  `/run/devai/jobs` in the target containers before slurmd starts; if a target
+  container restarts, its engine dies and its job fails.
 
-## 8. History
+## 9. History
 
 slurmdbd keeps every job: times, state, exit code, suspended time, the comment,
-the job script, and GPU memory and utilisation (measured). Each job's
-`/var/cache/devai/jobs/results/<jobid>/` holds its log, `result.json` (written
-by the job), `gpu.json` (energy) and artifacts. `devai-jobs` (devai-tools)
-joins the two: `devai-jobs list --since yesterday`, `show <id>`, `queue`,
-`cancel`, `hold` / `release`, `suspend` / `resume`, `interrupt`. The bench
-leaderboard stays and records each task's job id.
+the job script, and the GPU summary the epilog puts in `AdminComment`. Each
+job's `/var/cache/devai/jobs/results/<jobid>/` holds its log, `result.json`
+(written by the job), `gpu.json` (samples, peak, mean, energy) and artifacts.
+`devai-jobs` (devai-tools) joins the two: `devai-jobs list --since yesterday`,
+`show <id>`, `queue`, `cancel`, `hold` / `release`, `suspend` / `resume`,
+`interrupt`. The bench leaderboard stays and records each task's job id.
 
-## 9. Configuration
+## 10. Configuration
 
-In the repository: `deploy/engines/Dockerfile`, `slurm.conf`, `gres.conf`,
-`cgroup.conf`, `slurmdbd.conf.in`, `supervisord.conf`, the entrypoint and guard
-scripts. Generated once by `make engines-init`, never committed:
+In the repository, `deploy/slurm/`: the Dockerfile, `slurm.conf`, `gres.conf`,
+`cgroup.conf`, `slurmdbd.conf.in`, `supervisord.conf`, the entrypoint, the
+guard and the sampler. `devai-run` and `devai-kill` go into the engines and
+trainer images. Generated once by `make slurm-init`, never committed:
 `~/.config/devai/slurm/slurm.key`, `jwt_hs256.key` and the MariaDB password
 (mode 0600; backed up by `devai-backup`).
 
-## 10. Failure modes
+## 11. Failure modes
 
 | Failure | Effect | Handling |
 |---|---|---|
 | a Slurm daemon exits | supervisord restarts it; warm engines keep serving | the router answers 503 while it cannot launch |
 | MariaDB or slurmdbd down | jobs run; history is delayed | slurmctld spools the records |
 | GPU held outside Slurm | killed by the guard, or node drained | 503 naming the holder |
-| engine crashes | job fails; card freed with its cgroup | next request relaunches (breaker) |
-| process stuck in the driver | job stays `COMPLETING` | `UnkillableStepTimeout` drains the node |
-| `devai-engines` restarts | running jobs lost; card freed | router resubmits on demand |
+| engine crashes | `devai-run` returns non-zero; the job fails | next request relaunches (breaker) |
+| job script killed before its trap ran | the engine keeps running | the epilog's `devai-kill ... KILL`, then the idle check |
+| `devai-slurm` restarts | job scripts gone, engines orphaned | the entrypoint kills recorded process groups first |
+| a target container restarts | its engine dies; the job fails | router resubmits on demand |
 
-**Security.** `devai-engines` is privileged (in the user namespace), shares
-the host PID namespace and holds the GPU: it can signal every process of the
-devai user, which the guard needs. That is why the router, which handles the
-lab's traffic, stays out of it. Nothing new is published to the LAN; the JWT
-key and `slurm.key` are the secrets that matter.
+## 12. Security
 
-## 11. From today to this
+- `devai-slurm` holds the host's podman socket read-write, which is equivalent
+  to the devai user on the host, and runs whatever job scripts it is given. So
+  **anyone who can submit a job controls the host user**: the JWT key and
+  `slurm.key` are as sensitive as that user's login. Only the router (read-only
+  mount) and `devai-jobs` (0600 host file) get the JWT key. The router no
+  longer holds the socket.
+- `devai-slurm` is on `devai-net` only; the lab cannot reach slurmrestd.
+- The backend containers are unprivileged apart from the GPU; nothing new is
+  published to the LAN.
 
-| Today | Proposed |
-|---|---|
-| 5 engine containers, recreated per model by the router | 1 `devai-engines` container, permanent |
-| 8 engine images (with the trainer's CUDA base), 3 distributions | 1 image, Debian trixie |
-| stock vLLM 0.22.1 and vllm-devai 0.28 on two ports, plus 2 per-model images | one vLLM, 0.28 + HyperQwen, on :11435; :11437 retired |
-| the router trusts its own flags about the GPU | the router reads the GPU holder from Slurm |
-| no check that the card is free | the prolog guard |
-| laya busy hold in the router | trainer jobs |
-| bench clean slate and deadline in `bench-sync.py` | workload jobs, time limit, holds |
-| probers start engine containers | probe jobs |
-| results scattered | slurmdbd + `jobs/results/` + `devai-jobs` |
-| lab containers have the GPU | no GPU device in the lab |
+## 13. From today to this, and who does what
 
-**Models:** every vLLM row is re-probed on 0.28 and every SGLang row on the
-image's SGLang; a model that fails is dropped. That covers the rows probed only
-on stock 0.22.1, and the two models that needed their own image today
-(Nemotron-Nano-9B-v2 on 0.25.1, diffusiongemma on the gemma build).
+| Today | Proposed | Done by |
+|---|---|---|
+| 5 engine containers recreated per model by the router | `devai-engines` (permanent) + `devai-laya-trainer` | image-reduction plan (image); this plan (permanent run, helpers) |
+| 8 engine images, 3 distributions, stock builds | one engines image, trixie, CUDA 13.1, compiled here | image-reduction plan |
+| vllm and vllm-devai on 11435 / 11437 | one `vllm` backend on 11435 | image-reduction plan |
+| the router holds the podman socket and recreates containers | `devai-slurm` holds the socket; the router is a Slurm client | this plan |
+| no check that the card is free | the prolog guard | this plan |
+| laya busy hold in the router | trainer jobs | this plan |
+| bench clean slate and deadline in `bench-sync.py` | workload jobs, time limit, holds | this plan |
+| probers start engine containers | probe jobs | this plan |
+| results scattered | slurmdbd + `jobs/results/` + `devai-jobs` | this plan |
+| lab containers have the GPU | no GPU device in the lab | this plan |
 
-## 12. Open points
+The re-probe on the single backend versions, and dropping what fails, belong to
+the image-reduction plan.
 
-1. **SGLang 0.5.16 from PyPI on trixie** is not tested; the upstream image
-   carries extras beyond its pip dependencies (the image-reduction proposal
-   flags this). Keep SGLang only if it passes the re-probe?
-2. **The laya trainer without system CUDA** (its base is `nvidia/cuda` Ubuntu
-   today): not tested.
-3. **Python versions:** vLLM's venv uses Debian's Python 3.13; SGLang, laya and
-   the workload clients may need 3.14 from uv. Not yet resolved.
-4. **Which models survive** one vLLM and one SGLang version: known only after
-   the re-probe.
-5. **inspect's clock during a suspend:** its per-sample limit keeps running;
-   suspend between samples, or accept it. To be measured.
-6. **The laya trainer's internals** move from its HTTP controller to Slurm
+## 14. Open points
+
+1. **The exec path** (Sec. 4) is untested end to end: exit status, long runs,
+   start-up overhead, the trap and kill helpers, suspend through `STOP` /
+   `CONT`, the sampler. It is the first thing Phase 1 tests.
+2. **inspect's clock during a suspend:** its per-sample limit keeps running;
+   suspend between samples, or accept it.
+3. **`devai-workload` as a permanent container from the lab image** is a new
+   container, though not a new image. The alternative, running workloads in the
+   operator's own lab container, gives Slurm no fixed target.
+4. **The laya trainer's internals** move from its HTTP controller to trainer
    jobs; its API toward aiagent does not change, but the aiagent session should
    agree.

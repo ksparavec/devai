@@ -118,7 +118,7 @@ found three more findings.
 | [router-fanout](./router-fanout.md)                                 | Draft             |
 | [laya-trainer](./laya-trainer.md)                                   | In Progress       |
 | [library-service](./library-service.md)                             | Draft             |
-| [slurm-gatekeeper](./slurm-gatekeeper.md)                           | In Progress (Phase 0 done; design revised 2026-10-01) |
+| [slurm-gatekeeper](./slurm-gatekeeper.md)                           | In Progress (Phase 0 spike) |
 | [sops-age-secrets](./sops-age-secrets.md)                           | Non-functional    |
 | [skypilot-agent-skill](./skypilot-agent-skill.md)                   | Frozen            |
 | [gpu-arbiter-cluster-mode](./gpu-arbiter-cluster-mode.md)           | **Frozen**        |
