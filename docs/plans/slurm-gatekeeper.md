@@ -4,7 +4,7 @@ _Slurm, in containers, becomes the only thing that starts GPU work in devai; the
 
 ## Status
 
-Draft. Third layout proposed 2026-09-30 (D7-D12); nothing of it is built or tested yet. An earlier spike (2026-09-29) tested two layouts since discarded and is obsolete (see Context).
+Draft. Third layout proposed 2026-09-30 (D7-D14); nothing of it is built or tested yet. An earlier spike (2026-09-29) tested two layouts since discarded and is obsolete (see Context).
 
 ## Dependencies
 
@@ -46,15 +46,17 @@ The first architecture (one Slurm node per backend image) was judged far too com
 - **D8 -- One version per backend.** One vLLM (0.28.0 + HyperQwen), one SGLang, one Ollama, one laya trainer; a model that does not run on its backend's version is dropped. One vLLM backend, `vllm` on 11435; `vllm-devai` and 11437 are retired.
 - **D9 -- The backends live in one Debian trixie image, `devai-engines`, with no Slurm in it.** The laya trainer keeps its own image, also without Slurm.
 - **D10 -- All of Slurm -- slurmctld, slurmdbd, slurmrestd, MariaDB and slurmd -- in one image, `devai-slurm`, run as one container.** A job starts its process inside the backend's container with `podman exec`. Chosen over putting slurmd into the backends (the trade-off: Slurm then owns only the `podman exec` client, not the engine).
-- **D12 -- Slurm from Debian trixie's own packages** (2026-09-30): `slurmctld`, `slurmd`, `slurmdbd`, `slurmrestd`, `slurm-wlm-jwt-plugin`, `slurm-wlm-mysql-plugin`, version 24.11.5; no source build. Slurm no longer accounts GPUs itself (D10), so it needs no NVML build, and nothing in the design needs 26.05.
+- **D12 -- Slurm from Debian trixie's own packages** (2026-09-30): `slurmctld`, `slurmd`, `slurmdbd`, `slurmrestd`, `slurm-wlm-jwt-plugin`, `slurm-wlm-mysql-plugin`, version 24.11.5; no source build. Slurm no longer accounts GPUs itself (D10), so it needs no NVML build, and nothing in the design needs 26.05. The current build is `24.11.5-4+deb13u1` from `trixie-security`, so the image keeps that suite enabled.
 - **D11 -- CUDA 13.1 only, everything compiled here** (the engines and their own CUDA kernels; torch, FlashInfer, Triton stay pinned, hash-locked PyPI packages). SGLang 0.5.16 is compiled here, with `sglang-kernel` built for sm120. (Recorded in the image-reduction session and relayed from there.)
+- **D13 -- A suspended bench task is re-run, not continued** (2026-09-30). inspect's per-sample clock would keep running through a suspend and score the samples in flight as wrong, so a bench job is not frozen: suspending it cancels the running task and submits the same task again, held; resuming releases it, and the task starts again from its first sample. The cancelled attempt stays in the history with its log and is not scored. Tasks already finished are kept (one job per model and task).
+- **D14 -- The laya trainer's jobs become Slurm trainer jobs** (2026-09-30, agreed by the owner for devai and aiagent). Its fine-tuning API toward aiagent on :11438 does not change.
 
 ## Open questions
 
 1. ~~Where does an engine run?~~ In the backend's own container, started by the job with `podman exec` (D9, D10).
 2. Does the exec path hold up: exit status, long runs, start-up overhead, the trap and kill helpers, suspend through `STOP` / `CONT`, the GPU sampler? -- Phase 1 tests it first.
 3. ~~Slurm from Debian's packages or built from source?~~ Debian's packages, 24.11.5 (D12).
-4. inspect's per-sample clock keeps running while a bench is suspended: suspend between samples, or accept it?
+4. ~~inspect's per-sample clock during a suspend?~~ A suspended bench task is re-run from its first sample (D13).
 5. ~~A `devai-workload` container?~~ No: bench and test runs are operator actions, run as jobs in `devai-operator` ([Plan: devai-operator](./devai-operator.md)).
 
 ## Context

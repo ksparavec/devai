@@ -2,7 +2,7 @@
 
 **Status: proposed (2026-09-30), not built.** This is the design the phases of
 [the plan](plans/slurm-gatekeeper.md) implement; the plan holds the operator's
-decisions (D1-D12). **(measured)** marks a fact measured on this host in an
+decisions (D1-D14). **(measured)** marks a fact measured on this host in an
 earlier spike (2026-09-29); that spike tested two layouts since discarded and is
 obsolete, so only facts that do not depend on the layout are marked this way.
 The spike ran Slurm 26.05.4; the design now uses Debian's 24.11.5 (D12), which
@@ -261,6 +261,12 @@ engine healthy about 95 s after a cold start.
   resume.
 - **Interrupt, another engine:** suspend the bench job, run the quick job on its
   engine, re-take the bench's hold (the engine switches back), resume.
+- **Suspending a bench job** (D13) does not freeze it, because inspect's
+  per-sample clock would keep running: the running task is cancelled and the
+  same task is submitted again, held; resume releases it and the task starts
+  again from its first sample. The cancelled attempt keeps its log and is not
+  scored. Whether a released job starts without delay is untested (a requeued
+  job waited about 130 s in the spike, which is why this resubmits instead).
 - **Restarts:** the router rebuilds its record from Slurm, and engines keep
   serving meanwhile; if `devai-slurm` restarts, running jobs lose their script
   and the epilog never runs, so the entrypoint kills every process group under
@@ -337,12 +343,13 @@ the image-reduction plan.
 1. **The exec path** (Sec. 4) is untested end to end: exit status, long runs,
    start-up overhead, the trap and kill helpers, suspend through `STOP` /
    `CONT`, the sampler. It is the first thing Phase 1 tests.
-2. **inspect's clock during a suspend:** its per-sample limit keeps running;
-   suspend between samples, or accept it.
+2. ~~inspect's clock during a suspend~~ -- a suspended bench task is re-run
+   from its first sample (D13).
 3. ~~A `devai-workload` container for bench and test clients~~ -- not needed:
    they are operator actions, run as jobs in `devai-operator`.
-4. **The laya trainer's internals** move from its HTTP controller to trainer
-   jobs; its API toward aiagent does not change, but the aiagent session should
-   agree.
+4. ~~The laya trainer's internals~~ -- they move from its HTTP controller to
+   trainer jobs; its API toward aiagent does not change. Agreed by the owner
+   (D14).
 5. **Debian's Slurm 24.11.5 has not been run** here (D12); the spike ran
-   26.05.4. Phase 1 starts it before anything else.
+   26.05.4. Only its packages' contents were read (`apt-get download`,
+   `dpkg -c`). Phase 1 starts it before anything else.

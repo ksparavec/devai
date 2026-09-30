@@ -4,7 +4,7 @@ _A web service, in its own image and container, that offers everything the Makef
 
 ## Status
 
-Draft (2026-09-30). Decisions O1-O8 below are the operator's. Nothing is built.
+Draft (2026-09-30). Decisions O1-O9 below are the operator's. Nothing is built.
 
 ## Dependencies
 
@@ -34,12 +34,13 @@ Draft (2026-09-30). Decisions O1-O8 below are the operator's. Nothing is built.
 - **O6 -- On the LAN, behind a login.** HTTPS on a published LAN port (as Open WebUI's proxy was on :8443), TLS with mkcert certificates or a self-signed fallback.
 - **O7 -- One operator account,** an Apache htpasswd entry created by the init action.
 - **O8 -- Go and Rust as pinned upstream downloads** in the image, each checked against its published checksum: Go >= 1.26 (Debian has 1.24) and the rustup toolchain vLLM's `rust-toolchain.toml` names (Debian has rustc 1.85).
+- **O9 -- Compose from Docker, pinned.** Docker's `docker-compose-plugin` from Docker's own apt repository (`https://download.docker.com/linux/debian`, suite `trixie`, component `stable`), pinned at `5.1.0-1~debian.13~trixie`, the version this host runs today. The repository key is accepted only with Docker's fingerprint `9DC8 5822 9FC7 DD38 854A E2D8 8D81 803C 0EBF CD88`; apt then checks the package against the signed index. The package installs `/usr/libexec/docker/cli-plugins/docker-compose`, and the image's `containers.conf` names that path in `compose_providers`, so `podman compose` does not depend on a search order.
 
 ## Open questions
 
 1. ~~Exposure?~~ LAN, HTTPS, login (O6).
 2. ~~How many accounts?~~ One (O7).
-3. Compose provider: `podman compose` hands off to an external provider, on this host `/usr/local/bin/docker-compose` v5.1.0, which is not a Debian package. Debian's `docker-compose` or `podman-compose` package, or a pinned binary like Go and Rust (O8)?
+3. ~~Compose provider?~~ Docker's compose plugin, pinned (O9).
 4. ~~Go and Rust?~~ Pinned upstream downloads with checksums (O8).
 
 ## Context
@@ -51,7 +52,7 @@ Everything devai can do is a Makefile target run in a host shell: 124 documented
 **One image, `devai-operator`,** on the pinned `debian:trixie-slim`, holding what the scripts call today (measured by grepping the Makefile's recipes, 2026-09-30):
 
 - Apache, mod_wsgi, Flask (Debian `python3-flask` 3.1.1) -- the web service;
-- `python3`, `uv`, `git`, `curl`, `make`, podman (client) and a compose provider -- the tools the scripts use;
+- `python3`, `uv`, `git`, `curl`, `make`, podman (client) and Docker's compose plugin (O9) -- the tools the scripts use;
 - for the from-source builds: `cmake`, `ninja`, CUDA 13.1 `nvcc` and headers from NVIDIA's debian13 apt repository, Go and Rust as pinned downloads (O8).
 
 **One container,** on `devai-net`:
