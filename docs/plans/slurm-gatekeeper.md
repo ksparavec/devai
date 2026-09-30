@@ -8,7 +8,7 @@ In Progress -- Phase 0 (spike) done 2026-09-29. **Design revised 2026-09-30 (D7-
 
 ## Dependencies
 
-- [Plan: minimal-external-images](./minimal-external-images.md) -- builds `devai-engines` (Ollama, vLLM 0.28 + HyperQwen, SGLang 0.5.16; CUDA 13.1; everything compiled here; no Slurm), switches today's router to it, renames `vllm-devai` to `vllm`, and re-probes the fleet. This plan adds Slurm around it.
+- [Plan: minimal-external-images](./minimal-external-images.md) -- builds `devai-engines` (Ollama, vLLM 0.28 + HyperQwen, SGLang 0.5.16; CUDA 13.1; everything compiled here; no Slurm), switches today's router to it, renames `vllm-devai` to `vllm`, and re-probes the fleet. This plan adds Slurm around it. Its decisions M9-M13 apply here too: Open WebUI and MCP dropped, AMD/ROCm and the sops/age scaffold to the attic, one digest-pinned `debian:trixie-slim` for every image.
 
 ## Enables / Unblocks
 
@@ -157,7 +157,7 @@ Open questions 1-4 are answered.
 
 ## Phase 1 -- devai-slurm and the exec path
 
-First S8: a job that execs an engine into a stand-in container, is cancelled, times out, is suspended and resumed, and whose GPU use the sampler records. Then `deploy/slurm/`: the Dockerfile (devai's Slurm packages, MariaDB, supervisor, podman), Slurm and supervisord config, the entrypoint, the guard and the sampler; `devai-run` / `devai-kill` in the engines and trainer images (a coordinated change to the image-reduction plan's Dockerfiles); `make build-slurm`, `make slurm-init` (keys, MariaDB password), the `/var/cache/devai/jobs` volume, backups. Exit: an engine job starts and stops through `podman exec`, its GPU summary appears in `sacct`, and a stray GPU holder is killed or drains the node.
+First S8: a job that execs an engine into a stand-in container, is cancelled, times out, is suspended and resumed, and whose GPU use the sampler records. Then `deploy/slurm/`: the Dockerfile (devai's Slurm packages, MariaDB, supervisor, podman), Slurm and supervisord config, the entrypoint, the guard and the sampler; `devai-run` / `devai-kill` (source in `deploy/slurm/`) and their COPY lines in `deploy/Dockerfile.engines` and `deploy/Dockerfile.laya-trainer` (agreed with the image-reduction plan: its Phase 4, step 4c); the image on the one pinned `debian:trixie-slim` variable (its M13); `make build-slurm`, `make slurm-init` (keys and MariaDB password as plain 0600 files; no sops, which goes to the attic, M12), the `/var/cache/devai/jobs` volume, backups. Exit: an engine job starts and stops through `podman exec`, its GPU summary appears in `sacct`, and a stray GPU holder is killed or drains the node.
 
 ## Phase 2 -- Router as Slurm client
 
@@ -169,7 +169,7 @@ Bench (the 30-minute limit as a Slurm time limit), probes and the laya trainer a
 
 ## Phase 4 -- History
 
-The result format, `devai-jobs`, optionally an MCP tool. The bench leaderboard records each task's job id. Exit: "what happened yesterday" is one command.
+The result format and `devai-jobs` (no MCP tool: the image-reduction plan drops MCP, M10). The bench leaderboard records each task's job id. Exit: "what happened yesterday" is one command.
 
 ## Phase 5 -- Cleanup
 

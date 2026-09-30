@@ -66,7 +66,7 @@ Source: [`scripts/diagrams/slurm_architecture.py`](../scripts/diagrams/slurm_arc
 
 | Container | Image | Holds | Privileges |
 |---|---|---|---|
-| `devai-slurm` | `devai-slurm` (new, built here on `debian:trixie-slim`) | slurmctld, slurmdbd, slurmrestd, MariaDB, slurmd, the GPU guard, the GPU sampler, a podman client | `--privileged --cgroupns=private --pid=host`; GPU via CDI (NVML only); the host's podman socket read-write |
+| `devai-slurm` | `devai-slurm` (new, built here on the pinned `debian:trixie-slim`) | slurmctld, slurmdbd, slurmrestd, MariaDB, slurmd, the GPU guard, the GPU sampler, a podman client | `--privileged --cgroupns=private --pid=host`; GPU via CDI (NVML only); the host's podman socket read-write |
 | `devai-engines` | `devai-engines` (image-reduction plan) | Ollama, vLLM 0.28 + HyperQwen, SGLang 0.5.16, each in its own env; `devai-run`, `devai-kill` | GPU via CDI |
 | `devai-laya-trainer` | `devai-laya-trainer` (its own image, as today; its base is the image-reduction plan's call) | the laya trainer; `devai-run`, `devai-kill` | GPU via CDI |
 | `devai-workload` | the lab image | bench and test clients | none; no GPU |
@@ -84,7 +84,9 @@ and do nothing until a job execs into them.
   `0e522d39324b7b7da5e8096c678c4af00500ca4c3fe2e6da7e4f8d01f7082ec7`),
   SchedMD's own `debuild` step plus `libnvidia-ml-dev` (measured: builds on
   trixie) -- MariaDB 11.8, supervisor, tini and podman from Debian, and
-  devai's scripts in `/usr/local/lib/devai/`.
+  devai's scripts in `/usr/local/lib/devai/`. Build stage and final image both
+  use the one digest-pinned `debian:trixie-slim` Makefile variable every devai
+  image shares (image-reduction plan, M13).
 - **Why each privilege:** `--privileged --cgroupns=private` gives slurmd the
   cgroup control it needs (measured, rootless); `--pid=host` lets the guard and
   the sampler see and signal GPU processes, whose PIDs NVML reports in the host
@@ -251,10 +253,12 @@ job's `/var/cache/devai/jobs/results/<jobid>/` holds its log, `result.json`
 
 In the repository, `deploy/slurm/`: the Dockerfile, `slurm.conf`, `gres.conf`,
 `cgroup.conf`, `slurmdbd.conf.in`, `supervisord.conf`, the entrypoint, the
-guard and the sampler. `devai-run` and `devai-kill` go into the engines and
-trainer images. Generated once by `make slurm-init`, never committed:
+guard and the sampler. `devai-run` and `devai-kill` live in `deploy/slurm/` too;
+this plan adds their COPY lines to `deploy/Dockerfile.engines` and
+`deploy/Dockerfile.laya-trainer`. Generated once by `make slurm-init`, never committed:
 `~/.config/devai/slurm/slurm.key`, `jwt_hs256.key` and the MariaDB password
-(mode 0600; backed up by `devai-backup`).
+(mode 0600; backed up by `devai-backup`). Plain files, not sops: the sops/age
+scaffold goes to the attic with MCP (image-reduction plan, M12).
 
 ## 11. Failure modes
 
