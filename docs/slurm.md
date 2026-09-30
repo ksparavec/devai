@@ -38,6 +38,11 @@ Proposed:
   way.
 - **The router** stays a separate, unprivileged container and the only entry
   point for inference; its launch layer becomes a Slurm client.
+- **The operator's interface is `devai-operator`,** a web service in its own
+  image and container ([its plan](plans/devai-operator.md)). Its actions --
+  builds, pulls, probes, benches, backups -- are devai's scripts, run as Slurm
+  jobs inside `devai-operator`. The host shell stays for development and the
+  one-time root setup.
 - **The GPU guard** in `devai-slurm` checks the card before every GPU job and
   kills or refuses anything that holds it.
 - **One version per backend, CUDA 13.1, everything compiled here** (D8, D11).
@@ -63,11 +68,13 @@ Source: [`scripts/diagrams/slurm_architecture.py`](../scripts/diagrams/slurm_arc
 | 6 | slurmctld -> slurmdbd -> MariaDB | accounting records | inside `devai-slurm` | measured |
 | 7 | job script -> podman -> target container | `podman exec <container> devai-run <jobid> ...`; `devai-kill <jobid> <signal>` | the host's podman socket | untested |
 | 8 | engine, trainer -> GPU | CUDA (on a host with a GPU) | device via CDI | measured (engines on this card today) |
-| 9 | workload -> router | inference requests; hold / release | HTTP | requests measured; holds proposed |
-| 10 | operator -> Slurm, results | queue and history (REST); `scontrol suspend` / `resume`; result files | `devai-jobs` | proposed |
+| 9 | operator jobs -> router | a bench's inference requests; hold / release | HTTP | requests measured; holds proposed |
+| 10 | `devai-operator` -> slurmrestd | actions submitted as jobs; queue, history; `scontrol suspend` / `resume` | REST + JWT; `podman exec devai-slurm` | proposed |
 | 11 | GPU guard -> stray process | SIGTERM, then SIGKILL; if still busy, drain (on a host with a GPU) | signals (`--pid=host`) | measured |
 | 12 | host volumes -> containers | model stores, engine caches, the laya store | mounts | measured (model store, FlashInfer cache) |
 | 13 | `devai-slurm` -> `jobs/` | results, GPU samples, MariaDB files, controller state | files | proposed |
+| 14 | browser -> `devai-operator` | the web service: actions, jobs and logs, lab links, host setup | HTTPS, login | proposed |
+| 15 | `devai-operator` -> podman | its scripts' podman calls: builds, compose, bench and lab containers | the host's podman socket | proposed |
 
 ## 3. Containers and images
 
@@ -76,11 +83,11 @@ Source: [`scripts/diagrams/slurm_architecture.py`](../scripts/diagrams/slurm_arc
 | `devai-slurm` | `devai-slurm` (new, built here on the pinned `debian:trixie-slim`) | slurmctld, slurmdbd, slurmrestd, MariaDB, slurmd, the GPU guard, the GPU sampler, a podman client | `--privileged --cgroupns=private --pid=host`; the host's podman socket read-write; the GPU via CDI, for NVML only, when the host has one |
 | `devai-engines` | `devai-engines` (image-reduction plan) | Ollama, vLLM 0.28 + HyperQwen, SGLang 0.5.16, each in its own env; `devai-run`, `devai-kill` | GPU via CDI when present |
 | `devai-laya-trainer` | `devai-laya-trainer` (its own image, as today; its base is the image-reduction plan's call) | the laya trainer; `devai-run`, `devai-kill` | GPU via CDI when present |
-| `devai-workload` | `devai-lab` (the one lab image, M14) | bench and test clients | none; no GPU |
+| `devai-operator` | `devai-operator` ([its plan](plans/devai-operator.md)) | the web service (Apache + mod_wsgi), devai's scripts and the tools they call; the target of operator jobs | the host's podman socket read-write; the GPU when present (probes) |
 | `devai-router` | its own small image | the router | none |
 
-No Slurm package is installed in `devai-engines`, `devai-laya-trainer` or the
-lab image; `devai-run` and `devai-kill` are two short devai shell scripts.
+No Slurm package is installed in `devai-engines`, `devai-laya-trainer`,
+`devai-operator` or the lab image; `devai-run` and `devai-kill` are two short devai shell scripts.
 `devai-engines` and `devai-laya-trainer` run `tini` and an idle loop as PID 1
 and do nothing until a job execs into them.
 
@@ -171,7 +178,7 @@ described.
 | engine | `-L engine` | `devai-engines` | the backend's server on its port (11434 Ollama, 11435 vLLM, 11436 SGLang) | none (keep-warm) | router only |
 | trainer | `-L engine` | `devai-laya-trainer` | one fine-tuning job | `LAYA_MAX_HOLD_S` (900 s) | router (:11438 API) |
 | probe | `-L engine` | `devai-engines` | the engine plus the prober client | 60 min | `make probe-*` |
-| workload | none | `devai-workload` | bench and test clients | bench: `--time=32 --signal=B:INT@120` | bench-sync, `devai-jobs`, make |
+| operator action | the license for GPU actions (bench), else none | `devai-operator` | one of devai's scripts: bench, pull, build, backup, ... | per action; bench: `--time=32 --signal=B:INT@120` | `devai-operator` |
 
 The license, not the GPU, is what lets one engine run at a time, so the rule is
 the same on a host without a GPU: a second job asking for it waits as
@@ -233,11 +240,11 @@ A request that needs an engine:
    release (Slurm delays a released job by about 2 minutes; measured); it dies
    before it is healthy: 502 with the tail of its log, breaker charged.
 
-**Holds.** A workload keeps its engine for its whole run:
+**Holds.** A bench keeps its engine for its whole run:
 `POST /devai/v1/holds {job_id, model}` starts or keeps the engine and answers
 when it is healthy; `DELETE /devai/v1/holds/{job_id}` releases it. A hold is
-active while its workload job runs, paused while it is suspended, and dropped
-when the job ends.
+active while its job runs, paused while it is suspended, and dropped when the
+job ends.
 
 Measured timings that carry over: REST submit to running 1.0-1.3 s; the 27B
 engine healthy about 95 s after a cold start.
@@ -246,13 +253,14 @@ engine healthy about 95 s after a cold start.
 
 - **Switch:** drain the current engine, cancel its job (the trap kills the
   engine), submit the new one; the guard checks the card; the engine starts.
-- **Bench:** one workload job per (model, task): take a hold, run the task,
+- **Bench:** one operator job per (model, task) runs the bench script in
+  `devai-operator`: take a hold, run the task,
   write `result.json`, release. At 30 minutes Slurm sends SIGINT and the job
   scores the unbroken prefix, as `harvest_truncated.py` does today.
-- **Interrupt, same engine** (D1): suspend the workload, run the quick job,
+- **Interrupt, same engine** (D1): suspend the bench job, run the quick job,
   resume.
-- **Interrupt, another engine:** suspend the workload, run the quick job on its
-  engine, re-take the workload's hold (the engine switches back), resume.
+- **Interrupt, another engine:** suspend the bench job, run the quick job on its
+  engine, re-take the bench's hold (the engine switches back), resume.
 - **Restarts:** the router rebuilds its record from Slurm, and engines keep
   serving meanwhile; if `devai-slurm` restarts, running jobs lose their script
   and the epilog never runs, so the entrypoint kills every process group under
@@ -294,9 +302,10 @@ scaffold goes to the attic with MCP (image-reduction plan, M12).
 
 ## 12. Security
 
-- `devai-slurm` holds the host's podman socket read-write, which is equivalent
-  to the devai user on the host, and runs whatever job scripts it is given. So
-  **anyone who can submit a job controls the host user**: the JWT key and
+- `devai-slurm` and `devai-operator` hold the host's podman socket read-write,
+  which is equivalent to the devai user on the host, and `devai-slurm` runs
+  whatever job scripts it is given. So **anyone who can submit a job, or log in
+  to `devai-operator`, controls the host user**: the JWT key and
   `slurm.key` are as sensitive as that user's login. Only the router (read-only
   mount) and `devai-jobs` (0600 host file) get the JWT key. The router no
   longer holds the socket.
@@ -314,9 +323,10 @@ scaffold goes to the attic with MCP (image-reduction plan, M12).
 | the router holds the podman socket and recreates containers | `devai-slurm` holds the socket; the router is a Slurm client | this plan |
 | no check that the card is free | the prolog guard | this plan |
 | laya busy hold in the router | trainer jobs | this plan |
-| bench clean slate and deadline in `bench-sync.py` | workload jobs, time limit, holds | this plan |
+| bench clean slate and deadline in `bench-sync.py` | bench runs as operator jobs, with a time limit and a hold | this plan |
 | probers start engine containers | probe jobs | this plan |
 | results scattered | slurmdbd + `jobs/results/` + `devai-jobs` | this plan |
+| operations are Makefile targets in a host shell | `devai-operator`, a web service running devai's scripts as jobs; the Makefile stays for development | devai-operator plan |
 | lab containers have the GPU | no GPU device in the lab | this plan |
 
 The re-probe on the single backend versions, and dropping what fails, belong to
@@ -329,9 +339,8 @@ the image-reduction plan.
    `CONT`, the sampler. It is the first thing Phase 1 tests.
 2. **inspect's clock during a suspend:** its per-sample limit keeps running;
    suspend between samples, or accept it.
-3. **`devai-workload` as a permanent container from the lab image** is a new
-   container, though not a new image. The alternative, running workloads in the
-   operator's own lab container, gives Slurm no fixed target.
+3. ~~A `devai-workload` container for bench and test clients~~ -- not needed:
+   they are operator actions, run as jobs in `devai-operator`.
 4. **The laya trainer's internals** move from its HTTP controller to trainer
    jobs; its API toward aiagent does not change, but the aiagent session should
    agree.

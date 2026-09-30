@@ -111,32 +111,37 @@ def draw() -> str:
          "Numbered arrows = the table in docs/slurm.md Sec. 2", size=12, colour="#555", anchor="middle")
 
     # ---------------------------------------------------------- row A
-    box(20, 92, 310, 88, "Operator (host shell)", [
-        "devai-jobs: history, queue, suspend / resume,", "interrupt, result files",
-        "make: build, cache-up, bench, probe"], fill="#F4F4F4")
-    zone(360, 72, 430, 120, "Legend", "#FFFFFF", "#BBBBBB")
-    for i, (kind, what) in enumerate([("data", "inference data path"), ("control", "control: router / operator -> Slurm"),
+    box(20, 100, 220, 70, "Browser (LAN)", ["devai-operator over HTTPS", "(login)"], fill="#F4F4F4")
+    box(260, 92, 260, 88, "Host shell", ["development (make)", "one-time root setup:", "logs volume, tmpfs, installer"], fill="#FAFAFA")
+    zone(540, 72, 430, 120, "Legend", "#FFFFFF", "#BBBBBB")
+    for i, (kind, what) in enumerate([("data", "inference data path"), ("control", "control: operator / router -> Slurm"),
                                       ("slurm", "Slurm internal / podman exec"), ("gpu", "GPU use (CUDA)"),
                                       ("storage", "volume mount / file write"), ("kill", "GPU guard kills a holder")]):
-        cx, cy = 378 + (i // 3) * 214, 108 + (i % 3) * 28
+        cx, cy = 558 + (i // 3) * 214, 108 + (i % 3) * 28
         arrow([(cx, cy), (cx + 34, cy)], kind)
         text(cx + 42, cy + 4, what, size=10.2, colour="#333")
-    zone(820, 72, 650, 120, "devai-lab-egress  (internal network, no internet)", "#F4F8FD", "#8AA4C8")
-    box(840, 98, 610, 80, "Lab containers  (devai-lab)", [
+    zone(990, 72, 480, 120, "devai-lab-egress  (internal, no internet)", "#F4F8FD", "#8AA4C8")
+    box(1010, 98, 440, 80, "Lab containers  (devai-lab)", [
         "agents: claude, codex, opencode, pi, dsh, dstui, aiagent",
         "no GPU device; they talk only to the router (D1)"], fill="#E8F0FC", stroke=BLUE)
 
     # -------------------------------------------------------- devai-net
-    zone(20, 215, 1450, 625, "devai-net", "#FCFCF8", "#B9B08A")
-    box(560, 240, 640, 90, "devai-router  (own unprivileged container, small image)", [
+    zone(20, 215, 1450, 625, "", "#FCFCF8", "#B9B08A")
+    text(1456, 234, "devai-net", size=12, weight="bold", colour="#333", anchor="end")
+    box(40, 240, 460, 100, "devai-operator  (image + container)", [
+        "web service: Apache + mod_wsgi, login over TLS",
+        "devai's scripts and their tools; target of operator jobs",
+        "podman socket (its scripts); GPU when present (probes)"],
+        fill="#FDF6EC", stroke=ORANGE, width=2.2)
+    box(620, 240, 640, 90, "devai-router  (own unprivileged container, small image)", [
         ":11434 ollama    :11435 vllm    :11436 sglang    :11438 laya-trainer",
         "request path unchanged; launch layer = Slurm client (REST + self-signed JWT)",
-        "reads the GPU holder from Slurm; holds for workload jobs; no podman socket"],
+        "reads the GPU holder from Slurm; holds for bench jobs; no podman socket"],
         fill="#FFF3DC", stroke=ORANGE, width=2.2)
 
     # devai-slurm: all of Slurm, one image, one container
-    zone(40, 360, 460, 470, "devai-slurm  (one image, one container)", "#F5F0FB", PURPLE, label_dx=160)
-    text(200, 397, "privileged, --pid=host, podman socket; GPU (NVML) if present", size=10.2, colour=PURPLE)
+    zone(40, 360, 460, 470, "devai-slurm  (one image, one container)", "#F5F0FB", PURPLE)
+    text(54, 397, "privileged, --pid=host, podman socket; GPU (NVML) if present", size=10.2, colour=PURPLE)
     cp = dict(fill="#EFE7F8", stroke=PURPLE)
     box(60, 410, 420, 42, "slurmrestd  :6820", ["REST API v0.0.42, auth/jwt  (Slurm 24.11, Debian)"], **cp)
     box(60, 475, 420, 60, "slurmctld", ["queue, priorities, holds; state -> jobs/slurmctld/"], width=2.2, **cp)
@@ -149,19 +154,15 @@ def draw() -> str:
         "   and sampler (NVML) -> results/<jobid>/gpu.json"], fill="#EDE3F7", stroke=PURPLE, width=2.2)
 
     # backend containers, no Slurm
-    zone(540, 360, 460, 240, "devai-engines  (image + container; no Slurm)", "#EEF7EE", "#4F9A5A")
+    zone(580, 360, 440, 240, "devai-engines  (image + container; no Slurm)", "#EEF7EE", "#4F9A5A")
     job = dict(fill="#E0F1E0", stroke="#4F9A5A")
-    box(560, 392, 420, 44, "ollama serve  :11434", ["Ollama, compiled here"], **job)
-    box(560, 444, 420, 44, "vLLM 0.28 + HyperQwen  :11435", ["own env; CUDA 13.1, compiled here"], **job)
-    box(560, 496, 420, 44, "SGLang 0.5.16  :11436", ["own env; sglang-kernel compiled for sm120"], **job)
-    text(570, 562, "idle until a job runs one engine with devai-run;", size=10.5, colour="#2E6A2E")
-    text(570, 577, "devai-kill stops it (TERM, then KILL)", size=10.5, colour="#2E6A2E")
-    zone(1020, 360, 210, 240, "devai-laya-trainer", "#EEF7EE", "#4F9A5A")
-    text(1034, 397, "own image; no Slurm", size=10.5, colour="#2E6A2E")
-    box(1034, 420, 182, 70, "trainer runs", ["one fine-tuning job", "per trainer job"], **job)
-    zone(1250, 360, 200, 240, "devai-workload", "#FFFFFF", "#4F9A5A")
-    text(1264, 397, "devai-lab; no GPU", size=10.5, colour="#2E6A2E")
-    box(1264, 420, 172, 70, "clients", ["bench and test", "workload jobs"], fill="#FFFFFF", stroke="#4F9A5A")
+    box(600, 392, 400, 44, "ollama serve  :11434", ["Ollama, compiled here"], **job)
+    box(600, 444, 400, 44, "vLLM 0.28 + HyperQwen  :11435", ["own env; CUDA 13.1, compiled here"], **job)
+    box(600, 496, 400, 44, "SGLang 0.5.16  :11436", ["own env; sglang-kernel compiled for sm120"], **job)
+    text(610, 562, "idle until a job runs one engine with devai-run;", size=10.5, colour="#2E6A2E")
+    text(610, 577, "devai-kill stops it (TERM, then KILL)", size=10.5, colour="#2E6A2E")
+    zone(1040, 360, 410, 240, "devai-laya-trainer  (own image; no Slurm)", "#EEF7EE", "#4F9A5A")
+    box(1060, 400, 370, 64, "trainer runs", ["one fine-tuning job per trainer job", "started with devai-run, stopped with devai-kill"], **job)
 
     # -------------------------------------------------- below devai-net
     out.append(f'<path d="M58 870 h116 l18 18 v30 l-18 18 h-116 l-18 -18 v-30 z" fill="#FDECEC" stroke="{RED}" '
@@ -174,33 +175,35 @@ def draw() -> str:
     zone(20, 958, 1450, 120, "/var/cache/devai   (host volumes)", "#F6F6F6", "#999999", label_dx=1060)
     folder(40, 985, 480, 80, "jobs/   (new volume)", [
         "results/<jobid>/  result.json, gpu.json, logs", "mariadb/  history database    slurmctld/  state"], width=2.2)
-    folder(560, 985, 240, 80, "model stores", ["ollama/ vllm/ sglang/ laya/", "+ vLLM parser plugins"])
-    folder(820, 985, 180, 80, "engine caches", ["FlashInfer, SGLang", "(named volumes)"])
+    folder(580, 985, 240, 80, "model stores", ["ollama/ vllm/ sglang/ laya/", "+ vLLM parser plugins"])
+    folder(840, 985, 180, 80, "engine caches", ["FlashInfer, SGLang", "(named volumes)"])
 
     # ----------------------------------------------------------------- arrows
-    arrow([(1000, 178), (1000, 240)], "data", 1, (1000, 207), "inference API; fine-tuning jobs on :11438", (1016, 211))
-    arrow([(900, 330), (900, 360)], "data", 2, (900, 345), "proxied requests to devai-engines:<port>", (888, 350),
+    arrow([(1100, 178), (1100, 240)], "data", 1, (1100, 207), "inference API; fine-tuning jobs on :11438", (1116, 211))
+    arrow([(1000, 330), (1000, 360)], "data", 2, (1000, 345), "proxied requests to devai-engines:<port>", (988, 350),
           anchor="end", width=2.4)
-    arrow([(560, 290), (520, 290), (520, 431), (480, 431)], "control", 3, (520, 360),
-          "submit / cancel / state (REST + JWT)", (548, 282), anchor="end", width=2.2)
+    arrow([(620, 300), (540, 300), (540, 431), (480, 431)], "control", 3, (540, 380), width=2.2)
     arrow([(270, 452), (270, 475)], "slurm", 4, (270, 463))
     arrow([(60, 505), (48, 505), (48, 766), (60, 766)], "slurm", 5, (48, 640), both=True, width=2.2)
     arrow([(270, 535), (270, 560)], "slurm", 6, (270, 547))
     arrow([(270, 600), (270, 620)], "slurm")
     arrow([(380, 820), (380, 868)], "slurm", 7, (380, 846), "podman socket (rw)", (396, 850), width=2.2)
-    arrow([(520, 900), (530, 900), (530, 615), (770, 615), (770, 600)], "slurm", 7, (530, 760), width=2.0)
-    arrow([(770, 615), (1125, 615), (1125, 600)], "slurm", width=2.0)
-    arrow([(1125, 615), (1350, 615), (1350, 600)], "slurm", width=2.0)
-    text(1190, 632, "exec devai-run / devai-kill <jobid>", size=10.5, colour=PURPLE)
-    arrow([(980, 600), (980, 850), (1060, 850), (1060, 872)], "gpu", 8, (980, 780), width=2.4)
-    arrow([(1180, 600), (1180, 872)], "gpu", 8, (1180, 780), "CUDA (engines, trainer)", (1196, 784), width=2.4)
-    arrow([(1350, 360), (1350, 300), (1200, 300)], "data", 9, (1350, 330), dashed=True)
-    text(1338, 322, "requests; hold / release", size=10.5, colour=BLUE, anchor="end")
-    arrow([(175, 180), (175, 410)], "control", 10, (175, 300), "REST; scontrol", (191, 304), width=2.0)
+    arrow([(520, 900), (560, 900), (560, 615), (800, 615), (800, 600)], "slurm", 7, (560, 760), width=2.0)
+    arrow([(800, 615), (1245, 615), (1245, 600)], "slurm", width=2.0)
+    arrow([(560, 615), (560, 352), (470, 352), (470, 340)], "slurm", width=2.0)
+    text(1262, 632, "exec devai-run / devai-kill <jobid>", size=10.5, colour=PURPLE)
+    text(1262, 646, "(also into devai-operator)", size=10.5, colour=PURPLE)
+    arrow([(1000, 600), (1000, 850), (1060, 850), (1060, 872)], "gpu", 8, (1000, 780), width=2.4)
+    arrow([(1245, 600), (1245, 872)], "gpu", 8, (1245, 780), "CUDA (engines, trainer)", (1261, 784), width=2.4)
+    arrow([(500, 262), (620, 262)], "data", 9, (560, 262), dashed=True)
+    text(506, 236, "9: bench requests, holds", size=9.8, colour=BLUE)
+    arrow([(400, 340), (400, 410)], "control", 10, (400, 375), "REST", (416, 379), width=2.0)
     arrow([(125, 820), (125, 870)], "kill", 11, (125, 845))
     arrow([(680, 985), (680, 602)], "storage", 12, (680, 800), "mounts", (696, 804))
-    arrow([(910, 985), (910, 602)], "storage", 12, (910, 800))
+    arrow([(930, 985), (930, 602)], "storage", 12, (930, 800))
     arrow([(225, 820), (225, 993)], "storage", 13, (225, 950), "results, DB, state", (160, 972), anchor="end")
+    arrow([(130, 170), (130, 240)], "data", 14, (130, 206), "HTTPS", (146, 210), width=2.0)
+    text(40, 355, "15: its scripts' podman calls go to the same socket (not drawn)", size=9.8, colour=GREY)
 
     out.append("</svg>")
     return "\n".join(out) + "\n"

@@ -55,7 +55,7 @@ The first architecture (one Slurm node per backend image) was judged far too com
 2. Does the exec path hold up: exit status, long runs, start-up overhead, the trap and kill helpers, suspend through `STOP` / `CONT`, the GPU sampler? -- Phase 1 tests it first.
 3. ~~Slurm from Debian's packages or built from source?~~ Debian's packages, 24.11.5 (D12).
 4. inspect's per-sample clock keeps running while a bench is suspended: suspend between samples, or accept it?
-5. `devai-workload` is a new permanent container (from `devai-lab`, so no new image). Accept it, or run workloads somewhere else?
+5. ~~A `devai-workload` container?~~ No: bench and test runs are operator actions, run as jobs in `devai-operator` ([Plan: devai-operator](./devai-operator.md)).
 
 ## Context
 
@@ -81,8 +81,8 @@ An earlier spike (2026-09-29, commits 2e68b45 to e194309) tested two layouts tha
 The full proposed architecture, with a diagram of every component and interaction, is [docs/slurm.md](../slurm.md). In short:
 
 - **`devai-slurm`, one image and one container:** Slurm 24.11.5, MariaDB, supervisor and podman, all from Debian's packages (D12). A single-node cluster with one license, `engine:1`, which every engine, trainer and probe job takes, so one runs at a time -- with or without a GPU (M15). It is privileged, has `--pid=host`, holds the host's podman socket, and gets the GPU (for NVML only) when the host has one.
-- **Backends carry no Slurm:** `devai-engines` (the image-reduction plan) and `devai-laya-trainer` are permanent, idle containers; `devai-workload` (the lab image) runs bench and test clients.
-- **Jobs:** each job script runs `podman exec <container> devai-run <jobid> <command>` and stops it with `devai-kill <jobid> TERM`, then `KILL` (two small devai scripts in each target image). Kinds: engine (router only), trainer, probe (GPU); workload (no GPU; holds its engine through the router).
+- **Backends carry no Slurm:** `devai-engines` (the image-reduction plan) and `devai-laya-trainer` are permanent, idle containers. Operator actions -- bench, pulls, builds -- are devai's scripts, run as jobs in `devai-operator` ([Plan: devai-operator](./devai-operator.md)).
+- **Jobs:** each job script runs `podman exec <container> devai-run <jobid> <command>` and stops it with `devai-kill <jobid> TERM`, then `KILL` (two small devai scripts in each target image). Kinds: engine (router only), trainer, probe (GPU); operator action (GPU actions take the license; a bench holds its engine through the router).
 - **What Slurm no longer does itself:** it owns only the local `podman exec` client, so cancel, suspend and GPU accounting of the remote process are devai's scripts -- the trap, `devai-kill`, the epilog backstop, and an NVML sampler writing `gpu.json` and the job's `AdminComment`.
 - **The router** stays a separate, unprivileged container, gives up its podman socket, and becomes a Slurm client (REST + self-signed JWT); requests still go straight to the engines.
 - **The GPU guard** is the prolog of every GPU job: idle card, or kill the holder, or drain the node and hold the job. It also wipes vLLM's compile cache inside `devai-engines`.
@@ -102,7 +102,7 @@ The router launches and stops engines through slurmrestd, gives up its podman so
 
 ## Phase 3 -- Workloads, trainer, probes as jobs
 
-Bench (the 30-minute limit as a Slurm time limit), probes and the laya trainer as Slurm jobs; `devai-workload`; holds; queue, suspend/resume, cancel and clear-queue commands (D1). aiagent's fine-tuning API on :11438 stays. Exit: a bench and an interactive session run side by side without contention; interrupting works with the same and with another engine.
+Bench (the 30-minute limit as a Slurm time limit), probes and the laya trainer as Slurm jobs; operator actions as jobs in `devai-operator` (its Phase 3); holds; queue, suspend/resume, cancel and clear-queue commands (D1). aiagent's fine-tuning API on :11438 stays. Exit: a bench and an interactive session run side by side without contention; interrupting works with the same and with another engine.
 
 ## Phase 4 -- History
 
