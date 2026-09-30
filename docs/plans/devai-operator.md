@@ -4,7 +4,7 @@ _A web service, in its own image and container, that offers everything the Makef
 
 ## Status
 
-Draft (2026-09-30). Decisions O1-O5 below are the operator's. Nothing is built.
+Draft (2026-09-30). Decisions O1-O8 below are the operator's. Nothing is built.
 
 ## Dependencies
 
@@ -31,13 +31,16 @@ Draft (2026-09-30). Decisions O1-O5 below are the operator's. Nothing is built.
 - **O3 -- Host root stays host-shell setup.** `setup-logs` (LVM, mkfs, `/etc/fstab`) and `secrets-tmpfs` (a tmpfs mount) need `sudo`; `install` / `uninstall` write `~/.local/bin`. They stay one-time host setup: the web shows whether each is done and prints the exact command.
 - **O4 -- Interactive targets become links.** The web starts and stops JupyterLab lab containers and shows their links; a shell is a JupyterLab terminal.
 - **O5 -- The operator runs the scripts, not `make`.** Each action is a script with declared parameters. The Makefile stays as a development convenience that calls the same scripts.
+- **O6 -- On the LAN, behind a login.** HTTPS on a published LAN port (as Open WebUI's proxy was on :8443), TLS with mkcert certificates or a self-signed fallback.
+- **O7 -- One operator account,** an Apache htpasswd entry created by the init action.
+- **O8 -- Go and Rust as pinned upstream downloads** in the image, each checked against its published checksum: Go >= 1.26 (Debian has 1.24) and the rustup toolchain vLLM's `rust-toolchain.toml` names (Debian has rustc 1.85).
 
 ## Open questions
 
-1. Exposure: HTTPS on the LAN with a login, as Open WebUI's proxy was on :8443 -- recommendation -- or `127.0.0.1` only?
-2. Is one operator account (an Apache htpasswd entry made by the init action) enough?
-3. Compose provider: `podman compose` hands off to an external provider, on this host `/usr/local/bin/docker-compose` v5.1.0, which is not a Debian package. Debian's `docker-compose` or `podman-compose` package, or a pinned binary?
-4. Go and Rust: the from-source builds need Go >= 1.26 (Debian has 1.24; the host runs 1.27) and a rustup toolchain matching vLLM's `rust-toolchain.toml` (Debian has rustc 1.85). Pinned upstream downloads into the image, with their checksums -- recommendation -- or keep those two builds host-shell (development only)?
+1. ~~Exposure?~~ LAN, HTTPS, login (O6).
+2. ~~How many accounts?~~ One (O7).
+3. Compose provider: `podman compose` hands off to an external provider, on this host `/usr/local/bin/docker-compose` v5.1.0, which is not a Debian package. Debian's `docker-compose` or `podman-compose` package, or a pinned binary like Go and Rust (O8)?
+4. ~~Go and Rust?~~ Pinned upstream downloads with checksums (O8).
 
 ## Context
 
@@ -49,7 +52,7 @@ Everything devai can do is a Makefile target run in a host shell: 124 documented
 
 - Apache, mod_wsgi, Flask (Debian `python3-flask` 3.1.1) -- the web service;
 - `python3`, `uv`, `git`, `curl`, `make`, podman (client) and a compose provider -- the tools the scripts use;
-- for the from-source builds: `cmake`, `ninja`, CUDA 13.1 `nvcc` and headers from NVIDIA's debian13 apt repository, Go and Rust (Open question 4).
+- for the from-source builds: `cmake`, `ninja`, CUDA 13.1 `nvcc` and headers from NVIDIA's debian13 apt repository, Go and Rust as pinned downloads (O8).
 
 **One container,** on `devai-net`:
 
@@ -98,8 +101,8 @@ Start and stop JupyterLab lab containers and link them; the host-setup page. Exi
 
 | Risk | Phase | Mitigation |
 | ---- | ----- | ---------- |
-| the web login controls the host user (podman socket) | 1 | TLS, htpasswd, CSRF, no shell interpolation; Open question 1 decides whether the LAN sees it at all |
-| the toolbox image is large (CUDA 13.1 dev packages, Go, Rust) | 1 | one image, shared layers; or keep the two from-source builds host-shell (Open question 4) |
+| the web login controls the host user (podman socket), and it is on the LAN (O6) | 1 | TLS only, one strong htpasswd password (O7), CSRF tokens, parameters never passed through a shell; login attempts logged |
+| the toolbox image is large (CUDA 13.1 dev packages, Go, Rust) | 1 | one image, shared layers |
 | a path mounted at a different place breaks every podman call that passes it | 1 | path identity for the repo, `/var/cache/devai` and the home volume; a start-up check that refuses otherwise |
 | a direct action dies with an Apache restart | 1 | started with `setsid`, outside Apache's processes |
 | the Makefile and the registry drift apart | 2 | one script per operation, the coverage test |
