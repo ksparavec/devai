@@ -138,7 +138,7 @@ def draw() -> str:
     zone(40, 360, 460, 470, "devai-slurm  (one image, one container)", "#F5F0FB", PURPLE, label_dx=160)
     text(200, 397, "privileged, --pid=host, podman socket; GPU (NVML) if present", size=10.2, colour=PURPLE)
     cp = dict(fill="#EFE7F8", stroke=PURPLE)
-    box(60, 410, 420, 42, "slurmrestd  :6820", ["REST API, auth/jwt"], **cp)
+    box(60, 410, 420, 42, "slurmrestd  :6820", ["REST API v0.0.42, auth/jwt  (Slurm 24.11, Debian)"], **cp)
     box(60, 475, 420, 60, "slurmctld", ["queue, priorities, holds; state -> jobs/slurmctld/"], width=2.2, **cp)
     box(60, 560, 420, 40, "slurmdbd", ["accounting, job scripts, comments"], **cp)
     cylinder(60, 620, 420, 70, "MariaDB  (Debian package)", ["data -> jobs/mariadb/"])

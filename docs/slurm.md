@@ -2,9 +2,11 @@
 
 **Status: proposed (2026-09-30), not built.** This is the design the phases of
 [the plan](plans/slurm-gatekeeper.md) implement; the plan holds the operator's
-decisions (D1-D11). **(measured)** marks a fact measured on this host in an
+decisions (D1-D12). **(measured)** marks a fact measured on this host in an
 earlier spike (2026-09-29); that spike tested two layouts since discarded and is
 obsolete, so only facts that do not depend on the layout are marked this way.
+The spike ran Slurm 26.05.4; the design now uses Debian's 24.11.5 (D12), which
+ships the same plugins (checked 2026-09-30) but has not been run yet.
 **(untested)** marks what nothing has run yet; everything else is proposal. Once built, this document is
 the source of truth for Slurm in devai, as [router.md](router.md) is for the
 router.
@@ -55,7 +57,7 @@ Source: [`scripts/diagrams/slurm_architecture.py`](../scripts/diagrams/slurm_arc
 |---|---|---|---|---|
 | 1 | lab agents -> router | inference (OpenAI, Anthropic, Ollama APIs); fine-tuning jobs on :11438 | HTTP, `devai-lab-egress` | unchanged |
 | 2 | router -> engine | proxied requests to `devai-engines:<port>` | HTTP, `devai-net` | today's path, new host name |
-| 3 | router -> slurmrestd | submit, cancel, job and node state | REST, JWT the router signs itself | measured |
+| 3 | router -> slurmrestd | submit, cancel, job and node state | REST v0.0.42, JWT the router signs itself | measured on 26.05 (v0.0.44) |
 | 4 | slurmrestd -> slurmctld | the same, as Slurm RPC | inside `devai-slurm` | measured |
 | 5 | slurmctld <-> slurmd | launch, signal, kill the job script; node health | inside `devai-slurm` | measured |
 | 6 | slurmctld -> slurmdbd -> MariaDB | accounting records | inside `devai-slurm` | measured |
@@ -84,13 +86,16 @@ and do nothing until a job execs into them.
 
 ### 3.1 `devai-slurm`
 
-- **Image:** Slurm, MariaDB 11.8, supervisor, tini and podman, plus devai's
-  scripts in `/usr/local/lib/devai/`. Slurm itself is either Debian trixie's own
-  24.11.5 packages or devai's build of 26.05.4 from SchedMD's source
-  (`slurm-26-05-4-1`, sha256
-  `0e522d39324b7b7da5e8096c678c4af00500ca4c3fe2e6da7e4f8d01f7082ec7`; SchedMD's
-  `debuild` step built on trixie, measured) -- Open point 5. It needs no NVML
-  support: in this layout Slurm does not account GPUs itself. Build stage and final image both
+- **Image:** Debian trixie packages only -- Slurm 24.11.5 (`slurmctld`,
+  `slurmd`, `slurmdbd`, `slurmrestd`, `slurm-wlm-jwt-plugin`,
+  `slurm-wlm-mysql-plugin`; D12), MariaDB 11.8, supervisor, tini and podman --
+  plus devai's scripts in `/usr/local/lib/devai/`. No source build: Slurm needs
+  no NVML support, because in this layout it does not account GPUs itself.
+  Checked in the packages (2026-09-30): REST data parsers v0.0.40 to v0.0.42,
+  `auth_slurm` (which also serves `cred/slurm`; SchedMD's 26.05 build had no
+  separate `cred_slurm` plugin either, and `CredType=cred/slurm` worked there),
+  `auth_jwt`, `accounting_storage_mysql`, `cgroup_v2`, `proctrack_cgroup`,
+  `jobacct_gather_cgroup`. Build stage and final image both
   use the one digest-pinned `debian:trixie-slim` Makefile variable every devai
   image shares (image-reduction plan, M13).
 - **Why each privilege:** `--privileged --cgroupns=private` gives slurmd the
@@ -330,7 +335,5 @@ the image-reduction plan.
 4. **The laya trainer's internals** move from its HTTP controller to trainer
    jobs; its API toward aiagent does not change, but the aiagent session should
    agree.
-5. **Which Slurm:** Debian's own 24.11.5 packages (no source build; which REST
-   API versions it serves is still to check) or devai's build of 26.05.4 (REST
-   v0.0.44, measured in the spike)? Nothing here needs 26.05 or NVML any more. Recommendation: Debian's
-   packages.
+5. **Debian's Slurm 24.11.5 has not been run** here (D12); the spike ran
+   26.05.4. Phase 1 starts it before anything else.

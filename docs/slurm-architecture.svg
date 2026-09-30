@@ -53,7 +53,7 @@
 <text x="200" y="397" font-family="Helvetica, Arial, sans-serif" font-size="10.2" font-weight="normal" fill="#7A52B3" text-anchor="start">privileged, --pid=host, podman socket; GPU (NVML) if present</text>
 <rect x="60" y="410" width="420" height="42" rx="8" fill="#EFE7F8" stroke="#7A52B3" stroke-width="1.4"/>
 <text x="70" y="429" font-family="Helvetica, Arial, sans-serif" font-size="12.5" font-weight="bold" fill="#222" text-anchor="start">slurmrestd  :6820</text>
-<text x="70" y="443.5" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">REST API, auth/jwt</text>
+<text x="70" y="443.5" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">REST API v0.0.42, auth/jwt  (Slurm 24.11, Debian)</text>
 <rect x="60" y="475" width="420" height="60" rx="8" fill="#EFE7F8" stroke="#7A52B3" stroke-width="2.2"/>
 <text x="70" y="494" font-family="Helvetica, Arial, sans-serif" font-size="12.5" font-weight="bold" fill="#222" text-anchor="start">slurmctld</text>
 <text x="70" y="508.5" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">queue, priorities, holds; state -&gt; jobs/slurmctld/</text>
