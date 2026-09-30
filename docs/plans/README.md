@@ -119,6 +119,7 @@ found three more findings.
 | [laya-trainer](./laya-trainer.md)                                   | In Progress       |
 | [library-service](./library-service.md)                             | Draft             |
 | [slurm-gatekeeper](./slurm-gatekeeper.md)                           | Draft (redesigned 2026-09-30) |
+| [minimal-external-images](./minimal-external-images.md)             | Draft             |
 | [sops-age-secrets](./sops-age-secrets.md)                           | Non-functional    |
 | [skypilot-agent-skill](./skypilot-agent-skill.md)                   | Frozen            |
 | [gpu-arbiter-cluster-mode](./gpu-arbiter-cluster-mode.md)           | **Frozen**        |
