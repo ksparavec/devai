@@ -12,7 +12,7 @@ None. [Plan: slurm-gatekeeper](./slurm-gatekeeper.md) builds on this one: its jo
 
 ## Enables / Unblocks
 
-- One Slurm package build instead of one per distribution: every devai image is Debian trixie after Phases 3-4.
+- One distribution everywhere: every devai image is Debian trixie after Phases 3-4, the same base the Slurm plan's `devai-slurm` uses for Debian's own Slurm packages.
 - A re-bench that runs once, on final images. The re-bench of 2026-09-27/28 is stopped; if it resumed before Phase 4, every vLLM and SGLang row would be measured twice.
 - No floating upstream tags in the running stack. Today `latest` or `main` is what runs for the apt cache, the egress firewall, Open WebUI and 12 MCP servers.
 - Five containers fewer: registry-cache, vllm-devai, open-webui, webui-proxy, mcp-gateway (plus up to 12 MCP containers started per call).
@@ -94,7 +94,7 @@ End state:
 | ----- | ---------- | ---------- |
 | `debian:trixie-slim` | pulled, digest-pinned | -- |
 | `devai-engines` | trixie-slim + host builds | today's ollama / vllm / sglang containers; after Slurm, one permanent idle container (Slurm plan) |
-| `devai-slurm` | trixie-slim + devai's Slurm packages (all daemons) + Debian MariaDB (Slurm plan) | one |
+| `devai-slurm` | trixie-slim + Debian's Slurm 24.11.5 and MariaDB packages (Slurm plan, D12) | one |
 | `devai-router` | empty image + host-built static binary | router |
 | `devai-laya-trainer` | devai-base | laya-trainer |
 | `devai-base`, `devai-lab` | trixie-slim | the lab, with or without the GPU |
