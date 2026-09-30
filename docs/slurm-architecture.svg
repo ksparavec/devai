@@ -15,7 +15,7 @@
 </defs>
 <rect width="1500" height="1090" fill="#FFFFFF"/>
 <text x="750.0" y="30" font-family="Helvetica, Arial, sans-serif" font-size="20" font-weight="bold" fill="#222" text-anchor="middle">devai Slurm gatekeeper -- proposed architecture</text>
-<text x="750.0" y="50" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="normal" fill="#555" text-anchor="middle">single host, rootless podman, Slurm 26.05, one GPU; no Slurm in the backend containers. Numbered arrows = the table in docs/slurm.md Sec. 2</text>
+<text x="750.0" y="50" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="normal" fill="#555" text-anchor="middle">single host, rootless podman; no Slurm in the backend containers; the GPU is optional. Numbered arrows = the table in docs/slurm.md Sec. 2</text>
 <rect x="20" y="92" width="310" height="88" rx="8" fill="#F4F4F4" stroke="#666" stroke-width="1.4"/>
 <text x="30" y="111" font-family="Helvetica, Arial, sans-serif" font-size="12.5" font-weight="bold" fill="#222" text-anchor="start">Operator (host shell)</text>
 <text x="30" y="125.5" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">devai-jobs: history, queue, suspend / resume,</text>
@@ -38,7 +38,7 @@
 <rect x="820" y="72" width="650" height="120" rx="12" fill="#F4F8FD" stroke="#8AA4C8" stroke-width="1.4"/>
 <text x="834" y="92" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="bold" fill="#333" text-anchor="start">devai-lab-egress  (internal network, no internet)</text>
 <rect x="840" y="98" width="610" height="80" rx="8" fill="#E8F0FC" stroke="#2F6FD1" stroke-width="1.4"/>
-<text x="850" y="117" font-family="Helvetica, Arial, sans-serif" font-size="12.5" font-weight="bold" fill="#222" text-anchor="start">Lab containers  (lab image)</text>
+<text x="850" y="117" font-family="Helvetica, Arial, sans-serif" font-size="12.5" font-weight="bold" fill="#222" text-anchor="start">Lab containers  (devai-lab)</text>
 <text x="850" y="131.5" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">agents: claude, codex, opencode, pi, dsh, dstui, aiagent</text>
 <text x="850" y="146.0" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">no GPU device; they talk only to the router (D1)</text>
 <rect x="20" y="215" width="1450" height="625" rx="12" fill="#FCFCF8" stroke="#B9B08A" stroke-width="1.4"/>
@@ -50,10 +50,10 @@
 <text x="570" y="302.5" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">reads the GPU holder from Slurm; holds for workload jobs; no podman socket</text>
 <rect x="40" y="360" width="460" height="470" rx="12" fill="#F5F0FB" stroke="#7A52B3" stroke-width="1.4"/>
 <text x="200" y="380" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="bold" fill="#333" text-anchor="start">devai-slurm  (one image, one container)</text>
-<text x="200" y="397" font-family="Helvetica, Arial, sans-serif" font-size="10.2" font-weight="normal" fill="#7A52B3" text-anchor="start">privileged, --pid=host, GPU (NVML only), podman socket</text>
+<text x="200" y="397" font-family="Helvetica, Arial, sans-serif" font-size="10.2" font-weight="normal" fill="#7A52B3" text-anchor="start">privileged, --pid=host, podman socket; GPU (NVML) if present</text>
 <rect x="60" y="410" width="420" height="42" rx="8" fill="#EFE7F8" stroke="#7A52B3" stroke-width="1.4"/>
 <text x="70" y="429" font-family="Helvetica, Arial, sans-serif" font-size="12.5" font-weight="bold" fill="#222" text-anchor="start">slurmrestd  :6820</text>
-<text x="70" y="443.5" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">REST API v0.0.44, auth/jwt</text>
+<text x="70" y="443.5" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">REST API, auth/jwt</text>
 <rect x="60" y="475" width="420" height="60" rx="8" fill="#EFE7F8" stroke="#7A52B3" stroke-width="2.2"/>
 <text x="70" y="494" font-family="Helvetica, Arial, sans-serif" font-size="12.5" font-weight="bold" fill="#222" text-anchor="start">slurmctld</text>
 <text x="70" y="508.5" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">queue, priorities, holds; state -&gt; jobs/slurmctld/</text>
@@ -65,11 +65,11 @@
 <text x="72" y="650" font-family="Helvetica, Arial, sans-serif" font-size="12.5" font-weight="bold" fill="#222" text-anchor="start">MariaDB  (Debian package)</text>
 <text x="72" y="664.5" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">data -&gt; jobs/mariadb/</text>
 <rect x="60" y="712" width="420" height="108" rx="8" fill="#EDE3F7" stroke="#7A52B3" stroke-width="2.2"/>
-<text x="70" y="731" font-family="Helvetica, Arial, sans-serif" font-size="12.5" font-weight="bold" fill="#222" text-anchor="start">slurmd  --  the only node  (Gres=gpu:1)</text>
-<text x="70" y="745.5" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">one GPU job at a time; runs each job script</text>
+<text x="70" y="731" font-family="Helvetica, Arial, sans-serif" font-size="12.5" font-weight="bold" fill="#222" text-anchor="start">slurmd  --  the only node;  license engine:1</text>
+<text x="70" y="745.5" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">one engine / trainer / probe job at a time</text>
 <text x="70" y="760.0" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">job = podman exec &lt;container&gt; devai-run &lt;jobid&gt; ...</text>
-<text x="70" y="774.5" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">guard (prolog / epilog): idle card, kill holder, or drain;</text>
-<text x="70" y="789.0" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">GPU sampler (NVML) -&gt; results/&lt;jobid&gt;/gpu.json</text>
+<text x="70" y="774.5" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">GPU host: guard (idle card, kill holder, or drain)</text>
+<text x="70" y="789.0" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">   and sampler (NVML) -&gt; results/&lt;jobid&gt;/gpu.json</text>
 <rect x="540" y="360" width="460" height="240" rx="12" fill="#EEF7EE" stroke="#4F9A5A" stroke-width="1.4"/>
 <text x="554" y="380" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="bold" fill="#333" text-anchor="start">devai-engines  (image + container; no Slurm)</text>
 <rect x="560" y="392" width="420" height="44" rx="8" fill="#E0F1E0" stroke="#4F9A5A" stroke-width="1.4"/>
@@ -92,7 +92,7 @@
 <text x="1044" y="468.0" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">per trainer job</text>
 <rect x="1250" y="360" width="200" height="240" rx="12" fill="#FFFFFF" stroke="#4F9A5A" stroke-width="1.4"/>
 <text x="1264" y="380" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="bold" fill="#333" text-anchor="start">devai-workload</text>
-<text x="1264" y="397" font-family="Helvetica, Arial, sans-serif" font-size="10.5" font-weight="normal" fill="#2E6A2E" text-anchor="start">lab image; no GPU</text>
+<text x="1264" y="397" font-family="Helvetica, Arial, sans-serif" font-size="10.5" font-weight="normal" fill="#2E6A2E" text-anchor="start">devai-lab; no GPU</text>
 <rect x="1264" y="420" width="172" height="70" rx="8" fill="#FFFFFF" stroke="#4F9A5A" stroke-width="1.4"/>
 <text x="1274" y="439" font-family="Helvetica, Arial, sans-serif" font-size="12.5" font-weight="bold" fill="#222" text-anchor="start">clients</text>
 <text x="1274" y="453.5" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">bench and test</text>
@@ -107,8 +107,8 @@
 <text x="250" y="916.0" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">reached through its socket</text>
 <path d="M1020 882 l10 -10 h430 v58 l-10 10 z" fill="#CFEACF" stroke="#2E8B3E" stroke-width="2"/>
 <rect x="1020" y="882" width="430" height="58" rx="8" fill="#E3F4E3" stroke="#2E8B3E" stroke-width="2"/>
-<text x="1030" y="901" font-family="Helvetica, Arial, sans-serif" font-size="12.5" font-weight="bold" fill="#222" text-anchor="start">GPU 0</text>
-<text x="1030" y="915.5" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">RTX PRO 4000 Blackwell, 24 GB</text>
+<text x="1030" y="901" font-family="Helvetica, Arial, sans-serif" font-size="12.5" font-weight="bold" fill="#222" text-anchor="start">GPU 0  (optional)</text>
+<text x="1030" y="915.5" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">RTX PRO 4000 Blackwell, 24 GB; without one: Ollama, trainer on CPU</text>
 <rect x="20" y="958" width="1450" height="120" rx="12" fill="#F6F6F6" stroke="#999999" stroke-width="1.4"/>
 <text x="1080" y="978" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="bold" fill="#333" text-anchor="start">/var/cache/devai   (host volumes)</text>
 <path d="M40 993 v-6 a2 2 0 0 1 2 -2 h70 l8 8 z" fill="#FFFFFF" stroke="#777" stroke-width="2.2"/>

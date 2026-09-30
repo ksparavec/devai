@@ -107,7 +107,7 @@ def draw() -> str:
     markers()
     out.append(f'<rect width="{W}" height="{H}" fill="#FFFFFF"/>')
     text(W / 2, 30, "devai Slurm gatekeeper -- proposed architecture", size=20, weight="bold", anchor="middle")
-    text(W / 2, 50, "single host, rootless podman, Slurm 26.05, one GPU; no Slurm in the backend containers. "
+    text(W / 2, 50, "single host, rootless podman; no Slurm in the backend containers; the GPU is optional. "
          "Numbered arrows = the table in docs/slurm.md Sec. 2", size=12, colour="#555", anchor="middle")
 
     # ---------------------------------------------------------- row A
@@ -122,7 +122,7 @@ def draw() -> str:
         arrow([(cx, cy), (cx + 34, cy)], kind)
         text(cx + 42, cy + 4, what, size=10.2, colour="#333")
     zone(820, 72, 650, 120, "devai-lab-egress  (internal network, no internet)", "#F4F8FD", "#8AA4C8")
-    box(840, 98, 610, 80, "Lab containers  (lab image)", [
+    box(840, 98, 610, 80, "Lab containers  (devai-lab)", [
         "agents: claude, codex, opencode, pi, dsh, dstui, aiagent",
         "no GPU device; they talk only to the router (D1)"], fill="#E8F0FC", stroke=BLUE)
 
@@ -136,17 +136,17 @@ def draw() -> str:
 
     # devai-slurm: all of Slurm, one image, one container
     zone(40, 360, 460, 470, "devai-slurm  (one image, one container)", "#F5F0FB", PURPLE, label_dx=160)
-    text(200, 397, "privileged, --pid=host, GPU (NVML only), podman socket", size=10.2, colour=PURPLE)
+    text(200, 397, "privileged, --pid=host, podman socket; GPU (NVML) if present", size=10.2, colour=PURPLE)
     cp = dict(fill="#EFE7F8", stroke=PURPLE)
-    box(60, 410, 420, 42, "slurmrestd  :6820", ["REST API v0.0.44, auth/jwt"], **cp)
+    box(60, 410, 420, 42, "slurmrestd  :6820", ["REST API, auth/jwt"], **cp)
     box(60, 475, 420, 60, "slurmctld", ["queue, priorities, holds; state -> jobs/slurmctld/"], width=2.2, **cp)
     box(60, 560, 420, 40, "slurmdbd", ["accounting, job scripts, comments"], **cp)
     cylinder(60, 620, 420, 70, "MariaDB  (Debian package)", ["data -> jobs/mariadb/"])
-    box(60, 712, 420, 108, "slurmd  --  the only node  (Gres=gpu:1)", [
-        "one GPU job at a time; runs each job script",
+    box(60, 712, 420, 108, "slurmd  --  the only node;  license engine:1", [
+        "one engine / trainer / probe job at a time",
         "job = podman exec <container> devai-run <jobid> ...",
-        "guard (prolog / epilog): idle card, kill holder, or drain;",
-        "GPU sampler (NVML) -> results/<jobid>/gpu.json"], fill="#EDE3F7", stroke=PURPLE, width=2.2)
+        "GPU host: guard (idle card, kill holder, or drain)",
+        "   and sampler (NVML) -> results/<jobid>/gpu.json"], fill="#EDE3F7", stroke=PURPLE, width=2.2)
 
     # backend containers, no Slurm
     zone(540, 360, 460, 240, "devai-engines  (image + container; no Slurm)", "#EEF7EE", "#4F9A5A")
@@ -160,7 +160,7 @@ def draw() -> str:
     text(1034, 397, "own image; no Slurm", size=10.5, colour="#2E6A2E")
     box(1034, 420, 182, 70, "trainer runs", ["one fine-tuning job", "per trainer job"], **job)
     zone(1250, 360, 200, 240, "devai-workload", "#FFFFFF", "#4F9A5A")
-    text(1264, 397, "lab image; no GPU", size=10.5, colour="#2E6A2E")
+    text(1264, 397, "devai-lab; no GPU", size=10.5, colour="#2E6A2E")
     box(1264, 420, 172, 70, "clients", ["bench and test", "workload jobs"], fill="#FFFFFF", stroke="#4F9A5A")
 
     # -------------------------------------------------- below devai-net
@@ -170,7 +170,7 @@ def draw() -> str:
     text(116, 909, "outside Slurm", size=11, weight="bold", colour=RED, anchor="middle")
     text(116, 922, "(not allowed)", size=10, colour=RED, anchor="middle")
     box(240, 868, 280, 68, "podman service", ["host user, rootless", "reached through its socket"], fill="#F4F4F4")
-    gpu_box(1020, 872, 430, 58, "GPU 0", ["RTX PRO 4000 Blackwell, 24 GB"])
+    gpu_box(1020, 872, 430, 58, "GPU 0  (optional)", ["RTX PRO 4000 Blackwell, 24 GB; without one: Ollama, trainer on CPU"])
     zone(20, 958, 1450, 120, "/var/cache/devai   (host volumes)", "#F6F6F6", "#999999", label_dx=1060)
     folder(40, 985, 480, 80, "jobs/   (new volume)", [
         "results/<jobid>/  result.json, gpu.json, logs", "mariadb/  history database    slurmctld/  state"], width=2.2)
