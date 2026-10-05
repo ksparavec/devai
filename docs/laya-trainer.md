@@ -4,8 +4,10 @@ The laya trainer fine-tunes laya "System 1" decision models for aiagent by
 distillation from the 27B teacher. It is a router backend, but a **job runner**,
 not an inference engine: a request to its port starts a training job that holds
 the GPU for minutes to hours after the request has returned. The design and its
-owner decisions are in [docs/plans/laya-trainer.md](plans/laya-trainer.md); this
-page is the reference for what is built.
+owner decisions were in the laya-trainer plan (removed 2026-10-05, in git
+history; what was left of it is Phase 21 of
+[the platform-rebuild plan](plans/platform-rebuild.md)); this page is the
+reference for what is built.
 
 - Image: `localhost/devai-laya-trainer:latest` (`make build-laya-trainer`), on the
   lab's GPU base image (`devai-base-gpu`, Python 3.14.7), hash-locked Python

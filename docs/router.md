@@ -509,8 +509,9 @@ So folding alone is sufficient and **no field filtering is needed** --
 are not the blocker and pass through the normalisation untouched
 (`output_config.effort` is then rewritten by the reasoning policy, see
 3c -- a policy decision, not a shim requirement). SGLang was verified
-independently and behaves identically (see
-`docs/plans/sglang-backend-remediation.md` Phase 0, finding 11).
+independently and behaves identically (see the
+sglang-backend-remediation plan's Phase 0, finding 11; removed 2026-10-05, in git
+history).
 
 This is a client/server API-version mismatch rather than a devai defect:
 Claude Code emits a newer Anthropic beta wire format (note the

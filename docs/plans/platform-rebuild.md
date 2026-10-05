@@ -1,27 +1,25 @@
 # Platform rebuild
 
-_Pull exactly one image from upstream; compile every engine here into one container that runs all the time; let Slurm, in its own container, decide what is on the GPU and record every job; connect the containers with a NATS bus; make the router a Slurm client; and run everything the Makefile does from a web service, as jobs._
+_Pull exactly one image from upstream; compile every engine here into one container that runs all the time; let Slurm, in its own container, decide what is on the GPU and record every job; connect the containers with a NATS bus; make the router a Slurm client; and run everything the Makefile does from a web service, as jobs. Alongside: decide SGLang's future, answer Claude Code's throwaway requests in the router, rank models before probing, diagnose failed launches, offer lanes on one port, and build the library service aiagent needs._
 
 ## Status
 
 Draft (2026-10-05). Nothing is built or tested.
 
-- **One plan for the whole new architecture.** It replaces three plans, deleted the same day (git history keeps them): `slurm-gatekeeper`, `minimal-external-images` and `devai-operator`.
-  - Their decisions are kept below under their original IDs: M1-M15 (images), D1-D16 (Slurm), O1-O9 (operator), quoted as recorded.
-  - In them, "the Slurm plan", "the image-reduction plan" and "the devai-operator plan" now mean the matching phases of this plan.
+- **devai's only plan.** On 2026-10-05 it replaced every earlier plan; all were deleted, and git history keeps them. `docs/plans/README.md` lists each and what happened to it.
+  - Its core: `slurm-gatekeeper`, `minimal-external-images` and `devai-operator`. Their decisions are kept below under their original IDs: M1-M15 (images), D1-D16 (Slurm), O1-O9 (operator), quoted as recorded. In them, "the Slurm plan", "the image-reduction plan" and "the devai-operator plan" now mean the matching phases of this plan.
+  - The other plans: their parts that conflict with the rebuild or that it makes moot were dropped; the parts it absorbs are listed under "Absorbed from earlier plans"; their compatible or independent parts became Phases 15-21. The library-service plan's decisions are kept as LS1-LS28.
 - **The architecture is [docs/slurm.md](../slurm.md).** This plan follows it section by section (see Approach).
   - Where the code needs more detail than the architecture gives, the detail is fixed under Contracts (C1-C8).
   - Where that detail adds to or differs from slurm.md, it is recorded as an implementation decision (I1-I14), taken by the operator on 2026-10-05 and folded into slurm.md the same day.
-- **14 phases in one order.** Each has its files, steps, tests and exit criteria.
+- **21 phases.** Phases 1-14 build the new architecture; Phases 15-21 are the independent work folded in from earlier plans. Each has its files, steps, tests and exit criteria; the order table under Approach says what can run beside what.
 
 ## Dependencies
 
-None.
+None inside devai. Outside it:
 
-Two other plans are affected but not prerequisites:
-
-- [Plan: laya-trainer](./laya-trainer.md) (In Progress): its API toward aiagent does not change (D14). Phases 8 and 9 change how the trainer runs.
-- [Plan: library-service](./library-service.md): unaffected.
+- **aiagent** (devitops-com/aiagent): the library service's field-level contract is aiagent's `docs/design/library-service-needs.md` (Phase 20). The laya trainer's API toward aiagent does not change (D14; reference: docs/laya-trainer.md).
+- **Owner actions** that block parts of Phase 20 -- a contact address, API keys, contacting arXiv -- are listed there.
 
 ## Enables / Unblocks
 
@@ -40,7 +38,12 @@ Two other plans are affected but not prerequisites:
   - devai is run from a browser, without a host shell.
   - Every operator action -- build, pull, probe, bench, backup -- is in the same job history as the engines, with its log and its outcome.
   - The host needs only podman and the one-time root setup.
-- **Later:** several local GPUs, one engine per GPU, through Slurm's GPU allocation (not in scope here).
+- **Independent work folded in (Phases 15-21).**
+  - A measured decision on SGLang before it is compiled here.
+  - Claude Code's throwaway requests answered without an engine.
+  - Every catalog row ranked before probing; vendor launch recipes; failed launches diagnosed.
+  - The owner's three library use cases: a ranked list of important recent articles with critical opinions and verifiable implementations; explanations built only from the library, every claim cited with a confidence level; software architectures built from published, tested algorithms, with their sources.
+- **Later:** several local GPUs, one engine per GPU, through Slurm's GPU allocation; sandboxed execution of a paper's code (the library's verification level (b)). Not in scope here.
 
 ## Out of scope
 
@@ -65,6 +68,16 @@ Two other plans are affected but not prerequisites:
   - A browser terminal (O4).
   - Replacing JupyterLab or the agents' own UIs.
 - **Repository.** A separate project or repository (D5).
+- **Library service** (Phase 20):
+  - judgement of any kind: the service ranks nothing against a profile or topic, calls no LLM and runs no classifier;
+  - translation (aiagent translates);
+  - the storage medium, backups and exports (LS15);
+  - repository clones and datasets (LS10);
+  - verification level (b), sandboxed execution: a separate plan, later;
+  - paid sources (LS7) and web-search APIs;
+  - automated access to sources whose terms forbid it (LS8): no scraping, no captcha or Cloudflare workarounds;
+  - an MCP server over the library (LS3), for now; with M10 it would need MCP reconsidered.
+- **Routing by message content.** The lanes of Phase 19 are explicit only.
 
 ## Operator decisions
 
@@ -143,6 +156,52 @@ The first architecture (one Slurm node per backend image) was judged far too com
   - The repository key is accepted only with Docker's fingerprint `9DC8 5822 9FC7 DD38 854A E2D8 8D81 803C 0EBF CD88`; apt then checks the package against the signed index.
   - The package installs `/usr/libexec/docker/cli-plugins/docker-compose`, and the image's `containers.conf` names that path in `compose_providers`, so `podman compose` does not depend on a search order.
 
+### Library service (2026-09-25/26)
+
+Given in devai's session unless marked otherwise. LS1-LS28 were numbered D1-D28 in the library-service plan, and aiagent's documents may cite them that way; aiagent's own questions O1-O14 appear here as A-O1-A-O14.
+
+| # | Decision |
+| --- | --- |
+| LS1 | **The split.** aiagent owns everything that thinks: search planning and queries, classification (laya students), the multi-round loop between encoder and LLM, translation, verdicts, answers with citations, and the versioned research profile. devai owns the library service: all external network I/O, the store, the index, credentials, and model serving. |
+| LS2 | **A devai service with a small API**, like the laya trainer, not aiagent's own files. |
+| LS3 | **Consumers:** aiagent only, for now. An MCP server may be added later. |
+| LS4 | **arXiv: the PDF plus arXiv's HTML rendering, no LaTeX source.** Chosen after the research showed that `arxiv.org/robots.txt` disallows `/e-print` and `/src` for robots. It replaces the first answer ("PDF plus LaTeX source"). |
+| LS5 | **robots.txt and documented APIs.** A documented API follows its provider's API terms and limits. robots.txt governs every page and file fetch. (`export.arxiv.org/robots.txt` says `Disallow: /`, while arXiv's API terms sanction `/api/query` there; Wikipedia's robots.txt disallows `/w/` and `/api/`, while its bot policy documents those APIs.) |
+| LS6 | **Sources, in this order:** arXiv; free, independent sources (open-access journals, author pages; SSRN see LS8); GitHub repositories that papers link to; carefully selected blogs, forums and Wikipedia. "Independent" means not corporate or government owned. aiagent's A-O4, answered by the owner in aiagent's session, reads this as who publishes the fetched document: company and government publications are out, and the authors' affiliations are information only. |
+| LS7 | **Free sources only for now.** Paid sources may be added later. "Well-known" is a metric (for example the h-index), not a curated list. |
+| LS8 | **Sources whose terms forbid automation or storage** (SSRN, Substack, Kaggle's web pages, Stack Exchange for AI use, Reddit, Drive-hosted Colab notebooks) are used only through an official API whose terms allow it, or as a link. The service first looks for the same work at another open location. |
+| LS9 | **Logins** (Kaggle, GitHub, Medium, Substack, Reddit, Stack Exchange, Colab) are all wanted eventually. Honour robots.txt and every limit; never get banned. |
+| LS10 | **Code: no clones, no datasets.** Keep short, relevant excerpts only, each with a permanent link to its exact commit (repository, file, lines) and the repository's licence. Verification level (a), metadata and content checks, is required now but not sufficient. Level (b), sandboxed execution compared against the paper's results, comes later and is the project's edge. |
+| LS11 | **Relevance has two bounds:** the research profile is the outer bound (CS/AI, computational finance, analysis of PDEs, numerical analysis, probability); each query is the inner bound. |
+| LS12 | **Rejected items keep a verdict record and no artifacts.** "A negative answer is as valuable as a positive one." |
+| LS13 | **Verdict stamps.** Every verdict records the profile version and the model or student that decided. Nothing is re-judged automatically; an item is re-judged on request, or when it comes up again. Accepted items are never deleted silently. Some verdicts will go stale, or turn wrong, over time. How "comes up again" works is narrowed by aiagent's A-O1 (below): a resurfaced item is judged again without an owner override only when its current verdict is an `off_topic` reject for another topic; any other re-judge is an owner-requested override (A-O8). |
+| LS14 | **Latest version only**, for papers and for code: a stored repository's excerpts stay pinned to the commit they were taken from; a refresh to a newer commit happens on request, and afterwards only the latest accepted commit's excerpts are kept. |
+| LS15 | **Storage: one configurable directory**, configured once and used everywhere. Its type, backups and exports are out of this project's scope. Plain files, organised in a hierarchy like git's object store, fast for standard Linux tools, planned for millions of files. The directory may be any local path, not only under `/var/cache/devai/`, and exactly three things are required of it (2026-09-26): it is an absolute path, it already exists, and the owner can read and write it. Nothing else is a requirement: not whether it is its own volume, not its filesystem, not its size. |
+| LS16 | **English only**, for everything stored. A non-English source is machine-translated first (by aiagent), marked as such with the model named; the original is kept as a link, and citations point to the original. |
+| LS17 | **Search** is keyword plus vector, with an English embedding model on the CPU. Indexes are derived and rebuildable. |
+| LS18 | **Citations:** section, paragraph and equation, plus the PDF page. PDF pages alone are good enough. |
+| LS19 | **The research profile** lives in aiagent as a versioned file; the library records which version each verdict used. |
+| LS20 | **Acquisition runs as background jobs**, and aiagent must show progress and a time estimate. A prompt that stays silent for minutes is unacceptable. |
+| LS21 | **Contact identity:** a dedicated address, which the owner will create; a placeholder until then. |
+| LS22 | **Blogs are selected, not crawled.** A blog qualifies when it strictly covers the topics and its author also publishes cited articles or implements algorithms on the platforms above (ideally both). |
+| LS23 | **The first acceptance test:** the topic "Automatic Adjoint Differentiation method in computational finance". Not arXiv only: other sources are used where feasible. |
+| LS24 | **The embedding model gets its own volume**: a new store, `/var/cache/devai/embed`, on its own LV (per the mount-point convention), filled only through `scripts/select-models.py` from a pinned catalog row in a new `deploy/embed-models.yaml`. |
+| LS25 | **Other paths to the sources stay open.** The lab can reach arXiv and other sources directly (through pipelock, and trusted harnesses on devai-net; the MCP gateway's servers went with the gateway, platform-rebuild M10); the shared per-operator budget is accepted and documented, and nothing is closed. |
+| LS26 | **GROBID** is used for PDFs without arXiv HTML (about 4 GB of RAM, its own container). |
+| LS27 | **The anonymous arXiv PDF mirror** (Cornell's public GCS bucket) is checked in Phase 1 and used only if its terms and robots.txt allow automated downloads. |
+| LS28 | **Revoked items keep their artifacts for 30 days** in `trash/`, then lose them: a stated exception to LS12, as a safety net against a faulty client. |
+
+**Relayed from aiagent's session.** The owner answered aiagent's A-O1-A-O14 there on 2026-09-26 with "go with recommendations" (aiagent's session reported it; the owner has not said it in devai's session). Those that shape devai's rules: an `off_topic` reject is scoped to its topic, so the same item may be judged again for another topic, while `out_of_bounds`, `low_quality` and `duplicate` rejects stay final (A-O1); a new arXiv version is reported as `latest_seen` and refreshed only on request, and the old version's text units are kept while its PDF and HTML are dropped, which is a small, owner-approved exception to LS14 so that old citations still resolve (A-O2); only the owner overrides a verdict (A-O8); every metadata-only rejection keeps a record (A-O9); the staging TTL for fetched items that were never judged is 30 days (A-O11). A-O13's original recommendation (arXiv only first) is superseded by LS23.
+
+**devai's own safety rules** (not owner decisions): the service makes no external request while the contact address is unset; it refuses to start when `LIBRARY_DIR` fails one of LS15's three requirements, and it never creates that directory.
+
+**Decided 2026-10-05, when the plan was folded in here:**
+
+| # | Decision |
+| --- | --- |
+| LS29 | **GROBID is built here.** From a pinned release, in a two-stage `deploy/Dockerfile.grobid` on the pinned trixie-slim with Debian's JDK, CRF models only; no upstream image (M1). |
+| LS30 | **The library's API keys are plain 0600 files,** as the Slurm keys are (C7): `~/.config/devai/library/<name>`, mounted read-only into `devai-library` only, backed up by `devai-backup`. sops/age stays in the attic (M12). |
+
 ## Implementation decisions (2026-10-05)
 
 The plan proposed each of these as the smallest choice that lets the code be written, and the operator decided them on 2026-10-05. Three were decided differently from the proposal: I4, I9 and I10. All fourteen are folded into slurm.md; each names the sections that carry it and the phase that needs it.
@@ -211,7 +270,11 @@ The plan proposed each of these as the smallest choice that lets the code be wri
 2. Does slurmd run in an unprivileged container with `proctrack/linuxproc`, now that job scripts only send bus commands? -- Phase 5 step 1 answers it; the measured privileged setup is the fallback.
 3. The sleep fast path: how long sleep and wake take, how much VRAM a sleeping vLLM or SGLang process keeps, and whether sleep support costs speed or memory while serving. -- Phase 8 step 1 measures it; `sleep_mode=false` by default is the fallback.
 
-None of them blocks coding: each is the first step of its phase, and each has its fallback.
+4. What are the SGLang keep thresholds (Phase 15)? -- recommendation (the original plan's): keep requires both (i) SGLang's steady TTFT within 3x of vLLM's on the same checkpoint, and (ii) turn-2+ TTFT at least 25% better than vLLM's on an identical multi-turn workload, with a non-zero engine-reported cache hit rate and a measurable delta against `--disable-radix-cache`. Confirm before the runs.
+5. Short-circuit design (Phase 16)? -- recommendations (the original plan's): patterns in a config file (`deploy/shortcircuit-probes.json`), not in Go; streaming handled from the start; `/v1/messages` only; count_tokens only if Claude Code calls it and an engine tokenizer is reachable.
+6. Lanes design (Phase 19)? -- recommendations (the original plan's): a configurable directive prefix, default `@@`; an unknown token answers 400 listing the lanes; text content on `/v1/chat/completions` and `/v1/messages` first.
+
+None of them blocks coding: questions 1-3 are the first steps of their phases, each with a fallback; questions 4-6 have recommendations the phases follow unless the operator overrules them.
 
 ## Context
 
@@ -349,6 +412,12 @@ These engines cannot share one Python environment. And FlashInfer compiles its k
 | results scattered | slurmdbd + `jobs/results/` + the bus log + `devai-jobs` | 5, 13 |
 | operations are Makefile targets in a host shell | `devai-operator`, a web service running devai's scripts as jobs; the Makefile stays for development | 6, 7, 10, 12 |
 | the stack assumes an NVIDIA GPU | the same images with or without one | 11 |
+| SGLang's future undecided, with stale claims in the docs | a measured keep-or-freeze decision; the docs corrected | 15 |
+| Claude Code's throwaway requests load models | answered in the router, off by default | 16 |
+| an unprobed model has no estimate and no parser | vendor recipes and a labelled estimator | 17 |
+| a failed launch needs a manual post-mortem | a diagnosis, and one recorded auto-fix retry in probes | 18 |
+| one port per backend | an optional lanes port | 19 |
+| no library service | the library service for aiagent | 20 |
 | lab containers have the GPU | no GPU device in the lab | 14 |
 
 ### End state
@@ -382,8 +451,15 @@ These engines cannot share one Python environment. And FlashInfer compiles its k
 | 12 | Lab and host setup in the web | 6 | 11, 13 |
 | 13 | History | 10 | 11, 12 |
 | 14 | Cleanup and documentation | 10, 11, 12, 13 | -- |
+| 15 | SGLang: keep or freeze | -- (must finish before 4a) | 1-3, 5-7 |
+| 16 | Router short-circuit | -- (16a early) | any |
+| 17 | Catalog and fit tooling | -- (17a before 4g; calibration after 4 and 10) | 1-3, 5-7 |
+| 18 | Launch-failure diagnosis | 8, 10 | 11-13, 19 |
+| 19 | Lanes on one port | 9 | 10-13, 18 |
+| 20 | Library service | 2, 3 | 4-19 |
+| 21 | Loose ends | -- | any |
 
-The critical path is 1 -> 2 -> 3 -> 4 -> 8 -> 9 -> 10 -> 13 -> 14. Phase 5 and Phases 6-7 run beside it and must be done before 8 and 10 respectively.
+The critical path is 1 -> 2 -> 3 -> 4 -> 8 -> 9 -> 10 -> 13 -> 14. Phase 5 and Phases 6-7 run beside it and must be done before 8 and 10 respectively; Phase 15 runs beside 1-3 and must be done before 4. Phases 15-21 are outside slurm.md's scope.
 
 ## Absorbed from earlier plans (2026-10-05)
 
@@ -576,6 +652,7 @@ The router serves `/devai/v1/` on every backend port itself and never proxies th
 | `POST /devai/v1/holds` `{job_id, model}` | `model` is written as a client sends it (`<name>[::mtp][@ctx]`). The hold is checked against Slurm: `job_id` must be RUNNING, of kind bench, probe or action, and its comment must name this backend and model; otherwise 403. Starts or keeps the engine and answers 200 with the GPU record once it serves (long-poll up to `HEALTH_TIMEOUT_SECONDS`). 409 when another active hold needs a different launch; 503 + `Retry-After` when a trainer or probe job holds the GPU |
 | `DELETE /devai/v1/holds/{job_id}` | 204. A hold is also dropped when its job leaves RUNNING, checked on every decision and every 30 s |
 | `GET /devai/v1/gpu` | the GPU record: the holder's job, kind, backend, launch and state; the holds; the sleeper; the pending jobs and the launches they name |
+| `GET /devai/v1/ready` | 200 only when slurmrestd and the bus answer, the probe caches are loaded and the model stores are mounted; 503 naming what is missing. `/health` stays a liveness answer (Phase 9; from odysseus RT-6) |
 
 The router also blocks the engines' control routes on every listener, before the proxy, as `makeMutationGuard` blocks Ollama's store-changing paths today. It answers 403 with a body naming `devai-control`.
 
@@ -882,6 +959,7 @@ deploy/recovery-flags.json, deploy/docker-compose.yaml, Makefile, tests/
    - Run `make backup-create` first.
    - Failures go to the exclusion ledger and the model is dropped (M8), including the two models that had their own images.
    - It also closes items absorbed from earlier plans: the SGLang cells that still carry a GPTQ "unsupported quantization" verdict or no launch fingerprint, each re-probed with its load probe; and Gemma-4-31B-IT-NVFP4 with its `--enforce-eager` recovery flag.
+   - One model without a curated `parsers:` block joins the re-probe, so the card-derived parser path (`scripts/_card_hints.py`) runs end to end once.
 8. **4h -- `QUANT_IMAGE`** points at `devai-engines` (its vLLM environment); `scripts/quant/quant_smoke.py` already adds llm-compressor on top of the image's torch.
 
 ### Exit criteria
@@ -1286,6 +1364,7 @@ gpu-arbiter/slurm_launch.go       new    -- the Slurm launcher (below); replaces
                                             ensureOllamaRunning
 gpu-arbiter/gpu_record.go         new    -- the GPU record
 gpu-arbiter/holds.go              new    -- C5 holds and /devai/v1/gpu
+gpu-arbiter/ready.go              new    -- C5 /devai/v1/ready (from odysseus RT-6)
 gpu-arbiter/control_routes.go     new    -- C5 blocked engine routes, registered by newBackendMux on every listener
 gpu-arbiter/trainer_jobs.go       new    -- :11438 create and cancel -> trainer jobs; the boot reconcile with the controller
 gpu-arbiter/main.go               modify -- the podman launch layer removed (containerRecreate, createAndStart,
@@ -1370,6 +1449,7 @@ docs/router.md                    modify -- the launch sections rewritten for th
 - Requests alternating between an Ollama model and a vLLM model give exactly one engine job per switch, and never two engine processes on the card at once (the samples in `gpu.json`; no overlapping engine jobs in `sacct`).
 - After a router restart while vLLM serves, the next request for the same model is proxied without a load.
 - `make laya-check` passes through the router on Slurm: swap, 503 hold, job, parity, teacher restored.
+- `/devai/v1/ready` reports not ready with slurmrestd or NATS stopped, while `/health` still answers.
 - `make test-router`, `make test-e2e`, `make test-vllm` and `make test-sglang` pass.
 
 ### Phase 9 risks
@@ -1627,6 +1707,542 @@ Only the new path is left, no devai application container has a GPU device, and 
 
 ---
 
+## Phase 15 -- SGLang: keep or freeze
+
+From sglang-backend-remediation, Phase 5. Its Phases 0-3 shipped; its Phase 4 re-probe is absorbed by Phase 4 here.
+
+### Goal
+
+Decide, on measured evidence, whether SGLang stays -- before Phase 4 spends its riskiest step compiling it -- and leave no stale SGLang claim behind either way. The picker stops offering an agent/backend pair known to fail.
+
+It runs on today's images: upstream SGLang 0.5.16 is the version Phase 4 would compile (M5), so the measurement carries over. It must finish before Phase 4, step 4a.
+
+### Deliverables
+
+```
+gpu-arbiter/main.go (sglangEntrypoint)   modify -- emit --enable-metrics (Phase 8 carries it into pkg/engineargs)
+deploy/backend-flags.yaml                modify -- pin --enable-metrics and --disable-radix-cache
+scripts/bench/bench_concurrency.py       modify -- the multi-turn mode reads SGLang's /metrics prefix-cache counters,
+                                                    and a validation mode runs the same workload radix-on and with
+                                                    --disable-radix-cache on one engine
+scripts/model-picker.py                  modify -- `_resolve_agent` does not offer Codex on sglang (SGLang's /v1/responses
+                                                    takes no function tools, so every Codex turn fails there)
+CLAUDE.md, TODO.md, AGENTS.md, README.md, scripts/model-families.yaml (its SGLang status block),
+docs/backends.md, docs/router.md (the tool-mode table), docs/bench-results.md (via make bench-report)
+                                         modify -- every SGLang capability claim the caches contradict
+docs/html/                               modify or remove -- 15 hand-maintained pages with no generator; router.html
+                                                    still says "NVFP4 (broken)", bench-results.html "SGLang on hold"
+docs/plans/platform-rebuild.md           modify -- the decision, its thresholds and measured inputs, recorded as M16
+```
+
+### Detailed steps
+
+1. Confirm the keep thresholds before any run (Open question 4); a threshold set after seeing the numbers is no threshold.
+2. Emit `--enable-metrics` and pin it. Validate the multi-turn scorer radix-on against `--disable-radix-cache` on the same engine before trusting any cross-backend number (`make bench-concurrency MODE=multiturn` exists; it gains the cache-hit read-out).
+3. Measure on one checkpoint served by both engines: steady TTFT, turn-2+ TTFT on an identical multi-turn workload, and SGLang's engine-reported cache hit rate.
+4. Decide, and record it as M16:
+   - **keep:** Phase 4 builds SGLang as planned;
+   - **freeze:** Phase 4 skips steps 4a-4b and SGLang's stage in `Dockerfile.engines`; `sglang` leaves `_PICKER_BACKENDS` and the make targets; its router and prober code goes behind a build tag with a `RESTORE.md`, following the `attic/` precedent. The fixes from sglang-backend-remediation's Phases 1-3 stay: most of them serve vLLM too.
+5. Correct every prose site named above, and regenerate or delete `docs/html/`: a published page with a wrong capability claim is worse than none.
+6. Gate Codex off SGLang in the picker.
+
+### Exit criteria
+
+- The keep-or-freeze decision, its thresholds and its measured inputs are recorded here (M16).
+- No file in the repository asserts an SGLang capability that the probe caches contradict.
+- The picker never offers an agent/backend pair that is known to fail.
+
+### Phase 15 risks
+
+| Risk | Mitigation |
+| ---- | ---------- |
+| the multi-turn scorer measures something other than prefix reuse | step 2's radix-on versus radix-off validation on one engine |
+| the measurement needs a GPU window | it is short (one checkpoint, two engines) and replaces part of Phase 4a's cost if the answer is freeze |
+
+---
+
+## Phase 16 -- Router short-circuit
+
+From router-shortcircuit, Phases 1-4, and the leftovers of its Phase 5.
+
+### Goal
+
+Answer the throwaway requests Claude Code sends -- quota check, title generation, suggestion mode, command-prefix detection, file-path extraction -- in the router, without an engine. Today each can trigger a cold start whose answer is discarded as a UI label; after Phase 9 each would also cost an engine job.
+
+The governing rule: a request may be short-circuited only when its correct answer does not depend on the conversation's content -- a constant, or a pure syntactic function of the request bytes. Anything needing judgment falls through to the model.
+
+The feature is off by default, fail-open on every error, limited to `/v1/messages`, and calibrated on captured traffic before any pattern is trusted.
+
+It needs nothing. 16a should start early, so real traffic is captured. 16b-16d touch `makeRequestHandler`'s request path, which Phase 9 keeps; if they land before Phase 9, Phase 9 carries them.
+
+### Deliverables
+
+```
+gpu-arbiter/fingerprint.go          new    -- 16a: fingerprintRequest(path, body): path, model, max_tokens, n_messages,
+                                              has_system, system_sha256_12, has_tools, stream, body_bytes
+gpu-arbiter/fingerprint_test.go     new    -- table-driven, including "no message content in the output"
+gpu-arbiter/shortcircuit.go         new    -- 16b-16c: registry load, detector, Anthropic JSON and SSE synthesis,
+                                              the command_prefix and filepaths responders
+gpu-arbiter/shortcircuit_test.go    new    -- golden responses (JSON and the exact SSE byte sequence), no-match tables
+gpu-arbiter/main.go                 modify -- fingerprint line when DEVAI_REQUEST_FINGERPRINT=on (and a content-revealing
+                                              DEVAI_REQUEST_FINGERPRINT_RAW=on); load the registry at boot; call
+                                              tryShortCircuit after the malformed-JSON guard, before the model allowlist;
+                                              16e: /api/blobs/ added to ollamaMutationPaths
+deploy/shortcircuit-probes.json     new    -- the pattern registry, "enabled": false by default
+deploy/docker-compose.yaml          modify -- the registry mounted read-only; DEVAI_SHORTCIRCUIT, SHORTCIRCUIT_REGISTRY
+tests/fixtures/claude-code-probes/  new    -- captured request bodies, one per probe
+docs/router.md                      modify -- the fingerprint runbook; short-circuit as step 0 of the rewrite chain;
+                                              the model-store mutation guard, which docs/router.md does not document yet
+```
+
+### Detailed steps
+
+1. **16a -- Fingerprints, observe only.** One content-free `fingerprint:` line per POST when `DEVAI_REQUEST_FINGERPRINT=on`; the system text appears only as the first 12 hex digits of its SHA-256. The runbook: set it, run a real Claude Code session, bucket the lines by `(path, has_system, system_sha256_12, max_tokens, has_tools)`, and capture one body per frequent, deterministic bucket as a fixture.
+2. **16b -- Constant answers.** Registry entries `quota_check`, `title_generation`, `suggestion_mode`, matched only when ALL their declared markers co-occur (high precision, biased to false negatives). The answer is synthesised as an Anthropic message object, or as the full SSE sequence (`message_start` ... `message_stop`) when `stream` is true. Both `DEVAI_SHORTCIRCUIT` and the registry's `"enabled"` must be on. Every hit logs a `shortcircuit:` line naming the probe. Placed before the model allowlist on purpose: a probe carrying Claude Code's hard-coded Haiku id is answered, not refused.
+3. **16c -- Local-parse answers.** `prefix_detection` (markers `<policy_spec>` and `Command:`) and `filepath_extraction` (`Command:` and `Output:` plus a file-path marker), answered by pure functions ported from free-claude-code's `extract_command_prefix` / `extract_filepaths_from_command` and pinned by the fixtures. An empty extraction falls through.
+4. **16d -- count_tokens, optional.** Only if 16a shows Claude Code calling `/v1/messages/count_tokens` against the router. Delegate to the serving engine's `/tokenize` (after Phase 9, in `devai-engines`); never answer with an approximation, because a wrong count drives wrong compaction. Otherwise record it as shelved, with the reason.
+5. **16e -- Guard leftovers.** Block `/api/blobs/` like the other store-changing Ollama paths (the original Phase 5 planned it; the shipped guard does not), and document the guard in docs/router.md.
+
+### Exit criteria
+
+- With `DEVAI_REQUEST_FINGERPRINT=on` every POST emits exactly one `fingerprint:` line, and none when it is unset; a unit test shows the raw prompt text never appears in it.
+- Replayed fixtures return the correct canned answers, byte-validated against the golden JSON and SSE, and a normal chat, a summarisation-style request and a tool-call request all fall through.
+- With the feature off (the default), the request path is byte-identical to today.
+- Removing a required marker from a fixture flips it to fall-through.
+- count_tokens matches the engine's tokenizer on the fixtures, or is recorded as shelved.
+- `/api/blobs/` answers 403 on every listener; `make test-router` passes.
+
+### Phase 16 risks
+
+| Risk | Mitigation |
+| ---- | ---------- |
+| a real request matches a probe and gets a fabricated answer | all markers must co-occur; off by default; every hit logged; calibrated on captured traffic |
+| Claude Code changes a probe's wording | patterns live in a config file; a miss falls through to the model; fixtures pin the patterns |
+| a malformed synthesised answer makes Claude Code error | golden JSON and SSE tests |
+| logging request shapes leaks content | hashes only; the raw mode is a separate, documented switch |
+
+---
+
+## Phase 17 -- Catalog and fit tooling
+
+From odysseus-borrowed-ideas, CB-3 and the rest of CB-1. odysseus's mechanisms below were read by agents, not by hand: re-open the cited odysseus files before porting.
+
+### Goal
+
+- **17a, vendor launch recipes (CB-3):** a model starts probing from vLLM's published recipe -- parsers, engine flags, environment -- instead of from a bare command, and a new model gets a labelled parser guess before its first probe. Best done before Phase 4's re-probe, which then benefits.
+- **17b, the estimator (the rest of CB-1):** rank every catalog row before probing, and fill the picker's empty speed and quality cells with a clearly labelled estimate. The KV-at-context term already shipped in `scripts/catalog-discover.py`.
+
+It needs nothing. 17b's calibration uses the re-probed caches (Phase 4) and the re-bench (Phase 10).
+
+### Deliverables
+
+```
+scripts/fetch-vllm-recipes.py     new    -- 17a: fetch vllm-project/recipes YAML per catalog repo, normalise base args and
+                                            env, tool-calling and reasoning args, per-precision VRAM minimum and flags,
+                                            min_vllm_version; cache 6-12 h; offline-first (a cached copy, or nothing)
+scripts/model-families.yaml       modify -- recipe-seeded `parsers:` blocks, marked as seed
+deploy/recovery-flags.json        data   -- recipe-seeded engine_flags / engine_env, only where min_vllm_version admits
+                                            vLLM 0.28.0 (D8)
+scripts/_fit_estimate.py          new    -- 17b: estimate_memory_gb (reusing catalog-discover's KV term), a bandwidth-bound
+                                            decode estimate keyed by DEVAI_GPU_TYPE, quant quality and speed tables
+scripts/select-models.py          modify -- `make model-rank` (tiers perfect / good / marginal / too_tight; VRAM= override)
+scripts/model-picker.py           modify -- a recipe badge next to TOOLS; a labelled `est` value only in empty cells
+docs/llm-tokens-and-speed.md      modify -- cross-link the estimator to the derivation
+tests/python/test_fit_estimate.py, test_vllm_recipes.py
+                                  new    -- tables, tiers, offline behaviour, the version gate
+```
+
+### Detailed steps
+
+1. **17a:** the resolution order is recipe > name heuristic (labelled "guessed, not probe-verified") > none. A probe-verified value always wins. A recipe never injects a flag the pinned vLLM rejects (`min_vllm_version`).
+2. **17b:** probe and bench caches stay authoritative. An estimate appears only where no measurement exists, always labelled `est`. An unknown GPU type gives no estimate, never a wrong one. The odysseus idea of feeding predicted speed into cluster routing is dropped with cluster mode.
+3. **Calibration (17b), after Phases 4 and 10:** compare the predicted decode speed of every benched model with its measured one, and record the error band.
+
+### Exit criteria
+
+- For a model with an official recipe, the parsers and engine flags are set before any probe runs, and its first probe launches with the vendor command.
+- The picker shows a recipe badge; a probe-verified value overrides a recipe-seeded one; a model without a recipe falls back to the labelled heuristic, then to today's behaviour.
+- `make model-rank` prints a tier for every catalog row without starting a container, and `VRAM=80` re-ranks the catalog as on an 80 GB card.
+- The picker shows `est` only where no bench value exists.
+- The calibration's error band is recorded in docs/llm-tokens-and-speed.md.
+
+### Phase 17 risks
+
+| Risk | Mitigation |
+| ---- | ---------- |
+| a recipe lags or leads the pinned vLLM | the `min_vllm_version` gate; probes remain the authority |
+| an estimate is mistaken for a measurement | the unmissable `est` label; measured values always win |
+| the recipe repository is unreachable | offline-first: cached copy or no seed, never a failure |
+
+---
+
+## Phase 18 -- Launch-failure diagnosis and one-shot auto-fix
+
+From odysseus-borrowed-ideas, CB-2. Its odysseus regex table was read by an agent, not by hand: re-verify it before porting.
+
+### Goal
+
+A failed model launch comes back with a diagnosis and a concrete fix, and a probe that fails on a recognised signature retries once with that fix applied and recorded. Built on the new launch path, so it waits for Phases 8 and 10: today's hook points (`detectLaunchFailure`, the probers' container code) are removed by Phases 9 and 14.
+
+### Deliverables
+
+```
+devai-tools/internal/diagnose/    new    -- the error-signature -> fix table (KV or CUDA OOM, context too large, wrong
+                                            or missing tool-call parser, trust-remote-code, lm_head quantisation,
+                                            port in use, missing dependency, gated repository), table-driven tests
+devai-tools/internal/control/     modify -- a load_failed error carries `diagnosis {message, suggestions:[{op, flag,
+                                            value}]}` (an additive field on C1's error object)
+gpu-arbiter/slurm_launch.go       modify -- the 502 for a failed load carries the diagnosis, and X-DevAI-Warning names it
+scripts/_probe_hf_common.py       modify -- the bus driver retries a load once with the suggested flag, after writing it
+                                            into deploy/recovery-flags.json for that model, logged and attributed
+```
+
+### Exit criteria
+
+- A probe launched with a deliberately too-large context fails once, is diagnosed as "context too large / KV OOM", gets the corrected flag recorded in `deploy/recovery-flags.json`, and passes on the second attempt.
+- A failure that matches no signature is reported verbatim: no silent wrong fix.
+- The retry is capped at one attempt per probe.
+
+### Phase 18 risks
+
+| Risk | Mitigation |
+| ---- | ---------- |
+| a wrong auto-fix makes a probe "pass" | one retry only; every applied flag logged and attributed in recovery-flags.json; unmatched failures reported verbatim |
+| an over-broad signature misdiagnoses | the table is re-verified before porting and pinned by fixtures |
+
+---
+
+## Phase 19 -- Lanes on one port
+
+From router-fanout, Phase 1 and the single-host items of its Phase 4. Its cluster demux and broadcast were dropped with cluster mode.
+
+### Goal
+
+An optional extra router port on which one client reaches several models: a request's `model` field (an agent's main and background slots, mapped through aliases) or an inline `@@<lane>` directive at the start of the last user message picks a lane, and the router serves that lane's model. Routing is explicit only; the router never interprets message content.
+
+It waits for Phase 9: the lanes dispatch through the Slurm launcher. On one GPU every lane change is an engine switch, so the cost is a cold start whenever lanes alternate; the documentation says so plainly.
+
+### Deliverables
+
+```
+gpu-arbiter/fanout.go             new    -- LaneConfig load; pure ResolveTargets(path, body): model-field and alias match,
+                                            @@<lane>, @@<model>[@ctx][::reasoning][::mtp], the default lane; the
+                                            directive stripped from the forwarded body
+gpu-arbiter/fanout_test.go        new    -- every resolution branch, over OpenAI and Anthropic bodies
+gpu-arbiter/main.go               modify -- with DEVAI_FANOUT_PORT set, a lanes listener that resolves, rewrites `model`
+                                            and hands the request to the normal handler (the Slurm launcher's Ensure)
+deploy/fanout-lanes.yaml          new    -- prefix, default_lane, lanes, aliases; the feature is inert without the file
+deploy/docker-compose.yaml        modify -- DEVAI_FANOUT_PORT, FANOUT_LANES; the registry mounted read-only
+docs/fanout.md                    new    -- lanes, directives, agent recipes (Claude Code's ANTHROPIC_MODEL and
+                                            ANTHROPIC_DEFAULT_HAIKU_MODEL on two lanes), the cold-start cost
+```
+
+### Detailed steps
+
+1. Directives are matched only at the first non-whitespace position of the last user message. `@@@@` is a literal `@@`. An unknown `@@token` answers 400 listing the valid lanes, and the directive never reaches a model.
+2. `@@all` (broadcast) is refused with 400: on one GPU a broadcast is back-to-back cold starts.
+3. Each lane's model is checked against the probe caches at boot; a lane without a fitting cell is skipped and logged.
+4. Polish, each item separately shippable: stickiness (the latest `@@<lane>` in the resent history applies when the current message has none); Ollama-native `/api/chat` and text parts of multimodal content. A heuristic auto-lane stays parked: routing stays explicit.
+
+### Exit criteria
+
+- `ResolveTargets` returns the right target for a model-field match, an alias, each directive form and the default, and 400 for an unknown token -- over OpenAI and Anthropic bodies.
+- The directive is stripped from the forwarded body.
+- With `DEVAI_FANOUT_PORT` unset, the router is byte-identical to before.
+- A real two-slot agent configuration sends its foreground and background requests to two different lanes.
+
+### Phase 19 risks
+
+| Risk | Mitigation |
+| ---- | ---------- |
+| alternating lanes on one GPU thrash cold starts | documented; the default lane and aliases make the common case one model |
+| a legitimate message starting with `@@` is read as a directive | first-position match only; unknown token is a 400, not a silent route; `@@@@` escape |
+
+---
+
+## Phase 20 -- Library service
+
+From library-service. aiagent decides what to search, what to fetch and what to keep; the service makes every external request, politely, stores what aiagent accepts as plain files, and keeps search indexes that can be rebuilt from those files.
+
+The field-level API contract is aiagent's `docs/design/library-service-needs.md` (devitops-com/aiagent), adopted with three explicit adjustments (see API below). The owner's decisions are LS1-LS30 above. The design was reviewed adversarially before the owner saw it (48 confirmed findings, all addressed). Nothing is implemented.
+
+It needs Phase 2 (the pinned Debian image, pipelock and apt-cache built here) and Phase 3 (`devai-base` on Debian). It needs no GPU and no Slurm: none of its containers is a router backend. Sub-phases 20.1-20.5 run in order; 20.3 needs aiagent's side.
+
+### Needs
+
+- **aiagent's requirements document** (`docs/design/library-service-needs.md` in devitops-com/aiagent), the field-level contract, and aiagent's client implementation.
+- **Owner actions, each blocking the phase named:**
+  - the dedicated contact address (LS21) on the company's own domain: blocks 20.1's live exit (no external request without it), and every key application below;
+  - an OpenAlex API key: optional, raises the daily budget from $0.10 to $1 (20.2);
+  - a GitHub fine-grained token (20.4); a Hugging Face token (20.4); a Semantic Scholar key, requested only when 20.5 starts because unused keys are pruned after about 60 days; an OpenReview service account (20.5);
+  - contacting arXiv before the library passes about 1,000 full-text downloads ("Politeness engine").
+- **pipelock** (`docs/pipelock.md`): the service's outbound traffic goes through it for DLP.
+- **The lab launchers** (`bin/devai-agent`, the Makefile), which gain an optional read-only `/library` mount.
+
+Open for the owner: none (LS24-LS28 answered the original plan's questions). 20.1 still checks the arXiv PDF mirror's terms (LS27) and confirms the language detector's licence.
+
+### Verified source facts (2026-09-25/26)
+
+Researched from the providers' own documentation, terms and robots.txt files, then re-checked claim by claim by a second reader: 169 claims, of which 9 were refuted and corrected, 15 more confirmed only with corrections, and 1 left unverifiable. Several limits are undocumented or change often, so every number below is configuration, re-checked before the phase that uses it ships, and the service reads rate-limit headers at runtime rather than trusting these numbers.
+
+| Source | Access | Limits and terms the service applies |
+| --- | --- | --- |
+| arXiv legacy APIs (`export.arxiv.org/api/query`, `oaipmh.arxiv.org/oai`) | open | Terms: one request every 3 s on one connection, for all legacy APIs together and across all of the operator's machines. GET only (POST draws 429s sooner); cache each query 24 h; at most 2000 results per call. 429 "Rate exceeded" happens even at compliant rates (server capacity); 503 means excessive use. Show "Thank you to arXiv for use of its open access interoperability." |
+| arXiv files (`arxiv.org/pdf`, `/html`, `/abs`) | open | robots.txt: `Crawl-delay: 15`; `/pdf`, `/html`, `/abs` allowed; `/e-print`, `/src` disallowed. A descriptive User-Agent with contact. arXiv treats continued requests after a 403 as an attack. Contact arXiv before about 1,000 full-text downloads. Terms allow storing for personal or research use, not serving to others. |
+| arXiv HTML | open | LaTeXML output, backfilled far back. Checked 2026-09-26: on `2609.27602` (numerical analysis) every formula carries its TeX (`annotation encoding="application/x-tex"`, 78 of 78), equations carry their printed numbers ("(2.1)") and LaTeXML ids (`S2.E1`), sections and paragraphs carry ids (`S1`, `S1.p1`); the authors' `\label` keys are not in the page. Even `hep-th/9901001` (1999) has HTML ("Generated by LaTeXML oxide 0.7.6"). What arXiv answers for a paper with no HTML was not observed. |
+| arXiv metadata and licences | open | The API's Atom feed gives the latest version id and the dates of v1 and of the latest version only. The full version list, the withdrawal marker (best effort) and the licence come from OAI-PMH `arXivRaw`. Licences are per version and chosen by the submitter (CC BY, CC BY-SA, CC BY-NC-SA, CC BY-NC-ND, CC0, arXiv's non-exclusive licence); older records carry legacy URIs, and papers before April 2007 may have none. |
+| OpenAlex | keyless or free key | Since 2026-02-13 metered by a daily budget: keyless $0.10/day, a free key $1/day. Singletons are free; structural filter lists (ids, `cites:`, dates, `is_oa`) cost $0.0001 per call; text matching costs $0.001 whether sent as `search=` or as a `*.search` filter; content downloads cost $0.01. Semantic search: 1 request/s, 50 results. The polite-pool `mailto` is ignored. Author metrics come from clustered profiles: advisory only. Data CC0. Its Terms of Service could not be read (403 to automated fetches): unverified. |
+| Unpaywall | email parameter | DOI lookup only (`/v2/{doi}`); `/v2/search` returns 410 since 2026-09-18. Best open-access location, version and licence. |
+| Semantic Scholar | key required in practice | The keyless pool is shared by all anonymous users and may be throttled at any time. A key allows 1 request/s across all endpoints. From its 2024 release notes (since discontinued): free-email domains are refused, approval took about a month, keys idle about 60 days are pruned. The licence grants use "to access and display" S2 data, with per-field licences such as CC BY-NC or ODC-BY, and requires attribution. |
+| OpenReview | account required | API v2; anonymous calls get 403. Reviews and comments are CC BY 4.0. Rate limit undocumented. |
+| Hugging Face papers API | open, token advised | `GET /api/papers/{arxiv_id}` gives `githubRepo`, which is partial and may be set by users or automatically (`githubRepoAddedBy`). Anonymous quota 500 requests per 5-minute window per IP, "subject to change"; RateLimit headers. |
+| Papers with Code | frozen | Frozen since 2025-07-28 (archive, CC BY-SA). arXiv's own code widget (CatalyzeX) sits behind a Cloudflare challenge: not used. |
+| GitHub | token | REST with a fine-grained token: 5,000/h, code search 10/min; a documented retry ladder. Pin to a commit sha; permanent links `blob/<sha>/<path>#Lx-Ly`. Licence detection reads the LICENSE file only; "none" or "other" is not permission. |
+| Wikipedia | open, User-Agent with contact | At most 200 requests/min per client (target about 2/s), one in-flight Action API request. API paths allowed under LS5. |
+| SSRN | link only (LS8) | Terms forbid automated queries "of any sort"; Cloudflare challenges every PDF; TDM rights reserved. The same work is looked up by DOI (prefix 10.2139) at other open locations. |
+| Substack, Stack Exchange, Reddit, Drive-hosted Colab | link only (LS8) | Substack's terms forbid crawling and storing any significant portion (a Substack publication may sit on a custom domain: its feed's generator, hosting headers and CNAME give it away); Stack Exchange's policy bans gathering for AI tools; Reddit disallows everything in robots.txt and needs approval and local deletion sync; Drive-hosted Colab stays link only until the Drive API with the user's consent is researched. GitHub-hosted Colab notebooks go through the GitHub adapter. |
+| Kaggle | official API only (LS8) | Its terms forbid scraping and storing significant portions. Only through the official API, only notebooks the user names, and stored only under a stated open licence (as LS10 requires for code); otherwise a link. |
+| Medium | not decided | Not on the owner's restricted list. Its official API is unsupported (archived 2023) and never offered post content; public feeds are allowed by robots.txt; its terms could not be read (Cloudflare). Before 20.5: a manual read of the terms, then feed-only, on demand, for owner-approved authors. |
+
+### Design
+
+#### Components
+
+- **`devai-library`**: the service. Python 3.14 (`devai-base`'s, Phase 3), a stdlib HTTP server and worker threads in the laya trainer's style, hash-locked dependencies with permissive licences only: `protego` (BSD), `lxml` (BSD), `onnxruntime` (MIT), `tokenizers` (Apache), SQLite (public domain), and a language detector whose model ships inside the package (for example `lingua-language-detector`, Apache-2.0; the choice and licence are confirmed in 20.1), since the download rule forbids fetching models at run time. No AGPL or GPL code: no PyMuPDF, poppler or pandoc. It never parses a fetched PDF or HTML page itself.
+- **`devai-library-extract`**: the extractor. It turns PDF and HTML bytes into units: `pypdfium2` (Apache/BSD) and `pypdf` (BSD) for PDFs, `lxml` for HTML. It has no secrets, no mount of the store and no network except an internal one; bytes come in over HTTP and JSON goes out, and the service validates the JSON before writing anything.
+- **`devai-grobid`**: GROBID (Apache-2.0), built here (LS29), for PDF structure (sections, paragraphs, formulas, references with DOI and arXiv ids, page coordinates). About 4 GB of RAM. Called with `consolidateHeader=0` and `consolidateCitations=0`, so it never contacts CrossRef or anything else.
+- **The embedding model**: `bge-small-en-v1.5` (MIT, 384 dimensions, 512-token input), run with ONNX Runtime on the CPU inside the service. Downloaded only through `scripts/select-models.py`, from a pinned catalog row, into its own store (LS24).
+
+None of them is a router backend: none needs the GPU, so the router's GPU exclusivity does not apply.
+
+#### Network and egress
+
+- **Networks.** `devai-library` sits on `devai-net` and `devai-lab-egress`, as the router does, with no host port; the lab reaches it as `http://devai-library:8080`, and the name joins the lab's `NO_PROXY` lists (Makefile `PIPELOCK_NO_PROXY`, `bin/devai-agent` `NO_PROXY_HOSTS`). A third network, `devai-library-internal`, created with `--internal` by `make cache-up` and declared external in compose like the others, is the only network of `devai-library-extract` and `devai-grobid`; only `devai-library` joins it too.
+- **No URL ever comes from aiagent** (agreed with aiagent, its L11). Requests name a vetted source and a query, an identifier the service knows how to resolve (`arxiv:`, `doi:`), or an id the service issued (item, version, link). A link found in fetched content or in third-party metadata comes back as a link record, and the service alone decides whether it is fetchable.
+- **Every hop is checked.** Automatic redirects are off; each redirect is checked like a first request (host list, robots.txt, the host's limits). IP-literal URLs, internal service names, and loopback, private, link-local and unique-local addresses are refused. A host that is not in the host list is not fetched: admission is default-deny.
+- **Egress through pipelock**, so its DLP scans what leaves, including query text that aiagent wrote. The service trusts pipelock's CA. pipelock's header DLP will match real credentials (GitHub tokens, API keys): each is exempted with a per-pattern `exempt_domains` limited to its issuer's API host, in the phase that first sends it; keys travel in headers, never in URLs.
+- **pipelock's own answers are not upstream answers.** A pipelock block (DLP) comes back as a 403, and its connect failures as 5xx, on what looks like the upstream connection. The service recognises pipelock's responses (its block body or marker, confirmed in 20.1) and never counts them as the source's answer, so a DLP hit on one query cannot open a source's breaker: a DLP block is `egress_blocked`, final for that request and never resent unchanged; a pipelock connect failure or 5xx is `egress_unavailable`, a wait retried within the item's retry budget.
+- **pipelock does not restrict destinations.** Verified 2026-09-26 from a lab container: `example.com`, `arxiv.org` and `api.openalex.org` all answer 200 through pipelock, although only dev-tool domains are in its `api_allowlist`. So the service enforces its own host list; and other lab tools can still reach arXiv directly, spending the budget arXiv counts per operator, which the owner accepts (LS25).
+
+#### Politeness engine
+
+Scheduling is keyed on **rate groups**, defined in a versioned file, `deploy/library-sources.yaml`. A group spans the hosts that share one budget: `arxiv-legacy-api` (`export.arxiv.org` and `oaipmh.arxiv.org`: one connection, at least 3 s apart), `arxiv-files` (`arxiv.org`: robots' 15-second crawl delay, one connection), one group per other host. All jobs share a group's queue, first come first served in v1. Each group has:
+
+- kind: `api` (governed by the provider's API terms) or `pages` (governed by robots.txt), LS5;
+- minimum interval, maximum connections, daily budget (OpenAlex's in dollars, each call priced from its parameters and reconciled against the response's cost and budget headers);
+- authentication: none, or a named key file (LS30);
+- two kinds of breaker, keyed on the provider. A **denial** (an origin 403 from any host) opens a breaker that stays open until an operator clears it; for arXiv it stops all arXiv traffic and raises an alert, since arXiv treats continued requests after a 403 as an attack. **Overload** (sustained origin 429s or 5xx despite waiting, a configured count within a window, for example 5 within 10 minutes) pauses the provider for at least 15 minutes and then clears by itself. A single 429 or 503 is never a breaker event: arXiv sends 429 even at compliant rates.
+
+Waiting on a single 429 or 503: `Retry-After` when given (wait reason `retry_after`), otherwise exponential backoff with jitter (`backoff`), both within the item's retry budget (5 attempts or 30 minutes, aiagent's section 3.1). Only failed attempts count against the budget, and its 30 minutes exclude time spent waiting for a rate slot, an overload pause or a `quota` reset, so a wait never fails an item. Rate-limit headers (OpenAlex's `X-RateLimit-*`, GitHub's, Hugging Face's) update the budgets at runtime. Every request carries `User-Agent: devai-library/<version> (+mailto:<contact>)`.
+
+robots.txt is parsed with Protego and fetched by the service's own wrapper, following RFC 9309 with a stricter 4xx rule: an explicit User-Agent, a timeout, at most 5 redirects (each checked as above), a 500 KiB cap, a 24-hour cache. Outcomes and their reason codes: the rules forbid the path (`robots_disallowed`); robots.txt itself answers 401, 403 or a challenge (for example `cf-mitigated: challenge`), treated as disallow (`robots_denied`); robots.txt answers 429, 5xx or fails on the network, treated as disallow for now, with the cached copy kept and a retry later (`robots_unreachable`); 404, 410 and other 4xx mean "allow".
+
+**Stops, and how they show.** Three conditions stop a source until someone acts: an open denial breaker (`breaker_open`), the missing contact address (`contact_not_configured`, all sources), and the arXiv full-text cap (`arxiv_fulltext_cap`: a configured count below 1,000 papers, each paper counted once whatever its formats; it stops arXiv PDF and HTML downloads only, not search or OAI-PMH metadata, until the owner records that arXiv was contacted). An overload pause and an exhausted daily budget are not stops: they end by themselves, so jobs wait for them (`backoff`, or `quota` until the budget's reset time).
+
+- `/health` and `/v1/info` show a source `down` with its cause when all of its traffic is stopped (a missing contact, an open breaker), and `limited` with its cause when part of it is (the arXiv cap stops downloads, not search); the top-level status is `degraded` whenever any stop holds.
+- A job-creating request whose every named source is stopped answers 503 `unavailable` with `error.details.cause`.
+- A request naming a stopped source and a working one is accepted (202): the stopped source reports a per-source `error` in the search results, and fetch items that need a stopped source end promptly as `failed` with `upstream_unavailable`, still fetchable. The cause is always in `error.details.cause`, on 503 answers, per-source errors and per-item failures alike.
+- A running job whose source stops meanwhile gives `eta: {basis: unknown, reason: source_down}`, and its remaining items for that source end the same way.
+- Clearing a denial breaker, or recording the arXiv contact, is an explicit operator command, recorded under `state/`. Counters that must survive a restart (daily budgets, the arXiv total, breaker state) live under `state/`.
+
+#### Configuration
+
+- **`LIBRARY_DIR` in `.env`**, set once (LS15). Compose and the Makefile read it from `.env`. `bin/devai-agent` does not read `.env` by design, so `make install` stages it as `~/.devai/library`, a symlink to the directory, exactly as it stages the probe caches; the launcher mounts it and prints a warning naming `make install` when it is missing. A test checks that compose, the Makefile and the launcher resolve the same path.
+- **Optional everywhere except in the service.** The lab mounts `/library` (read-only) only when the library is configured, as it mounts `/laya` only when that exists. `devai-library`, `devai-library-extract` and `devai-grobid` are in a compose profile, `library`, which `make cache-up` enables only when `LIBRARY_DIR` is set (as it already skips `laya-trainer` without its image); compose gets an inert default for the variable, so an unset key never breaks other compose commands. A host that starts the stack without `.env` (the systemd unit, where installed) simply runs without the library.
+- **Three checks, no more (LS15).** `make cache-up` and the service check that `LIBRARY_DIR` is an absolute path, that the directory exists, and that it is readable and writable; a failure refuses the library's start and names the requirement that failed. Nothing creates the directory, and nothing checks where it lives, whether it is its own volume, its filesystem or its free space. The service's containers run with the owner's host uid, so the owner's read and write permission is all they need. On its first start in a directory the service writes `LAYOUT.json` (the layout version) and its own top-level directories beside whatever is already there, and it never touches a file it did not write.
+- **`LIBRARY_CONTACT`** in `.env`: the contact address (LS21). Unset, the service answers but makes no external request.
+
+#### The store (`LIBRARY_DIR`)
+
+The service owns the layout; aiagent uses only paths the API returns (its principle 8).
+
+```
+<LIBRARY_DIR>/
+  LAYOUT.json                    layout version, written by the service on its first start
+  objects/aa/bb/<sha256>         artifact bytes (PDF, HTML), content-addressed, write-once, 0444
+  items/aa/bb/itm-<24 hex>/      one directory per item; aa/bb = the first 4 hex of the id
+    key.json                     canonical key and first-seen time, write-once
+    records/<ns>-<type>-<id>.json  append-only: metadata snapshots, fetch results, verdicts, topic
+                                 assessments, aliases, redirects, tombstones, index status
+    texts/tx-<24 hex>/           an accepted item's text versions: text.json, units.jsonl, SHA256SUMS
+  staging/aa/bb/itm-.../         the same shape, before a verdict; purged on reject or after 30 days
+  jobs/lbjob-<24 hex>/           job.json, events.jsonl, results.jsonl
+  profiles/<name>/<version>.json research profile versions, opaque
+  state/                         politeness counters, breakers, the arXiv contact record
+  trash/<date>/                  artifacts of revoked items, kept 30 days (LS28)
+  index/                         derived only: alias index, keyword index, embeddings, topic listings
+```
+
+- **The plain files are the only source of truth.** An item's current state is the fold of its `records/`; everything under `index/` is derived and can be deleted and rebuilt (aiagent's acceptance check 6).
+- **Fan-out.** Two levels of two hex digits, as in git's object store but one level deeper: 65,536 leaf directories, so ten million items or objects leave about 150 entries per directory. The fan-out keeps every directory small whatever the filesystem, so `ls`, `find` and shell globs stay fast.
+- **Writes are atomic** (write to a temporary name, then rename); files are 0444 and directories 0555 once final, as on the laya store. Standard tools work directly: `find items -name key.json`, `jq` over `records/`, `grep` over `units.jsonl`.
+- **English only (LS16) in what stays.** Permanent records hold English only: for a non-English item, aiagent submits English metadata (`metadata_en`) with its verdict, and English renderings of evidence quotes (`quote_en`); the service stores those and keeps the original only as a link with its sha256. Staging, which is temporary, holds the original-language text until the verdict or the TTL.
+- **Rejects and purges.** A reject deletes the item's staged artifacts and texts and writes tombstone records; unit addresses of a purged text answer 410 `text_purged` with the tombstone. A purge after the staging TTL is done by a maintenance job, which emits `item.purged` events like any other job.
+- **Revoked items** (an accept turned into a reject) move their artifacts to `trash/<date>/`, where a maintenance job deletes them after 30 days (LS28); their record says where they are until then.
+
+#### Text extraction
+
+- **Versions are fixed first.** The fetch job resolves the latest version `vN` once, then fetches `/pdf/<id>vN` and `/html/<id>vN`, and the `arXivRaw` record (full version list, withdrawal marker, licence) as one paced request on the legacy-API group. Accept only copies the licence from that stored record; it makes no external request.
+- **Format checks before hashing.** A PDF must start with `%PDF-`. A valid HTML page is 200, `text/html`, carries the LaTeXML generator marker, and names version `vN`. A definite "no HTML" is a 404 or 410, or a 200 without the LaTeXML marker: PDF-only staging at once, not a failure, with `quality.warnings` saying why. A 429, 5xx, network failure, or a 200 with the marker but the wrong content type or version is an error, retried within the item's retry budget like the PDF, and PDF-only staging with a warning if the budget runs out. HTML for a PDF-only item is fetched later only on request. Nothing that fails a check is stored or becomes a `sha256:` alias.
+- **arXiv HTML is the primary text when it exists** (`origin: html`, `role: primary`): sections and paragraphs from LaTeXML's ids (`anchor.html_id` carries the unit's own id, for example `S3.SS2.p2`; `anchor.paragraph` comes from it; `anchor.block` is null), display equations as TeX with their printed numbers (`equation_number_method: html`; `equation_labels` empty, since arXiv's HTML drops the authors' labels; `refs.labels` point to LaTeXML ids), inline math as `$TeX$` with `math_spans` (offsets including the `$` delimiters), theorem-like environments (`anchor.env`: `{name, label, number}`), captions, and bibliography entries with parsed identifiers (`refs.cites` entries: `{html_id, printed, ids: {doi, arxiv, url}}`); a `heading` unit carries its section's `html_id`. `html_id`, `env`, `refs.cites` and `refs.labels` are v1 for HTML texts and null for PDF texts; section and paragraph anchors come from GROBID for PDF texts. The PDF page of each unit comes from aligning its text with the PDF's text layer (`page_method: text_align`), and the PDF text becomes a `fallback` text (`fallback_text_id`).
+- **Licences of non-arXiv works** are recorded at fetch time from the open-access location the copy came from (OpenAlex's `locations[].license`, Unpaywall's `best_oa_location.license`), with `stated_by` naming that source (`stated_by` is one of `arxiv`, `openalex`, `unpaywall`); when none is given, `license.status` is `none_stated`. Accept never makes an external request.
+- **Otherwise the PDF through GROBID** (`origin: pdf`): sections, paragraphs, formulas, references and page coordinates (`page_method: pdf_native`), with pypdfium2 as the fallback. A PDF without a text layer fails the fetch with `no_text_layer` (A-O7: OCR later).
+- **Units** follow aiagent's rules (its section 3): structural kinds, at most 1,300 characters, split only when oversized, at sentence boundaries outside math and citations, no overlap, `prev`/`next` links, link records for every link found, and `lang` per unit from the language detector. The service counts characters only.
+
+#### Index
+
+- **Keyword:** SQLite FTS5 with the porter/unicode61 tokenizer, a derived file under `index/`, updated incrementally.
+- **Vector:** embeddings stored as derived files keyed by (unit text sha256, model sha256), so a rebuild does not re-embed. Search starts as exact search over memory-mapped matrices (float32, later int8); faiss-cpu (MIT) is the next step when measurements call for it. Units longer than the model's 512 tokens are chunked internally; a hit always reports the unit.
+- **Hybrid search** fuses the two lists mechanically (reciprocal-rank fusion) and returns the fused score (v1), later the component scores too.
+- **Rebuild times** are measured, not promised, and reported by `/v1/info`.
+
+#### Jobs and progress
+
+As aiagent's section 8 specifies, in the laya trainer's style: every job-starting request returns 202 at once; `jobs/<id>/job.json` is rewritten atomically at every event, at most once per second, and `events.jsonl` is append-only. Waits carry their reason (`rate_limit`, `crawl_delay`, `retry_after`, `backoff`, `quota`, `concurrency`) and an `until` time. The first ETA comes within 2 s, computed from the schedule (requests left per rate group times the group's interval, plus measured transfer and extraction times), and a heartbeat at least every 5 s. `eta_inputs` and `/v1/info` report per rate group (`per_group`), since one source can span groups with different intervals (arXiv: 3 s and 15 s). After a restart a job resumes: every item step is idempotent, and unfinished items are queued again. For scale: 25 arXiv papers as PDF and HTML are about 50 files at arXiv's 15-second crawl delay, so about 12-13 minutes of waiting (the PDF mirror, if LS27's check allows it, would halve it).
+
+#### API
+
+aiagent's section 9.6 lists the endpoints and marks what v1 needs; this plan adopts it with three adjustments, which aiagent's document reflects:
+
+1. arXiv artifacts are `pdf` and `html`, never `eprint` (LS4).
+2. Sources restricted by LS8 come back as candidates or link records with a not-fetchable reason (`terms_disallow_automation`) and their link.
+3. **HTML-primary text in v1**, as described under "Text extraction", instead of PDF-only text: `origin: html`, `page_method: text_align`, paragraph anchors from LaTeXML, `math_spans`, printed equation numbers. This serves the reason for LS4 (exact formulas for PDE and numerical analysis work).
+
+Also agreed with aiagent: fetch keys `arxiv:`, `doi:` and `ssrn:` (an `ssrn:` key is accepted and ends `not_fetchable` with `terms_disallow_automation`, its open-access copy being fetched by `link_id`); the id namespace `openalex:W<id>` for works that have neither an arXiv id nor a DOI, minted after `ssrn` (`arxiv > doi > ssrn > openalex > gh > wiki > url`), and an OpenAlex id is always registered as an alias; a missing contact address shows in `/health` (`status: degraded`, `contact.configured: false`) and in `/v1/info` (each source `down`, cause `contact_not_configured`), and a job-creating request for an external source answers 503 `unavailable` with that cause in `error.details.cause`, so aiagent's acceptance step 0 fails fast.
+
+| v1 | Later |
+| --- | --- |
+| `GET /health`, `GET /v1/info` | `POST /v1/items/{id}/translations` |
+| profiles: `PUT`/`GET /v1/profiles/{name}/versions/...` | `POST /v1/items/match` |
+| `POST /v1/searches`, `POST /v1/fetches` | `GET /v1/verdicts?basis=...&profile_version_lt=...` |
+| `POST /v1/enrichments` (author metrics and citations from OpenAlex), `GET /v1/candidates/{id}` | `GET /v1/jobs/{id}/events/stream` (SSE) |
+| jobs: `GET /v1/jobs[/{id}]`, `.../events`, `.../results`, `POST .../cancel` | repository fetches and excerpts |
+| `GET /v1/items/{id}` (with tombstones), `GET /v1/items/resolve?key=` | |
+| `GET /v1/items/{id}/texts/{text_id}/units` (410 with the tombstone for a purged text) | |
+| `POST /v1/verdicts`, `POST /v1/verdicts/batch`, `GET /v1/verdicts/{id}` | |
+| `POST /v1/items/{id}/topics` | |
+| `GET /v1/library/topics[/{topic_id}/items]`, `POST /v1/library/search` | |
+
+#### devai's answers to aiagent's questions (O-LS1 to O-LS13)
+
+| # | Answer |
+| --- | --- |
+| O-LS1 | A plain compose container, not a router backend: `http://devai-library:8080` on devai-net and devai-lab-egress. |
+| O-LS2 | The library root is mounted read-only at `/library` in the lab when configured (later `inbox/` read-write), from `LIBRARY_DIR` (staged for `bin/devai-agent` by `make install`). Secrets never live in the library directory. `state/` and `index/` live under the root; aiagent must not depend on their files. |
+| O-LS3, O-LS11 | Replaced by arXiv HTML (LS4): paragraph and equation anchors and printed numbers come from LaTeXML's output; the authors' `\label` keys are not available. PDFs without HTML go through GROBID. |
+| O-LS4 | Dropped: the service counts no tokens. |
+| O-LS5 | `bge-small-en-v1.5`; embeddings cached by (unit text sha256, model sha256); exact search first; rebuild times measured. |
+| O-LS6 | SQLite FTS5, porter/unicode61, derived. |
+| O-LS7 | The arXiv legacy APIs (search and OAI-PMH) share one queue: one request per 3 s on one connection. arXiv files: robots' 15-second crawl delay, one queue. No e-print (LS4). |
+| O-LS8 | OpenAlex (discovery, open-access locations, citations, advisory author metrics), Unpaywall by DOI; SSRN link only (LS8); Semantic Scholar later, once a key is granted. |
+| O-LS9 | Jobs resume after a restart; per-group queues are first come, first served across jobs in v1. |
+| O-LS10 | Yes: revoked items' artifacts stay in `trash/` for 30 days (LS28, an owner-approved exception to LS12). |
+| O-LS12 | `devai-library/<version> (+mailto:<contact>)`; robots.txt as described above; candidates report `access.robots_allowed` with the reason. |
+| O-LS13 | Later: author pages from OpenAlex open-access locations, references parsed by GROBID and LaTeXML, and ORCID; blogs from an owner-approved list (LS22). No web-search API. |
+
+#### GROBID, built here (LS29)
+
+`deploy/Dockerfile.grobid` has two stages on the pinned trixie-slim. The build stage installs Debian's `openjdk-21-jdk-headless`, unpacks GROBID's source at a pinned release (sha256-pinned tarball) and builds the service distribution with GROBID's Gradle wrapper, whose `distributionSha256Sum` is pinned; every network step is tried 3 times, as in `scripts/build-vllm.sh`. The runtime stage holds Debian's `openjdk-21-jre-headless` and the distribution with its CRF models (they ship in the source's `grobid-home`), no DeLFT deep-learning models. The upstream-images guard (Phase 2) sees `localhost/devai-grobid` and needs no exception. Untested: whether the pinned release builds with JDK 21 (checked first in 20.1), and Gradle's dependency downloads from Maven Central, which the wrapper pin does not cover; the first build records them with their checksums (Gradle dependency verification).
+
+#### Keys (LS30)
+
+Each key the library uses is a plain file the owner writes once into `~/.config/devai/library/` (mode 0700, created by `make library-init`): `openalex.key`, `github.token`, `hf.token`, `s2.key`, `openreview.credentials`, each 0600. Each is mounted read-only into `devai-library` only. The service refuses a key file that group or others can read, never logs a key, and sends keys in headers, never in URLs. `devai-backup` includes the directory.
+
+### 20.1 -- store, service core, politeness, arXiv
+
+**Goal:** a running service that searches arXiv and fetches PDFs and HTML politely, stages English text units, and records verdicts, with jobs, progress and ETA.
+
+**Deliverables:**
+- Configuration: `LIBRARY_DIR` and `LIBRARY_CONTACT` in `.env.example`; the compose profile with the inert default; `make install` staging `~/.devai/library`; the optional lab mount in the Makefile and `bin/devai-agent`; LS15's three checks in `make cache-up` and the service.
+- Images and services: `deploy/Dockerfile.library` and `deploy/Dockerfile.library-extract` (hash-locked, on `devai-base`), `deploy/Dockerfile.grobid` (LS29), `devai-library`, `devai-library-extract`, `devai-grobid`, the `devai-library-internal` network; `make build-library`, `make build-grobid`, `make test-library`, `make library-init` (LS30), each registered as an operator action (C8).
+- `deploy/library-sources.yaml` with the arXiv rate groups; the politeness engine, the RFC 9309 wrapper with the stricter 4xx rule, the redirect and address checks, the breakers, the stops, recognition of pipelock's responses.
+- The store: layout, append-only records and their fold, alias resolution with a single writer, tombstones, the maintenance job (staging TTL, and the 30-day trash of revoked items, LS28).
+- The arXiv adapter: search (GET, cached 24 h), version resolution, PDF, HTML, `arXivRaw` in the fetch job; format checks. The check of the anonymous PDF mirror's terms and robots.txt (LS27); the mirror is wired in only if both allow it.
+- Extraction: HTML-primary units with text-aligned pages, GROBID for PDFs without HTML, the language detector.
+- The v1 endpoints except enrichments and library search: verdicts with evidence checks, the one-current-verdict rule with A-O1's scoped exception, topic assessments, tombstones and 410.
+- Jobs: events, waits, ETA per rate group, heartbeat, cancel, resume.
+- Docs: `docs/library.md` (reference), CLAUDE.md, `docs/pipelock.md` (the finding that it does not restrict destinations).
+
+**Exit criteria:**
+- Unit tests with a fake upstream: intervals and crawl delays per rate group (search and OAI-PMH never overlap); 429 and 503 with and without `Retry-After` (a wait, never a breaker); sustained 429s (the self-clearing overload pause) and an origin 403 (the denial breaker, cleared only by the operator); a fake pipelock block that must not open arXiv's breaker; robots outcomes (`robots_disallowed`, `robots_denied`, `robots_unreachable`, 404 as allow) and the LS5 exemption; the stops' 503 and per-source error shapes; a cross-host redirect and a redirect to an internal name, both refused; every per-item outcome in aiagent's section 3.1; HTML present, absent and broken; verdict rules and the fold; the stops as `/health` and ETA show them; `LIBRARY_DIR` unset, relative, missing, and not writable (each refused, naming the requirement), and valid on an empty and on a non-empty directory (the layout written on first start, other files left alone).
+- A layout test at scale: synthetic items and objects in the hundreds of thousands, timing `find` and a full fold.
+- A live smoke run, once the contact address exists: one small arXiv query, a fetch of two papers (one with HTML, one without), units with anchors and pages, a reject that purges and answers 410, an accept that keeps, all within arXiv's limits.
+
+### 20.2 -- OpenAlex, open-access locations, index
+
+**Goal:** sources beyond arXiv (LS23), and search over the library.
+
+**Entry:** a manual read of OpenAlex's Terms of Service in an ordinary browser.
+
+**Deliverables:**
+- The OpenAlex adapter: discovery (structural filters where they fit, text matching priced as search), open-access locations, `cited_by_count` and citing works, advisory author metrics with provenance (source, as-of date, match method), the dollar budget; `POST /v1/enrichments` and `GET /v1/candidates/{id}`.
+- Unpaywall by DOI. Fetchable link records for open-access PDFs on allowed hosts (each host added to `library-sources.yaml` with its own robots and limits); "known, not held" link records otherwise, SSRN included (LS8).
+- The key, if an OpenAlex key exists: `~/.config/devai/library/openalex.key` (LS30), mounted into `devai-library` only, the per-pattern DLP exemption for OpenAlex's host. Without a key, 20.2-20.3 run keyless at $0.10/day, and the acceptance test is sized to that.
+- The keyword and vector indexes, library search; the embedding model's store (LS24: `/var/cache/devai/embed` on its own LV, set up with `deploy/setup-logs-volume.sh`), its catalog row in `deploy/embed-models.yaml` and its pull through `scripts/select-models.py`.
+- The rebuild command: delete `index/` and rebuild it from the plain files.
+
+**Exit criteria:** candidates from OpenAlex merge with arXiv records by identifier; a non-arXiv open-access PDF is fetched from an allowed host; an SSRN work comes back as a link with its reason; after a rebuild from the plain files the topic listing is byte-identical and every alias resolves as before (aiagent's check 6).
+
+### 20.3 -- the acceptance test, with aiagent
+
+**Goal:** the owner's test (LS23) end to end, as aiagent's section 10 walks it.
+
+**Exit criteria:** aiagent's checks 1-7 pass on the AAD topic: check 2 as revised (a PDF, plus the arXiv HTML when the fetch staged it, otherwise a `quality.warnings` reason, and a license field, which may be `none_stated` for old arXiv papers), and check 7 (the run searches OpenAlex as well as arXiv, and its results hold at least one non-arXiv work, either an open-access copy fetched from an allowed host or a "known, not held" link with its reason). Progress never goes silent for more than 5 s. The measured times are recorded here.
+
+### 20.4 -- code (verification level (a))
+
+**Goal:** GitHub repositories that papers link to (LS6, LS10).
+
+**Deliverables:** the GitHub adapter (fine-grained token, the documented retry ladder, commit pinning, licence detection, the tree with dataset-like files refused, fetches of chosen files only); code links from Hugging Face's papers API (token, `githubRepoAddedBy` recorded with each link, so user-set links are not treated as official) and from the papers themselves; excerpts stored as aiagent's section 3.6 specifies (at most 80 lines each, 10 per repository, licence required, A-O3), refreshed per LS14; the level (a) checks as data; per-pattern DLP exemptions for GitHub's and Hugging Face's API hosts; their tokens as key files (LS30).
+
+### 20.5 -- selected community sources
+
+**Goal:** the remaining sources, within their terms (LS8, LS9, LS22).
+
+**Deliverables:** the Wikipedia API (revision-pinned, cited by `oldid`); owner-approved blogs through their feeds, each blog's hosting platform classified first, so a Substack-hosted blog on its own domain inherits Substack's LS8 status; Semantic Scholar citation contexts (key requested at the start of this phase; storage of each field only under its licence); OpenReview reviews (a service account); Kaggle's API for notebooks the user names (stored only under a stated open licence); GitHub-hosted Colab notebooks; Medium after the terms are read. Link records for everything else.
+
+### Later -- verification level (b), a separate plan
+
+Sandboxed execution of chosen code, compared against the paper's reported results, as a Slurm job with the engine license, like the trainer jobs (Phases 8-9). It reuses the job model.
+
+### Phase 20 risks
+
+| Risk | Phase | Mitigation |
+| --- | --- | --- |
+| A ban from arXiv (403) after a policy mistake. | 20.1 | Rate groups, the crawl delay, the arXiv breaker, persisted counters, the full-text cap until arXiv is contacted. |
+| A pipelock DLP block mistaken for a source's denial. | 20.1 | pipelock's responses recognised and recorded as `egress_blocked`; a fake-block test. |
+| Other lab paths spend arXiv's per-operator budget. | 20.1 | Accepted by the owner (LS25); documented in `docs/library.md`; the breakers stop the library quickly if arXiv pushes back. |
+| Limits change without notice (OpenAlex changed its model in 2026; arXiv's docs disagree with each other). | all | Every limit is configuration; runtime headers win; the first 429 from any host is logged and alerted. |
+| Parser exploits in PDFs or HTML. | 20.1 | Parsing only in `devai-library-extract` and GROBID: no secrets, no store, internal network only; the service validates their JSON. |
+| The service used to reach internal hosts (SSRF). | 20.1 | No URLs from aiagent; every redirect hop checked; internal names and private addresses refused; default-deny host admission. |
+| arXiv HTML missing or broken for a paper. | 20.1 | Format checks; GROBID over the PDF; `quality.warnings` in `text.json`. |
+| The library is written somewhere unintended (an unmounted mount point, a mistyped but existing path). | 20.1 | Accepted by the owner (LS15): only the three requirements are checked. The service logs the resolved path and its layout version at every start. |
+| Real credentials blocked by pipelock's DLP. | 20.2, 20.4, 20.5 | Per-pattern exemptions limited to each issuer's API host, added in the phase that sends the credential. |
+| Author metrics wrong (split or merged profiles). | 20.2 | Advisory only, with source, as-of date and match method (A-O5). |
+| Millions of files slow the tools. | 20.1 | Two-level fan-out, measured in the layout test; indexes derived. |
+| Licence contamination of the service. | 20.1 | Permissive dependencies only. |
+| Credentials leaking into the lab. | 20.2, 20.4, 20.5 | Secrets only in `devai-library`; never in the library directory. |
+
+---
+
+## Phase 21 -- Loose ends
+
+Small items left by finished plans. Each is independent of the rest and can be done at any time.
+
+| Item | From | What is left |
+|---|---|---|
+| close the laya trainer's Phase 4 | laya-trainer | an owner decision on its open quality caveats: on the held-out data, precision >= 0.90 is not supported once the three rounds are corrected for together (Bonferroni bound 0.893); on opinion text the lower bound is 0.848; the fast-mode VRAM figure comes from one job whose artifact was never evaluated. docs/router.md's `LAYA_MAX_HOLD_S` row then points to docs/laya-trainer.md "Measurements" for the per-step times, cold start and peak VRAM |
+| pin pi | pi-coding-agent | `make fetch-cli` downloads pi from `releases/latest`; pin a version, as every other download is pinned |
+| pi's two notes | pi-coding-agent | document the cold start a `/model` switch can cause (the GPU is exclusive), and how Pi picks up AGENTS.md |
+| parser provenance | card-derived-hints-and-bench-sync | document the fields the probers stamp into the probe caches (`tool_parser_source`, `reasoning_parser_source`, `parser_disagreement`, `card_sampling`) in docs/backends.md. The card branch's first real run goes with Phase 4's re-probe |
+
+### Exit criteria
+
+- The laya trainer's Phase 4 is closed or re-opened by the owner, and recorded in docs/laya-trainer.md.
+- `make fetch-cli` pins pi; the two pi notes and the provenance fields are documented.
+
+---
+
 ## Combined risk register
 
 | Risk | Phase | Mitigation |
@@ -1647,6 +2263,10 @@ Only the new path is left, no devai application container has a GPU device, and 
 | a sleeper nobody needs keeps host RAM and VRAM while the router is down | 9 | the router unloads it when it is back (I9) |
 | an interrupt with another model costs a cold start (about 95 s for Qwen3.8-27B) | 10 | the sleep fast path for vLLM and SGLang; the same-model path needs nothing |
 | submitting a job can run any registered action, destructive ones included | 5-10 | the JWT key only in `devai-slurm`, the router and `devai-operator`; nothing published; bus users limited to their subjects |
+| a short-circuit answers a real request with a canned string | 16 | all markers must co-occur; off by default; every hit logged |
+| an auto-fix makes a probe pass for the wrong reason | 18 | one retry; every applied flag recorded and attributed |
+| a ban from arXiv (403) after a policy mistake | 20 | rate groups, the crawl delay, the arXiv breaker, persisted counters, the full-text cap until arXiv is contacted |
+| GROBID does not build from source with Debian's JDK | 20 | checked first in 20.1; the PDF text then comes from pypdfium2 alone until it builds |
 
 ## Migration / rollback story
 
@@ -1683,8 +2303,15 @@ Only the new path is left, no devai application container has a GPU device, and 
 | 12 | 1-2 days |
 | 13 | 1-2 days |
 | 14 | 2 days |
+| 15 | 2-3 days, plus a GPU window |
+| 16 | 3-4 days |
+| 17 | 3-5 days |
+| 18 | 2-3 days |
+| 19 | 2-3 days |
+| 20 | 13-18 days (20.1: 5-6, 20.2: 2-3, 20.3: 1 plus aiagent's side, 20.4: 2-3, 20.5: 3-5) |
+| 21 | 1-2 days |
 
-Estimates, not measurements. Phases 5-7 run beside 1-4, so the wall-clock total is shorter than the sum.
+Estimates, not measurements. Phases 5-7, 15-17, 20 and 21 run beside others, so the wall-clock total is shorter than the sum.
 
 ## References
 
@@ -1700,6 +2327,17 @@ Estimates, not measurements. Phases 5-7 run beside 1-4, so the wall-clock total 
 - Apache mod_wsgi (Debian `libapache2-mod-wsgi-py3`); Flask (Debian `python3-flask`).
 - pipelock: github.com/luckyPipewrench/pipelock (Go, Apache-2.0).
 - SGLang 0.5.16 package metadata on PyPI (pinned dependencies); NVIDIA's CUDA repository for Debian 13 (the host's CUDA 13.1 packages).
+- Router short-circuit (Phase 16): free-claude-code, github.com/Alishahryar1/free-claude-code (`api/detection.py`, `api/optimization_handlers.py`).
+- Catalog tooling and diagnosis (Phases 17-18): odysseus, github.com/pewdiepie-archdaemon/odysseus (`services/hwfit/*`, `routes/cookbook_*`); vllm-project/recipes.
+- Library service (Phase 20):
+  - aiagent: `docs/design/library-service-needs.md` (devitops-com/aiagent), the field-level contract.
+  - arXiv: API terms https://info.arxiv.org/help/api/tou.html; user manual https://info.arxiv.org/help/api/user-manual.html; https://arxiv.org/robots.txt and https://export.arxiv.org/robots.txt; robots guidance https://info.arxiv.org/help/robots.html; per-article downloads https://info.arxiv.org/help/ir.html; bulk data https://info.arxiv.org/help/bulk_data.html; OAI-PMH https://info.arxiv.org/help/oa/index.html; identifiers https://info.arxiv.org/help/arxiv_identifier_for_services.html; media types https://info.arxiv.org/help/mimetypes.html; the 2025-11 API replacement https://groups.google.com/a/arxiv.org/g/api/c/-WpHNxbaxU0.
+  - OpenAlex: authentication https://help.openalex.org/api/authentication/; pricing https://help.openalex.org/access/pricing/; searching https://help.openalex.org/api/searching/; semantic search https://help.openalex.org/api/semantic-search/; deprecations https://help.openalex.org/guides/deprecations.
+  - Unpaywall: https://unpaywall.org/products/api and https://unpaywall.org/legal/terms-of-service.
+  - Semantic Scholar: https://www.semanticscholar.org/product/api, its licence https://www.semanticscholar.org/product/api/license, release notes https://github.com/allenai/s2-folks/blob/main/API_RELEASE_NOTES.md. OpenReview: https://docs.openreview.net/getting-started/using-the-api and https://openreview.net/legal/terms.
+  - SSRN: https://www.ssrn.com/index.cfm/en/terms-of-use/ and https://papers.ssrn.com/robots.txt.
+  - Wikimedia: https://foundation.wikimedia.org/wiki/Policy:Wikimedia_Foundation_User-Agent_Policy, https://www.mediawiki.org/wiki/Wikimedia_APIs/Rate_limits, https://wikitech.wikimedia.org/wiki/Robot_policy.
+  - Tooling: RFC 9309 https://www.rfc-editor.org/rfc/rfc9309.txt; Protego https://github.com/scrapy/protego; pypdfium2 https://github.com/pypdfium2-team/pypdfium2; GROBID https://grobid.readthedocs.io/en/latest/Grobid-docker/ and https://github.com/kermitt2/grobid/blob/master/doc/Coordinates-in-PDF.md; LaTeXML https://github.com/brucemiller/LaTeXML.
 - In this repository:
   - the host-build pattern: scripts/build-vllm.sh, scripts/build-ollama.sh, deploy/Dockerfile.vllm, deploy/Dockerfile.ollama;
   - attic/README.md and attic/cluster-mode/RESTORE.md: the pattern for moving work to the attic;

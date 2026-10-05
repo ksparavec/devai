@@ -143,7 +143,7 @@ python3 perf_client_logs.py ~/.cache/devai /var/cache/devai/logs/devai-vllm.log 
 - `perf_phases.py` (`python3 perf_phases.py /var/cache/devai/logs/devai-router.log /var/cache/devai/logs/devai-vllm.log /var/cache/devai/logs/devai-vllm-devai.log $O/ /var/cache/devai/bench/bench-vllm-run-20260505T140328Z.log`): vLLM start-up phases and memory lines (weights, model load, compile, KV pool, graph pool, peak activation, effective GPU-memory utilisation) joined to the router launches, never-ready and restart-abandoned launches, the MTP memory cost (weights, KV bytes per token, KV pool), CUDA-graph capture sizes, and the 2026-05-05 bench-run summary lines.
 - `perf_enginelog.py` holds the log parsers.
 
-## laya trainer (docs/laya-trainer.md, docs/plans/laya-trainer.md)
+## laya trainer (docs/laya-trainer.md)
 
 ```bash
 python3 scripts/stats/laya_stats.py      # defaults point at /var/cache/devai/laya, ~/devai-home, ~/laya-pilot, ~/git/aiagent

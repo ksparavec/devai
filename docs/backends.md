@@ -997,7 +997,8 @@ live caches -- read this before building anything on them):
   confounded: a failed serve records 0.0 as well. On this fleet 3 of its
   4 zeros are reasoning models that hit the 2048-token output ceiling,
   not recall failures. Nothing gates on it and nothing should until the
-  measurement is repaired. See `docs/plans/README.md`.
+  measurement is repaired. See the plans index's defect record of 2026-07-25
+  (removed 2026-10-05, in git history).
 
 **Why there is no concurrency burst.** The load probe deliberately sends
 one request, not a workload. `max_num_batched_tokens` defaults to 2048
