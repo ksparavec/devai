@@ -8,21 +8,17 @@ _Repair the SGLang code paths by extending the two backend contracts that alread
 has not started.
 
 - **Phase 1:** shipped -- SGLang's failure signatures, the breaker's own lock,
-  and repayment on a served response. Its 24-hour soak check has no recorded
-  result.
+  and repayment on a served response. Its 24-hour soak check was absorbed by
+  the platform-rebuild plan (its Phase 10).
 - **Phases 2 and 3:** shipped.
 - **Phase 4:** the launch fingerprint shipped, and `make probe-check` reports its
   coverage; automatic invalidation was backed out, so it only reports. The
-  forced re-probe (steps 4-5) was not done: the SGLang probe cache still holds 7
-  cells failed with a GPTQ "unsupported quantization" verdict, and 4 of its 10
-  fitting cells carry a fingerprint.
+  forced re-probe (steps 4-5) was absorbed by the platform-rebuild plan's
+  Phase 4 re-probe.
 - **Phase 5:** not started. No `--enable-metrics`, no keep-or-freeze decision;
   the picker still offers `sglang`.
 - **Not recorded below:** the Ornith-1.0-9B-NVFP4 SGLang quarantine was
   reversed. Its cell fits and serves since 2026-07-29 (docs/backends.md).
-- **The [platform-rebuild](./platform-rebuild.md) plan** compiles SGLang 0.5.16
-  here and re-probes every model on its new image (its Phase 4). That replaces
-  this plan's Phase 4 re-probe on the old image.
 
 History: the pre-work evidence phase (Phase 0 below) was run, read-only, on
 2026-07-27, and its results are recorded here.
@@ -420,8 +416,8 @@ gpu-arbiter/lifecycle_test.go      modify -- handler-level breaker test
   `TestMakeRequestHandler_BreakerNotRepaidOnUpstream5xx` both fail with `spent=0`
   (i.e. repaid); after the fix both pass. 357 router tests are race-clean.
 - 24 hours after deploy, `grep -c 'sglang with model' devai-router.log` for a single
-  model is in single digits. **PENDING** -- time-based; router redeployed
-  2026-07-27T17:39Z.
+  model is in single digits. **Absorbed 2026-10-05** by the platform-rebuild
+  plan's re-bench (its Phase 10).
 
 ### Deviation recorded during execution
 
@@ -836,11 +832,8 @@ deploy/.sglang-reasoning-cache.json data -- eight cells re-measured
    cannot load on this image regardless. Adding one would be speculative curation.
    The two families whose SGLang exclusion is genuinely unexplained -- qwen3-coder and
    nemotron-3-nano -- already have their parser blocks.
-4. Re-probe the eight poisoned cells with `PROBE_FORCE=1` (note: `PROBE_FORCE_ARCH=1`
-   is insufficient -- the skip precedes `band.clear()`).
-5. Re-run the load probe after every forced fit re-probe: a fit re-probe drops the
-   `serving_*` augmentation, so skipping this would leave cells advertising a fit with
-   no serving evidence.
+4. *(Steps 4-5, the forced re-probe and its load probe, were absorbed on 2026-10-05
+   by the platform-rebuild plan's Phase 4 re-probe.)*
 
 ### Progress (2026-07-28)
 
@@ -872,43 +865,6 @@ deploy/.sglang-reasoning-cache.json data -- eight cells re-measured
   into an unrequested fleet-wide re-probe. Reporting puts the same
   information in front of an operator where a false positive costs one line
   of output instead of a GPU day. `PROBE_FORCE=1` remains the re-probe path.
-
-### Blocker: steps 4-5 need ~160 GB of downloads, not just a GPU window
-
-Open question 4 asked whether a multi-hour GPU window was available and told
-the plan to "say so up front rather than discovering it mid-phase". Saying so:
-**the window is not the binding constraint. The weights are.**
-
-All eight poisoned cells belong to models with **no weights in either store**:
-
-| Model | approx size |
-| --- | --- |
-| Gemma-4-31B-IT-NVFP4 | 30.4 GB |
-| Qwen3.6-35B-A3B-NVFP4 | 21.8 GB |
-| Qwen3.6-27B-MTP-pi-tune-NVFP4 | 19.2 GB |
-| Qwen3.6-27B-Text-NVFP4-MTP | 18.3 GB |
-| NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4 | 18.0 GB |
-| diffusiongemma-26B-A4B-it-NVFP4 | 17.5 GB |
-| Gemma-4-26B-A4B-NVFP4 | 17.5 GB |
-| Qwen3-Coder-30B-A3B-Instruct-FP4 | 16.9 GB |
-| **total** | **~159.5 GB** |
-
-Disk is not the problem (581 GB free on `vgais-cache`); the download time and
-the multi-hour GPU sweep afterwards are, and they are a materially larger
-commitment than any other step in this plan.
-
-The plan's own second verification pass already bounds the prize to **two**
-models -- `Qwen3-Coder-30B-A3B-Instruct-FP4` and
-`NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4` (~35 GB combined). The other six are
-either genuine `gemma4` arch walls hit inside `AutoConfig.from_pretrained`, or
-the qwen3.6 gated-delta-net kernel gap, both corroborated by independent clean
-probes. Re-probing those six is expected to reproduce their failures with
-better labels.
-
-Recommended scope when this is scheduled: download and re-probe the two
-unexplained models only, and record the other six as expected-failure with the
-corrected `launch_args` classification rather than spending ~125 GB and
-several hours to confirm what two independent probes already show.
 
 ### Exit criteria
 

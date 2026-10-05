@@ -7,12 +7,10 @@ catalog rows (download + probe) in one closed loop._
 ## Status
 
 **Done (unverified)** (checked against the code 2026-10-05). All 4 phases are in the code and
-unit-tested, but the live confirmation is still open:
-
-- The Gemma-4-31B-IT-NVFP4 scoped probe ran once and failed (`oom` in the
-  exclusion ledger). Its re-check with the `--enforce-eager` recovery flag
-  added since is not recorded.
-- No live `make model-sync` run is recorded.
+unit-tested. Its two open live checks were absorbed on 2026-10-05 by the
+platform-rebuild plan: the Gemma-4-31B-IT-NVFP4 re-check with its
+`--enforce-eager` recovery flag (its Phase 4 re-probe) and a live
+`make model-sync` run (its Phase 10).
 
 The ledger is nested per backend, not the flat shape drafted below.
 

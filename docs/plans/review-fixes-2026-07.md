@@ -175,31 +175,14 @@ already covers parts of Phase 1, 4, 5, 6 and 8.
      The time-outs may themselves be a q8_0 effect.
    - See docs/backends.md, "Per-tier KV-cache dtype".
 
-## Unverified
+## Unverified -- absorbed
 
-The plan requires live-GPU test output before Phase 3 (router hot path)
-may merge. That did not run:
-
-- `make test-router` -- not run.
-- `make test-vllm` -- not run.
-
-Both need the GPU free and `make cache-down`, which was not available on
-the execution host. Every claim about router and backend behaviour above
-therefore rests on source reading and on the Go/Python unit tests, not on
-a live serving round-trip. Phase 3 is **not** cleared to merge on this
-evidence alone. This is still true after pass 3 -- neither test ran in
-any of the three passes.
-
-Two further things nothing in this remediation verified end to end:
-
-- The cluster-mode drain/degraded-route behaviour and the SkyPilot
-  teardown retry are covered by Go unit tests only. There is no live
-  head + worker + cloud VM run behind them, and `MarkForTeardown` still
-  has no production caller.
-- The `devai-model-status` weights-on-disk gate is inert in the
-  published container, which mounts no weight volumes -- it degrades to
-  the un-gated verdict and says so in its `notes`. It was exercised on
-  the host, not through the gateway.
+The live runs this plan required before its Phase 3 could merge
+(`make test-vllm` and a live router run) never happened. They were absorbed on
+2026-10-05 by the platform-rebuild plan, whose Phase 4 and Phase 9 exit
+criteria run them. Its other unverified items were the cluster-mode and
+SkyPilot paths (frozen) and the `devai-model-status` gate (removed with MCP);
+both are moot.
 
 ## Context
 

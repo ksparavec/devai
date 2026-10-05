@@ -385,6 +385,22 @@ These engines cannot share one Python environment. And FlashInfer compiles its k
 
 The critical path is 1 -> 2 -> 3 -> 4 -> 8 -> 9 -> 10 -> 13 -> 14. Phase 5 and Phases 6-7 run beside it and must be done before 8 and 10 respectively.
 
+## Absorbed from earlier plans (2026-10-05)
+
+Open items of earlier plans that a phase of this plan does anyway, as part of
+its own work. They were dropped from those plans and are not separate work.
+
+| Earlier plan | Open item | Done in |
+|---|---|---|
+| sglang-backend-remediation | Phase 4, steps 4-5: re-probe the SGLang cells that still carry a GPTQ "unsupported quantization" verdict (7 on 2026-10-05) and the cells without a launch fingerprint, each with its load probe | Phase 4, step 4g: every model is re-probed on `devai-engines`, with SGLang 0.5.16 compiled here |
+| sglang-backend-remediation | Phase 1's 24-hour soak check: an SGLang model must not crash-loop through the launch breaker | Phase 10: an exit criterion of the re-bench |
+| model-lifecycle-ledger | re-check Gemma-4-31B-IT-NVFP4 with its `--enforce-eager` recovery flag | Phase 4, step 4g |
+| model-lifecycle-ledger | a live `make model-sync` run | Phase 10: an exit criterion, once the probers load through the bus |
+| review-fixes-2026-07 | the live `make test-vllm` and router run its Phase 3 required | Phases 4 and 9: their exit criteria run `make test-vllm`, `make test-sglang` and `make test-e2e` |
+| bench-rewrite | bench coverage: 6 rows on 2026-10-05, none for SGLang | Phase 10: the one re-bench on the final images |
+| odysseus-borrowed-ideas, RT-4 | foreground priority: background work yields to interactive requests | Phases 9-10: Slurm's queue, holds, the router's yielding, D1's interrupt |
+| odysseus-borrowed-ideas, RT-5 | one aggregate health readout | Phase 9 (`/devai/v1/gpu`), Phase 13 (`devai-jobs engines`), Phase 6 (the operator's stack page) |
+
 ---
 
 ## Contracts
@@ -865,6 +881,7 @@ deploy/recovery-flags.json, deploy/docker-compose.yaml, Makefile, tests/
 7. **4g -- Re-probe everything** on the new image: `make probe`, `probe-vllm`, `probe-sglang`, `probe-load-vllm`, `probe-load-sglang`.
    - Run `make backup-create` first.
    - Failures go to the exclusion ledger and the model is dropped (M8), including the two models that had their own images.
+   - It also closes items absorbed from earlier plans: the SGLang cells that still carry a GPTQ "unsupported quantization" verdict or no launch fingerprint, each re-probed with its load probe; and Gemma-4-31B-IT-NVFP4 with its `--enforce-eager` recovery flag.
 8. **4h -- `QUANT_IMAGE`** points at `devai-engines` (its vLLM environment); `scripts/quant/quant_smoke.py` already adds llm-compressor on top of the image's torch.
 
 ### Exit criteria
@@ -1452,6 +1469,9 @@ devai-tools/cmd/devai-jobs/       modify -- submit (action, probe, bench run), h
   - with another model, the bench's model sleeps and wakes, and the cancelled attempt is in the history, not scored.
 - Probing one vLLM model and one Ollama model through probe jobs gives the same fit verdict and context as the container prober for the same cell. Cells are compared field by field; VRAM may differ within run-to-run noise.
 - The re-bench has run on the Slurm path. Its rows carry job ids, and `bench-report` renders them.
+  - It covers every pickable row at the context the picker offers, SGLang's included if SGLang is kept.
+  - No model trips the launch breaker in a loop while it runs (sglang-backend-remediation's 24-hour soak check).
+- A live `make model-sync` run onboards one new catalog row: download, probe jobs, ledger verdict.
 - `make test-python` (the bench, probe and model-sync tests updated), `make test-devai-tools` and `make test-operator` pass.
 
 ### Phase 10 risks

@@ -85,8 +85,6 @@ promoting a feature to Accepted.
 | CB-1   | Analytic pre-probe fit/TPS/quality estimator                   | Cookbook | high   | med    | first-hand | KV-at-ctx term shipped 2026-07-26; rest Proposed |
 | CB-2   | Serve-error -> auto-fix retry loop (grows recovery-flags.json) | Cookbook | high   | med    | agent-read | Proposed |
 | CB-3   | Ingest vllm-project/recipes as authoritative launch config     | Cookbook | high   | med    | agent-read | Proposed |
-| RT-4   | Foreground-priority gate (background jobs yield)               | Router   | high   | med    | agent-read | Proposed |
-| RT-5   | Consolidated /health/all readout + external-GPU scan           | Router   | med-hi | med    | agent-read | Proposed |
 | CB-4   | Use-case-weighted ranking presets over bench columns           | Cookbook | med    | low    | first-hand | **Shipped 2026-07-26** |
 | RT-6   | Readiness probe distinct from liveness                         | Router   | med    | low    | agent-read | Proposed |
 
@@ -423,104 +421,6 @@ SSE `error` event instead. Gate the whole behaviour on `stream:true` (the
 router already parses the body for `maybeStripTools`), so non-streaming
 requests keep their proper HTTP error status.
 
-### RT-4 -- Foreground-priority gate (background jobs yield)
-
-- **Status:** Proposed
-- **Value / Effort:** high / medium
-- **Verification:** agent-read (`src/interactive_gate.py`,
-  `src/task_scheduler.py:850-908`)
-- **Depends on:** cluster-mode Phase 1 stable (touches the same idle surfaces)
-
-**What odysseus does.** `interactive_gate` keeps an active-request counter +
-browser heartbeat + detached-stream detector; background tasks
-`wait_for_interactive_quiet()` until no active request, no activity for a quiet
-window, and no live stream. A 250ms monitor cancels a running background task
-the instant foreground activity resumes, so background work never competes
-with the user on the shared model.
-
-**devai gap.** Every router request is peer-priority. Under GPU mutual
-exclusion a model swap is catastrophic (evicts a warm model, cold-start
-seconds), yet nothing stops a low-priority background caller (`make bench`, a
-scheduled probe, `model-sync`) from forcing a swap that evicts the user's
-interactive model mid-turn.
-
-**Proposed change.** Add a priority signal to gpu-arbiter (an
-`X-DevAI-Priority: background` header, or a dedicated low-priority port). A
-background request that would require a different `currentModel`/
-`currentContext` BLOCKS until the resident model has been idle for a quiet
-window (reuse `IDLE_TIMEOUT`) or returns 503 / queues, instead of preempting.
-Set the background flag in `scripts/bench/bench_runner.py`,
-`scripts/_probe_load.py`, and `scripts/model-sync.py` so batch tooling yields
-to interactive serving.
-
-**Deliverables.**
-```
-gpu-arbiter/main.go                modify -- honor X-DevAI-Priority: background before a swap
-scripts/bench/bench_runner.py      modify -- set the background priority header
-scripts/_probe_load.py             modify -- same
-scripts/model-sync.py              modify -- same
-```
-
-**Exit criteria.**
-- A background request that would evict a warm interactive model waits (or
-  503s), and does NOT trigger a swap while the interactive model is in use.
-- A foreground request always preempts a queued background one.
-- With no interactive traffic, background jobs proceed exactly as today.
-
-**Risks / notes.** Starvation: a permanently-busy interactive model could
-block a background probe indefinitely. Add a max-wait after which the
-background job either proceeds or fails loudly, so `make bench` cannot hang
-forever.
-
-### RT-5 -- Consolidated /health/all readout + external-GPU scan
-
-- **Status:** Proposed
-- **Value / Effort:** medium-high / medium
-- **Verification:** agent-read (`src/service_health.py`,
-  `src/tools/cookbook.py:312-417`)
-- **Depends on:** none
-
-**What odysseus does.** `service_health` fans out per-subsystem probes into
-ONE report with a 4-state vocabulary (ok / degraded / down / disabled), each
-bounded by a per-op timeout, an N-item fan-out budget (a thread pool with
-`as_completed` timeout + `shutdown(wait=False)`), a per-subsystem deadline and
-an overall ceiling. Errors pass through `_classify_error` (never `str(exc)`)
-and every URL through `_safe_url` (strips userinfo/query/fragment). Separately
-a `/proc` scan surfaces model servers the tracker did not launch.
-
-**devai gap.** devai has per-backend `/health` and `get_router_status` but no
-single aggregate verdict across ollama + vllm + sglang + MCP gateway +
-SkyPilot server + cluster workers, no degraded-vs-down distinction, no
-bounded-fan-out budget, and no secret-free error classification for the status
-surface. The router also cannot see a NON-devai process already holding the
-GPU it enforces exclusion over.
-
-**Proposed change.** Add a `/health/all` handler to gpu-arbiter that fans out
-(bounded goroutine budget + per-probe timeout + overall ceiling) to the 3
-backends + MCP gateway + SkyPilot API server + registered workers, returning
-ok / degraded / down / disabled per subsystem with SAFE category tokens
-(timeout / connection_refused / dns / tls) -- never raw exceptions or
-credential-bearing URLs. Surface it via `devai-tools/internal/routerclient`
-`get_router_status`. Fold in a `podman ps` + host `/proc` scan so the readout
-reports externally-launched vLLM/SGLang/Ollama processes occupying the GPU.
-
-**Deliverables.**
-```
-gpu-arbiter/main.go (or new file)  modify -- /health/all bounded fan-out handler
-devai-tools/internal/routerclient/ modify -- consume /health/all in get_router_status
-scripts/... (optional)             new    -- podman ps + /proc external-GPU scan helper
-```
-
-**Exit criteria.**
-- `/health/all` returns one JSON with ok/degraded/down/disabled per subsystem,
-  bounded by an overall deadline even if a subsystem hangs.
-- No raw exception text or credential-bearing URL ever appears in the output.
-- An externally-launched process holding the GPU is reported.
-
-**Risks / notes.** The `/proc` scan must degrade gracefully where the router
-container cannot see host processes (rootless podman namespace); report
-"unknown" rather than falsely "clear."
-
 ### RT-6 -- Readiness probe distinct from liveness
 
 - **Status:** Proposed
@@ -621,7 +521,9 @@ message-inspection, no own agent loop) or fall outside the user's scope
   platform-rebuild plan's Phase 9, which rewrites the router's `/health` from
   its GPU record. RT-2, RT-3, CMP-1 and CMP-2 removed from the register:
   rejected, and the platform rebuild drops the MCP gateway RT-2 and RT-3
-  build on.
+  build on. RT-4 (foreground priority) and RT-5 (aggregate health) removed:
+  absorbed by the platform-rebuild plan (Slurm's queue and holds; its
+  `/devai/v1/gpu`, `devai-jobs engines` and operator stack page).
 
 ## References
 
