@@ -6,7 +6,7 @@
 
 - the operator's decisions: D1-D16, plus M1-M15 and O1-O9 for the images and
   the operator;
-- the implementation decisions I1-I14, which this document includes where they
+- the implementation decisions I1-I20, which this document includes where they
   shape the design;
 - the interfaces the code is written against (its contracts C1-C8).
 
@@ -63,7 +63,8 @@ Proposed:
 - **The GPU guard** in `devai-slurm` checks the card before every GPU job: it
   asks devai's engines to unload and kills anything else that holds it.
 - **Only `devai-operator` holds the host's podman socket** (builds, compose,
-  lab containers). `devai-slurm` and the router do not.
+  lab containers, and the log follower, which moves into it from its own
+  container; plan I20). `devai-slurm` and the router do not.
 - **One version per backend, CUDA 13.1, everything compiled here** (D8, D11).
 - **The GPU is optional** (M15): one host check decides
   at launch; a host without an NVIDIA GPU runs only Ollama (CPU) and the laya
@@ -104,7 +105,7 @@ Source: [`scripts/diagrams/slurm_architecture.py`](../scripts/diagrams/slurm_arc
 | `devai-slurm` | `devai-slurm` (new, built here on the pinned `debian:trixie-slim`) | slurmctld, slurmdbd, slurmrestd, MariaDB, slurmd, nats-server, the GPU guard, the GPU sampler, the bus log, `devai-bus`, `devai-jobs` | `--pid=host`; the GPU via CDI, for NVML only, when the host has one; `--privileged --cgroupns=private` only if slurmd turns out to need them (Sec. 3.1) |
 | `devai-engines` | `devai-engines` (the plan's Phase 4) | supervisord, `devai-control`, Ollama, vLLM 0.28 + HyperQwen, SGLang 0.5.16, each in its own env and on its own port (11434, 11435, 11436) | GPU via CDI when present |
 | `devai-laya-trainer` | `devai-laya-trainer` (its own image, as today, on `devai-base`; the plan's Phase 3) | supervisord, `devai-control`, the laya trainer | GPU via CDI when present |
-| `devai-operator` | `devai-operator` ([the plan](plans/platform-rebuild.md), Phase 6) | supervisord, Apache + mod_wsgi, `devai-control`, `devai-bus`, `devai-jobs`, devai's scripts and the tools they call | the host's podman socket read-write; the GPU when present (probes); HTTPS published on the LAN (O6) |
+| `devai-operator` | `devai-operator` ([the plan](plans/platform-rebuild.md), Phase 6) | supervisord, Apache + mod_wsgi, `devai-control`, `devai-bus`, `devai-jobs`, devai's scripts and the tools they call, the log follower (plan I20) | runs as `devai` with `--userns=keep-id` (plan I19); the host's podman socket read-write; the GPU when present (probes); HTTPS published on the LAN (O6) |
 | `devai-router` | its own small image | the router, with a bus client that follows engine state and unloads a sleeper no job needs (I9) | none |
 
 No Slurm package is installed outside `devai-slurm`. `devai-control` (the
@@ -243,9 +244,11 @@ What load and unload mean for each engine:
   RAM and drops the KV cache; SGLang's `/release_memory_occupation` releases its
   memory. The next `load` of the same model with the same settings wakes it
   (`/wake_up`, `/resume_memory_occupation`) instead of starting a process. At
-  most one model sleeps at a time; a second sleep unloads the first. Once no
-  pending job names the sleeping model any more -- its job was cancelled, or
-  it ran with other settings -- the router unloads it (I9). A sleeping
+  most one model sleeps at a time; a second sleep unloads the first, and so
+  does a load of another model on the same engine, since each engine serves one
+  model process on its port. Once no pending job names the sleeping model any
+  more, and no just-started job that names it is still about to take its hold,
+  the router unloads it (I9). A sleeping
   model costs host RAM (about 18 GiB for the 27B at level 1; the host has
   62 GiB) and keeps some VRAM (not measured), which the next load's memory
   fraction must leave free. How long sleep and wake take is not measured.
@@ -319,7 +322,7 @@ trainer and probe job, in `devai-slurm`:
 
 1. waits up to 10 s for an idle card: no compute process and at most 512 MiB
    used, apart from a sleeping devai model, whose use it takes from that
-   engine's state;
+   engine's state (the sleeper's `used_mib`, plan C1);
 2. otherwise asks each devai engine that holds the card to `unload`, over the
    bus, and waits up to 60 s. The guard matches NVML's PIDs to a container
    through `/proc/<pid>/cgroup`: a PID's cgroup is compared with that of the
@@ -385,16 +388,18 @@ A request that needs an engine:
    drained and its job ended -- with `sleep` if a pending job needs that model,
    with `unload` otherwise -- and a new engine job submitted;
 4. the new job is refused by the guard: cancel it and return 503 naming the
-   holder, without charging the launch breaker, and resubmit rather than
-   release (Slurm delays a released job by about 2 minutes; measured); the load
-   fails: 502 with the engine's log tail from `devai-control`, breaker charged.
+   holder, without charging the launch breaker; the next request submits a
+   new job rather than releasing the held one (Slurm delays a released job by
+   about 2 minutes; measured); the load fails: 502 with the engine's log tail
+   from `devai-control`, breaker charged.
 
 **Yielding.** A pending trainer or probe job makes the router end its engine
 job, unless a hold binds that engine. Otherwise a keep-warm engine job would
 keep the engine license forever.
 
-**The sleeper.** Once no pending job names the sleeping model any more, the
-router sends `unload` for it (I9). It checks this whenever it refreshes the
+**The sleeper.** Once no pending job names the sleeping model any more, and no
+running bench, probe or action job that names it is within 60 s of its start
+without a hold, the router sends `unload` for it (I9). It checks this whenever it refreshes the
 pending jobs (every 2 s) and at boot. While the router is down, a sleeper
 stays.
 
@@ -516,7 +521,8 @@ creates the operator's htpasswd entry and its TLS certificate under
 
 ## 12. Security
 
-- **Only `devai-operator` holds the host's podman socket**, which is
+- **Only `devai-operator` holds the host's podman socket** (from the plan's
+  Phase 6, when the log follower moves into it, I20), which is
   equivalent to the devai user on the host; so logging in to `devai-operator`
   controls the host user (its plan: TLS, one strong password, CSRF tokens).
 - **A job reaches other containers only through the bus**, whose verbs are
