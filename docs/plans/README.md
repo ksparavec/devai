@@ -48,7 +48,7 @@ history too.
 | router-fanout | Draft | Phase 1 and the single-host polish became Phase 19; Phases 2-3 dropped (cluster mode) |
 | odysseus-borrowed-ideas | Draft | RT-1, CB-4 and CB-1's KV term shipped; CB-3 and the rest of CB-1 became Phase 17, CB-2 Phase 18, RT-6 part of Phase 9; RT-4 and RT-5 absorbed; RT-2, RT-3, CMP-1, CMP-2 rejected |
 | library-service | Draft | became Phase 20; its decisions D1-D28 are LS1-LS28 there |
-| laya-trainer | In Progress | Phases 1-4 shipped; closing Phase 4 is in Phase 21 |
+| laya-trainer | In Progress | Phases 1-4 shipped; Phase 4 closed by the operator on 2026-10-05 (platform-rebuild I23) |
 | pi-coding-agent | Done | shipped; pinning pi and two notes are in Phase 21 |
 | card-derived-hints-and-bench-sync | Done | shipped; the provenance docs are in Phase 21, the card branch's first real run in Phase 4 |
 | model-lifecycle-ledger | Done (unverified) | shipped; its live checks absorbed (Phases 4 and 10) |

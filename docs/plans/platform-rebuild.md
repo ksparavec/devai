@@ -11,7 +11,7 @@ Draft (2026-10-05). Nothing is built or tested.
   - The other plans: their parts that conflict with the rebuild or that it makes moot were dropped; the parts it absorbs are listed under "Absorbed from earlier plans"; their compatible or independent parts became Phases 15-21. The library-service plan's decisions are kept as LS1-LS28.
 - **The architecture is [docs/slurm.md](../slurm.md).** This plan follows it section by section (see Approach).
   - Where the code needs more detail than the architecture gives, the detail is fixed under Contracts (C1-C8).
-  - Where that detail adds to or differs from slurm.md, it is recorded as an implementation decision (I1-I20), taken by the operator on 2026-10-05; those that shape the architecture are folded into slurm.md.
+  - Where that detail adds to or differs from slurm.md, it is recorded as an implementation decision (I1-I24), taken by the operator on 2026-10-05; those that shape the architecture are folded into slurm.md.
 - **21 phases.** Phases 1-14 build the new architecture; Phases 15-21 are the independent work folded in from earlier plans. Each has its files, steps, tests and exit criteria; the order table under Approach says what can run beside what.
 
 ## Dependencies
@@ -204,7 +204,7 @@ Given in devai's session unless marked otherwise. LS1-LS28 were numbered D1-D28 
 
 ## Implementation decisions (2026-10-05)
 
-The plan proposed each of these as the smallest choice that lets the code be written, and the operator decided them on 2026-10-05. I1-I14 were decided first, three of them differently from the proposal (I4, I9, I10); I15-I20 the same day, after a readiness review. Each is folded into slurm.md where it shapes the architecture, and each names those sections and the phase that needs it.
+The plan proposed each of these as the smallest choice that lets the code be written, and the operator decided them on 2026-10-05. I1-I14 were decided first, three of them differently from the proposal (I4, I9, I10); I15-I24 the same day, after a readiness review. Each is folded into slurm.md where it shapes the architecture, and each names those sections and the phase that needs it.
 
 - **I1 -- The bus carries data, never command lines** (slurm.md Sec. 4; Phase 8).
   - The `load` request carries the router's launch configuration as typed fields (C2), and `devai-control` builds the argument list itself, with the router's builders moved into a shared package.
@@ -272,6 +272,14 @@ The plan proposed each of these as the smallest choice that lets the code be wri
   - An automatic fix is a flag that is safe to append, scoped with `backends` (for example `--enforce-eager` after a CUDA-graph OOM): applied once, logged and attributed. `devai-control` re-reads `deploy/recovery-flags.json` on every load.
   - Context, parser and memory-fraction suggestions are reported with the diagnosis and never applied: they are launch settings (C2), and a recovery flag would override every later launch.
 - **I19 -- devai-operator runs as `devai` with `--userns=keep-id`** (C6; Phase 6; operator, 2026-10-05), as the lab containers do. Apache (on 8443), supervisord and every action run as uid 1000, mapped to the host user, so the files it writes on host paths belong to the host user.
+- **I21 -- Phase 16 follows the original short-circuit design** (Phase 16; operator, 2026-10-05):
+  - patterns in `deploy/shortcircuit-probes.json`, re-tunable without a rebuild;
+  - streaming (SSE) handled from the start, since Claude Code streams most calls;
+  - `/v1/messages` only;
+  - count_tokens (16d) only if Claude Code calls it and an engine tokenizer is reachable, never approximated.
+- **I22 -- Phase 19 follows the original lanes design** (Phase 19; operator, 2026-10-05): an opt-in port, off by default; a configurable directive prefix, default `@@`; an unknown directive answers 400 listing the lanes; text content on `/v1/chat/completions` and `/v1/messages` first; broadcast refused.
+- **I23 -- The laya trainer's Phase 4 is closed** (Phase 21; operator, 2026-10-05). Its quality caveats stay recorded in docs/laya-trainer.md as known limits ("Quality of the installed student"). Phases 8-9 re-run `make laya-check` on the new path anyway.
+- **I24 -- The card-derived parser path is exercised without a download** (Phase 4; operator, 2026-10-05). Every vLLM/SGLang family has a curated `parsers:` block -- the parser-less families are Ollama-only -- so no catalog row reaches the card path on its own. Phase 4 re-probes one model already on disk (Qwen3.5-9B-NVFP4) with a prober switch that ignores its curated block and its recipe seed, so the card-derived parsers drive the launch. That cell goes to a scratch cache and is compared with the curated one.
 - **I20 -- The log follower moves into devai-operator** (slurm.md Sec. 1, 3 and 12; Phase 6; operator, 2026-10-05). `deploy/logging.sh` becomes a supervisord program in `devai-operator`, which holds the podman socket anyway, and the `devai-logger` container goes. From Phase 6 on, `devai-operator` is the only holder of the socket, as slurm.md says.
 
 ## Open questions
@@ -281,10 +289,10 @@ The plan proposed each of these as the smallest choice that lets the code be wri
 3. The sleep fast path: how long sleep and wake take, how much VRAM a sleeping vLLM or SGLang process keeps, and whether sleep support costs speed or memory while serving. -- Phase 8 step 1 measures it; `sleep_mode=false` by default is the fallback.
 
 4. ~~What are the SGLang keep thresholds (Phase 15)?~~ Decided: I16.
-5. Short-circuit design (Phase 16)? -- recommendations (the original plan's): patterns in a config file (`deploy/shortcircuit-probes.json`), not in Go; streaming handled from the start; `/v1/messages` only; count_tokens only if Claude Code calls it and an engine tokenizer is reachable.
-6. Lanes design (Phase 19)? -- recommendations (the original plan's): a configurable directive prefix, default `@@`; an unknown token answers 400 listing the lanes; text content on `/v1/chat/completions` and `/v1/messages` first.
+5. ~~Short-circuit design (Phase 16)?~~ Decided: I21.
+6. ~~Lanes design (Phase 19)?~~ Decided: I22.
 
-None of them blocks coding: questions 1-3 are the first steps of their phases, each with a fallback; questions 5-6 have recommendations the phases follow unless the operator overrules them.
+None of them blocks coding: questions 1-3 are the first steps of their phases, each with a fallback, and the rest are decided.
 
 ## Context
 
@@ -947,6 +955,7 @@ scripts/bench/bench_runner.py, _bench_core.py, scripts/bench-sync.py
                                      modify -- per-engine identity instead of image digest; cache volumes under HOME
 scripts/probe-vllm-devai-reasoning.py remove -- merged into the vllm prober
 scripts/prepare-checkpoint.py        modify -- its image is devai-engines (vLLM environment), not docker.io/devai/vllm-devai
+scripts/_probe_hf_common.py          modify -- PROBE_IGNORE_CURATED_PARSERS=1 with a scratch cache (I24)
 tests/python/test_upstream_images.py modify -- the engine images and QUANT_IMAGE leave the transitional allowlist
 scripts/model-picker.py, bin/devai-agent, config/*, scripts/generate-catalog.py, deploy/models.yaml,
 deploy/recovery-flags.json, deploy/docker-compose.yaml, Makefile, tests/
@@ -981,7 +990,7 @@ deploy/recovery-flags.json, deploy/docker-compose.yaml, Makefile, tests/
    - Run `make backup-create` first.
    - Failures go to the exclusion ledger and the model is dropped (M8), including the two models that had their own images.
    - It also closes items absorbed from earlier plans. The SGLang cells without a launch fingerprint are re-probed with their load probe. The 7 SGLang cells that still carry a GPTQ "unsupported quantization" verdict (Gemma-4-31B-IT-NVFP4 among them) have no weights on disk and are not downloaded (I17): they are removed from the SGLang probe cache, and each model gets a `manual` ledger verdict saying why.
-   - The card-derived parser path (`scripts/_card_hints.py`) gets its first real run on one model that has neither a curated `parsers:` block nor a vendor recipe (Phase 17a). No such model is on disk, so this needs one download -- the smallest such catalog row, through `make model-pull NAME=...` -- and is skipped if the operator declines it.
+   - The card-derived parser path (`scripts/_card_hints.py`) gets its first real run (I24): Qwen3.5-9B-NVFP4 is re-probed with `PROBE_IGNORE_CURATED_PARSERS=1`, which makes the prober skip its curated `parsers:` block and its recipe seed. The cell goes to a scratch cache and is compared with the curated cell: the same parsers, or a recorded disagreement.
 8. **4h -- `QUANT_IMAGE`** points at `devai-engines` (its vLLM environment); `scripts/quant/quant_smoke.py` already adds llm-compressor on top of the image's torch.
 
 ### Exit criteria
@@ -1951,7 +1960,7 @@ tests/python/test_fit_estimate.py, test_vllm_recipes.py
 
 ### Detailed steps
 
-1. **17a:** a parser comes from, in order: the curated `parsers:` block; the card-derived value (`scripts/_card_hints.py`, which refuses rather than guesses); the recipe seed; a name heuristic, labelled "guessed, not probe-verified"; none. The probe is the final authority, and the probe cache records where a value came from (`recipe` joins `tool_parser_source`'s values). A recipe never injects a flag the pinned vLLM rejects (`min_vllm_version`). Phase 4's card-branch model is chosen among rows without a recipe.
+1. **17a:** a parser comes from, in order: the curated `parsers:` block; the card-derived value (`scripts/_card_hints.py`, which refuses rather than guesses); the recipe seed; a name heuristic, labelled "guessed, not probe-verified"; none. The probe is the final authority, and the probe cache records where a value came from (`recipe` joins `tool_parser_source`'s values). A recipe never injects a flag the pinned vLLM rejects (`min_vllm_version`). Phase 4's card-path check ignores both the curated block and the recipe seed (I24).
 2. **17b:** probe and bench caches stay authoritative. An estimate appears only where no measurement exists, always labelled `est`. An unknown GPU type gives no estimate, never a wrong one. The odysseus idea of feeding predicted speed into cluster routing is dropped with cluster mode.
 3. **Calibration (17b), after Phases 4 and 10:** compare the predicted decode speed of every benched model with its measured one, and record the error band.
 
@@ -2360,11 +2369,10 @@ Sandboxed execution of chosen code, compared against the paper's reported result
 
 ## Phase 21 -- Loose ends
 
-Small items left by finished plans. Each is independent of the rest and can be done at any time.
+Small items left by finished plans. (The laya trainer's Phase 4, once listed here, was closed by the operator: I23.) Each is independent of the rest and can be done at any time.
 
 | Item | From | What is left |
 |---|---|---|
-| close the laya trainer's Phase 4 | laya-trainer | an owner decision on its open quality caveats: on the held-out data, precision >= 0.90 is not supported once the three rounds are corrected for together (Bonferroni bound 0.893); on opinion text the lower bound is 0.848; the fast-mode VRAM figure comes from one job whose artifact was never evaluated. (docs/router.md's `LAYA_MAX_HOLD_S` row already points to docs/laya-trainer.md "Measurements"; Phase 14 rewrites it for I11 anyway.) |
 | pin pi | pi-coding-agent | `make fetch-cli` downloads pi from `releases/latest`; pin a version, as every other download is pinned |
 | pi's two notes | pi-coding-agent | document the cold start a `/model` switch can cause (the GPU is exclusive), and how Pi picks up AGENTS.md |
 | parser provenance | card-derived-hints-and-bench-sync | document the fields the probers stamp into the probe caches (`tool_parser_source`, `reasoning_parser_source`, `parser_disagreement`, `card_sampling`) in docs/backends.md. The card branch's first real run goes with Phase 4's re-probe |
@@ -2373,7 +2381,6 @@ Each row is its own small change; none depends on another phase.
 
 ### Exit criteria
 
-- The laya trainer's Phase 4 is closed or re-opened by the owner, and recorded in docs/laya-trainer.md.
 - `make fetch-cli` pins pi; the two pi notes and the provenance fields are documented.
 
 ---

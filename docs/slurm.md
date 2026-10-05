@@ -6,7 +6,7 @@
 
 - the operator's decisions: D1-D16, plus M1-M15 and O1-O9 for the images and
   the operator;
-- the implementation decisions I1-I20, which this document includes where they
+- the implementation decisions I1-I24, which this document includes where they
   shape the design;
 - the interfaces the code is written against (its contracts C1-C8).
 

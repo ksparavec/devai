@@ -5,8 +5,9 @@ distillation from the 27B teacher. It is a router backend, but a **job runner**,
 not an inference engine: a request to its port starts a training job that holds
 the GPU for minutes to hours after the request has returned. The design and its
 owner decisions were in the laya-trainer plan (removed 2026-10-05, in git
-history; what was left of it is Phase 21 of
-[the platform-rebuild plan](plans/platform-rebuild.md)); this page is the
+history). Its Phase 4 was closed by the owner on 2026-10-05, with the quality
+caveats under "Quality of the installed student" kept as known limits
+([the platform-rebuild plan](plans/platform-rebuild.md), I23); this page is the
 reference for what is built.
 
 - Image: `localhost/devai-laya-trainer:latest` (`make build-laya-trainer`), on the
