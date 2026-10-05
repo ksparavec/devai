@@ -82,16 +82,16 @@ promoting a feature to Accepted.
 | ID     | Feature                                                        | Area     | Value  | Effort | Verify     | Status   |
 | ------ | -------------------------------------------------------------- | -------- | ------ | ------ | ---------- | -------- |
 | RT-1   | SSE keepalive heartbeat during cold-start                      | Router   | high   | low-med| first-hand | **Shipped 2026-07-26** |
-| CB-1   | Analytic pre-probe fit/TPS/quality estimator                   | Cookbook | high   | med    | first-hand | Proposed |
+| CB-1   | Analytic pre-probe fit/TPS/quality estimator                   | Cookbook | high   | med    | first-hand | KV-at-ctx term shipped 2026-07-26; rest Proposed |
 | CB-2   | Serve-error -> auto-fix retry loop (grows recovery-flags.json) | Cookbook | high   | med    | agent-read | Proposed |
 | CB-3   | Ingest vllm-project/recipes as authoritative launch config     | Cookbook | high   | med    | agent-read | Proposed |
-| RT-2   | Conversational model-mgmt MCP write tools                      | Router   | high   | med    | agent-read | Proposed |
-| RT-3   | Fail-closed tool policy for the MCP gateway                    | Router   | high   | med    | agent-read | Proposed |
-| CMP-1  | Blind A/B human-preference duel + PREF% picker column          | Compare  | high   | med    | first-hand | Proposed |
+| RT-2   | Conversational model-mgmt MCP write tools                      | Router   | high   | med    | agent-read | Rejected 2026-07-25 |
+| RT-3   | Fail-closed tool policy for the MCP gateway                    | Router   | high   | med    | agent-read | Rejected 2026-07-25 |
+| CMP-1  | Blind A/B human-preference duel + PREF% picker column          | Compare  | high   | med    | first-hand | Rejected 2026-07-25 |
 | RT-4   | Foreground-priority gate (background jobs yield)               | Router   | high   | med    | agent-read | Proposed |
 | RT-5   | Consolidated /health/all readout + external-GPU scan           | Router   | med-hi | med    | agent-read | Proposed |
-| CMP-2  | LLM-as-judge pairwise scoring as a bench task                  | Compare  | high   | high   | agent-read | Proposed |
-| CB-4   | Use-case-weighted ranking presets over bench columns           | Cookbook | med    | low    | first-hand | Proposed |
+| CMP-2  | LLM-as-judge pairwise scoring as a bench task                  | Compare  | high   | high   | agent-read | Rejected 2026-07-25 |
+| CB-4   | Use-case-weighted ranking presets over bench columns           | Cookbook | med    | low    | first-hand | **Shipped 2026-07-26** |
 | RT-6   | Readiness probe distinct from liveness                         | Router   | med    | low    | agent-read | Proposed |
 
 ## Dependencies and relationship to existing plans
@@ -138,7 +138,7 @@ promoting a feature to Accepted.
 
 ### CB-1 -- Analytic pre-probe fit / TPS / quality estimator
 
-- **Status:** Proposed
+- **Status:** Partly shipped 2026-07-26 -- only the KV-at-ctx term, in `scripts/catalog-discover.py` (`estimate_kv_gb`). The rest (the fit/TPS/quality estimator, `make model-rank`, picker cells, calibration) is Proposed.
 - **Value / Effort:** high / medium
 - **Verification:** first-hand (read `services/hwfit/fit.py`;
   cross-checked devai's `docs/llm-tokens-and-speed.md` bandwidth model)
@@ -318,7 +318,7 @@ pinned image rejects.
 
 ### CB-4 -- Use-case-weighted ranking presets over bench columns
 
-- **Status:** Proposed
+- **Status:** Shipped 2026-07-26 -- five use-case sort modes on ctrl-s in `scripts/model-picker.py` (`_USE_CASE_SORT_MODES`, scored by `_use_case_score`). No unit test covers the sort modes themselves.
 - **Value / Effort:** medium / low
 - **Verification:** first-hand (read `services/hwfit/fit.py` ranking path)
 - **Depends on:** none
@@ -365,7 +365,7 @@ so the composite never hides the underlying numbers.
 
 ### CMP-1 -- Blind A/B human-preference duel + PREF% picker column
 
-- **Status:** Proposed
+- **Status:** Rejected 2026-07-25 (see the triage note at the top).
 - **Value / Effort:** high / medium
 - **Verification:** first-hand (read `routes/compare_routes.py` in full)
 - **Depends on:** bench-cache schema conventions (bench-rewrite)
@@ -422,7 +422,7 @@ win%, and mark PREF% ADVISORY so it never becomes a hard picker filter.
 
 ### CMP-2 -- LLM-as-judge pairwise scoring as a bench task
 
-- **Status:** Proposed
+- **Status:** Rejected 2026-07-25 (see the triage note at the top).
 - **Value / Effort:** high / high
 - **Verification:** agent-read (`routes/skills_routes.py:778-943`,
   `services/memory/memory_extractor.py:487-659`,
@@ -546,7 +546,7 @@ requests keep their proper HTTP error status.
 
 ### RT-2 -- Conversational model-management MCP write tools
 
-- **Status:** Proposed
+- **Status:** Rejected 2026-07-25 (see the triage note at the top).
 - **Value / Effort:** high / medium
 - **Verification:** agent-read (`src/tools/cookbook.py:190-233,420-600,1217-1341`,
   `src/agent_tools/model_interaction_tools.py:20-210`)
@@ -603,7 +603,7 @@ unless the caller is foreground.
 
 ### RT-3 -- Fail-closed tool policy for the MCP gateway
 
-- **Status:** Proposed
+- **Status:** Rejected 2026-07-25 (see the triage note at the top).
 - **Value / Effort:** high / medium
 - **Verification:** agent-read (`src/tool_security.py`,
   `src/task_action_policy.py`, `src/task_scheduler.py:828-848`,
@@ -844,6 +844,15 @@ message-inspection, no own agent loop) or fall outside the user's scope
   marked already-covered, 12 rejected as out-of-fit. RT-1 recommended as the
   first item to schedule (highest value-to-effort, self-contained). No feature
   Accepted yet.
+- 2026-07-25 -- Triage (the note at the top). RT-1, CB-4 and CB-1's KV-at-ctx
+  term approved; RT-2, RT-3, CMP-1 and CMP-2 rejected.
+- 2026-07-26 -- RT-1 shipped (`gpu-arbiter/sse_keepalive.go`); CB-4 shipped
+  (use-case sort keys in `scripts/model-picker.py`); CB-1's KV-at-ctx term
+  shipped in `scripts/catalog-discover.py`.
+- 2026-10-05 -- Statuses checked against the code; the dashboard and the
+  per-feature Status lines updated to match. RT-5 and RT-6 overlap with the
+  platform-rebuild plan's Phase 9, which rewrites the router's `/health` from
+  its GPU record.
 
 ## References
 
@@ -854,5 +863,3 @@ message-inspection, no own agent loop) or fall outside the user's scope
 - devai internal: `docs/router.md`, `docs/backends.md`, `docs/nvfp4-coldstart.md`,
   `docs/llm-tokens-and-speed.md`, and the sibling plans linked under
   "Dependencies and relationship to existing plans" above.
-</content>
-</invoke>

@@ -83,7 +83,7 @@ What changed on 2026-07-25:
   race-clean; see docs/router.md "SSE keepalive during cold start").
   RT-1's second deliverable, `cluster_proxy.go`, is moot -- that file
   went to `attic/cluster-mode/` with the rest of the frozen feature.
-- **`bench-rewrite` stays In Progress, but Phase 6 is struck.** The
+- **`bench-rewrite` stayed In Progress, but Phase 6 is struck** (closed as Done on 2026-07-27). The
   backfill targets a 32K/64K/128K/256K probe grid that no longer exists
   -- the probers now keep exactly one winner cell per (model, backend).
   Executing it would write bench rows the picker cannot read. Its real
@@ -104,7 +104,7 @@ found three more findings.
 
 | Plan                                                                | Status            |
 | ------------------------------------------------------------------- | ----------------- |
-| [mcp-gateway](./mcp-gateway.md)                                     | **Done**          |
+| [mcp-gateway](./mcp-gateway.md)                                     | Partial (Phase 2 never worked); removed by platform-rebuild |
 | [model-lifecycle-ledger](./model-lifecycle-ledger.md)               | Done (unverified) |
 | [review-fixes-2026-07](./review-fixes-2026-07.md)                   | Done (unverified) |
 | [bench-rewrite](./bench-rewrite.md)                                 | **Done**          |
@@ -112,7 +112,7 @@ found three more findings.
 | [card-derived-hints-and-bench-sync](./card-derived-hints-and-bench-sync.md) | **Done** (Phases 1-5 shipped) |
 | [sglang-backend-remediation](./sglang-backend-remediation.md)       | In Progress (Phases 0-3 shipped; Ph 4 partial) |
 | [router-anthropic-messages-compat](./router-anthropic-messages-compat.md) | **Done**      |
-| [router-shortcircuit](./router-shortcircuit.md)                     | Draft             |
+| [router-shortcircuit](./router-shortcircuit.md)                     | Draft (Phase 5's goal met by the router's mutation guard) |
 | [odysseus-borrowed-ideas](./odysseus-borrowed-ideas.md)             | Draft (partly frozen) |
 | [pi-coding-agent](./pi-coding-agent.md)                             | **Done**          |
 | [router-fanout](./router-fanout.md)                                 | Draft             |
@@ -375,7 +375,7 @@ probably do them in series rather than context-switching.
 | 13   | card-derived-hints-and-bench-sync             | ~1.5 weeks | No        | Both prerequisites already satisfied, so it can ship at any point. Appended rather than inserted because it is off the critical path entirely. Phases 1-4 (hints) and Phase 5 (bench loop) are independent tracks and can be split across people or releases. |
 | 14   | router-anthropic-messages-compat              | ~half a day | No       | No dependencies, off the critical path, but the only entry here that fixes a CURRENT user-facing break (Claude Code cannot complete a turn against any vLLM row). Numbered last only because this table is ordered by dependency, not priority -- in practice it should be done first. Its one open question is a ~30 min GPU-exclusive replay that gates the code. Note its open questions 1 and 4 (does SGLang expose `/v1/messages`; does its shim behave like vLLM's) are already ANSWERED in sglang-backend-remediation Phase 0 -- yes, and folding the stray system message is sufficient for both HF backends. |
 | 15   | sglang-backend-remediation                    | ~2 weeks + 1 GPU window | No | No dependencies. Off the dependency critical path, but **Phase 1 should be run before anything else in this table**: the fleet is currently burning GPU on a crash loop (72 router recreates of one model in a day, 93% of SGLang's server errors from that single model). Phases 2-3 are mostly backend-agnostic and improve vLLM too -- 12 of its 19 HIGH findings are owed whether SGLang is kept or frozen. Phase 4 needs the GPU window; Phase 5 is the optional keep-or-freeze adjudication. |
-| 16   | laya-trainer                                  | ~1.5 weeks + 1 GPU window | No | No devai dependencies; its only prerequisite is aiagent `feat/system1-distill`, which produces the datasets and consumes the artifacts. Phases 1-3 are code; Phase 4 needs one GPU window and sets `LAYA_MAX_HOLD_S` from the measured job time. Off the critical path. |
+| 16   | laya-trainer                                  | ~1.5 weeks + 1 GPU window | No | No devai dependencies; its only prerequisite is aiagent `feat/system1-distill`, which produces the datasets and consumes the artifacts. Phases 1-3 are code (merged); Phase 4 ran on 2026-09-25, and `LAYA_MAX_HOLD_S` is 900 s by owner decision. It stays In Progress by owner decision. Off the critical path. |
 
 **Eight of these sixteen steps are FROZEN** (4, 5, 6, 8, 9, 10, 11, 12) -- their plans
 were parked on 2026-07-25 and their sources moved to `attic/`. They are kept in this
@@ -448,7 +448,7 @@ frozen (see above), most of this list is free-floating by default rather than by
   parallel with cluster-mode Phase 1 onwards. **Shipped: the plan is Done.**
 - **[FROZEN]** cluster-mode Phase 3 (step 12) -- no dependents; activate on
   demand.
-- sglang-backend-remediation (Draft, Phase 0 run) -- host-side probe/bench tooling
+- sglang-backend-remediation (In Progress: Phases 0-3 shipped, Phase 4 partial, Phase 5 not started) -- host-side probe/bench tooling
   plus localised router edits; no deps and no dependents. Phase 1 stops a live crash
   loop and should go first. Phases 2-3 are largely backend-agnostic and improve vLLM
   too. Phase 4 needs a GPU-exclusive window; Phase 5 is an optional adjudication.
@@ -464,7 +464,7 @@ frozen (see above), most of this list is free-floating by default rather than by
   than merely unscheduled.
 - pi-coding-agent (Done, 2026-09-23) -- lab-image + picker change, no deps and no
   dependents; wired the same way as OpenCode.
-- card-derived-hints-and-bench-sync (In Progress) -- host-side probe/bench
+- card-derived-hints-and-bench-sync (Done, Phases 1-5 shipped) -- host-side probe/bench
   tooling only; touches no router, no picker, no container topology. Its two
   prerequisites (bench-rewrite's v3 schema, model-lifecycle-ledger's
   exclusion ledger) are already landed, so nothing gated it. Phases 1-4

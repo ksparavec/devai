@@ -23,7 +23,20 @@ re-implementing it._
 
 ## Status
 
-**In Progress.** Scaffold shipped 2026-05-15 (one PR, all
+**Non-functional** (checked against the code 2026-10-05). The scaffold is in the tree, but it has
+never encrypted anything:
+
+- `.sops.yaml` still names the literal `age1xxxx...` placeholder recipient;
+- no host key was generated;
+- no `deploy/*.sops.env` exists.
+
+Its only remaining consumer, the MCP gateway's two servers that need secrets,
+never received one. The `fetch-cli` block downloads sops and age from
+`releases/latest`, without the pinning and checksum this plan asked for. The
+[platform-rebuild](./platform-rebuild.md) plan moves it to `attic/` (its M12,
+Phase 1).
+
+History: scaffold shipped 2026-05-15 (one PR, all
 deliverables landed). `scripts/age-keygen-host.sh`,
 `scripts/render-secret.sh`, `deploy/setup-secrets-tmpfs.sh`,
 `.sops.yaml` (placeholder rule), `Makefile` targets

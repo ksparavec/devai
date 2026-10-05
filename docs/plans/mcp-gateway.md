@@ -2,7 +2,20 @@
 
 ## Status
 
-**In Progress.** Phases 1 and 2 shipped 2026-05-15. Phase 1
+**Partial; to be removed** (checked against the code 2026-10-05).
+
+- **Phase 1 works.** It was verified live on 2026-07-25: 134 tools, and 13 of
+  the 15 enabled servers start (`filesystem` and `arxiv-mcp-server` do not).
+  That was after the catalog was rebuilt on the gateway's real schema
+  (`deploy/mcp-catalog-devai.yaml`); the `deploy/mcp-servers.yaml` described
+  below was deleted.
+- **Phase 2 does not work.** No encrypted `deploy/mcp-secrets.sops.env` exists,
+  the sops/age scaffold it relies on was never used, and the GitHub and
+  Firecrawl tools have never been called with a secret.
+- **The [platform-rebuild](./platform-rebuild.md) plan removes the gateway**
+  (its M10, Phase 1), so Phase 2 will not be finished.
+
+History: Phases 1 and 2 shipped 2026-05-15. Phase 1
 covered 10 Tier 1 servers (no secrets); Phase 2 added 4 Tier 2
 servers (`github-official`, `firecrawl`, `hugging-face`,
 `context7`) backed by the shared sops/age scaffold:

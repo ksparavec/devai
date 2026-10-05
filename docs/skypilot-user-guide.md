@@ -6,8 +6,9 @@ CLI plus its broad cloud-extras set
 credentials in place, you can ask any of the bundled CLI agents
 (Claude Code, Gemini CLI, Codex CLI) to provision GPU jobs on your
 own cloud accounts via natural-language instructions -- the
-[SkyPilot Agent Skill](https://blog.skypilot.co/agent-skill/) plugin
-teaches each agent how to drive the `sky` CLI.
+agents drive the `sky` CLI as an ordinary command-line tool. No
+[SkyPilot Agent Skill](https://blog.skypilot.co/agent-skill/) plugin is
+installed (see "Driving SkyPilot from an AI agent" below).
 
 This is the user-facing reference. The architecture rationale and
 phase split live in
@@ -23,7 +24,7 @@ this guide is independent of it.
 | ------------------- | ------------------------------------------------------ |
 | `sky` CLI           | All standard commands (launch/exec/status/down/etc.)   |
 | Cloud extras        | aws, gcp, azure, kubernetes, slurm, runpod, lambda     |
-| Agent Skill         | Pre-installed for the agents that support it           |
+| Agent Skill         | Not installed; agents drive the `sky` CLI directly     |
 | Credentials         | Read from $HOME/{.aws,.config/gcloud,.config/sky,...}  |
 | Cost path           | Your cloud account; devai never sees a bill            |
 
@@ -122,10 +123,10 @@ A 24-hour fine-tune on a single A100 is ~$30. A 24-hour H100 run
 that you forget to shut down is ~$120. **Use `sky cost-report`
 weekly** and set up budget alerts on each cloud account.
 
-## Plugin install per agent (if needed)
+## Plugin install per agent (optional)
 
-The plugin should be pre-installed by the lab image; if it's missing
-for your agent, install manually:
+The lab image does not install the SkyPilot Agent Skill plugin. To add
+it for your agent, install it yourself:
 
 - **Claude Code**:
   ```bash

@@ -4,11 +4,28 @@ _Repair the SGLang code paths by extending the two backend contracts that alread
 
 ## Status
 
-Draft. Not yet scheduled for execution.
+**In Progress** (checked against the code 2026-10-05). Phases 0-3 shipped, Phase 4 is partial, and Phase 5
+has not started.
 
-The pre-work evidence phase (Phase 0 below) has already been RUN, read-only, on
-2026-07-27, and its results are recorded here. Nothing else has been started and no
-code has been modified.
+- **Phase 1:** shipped -- SGLang's failure signatures, the breaker's own lock,
+  and repayment on a served response. Its 24-hour soak check has no recorded
+  result.
+- **Phases 2 and 3:** shipped.
+- **Phase 4:** the launch fingerprint shipped, and `make probe-check` reports its
+  coverage; automatic invalidation was backed out, so it only reports. The
+  forced re-probe (steps 4-5) was not done: the SGLang probe cache still holds 7
+  cells failed with a GPTQ "unsupported quantization" verdict, and 4 of its 10
+  fitting cells carry a fingerprint.
+- **Phase 5:** not started. No `--enable-metrics`, no keep-or-freeze decision;
+  the picker still offers `sglang`.
+- **Not recorded below:** the Ornith-1.0-9B-NVFP4 SGLang quarantine was
+  reversed. Its cell fits and serves since 2026-07-29 (docs/backends.md).
+- **The [platform-rebuild](./platform-rebuild.md) plan** compiles SGLang 0.5.16
+  here and re-probes every model on its new image (its Phase 4). That replaces
+  this plan's Phase 4 re-probe on the old image.
+
+History: the pre-work evidence phase (Phase 0 below) was run, read-only, on
+2026-07-27, and its results are recorded here.
 
 ## Dependencies
 

@@ -23,7 +23,15 @@ of the existing router._
 
 ## Status
 
-**In Progress.** Phases 1, 1.5, and 2 shipped 2026-05-15.
+**Frozen** (2026-07-25; see the banner).
+
+- Phases 1, 1.5 and 2 are in `attic/cluster-mode/`, and they never worked end
+  to end: the Phase 1.5 preflight passed against a Python stub head, not a real
+  one.
+- Phase 3 never started.
+- `attic/cluster-mode/RESTORE.md` lists the 12 defects open at freeze time.
+
+History: Phases 1, 1.5, and 2 shipped 2026-05-15.
 
 Phase 1: `--mode` flag dispatch in `main.go`, `cluster_proto.go`,
 `cluster_auth.go`, `parse_minimal.go`, `cluster_worker.go`,

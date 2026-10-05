@@ -58,6 +58,11 @@ this file. It targets a probe grid that no longer exists.
   have none at all") has since been closed by the bench-sync loop; two
   SGLang rows are benched and current.
 
+**Note 2026-10-05:** the coverage above no longer holds. The bench cache now
+holds 6 rows, none of them for SGLang. The re-bench of 2026-09-27/28 was
+stopped, and the [platform-rebuild](./platform-rebuild.md) plan re-benches once,
+on its final images (its Phase 10). The code this plan delivered is unaffected.
+
 ### Known gap, deliberately not closed here
 
 Five vLLM rows classify as `complete (unstamped image -- cannot judge

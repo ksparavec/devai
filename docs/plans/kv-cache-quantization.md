@@ -27,7 +27,16 @@ _Bring KV-cache quantization to parity across all three backends, fix the fit-ma
 
 ## Status
 
-Draft. Not yet scheduled for execution.
+**Superseded** (see the banner above). Its substance shipped another way in
+July 2026:
+
+- KV is costed per backend (`scripts/select-models.py`, `KV_BYTES`,
+  `resolve_kv_dtype`).
+- Every probe cell is stamped with the KV dtype it was measured under, and the
+  router launches each tier with that dtype.
+
+Phase 2's global Ollama q8_0 default and Phase 3's `::kv=` request suffix were
+deliberately not built.
 
 ## Dependencies
 

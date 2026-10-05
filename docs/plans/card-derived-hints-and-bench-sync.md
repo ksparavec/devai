@@ -4,9 +4,17 @@ _Derive backend hints from checkpoint metadata instead of hand-curating them, an
 
 ## Status
 
-**In Progress.** Phases 1, 2, 3 and 4 shipped 2026-07-28 (Phase 5 shipped
+**Done.** Phases 1, 2, 3 and 4 shipped 2026-07-28 (Phase 5 shipped
 2026-07-26). Phase 4's `--sampling={harness,card}` deliverable is
 superseded rather than built -- see its Result section.
+
+Still open (checked against the code 2026-10-05):
+
+- Phase 3's `card` branch has never run end to end on a real model: no
+  uncurated model exists on this host.
+- The provenance fields it stamps into the probe caches (`tool_parser_source`,
+  `reasoning_parser_source`, `parser_disagreement`, `card_sampling`) are not
+  documented in docs/ or CLAUDE.md.
 
 ## Dependencies
 

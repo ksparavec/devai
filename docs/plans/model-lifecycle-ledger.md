@@ -6,7 +6,17 @@ catalog rows (download + probe) in one closed loop._
 
 ## Status
 
-In Progress (2026-06-23). All four open questions resolved (see "Decisions"
+**Done (unverified)** (checked against the code 2026-10-05). All 4 phases are in the code and
+unit-tested, but the live confirmation is still open:
+
+- The Gemma-4-31B-IT-NVFP4 scoped probe ran once and failed (`oom` in the
+  exclusion ledger). Its re-check with the `--enforce-eager` recovery flag
+  added since is not recorded.
+- No live `make model-sync` run is recorded.
+
+The ledger is nested per backend, not the flat shape drafted below.
+
+History: In Progress (2026-06-23). All four open questions resolved (see "Decisions"
 below). All 4 phases implemented + unit-tested; GPU-dependent confirmation
 (the Gemma-4-31B-IT-NVFP4 scoped probe, a live `make model-sync` run) is
 still pending on the host.

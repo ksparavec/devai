@@ -4,7 +4,12 @@ _Route different queries within a single chat session to different backends/mode
 
 ## Status
 
-Draft. Not yet scheduled for execution.
+Draft. Not yet scheduled for execution. Nothing is built (checked against the code 2026-10-05).
+
+- Phase 1 (single host) does not depend on cluster mode.
+- Phases 2-3 extend cluster mode (`cluster_head.go`, `routing_policy.go`), which
+  was frozen on 2026-07-25 and lives in `attic/cluster-mode/`. They cannot run
+  until it is restored.
 
 ## Dependencies
 

@@ -23,7 +23,13 @@ on-prem._
 
 ## Status
 
-**In Progress.** Phases 1 and 2 shipped 2026-05-15.
+**Frozen** (2026-07-25; see the banner).
+
+- Phase 1 and the Phase 2 code are in `attic/cluster-mode/`.
+- Phase 2 was never wired: its constructors had no callers.
+- Phase 3 never started.
+
+History: Phases 1 and 2 shipped 2026-05-15.
 
 Phase 1: `devai-skypilot-api-server` compose service (image pinned
 to `berkeleyskypilot/skypilot:0.12.1`, profile=cluster, port 46580,

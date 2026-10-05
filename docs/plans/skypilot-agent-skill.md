@@ -20,7 +20,14 @@ instructions._
 
 ## Status
 
-**In Progress.** Phase 1 (SkyPilot CLI install in the lab image)
+**Frozen** (2026-07-25; see the banner).
+
+- **Phase 1 is live:** the `sky` CLI is in the lab image, since 2026-09-27 in its
+  own venv `/opt/skypilot` from `requirements-skypilot.lock`. That replaced the
+  wheel pre-fetch described below, and `scripts/sky-setup.sh` is installed.
+- **Phase 2 (the plugin) never started.**
+
+History: Phase 1 (SkyPilot CLI install in the lab image)
 shipped 2026-05-15: Makefile fetch-cli SkyPilot wheel block,
 CACHE_BUILD_ARGS conditional wheel mount, Dockerfile.lab offline
 install via `uv pip install --offline --find-links`,

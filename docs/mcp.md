@@ -254,11 +254,9 @@ connect anonymously, so they need nothing.
 **The secrets path is unverified end-to-end.** Two known problems:
 
 1. Upstream's secret names are `github.personal_access_token` and
-   `firecrawl.api_key`. `deploy/mcp-secrets.sops.env.example` still
-   carries the older `GITHUB_TOKEN` / `FIRECRAWL_API_KEY` /
-   `HF_TOKEN` / `CONTEXT7_API_KEY` names, which do not match, and
-   whether the gateway accepts dotted keys from the `--secrets` env file
-   has not been tested here.
+   `firecrawl.api_key`, and `deploy/mcp-secrets.sops.env.example` uses
+   them (since 2026-07-26). Whether the gateway accepts dotted keys from
+   the `--secrets` env file has not been tested here.
 2. The sops/age scaffold itself is not functional on this host:
    `.sops.yaml` still carries the literal `age1xxxx...` placeholder
    recipient and no age key has been generated, so

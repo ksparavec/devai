@@ -4,7 +4,15 @@ _Answer model-independent Claude Code probe requests directly in the router (wit
 
 ## Status
 
-Draft. Not yet scheduled for execution.
+Draft. Not yet scheduled for execution (checked against the code 2026-10-05).
+
+- Phases 1-4 have not started.
+- Phase 5's goal is already met by another route: the router's model-store
+  mutation guard (`ollamaMutationPaths`, `makeMutationGuard`), shipped
+  2026-07-26 as a router fix. It differs from Phase 5 as written:
+  - it is always on (no `DEVAI_OLLAMA_GUARD` toggle);
+  - it is registered on every backend listener;
+  - it does not block `/api/blobs/`.
 
 ## Dependencies
 
