@@ -130,9 +130,9 @@ def draw() -> str:
     zone(20, 215, 1450, 665, "", "#FCFCF8", "#B9B08A")
     text(1456, 234, "devai-net", size=12, weight="bold", colour="#333", anchor="end")
     box(40, 240, 460, 100, "devai-operator  (image + container)", [
-        "web service: Apache + mod_wsgi, login over TLS",
-        "devai-control: runs registered actions for jobs",
-        "podman socket (its scripts); GPU when present (probes)"],
+        "web service: Apache + mod_wsgi, login over TLS; uid devai (keep-id)",
+        "devai-control: runs registered actions for jobs; the log follower",
+        "podman socket (scripts, log follower); GPU when present (probes)"],
         fill="#FDF6EC", stroke=ORANGE, width=2.2)
     box(620, 240, 640, 90, "devai-router  (own unprivileged container, small image)", [
         ":11434 ollama    :11435 vllm    :11436 sglang    :11438 laya-trainer",
@@ -142,7 +142,7 @@ def draw() -> str:
 
     # devai-slurm: all of Slurm and the bus, one image, one container
     zone(40, 360, 460, 470, "devai-slurm  (one image, one container)", "#F5F0FB", PURPLE)
-    text(54, 397, "--pid=host; GPU (NVML) if present; no podman socket", size=10.2, colour=PURPLE)
+    text(54, 397, "--pid=host; keep-id; GPU (NVML) if present; no podman socket", size=10.2, colour=PURPLE)
     cp = dict(fill="#EFE7F8", stroke=PURPLE)
     bus = dict(fill="#E3F3F3", stroke=TEAL)
     box(60, 410, 420, 42, "slurmrestd  :6820", ["REST API v0.0.42, auth/jwt  (Slurm 24.11, Debian)"], **cp)

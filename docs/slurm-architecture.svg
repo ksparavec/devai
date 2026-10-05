@@ -54,9 +54,9 @@
 <text x="1456" y="234" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="bold" fill="#333" text-anchor="end">devai-net</text>
 <rect x="40" y="240" width="460" height="100" rx="8" fill="#FDF6EC" stroke="#D98A1C" stroke-width="2.2"/>
 <text x="50" y="259" font-family="Helvetica, Arial, sans-serif" font-size="12.5" font-weight="bold" fill="#222" text-anchor="start">devai-operator  (image + container)</text>
-<text x="50" y="273.5" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">web service: Apache + mod_wsgi, login over TLS</text>
-<text x="50" y="288.0" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">devai-control: runs registered actions for jobs</text>
-<text x="50" y="302.5" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">podman socket (its scripts); GPU when present (probes)</text>
+<text x="50" y="273.5" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">web service: Apache + mod_wsgi, login over TLS; uid devai (keep-id)</text>
+<text x="50" y="288.0" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">devai-control: runs registered actions for jobs; the log follower</text>
+<text x="50" y="302.5" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">podman socket (scripts, log follower); GPU when present (probes)</text>
 <rect x="620" y="240" width="640" height="90" rx="8" fill="#FFF3DC" stroke="#D98A1C" stroke-width="2.2"/>
 <text x="630" y="259" font-family="Helvetica, Arial, sans-serif" font-size="12.5" font-weight="bold" fill="#222" text-anchor="start">devai-router  (own unprivileged container, small image)</text>
 <text x="630" y="273.5" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">:11434 ollama    :11435 vllm    :11436 sglang    :11438 laya-trainer</text>
@@ -64,7 +64,7 @@
 <text x="630" y="302.5" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">engine state from the bus; blocks engine control routes; no podman socket</text>
 <rect x="40" y="360" width="460" height="470" rx="12" fill="#F5F0FB" stroke="#7A52B3" stroke-width="1.4"/>
 <text x="54" y="380" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="bold" fill="#333" text-anchor="start">devai-slurm  (one image, one container)</text>
-<text x="54" y="397" font-family="Helvetica, Arial, sans-serif" font-size="10.2" font-weight="normal" fill="#7A52B3" text-anchor="start">--pid=host; GPU (NVML) if present; no podman socket</text>
+<text x="54" y="397" font-family="Helvetica, Arial, sans-serif" font-size="10.2" font-weight="normal" fill="#7A52B3" text-anchor="start">--pid=host; keep-id; GPU (NVML) if present; no podman socket</text>
 <rect x="60" y="410" width="420" height="42" rx="8" fill="#EFE7F8" stroke="#7A52B3" stroke-width="1.4"/>
 <text x="70" y="429" font-family="Helvetica, Arial, sans-serif" font-size="12.5" font-weight="bold" fill="#222" text-anchor="start">slurmrestd  :6820</text>
 <text x="70" y="443.5" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">REST API v0.0.42, auth/jwt  (Slurm 24.11, Debian)</text>
