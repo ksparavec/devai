@@ -104,11 +104,9 @@ found three more findings.
 
 | Plan                                                                | Status            |
 | ------------------------------------------------------------------- | ----------------- |
-| [mcp-gateway](./mcp-gateway.md)                                     | Partial (Phase 2 never worked); removed by platform-rebuild |
 | [model-lifecycle-ledger](./model-lifecycle-ledger.md)               | Done (unverified) |
 | [review-fixes-2026-07](./review-fixes-2026-07.md)                   | Done (unverified) |
 | [bench-rewrite](./bench-rewrite.md)                                 | **Done**          |
-| [kv-cache-quantization](./kv-cache-quantization.md)                 | Superseded        |
 | [card-derived-hints-and-bench-sync](./card-derived-hints-and-bench-sync.md) | **Done** (Phases 1-5 shipped) |
 | [sglang-backend-remediation](./sglang-backend-remediation.md)       | In Progress (Phases 0-3 shipped; Ph 4 partial) |
 | [router-anthropic-messages-compat](./router-anthropic-messages-compat.md) | **Done**      |
@@ -119,10 +117,6 @@ found three more findings.
 | [laya-trainer](./laya-trainer.md)                                   | In Progress       |
 | [library-service](./library-service.md)                             | Draft             |
 | [platform-rebuild](./platform-rebuild.md)                           | Draft             |
-| [sops-age-secrets](./sops-age-secrets.md)                           | Non-functional    |
-| [skypilot-agent-skill](./skypilot-agent-skill.md)                   | Frozen            |
-| [gpu-arbiter-cluster-mode](./gpu-arbiter-cluster-mode.md)           | **Frozen**        |
-| [skypilot-fleet-provisioner](./skypilot-fleet-provisioner.md)       | **Frozen**        |
 
 ## Defects found 2026-07-25/26 -- all closed
 

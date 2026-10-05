@@ -81,6 +81,9 @@ fixed, so a naive thaw restores broken code.
 
 ## The design plans
 
-The plans themselves stay in `docs/plans/` with a `Frozen` status
-rather than moving here -- they are still the design record, and
-`docs/plans/README.md` is the canonical status table.
+The plans (gpu-arbiter-cluster-mode, skypilot-fleet-provisioner,
+skypilot-agent-skill) were removed from `docs/plans/` on 2026-10-05: the
+platform rebuild replaces the launch layer they extend, and multi-host, if it
+comes, is built on Slurm. They remain the design record in git history:
+`git log --diff-filter=D -- docs/plans/gpu-arbiter-cluster-mode.md` finds the
+commit that removed them.

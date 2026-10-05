@@ -36,7 +36,7 @@ from this plan:
 ## Dependencies
 
 - None. This is a lab-image + picker change, the same shape as the
-  [skypilot-agent-skill](./skypilot-agent-skill.md) lab-image addition
+  skypilot-agent-skill (plan removed 2026-10-05) lab-image addition
   (bundle a CLI tool, wire it via the picker). It does not touch the Go
   router.
 
@@ -334,7 +334,7 @@ docs/ (router.md or a short note)            modify -- pi wiring + the /model co
   `openai-completions` / `openai-responses` / `anthropic-messages` /
   `google-generative-ai`; only `id` required per model; apiKey accepts a
   literal, env var, or `!command`).
-- [Plan: skypilot-agent-skill](./skypilot-agent-skill.md) -- prior art for
+- Plan: skypilot-agent-skill (plan removed 2026-10-05) -- prior art for
   bundling a CLI into the lab image via fetch-cli.
 - [Plan: router-fanout](./router-fanout.md) -- pi's multi-provider
   models.json is a natural client for it.

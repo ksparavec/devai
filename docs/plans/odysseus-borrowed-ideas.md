@@ -7,7 +7,7 @@
 >   a verified router defect), CB-4 (use-case-weighted sort key, roughly
 >   20 lines on top of scoring the picker already computes), and CB-1's
 >   KV-at-ctx term for `catalog-discover`'s weight-only VRAM estimate.
-> - **REJECTED, not merely deferred:** RT-2 (MCP write tools -- turns
+> - **REJECTED, not merely deferred** (and removed from this register on 2026-10-05): RT-2 (MCP write tools -- turns
 >   devai into a conversational fleet manager), RT-3 (fail-closed MCP tool
 >   policy -- hardening for a threat model a single-user loopback-only
 >   deployment does not have, and it exists only as RT-2's prerequisite),
@@ -85,12 +85,8 @@ promoting a feature to Accepted.
 | CB-1   | Analytic pre-probe fit/TPS/quality estimator                   | Cookbook | high   | med    | first-hand | KV-at-ctx term shipped 2026-07-26; rest Proposed |
 | CB-2   | Serve-error -> auto-fix retry loop (grows recovery-flags.json) | Cookbook | high   | med    | agent-read | Proposed |
 | CB-3   | Ingest vllm-project/recipes as authoritative launch config     | Cookbook | high   | med    | agent-read | Proposed |
-| RT-2   | Conversational model-mgmt MCP write tools                      | Router   | high   | med    | agent-read | Rejected 2026-07-25 |
-| RT-3   | Fail-closed tool policy for the MCP gateway                    | Router   | high   | med    | agent-read | Rejected 2026-07-25 |
-| CMP-1  | Blind A/B human-preference duel + PREF% picker column          | Compare  | high   | med    | first-hand | Rejected 2026-07-25 |
 | RT-4   | Foreground-priority gate (background jobs yield)               | Router   | high   | med    | agent-read | Proposed |
 | RT-5   | Consolidated /health/all readout + external-GPU scan           | Router   | med-hi | med    | agent-read | Proposed |
-| CMP-2  | LLM-as-judge pairwise scoring as a bench task                  | Compare  | high   | high   | agent-read | Rejected 2026-07-25 |
 | CB-4   | Use-case-weighted ranking presets over bench columns           | Cookbook | med    | low    | first-hand | **Shipped 2026-07-26** |
 | RT-6   | Readiness probe distinct from liveness                         | Router   | med    | low    | agent-read | Proposed |
 
@@ -100,9 +96,9 @@ promoting a feature to Accepted.
   exposing serve/download/stop tools without a policy gate is a privilege
   escalation. RT-3 is a hard prerequisite.
 - CB-1 (estimator) feeds an optional predicted-TPS tiebreak into
-  [Plan: gpu-arbiter-cluster-mode](./gpu-arbiter-cluster-mode.md)'s
+  Plan: gpu-arbiter-cluster-mode (plan removed 2026-10-05)'s
   `routing_policy.go`, and a hypothetical-GPU sizing input into
-  [Plan: skypilot-fleet-provisioner](./skypilot-fleet-provisioner.md). Both
+  Plan: skypilot-fleet-provisioner (plan removed 2026-10-05). Both
   are optional wire-ups, not blockers.
 - CB-2 (serve-error diagnosis) and CB-3 (recipe ingestion) both write into the
   existing `deploy/recovery-flags.json` + `scripts/model-families.yaml`
@@ -361,123 +357,6 @@ so the composite never hides the underlying numbers.
 
 ---
 
-## Compare features
-
-### CMP-1 -- Blind A/B human-preference duel + PREF% picker column
-
-- **Status:** Rejected 2026-07-25 (see the triage note at the top).
-- **Value / Effort:** high / medium
-- **Verification:** first-hand (read `routes/compare_routes.py` in full)
-- **Depends on:** bench-cache schema conventions (bench-rewrite)
-
-**What odysseus does.** Compare runs one prompt against N (model, endpoint)
-pairs in side-by-side panes, randomizes them into neutral "Model A" / "Model
-B" slots, WITHHOLDS identities from both the API response and the session
-names, and reveals only AFTER the human votes. Each pane captures TTFT /
-tok-s / cost with a "Fastest" badge; votes persist and a Scoreboard aggregates
-per-model Win% / W-L-T / avg-cost. Confirmed detail: their server-side winner
-table is WRITE-ONLY -- `/vote` records a winner but nothing reads it back into
-a ranking, a loop devai can close properly.
-Source: `routes/compare_routes.py:70-318`, `static/js/compare/*`.
-
-**devai gap.** devai has only an offline OBJECTIVE bench (gsm8k / humaneval /
-tools / leak). It cannot capture subjective human quality preference (tone,
-instruction-following, code taste) between two locally-served models -- exactly
-the axis exact-match scoring cannot measure -- and has no bias-controlled way
-for an operator to judge their own fleet.
-
-**Proposed change.** Add `make compare PROMPT=... A=<name>@<ctx>
-B=<name>@<ctx>` (and a picker multi-select action) that hits the router ports,
-prints "Response A" / "Response B" under a RANDOM per-duel A<->B mapping, takes
-an A/B/tie vote, then reveals. Because of GPU mutual exclusion the duel runs
-SEQUENTIALLY (serve A -> capture -> swap -> serve B -> vote); true-parallel
-only across cluster workers. Print a per-response footer (TTFT / tok-s /
-peak-VRAM + fastest badge) reusing router/bench metrics. Persist votes to
-`deploy/.compare-cache.json` (same `_meta.host_env_id` stamping as
-`.bench-cache.json`), add a PREF% (Wilson lower-bound or win-rate) column +
-sort mode to `model-picker.py`, and a `make compare-report`. Support `RANDOM=1`
-to auto-draw two fitting, non-ledger-excluded rows.
-
-**Deliverables.**
-```
-scripts/compare/compare_runner.py  new    -- sequential duel driver over router ports
-deploy/.compare-cache.json         data   -- preference ledger (gitignored, host_env stamped)
-scripts/model-picker.py            modify -- PREF% column + sort mode
-scripts/compare/compare_report.py  new    -- `make compare-report` leaderboard
-Makefile                           modify -- compare / compare-report targets
-```
-
-**Exit criteria.**
-- A duel serves A, captures, swaps to B, captures, presents blind, records a
-  vote, and reveals identities only after the vote.
-- Left/right (A/B) mapping is randomized per duel and never leaks before the
-  vote (mirrors odysseus issue #1285's fix -- neutral slot names).
-- Votes accumulate in `.compare-cache.json`; PREF% renders in the picker and
-  `make compare-report` prints a per-model win-rate leaderboard.
-
-**Risks / notes.** The GPU-exclusion swap makes a duel slow (two cold starts
-possible); document that up front and reuse keep-warm where the two models
-share a backend. Human samples are small -- use a Wilson lower bound, not raw
-win%, and mark PREF% ADVISORY so it never becomes a hard picker filter.
-
-### CMP-2 -- LLM-as-judge pairwise scoring as a bench task
-
-- **Status:** Rejected 2026-07-25 (see the triage note at the top).
-- **Value / Effort:** high / high
-- **Verification:** agent-read (`routes/skills_routes.py:778-943`,
-  `services/memory/memory_extractor.py:487-659`,
-  `static/js/compare/index.js:761-869`)
-- **Depends on:** CMP-1 (prompt corpus) + a populated leaderboard
-
-**What odysseus does.** `skills_routes._audit_one_skill` runs a
-test -> judge -> fix -> retry loop: a student model runs a synthesized task,
-an LLM judge emits pass/fail, on fail the artifact self-edits, and a distinct
-stronger TEACHER rewrites it while the student re-runs (proving the student can
-now succeed) before demoting to draft. `memory_extractor.audit_memories` wraps
-LLM curation in a fingerprint short-circuit (skip if unchanged) and a "refuse
-if the model returned <50% of the entries" over-deletion tripwire.
-
-**devai gap.** All devai bench tasks are objective/deterministic; there is no
-signal for open-ended answer quality (chat, reasoning prose, code taste), no
-teacher/student pairing, and no self-validation of machine-generated artifacts
-(recovery-flags entries and future runbooks are hand-curated). This is the
-CORRECT reinterpretation of odysseus's "synthesis" for a serving lab -- NOT
-odysseus's search-summary feature, which is out of scope.
-
-**Proposed change.** Add a `pairwise_judge` task to
-`scripts/bench/bench_runner.py`: for a curated prompt set, generate each
-model's answer via the router, then run a judge model (through the same
-router, GPU-exclusion-serialized) with a rubric prompt returning A|B|tie,
-POSITION-SWAPPED and averaged to cancel order bias, storing a win matrix per
-(ctx, host_env_id) under a new `.bench-cache.json` tasks subset. Pick judge /
-teacher and student EMPIRICALLY from the leaderboard (highest CODE% / TOTAL%
-fitting model = judge). Optionally extend to a teacher/student loop that
-promotes an auto-generated recovery-flags entry draft -> published only on
-student success. Wrap any LLM curation with fingerprint-short-circuit +
-"refuse if >X% rows removed" rails. Gate judge output as ADVISORY (like the
-leak caveat) -- LLM-judge verdicts are noisy and self-preferential -- never a
-hard exclusion input.
-
-**Deliverables.**
-```
-scripts/bench/bench_runner.py      modify -- pairwise_judge task (position-swapped)
-scripts/bench/_bench_core.py       modify -- win-matrix storage in the tasks subset
-scripts/bench/bench_report.py      modify -- render judge win-matrix (advisory-flagged)
-```
-
-**Exit criteria.**
-- `pairwise_judge` produces an A|B|tie verdict per prompt, averaged over both
-  position orderings, stored per (ctx, host_env_id).
-- The judge is auto-selected from the leaderboard, not hardcoded.
-- Judge results render as ADVISORY and never feed the exclusion ledger or a
-  hard picker filter.
-
-**Risks / notes.** LLM judges are self-preferential and order-biased -- the
-position swap is mandatory, and the output must stay advisory. High effort:
-this is the last item to schedule, and only after CMP-1 has a prompt corpus.
-
----
-
 ## Router / agent-surface features
 
 ### RT-1 -- SSE keepalive heartbeat during cold-start
@@ -543,118 +422,6 @@ subsequent launch failure can no longer return a 5xx; it must emit an in-band
 SSE `error` event instead. Gate the whole behaviour on `stream:true` (the
 router already parses the body for `maybeStripTools`), so non-streaming
 requests keep their proper HTTP error status.
-
-### RT-2 -- Conversational model-management MCP write tools
-
-- **Status:** Rejected 2026-07-25 (see the triage note at the top).
-- **Value / Effort:** high / medium
-- **Verification:** agent-read (`src/tools/cookbook.py:190-233,420-600,1217-1341`,
-  `src/agent_tools/model_interaction_tools.py:20-210`)
-- **Depends on:** **RT-3 (hard prerequisite -- do not ship write tools without
-  the policy gate)**
-
-**What odysseus does.** `src/tools/cookbook.py` is a full agent tool suite:
-`do_download_model`, `do_serve_model` (auto-registers an OpenAI endpoint so
-the model is instantly routable), `do_stop`/`tail`/`list_served`,
-`do_serve_preset`, `do_search_hf`. `model_interaction_tools` adds
-`chat_with_model` and `ask_teacher` ("auto" -> a configured teacher model with
-a senior-mentor system prompt) routed through one endpoint resolver. Presets
-live as named `{model, host, port, cmd}` the agent launches by name.
-
-**devai gap.** devai's only MCP surface (`devai-model-status`) is strictly
-READ-ONLY. An external agent cannot download, serve, stop, tail, or benchmark
-a model conversationally, nor escalate to a stronger model -- the exact
-natural-language fleet management devai's "external agents point at the router"
-thesis is positioned for but does not expose. This is the single biggest
-capability gap for that thesis.
-
-**Proposed change.** Extend `devai-tools/cmd/devai-mcp-modelstatus` with WRITE
-tools that shell out to existing surfaces: `pull_model` (`make model-pull
-NAME=`), `serve_model` (an `@ctx` request to the router port, returns the
-endpoint), `stop_model`, `tail_backend_log` (`make logs SERVICE=`),
-`run_bench` (`make bench`), plus `ask_teacher` that auto-selects the
-highest-TOTAL% / largest-fitting model from the probe+bench caches (reuse
-`devai-tools/internal/modelcache`). Support named launch presets via a
-`presets:` block in `~/.devai/preferences.yaml` that materialize a canonical
-`<name>::<reasoning>@<ctx>` string. Gate EVERY write tool behind the
-admin/allowlist check from RT-3, under the gateway's existing
-`--block-secrets`/`no-new-privileges`.
-
-**Deliverables.**
-```
-devai-tools/cmd/devai-mcp-modelstatus/  modify -- add pull/serve/stop/tail/bench/ask_teacher tools
-devai-tools/internal/modelcache/        reuse  -- teacher auto-select from bench cache
-~/.devai/preferences.yaml               data   -- optional presets: block
-docs/mcp-model-status.md                modify -- document the new write tools + policy gating
-```
-
-**Exit criteria.**
-- An MCP-aware agent can, in one conversation, pull a model, serve it, get the
-  endpoint back, chat through it, and stop it -- all through the gateway.
-- Every write tool is refused for a non-admin/unallowlisted caller (RT-3), with
-  a single-user fast-path.
-- Read tools (`list_fitting_models`, `get_model_bench`, `get_router_status`)
-  are unchanged.
-
-**Risks / notes.** This is a privilege surface. It MUST NOT ship before RT-3.
-`serve_model` under GPU mutual exclusion will evict whatever is warm -- pair
-with RT-4 so a conversational serve does not stomp an interactive session
-unless the caller is foreground.
-
-### RT-3 -- Fail-closed tool policy for the MCP gateway
-
-- **Status:** Rejected 2026-07-25 (see the triage note at the top).
-- **Value / Effort:** high / medium
-- **Verification:** agent-read (`src/tool_security.py`,
-  `src/task_action_policy.py`, `src/task_scheduler.py:828-848`,
-  `src/mcp_manager.py:46-132`)
-- **Depends on:** none (prerequisite FOR RT-2)
-
-**What odysseus does.** `tool_security` maintains a blocked set (bash / python
-/ write_file / serve / download / manage_*) and fails CLOSED -- a malformed or
-unknown tool name is treated as blocked. Plan mode inverts an allowlist
-THROUGH the denylist so a newly-added or import-failed tool defaults to
-BLOCKED. `task_action_policy` classifies money-spending / infra actions as
-admin-only and the scheduler PAUSES (not runs) a non-admin task that hits one.
-`mcp_manager` sanitizes untrusted tool schemas and classifies each tool
-read-only vs write, failing closed on ambiguity.
-
-**devai gap.** The gateway runs with `--block-secrets`/`no-new-privileges` but
-has NO per-tool policy: any MCP-aware agent can call any exposed tool
-(including shell / filesystem-write / serve / provision) at full privilege.
-There is no read-only allowlist, no fail-closed on unknown tool names, and no
-privilege gate on money-spending actions (SkyPilot launch,
-container-recreate-for-download, serve).
-
-**Proposed change.** Add a gateway-side (or router pre-filter) tool policy to
-`deploy/mcp-servers.yaml` / the gateway config: default-deny a static set
-(shell / filesystem-write / model-serve / provisioning), require an explicit
-per-caller allowlist, and FAIL CLOSED on unknown/malformed names
-(allowlist-through-denylist, so a new server's tools are blocked until
-classified). Add a per-tool `readOnly` annotation (devai-model-status read
-tools pass; RT-2's write tools are admin-only). Classify router/head
-infra-spend actions (SkyPilot launch, download-recreate, serve) as privileged
-and REFUSE -- not silently run -- when unauthorized, with a single-user
-fast-path.
-
-**Deliverables.**
-```
-deploy/mcp-servers.yaml            modify -- per-tool readOnly + denylist annotations
-deploy/mcp-gateway.env             modify -- policy toggle + single-user fast-path
-docs/mcp.md                        modify -- document the policy + fail-closed semantics
-tests/test-mcp.sh                  modify -- assert an unknown tool name is blocked
-```
-
-**Exit criteria.**
-- A tool name not in the classification defaults to BLOCKED.
-- Read tools pass; shell/write/serve/provision tools are refused without
-  explicit allowlisting.
-- A single-user install has a fast-path that keeps the current behaviour
-  ergonomic while still failing closed on unknowns.
-
-**Risks / notes.** Over-blocking breaks Phase 1 Tier-1 servers if the default
-denylist is too broad; classify the existing 10+4 servers explicitly so the
-default policy is a no-op for them and only bites new/unknown tools.
 
 ### RT-4 -- Foreground-priority gate (background jobs yield)
 
@@ -852,7 +619,9 @@ message-inspection, no own agent loop) or fall outside the user's scope
 - 2026-10-05 -- Statuses checked against the code; the dashboard and the
   per-feature Status lines updated to match. RT-5 and RT-6 overlap with the
   platform-rebuild plan's Phase 9, which rewrites the router's `/health` from
-  its GPU record.
+  its GPU record. RT-2, RT-3, CMP-1 and CMP-2 removed from the register:
+  rejected, and the platform rebuild drops the MCP gateway RT-2 and RT-3
+  build on.
 
 ## References
 

@@ -7,13 +7,14 @@ _Route different queries within a single chat session to different backends/mode
 Draft. Not yet scheduled for execution. Nothing is built (checked against the code 2026-10-05).
 
 - Phase 1 (single host) does not depend on cluster mode.
-- Phases 2-3 extend cluster mode (`cluster_head.go`, `routing_policy.go`), which
-  was frozen on 2026-07-25 and lives in `attic/cluster-mode/`. They cannot run
-  until it is restored.
+- **Dropped 2026-10-05:** Phase 2 (cluster-mode demux), Phase 3 (broadcast) and
+  Phase 4's streamed broadcast. They extend the frozen cluster mode, and on one
+  GPU a broadcast is refused. Multi-host, if it comes, is built on Slurm (the
+  platform-rebuild plan).
 
 ## Dependencies
 
-- [Plan: gpu-arbiter-cluster-mode](./gpu-arbiter-cluster-mode.md) Phase 2
+- Plan: gpu-arbiter-cluster-mode (plan removed 2026-10-05) Phase 2
   (head mode + `routing_policy.go` + `cluster_proxy.go`) -- required for
   the concurrent-demux and broadcast phases. The cluster-first design
   centre lives on the head; without it, fanout degrades to serialized
@@ -236,113 +237,6 @@ docs/router.md                modify -- cross-link the fanout surface and note i
 
 ---
 
-## Phase 2 -- cluster-mode demux (concurrent)
-
-### Goal
-
-Make demux first-class on the cluster head, where lanes serve
-concurrently across workers -- the cluster-first payoff. Depends on
-cluster-mode Phase 2 (head).
-
-### Deliverables
-
-```
-gpu-arbiter/cluster_head.go   modify -- run ResolveTargets in the frontend handler before RouteDecision
-gpu-arbiter/routing_policy.go modify -- accept lane constraints (backend/model/gpu-type) as routing inputs
-gpu-arbiter/fanout.go         modify -- map a Target to worker-selection constraints
-docs/fanout.md                modify -- cluster behaviour section
-docs/cluster-mode.md          modify -- cross-link fanout as a steering layer over the 4-tier policy
-```
-
-### Detailed steps
-
-1. In the head frontend handler (which today calls `ParseMinimal` then
-   `RouteDecision`), call `ResolveTargets` first. A resolved Target
-   becomes constraints fed into `routing_policy.go`: the lane pins the
-   model (and optionally a `gpu_type` preference), and the existing 4-tier
-   scorer picks the best matching worker. An `@@<model>` ad-hoc directive
-   pins the model the same way a normal request would.
-2. Because lanes live on different workers, two slots (foreground/code,
-   background/chat) routed to two workers serve **concurrently** -- no GPU
-   mutex between them. This is the behaviour single mode cannot offer.
-3. Keep single-mode dispatch (Phase 1) unchanged; the resolver is shared,
-   only the dispatcher differs by mode.
-
-### Exit criteria
-
-- On a head with two registered workers advertising the two lane models,
-  alternating requests to the two lanes route to the two workers and do
-  not serialize (verified in the cluster preflight harness or a head unit
-  test with stub workers).
-- `routing_policy.go` lane-constrained scoring is unit-tested
-  (`routing_policy_test.go`).
-
-### Phase 2 risks
-
-| Risk                                          | Mitigation                                                  |
-| --------------------------------------------- | ----------------------------------------------------------- |
-| Lane model not present on any worker          | 4-tier policy already handles "right-model-too-small / different-model"; return its existing structured no-worker error |
-| Coupling fanout tightly to head internals     | Resolver stays pure and mode-agnostic; only the thin dispatcher touches head code |
-
----
-
-## Phase 3 -- broadcast (@@all)
-
-### Goal
-
-`@@all` (and `@@<lane1>,<lane2>`) sends one prompt to multiple lanes and
-returns an aggregated response. Concurrent in head mode; refused or
-serialized in single mode per the GPU-mutex policy.
-
-### Deliverables
-
-```
-gpu-arbiter/fanout.go         modify -- ResolveTargets returns >1 Target for broadcast directives
-gpu-arbiter/fanout_broadcast.go new  -- fan-out dispatch (concurrent in head, serialized/refused in single) + aggregation
-gpu-arbiter/fanout_broadcast_test.go new -- aggregation golden tests (labeled + choices)
-deploy/fanout-lanes.yaml      modify -- broadcast: { lanes, aggregate, judge_lane }
-docs/fanout.md                modify -- broadcast section + single-mode caveat
-```
-
-### Detailed steps
-
-1. Resolver: `@@all` -> the configured `broadcast.lanes`;
-   `@@a,b` -> the named subset. Return a multi-Target result.
-2. Dispatcher:
-   - Head mode: issue the N upstream requests concurrently
-     (`errgroup`-style), each through `cluster_proxy.go`, collect results.
-   - Single mode: if all lanes are coexist-capable, serialize; otherwise
-     refuse with a 400 (open question 3). Never silently take minutes.
-   - Broadcast is **non-streaming first** (`stream:false` enforced;
-     streamed broadcast deferred to Phase 4).
-3. Aggregation (`aggregate` config):
-   - `labeled` (default): one response whose content is lane-headed
-     sections (`=== code (vllm/gpt-oss-20b) ===\n...`). Works for both
-     OpenAI and Anthropic shapes.
-   - `choices`: OpenAI-only; return N `choices[]`, one per lane.
-   - `judge`: send the N answers to `judge_lane` for a synthesized pick
-     (optional; quality not a goal here).
-4. Tag each section/choice with its lane so the user knows the source.
-
-### Exit criteria
-
-- `@@all` in head mode returns all lane answers, labeled, with the
-  upstream calls issued concurrently (asserted via stub-worker timing or
-  call-count in a head test).
-- Single-mode `@@all` either serializes (coexist-capable lanes) or returns
-  the documented 400.
-- Aggregation output matches golden fixtures for `labeled` and `choices`.
-
-### Phase 3 risks
-
-| Risk                                            | Mitigation                                                        |
-| ----------------------------------------------- | ----------------------------------------------------------------- |
-| One lane errors or times out mid-broadcast      | Per-lane error captured into its section; partial results returned, not a whole-request failure |
-| Single-mode broadcast surprises with minutes-long latency | Refuse-by-default policy (open question 3); explicit operator override flag |
-| Aggregation wire-format incorrectness           | Golden tests for both formats; non-streaming only in this phase   |
-
----
-
 ## Phase 4 -- polish (optional)
 
 ### Goal
@@ -354,11 +248,9 @@ Lower-priority refinements, each independently skippable.
 1. **Stickiness**: scan the resent message history for the most recent
    `@@<lane>` directive and apply it when the current message has none --
    stateless (history is resent by the client) yet sticky-feeling.
-2. **Streamed broadcast**: interleave or sequentially stream lane outputs
-   with lane separators over one SSE connection.
-3. **Ollama-native + multimodal surfaces**: extend directive extraction to
+2. **Ollama-native + multimodal surfaces**: extend directive extraction to
    `/api/chat` and to text parts inside multimodal content arrays.
-4. **Explicitly-deferred classifier hook**: a clearly opt-in, heuristic-
+3. **Explicitly-deferred classifier hook**: a clearly opt-in, heuristic-
    first (keyword) auto-lane for prefix-less, default-bound requests --
    gated behind its own env, never overriding an explicit signal. Flagged
    here only so a future contributor sees it was considered and parked,
@@ -403,7 +295,7 @@ Lower-priority refinements, each independently skippable.
 
 ## References
 
-- [Plan: gpu-arbiter-cluster-mode](./gpu-arbiter-cluster-mode.md) -- the
+- Plan: gpu-arbiter-cluster-mode (plan removed 2026-10-05) -- the
   head routing this builds on (`parse_minimal.go`, `routing_policy.go`,
   `cluster_proxy.go`).
 - [Plan: router-shortcircuit](./router-shortcircuit.md) -- shares the

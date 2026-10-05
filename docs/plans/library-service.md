@@ -36,7 +36,7 @@ Given in devai's session unless marked otherwise.
 | D22 | **Blogs are selected, not crawled.** A blog qualifies when it strictly covers the topics and its author also publishes cited articles or implements algorithms on the platforms above (ideally both). |
 | D23 | **The first acceptance test:** the topic "Automatic Adjoint Differentiation method in computational finance". Not arXiv only: other sources are used where feasible. |
 | D24 | **The embedding model gets its own volume**: a new store, `/var/cache/devai/embed`, on its own LV (per the mount-point convention), filled only through `scripts/select-models.py` from a pinned catalog row in a new `deploy/embed-models.yaml`. |
-| D25 | **Other paths to the sources stay open.** The lab can reach arXiv and other sources directly (through pipelock, the MCP gateway's arXiv, Wikipedia and fetch servers, and trusted harnesses on devai-net); the shared per-operator budget is accepted and documented, and nothing is closed. |
+| D25 | **Other paths to the sources stay open.** The lab can reach arXiv and other sources directly (through pipelock, and trusted harnesses on devai-net; the MCP gateway's servers went with the gateway, platform-rebuild M10); the shared per-operator budget is accepted and documented, and nothing is closed. |
 | D26 | **GROBID** is used for PDFs without arXiv HTML (about 4 GB of RAM, its own container). |
 | D27 | **The anonymous arXiv PDF mirror** (Cornell's public GCS bucket) is checked in Phase 1 and used only if its terms and robots.txt allow automated downloads. |
 | D28 | **Revoked items keep their artifacts for 30 days** in `trash/`, then lose them: a stated exception to D12, as a safety net against a faulty client. |
@@ -53,7 +53,6 @@ Given in devai's session unless marked otherwise.
   - an OpenAlex API key: optional, raises the daily budget from $0.10 to $1 (Phase 2);
   - a GitHub fine-grained token (Phase 4); a Hugging Face token (Phase 4); a Semantic Scholar key, requested only when Phase 5 starts because unused keys are pruned after about 60 days; an OpenReview service account (Phase 5);
   - contacting arXiv before the library passes about 1,000 full-text downloads ("Politeness engine").
-- **The sops/age secret scaffold** (`docs/secrets.md`, status Non-functional). The library is its first working consumer: from Phase 2 when an OpenAlex key exists, otherwise from Phase 4.
 - **pipelock** (`docs/pipelock.md`): the service's outbound traffic goes through it for DLP.
 - **The lab launchers** (`bin/devai-agent`, the Makefile), which gain an optional read-only `/library` mount.
 
@@ -103,7 +102,7 @@ Researched from the providers' own documentation, terms and robots.txt files, th
 
 - **`devai-library`**: the service. Python 3.14 (the base image's), a stdlib HTTP server and worker threads in the laya trainer's style, hash-locked dependencies with permissive licences only: `protego` (BSD), `lxml` (BSD), `onnxruntime` (MIT), `tokenizers` (Apache), SQLite (public domain), and a language detector whose model ships inside the package (for example `lingua-language-detector`, Apache-2.0; the choice and licence are confirmed in Phase 1), since the download rule forbids fetching models at run time. No AGPL or GPL code: no PyMuPDF, poppler or pandoc. It never parses a fetched PDF or HTML page itself.
 - **`devai-library-extract`**: the extractor. It turns PDF and HTML bytes into units: `pypdfium2` (Apache/BSD) and `pypdf` (BSD) for PDFs, `lxml` for HTML. It has no secrets, no mount of the store and no network except an internal one; bytes come in over HTTP and JSON goes out, and the service validates the JSON before writing anything.
-- **`devai-grobid`**: GROBID (Apache-2.0), the CRF image, for PDF structure (sections, paragraphs, formulas, references with DOI and arXiv ids, page coordinates). About 4 GB of RAM. Called with `consolidateHeader=0` and `consolidateCitations=0`, so it never contacts CrossRef or anything else.
+- **`devai-grobid`**: GROBID (Apache-2.0), for PDF structure (sections, paragraphs, formulas, references with DOI and arXiv ids, page coordinates). About 4 GB of RAM. Called with `consolidateHeader=0` and `consolidateCitations=0`, so it never contacts CrossRef or anything else.
 - **The embedding model**: `bge-small-en-v1.5` (MIT, 384 dimensions, 512-token input), run with ONNX Runtime on the CPU inside the service. Downloaded only through `scripts/select-models.py`, from a pinned catalog row, into its own store (D24).
 
 None of them is a router backend: none needs the GPU, so the router's GPU exclusivity does not apply.
@@ -264,7 +263,7 @@ Also agreed with aiagent: fetch keys `arxiv:`, `doi:` and `ssrn:` (an `ssrn:` ke
 **Deliverables:**
 - The OpenAlex adapter: discovery (structural filters where they fit, text matching priced as search), open-access locations, `cited_by_count` and citing works, advisory author metrics with provenance (source, as-of date, match method), the dollar budget; `POST /v1/enrichments` and `GET /v1/candidates/{id}`.
 - Unpaywall by DOI. Fetchable link records for open-access PDFs on allowed hosts (each host added to `library-sources.yaml` with its own robots and limits); "known, not held" link records otherwise, SSRN included (D8).
-- The secret path, if an OpenAlex key exists: sops/age, tmpfs, mounted into `devai-library` only, the per-pattern DLP exemption for OpenAlex's host. Without a key, Phases 2-3 run keyless at $0.10/day, and the acceptance test is sized to that.
+- The secret path, if an OpenAlex key exists: mounted into `devai-library` only, the per-pattern DLP exemption for OpenAlex's host. Without a key, Phases 2-3 run keyless at $0.10/day, and the acceptance test is sized to that.
 - The keyword and vector indexes, library search; the embedding model's store (D24: `/var/cache/devai/embed` on its own LV, set up with `deploy/setup-logs-volume.sh`), its catalog row in `deploy/embed-models.yaml` and its pull through `scripts/select-models.py`.
 - The rebuild command: delete `index/` and rebuild it from the plain files.
 
@@ -312,7 +311,7 @@ None for the owner: the plan's five open questions were answered on 2026-09-26 (
 | Author metrics wrong (split or merged profiles). | 2 | Advisory only, with source, as-of date and match method (O5). |
 | Millions of files slow the tools. | 1 | Two-level fan-out, measured in the layout test; indexes derived. |
 | Licence contamination of the service. | 1 | Permissive dependencies only. |
-| Credentials leaking into the lab. | 2, 4, 5 | Secrets only in `devai-library`, from tmpfs; never in the library directory. |
+| Credentials leaking into the lab. | 2, 4, 5 | Secrets only in `devai-library`; never in the library directory. |
 
 ## Estimated effort
 

@@ -83,7 +83,7 @@ already covers parts of Phase 1, 4, 5, 6 and 8.
   `devai-model-status` MCP tool agree with each other, which is a precondition
   for trusting model selection at all.
 - Unblocks honest advertisement of cluster mode
-  ([Plan: gpu-arbiter-cluster-mode](./gpu-arbiter-cluster-mode.md)), whose
+  (Plan: gpu-arbiter-cluster-mode (plan removed 2026-10-05)), whose
   head-mode request serving was a 503 placeholder at `57c4052`. Resolved
   by open question 1 below: it is now wired to the single-host chain.
 - Removes the probe/bench cache corruption paths that
@@ -106,7 +106,7 @@ already covers parts of Phase 1, 4, 5, 6 and 8.
 
 1. **Phase 6, head-mode serving.** Wire `/v1/cluster/inbound` into the
    single-host chain, or correct `CLAUDE.md` and
-   [docs/cluster-mode.md](../cluster-mode.md) to say it is unimplemented?
+   docs/cluster-mode.md (now attic/cluster-mode/docs/cluster-mode.md) to say it is unimplemented?
    The current state -- advertised as shipped, returns 503 -- is the only
    option that is not acceptable. Cost differs by roughly a day.
 
@@ -509,7 +509,7 @@ recommended minimum scope if the work has to be cut short.
   local-only; regenerate with a full-repo review at `57c4052` if lost)
 - Prior review, all findings resolved in `6cacc14`:
   `.claude/PRPs/reviews/local-2026-05-13-review.md`
-- [Plan: gpu-arbiter-cluster-mode](./gpu-arbiter-cluster-mode.md) -- Phase 6 here
+- Plan: gpu-arbiter-cluster-mode (plan removed 2026-10-05) -- Phase 6 here
   corrects its head-mode serving gap
 - [Plan: bench-rewrite](./bench-rewrite.md) -- Phase 4 here fixes readers of the
   schema it defines

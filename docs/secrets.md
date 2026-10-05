@@ -26,8 +26,8 @@ podman `file`/`pass` drivers (per-runtime coupling), systemd-creds
 (host-specific, harder to share across hosts), Vault / OpenBao (runs a
 service, overkill for single-user lab).
 
-Full rationale: `docs/plans/sops-age-secrets.md` "Confirmed decisions"
-item 1.
+Full rationale: the sops-age-secrets plan's "Confirmed decisions" item 1
+(removed 2026-10-05; in git history: `git log --diff-filter=D -- docs/plans/sops-age-secrets.md` finds the commit).
 
 ## One-time setup
 
@@ -171,8 +171,8 @@ Each of these wraps the age private key in additional protection:
 - **YubiKey**: FIDO2-protected age plugin (`age-plugin-yubikey`) keeps
   the private key on hardware that can't be exfiltrated by malware.
 
-Documented as a known gap, not built in v1. Per
-`docs/plans/sops-age-secrets.md` item: "TPM / YubiKey / systemd-creds
+Documented as a known gap, not built in v1. Per the sops-age-secrets plan
+(removed 2026-10-05, in git history): "TPM / YubiKey / systemd-creds
 wrapping of the age private key. Noted as a 'paranoid mode' follow-up
 in the docs but not built here."
 

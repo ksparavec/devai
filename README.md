@@ -427,7 +427,7 @@ What moved: 22 Go files (11 source + 11 test, each now carrying a `//go:build de
 
 `gpu-arbiter` still accepts `--mode`, but any value other than `single` now exits with a pointer to the attic. Read [`attic/README.md`](attic/README.md) for why it was frozen, and `attic/cluster-mode/RESTORE.md` for the defects that were open at freeze time before attempting a thaw -- a naive thaw restores broken code.
 
-The design plans stay in `docs/plans/` with a frozen status; they are still the design record.
+The design plans were removed from `docs/plans/` on 2026-10-05; they are in git history.
 
 ## GPU Support
 

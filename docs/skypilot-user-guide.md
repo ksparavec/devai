@@ -10,13 +10,10 @@ agents drive the `sky` CLI as an ordinary command-line tool. No
 [SkyPilot Agent Skill](https://blog.skypilot.co/agent-skill/) plugin is
 installed (see "Driving SkyPilot from an AI agent" below).
 
-This is the user-facing reference. The architecture rationale and
-phase split live in
-[docs/plans/skypilot-agent-skill.md](plans/skypilot-agent-skill.md).
-The system-side fleet provisioner (gpu-arbiter cloud-burst) is the
-**sibling** plan
-[docs/plans/skypilot-fleet-provisioner.md](plans/skypilot-fleet-provisioner.md);
-this guide is independent of it.
+This is the user-facing reference. Its plan (skypilot-agent-skill) and the
+sibling system-side fleet provisioner plan were removed on 2026-10-05; both
+are in git history. The fleet provisioner's code is frozen in
+`attic/cluster-mode/`; this guide is independent of it.
 
 ## What you get
 
@@ -174,9 +171,6 @@ back into the lab's environment.
 
 ## References
 
-- Plan: [docs/plans/skypilot-agent-skill.md](plans/skypilot-agent-skill.md)
-- Sibling system-side plan:
-  [docs/plans/skypilot-fleet-provisioner.md](plans/skypilot-fleet-provisioner.md)
 - SkyPilot docs: docs.skypilot.co
 - SkyPilot GitHub: github.com/skypilot-org/skypilot
 - Agent Skill: blog.skypilot.co/agent-skill/

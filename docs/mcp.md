@@ -10,9 +10,9 @@ gateway and never the individual servers.
 This is the source of truth for the gateway. See also
 `docs/mcp-model-status.md` (the one MCP server this repo authors) and
 `docs/pipelock.md` (the peer opt-in service whose compose conventions
-this one mirrors). `docs/plans/mcp-gateway.md` holds the original
-design; its Tier 1 / Tier 2 phase language predates the 2026-07-25
-rebuild and is history, not the current shape.
+this one mirrors). The original design was the mcp-gateway plan
+(removed 2026-10-05; in git history: `git log --diff-filter=D -- docs/plans/mcp-gateway.md` finds the commit); its Tier 1 / Tier 2 phase language predates
+the 2026-07-25 rebuild. The platform-rebuild plan removes the gateway (M10).
 
 ## Status snapshot (2026-07-25)
 
@@ -261,7 +261,7 @@ connect anonymously, so they need nothing.
    `.sops.yaml` still carries the literal `age1xxxx...` placeholder
    recipient and no age key has been generated, so
    `make mcp-secrets-render` has never produced a real file. See
-   `docs/secrets.md` and the status entry in `docs/plans/README.md`.
+   `docs/secrets.md`.
 
 The intended shape, for when someone does verify it:
 `make age-keygen-host` once, add the printed public key to `.sops.yaml`,
@@ -373,4 +373,4 @@ The lab is egress-locked behind pipelock. `devai-mcp-gateway` and
 - First-party server: `docs/mcp-model-status.md`
 - Secrets scaffold: `docs/secrets.md`
 - Egress firewall: `docs/pipelock.md`
-- Original plan (pre-rebuild): `docs/plans/mcp-gateway.md`
+- Original plan: mcp-gateway (removed 2026-10-05, in git history)
