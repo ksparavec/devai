@@ -102,7 +102,7 @@ Source: [`scripts/diagrams/slurm_architecture.py`](../scripts/diagrams/slurm_arc
 
 | Container | Image | Holds | Privileges |
 |---|---|---|---|
-| `devai-slurm` | `devai-slurm` (new, built here on the pinned `debian:trixie-slim`) | slurmctld, slurmdbd, slurmrestd, MariaDB, slurmd, nats-server, the GPU guard, the GPU sampler, the bus log, `devai-bus`, `devai-jobs` | `--pid=host`; `--userns=keep-id` (plan I26); the GPU via CDI, for NVML only, when the host has one; `--privileged --cgroupns=private` only if slurmd turns out to need them (Sec. 3.1) |
+| `devai-slurm` | `devai-slurm` (new, built here on the pinned `debian:trixie-slim`) | slurmctld, slurmdbd, slurmrestd, MariaDB, slurmd, nats-server, the GPU guard, the GPU sampler, the bus log, `devai-bus`, `devai-jobs` | `--pid=host`; podman's default user namespace, so its root is the host user (plan I26); the GPU via CDI, for NVML only, when the host has one; `--privileged --cgroupns=private` only if slurmd turns out to need them (Sec. 3.1) |
 | `devai-engines` | `devai-engines` (the plan's Phase 4) | supervisord, `devai-control`, Ollama, vLLM 0.28 + HyperQwen, SGLang 0.5.16, each in its own env and on its own port (11434, 11435, 11436) | GPU via CDI when present |
 | `devai-laya-trainer` | `devai-laya-trainer` (its own image, as today, on `devai-base`; the plan's Phase 3) | supervisord, `devai-control`, the laya trainer | GPU via CDI when present |
 | `devai-operator` | `devai-operator` ([the plan](plans/platform-rebuild.md), Phase 6) | supervisord, Apache + mod_wsgi, `devai-control`, `devai-bus`, `devai-jobs`, devai's scripts and the tools they call, the log follower (plan I20) | runs as `devai` with `--userns=keep-id` (plan I19); the host's podman socket read-write; the GPU when present (probes); HTTPS published on the LAN (O6) |
@@ -123,8 +123,9 @@ and history tool (Sec. 9), runs only in `devai-slurm` and `devai-operator`
 - **Image:** Debian trixie packages only -- Slurm 24.11.5 (`slurmctld`,
   `slurmd`, `slurmdbd`, `slurmrestd`, `slurm-wlm-jwt-plugin`,
   `slurm-wlm-mysql-plugin`; D12), MariaDB 11.8, `nats-server` 2.10.27,
-  supervisor, tini and `python3` (`python3-minimal` lacks `ctypes`) -- plus
-  `devai-bus`, `devai-jobs` and
+  supervisor, tini (run as `tini -s`: under `--pid=host` it is not PID 1)
+  and `python3` (`python3-minimal` lacks `ctypes`) -- plus `devai-bus`,
+  `devai-jobs` and
   devai's scripts in `/usr/local/lib/devai/`. Among those scripts is
   `devai-gpu`, the NVML reader the guard and the sampler use: stdlib Python
   through `ctypes`, because `nvidia-smi` on this driver does not expose the
@@ -147,11 +148,21 @@ and history tool (Sec. 9), runs only in `devai-slurm` and `devai-operator`
   script that sends bus commands, so this layout proposes
   `ProctrackType=proctrack/linuxproc`, no cgroup plugins and an unprivileged
   container. Whether slurmd runs that way is untested; the measured
-  privileged setup is the fallback. The container runs with
-  `--userns=keep-id` (plan I26), as `devai-operator` does: jobs run as `devai`
-  (uid 1000) and so write as the host user, and the prolog and epilog, which
-  run as root, hand their files to `devai`. So both containers can write a
-  job's results directory, and everything in it belongs to the host user.
+  privileged setup is the fallback.
+
+  The container stays in podman's default user namespace (plan I26), so its
+  root is the host user. The guard can therefore see and kill GPU holders in
+  every rootless container and on the host (measured with `sleep` processes,
+  2026-10-06).
+
+  Jobs run as `devai`, a subordinate uid on the host. They cannot signal the
+  host user's processes, nor read the keys mounted into the container, which
+  appear as root's 0600 files; the entrypoint copies only the jobs bus
+  password for them.
+
+  Each job's results directory is shared with `devai-operator` through a
+  setgid group: owned by `devai`, group 0 (the host user's group), mode 2775.
+  Job scripts run with umask 0002.
 - **Processes:** supervisord runs MariaDB, slurmdbd, slurmctld, slurmrestd,
   slurmd, nats-server and the bus log (Sec. 9).
 - **Slurm configuration:**
@@ -163,7 +174,9 @@ and history tool (Sec. 9), runs only in `devai-slurm` and `devai-operator`
     many jobs at once as it has CPUs.
   - Two cluster licenses: `engine:1`, and `bench:1`, which keeps bench tasks
     one at a time (I5).
-  - Further: `CompleteWait=30`; one partition; `auth/slurm` plus `auth/jwt`;
+  - Further: `PrologEpilogTimeout=180` (a hung prolog or epilog drains the
+    node instead of holding the license); `BatchStartTimeout=240`, above it, so
+    a slow guard prolog does not get its job requeued; one partition; `auth/slurm` plus `auth/jwt`;
     `proctrack/linuxproc`; `AccountingStoreFlags=job_comment,job_script`;
     `KillWait=30`; `PrologFlags=Alloc`; `Prolog` / `Epilog` = the guard; a
     health check every 30 s (Sec. 6).
@@ -260,10 +273,15 @@ What load and unload mean for each engine:
   more: no pending job, active hold or running engine job names it, and no
   just-started job that names it is still about to take its hold (I9). A
   sleeping model costs host RAM (about 18 GiB for the 27B at level 1; the host
-  has 62 GiB) and keeps some VRAM (not measured). `devai-control` lowers the
-  next load's memory fraction by that much (not for a model whose recovery
-  flags set the fraction), and if the load still fails, unloads the sleeper and
-  loads once more. How long sleep and wake take is not measured.
+  has 62 GiB) and keeps some VRAM (not measured).
+
+  For a vLLM load, `devai-control` lowers the memory fraction by that much.
+  vLLM's fraction is of the whole card, while SGLang's is already of the free
+  memory, and the fraction is not lowered for a model whose recovery flags set
+  it. SGLang's KV pool still shrinks, and a pool below the context does not
+  fail its load (SGLang caps the request length instead), so `devai-control`
+  checks it. If a load fails on memory, or an SGLang pool comes up below its
+  context, `devai-control` unloads the sleeper and loads once more. How long sleep and wake take is not measured.
 - **The laya trainer:** the controller, which serves the :11438 API, runs all
   the time and no longer starts runs itself. `train` starts one run
   (`laya_trainer.run_job`, which the controller used to spawn) as a
@@ -276,11 +294,12 @@ configuration, arrives in the job's environment:
 
 ```bash
 #!/bin/bash
+umask 0002
 S=devai.engines.$DEVAI_BACKEND J=$SLURM_JOB_ID
 trap 'devai-bus request $S.unload "{\"job\":$J}" --timeout 25s; exit 0' TERM INT
 trap 'devai-bus request $S.sleep "{\"job\":$J}" --timeout 120s; exit 0' USR1
-devai-bus request $S.load "$DEVAI_LOAD" --job "$J" --timeout 660s || exit 1
-devai-bus hold $S --job "$J" &   # a lease every 10 s; exits when the engine stops serving this job
+devai-bus request $S.load "$DEVAI_LOAD" --job "$J" --timeout 660s || exit $?
+devai-bus hold $S --job "$J" --parent $$ &   # a lease every 10 s; ignores TERM and INT; exits 0 when the service stops serving this job, 3 on failed
 wait $!
 ```
 
@@ -290,7 +309,7 @@ again and waits up to 60 s.
 | Concern | Who does it |
 |---|---|
 | a model onto the GPU | the job's `load`; `devai-control` starts or loads it |
-| cancel (`scancel`, time limit) | Slurm sends the job script SIGTERM; its trap sends `unload`; the epilog sends `unload` again and checks the card (Sec. 6) |
+| cancel (`scancel`, time limit) | Slurm sends SIGTERM to the job script and every process it started (`devai-bus hold` ignores it, and dies with its script); the script's trap sends `unload`; the epilog sends `unload` again and checks the card (Sec. 6) |
 | switch away, fast path | the router cancels with `scancel --signal=USR1 --batch`; the trap sends `sleep` |
 | the engine fails | `devai-control` publishes `failed`; `devai-bus hold` exits; the job ends non-zero |
 | the job disappears without its trap or epilog (`devai-slurm` restarts) | the lease runs out after 60 s and `devai-control` unloads |
@@ -316,9 +335,10 @@ A bench uses the GPU only through the router and keeps its engine with a hold
 never start. The `bench` license only keeps bench tasks one at a time (I5).
 The engine license, not the GPU, is what lets one engine run at a time, so the
 rule is the same on a host without a GPU: a second job asking for it waits as
-`PENDING (Licenses)` (measured). `CompleteWait=30` makes Slurm start nothing
-while a job is still completing, so the next job's prolog always follows the
-previous job's epilog (Slurm's documented behaviour; not measured). On a host
+`PENDING (Licenses)` (measured). Slurm returns a job's licenses only after
+its epilog has finished, and starts nothing on a node that still has a
+completing job. So the next GPU job's prolog always follows the previous one's
+epilog (read in the 24.11.5 source; checked in the plan's Phase 5). On a host
 without a GPU the router submits only Ollama and trainer jobs; vLLM and SGLang
 requests are refused before anything is submitted. Every job carries a JSON
 comment (kind, backend, model, context, MTP, hold, requester, git commit);
@@ -340,23 +360,40 @@ trainer and probe job, in `devai-slurm`:
    bus, and waits up to 60 s. The guard matches NVML's PIDs to a container
    through `/proc/<pid>/cgroup`: a PID's cgroup is compared with that of the
    `devai-control` process whose command line names the container. A devai engine is
-   asked, not killed: its supervisor would start a killed service again;
-3. sends every other holder SIGTERM, then SIGKILL after 5 s (measured from a
-   privileged container with `--pid=host`: a PyTorch process in another
-   container died and the card went back to 2 MiB; the same from an
-   unprivileged container is untested);
-4. if the card is still busy, or a holder belongs to another user, exits 1:
+   asked, not killed: its supervisor would start a killed service again.
+   - A laya trainer run that holds the card gets `cancel` with `force`.
+   - A holder in `devai-operator` (a prober or its ballast) is stale here,
+     since this job holds the only engine license. The guard finds its run
+     through the `DEVAI_JOB_ID` in its `/proc/<pid>/environ` and sends `stop`
+     with `force` for that run (TERM, 5 s grace). It kills the holder if it
+     is still there. Without a `DEVAI_JOB_ID` it is a foreign holder (step 3).
+   - Each container holds one `devai-control`; two in one cgroup are a
+     configuration error (exit 1);
+3. sends every other holder SIGTERM, then SIGKILL after 5 s. A holder that is
+   its container's PID 1 ignores SIGTERM unless it has a handler. Measured:
+   - from a privileged container with `--pid=host`: a PyTorch process in
+     another container died and the card went back to 2 MiB;
+   - from an unprivileged container in podman's default user namespace:
+     `sleep` processes on the host, in another container and in a keep-id
+     container were killed (2026-10-06, no GPU);
+4. if the card is still busy, or a holder belongs to another host user (a uid
+   the container cannot map, shown as 65534), exits 1:
    Slurm drains the node and holds the job, so nothing starts on a busy card
    (measured);
 5. starts the GPU sampler and reads the energy counter.
 
+The waits add up to about 140 s at most (10 + 60 + 60 + 5 + 5 s and the bus
+round trips), within `PrologEpilogTimeout`.
+
 The epilog of an engine, trainer or probe job stops the sampler, writes
-`gpu.json`, sends the job's engine `unload` unless the job ended with `sleep`,
-and checks the card is idle again (apart from a sleeping model); if not, it
-exits 1 and the node drains. With one node and `CompleteWait`, this check
-cannot race the next job. Bench and action jobs run beside a serving engine
+`gpu.json`, ends the job's service as its script would -- `unload` for an
+engine or probe job's engine unless the job ended with `sleep`, `cancel` for a
+trainer job's run (a no-op once it has ended) -- and checks the card is idle again (apart from a sleeping model); if not, it
+exits 1 and the node drains. A probe job's epilog first stops its action if
+it still runs. Slurm starts nothing on the node until the epilog has finished,
+so this check cannot race the next job. Bench and action jobs run beside a serving engine
 job, so their prolog and epilog leave the card and the engines alone. On a host
-without a GPU, prolog and epilog only send `unload`.
+without a GPU, the epilog only sends that `unload` or `cancel`.
 
 The prolog writes its verdict to `results/<jobid>/guard.json` and publishes it
 on `devai.events.slurm.guard`. The router reads the holder from that event and
@@ -536,7 +573,7 @@ creates the operator's htpasswd entry and its TLS certificate under
 | the bus is down longer than a lease | engines unload although their jobs still run | the jobs see their engine leave `serving` and end; the router resubmits |
 | `devai-control` restarts | its model process keeps running | it takes it over again from supervisord's status |
 | an engine container restarts | its models are gone; its jobs fail | the router resubmits on demand |
-| a sleeping model leaves too little VRAM for the next load | the load fails | `devai-control` unloads the sleeping model and loads once more |
+| a sleeping model leaves too little VRAM for the next load | the load fails (vLLM, Ollama), or an SGLang pool comes up below its context | `devai-control` unloads the sleeping model and loads once more |
 | the router is down while a model sleeps | the sleeper keeps host RAM and some VRAM | the router unloads it when it is back, if no job needs it (I9) |
 
 ## 12. Security
@@ -550,8 +587,13 @@ creates the operator's htpasswd entry and its TLS certificate under
   fixed; it can no longer run arbitrary commands in them. But anyone who can
   submit a job can load and unload models and run any registered operator
   action, destructive ones included (the web page's confirmation does not
-  apply there), and a job script runs in `devai-slurm` with `--pid=host`. So
-  the JWT key and `slurm.key` stay as sensitive as the operator's login. Only
+  apply there). So the JWT key and `slurm.key` stay as sensitive as the
+  operator's login.
+
+  A job script runs in `devai-slurm` with `--pid=host`, as `devai`, a
+  subordinate uid on the host (plan I26). It can neither read the keys
+  mounted there, since only its bus password is copied for it, nor signal the
+  host user's processes. Only
   `devai-slurm`, the router and `devai-operator` get the JWT key, as read-only
   mounts. `devai-jobs` runs inside those containers (I13), so the key is never
   read on the host.

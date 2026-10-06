@@ -26,7 +26,7 @@
 <text x="270" y="111" font-family="Helvetica, Arial, sans-serif" font-size="12.5" font-weight="bold" fill="#222" text-anchor="start">Host shell</text>
 <text x="270" y="125.5" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">development (make)</text>
 <text x="270" y="140.0" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">one-time root setup:</text>
-<text x="270" y="154.5" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">logs volume, tmpfs, installer</text>
+<text x="270" y="154.5" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">logs and jobs volumes, installer</text>
 <rect x="540" y="72" width="430" height="120" rx="12" fill="#FFFFFF" stroke="#BBBBBB" stroke-width="1.4"/>
 <text x="554" y="92" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="bold" fill="#333" text-anchor="start">Legend</text>
 <path d="M558 104 L592 104" fill="none" stroke="#2F6FD1" stroke-width="1.8" marker-end="url(#e-data)"/>
@@ -64,7 +64,7 @@
 <text x="630" y="302.5" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">engine state from the bus; blocks engine control routes; no podman socket</text>
 <rect x="40" y="360" width="460" height="470" rx="12" fill="#F5F0FB" stroke="#7A52B3" stroke-width="1.4"/>
 <text x="54" y="380" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="bold" fill="#333" text-anchor="start">devai-slurm  (one image, one container)</text>
-<text x="54" y="397" font-family="Helvetica, Arial, sans-serif" font-size="10.2" font-weight="normal" fill="#7A52B3" text-anchor="start">--pid=host; keep-id; GPU (NVML) if present; no podman socket</text>
+<text x="54" y="397" font-family="Helvetica, Arial, sans-serif" font-size="10.2" font-weight="normal" fill="#7A52B3" text-anchor="start">--pid=host; default userns; GPU (NVML) if present; no podman socket</text>
 <rect x="60" y="410" width="420" height="42" rx="8" fill="#EFE7F8" stroke="#7A52B3" stroke-width="1.4"/>
 <text x="70" y="429" font-family="Helvetica, Arial, sans-serif" font-size="12.5" font-weight="bold" fill="#222" text-anchor="start">slurmrestd  :6820</text>
 <text x="70" y="443.5" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">REST API v0.0.42, auth/jwt  (Slurm 24.11, Debian)</text>

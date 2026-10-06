@@ -43,7 +43,7 @@ history too.
 | sops-age-secrets | Non-functional | dropped as moot: the scaffold goes to the attic (M12) |
 | mcp-gateway | Partial | dropped as moot: the gateway is removed (M10) |
 | kv-cache-quantization | Superseded | dropped |
-| sglang-backend-remediation | In Progress | Phases 0-3 shipped; the Phase 4 re-probe and the Phase 1 soak check absorbed (platform-rebuild Phases 4 and 10); Phase 5 became Phase 15 |
+| sglang-backend-remediation | In Progress | Phases 0-3 shipped; Phase 4's re-probe absorbed (platform-rebuild Phase 4; its 7 GPTQ cells are removed instead, I17) and the Phase 1 soak check (Phase 10); Phase 5 became Phase 15 |
 | router-shortcircuit | Draft | Phases 1-4 became Phase 16; Phase 5's goal met by the router's mutation guard, its leftovers in 16e |
 | router-fanout | Draft | Phase 1 and the single-host polish became Phase 19; Phases 2-3 dropped (cluster mode) |
 | odysseus-borrowed-ideas | Draft | RT-1, CB-4 and CB-1's KV term shipped; CB-3 and the rest of CB-1 became Phase 17, CB-2 Phase 18, RT-6 part of Phase 9; RT-4 and RT-5 absorbed; RT-2, RT-3, CMP-1, CMP-2 rejected |
@@ -51,7 +51,7 @@ history too.
 | laya-trainer | In Progress | Phases 1-4 shipped; Phase 4 closed by the operator on 2026-10-05 (platform-rebuild I23) |
 | pi-coding-agent | Done | shipped; pinning pi and two notes are in Phase 21 |
 | card-derived-hints-and-bench-sync | Done | shipped; the provenance docs are in Phase 21, the card branch's first real run in Phase 4 |
-| model-lifecycle-ledger | Done (unverified) | shipped; its live checks absorbed (Phases 4 and 10) |
+| model-lifecycle-ledger | Done (unverified) | shipped; its live `make model-sync` run absorbed (Phase 10); its Gemma-4-31B re-check dropped (I17) |
 | review-fixes-2026-07 | Done (unverified) | shipped; its live runs absorbed (Phases 4 and 9) |
 | bench-rewrite | Done | shipped; bench coverage absorbed (Phase 10) |
 | router-anthropic-messages-compat | Done | shipped |

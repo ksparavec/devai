@@ -112,7 +112,7 @@ def draw() -> str:
 
     # ---------------------------------------------------------- row A
     box(20, 100, 220, 70, "Browser (LAN)", ["devai-operator over HTTPS", "(login)"], fill="#F4F4F4")
-    box(260, 92, 260, 88, "Host shell", ["development (make)", "one-time root setup:", "logs volume, tmpfs, installer"], fill="#FAFAFA")
+    box(260, 92, 260, 88, "Host shell", ["development (make)", "one-time root setup:", "logs and jobs volumes, installer"], fill="#FAFAFA")
     zone(540, 72, 430, 120, "Legend", "#FFFFFF", "#BBBBBB")
     for i, (kind, what) in enumerate([("data", "inference data path"), ("slurm", "Slurm internal"),
                                       ("bus", "bus (NATS): commands, state"), ("gpu", "GPU use (CUDA)"),
@@ -142,7 +142,7 @@ def draw() -> str:
 
     # devai-slurm: all of Slurm and the bus, one image, one container
     zone(40, 360, 460, 470, "devai-slurm  (one image, one container)", "#F5F0FB", PURPLE)
-    text(54, 397, "--pid=host; keep-id; GPU (NVML) if present; no podman socket", size=10.2, colour=PURPLE)
+    text(54, 397, "--pid=host; default userns; GPU (NVML) if present; no podman socket", size=10.2, colour=PURPLE)
     cp = dict(fill="#EFE7F8", stroke=PURPLE)
     bus = dict(fill="#E3F3F3", stroke=TEAL)
     box(60, 410, 420, 42, "slurmrestd  :6820", ["REST API v0.0.42, auth/jwt  (Slurm 24.11, Debian)"], **cp)

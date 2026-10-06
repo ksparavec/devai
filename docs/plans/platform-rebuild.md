@@ -204,11 +204,11 @@ Given in devai's session unless marked otherwise. LS1-LS28 were numbered D1-D28 
 
 ## Implementation decisions (2026-10-05)
 
-The plan proposed each of these as the smallest choice that lets the code be written, and the operator decided them on 2026-10-05. I1-I14 were decided first, three of them differently from the proposal (I4, I9, I10); I15-I24 the same day, after a readiness review; I25 and I26 after a second review, which also changed I24's model and defined I16's measurement. Each is folded into slurm.md where it shapes the architecture, and each names those sections and the phase that needs it.
+The plan proposed each of these as the smallest choice that lets the code be written, and the operator decided them on 2026-10-05. I1-I14 were decided first, three of them differently from the proposal (I4, I9, I10); I15-I24 the same day, after a readiness review; I25 and I26 after a second review, which also changed I24's model and defined I16's measurement. After a third review, on 2026-10-06, the operator revisited I26 and completed I16's measurement. Each is folded into slurm.md where it shapes the architecture, and each names those sections and the phase that needs it.
 
 - **I1 -- The bus carries data, never command lines** (slurm.md Sec. 4; Phase 8).
   - The `load` request carries the router's launch configuration as typed fields (C2), and `devai-control` builds the argument list itself, with the router's builders moved into a shared package.
-  - `devai-control` reads recovery flags and parser plugins from the same `deploy/recovery-flags.json` and `deploy/vllm-plugins.json`.
+  - `devai-control` reads recovery flags and parser plugins from the same files as the router: `deploy/recovery-flags.json`, `deploy/recovery-flags.generated.json` (I25) and `deploy/vllm-plugins.json`.
   - So a job, or anyone holding the `jobs` bus password, cannot run arbitrary commands in `devai-engines` (slurm.md Sec. 12).
   - Probes and serving get identical command lines; today the probers build their own (`vllm_command_args`, `sglang_command_args`).
 - **I2 -- The shared Go code lives in the router's module** (slurm.md Sec. 3; Phases 5 and 8): `gpu-arbiter/pkg/engineargs` (argument builders, Phase 8), `gpu-arbiter/pkg/bus` (subjects, messages, client), `gpu-arbiter/pkg/slurmrest` (JWT and the REST client).
@@ -265,22 +265,33 @@ The plan proposed each of these as the smallest choice that lets the code be wri
 - **I14 -- Running without a GPU comes after the router moves to Slurm** (Phase 11).
   - The CPU mode of the router is written once, in the Slurm launcher, and never in the podman path that Phase 9 removes.
   - The earlier phases keep only the cheap no-GPU checks of the pieces they build (devai-slurm, devai-control).
-- **I15 -- Phase 15's baseline is Qwen3.5-9B-NVFP4 on vLLM 0.28** (Phase 15; operator, 2026-10-05). No model fits both SGLang and the vLLM that survives (M4): the two models that fit vLLM 0.28 do not fit SGLang. Qwen3.5-9B-NVFP4 fits SGLang and its weights are on disk, so Phase 15 first probes it on vLLM 0.28 and then measures both engines on it.
+- **I15 -- Phase 15's baseline is Qwen3.5-9B-NVFP4 on vLLM 0.28** (Phase 15; operator, 2026-10-05). No model fits both SGLang and the vLLM that survives (M4): the two models that fit vLLM 0.28 do not fit SGLang. Qwen3.5-9B-NVFP4 fits SGLang and its weights are on disk, so Phase 15 first probes it on vLLM 0.28 and then measures both engines on it. If it does not load on vLLM 0.28, gpt-oss-20b and then Gemma-4-26B-A4B-it-NVFP4 are tried; if none loads, SGLang is frozen by default (Phase 15, step 1).
 - **I16 -- The SGLang keep thresholds** (Phase 15; operator, 2026-10-05). SGLang is kept only if both hold:
   - (i) its steady TTFT is within 3x of vLLM's on the same checkpoint;
-  - (ii) its turn-2+ TTFT on an identical multi-turn workload is at least 25% better than vLLM's, with a non-zero engine-reported cache hit rate and a measurable gain over `--disable-radix-cache`.
+  - (ii) its turn-2+ TTFT on an identical multi-turn workload is at least 25% better than vLLM's, with a non-zero engine-reported cache hit rate and a measurable gain over `--disable-radix-cache` (conditions (b)-(d) below).
 
-  How it is measured (operator, 2026-10-05, after the second readiness review; docs/statistics-primer.md conventions):
-  - MTP off on both engines (the checkpoint declares `mtp:`, and the picker would launch it with `::mtp`); the same context, sampling and prompts.
-  - Steady TTFT: the median of 30 single-turn requests per engine, after one warm-up request.
-  - Turn-2+ TTFT: 20 five-turn sessions per engine. A session's value is the median TTFT of its turns 2-5; the engine's is the median of its 20 session values.
+  How it is measured (operator, 2026-10-05 and 2026-10-06, after the second and third readiness reviews; docs/statistics-primer.md conventions):
+  - Both engines are launched by the check itself, outside the router (Phase 15), at one context (the smaller of the two probed maxima), with MTP off (the checkpoint declares `mtp:`, and the picker would launch it with `::mtp`).
+  - Each engine runs with the KV-cache dtype its probe cell is stamped with, as the router would serve it: vLLM 0.28 at fp8 (step 1's probe); SGLang without `--kv-cache-dtype`, since the checkpoint has no KV quantization (its default, bf16). The check passes the dtype explicitly, never a prober's default; the context is the smaller of the two maxima probed under those dtypes; the report records both. So the ratios compare each engine as served.
+  - Every request carries the same body:
+    - reasoning off, as `chat_template_kwargs: {"enable_thinking": false}` at the top level, which both engines read (for the gpt-oss-20b fallback, whose template ignores it, `reasoning_effort: "low"`);
+    - the same sampling;
+    - no tools (the two engines use different Qwen3.5 tool parsers).
+  - Steady TTFT: the bench's latency prompts (`scripts/bench/data/latency_prompts.jsonl`), prompt 0 as the warm-up, then the median over prompts 1-30. They are distinct and short (about 4-55 tokens, sharing at most 13 characters), so this measures scheduling, streaming and a short prefill, not long-prompt prefill.
+  - Turn-2+ TTFT: 20 sessions per engine and configuration (vLLM, SGLang radix-on, SGLang radix-off), each of five turns with run_multiturn's sizes: a 4,096-token system prefix, 4,096 tokens added per turn, 64 tokens out (its defaults, fixed here before the runs).
+    - Each session has its own salt, made of a per-run nonce, the engine and the session number. So every session starts on a new prefix: sessions are independent, and no cache is flushed between them.
+    - A session's value is the median TTFT of its turns 2-5; the engine's is the median of its 20 session values.
   - Ratios are SGLang over vLLM, and radix-on over radix-off for the gain. Their 95% interval is a percentile bootstrap over session values (`boot_ci_two_sample` in scripts/stats/statlib.py, 10,000 resamples): sessions, not turns, because the turns of one session are not independent.
-  - SGLang is kept when the steady ratio is at most 3.0 and the turn-2+ ratio at most 0.75 (point estimates), and the turn-2+ ratio's interval excludes 1.0.
-  - "A measurable gain over `--disable-radix-cache`" means the radix-on over radix-off turn-2+ ratio's interval excludes 1.0. The hit rate is SGLang's `/metrics` prefix-cache counter over the turn-2+ requests.
+  - SGLang is kept only when all four hold; any other outcome is a freeze:
+    - (a) the steady ratio is at most 3.0 (point estimate);
+    - (b) the turn-2+ ratio, SGLang over vLLM, is at most 0.75 (point estimate), and its interval lies wholly below 1.0;
+    - (c) the turn-2+ ratio of SGLang radix-on over radix-off has an interval lying wholly below 1.0 (radix-on faster): the "measurable gain over `--disable-radix-cache`" of (ii);
+    - (d) the pooled hit rate of the radix-on sessions is above zero. It is the sum over sessions of the change in `sglang:cached_tokens_total` (summed over `cache_source`) over the sum of the change in `sglang:prompt_tokens_total`, each read before turn 2 and after the session's last turn (`--enable-metrics`); the per-session rates are reported too.
+  - The measured run is not repeated: a failed condition is a freeze, not a reason to change the scorer. The scorer is checked before it, in an uncounted dry run (Phase 15, step 2).
 - **I17 -- No downloads for the stale SGLang cells** (Phase 4; operator, 2026-10-05). The 7 SGLang cells that still carry a GPTQ "unsupported quantization" verdict -- 142 GB of weights, none on disk, Gemma-4-31B-IT-NVFP4 among them -- are removed from the SGLang probe cache. Their models stay out of the picker, each with a `manual` ledger verdict saying why. The rebuild re-probes only models whose weights are on disk. This also drops model-lifecycle-ledger's Gemma-4-31B re-check.
   - The other rows whose weights are not in their store -- 16 of the 22 vLLM-cache rows and 9 more SGLang rows on 2026-10-05 -- are not re-probed either and get no verdict. Their cells keep the old engine stamp: `make probe-check` lists them as not re-probed without failing, and the picker hides them (Phase 4, 4f-4g). A later `make model-pull NAME=<row>` and a probe bring one back.
 - **I18 -- Phase 18 applies only safe flags** (Phase 18; operator, 2026-10-05).
-  - An automatic fix is a flag that is safe to append, scoped with `backends` (for example `--enforce-eager` after a CUDA-graph OOM): applied once, logged and attributed, in the file of machine-made flags (I25). `devai-control` re-reads both recovery files on every load.
+  - An automatic fix is a flag that is safe to append, scoped with `backends` (for example `--enforce-eager` after a CUDA-graph OOM): applied once, logged and attributed, in the file of machine-made flags (I25). Every reader re-reads both recovery files at each launch: `devai-control` from Phase 8, the router and the probers from Phase 17.
   - Context, parser and memory-fraction suggestions are reported with the diagnosis and never applied: they are launch settings (C2), and a recovery flag would override every later launch.
 - **I19 -- devai-operator runs as `devai` with `--userns=keep-id`** (C6; Phase 6; operator, 2026-10-05), as the lab containers do. Apache (on 8443), supervisord and every action run as uid 1000, mapped to the host user, so the files it writes on host paths belong to the host user.
 - **I20 -- The log follower moves into devai-operator** (slurm.md Sec. 1, 3 and 12; Phase 6; operator, 2026-10-05). `deploy/logging.sh` becomes a supervisord program in `devai-operator`, which holds the podman socket anyway, and the `devai-logger` container goes. From Phase 6 on, `devai-operator` and the router hold the socket; from Phase 9, when the router gives it up, `devai-operator` alone, as slurm.md says.
@@ -288,25 +299,47 @@ The plan proposed each of these as the smallest choice that lets the code be wri
   - patterns in `deploy/shortcircuit-probes.json`, re-tunable without a rebuild;
   - streaming (SSE) handled from the start, since Claude Code streams most calls;
   - `/v1/messages` only;
-  - count_tokens (16d) only if Claude Code calls it and an engine tokenizer is reachable, never approximated.
+  - count_tokens (16d) only if Claude Code calls it; the engine's own count (its `/v1/messages/count_tokens`, as revised after the third readiness review), never approximated.
 - **I22 -- Phase 19 follows the original lanes design** (Phase 19; operator, 2026-10-05): an opt-in port, off by default; a configurable directive prefix, default `@@`; an unknown directive answers 400 listing the lanes; text content on `/v1/chat/completions` and `/v1/messages` first; broadcast refused.
 - **I23 -- The laya trainer's Phase 4 is closed** (operator, 2026-10-05; it was listed under Phase 21 before). Its quality caveats stay recorded in docs/laya-trainer.md as known limits ("Quality of the installed student"). Phase 9 re-runs `make laya-check` on the new path anyway (Phase 8 runs trainer jobs by hand).
 - **I24 -- The card-derived parser path is exercised without a download** (Phase 4; operator, 2026-10-05).
   - Every on-disk vLLM row has a curated `parsers:` block. Two on-disk SGLang rows lack a part of one -- Gemma-4-26B-A4B-it-NVFP4 has none, NVIDIA-Nemotron-Nano-9B-v2-NVFP4 no tool parser -- and both derive nothing on SGLang (`scripts/_card_hints.py` maps gemma4 and nemotron_json to no SGLang parser). So no re-probe exercises a positive derivation on its own.
   - Phase 4 therefore re-probes gpt-oss-20b, whose weights are in both stores, with a prober switch that ignores its curated block, its recipe seed and the name heuristic (Phase 17), so the card-derived parsers alone drive the launch. Its Harmony markup derives `openai` / `openai_gptoss` on vLLM and `gpt-oss` / `gpt-oss` on SGLang.
-  - That cell goes to a scratch cache and is compared with the curated one.
+  - That cell goes to a scratch cache, with a scratch exclusion ledger (`--ledger`, so the run leaves `deploy/.model-status.json` alone), and is compared with the curated one.
+  - gpt-oss-20b has not run on vLLM 0.28 yet. If it does not load there in 4g, the check runs on SGLang only (if kept) and records why.
   - The first choice, Qwen3.5-9B-NVFP4, rested on a wrong premise (that every vLLM/SGLang family had a curated block; 15 SGLang catalog rows have none). `_card_hints.py` refuses that checkpoint by design -- ambiguous Qwen3 XML tool markup, a bare `<think>` -- so it could only have exercised the refusal branch. The operator changed the model after the second readiness review.
 - **I25 -- Machine-made recovery flags live in their own file** (C2, C6; Phases 8, 17 and 18; operator, 2026-10-05, after the second readiness review).
   - `deploy/recovery-flags.generated.json` holds every flag a program added -- recipe flags (Phase 17's `recipe-apply`) and automatic fixes (Phase 18) -- and nothing else. `deploy/recovery-flags.json` stays hand-curated, and its contract does not change.
   - Each model has a list of groups, `{backends, engine_flags, engine_env, source, reason, added}`. `backends` is required (there is no "every backend"); `source` is `recipe` or `auto-fix`; there is no `image` (M8). A missing file reads as empty.
-  - Both readers -- the router's recovery registry (`pkg/engineargs` from Phase 8, used by the router and `devai-control`) and `scripts/_probe_hf_common.py` -- append, for a launch on backend B, the curated entry's flags and environment when it applies to B, then every generated group that names B, in file order. The last flag still wins.
+  - Both readers -- the router's recovery registry (`pkg/engineargs` from Phase 8, used by the router and `devai-control`) and `scripts/_probe_hf_common.py` -- append, for a launch on backend B, the curated entry's flags and environment when it applies to B, then every generated group whose `backends` names B or B's engine (the curated file's rule: `appliesTo`, `_entry_applies`), in file order. The last flag still wins. Phase 17a adds the file and both readers; Phase 8 needs 17a and carries the Go reader into `pkg/engineargs`.
   - Removing a group, or the whole file, reverts what it added; the curated file is never written by a program.
-  - Writers write the whole file to a temporary name and rename it (the repository's convention). So `devai-engines` mounts the `deploy/` directory, not single files (C6): a single-file bind mount keeps the old inode after a rename, and the container goes on reading the old content (checked with podman in the second readiness review). A `git checkout` replaces files by rename too.
+  - Writers write the whole file to a temporary name and rename it (the repository's convention), and every reader re-reads both files at each launch. Today the router reads its registry only once, at boot.
+  - So `devai-engines`, and the router while it still builds the engines' argument lists, mount the repository's `deploy/` directory, not single files (C6).
+    - A single-file bind mount keeps the old inode after a rename, and the container goes on reading the old content (checked with podman in the second readiness review). A `git checkout` replaces files by rename too.
+    - The mount uses the absolute path `${DEVAI_REPO:?}/deploy`, so an unset value stops compose instead of mounting `/deploy`. The Makefile exports `DEVAI_REPO := $(CURDIR)` (Phase 6 or 17a, whichever lands first); actions get it from C8's base environment, and the systemd unit sets it (Phase 7). A relative `./` mount is avoided because `make install-systemd` used to run compose from a copy in `~/.config/devai`, which also holds the keys (C7).
   - Tracked in git, like the curated file, so every recipe flag and automatic fix shows in `git diff` and is kept by a commit.
-- **I26 -- devai-slurm runs with `--userns=keep-id`** (C4, C6; Phase 5; operator, 2026-10-05, after the second readiness review), as devai-operator does (I19).
-  - Jobs run as `devai` (uid 1000) and so write as the host user. The prolog and the epilog run as container root and hand what they write under `results/<jobid>/` to `devai` (`chown`).
-  - So every file under `/var/cache/devai/jobs/results` belongs to the host user, and devai-slurm and devai-operator can both write a job's directory. MariaDB, slurmctld and slurmrestd keep their own users inside; their files under `mariadb/` and `slurmctld/` map to subordinate ids on the host.
-  - Tested in Phase 5's first live job, together with Open question 2 (whether keep-id also holds in the privileged fallback is part of that test).
+- **I26 -- devai-slurm stays in podman's default user namespace; each job's results directory is shared through a setgid group** (C3, C4, C6; Phases 5 and 8; operator, 2026-10-06).
+  - **History.** First decided on 2026-10-05 as `--userns=keep-id`. The third readiness review found three problems with keep-id, and the operator revisited it:
+    - devai-slurm's root becomes a subordinate uid, which may not signal your processes;
+    - uid 1000 becomes the default user;
+    - every job, which then runs as you, can read devai-slurm's keys.
+
+    Checked with rootless podman 5.4.2 on this host on 2026-10-06, with `sleep` processes and no GPU.
+  - **The guard.** Container root is the host user. With `--pid=host` it read `/proc/<pid>/cgroup` and killed three processes: one on the host, one in another default-namespace container and one in a keep-id container.
+    - Killing a non-root process in another default-namespace container needs CAP_KILL, so devai-slurm keeps its default capabilities.
+    - The uid `/proc` shows is translated (you appear as 0). So the guard identifies a holder by its cgroup (the `libpod-<id>.scope` segment).
+    - A holder whose uid devai-slurm cannot map (shown as 65534) belongs to another host user: exit 1.
+  - **Jobs.** They run as `devai`: uid 1000 inside, a subordinate uid on the host (100999 here).
+    - They could not signal your processes, nor read the 0600 key files mounted into devai-slurm, which appear as root's.
+    - The entrypoint copies only the jobs bus password to `/run/devai/bus/jobs.pass` (a tmpfs), owned by devai, mode 0400.
+    - With `--pid=host` a job still sees every process's command line, and may signal processes that run as its own subordinate uid. So no devai service runs as uid 1000 in a default-namespace container, or as uid 999 in a keep-id one (the same host uid), and devai is not in group 0 inside devai-slurm. devai-engines and devai-laya-trainer run as root.
+  - **Results.** For every job, the prolog creates `results/<jobid>/` and `results/<jobid>/artifacts/`, owned by devai, group 0 (in the default namespace, gid 0 is your own group), mode 2775. Job scripts run with umask 0002.
+    - Slurm writes `job.log` as devai. devai-operator (keep-id: your uid and group) writes `action.log` and `result.json` through the group bit. The prolog and the epilog (root, that is, you) write `guard.json` and `gpu.json`.
+    - Every file carries your group, but the owners are mixed: `job.log` has the subordinate uid. You can read every file and delete the directory.
+    - The guard's files belong to your uid, as devai-operator's do, so devai-operator could rewrite them. Accepted: it holds the podman socket anyway.
+  - **Untested until Phase 5:**
+    - Slurm's own mode for `job.log`;
+    - whether devai-slurm's daemons run in this layout, with or without the privileged fallback (Open question 2).
 
 ## Open questions
 
@@ -485,12 +518,12 @@ These engines cannot share one Python environment. And FlashInfer compiles its k
 |---|---|---|---|
 | 1 | Remove and move to attic | -- | 5 |
 | 2 | Infrastructure built here | 1 | 5 |
-| 3 | One lab image on Debian | 2 | 5, 6 |
+| 3 | One lab image on Debian | 2 | 5 |
 | 4 | `devai-engines` | 3 | 5, 6, 7 |
 | 5 | `devai-slurm` and the bus | -- (it uses Phase 2's Debian pin once that exists) | 1-4, 6, 7 |
 | 6 | `devai-operator`: image, container, direct actions | 2, 3 (`scripts/host-gpu.sh`), and Phase 5's `make setup-jobs` (step 8, which can run on its own first: its runs write under `/var/cache/devai/jobs`) | 4, 5 |
 | 7 | Recipes into scripts | 6 | 4, 5, 8 |
-| 8 | Engines and trainer under `devai-control` | 4, 5 (its step 1 needs nothing, and runs before 4e retires `vllm-devai`) | 7 |
+| 8 | Engines and trainer under `devai-control` | 4, 5, 17a (the generated recovery file and its readers, I25); its step 1 needs nothing, and runs before 4e retires `vllm-devai` | 7 |
 | 9 | Router as Slurm client | 8 | 7 |
 | 10 | Workloads and operator actions as jobs; the re-bench | 7, 9 | -- |
 | 11 | Running without a GPU | 10 | 12, 13 |
@@ -500,12 +533,12 @@ These engines cannot share one Python environment. And FlashInfer compiles its k
 | 15 | SGLang: keep or freeze | -- (must finish before 4a) | 1-3, 5-7 |
 | 16 | Router short-circuit | -- (16a early) | any |
 | 17 | Catalog and fit tooling | -- (17a best before 4g; 17b's calibration after 4 and 10) | 17a beside 1-3, 5-7; 17b any time |
-| 18 | Launch-failure diagnosis | 8, 10, 17a (its reader of the generated recovery file, I25) | 11-13, 19 |
+| 18 | Launch-failure diagnosis | 8, 10 | 11-13, 19 |
 | 19 | Lanes on one port | 9 | 10-13, 18 |
-| 20 | Library service | 2, 3 (and 7 for its registry entries) | 4-19 |
+| 20 | Library service | 2, 3, 6 (and 7 for its registry entries, 12 for the lab action's mount) | 4, 5, 7-19 |
 | 21 | Loose ends | -- | any |
 
-The critical path is 1 -> 2 -> 3 -> 4 -> 8 -> 9 -> 10 -> 13 -> 14. Phase 5 and Phases 6-7 run beside it and must be done before 8 and 10 respectively; Phase 15 runs beside 1-3 and must be done before 4. Phases 15-21 are outside slurm.md's scope.
+The critical path is 1 -> 2 -> 3 -> 4 -> 8 -> 9 -> 10 -> 13 -> 14. Phase 5 and Phases 6-7 run beside it and must be done before 8 and 10 respectively; Phase 15 runs beside 1-3 and must be done before 4, and 17a before 8. Phases 15-21 are outside slurm.md's scope.
 
 ## Absorbed from earlier plans (2026-10-05)
 
@@ -537,7 +570,7 @@ The interfaces the code is written against. They refine docs/slurm.md, which inc
 
 | Container | Services | `devai-control` kinds |
 |---|---|---|
-| `engines` | `ollama`, `vllm`, `sglang`; `fake` in Phase 5's test container | engine; `fake` |
+| `engines` | `ollama`, `vllm`, `sglang`; `fake` in Phase 5's engines test container | engine; `fake` |
 | `laya-trainer` | `trainer`; `controller` | trainer; program |
 | `operator` | `actions`; `apache` | actions; program |
 
@@ -569,21 +602,21 @@ The interfaces the code is written against. They refine docs/slurm.md, which inc
 
 | Verb | Fields | Effect and reply |
 |---|---|---|
-| `state` | -- | the service's state |
+| `state` | `job` (for `actions` only) | the service's state; for `actions`, that job's run |
 | `start`, `stop`, `restart` | -- | the same on the supervisord program; then its state |
 | `reload` | -- | re-read the program's configuration; restart it if it changed |
 | `load` | `launch` (C2), `timeout_s` (default 600) | replies once serving, or `load_failed` with the log tail. The same launch already serving for the same job is a no-op; the same launch sleeping is woken |
 | `unload` | `target` (`active`, the default, or `sleeper`), `force` (default false), `timeout_s` (default 60) | unloads the loaded model, or the sleeping one; replies once the program has exited and NVML's used memory is back to its level before that load (+256 MiB) |
 | `sleep` | -- | vLLM `/sleep?level=1`, SGLang `/release_memory_occupation`; `unsupported` on Ollama. The sleeper stays until a load wakes or replaces it, or until an `unload` with `target: sleeper` (I9) |
-| `lease` | -- (published, no reply) | renews the job's lease on its model, or on its action run (`devai.operator.actions.lease`); after 60 s without one, the model is unloaded, or the action's process group is stopped as `stop` with `TERM` and a 30 s grace would |
-| `train`, `cancel` | `ft_job`, `reason` | start or stop one laya run |
-| `run`, `stop` | `action`, `params`; `signal` (`INT` or `TERM`), `grace_s` | `run` starts a registered action (C8) and replies once it has started (`running`); its end is an event (`exited`, with `exit_code`). `stop` signals its process group, then SIGKILL after the grace |
+| `lease` | -- (published, no reply) | renews the job's lease on its model, its trainer run or its action run; after 60 s without one, the model is unloaded, the trainer run cancelled, or the action's process group stopped as `stop` with `TERM` and a 30 s grace would |
+| `train`, `cancel` | `ft_job`, `reason`; `cancel` also `force` | start or stop one laya run. `cancel` without `ft_job` stops the run of the sending job, or with `force` whatever run is going; the trainer's state names its run's `job` and `ft_job` |
+| `run`, `stop` | `run`: `action`, `params`, `kind` (the kind of the job sending it); `stop`: `signal` (`INT` or `TERM`), `grace_s`, and `force` with `run_job` (the job whose run to stop) | `run` starts a registered action (C8) for the job and replies once it has started (`running`); it is refused (`bad_request`) when the action's `job_kind` is not `kind`, or when a `stop` for that job came first. The run's end is an event: `exited` with `exit_code`, or `lost`. `stop` signals the run's process group and replies at once; SIGKILL follows after the grace |
 
-A loaded model belongs to the job that loaded it, and an action run to the job that started it. `unload`, `sleep`, `stop` and `lease` from another job are refused with `not_owner`. The exception is `unload` with `force`, which the guard, the operator and -- for a sleeper -- the router send.
+A loaded model belongs to the job that loaded it, and a trainer or action run to the job that started it. `unload`, `sleep`, `stop`, `cancel` and `lease` from another job are refused with `not_owner`. The exception is `unload`, `stop` and `cancel` with `force`, which the guard and the operator send, and the router for a sleeper's `unload`.
 
 **State.** `{"container", "service", "status", "job", "launch", "since", "build", "sleeper", "error"}`:
 
-- `status` is one of `idle`, `loading`, `serving`, `sleeping`, `waking`, `unloading`, `failed`, `stopped`. An `actions` service keeps one state per job instead, `running` or `exited` with `exit_code`.
+- `status` is one of `idle`, `loading`, `serving`, `sleeping`, `waking`, `unloading`, `failed`, `stopped`. An `actions` service keeps one state per job instead -- `running`, `exited` with `exit_code`, or `lost` (a restarted `devai-control` adopted the run but cannot collect its exit status) -- which `state` with that `job` returns; an ended run's state is kept 10 minutes.
 - `sleeper` is `{"job", "launch", "since", "used_mib"}` or null. `used_mib` is the card's used memory that `devai-control` read right after the model went to sleep, minus its reading before that model's load. The guard tolerates that much as the sleeper's (Phase 8).
 - `error` is `{"code", "message", "log_tail"}` or null.
 - `build` is the engine build id, read from `/etc/devai/engine-builds.json`, which `Dockerfile.engines` writes with the same content hashes as its `devai.engine.<backend>` labels (Phase 4, step 4c). The router compares it with the probe cache's stamp, without podman.
@@ -608,7 +641,7 @@ A loaded model belongs to the job that loaded it, and an action run to the job t
 
 Some settings are not in the request: `devai-control` resolves them from files mounted read-only (I1):
 
-- recovery flags and environment, by backend and model: first `deploy/recovery-flags.json` (hand-curated; that file's own contract, also named C2), then `deploy/recovery-flags.generated.json` (machine-made, I25); both re-read on every load from Phase 18 (I18);
+- recovery flags and environment, by backend and model: first `deploy/recovery-flags.json` (hand-curated; that file's own contract, also named C2), then `deploy/recovery-flags.generated.json` (machine-made, I25); both re-read at every load (I18, I25; `devai-control` from Phase 8);
 - parser plugin paths, from `deploy/vllm-plugins.json`.
 
 All three come from the `deploy/` directory, mounted read-only (C6). A recovery flag that sets a launch setting overrides the C2 field, since the last flag wins: 9 of the 14 curated entries set `--gpu-memory-utilization` or `--mem-fraction-static`, the Qwen3.8 rows among them. Machine-made flags never set one (I18; Phase 17).
@@ -628,7 +661,7 @@ Every job sets:
 - `licenses`, `time_limit` and the warning signal, per kind (table below).
 - `current_working_directory`: `/var/cache/devai/jobs/results`.
 - `standard_output` and `standard_error`: `/var/cache/devai/jobs/results/%j/job.log`.
-- `environment`: `PATH=/usr/local/bin:/usr/bin:/bin`, `DEVAI_BUS_URL=nats://127.0.0.1:4222`, `DEVAI_BUS_USER=jobs`, `DEVAI_BUS_PASSWORD_FILE=/etc/devai/bus/jobs.pass`, plus the kind's own (`DEVAI_BACKEND`, `DEVAI_LOAD`, `DEVAI_FT_JOB`, `DEVAI_ACTION`, `DEVAI_PARAMS`). A job gets only the environment its submitter passes (measured).
+- `environment`: `PATH=/usr/local/bin:/usr/bin:/bin`, `DEVAI_BUS_URL=nats://127.0.0.1:4222`, `DEVAI_BUS_USER=jobs`, `DEVAI_BUS_PASSWORD_FILE=/run/devai/bus/jobs.pass` (the copy devai can read, I26), plus the kind's own (`DEVAI_BACKEND`, `DEVAI_LOAD`, `DEVAI_FT_JOB`, `DEVAI_ACTION`, `DEVAI_PARAMS`). A job gets only the environment its submitter passes (measured).
 - `comment`: JSON, under 1 KiB: `{"v":1, "kind", "backend", "model", "ctx", "mtp", "requester", "git", ...}`. Per kind:
   - trainer: `ft_job`;
   - probe: `action`;
@@ -639,30 +672,62 @@ Every job sets:
 |---|---|---|---|
 | engine | `engine` | none | `load` `$DEVAI_LOAD`; hold. TERM -> `unload`; USR1 -> `sleep` |
 | trainer | `engine` | `LAYA_MAX_HOLD_S`, rounded up to whole minutes, Slurm's unit (0 = unlimited); `B:USR2@30` | `train`; hold. TERM -> `cancel`; USR2 -> `cancel` with reason `time_limit` |
-| probe | `engine` | 60 min | one model (one model and band for Ollama): `run` the per-model probe action `probe-<backend>-model` (C8) in `devai-operator`; hold the run (`devai-bus hold devai.operator.actions --job $J`), and beside it lease the model the prober loads with this job id (`devai-bus hold devai.engines.$DEVAI_BACKEND --job $J --lease-only`). TERM -> `stop` the action, then a forced `unload` on `devai.engines.$DEVAI_BACKEND` |
-| bench | `bench` (I5) | 32 min; `B:INT@120` | `run` the bench-task action; hold the run. INT -> `stop {signal: INT, grace_s: 110}`; TERM -> `stop {signal: TERM}` |
-| action | none | per action, from the registry (C8) | `run`; hold the run. TERM -> `stop` |
+| probe | `engine` | 60 min | `probe.sh`, one model (one model and band for Ollama): lease the model the prober loads with this job id (`devai-bus hold devai.engines.$DEVAI_BACKEND --job $J --lease-only`); `run` the per-model probe action `probe-<backend>-model` (C8) in `devai-operator`, and hold the run. TERM -> `stop` the action and wait for it, then `unload` the model (the job owns it) |
+| bench | `bench` (I5) | 32 min; `B:INT@120` | `bench.sh`: `run` the bench-task action and hold the run. INT -> `stop {signal: INT, grace_s: 110}` and wait for the run to end; TERM -> `stop {signal: TERM}` and wait |
+| action | none | per action, from the registry (C8) | `action.sh`: `run` and hold the run. TERM -> `stop` and wait |
 
 These time limits are defaults; a C8 registry entry's `time_limit_min`, when set, wins for the jobs its action submits.
 
-Holding an action run is `devai-bus hold devai.operator.actions --job $J`: it renews the run's lease every 10 s and exits 0 when the action exits 0, 1 otherwise. If the script dies without its trap (SIGKILL, `devai-slurm` restarting), `devai-control` stops the action's process group 60 s after the last renewal (C1). So no action outlives its job, and the prober of a dead probe job cannot go on loading models outside the engine license.
+`devai-bus hold <subject> --job $J --parent $$` holds a model, a trainer run or an action run:
+- It subscribes to the service's events first and then asks for its state, so a run that ended before it started is not missed. On `devai.operator.actions` it exits 0 when the action exits 0, 1 when it exits non-zero, and 3 when the run is `lost`; when the job has no run, it exits 0 at once.
+- It renews the lease every 10 s.
+- It ignores SIGTERM and SIGINT. On `scancel` and on the time limit, Slurm signals every process of the batch step, not only the script (24.11.5: slurmd's `_kill_all_active_steps` with SIGTERM; `proctrack/linuxproc` signals the whole process tree). The hold must outlive that signal to see its run end. Only `--batch` / `B:` signals reach the script alone. Slurm's SIGKILL after `KillWait` still ends it.
+- It dies with its script: it sets `PR_SET_PDEATHSIG(SIGKILL)`, and exits at once if its parent is no longer the `--parent` pid. A hold whose script was SIGKILLed is re-parented to `tini -s` (C6) and so leaves the step's process tree; it would otherwise renew its lease for ever.
+- With `--lease-only` it only renews a lease, and ends on SIGHUP from its script.
+- `devai-bus request` keeps the default handling of SIGTERM, so a trap is never held up behind a long `load`.
 
-Exit codes:
+If the script dies without its trap (SIGKILL, `devai-slurm` restarting), `devai-control` stops the run 60 s after the last renewal (C1). So no action outlives its job, and the prober of a dead probe job cannot go on loading models outside the engine license.
 
-- 0: the job ended normally, including after a cancel;
-- 1: refused or failed (`load_failed`, `busy`, an action that exited non-zero);
-- 2: the bus could not be reached;
-- 3: the service left its active state on its own (an engine `failed`).
-
-The engine job script, `deploy/slurm/jobs/engine.sh` (slurm.md Sec. 4's, with timeouts):
+The action job script, `deploy/slurm/jobs/action.sh`:
 
 ```bash
 #!/bin/bash
+umask 0002
+A=devai.operator.actions J=$SLURM_JOB_ID H=
+stop() {   # stop replies at once (C1); the job ends only once the run has ended
+  devai-bus request $A.stop "{\"job\":$J,\"signal\":\"$1\",\"grace_s\":$2}" --timeout 5s
+  [ -n "$H" ] || { devai-bus hold $A --job "$J" --parent $$ & H=$!; }   # TERM came during `run`
+  wait "$H"; rc=$?
+  [ "$rc" = 1 ] && rc=0     # the run ended because this script stopped it; its own status is in result.json
+  exit $rc
+}
+trap 'stop TERM 20' TERM          # scancel or the time limit; Slurm sends SIGKILL after KillWait (30 s)
+devai-bus request $A.run "{\"kind\":\"action\",\"action\":\"$DEVAI_ACTION\",\"params\":$DEVAI_PARAMS}" --job "$J" --timeout 30s || exit $?
+devai-bus hold $A --job "$J" --parent $$ &   # ignores TERM and INT; exits with the run: 0, 1 or 3
+H=$!
+wait $H
+```
+
+- `bench.sh` sends kind `bench` and adds `trap 'stop INT 110' INT` for Slurm's `B:INT@120` warning. The task scores its unbroken prefix and exits; only then does the job end and release the `bench` license.
+- `probe.sh` sends kind `probe`. Before `run` it starts `devai-bus hold devai.engines.$DEVAI_BACKEND --job "$J" --lease-only --parent $$ &` for the model the prober loads with this job id. Once the run's hold has returned, on either path (its `stop()` and its normal end), it sends that model's `unload` (the job owns it: no `force`) and ends the lease with `kill -HUP`.
+
+Exit codes, the same for `devai-bus` and for every job script, which passes them through:
+
+- 0: done; a job ended normally, including after a cancel or a stop its own script sent;
+- 1: refused or failed (an error reply such as `load_failed` or `busy`, or an action that exited non-zero on its own);
+- 2: the bus could not be reached;
+- 3: the service left its active state on its own (an engine `failed`, or an action run `lost`).
+
+The engine job script, `deploy/slurm/jobs/engine.sh` (slurm.md Sec. 4 shows the same script):
+
+```bash
+#!/bin/bash
+umask 0002
 S=devai.engines.$DEVAI_BACKEND J=$SLURM_JOB_ID
 trap 'devai-bus request $S.unload "{\"job\":$J}" --timeout 25s; exit 0' TERM INT
 trap 'devai-bus request $S.sleep "{\"job\":$J}" --timeout 120s; exit 0' USR1
-devai-bus request $S.load "$DEVAI_LOAD" --job "$J" --timeout 660s || exit 1
-devai-bus hold $S --job "$J" &   # a lease every 10 s; exits 0 when the service stops serving this job, 3 on failed
+devai-bus request $S.load "$DEVAI_LOAD" --job "$J" --timeout 660s || exit $?
+devai-bus hold $S --job "$J" --parent $$ &   # a lease every 10 s; ignores TERM and INT; exits 0 when the service stops serving this job, 3 on failed
 wait $!
 ```
 
@@ -670,11 +735,11 @@ How the router ends an engine job:
 
 - To unload it, the router cancels it: Slurm sends SIGTERM, waits `KillWait` (30 s), then sends SIGKILL.
 - To make it sleep, the router signals the batch script alone, `DELETE /slurm/v0.0.42/job/<id>?signal=SIGUSR1&flags=BATCH_JOB` (`scancel --signal=USR1 --batch`).
-- The trap's `unload` waits at most 25 s. The epilog sends `unload` again and waits up to 60 s, so a slow shutdown past `KillWait` is still cleaned up. The epilog skips that `unload` when the service reports `sleeping` for this job.
+- The trap's `unload` waits at most 25 s. The epilog sends `unload` again and waits up to 60 s, so a slow shutdown past `KillWait` is still cleaned up. The epilog skips that `unload` when the service reports `sleeping` for this job. For a trainer job the epilog sends `cancel` instead (no `ft_job`: the run of that job; reason `epilog`; a no-op once the run has ended).
 
 ### C4 -- Files under `/var/cache/devai/jobs`
 
-This is its own volume (D3), created by `make setup-jobs`. Everything under `results/` belongs to the host user (I26): the prolog creates `results/<jobid>/` as `devai`, and the prolog and the epilog hand their own files to `devai`.
+This is its own volume (D3), created by `make setup-jobs`. A job's directory is shared through a setgid group (I26). The prolog creates `results/<jobid>/` and its `artifacts/` owned by devai, group 0 (the host user's group), mode 2775. `job.log` belongs to devai's subordinate uid and everything else to the host user; every file carries the host user's group.
 
 ```
 results/<jobid>/job.log          the job script's output (Slurm)
@@ -718,10 +783,10 @@ The exact lists are read from the 0.28 and 0.5.16 sources in Phase 9 step 1 and 
 
 | Container | Ports | Mounts |
 |---|---|---|
-| `devai-slurm` | 6820 (slurmrestd) and 4222 (NATS) on `devai-net`; nothing published | runs with `--userns=keep-id` (I26); `/var/cache/devai/jobs` read-write; its C7 files; the bus passwords of every user, to render the server configuration |
-| `devai-engines` | Ollama 11434, vLLM 11435, SGLang 11436 on `devai-net` -- one port per engine, since they share a network namespace | the Ollama store at `/root/.ollama` read-write; the vLLM and SGLang stores at their host paths, read-only; the FlashInfer cache volumes; `jobs/engines/` read-write; the repository's `deploy/` directory at `/etc/devai/deploy` and the plugin directory, read-only -- directories, so a file replaced by rename is seen (I25); its bus password |
+| `devai-slurm` | 6820 (slurmrestd) and 4222 (NATS) on `devai-net`; nothing published | podman's default user namespace, so its root is the host user, with its default capabilities (I26); `tini -s` as its entrypoint, since under `--pid=host` tini is not PID 1; a tmpfs at `/run/devai`; `/var/cache/devai/jobs` read-write; its C7 files; the bus passwords of every user, to render the server configuration. Inside, these appear as root's 0600 files; only the jobs password is copied for devai (I26) |
+| `devai-engines` | Ollama 11434, vLLM 11435, SGLang 11436 on `devai-net` -- one port per engine, since they share a network namespace | the Ollama store at `/root/.ollama` read-write; the vLLM and SGLang stores at their host paths, read-only; the FlashInfer cache volumes; `jobs/engines/` read-write; `${DEVAI_REPO}/deploy` at `/etc/devai/deploy` and the plugin directory, read-only -- directories, so a file replaced by rename is seen, by absolute path (I25); its bus password; its processes run as root (I26) |
 | `devai-laya-trainer` | the controller on 11434, on `devai-net` | `/var/cache/devai/laya` at `/laya`; its bus password |
-| `devai-operator` | `${OPERATOR_PORT:-8443}` published on all interfaces (O6) | runs as `devai` with `--userns=keep-id` (I19); the host's podman socket read-write; the repository, `/var/cache/devai` and the home volume at their host paths (path identity), and `LIBRARY_DIR` the same way through `deploy/compose.library.yaml`, which is added only when it is set (Phase 20); TLS files, htpasswd and the HF token read-only (the token at `/etc/devai/operator/hf-token`, named by `HF_TOKEN_PATH`); from Phase 10, the JWT key and the `operator` and `control-operator` bus passwords; the GPU when present |
+| `devai-operator` | `${OPERATOR_PORT:-8443}` published on all interfaces (O6) | runs as `devai` with `--userns=keep-id` (I19); the host's podman socket read-write; the repository, `/var/cache/devai` and the home volume at their host paths (path identity), and `LIBRARY_DIR` the same way through `deploy/compose.operator-library.yaml`, which `make operator-up` adds only when it is set (Phase 20); TLS files, htpasswd and the HF token read-only (the token at `/etc/devai/operator/hf-token`, named by `HF_TOKEN_PATH`); from Phase 10, the JWT key and the `operator` and `control-operator` bus passwords; the GPU when present |
 | `devai-router` | 11434, 11435, 11436, 11438 (11437 retired in Phase 4); `DEVAI_FANOUT_PORT` when Phase 19's lanes are on | the JWT key; its bus password; no podman socket (from Phase 9) |
 
 Each engine keeps a cache directory of its own, as with today's per-backend volumes. The `devai-engine` launcher sets `HOME=/var/lib/devai-engines/<backend>` (Phase 4, step 4d), and the `devai-engine-cache-<backend>-*` volumes mount under it. Before every vLLM start, `devai-control` deletes `$HOME/.cache/vllm` and `/tmp/torchinductor_*` (docs/router.md: with that cache, vLLM under-measured activation memory and OOM-killed engines).
@@ -746,7 +811,7 @@ The router's environment, set in compose:
 - `SLURM_REST_URL=http://devai-slurm:6820`, `SLURM_JWT_KEY_FILE`, `SLURM_USER=devai`;
 - `DEVAI_BUS_URL=nats://devai-slurm:4222`, `DEVAI_BUS_USER=router`, `DEVAI_BUS_PASSWORD_FILE`.
 
-`devai-control` reads `/etc/devai/control.yaml`, one per image, and is started as `devai-control --container <name> --config /etc/devai/control.yaml`; the flag must equal the file's `container:`. The guard finds each container's `devai-control` by that command line (Phase 5). The argument builders take each engine's port from this file (Phase 8). The engines' copy:
+`devai-control` reads `/etc/devai/control.yaml`, one per container, and is started as `devai-control --container <name> --config /etc/devai/control.yaml`; the flag must equal the file's `container:`. The guard finds each container's `devai-control` by that command line (Phase 5). The argument builders take each engine's port from this file (Phase 8). The engines' copy:
 
 ```yaml
 container: engines
@@ -784,7 +849,8 @@ actions:
         required: true
         to: {flag: --name}            # or {env: NAME}; a bool flag is present or absent
         help: Catalog row name
-    license: null                     # engine (probes) | bench | null
+    job_kind: action                  # action | probe | bench: the Slurm job (C3) a run is submitted as,
+                                      # which sets its license; devai-control refuses a run from another kind
     time_limit_min: 240
     confirm: false                    # true for destructive actions: the page asks again
     covers: [model-pull]              # the Makefile targets this action replaces
@@ -793,6 +859,8 @@ not_offered:
     reason: interactive; a JupyterLab terminal replaces it (O4)
 pending: []                           # targets not yet moved to scripts; Phase 7 empties it
 ```
+
+A `job` action is always submitted as the job kind its entry names, from the web and from `devai-jobs submit` alike, so a per-model probe started from the page runs as a probe job, with the engine license and the guard. `devai-control` refuses a `run` whose `kind` differs. This guards against mistakes, not attacks: whoever can submit holds the JWT key anyway (slurm.md Sec. 12).
 
 The web app talks to Slurm only through `devai-jobs ... --json` (I13), and to the bus only through `devai-bus`. So there is one REST client and one bus client in Go, and none in Python.
 
@@ -989,7 +1057,10 @@ scripts/bench/bench_runner.py, _bench_core.py, scripts/bench-sync.py
                                      modify -- per-engine identity instead of image digest; cache volumes under HOME
 scripts/probe-vllm-devai-reasoning.py remove -- merged into the vllm prober
 scripts/prepare-checkpoint.py        modify -- its image is devai-engines (vLLM environment), not docker.io/devai/vllm-devai
-scripts/_probe_hf_common.py          modify -- PROBE_IGNORE_CURATED_PARSERS=1 with a scratch cache (I24)
+scripts/_probe_hf_common.py          modify -- PROBE_IGNORE_CURATED_PARSERS=1 with a scratch cache, and --ledger PATH so a
+                                               scratch run leaves deploy/.model-status.json alone (I24)
+scripts/_model_status.py             modify -- --exclude NAME::BACKEND --reason TEXT: a `manual` verdict, TEXT its detail, as --retire takes it (I17)
+scripts/probe-cache-drop.py          new    -- removes named rows from a probe cache, atomically, as the probers save (I17)
 tests/python/test_upstream_images.py modify -- the engine images, VLLM_DEVAI_IMAGE_TAG and QUANT_IMAGE leave the
                                                transitional allowlist
 scripts/model-picker.py, scripts/probe-check.py
@@ -997,7 +1068,7 @@ scripts/model-picker.py, scripts/probe-check.py
                                                another engine build is listed by probe-check as not re-probed,
                                                without failing, and hidden by the picker (I17)
 scripts/model-picker.py, bin/devai-agent, config/*, scripts/generate-catalog.py, deploy/models.yaml,
-deploy/recovery-flags.json, deploy/docker-compose.yaml, Makefile, tests/
+deploy/recovery-flags.json, deploy/recovery-flags.generated.json, deploy/docker-compose.yaml, Makefile, tests/
                                      modify -- vllm-devai -> vllm (M4); `image` field removed (M8)
 ```
 
@@ -1021,16 +1092,16 @@ deploy/recovery-flags.json, deploy/docker-compose.yaml, Makefile, tests/
    - Each engine thus has its own `~/.cache`. The router's `engineCacheVolumes` and the probers' `engine_cache_volumes` mount the existing `devai-engine-cache-<backend>-*` volumes under that `HOME` (C6).
    - The router's `vllmEntrypoint` / `sglangEntrypoint` and Ollama's launch call the launcher instead of a bare `python3`; so do the probers.
    - One `ENGINES_IMAGE` replaces `OLLAMA_IMAGE`, `VLLM_IMAGE`, `VLLM_DEVAI_IMAGE` and `SGLANG_IMAGE`.
-5. **4e -- `vllm-devai` becomes `vllm`** in the router's backend table, compose, the picker's backend lists and agent provider sets (`router-vllm-devai`), the probers, the derived catalog rows (`backend: [vllm]`), and the tests that pin the vllm-devai registration points. Port 11437 is retired.
+5. **4e -- `vllm-devai` becomes `vllm`.** Run Phase 8 step 1 first: it needs `vllm-devai`, which this step retires. The rename covers the router's backend table, compose, the picker's backend lists and agent provider sets (`router-vllm-devai`), the probers, the derived catalog rows (`backend: [vllm]`), and the tests that pin the vllm-devai registration points. Port 11437 is retired. Every `vllm-devai` in a `backends` list becomes `vllm`, in `deploy/recovery-flags.json` and in `deploy/recovery-flags.generated.json` (groups recipe-apply wrote before 4e; the file is rewritten whole and renamed, I25); a test shows a pre-4e `["vllm-devai"]` group applying to a `vllm` launch.
 6. **4f -- Per-engine staleness.** Today the HF probe caches stamp `_meta.current_image_digest`, and three places compare it: `make probe-check`, the router's drift check (`probeCachePathByBackend`, `readProbedImageDigest`) and `make bench-plan` (`stale_image`).
    - With one image for every backend, rebuilding it for an Ollama change would mark every vLLM and SGLang cell and bench row stale.
    - So stamp and compare the engine's `devai.engine.<backend>` label instead. Ollama's cache gets the same stamp (it has none today).
 7. **4g -- Re-probe everything** on the new image: `make probe`, `probe-vllm`, `probe-sglang`, `probe-load-vllm`, `probe-load-sglang`.
    - Run `make backup-create` first.
    - Failures go to the exclusion ledger and the model is dropped (M8), including the two models that had their own images.
-   - It also closes items absorbed from earlier plans. The SGLang cells without a launch fingerprint are re-probed with their load probe. The 7 SGLang cells that still carry a GPTQ "unsupported quantization" verdict (Gemma-4-31B-IT-NVFP4 among them) have no weights on disk and are not downloaded (I17): they are removed from the SGLang probe cache, and each model gets a `manual` ledger verdict saying why.
+   - It also closes items absorbed from earlier plans. The SGLang cells without a launch fingerprint are re-probed with their load probe. The 7 SGLang cells that still carry a GPTQ "unsupported quantization" verdict (Gemma-4-31B-IT-NVFP4 among them) have no weights on disk and are not downloaded (I17): they are removed from the SGLang probe cache, and each model gets a `manual` ledger verdict saying why (`scripts/probe-cache-drop.py` and `scripts/_model_status.py --exclude`, after `make backup-create`).
    - Rows whose weights are not on disk are not re-probed and get no verdict (I17).
-   - The card-derived parser path (`scripts/_card_hints.py`) gets its first real run (I24): gpt-oss-20b is re-probed on vLLM, and on SGLang if kept, with `PROBE_IGNORE_CURATED_PARSERS=1`, which makes the prober skip its curated `parsers:` block, its recipe seed and the name heuristic (Phase 17). The cells go to a scratch cache and are compared with the curated cells: the same parsers, or a recorded disagreement.
+   - The card-derived parser path (`scripts/_card_hints.py`) gets its first real run (I24): gpt-oss-20b is re-probed on vLLM, and on SGLang if kept, with `PROBE_IGNORE_CURATED_PARSERS=1`, which makes the prober skip its curated `parsers:` block, its recipe seed and the name heuristic (Phase 17). The cells go to a scratch cache, with a scratch ledger (`--ledger`), and are compared with the curated cells: the same parsers, or a recorded disagreement. If gpt-oss-20b does not load on vLLM 0.28, the check runs on SGLang only (if kept) and records why.
 8. **4h -- `QUANT_IMAGE`** points at `devai-engines` (its vLLM environment); `scripts/quant/quant_smoke.py` already adds llm-compressor on top of the image's torch.
 
 ### Exit criteria
@@ -1040,7 +1111,7 @@ deploy/recovery-flags.json, deploy/docker-compose.yaml, Makefile, tests/
 - `make test-router`, `make test-python`, `make test-vllm`, `make test-sglang` and `make test-e2e` pass.
 - Rebuilding only the Ollama part leaves `make probe-check` clean for vLLM and SGLang.
 - No file in the repository asserts an SGLang capability that the re-probed caches contradict (Phase 15's documentation check, run again on the new caches).
-- Done before Phase 8 starts.
+- Done before Phase 8 step 2 starts. Phase 8 step 1 is the exception: it runs on today's images before 4e.
 
 ### Phase 4 risks
 
@@ -1059,7 +1130,7 @@ deploy/recovery-flags.json, deploy/docker-compose.yaml, Makefile, tests/
 
 ### Goal
 
-`devai-slurm` runs Slurm, MariaDB, NATS and the bus log. The guard and the sampler work on the real card. `devai-bus`, `devai-control` (the `program`, `fake` and `actions` kinds) and a basic `devai-jobs` exist, and are tested against a test container whose "engine" is the VRAM ballast. No engine, router or bench code changes. This phase can start at once, beside Phases 1-4.
+`devai-slurm` runs Slurm, MariaDB, NATS and the bus log. The guard and the sampler work on the real card. `devai-bus`, `devai-control` (the `program`, `fake` and `actions` kinds) and a basic `devai-jobs` exist, and are tested against two test containers whose "engine" is the VRAM ballast. No engine, router or bench code changes. This phase can start at once, beside Phases 1-4.
 
 ### Deliverables
 
@@ -1081,13 +1152,14 @@ deploy/slurm/slurm.conf.in        new    -- ClusterName=devai; SlurmctldHost=loc
                                             AccountingStorageType=accounting_storage/slurmdbd,
                                             AccountingStoreFlags=job_comment,job_script; PrologFlags=Alloc;
                                             Prolog/Epilog; HealthCheckProgram, HealthCheckInterval=30 (I7);
-                                            CompleteWait=30; KillWait=30; SlurmdParameters=config_overrides;
+                                            PrologEpilogTimeout=180; BatchStartTimeout=240; KillWait=30; SlurmdParameters=config_overrides;
                                             StateSaveLocation=/var/cache/devai/jobs/slurmctld
 deploy/slurm/slurmdbd.conf.in     new    -- MariaDB on localhost, the password from mariadb.pass, auth/jwt as alt type
 deploy/slurm/nats-server.conf.in  new    -- C1 users and permissions; passwords filled in at start into /run/devai (0600)
 deploy/slurm/supervisord.conf     new    -- mariadb, slurmdbd, slurmctld, slurmrestd (user slurmrest, -a rest_auth/jwt,
                                             :6820), slurmd (-N devai), nats-server, the bus log
-deploy/slurm/entrypoint.sh        new    -- render the configs (the node's CPUs and memory from the host, I4); run directories for slurm, slurmrest, mysql; initialise
+deploy/slurm/entrypoint.sh        new    -- render the configs (the node's CPUs and memory from the host, I4); copy the jobs bus
+                                            password to /run/devai/bus/jobs.pass (devai, 0400; I26); run directories for slurm, slurmrest, mysql; initialise
                                             MariaDB on an empty data directory (--innodb-snapshot-isolation=OFF);
                                             exec supervisord; once slurmdbd answers, idempotent sacctmgr: cluster devai,
                                             account devai, users devai and root, devai AdminLevel=Operator (I6)
@@ -1097,7 +1169,7 @@ deploy/slurm/devai-gpu            new    -- stdlib Python, NVML via ctypes (I3):
 deploy/slurm/prolog.sh, epilog.sh, healthcheck.sh
                                   new    -- slurm.md Sec. 6, I7: the guard, the sampler and the idle check for
                                             engine, trainer and probe jobs only; for every job the prolog creates
-                                            results/<jobid>/ as devai (I26)
+                                            results/<jobid>/ and its artifacts/ as devai:0, mode 2775 (I26)
 deploy/slurm/jobs/engine.sh, trainer.sh, probe.sh, bench.sh, action.sh
                                   new    -- C3
 deploy/slurm/openapi-v0.0.42.json new    -- the spec dumped from this slurmrestd (step 2); fixture for pkg/slurmrest
@@ -1108,8 +1180,9 @@ gpu-arbiter/pkg/slurmrest/        new    -- JWT signer; Submit, Job, Jobs, Signa
 gpu-arbiter/go.mod, devai-tools/go.mod
                                   modify -- nats.go (nats-server for tests only); devai-tools requires gpu-arbiter
                                             with replace => ../gpu-arbiter (I2)
-devai-tools/cmd/devai-bus/        new    -- request, publish, hold (with --lease-only; on devai.operator.actions it
-                                            exits with the action, C3), watch, log
+devai-tools/cmd/devai-bus/        new    -- request, publish, hold (C3: ignores TERM and INT, dies with its --parent;
+                                            --lease-only ends on HUP; on devai.operator.actions it exits with the
+                                            action), watch, log; the exit codes of C3
 devai-tools/cmd/devai-control/    new    -- main
 devai-tools/internal/control/     new    -- config, supervisord XML-RPC client (getProcessInfo, startProcess,
                                             stopProcess, signalProcess, reloadConfig, addProcessGroup,
@@ -1123,20 +1196,24 @@ devai-tools/cmd/devai-jobs/       new    -- list, show, queue, cancel, node, sub
                                             (basic; Phase 13 completes it)
 bin/devai-jobs                    new    -- `podman exec devai-slurm devai-jobs "$@"` (I13); installed by `make install`
 tests/slurm/Dockerfile.control-test
-                                  new    -- trixie-slim + supervisor + two devai-control processes, so jobs use the
-                                            production subjects and users: one as container `engines` (service
-                                            `fake`: scripts/vram-ballast.py as the engine, whose `load` holds N MiB
-                                            and is "serving" once it prints ready), one as `operator` (service
-                                            `actions`, with a test registry)
+                                  new    -- trixie-slim + supervisor + devai-control. test-slurm.sh runs it as two
+                                            containers, so jobs use the production subjects, users and namespaces:
+                                            devai-control-test-engines (default user namespace, root, the GPU;
+                                            container `engines`, service `fake`: scripts/vram-ballast.py as the
+                                            engine, whose `load` holds N MiB and is "serving" once it prints
+                                            ready) and devai-control-test-operator (keep-id, user devai, no GPU;
+                                            container `operator`, service `actions`, with a test registry); each
+                                            with its own control.yaml
 tests/slurm/test-slurm.sh         new    -- the live checks in the exit criteria; refuses to run while a production
                                             devai-control runs (devai-engines or devai-operator), since both would
-                                            answer the same subjects and match the guard's command-line lookup
+                                            answer the same subjects and match the guard's command-line lookup; starts both
+                                            test containers and removes them afterwards
 tests/python/test_slurm_config.py new    -- static: the C1 table equals nats-server.conf.in; the slurm.conf.in keys and their rendering
                                             above; the compose service has no podman socket and publishes nothing
 tests/python/test_devai_gpu.py    new    -- devai-gpu and the guard's decisions with DEVAI_GPU_FAKE
 deploy/docker-compose.yaml        modify -- service `slurm` (container devai-slurm, hostname devai-slurm, devai-net
-                                            only, pid: host, userns keep-id (I26), the GPU when present, C6/C7
-                                            mounts); profile `slurm`
+                                            only, pid: host, the default user namespace (I26), tmpfs /run/devai,
+                                            the GPU when present, C6/C7 mounts); profile `slurm`
                                             until Phase 9
 Makefile                          modify -- build-slurm, slurm-init, setup-jobs, slurm-up, slurm-down, test-slurm
 scripts/slurm-init.sh             new    -- C7 (the Slurm part)
@@ -1146,7 +1223,7 @@ devai-tools/internal/backup/manifest.go
 
 ### Detailed steps
 
-1. **Open question 2 first.** Build the image and start it unprivileged (`--pid=host`, the GPU), with slurmd on `proctrack/linuxproc`.
+1. **Open question 2 first.** Build the image and start it unprivileged (`--pid=host`, the GPU, podman's default user namespace: I26), with slurmd on `proctrack/linuxproc`.
    - Submit `sleep 600` with `-L engine` and cancel it; check that its process tree is gone.
    - If slurmd refuses to run this way, fall back to the measured setup: `--privileged --cgroupns=private`, the cgroup step in the entrypoint, `cgroup.conf` with `IgnoreSystemd=yes`, `proctrack/cgroup`.
    - Record which setup runs.
@@ -1160,11 +1237,11 @@ devai-tools/internal/backup/manifest.go
    - lease expiry;
    - adopting a running program from the state file after a `devai-control` restart;
    - the permissions (a `jobs` client cannot publish `devai.engines.ollama.restart`);
-   - an `actions` run refused when its parameters break the registry; a run whose process group is signalled and then killed after its grace; a run stopped once its lease lapses; `run` replying on start and `exited` arriving as an event.
+   - an `actions` run refused when its parameters break the registry; a run whose process group is signalled and then killed after its grace; a run stopped once its lease lapses; `run` replying on start and `exited` arriving as an event; a `run` refused after a `stop` for its job; a forced `stop` with `run_job` stopping another job's run, and `not_owner` without `force`; a hold whose parent shell is SIGKILLed exiting within 1 s, and one started with a dead `--parent` exiting at once.
 6. **The guard.** `devai-gpu`, the prolog, the epilog and the health check.
-   - Unit tests with `DEVAI_GPU_FAKE`: idle; a devai holder that unloads; a foreign holder that is killed; a foreign holder of another user (exit 1); the energy delta; a bench or action job, whose prolog and epilog leave the card alone even when it is busy.
+   - Unit tests with `DEVAI_GPU_FAKE`: idle; a devai holder that unloads; a foreign holder that is killed; a foreign holder of another user (exit 1); the energy delta; a bench or action job, whose prolog and epilog leave the card alone even when it is busy; a holder in the operator container whose job is gone (a fake environ carrying `DEVAI_JOB_ID`): a forced `stop` with `run_job`, then a kill; one without `DEVAI_JOB_ID`, treated as foreign; two `devai-control` processes in one cgroup, a configuration error (exit 1); a trainer job, whose epilog sends `cancel`, not `unload`.
    - Live tests on the card, in `test-slurm.sh`.
-   - Mapping an NVML PID to a devai container: compare `/proc/<pid>/cgroup` with that of the `devai-control` process whose command line names the container. Both are read through `--pid=host`.
+   - Mapping an NVML PID to a devai container: compare `/proc/<pid>/cgroup` with that of the `devai-control` process whose command line names the container. Both are read through `--pid=host`. Each container holds exactly one `devai-control`. A holder in devai-operator is matched to its run by the `DEVAI_JOB_ID` in its `/proc/<pid>/environ` (C8 sets it for every `job` action, and children inherit it). devai-slurm's root and devai-operator's devai are the same host uid, so it is readable (untested so far).
    - Check whether 24.11 accepts `scontrol update JobId=<id> AdminComment=...` from the epilog of a completing job. If it does not, the summary stays in `gpu.json`, and Phase 13 reads it from there.
    - Check whether a node drained by a failed prolog keeps a reason that the health check can recognise; otherwise the health check also reads `guard.json`.
 7. **The bus log.** `devai-bus log --dir /var/cache/devai/jobs/bus` writes one JSON line per event, with the receive time.
@@ -1174,13 +1251,18 @@ devai-tools/internal/backup/manifest.go
 
 - After `make setup-jobs slurm-init build-slurm slurm-up`, `sinfo` shows `devai` idle, `sacctmgr show cluster` lists `devai`, and `podman port devai-slurm` lists nothing.
 - A job submitted through slurmrestd from another container on `devai-net`, with a JWT signed by `pkg/slurmrest`, runs, and its JSON comment arrives intact in `sacct`. A second `-L engine` job waits as `PENDING (Licenses)`.
-- Against the test container:
+- Against the test containers:
   - an engine job loads the fake engine (2 GiB held), and `sacct` or `gpu.json` shows the GPU summary;
   - `scancel` unloads it and the card is back at its baseline;
   - when the job script is killed with SIGKILL, the epilog unloads;
   - when the job script is killed and the epilog is switched off (a test switch), the lease unloads within 70 s;
-  - when an action job's script is killed with SIGKILL, the action's process group is stopped within 70 s.
-- `results/<jobid>/` and every file in it belong to the host user, including `action.log` and `result.json` written by the test container's `operator` devai-control (I26).
+  - when an action job's script is killed with SIGKILL, the action's process group is stopped within 70 s;
+  - `scancel` of an action job whose action needs 15 s to stop: the job stays RUNNING or COMPLETING until the action's `exited` event, and a queued `-L bench` job starts only after that; the same for a `scancel` during the `run` request.
+- Ownership and isolation (I26):
+  - In `results/<jobid>/`, the operator test container's devai-control, running keep-id as the host user, writes `action.log` and `result.json`. Every file carries the host user's group, and the host user can read every file and delete the directory.
+  - A job cannot read `slurm.key`, nor signal a process of the host user.
+  - The guard kills a GPU holder that runs as a non-root user in another rootless container.
+- The next engine job's prolog starts only after the previous engine job's epilog has ended. Slurm returns the license only after the epilog, and starts nothing on a node with a completing job (read in the 24.11.5 source; checked here).
 - A foreign VRAM holder (the ballast in a plain container) is killed by the next GPU job's prolog. A foreign holder the guard cannot kill drains the node and the job is held; the health check resumes the node within 60 s of the holder exiting.
 - `devai-bus request devai.engines.fake.restart` restarts the program, and every event lands in `jobs/bus/<date>.jsonl`.
 - Started without the GPU device (`test-slurm.sh` starts it so; the compose switch comes in Phase 11), `devai-slurm` runs, the prolog and the epilog skip NVML, and jobs run.
@@ -1260,7 +1342,8 @@ devai-tools/internal/backup/manifest.go
 tests/python/test_upstream_images.py
                                   modify -- the logger's image leaves the transitional allowlist
 Makefile                          modify -- build-operator, operator-init, operator-up, operator-lock, test-operator; the moved
-                                            recipes call their scripts
+                                            recipes call their scripts; `export DEVAI_REPO := $(CURDIR)` unless Phase 17a
+                                            added it first (I25)
 .env.example                      modify -- OPERATOR_PORT=8443 (WEBUI_PORT left with Open WebUI in Phase 1)
 ```
 
@@ -1279,7 +1362,7 @@ Makefile                          modify -- build-operator, operator-init, opera
 4. **This phase's actions.** Their scripts under `scripts/ops/`, and the Makefile targets calling them.
 5. **The coverage test,** with the `pending` list that Phase 7 empties.
 6. **The probers' imports** are checked against the image's Python (stdlib and PyYAML): this phase already runs probes from it.
-7. **`stack-down` leaves `devai-operator` running**, with its direct runs; it stops every other service. Rebuilding or restarting `devai-operator` itself is a host command (`make operator-up`), which also runs the host check (`scripts/host-gpu.sh`) and passes its result in as `DEVAI_GPU_DEVICE`.
+7. **`stack-down` leaves `devai-operator` running**, with its direct runs; it stops every other service. `stack-up` likewise names every service but `devai-operator`, so neither action ever recreates the container it runs in. Rebuilding or restarting `devai-operator` itself is a host command (`make operator-up`), which also runs the host check (`scripts/host-gpu.sh`) and passes its result in as `DEVAI_GPU_DEVICE`.
 
 ### Exit criteria
 
@@ -1331,6 +1414,7 @@ tests/python/test_makefile_ops.py new    -- every offered target's recipe is one
    - Interactive targets (`lab`, `shell`) become `lab` actions (Phase 12) or are not offered.
    - Host-root targets (`setup-logs`, `setup-jobs`, the volume set-ups) become `host` actions (O3).
    - Targets Phase 1 removed are gone already. `secrets-tmpfs` in O3 went to the attic with sops/age (M12).
+   - `install-systemd` is already broken: its unit runs compose from a copy in `~/.config/devai`, which stages none of six current mounts. Its unit now runs compose in the repository (`WorkingDirectory=<repo>/deploy`), with `--env-file <repo>/.env`, `Environment=DEVAI_REPO=<repo>` (I25) and the override files `make cache-up` would add (`compose.gpu.yaml`, `compose.library.yaml`), since it reads neither the Makefile nor its checks. That also keeps compose's `./` paths away from the key directories under `~/.config/devai` (C7). It becomes a `host` action, since it writes the host user's systemd directory.
 2. Move the recipes group by group: stack and build first (the most used), then models, probe and bench, then tests, logs and maintenance.
 3. For each moved target, run the target before and after and compare what it does: its output, and the files it writes.
 
@@ -1361,7 +1445,7 @@ tests/python/test_makefile_ops.py new    -- every offered target's recipe is one
 gpu-arbiter/pkg/engineargs/       new    -- moved out of main.go with no change in behaviour: LaunchConfig,
                                             VLLMArgs / SGLangArgs (were vllmEntrypoint / sglangEntrypoint), the
                                             speculative helpers, OllamaEnv (was ollamaDynamicEnv), the recovery and
-                                            plugin registries (recovery_flags.go, vllm_plugins.go); FromLoad(C2,
+                                            plugin registries (recovery_flags.go, with 17a's reader of the generated file, I25; vllm_plugins.go); FromLoad(C2,
                                             registries, store, port) -> argv + env; the router passes 11434
                                             (unchanged), devai-control the port from control.yaml
 gpu-arbiter/main.go, recovery_flags.go, vllm_plugins.go
@@ -1400,7 +1484,7 @@ laya-trainer/laya_trainer/run_job.py
                                             devai-control passes that reason
 laya-trainer/laya_trainer/jobs.py modify -- `finalize` entry point for devai-control (changes only a non-terminal record)
 deploy/docker-compose.yaml        modify -- profile `slurm`: service `engines` (devai-engines, the C6 mounts, the GPU
-                                            when present); laya-trainer runs supervisord
+                                            when present); laya-trainer runs supervisord; both run as root (I26)
 tests/slurm/test-engines.sh       new    -- the live checks below; starts the trainer with LAYA_RUN_BY=control, so
                                             the hand-submitted trainer jobs exercise the new path before Phase 9
                                             flips the default
@@ -1412,12 +1496,25 @@ deploy/slurm/prolog.sh, epilog.sh, healthcheck.sh, devai-gpu
                                             and its ballast is sized for the full one. Unit tests for both
 devai-tools/internal/control/nvml.go
                                   new    -- memory readings through nvidia-smi (C1, "Memory readings")
+devai-tools/internal/control/recovery.go
+                                  new    -- the recovery files and the plugin registry re-read at every load (I18, I25)
 ```
 
-**The sleeper's VRAM** (`engine_hf.go`, `engine_ollama.go`). A load on another service while a model sleeps:
+**The sleeper's VRAM** (`engine_hf.go`, `engine_ollama.go`). This covers a load on another service while a model sleeps. The two engines size memory in opposite ways (read in the vLLM 0.28 and SGLang 0.5.16 sources, 2026-10-06):
 
-- vLLM or SGLang: `devai-control` lowers the launch's `mem_fraction` by the sleeper's `used_mib` over the card's total, and records the change in its reply. Not for a model whose recovery flags set the fraction themselves (C2: 9 of the 14 curated entries do, the Qwen3.8 rows among them): for those only the retry below applies.
-- If the load then fails with an out-of-memory signature, `devai-control` unloads the sleeper and loads once more, and says so in its reply. Ollama, whose fit llama.cpp decides, gets only this retry.
+- **vLLM** takes `--gpu-memory-utilization` of the card's total memory, and refuses to start when less than that is free.
+  - `devai-control` lowers it by the sleeper's `used_mib` over the card's total, and records the change in its reply.
+  - Not for a model whose recovery flags set it (C2: 9 of the 14 curated entries do, the Qwen3.8 rows among them). For those only the retry below applies.
+- **SGLang** takes `--mem-fraction-static` of the memory free when it starts, so it starts with a sleeper on the card, and nothing is lowered.
+  - But its KV pool and runtime headroom shrink by about that fraction of the sleeper's `used_mib`.
+  - A pool smaller than the context does not fail the load: SGLang caps the request length instead (`max_req_len = min(context_len - 1, pool - 1)`, 0.5.16 `managers/tp_worker.py`) and refuses longer prompts only when they arrive.
+  - So after an SGLang load while a sleeper exists, `devai-control` reads `max_req_input_len` from the engine's `GET /server_info`. An unconstrained pool reports `ctx - 6`. Anything lower counts as a memory failure (`kv_pool_below_ctx`, both numbers in the reply).
+- **If the load then fails on memory, or an SGLang pool comes up below its context**, `devai-control` unloads the sleeper and loads once more, and says so in its reply. Ollama, whose fit llama.cpp decides, gets only this retry.
+  - A memory failure is recognised by these substrings of the engine's log:
+    - vLLM: `less than desired GPU memory utilization`, `No available memory for the cache blocks`, `larger than the available KV cache memory`;
+    - SGLang: `Loaded weights leave no GPU memory for the KV cache`;
+    - any engine: `CUDA out of memory`, `torch.cuda.OutOfMemoryError`;
+    - Ollama: `cudaMalloc failed: out of memory`.
 - A load on the sleeper's own service never meets this: the new model process replaces the sleeper first.
 
 ### Detailed steps
@@ -1452,12 +1549,17 @@ devai-tools/internal/control/nvml.go
   - a load with another context length restarts `ollama serve`, and `/api/ps` then shows that context;
   - a `/v1/chat/completions` request without `num_ctx` does not make Ollama load the model again (its log shows one load).
 - A sleeping model does not make the next engine job's prolog unload it, and the epilog's idle check tolerates it; a probe job's prolog unloads it.
-- With a vLLM model sleeping, a load on another service starts with its memory fraction lowered by the sleeper's `used_mib`; a load forced to fail with an out-of-memory error (a fraction too large, set in the test) unloads the sleeper and succeeds on the second attempt.
+- The sleeper's VRAM:
+  - with an SGLang model sleeping (if SGLang is kept), a vLLM load starts with its utilization lowered by the sleeper's `used_mib`;
+  - with a vLLM model sleeping (if SGLang is kept), an SGLang load at its probed context reports a `max_req_input_len` of at least ctx - 6, after a retry if the pool came up short, and a prompt filling 99% of that context succeeds;
+  - with a model sleeping, a load forced to fail on memory (a fraction too large, set in the test) unloads the sleeper and succeeds on the second attempt.
+- A recovery file replaced by rename is used by the next load, without restarting `devai-engines`.
 - When `devai-control` is killed while vLLM serves, supervisord restarts it and it adopts the model: `serving`, the same job, the same process.
 - Trainer jobs on the reference dataset `ds-a6c9c8248242`, submitted by hand after the controller created the job:
   - one runs to the end and finishes `succeeded`, with a record shaped as `make laya-check` expects;
   - `scancel` during training ends a job `cancelled`;
   - the time-limit signal ends a job `failed` with `time_limit`.
+- When a trainer job's script is killed with SIGKILL, the epilog's `cancel` ends the run `cancelled`, and the card is idle.
 - With `devai-engines` started without the GPU device (`test-engines.sh` starts it so; the compose switch comes in Phase 11), Ollama loads with `num_gpu: 0`, and a vLLM load is refused with `no_gpu`.
 - `make test-router`, `make test-devai-tools`, `make test-laya-trainer` and `make test-slurm` pass.
 
@@ -1466,7 +1568,7 @@ devai-tools/internal/control/nvml.go
 | Risk | Mitigation |
 | ---- | ---------- |
 | sleep mode costs speed or memory while serving | measured in step 1; if so, it is used only for a launch that a pending job names |
-| a sleeping model leaves too little VRAM for the next load | `devai-control` lowers the next load's memory fraction by the sleeper's `used_mib` (not for a model whose recovery flags set the fraction); if the load still fails, it unloads the sleeper and loads once more |
+| a sleeping model leaves too little VRAM for the next load | for a vLLM load, `devai-control` lowers the utilization by the sleeper's `used_mib`, unless recovery flags set it (SGLang sizes from free memory; an SGLang pool below its context counts as a failure); if a load still fails, it unloads the sleeper and loads once more |
 | the refactor changes an argument | the golden corpus, compared byte for byte |
 | one engine process crashing takes the others down | each is its own supervisord program; only a container restart affects all of them, and the router then submits new jobs |
 
@@ -1515,11 +1617,13 @@ scripts/bench/clean_slate.py, scripts/_probe_hf_common.py (MUTEX_CONTAINERS)
                                   modify -- the legacy paths name devai-engines and need the stack stopped;
                                             removed in Phase 14
 laya-trainer (LAYA_RUN_BY)        modify -- flipped to `control` (Phase 8)
-Makefile (probe, cache-down)      modify -- `make probe`'s legacy Ollama path starts a throwaway `devai-ollama`
-                                            container from devai-engines (`devai-engine ollama serve`, the band's
-                                            environment) with the stack stopped, as the HF probers' legacy path
-                                            does, instead of compose's removed `ollama` service (removed in
-                                            Phase 14); cache-down's list of router-recreated containers goes
+scripts/ops/probe-ollama.sh, Makefile (cache-down)
+                                  modify -- the legacy Ollama probe path (in scripts/ops/probe-ollama.sh since
+                                            Phase 6) starts a throwaway `devai-ollama` container from
+                                            devai-engines (`devai-engine ollama serve`, the band's environment)
+                                            with the stack stopped, as the HF probers' legacy path does, instead
+                                            of compose's removed `ollama` service (removed in Phase 14);
+                                            cache-down's list of router-recreated containers goes
 tests/test-model-matrix.sh        modify -- the forced fresh Ollama load cancels the engine-ollama job
                                             (`bin/devai-jobs cancel`) instead of removing devai-ollama
 tests/test-router-idle.sh         modify -- the idle sweep is checked by the engine job's end and /health, not by
@@ -1545,7 +1649,7 @@ tests/test-router-idle.sh         modify -- the idle sweep is checked by the eng
 4. Otherwise, switch:
    - drain, as `drainBackend` does today;
    - end the holder's job -- `SIGUSR1` when its backend sleeps, a pending job names its launch, and the new launch is on another backend (on the same backend the new model process replaces it anyway); a cancel otherwise;
-   - wait until Slurm reports the job ended (polling every 500 ms, at most 90 s);
+   - wait until Slurm reports the job ended (polling every 500 ms, at most 150 s: longer than the USR1 trap's 120 s `sleep` and `KillWait`'s 30 s). If it has not ended by then, cancel it (harmless after USR1) and submit anyway: the new job waits PENDING (Licenses), since Slurm returns `engine` only after the old job's epilog (Phase 5), and case 5's `gpu_queue` ends the request if the license never comes;
    - submit the new engine job, with `DEVAI_LOAD` = C2 built from `computeLaunchConfig` and the rest of today's resolution;
    - continue as in case 2.
 5. How a launch can end:
@@ -1624,19 +1728,20 @@ deploy/operator/control.yaml      new    -- container `operator`, services `acti
                                             user control-operator
 deploy/docker-compose.yaml        modify -- devai-operator: the control-operator and operator bus passwords, the JWT key
 devai-operator/devai_operator/jobs.py
-                                  new    -- `job` actions submitted through `devai-jobs submit action ... --json`;
+                                  new    -- `job` actions submitted through `devai-jobs submit ... --json` as the job
+                                            kind their entry names (C8);
                                             the queue, history and job pages (job.log, action.log and result.json,
                                             polled); cancel, hold, release, suspend, resume
 devai-operator/devai_operator/registry.py
                                   modify -- `job` and `direct` kinds per O2: stack lifecycle (stack-up, stack-down,
                                             build and restart of devai-slurm) stays direct
-deploy/operator/actions.yaml      modify -- `kind: job` for every non-lifecycle action. Entries: bench-task (license
-                                            bench); the submitters probe-ollama, probe-vllm, probe-sglang,
-                                            probe-load-vllm, probe-load-sglang (license null: they only submit
-                                            probe jobs); and per model probe-ollama-model, probe-vllm-model,
-                                            probe-sglang-model, probe-load-vllm-model, probe-load-sglang-model
-                                            (license engine), which a probe job runs (C3). Like bench and
-                                            bench-task, a submitter never runs a prober itself
+deploy/operator/actions.yaml      modify -- `kind: job` for every non-lifecycle action. Entries: bench-task
+                                            (job_kind bench); the submitters probe-ollama, probe-vllm,
+                                            probe-sglang, probe-load-vllm, probe-load-sglang (job_kind action: they
+                                            only submit probe jobs); and per model probe-ollama-model,
+                                            probe-vllm-model, probe-sglang-model, probe-load-vllm-model,
+                                            probe-load-sglang-model (job_kind probe), each run inside a probe job
+                                            (C3). Like bench and bench-task, a submitter never runs a prober itself
 scripts/ops/bench-task.sh         new    -- the bench-task action: `podman run --label devai.job=$DEVAI_JOB_ID ...
                                             devai-lab /scripts/bench/bench_task.py ...` with the GPU device for NVML
                                             reads and CUDA_VISIBLE_DEVICES= (I12), and $DEVAI_RESULTS_DIR mounted at
@@ -1679,8 +1784,8 @@ devai-operator/devai_operator/engines.py
 1. **`devai-control` in the operator image.** As soon as Phase 6's image exists, `Dockerfile.operator` gains `devai-control` (C8's `actions` kind, from Phase 5) and the app submits `job` actions through `devai-jobs`. An action started from the browser then appears in `devai-jobs list` with its log.
 2. **The probe job.**
    - One probe job per model (per model and band for Ollama). `scripts/ops/probe-*.sh` asks the prober for its targets (`--list-targets`, the prober's own selection) and submits one job each through `devai-jobs submit probe`, in order.
-   - Each job's script (C3) sends `run` for `probe-<backend>-model` with its model, holds that run (`devai-bus hold devai.operator.actions --job $J`), and leases the model the prober loads with its job id (`devai-bus hold devai.engines.$DEVAI_BACKEND --job $J --lease-only`).
-   - The prober loads, measures and unloads inside the job. On TERM the script stops the action and sends a forced `unload`.
+   - Each job runs `probe.sh` as C3 specifies: the model's lease first, then `run` for `probe-<backend>-model` with its model and the run's hold; on TERM, `stop` and wait for the run; then a plain `unload` (the job owns the model) and the lease's end.
+   - The prober loads, measures and unloads inside the job.
    - The prober's request for a cell and `gpu-arbiter -print-load`'s request for the same cell are compared in a test (I1).
 3. **The bench task** (C3, license `bench`).
    - The hold is taken before the first sample, so inspect's clock never runs during a load.
@@ -1706,6 +1811,7 @@ devai-operator/devai_operator/engines.py
   - It covers every pickable row at the context the picker offers, SGLang's included if SGLang is kept.
   - No model trips the launch breaker in a loop while it runs (sglang-backend-remediation's 24-hour soak check).
 - A live `make model-sync` run onboards one new catalog row: download, probe jobs, ledger verdict.
+- A prober left running after its probe job was killed with SIGKILL is stopped by the next GPU job's prolog.
 - `make test-python` (the bench, probe and model-sync tests updated), `make test-devai-tools` and `make test-operator` pass.
 
 ### Phase 10 risks
@@ -1849,7 +1955,7 @@ Only the new path is left, no devai application container has a GPU device, and 
 ### Detailed steps
 
 1. **Router.** Nothing is left to remove: Phase 9 removed the podman launch layer (I10).
-2. **Probers.** Remove the container driver (`container_run_detached` and the functions around it, `MUTEX_CONTAINERS`).
+2. **Probers.** Remove the container driver (`container_run_detached` and the functions around it, `MUTEX_CONTAINERS`), and `scripts/ops/probe-ollama.sh`'s throwaway `devai-ollama` container (Phase 9).
 3. **Bench.** Remove `clean_slate.py`, the deadline path and `--legacy` in `bench-sync.py`, and the `bench-harvest` target. Rewrite `test_bench_clean_slate.py` and `test_bench_deadline.py` for the job path or delete them.
 4. **Images.** Remove `deploy/Dockerfile.ollama` and `deploy/Dockerfile.vllm` (merged into `Dockerfile.engines`).
    - List the retired images with their sizes: the upstream ones and the old `devai-base-cpu`, `devai-lab-cpu`, `devai-base-gpu`, `devai-lab-gpu`, `devai-ollama`, `vllm-devai`.
@@ -1885,10 +1991,26 @@ It runs on today's images: upstream SGLang 0.5.16 is the version Phase 4 would c
 ```
 gpu-arbiter/main.go (sglangEntrypoint)   modify -- emit --enable-metrics (Phase 8 carries it into pkg/engineargs)
 deploy/backend-flags.yaml                modify -- pin --enable-metrics and --disable-radix-cache
-scripts/bench/bench_concurrency.py       modify -- the multi-turn mode reads SGLang's /metrics prefix-cache counters,
-                                                    and a validation mode runs the same workload radix-on and with
-                                                    --disable-radix-cache on one engine
-scripts/bench/sglang_radix_check.py     new    -- the radix-on / radix-off validation (step 2)
+scripts/bench/bench_concurrency.py       modify -- run_multiturn gains `body_fields` (merged into the TOP level of every
+                                                    request, warm-up included; never under an `extra_body` key, which
+                                                    neither engine reads) and `on_turn(i)` (a callback before each
+                                                    measured turn); with neither, it behaves exactly as today.
+                                                    run_multiturn_sessions runs N sessions through it, each salted with a
+                                                    per-run nonce, the engine and the session number, reads SGLang's
+                                                    counters from --metrics-url in on_turn before turn 2 and again after
+                                                    the last turn, and reports the per-session turn-2+ medians; CLI
+                                                    --sessions, --salt-prefix, --metrics-url (I16)
+scripts/bench/sglang_keep_check.py       new    -- the whole measurement (steps 2-3): launches each engine through the
+                                                    probers' container driver, with their command args and recovery
+                                                    flags, at one context and each probe cell's KV dtype (I16), after
+                                                    checking that nothing holds the card (assert_no_active_backends);
+                                                    steady TTFT and the sessions on each, SGLang also with
+                                                    --disable-radix-cache; I16's statistics with scripts/stats/statlib.py;
+                                                    a JSON report that M16 cites. Removed again after M16 (step 4)
+Makefile                                 modify -- bench-concurrency passes SESSIONS, SALT_PREFIX, METRICS_URL;
+                                                    sglang-keep-check (removed with the script)
+deploy/operator/actions.yaml             modify -- once Phase 6 has landed, sglang-keep-check in `not_offered`: a one-shot
+                                                    measurement for M16, run with the stack down
 gpu-arbiter/testdata/argv-golden.txt     modify -- regenerated for --enable-metrics
 scripts/probe-sglang-reasoning.py (sglang_command_args)
                                          modify -- --enable-metrics, as the router's argv; a --disable-radix-cache
@@ -1905,13 +2027,21 @@ docs/plans/platform-rebuild.md           modify -- the decision, its thresholds 
 
 ### Detailed steps
 
-1. **The baseline (I15).** Probe Qwen3.5-9B-NVFP4 on vLLM 0.28 (`make probe-vllm-devai PROBE_REPO=...`); it already fits SGLang. If it does not fit vLLM 0.28, gpt-oss-20b takes its place: its weights are in both stores and it fits SGLang (131,072 tokens on 2026-10-05). The keep thresholds and their measurement are I16, recorded before any run.
-2. Emit `--enable-metrics` and pin it. Validate the multi-turn scorer radix-on against `--disable-radix-cache` on the same engine before trusting any cross-backend number. The radix-off engine is launched outside the router, with the router stopped: `scripts/bench/sglang_radix_check.py` starts SGLang through the probers' container driver, with `sglang_command_args` (which emits `--enable-metrics` as the router does from this phase, and `--disable-radix-cache` for the radix-off run), and runs the multi-turn workload against it directly (`make bench-concurrency MODE=multiturn` is the workload; it gains the cache-hit read-out).
-3. Measure on one checkpoint served by both engines, as I16 defines it: steady TTFT, turn-2+ TTFT on an identical multi-turn workload, and SGLang's engine-reported cache hit rate; MTP off on both.
+1. **The baseline (I15).** Probe Qwen3.5-9B-NVFP4 on vLLM 0.28 (`make probe-vllm-devai PROBE_REPO=...`); it already fits SGLang. If it does not fit vLLM 0.28, gpt-oss-20b takes its place after the same probe (neither has run on vLLM 0.28 yet): its weights are in both stores and it fits SGLang (131,072 tokens on 2026-10-05). If gpt-oss-20b does not load on vLLM 0.28 either, Gemma-4-26B-A4B-it-NVFP4 is tried the same way: its weights are in both stores, it fits SGLang (262,144 tokens, with its SGLang recovery flags), and its thinking is opt-in, so the reasoning-off body needs nothing more. If none of the three loads, Phase 15 measures nothing: SGLang is frozen by default, since I16 cannot be met without a baseline on the surviving vLLM (M4). M16 records the three failed probes, and the operator may overrule it. The keep thresholds and their measurement are I16, recorded before any run.
+2. Emit `--enable-metrics` and pin it. The engines are launched outside the router, with the whole stack down (`make cache-down`; the check calls `assert_no_active_backends` before its first launch, as the probers do, because stopping only the router leaves Ollama's warm model or an engine on the card): `scripts/bench/sglang_keep_check.py` starts each through the probers' container driver -- SGLang with `sglang_command_args` (which emits `--enable-metrics` as the router does from this phase, and `--disable-radix-cache` for the radix-off run), vLLM 0.28 with the vllm-devai prober's arguments -- and runs the workload against it directly: the multi-turn sessions of `bench_concurrency.py`, with the cache-hit read-out. Before the measured run, an uncounted dry run checks the instrument: SGLang radix-on, 2 sessions, whose turns 2-5 must show a non-zero hit rate. Zero means the workload does not reuse prefixes: the scorer is fixed and the dry run repeated, before any measured run (I16).
+3. Measure on one checkpoint served by both engines, exactly as I16 defines it (the same check script; MTP and reasoning off, no tools, one context): steady TTFT, turn-2+ TTFT over salted sessions, and SGLang's engine-reported cache hit rate.
 4. Decide, and record it as M16:
    - **keep:** Phase 4 builds SGLang as planned;
-   - **freeze:** Phase 4 skips steps 4a-4b and SGLang's stage in `Dockerfile.engines`; `sglang` leaves `_PICKER_BACKENDS` and the make targets; its router code goes behind a Go build tag, and its prober (`scripts/probe-sglang-reasoning.py`) and SGLang-only tests move to `attic/sglang/`, with a `RESTORE.md`, following the `attic/` precedent. The fixes from sglang-backend-remediation's Phases 1-3 stay: most of them serve vLLM too. Every mention of SGLang in Phases 4-14, 18 and 19 and in C1, C2, C5, C6 and C7 then lapses, and exit criteria that name SGLang read "if kept". The `RESTORE.md` carries the SGLang plan's open questions.
+   - **freeze:** Phase 4 skips steps 4a-4b and SGLang's stage in `Dockerfile.engines`; `sglang` leaves `_PICKER_BACKENDS` and the make targets; its entry leaves the router's backend table together with the then-unused `sglangURL`, so its router code stays but is unreachable (checked on a copy: the router builds and `go test` passes, 2026-10-06). Its prober (`scripts/probe-sglang-reasoning.py`) and its Python tests move to `attic/sglang/`, with a `RESTORE.md`, following the `attic/` precedent. Everything else that lists `sglang` as a backend drops it in the same change, so nothing points at a dead port:
+     - `scripts/model-sync.py`: its `make probe-sglang` step;
+     - `scripts/bench-sync.py`: `BACKENDS`;
+     - `scripts/bench/bench_runner.py`: its backend choices, and the SGLang bench target;
+     - `scripts/select-models.py`: the SGLang store-gap check;
+     - `scripts/model-picker.py`'s `_BACKENDS`, and the `router-sglang` entries in config/codex/config.toml and config/opencode/opencode.json, so no agent keeps the provider.
+
+     Check: `make model-sync DRY_RUN=1` and `make bench-plan` name no SGLang step or row. The fixes from sglang-backend-remediation's Phases 1-3 stay: most of them serve vLLM too. Every mention of SGLang in Phases 4-14, 16, 18 and 19 and in C1, C2, C5, C6 and C7 then lapses, and exit criteria that name SGLang read "if kept". The `RESTORE.md` carries the SGLang plan's open questions.
    - Either way, M16 records the unexplained Qwen3.5-9B HumanEval result (0.86 on SGLang against 0.68 on vLLM, same checkpoint).
+   - Either way, once M16 is recorded, `scripts/bench/sglang_keep_check.py` and its target are removed. Git keeps them, and M16 cites the report and the commit. It is a one-time measurement, built on the vllm-devai prober (removed in 4e), the SGLang prober and the container driver (removed in Phase 14).
 5. Correct every prose site named above, and regenerate or delete `docs/html/`: a published page with a wrong capability claim is worse than none.
 6. Gate Codex off SGLang in the picker.
 
@@ -1925,7 +2055,8 @@ docs/plans/platform-rebuild.md           modify -- the decision, its thresholds 
 
 | Risk | Mitigation |
 | ---- | ---------- |
-| the multi-turn scorer measures something other than prefix reuse | step 2's radix-on versus radix-off validation on one engine |
+| the multi-turn scorer measures something other than prefix reuse | step 2's uncounted dry run (a non-zero hit rate) before the measured run |
+| no baseline loads on vLLM 0.28 | the three-candidate order in step 1; freeze by default, recorded in M16 |
 | the measurement needs a GPU window | it is short (one checkpoint, two engines) and replaces part of Phase 4a's cost if the answer is freeze |
 
 ---
@@ -1989,7 +2120,18 @@ docs/router.md                      modify -- the fingerprint runbook; short-cir
 
    Matcher keys: `max_tokens_eq`, `single_user_message`, `content_contains_any`, `user_content_contains_any`, `system_contains_all`, `system_contains_any`, `body_contains_all`; every declared key must hold. The patterns mirror free-claude-code's and are calibrated against the 16a fixtures before the registry is enabled.
 3. **16c -- Local-parse answers.** `prefix_detection` (markers `<policy_spec>` and `Command:`) and `filepath_extraction` (`Command:` and `Output:` plus a file-path marker), answered by pure functions (`respond.kind` `command_prefix` and `filepaths`) ported from free-claude-code's `extract_command_prefix` / `extract_filepaths_from_command` and pinned by the fixtures. An empty extraction falls through.
-4. **16d -- count_tokens, optional.** Only if 16a shows Claude Code calling `/v1/messages/count_tokens` against the router. Delegate to the serving engine's `/tokenize` (after Phase 9, in `devai-engines`), and only while the requested model's engine is serving. Otherwise the router answers 503 `count_tokens_unavailable` itself and does not forward the request: forwarding would start the engine, since any POST that names a model goes through `ensureBackendRunning` (after Phase 9, Ensure). Never answer with an approximation: a wrong count drives wrong compaction. Otherwise record it as shelved, with the reason.
+4. **16d -- count_tokens, optional.** Only if 16a shows Claude Code calling `/v1/messages/count_tokens` against the router; otherwise record it as shelved, with the reason.
+   - **Forward it to the engine.** vLLM 0.28 and SGLang 0.5.16 serve that route themselves and count the fully rendered chat template, so the count is exact (read in both sources, 2026-10-06).
+     - The router forwards it only when the request would be proxied without any launch. After the suffixes are peeled, the loaded launch (model, context, speculative spec) must be exactly this one, and serving: Ensure case 1, or before Phase 9 `bs.running` with the same `currentModel`, `currentContext` and spec.
+     - It then calls the proxy directly, never `ensureBackendRunning` or Ensure, so a count can neither start nor switch anything.
+     - First it runs the `/v1/messages` rewrite chain unchanged -- the system-message fold and `applyHFAnthropicMessagesPolicy` -- behind a path check that accepts both paths.
+       - Under DISABLE that sends vLLM `chat_template_kwargs.enable_thinking=false` and SGLang `thinking: {type: disabled}`.
+       - Under ENABLE or noop it drops `thinking` on SGLang; without the drop, a row with no reasoning parser answers 400.
+       - vLLM's count ignores `output_config`, so on vLLM the router also passes the policy's effort as `chat_template_kwargs.reasoning_effort`.
+       - SGLang's count request has no `chat_template_kwargs`, so an explicit effort cannot be carried there. The count then uses the template's default effort, which is what `/v1/messages` gets under `auto`.
+   - **Not serving, or another model or context loaded:** the router answers 503 `count_tokens_unavailable` itself and does not forward. Forwarding would start or switch the engine, since any request that names a model goes through `ensureBackendRunning` (after Phase 9, Ensure).
+   - **Ollama** v0.34.2 has no such route: on its port the router answers 404 `count_tokens_unsupported`.
+   - Never an approximation: a wrong count drives wrong compaction.
 5. **16e -- Guard leftovers.** Block `/api/blobs/` like the other store-changing Ollama paths (the original Phase 5 planned it; the shipped guard does not), and document the guard in docs/router.md.
 
 ### Exit criteria
@@ -1998,7 +2140,7 @@ docs/router.md                      modify -- the fingerprint runbook; short-cir
 - Replayed fixtures return the correct canned answers, byte-validated against the golden JSON and SSE, and a normal chat, a summarisation-style request and a tool-call request all fall through.
 - With the feature off (the default), the request path is byte-identical to today.
 - Removing a required marker from a fixture flips it to fall-through.
-- count_tokens matches the engine's tokenizer on the fixtures, and answers 503 `count_tokens_unavailable` without submitting a job when the model is not being served; or it is recorded as shelved.
+- count_tokens returns the engine's own count on the fixtures (vLLM and SGLang), equal to the prompt tokens the engine reports for the same `/v1/messages` body under `auto` and under `::nothink`. It answers 503 `count_tokens_unavailable`, with the loaded model untouched, when another model or context is loaded or nothing is, and 404 `count_tokens_unsupported` on the Ollama port. Or it is recorded as shelved.
 - `/api/blobs/` answers 403 on every listener; `make test-router` passes.
 
 ### Phase 16 risks
@@ -2035,31 +2177,57 @@ deploy/recipe-seeds.yaml          new    -- 17a's output, one entry per catalog 
                                             writer, catalog-discover-add
 scripts/recipe-apply.py           new    -- `make recipe-apply NAME=<row>`: after review, writes a row's recipe flags into
                                             deploy/recovery-flags.generated.json (I25) as one group with
-                                            `backends: ["vllm"]` and `"source": "recipe"`, only where min_vllm_version
-                                            admits vLLM 0.28.0 (D8). Only flags outside C2: a recipe flag that sets a
-                                            launch setting (--max-model-len, --kv-cache-dtype, --gpu-memory-utilization,
-                                            --max-num-seqs, the parser flags, --speculative-config) is reported and
-                                            never written, since the last flag wins and it would pin every launch (I18)
+                                            `"source": "recipe"`, only where min_vllm_version admits vLLM 0.28.0
+                                            (D8), scoped to the backend that runs 0.28: `vllm-devai` before Phase
+                                            4e, `vllm` after (backends match by engine, so a ["vllm"] group before
+                                            4e would also reach stock 0.22.1; 4e rewrites the groups written
+                                            before it). It writes only flags the argument builders never emit and
+                                            reports the rest, since the last flag wins and such a flag would pin
+                                            every launch (I18). The excluded set: every flag in
+                                            gpu-arbiter/testdata/argv-golden.txt except what a case injects as
+                                            RecoveryFlags (today only --enforce-eager, which stays writable: I18's
+                                            own example), plus the speculative flags (vLLM --speculative-config;
+                                            SGLang --speculative-algorithm, -num-steps, -num-draft-tokens,
+                                            -eagle-topk, -draft-model-path) and the sleep flags
+                                            (--enable-sleep-mode, --enable-memory-saver). Tested: --enforce-eager
+                                            written, --max-model-len reported
 deploy/recovery-flags.generated.json
                                   new    -- `{"version": 1, "models": {}}` (I25)
 gpu-arbiter/recovery_flags.go, scripts/_probe_hf_common.py
-                                  modify -- read deploy/recovery-flags.generated.json after the curated file (I25);
+                                  modify -- read deploy/recovery-flags.generated.json after the curated file, and
+                                            re-read both at each launch when either changed (the router reads its
+                                            registry once, at boot, today) (I25);
                                             tests: a group applies only to its backends, and removing it reverts
                                             exactly its flags. _probe_hf_common.py also gets the parser order
                                             below: recipe-seeds.yaml as a seed, `recipe` as a `tool_parser_source`
                                             value, the name heuristic, and I24's switch skipping both
-deploy/docker-compose.yaml        modify -- the router mounts deploy/ read-only as a directory instead of its two
-                                            single files, so it reads the generated file and sees a rewrite (until
-                                            Phase 9 it still builds the engines' argv)
-scripts/_fit_estimate.py          new    -- 17b: estimate_memory_gb (reusing catalog-discover's KV term), a bandwidth-bound
-                                            decode estimate keyed by the GPU's name (`nvidia-smi --query-gpu=name`;
-                                            DEVAI_GPU_TYPE overrides it, documented in .env.example), quant quality and speed tables
+deploy/docker-compose.yaml        modify -- the router mounts ${DEVAI_REPO}/deploy read-only at /etc/devai/deploy and
+                                            reads both recovery files there, so it sees a rewrite (until Phase 9 it
+                                            still builds the engines' argv); DEVAI_REPO as I25 says
+scripts/_fit_estimate.py          new    -- 17b: estimate_memory_gb, with the KV-at-context term moved here from
+                                            scripts/catalog-discover.py; a bandwidth-bound decode estimate keyed by
+                                            the GPU's name (on the host `nvidia-smi --query-gpu=name`, which
+                                            DEVAI_GPU_TYPE overrides; in the picker, the bench cache's); quant
+                                            quality and speed tables. It imports only the stdlib and yaml
+scripts/catalog-discover.py       modify -- imports its KV term (estimate_kv_gb) from _fit_estimate
 scripts/select-models.py          modify -- `make model-rank` (tiers perfect / good / marginal / too_tight; VRAM= override)
-Makefile                          modify -- fetch-vllm-recipes, recipe-apply, model-rank
+Makefile                          modify -- fetch-vllm-recipes, recipe-apply, model-rank; export DEVAI_GPU_TYPE
 .env.example                      modify -- DEVAI_GPU_TYPE
-deploy/operator/actions.yaml      modify -- once Phase 7 has landed: recipe-apply and model-rank, each a `job` action
-                                            with a scripts/ops/ script (Phase 7's coverage test needs both)
-scripts/model-picker.py           modify -- a recipe badge next to TOOLS; a labelled `est` value only in empty cells
+deploy/operator/actions.yaml      modify -- once Phase 7 has landed: fetch-vllm-recipes, recipe-apply and model-rank,
+                                            each a `job` action with a scripts/ops/ script (Phase 7's coverage test
+                                            needs all three)
+scripts/model-picker.py           modify -- a recipe badge next to TOOLS; a labelled `est` value only in empty cells;
+                                            the GPU's name from the bench cache (_meta.host_env_history, mounted
+                                            already; the lab has no GPU after Phase 14), and no estimate when that
+                                            names no GPU or one the table lacks (DEVAI_GPU_TYPE is for the host
+                                            tools only: it reaches neither the lab nor devai-agent); _fit_estimate
+                                            imported optionally, so a newer picker still starts in an older image
+deploy/Dockerfile.lab, bin/devai-agent, Makefile (install, uninstall), tests/python/test_picker_container_imports.py
+                                  modify -- _fit_estimate.py co-located with the picker at /usr/local/bin and listed
+                                            in CO_LOCATED, with a test that imports it beside the picker and the
+                                            CO_LOCATED files alone; deploy/recipe-seeds.yaml at /etc/devai, baked by
+                                            Dockerfile.lab like models.yaml and overmounted by devai-agent (staged
+                                            by make install)
 docs/llm-tokens-and-speed.md      modify -- cross-link the estimator to the derivation
 tests/python/test_fit_estimate.py, test_vllm_recipes.py
                                   new    -- tables, tiers, offline behaviour, the version gate
@@ -2095,7 +2263,7 @@ From odysseus-borrowed-ideas, CB-2. Its odysseus regex table was read by an agen
 
 ### Goal
 
-A failed model launch comes back with a diagnosis and a concrete fix, and a probe that fails on a recognised signature retries once with that fix applied and recorded. Built on the new launch path, so it waits for Phases 8 and 10: today's hook points (`detectLaunchFailure`, the probers' container code) are removed by Phases 9 and 14. It writes its fixes into the generated recovery file, whose readers Phase 17a adds (I25).
+A failed model launch comes back with a diagnosis and a concrete fix, and a probe that fails on a recognised signature retries once with that fix applied and recorded. Built on the new launch path, so it waits for Phases 8 and 10: today's hook points (`detectLaunchFailure`, the probers' container code) are removed by Phases 9 and 14. It writes its fixes into the generated recovery file, which Phase 17a's readers and `devai-control` (since Phase 8) re-read at every launch (I25).
 
 ### Deliverables
 
@@ -2104,35 +2272,35 @@ devai-tools/internal/diagnose/    new    -- the error-signature -> fix table (KV
                                             or missing tool-call parser, trust-remote-code, lm_head quantisation,
                                             port in use, missing dependency, gated repository), each fix marked
                                             `applicable` (a flag safe to append) or `report` (I18); table-driven tests
-devai-tools/internal/control/     modify -- a load_failed error carries `diagnosis {message, suggestions:[{op, flag,
-                                            value}]}` (an additive field on C1's error object)
+devai-tools/internal/control/     modify -- a load_failed error carries `diagnosis {message, suggestions:[{kind, op,
+                                            flag, value}]}`, an additive field on C1's error object: `kind` is
+                                            `applicable` or `report` (I18), `op` is `append`, `replace` or
+                                            `remove`, and an applicable suggestion is always an `append`
 gpu-arbiter/slurm_launch.go       modify -- the 502 for a failed load carries the diagnosis, and X-DevAI-Warning names it
-scripts/_probe_hf_common.py       modify -- the bus driver retries a load once with an `applicable` fix (I18): it adds
+scripts/_probe_hf_common.py       modify -- the bus driver retries a load once with the first suggestion of `kind` `applicable` (I18): it adds
                                             a group to that model's list in deploy/recovery-flags.generated.json
                                             (I25) -- `backends` = the failing backend, `"source": "auto-fix"`, the
                                             diagnosis as `reason` -- logged and attributed; `report` suggestions go
                                             into the cell's evidence
-devai-tools/internal/control/recovery.go
-                                  new    -- both recovery files re-read on every load (I18, I25)
-devai-tools/internal/control (fake kind)
-                                  modify -- appends the model's recovery flags to the fake engine's arguments, as
-                                            the engine kinds do
-tests/slurm/fake-oom-engine.py    new    -- for the test container's `fake` service: prints a captured vLLM
-                                            CUDA-graph OOM log and exits 1 unless its arguments carry
-                                            --enforce-eager; otherwise holds memory as the ballast does
+tests/python/test_probe_autofix.py
+                                  new    -- the retry without a GPU: the prober's bus driver against a stub
+                                            devai-control that answers load_failed with a synthetic CUDA-graph OOM
+                                            log tail (tests/fixtures/vllm/cuda-graph-oom.synthetic.log: no real case
+                                            exists), then serving once the auto-fix group is in the generated file
 ```
 
 ### Detailed steps
 
-1. Port the signature table from odysseus's `routes/cookbook_helpers.py:1208-1381` after re-reading it, and pin it with captured failure logs (`tests/fixtures/sglang/` and the vLLM failure fixtures).
+1. Port the signature table from odysseus's `routes/cookbook_helpers.py:1208-1381` after re-reading it, and pin it with failure logs: `tests/fixtures/sglang/argparse-rejection.log`; new `tests/fixtures/vllm/` files cut from the persisted engine logs (`/var/cache/devai/logs/devai-vllm*.log`) and the strings `tests/python/test_probe_classify.py` already holds; and, for a signature with no captured case (the CUDA-graph OOM), a synthetic excerpt whose first line says so. Add the memory signatures Phase 8 recognises (vLLM's `less than desired GPU memory utilization` and `larger than the available KV cache memory`, SGLang's `Loaded weights leave no GPU memory for the KV cache`): today's router list has only `No available memory for the cache blocks`, so the router reports such failures as the generic `Engine core initialization failed`.
 2. Mark each fix `applicable` or `report` (I18).
 3. Wire the diagnosis into `devai-control`'s `load_failed`, the router's 502 and the prober's evidence.
-4. Add the one-shot retry to the probers' bus driver; `devai-control` re-reads the recovery registry on every load.
+4. Add the one-shot retry to the probers' bus driver (`devai-control` re-reads the recovery files at every load since Phase 8).
 
 ### Exit criteria
 
-- A probe that fails on a CUDA-graph OOM is diagnosed, gets `--enforce-eager` in a new group of the generated recovery file (`backends` = its backend, `source` = `auto-fix`), and passes on the second attempt. No model on disk is known to fail this way -- every curated `--enforce-eager` entry belongs to a model whose weights are not on disk, and I17 rules out downloads -- so this runs against the test container's `fake` service with `tests/slurm/fake-oom-engine.py`; a live run waits for a real case.
-- A change to the generated recovery file, written by rename, reaches the next load without restarting `devai-engines`.
+- A probe that fails on a CUDA-graph OOM is diagnosed, gets `--enforce-eager` in a new group of the generated recovery file (`backends` = its backend, `source` = `auto-fix`), and passes on the second attempt.
+  - No model on disk is known to fail this way: every curated `--enforce-eager` entry belongs to a model whose weights are not on disk, and I17 downloads nothing.
+  - So `test_probe_autofix.py` shows the retry, and Phase 8's exit criteria show `devai-control`'s re-read. A live run waits for a real case.
 - A probe launched with a deliberately too-large context fails, is diagnosed as "context too large / KV OOM", and its evidence carries the suggestion; nothing is applied.
 - A failure that matches no signature is reported verbatim: no silent wrong fix.
 - The retry is capped at one attempt per probe.
@@ -2181,7 +2349,7 @@ docs/fanout.md                    new    -- lanes, directives, agent recipes (Cl
    prefix: "@@"            # the directive marker (configurable)
    default_lane: chat
    lanes:                  # each lane: backend, model, optional ctx, reasoning, mtp
-     chat:   { backend: ollama, model: "qwen3.5:9b-q8_0" }
+     chat:   { backend: ollama, model: "qwen3.5:35b-a3b-ud-q3_k_xl" }
      code:   { backend: vllm,   model: "gpt-oss-20b", ctx: 65536 }
      reason: { backend: vllm,   model: "Qwen3.5-9B-NVFP4", reasoning: high }
    aliases:                # model-field value -> lane (an agent's slots)
@@ -2217,7 +2385,7 @@ From library-service. aiagent decides what to search, what to fetch and what to 
 
 The field-level API contract is aiagent's `docs/design/library-service-needs.md` (devitops-com/aiagent), adopted with three explicit adjustments (see API below). The owner's decisions are LS1-LS30 above. The design was reviewed adversarially before the owner saw it (48 confirmed findings, all addressed). Nothing is implemented.
 
-It needs Phase 2 (the pinned Debian image, pipelock and apt-cache built here) and Phase 3 (`devai-base` on Debian). It needs no GPU and no Slurm: none of its containers is a router backend. Its Makefile targets join the operator's registry (C8), with `scripts/ops/` scripts, once Phase 7 has landed; before that they go into C8's `pending` list. Sub-phases 20.1-20.5 run in order; 20.3 needs aiagent's side.
+It needs Phase 2 (the pinned Debian image, pipelock and apt-cache built here), Phase 3 (`devai-base` on Debian) and Phase 6 (`devai-operator`: its `LIBRARY_DIR` mount, `make operator-up`, the stack page). Phase 12's `lab-start.sh` gets the `/library` mount once both have landed. It needs no GPU and no Slurm: none of its containers is a router backend. Its Makefile targets join the operator's registry (C8), with `scripts/ops/` scripts, once Phase 7 has landed; before that they go into C8's `pending` list. Sub-phases 20.1-20.5 run in order; 20.3 needs aiagent's side.
 
 ### Needs
 
@@ -2294,13 +2462,13 @@ robots.txt is parsed with Protego and fetched by the service's own wrapper, foll
 - A job-creating request whose every named source is stopped answers 503 `unavailable` with `error.details.cause`.
 - A request naming a stopped source and a working one is accepted (202): the stopped source reports a per-source `error` in the search results, and fetch items that need a stopped source end promptly as `failed` with `upstream_unavailable`, still fetchable. The cause is always in `error.details.cause`, on 503 answers, per-source errors and per-item failures alike.
 - A running job whose source stops meanwhile gives `eta: {basis: unknown, reason: source_down}`, and its remaining items for that source end the same way.
-- Clearing a denial breaker, or recording the arXiv contact, is an explicit operator command, recorded under `state/`: `devai-library-admin breaker-clear <provider>` and `devai-library-admin arxiv-contact-recorded`, run inside `devai-library` and offered as C8 actions of kind `job` in the `library` group (license null; each runs `podman exec devai-library devai-library-admin ...`). Alerts -- an opened denial breaker, the first 429 from a host -- are appended to `state/alerts.jsonl` and listed under `alerts` in `/health`; the operator's stack page shows them. Counters that must survive a restart (daily budgets, the arXiv total, breaker state) live under `state/`.
+- Clearing a denial breaker, or recording the arXiv contact, is an explicit operator command, recorded under `state/`: `devai-library-admin breaker-clear <provider>` and `devai-library-admin arxiv-contact-recorded`, run inside `devai-library` and offered as C8 actions of kind `job` in the `library` group (job_kind action; each runs `podman exec devai-library devai-library-admin ...`). Alerts -- an opened denial breaker, the first 429 from a host -- are appended to `state/alerts.jsonl` and listed under `alerts` in `/health`; the operator's stack page shows them. Counters that must survive a restart (daily budgets, the arXiv total, breaker state) live under `state/`.
 
 #### Configuration
 
 - **`LIBRARY_DIR` in `.env`**, set once (LS15). Compose and the Makefile read it from `.env`. `bin/devai-agent` does not read `.env` by design, so `make install` stages it as `~/.devai/library`, a symlink to the directory, exactly as it stages the probe caches; the launcher mounts it and prints a warning naming `make install` when it is missing. A test checks that compose, the Makefile and the launcher resolve the same path.
-- **Optional everywhere except in the service.** The lab mounts `/library` (read-only) only when the library is configured, as it mounts `/laya` only when that exists. `devai-library`, `devai-library-extract`, `devai-grobid` and devai-operator's `LIBRARY_DIR` mount live in `deploy/compose.library.yaml`, which `make cache-up`, `make operator-up` and the stack-up action add only when `LIBRARY_DIR` is set, as `deploy/compose.gpu.yaml` is added only on a host with a GPU (Phase 11). A profile with an inert default would not do: devai-operator runs all the time and is in no profile, and podman refuses a bind mount whose source does not exist. Without the file, compose never sees the variable. A host that starts the stack without `.env` (the systemd unit, where installed) simply runs without the library.
-- **Three checks, no more (LS15).** `make cache-up` and the service check that `LIBRARY_DIR` is an absolute path, that the directory exists, and that it is readable and writable; a failure refuses the library's start and names the requirement that failed. Nothing creates the directory, and nothing checks where it lives, whether it is its own volume, its filesystem or its free space. The service's containers run with the owner's host uid, so the owner's read and write permission is all they need. On its first start in a directory the service writes `LAYOUT.json` (the layout version) and its own top-level directories beside whatever is already there, and it never touches a file it did not write.
+- **Optional everywhere except in the service.** The lab mounts `/library` (read-only) only when the library is configured, as it mounts `/laya` only when that exists. `devai-library`, `devai-library-extract` and `devai-grobid` live in `deploy/compose.library.yaml`, which `make cache-up` and the stack-up action add only when `LIBRARY_DIR` is set, as `deploy/compose.gpu.yaml` is added only on a host with a GPU (Phase 11). devai-operator's own `LIBRARY_DIR` mount lives in `deploy/compose.operator-library.yaml`, which only `make operator-up` adds: the stack-up action runs inside devai-operator and must never recreate it (Phase 6). That file also sets `DEVAI_OPERATOR_LIBRARY_DIR` in devai-operator; after setting or changing `LIBRARY_DIR`, run `make operator-up` once. A profile with an inert default would not do: devai-operator runs all the time and is in no profile, and podman refuses a bind mount whose source does not exist. Without these files, compose never sees the variable. A host that starts the stack without `.env` (the systemd unit, where installed) simply runs without the library.
+- **Three checks, no more (LS15).** `scripts/ops/stack-up.sh` (behind both `make cache-up` and the stack-up action) and the service check that `LIBRARY_DIR` is an absolute path, that the directory exists, and that it is readable and writable; a failure refuses the library's start and names the requirement that failed. Inside devai-operator, stack-up.sh first compares `.env`'s `LIBRARY_DIR` with `DEVAI_OPERATOR_LIBRARY_DIR`. When they differ, it refuses the library with "LIBRARY_DIR is not mounted in devai-operator: run make operator-up", and starts the rest of the stack. Nothing creates the directory, and nothing checks where it lives, whether it is its own volume, its filesystem or its free space. The service's containers run with the owner's host uid, so the owner's read and write permission is all they need. On its first start in a directory the service writes `LAYOUT.json` (the layout version) and its own top-level directories beside whatever is already there, and it never touches a file it did not write.
 - **`LIBRARY_CONTACT`** in `.env`: the contact address (LS21). Unset, the service answers but makes no external request.
 
 #### The store (`LIBRARY_DIR`)
@@ -2404,7 +2572,7 @@ Each key the library uses is a plain file the owner writes once into `~/.config/
 **Goal:** a running service that searches arXiv and fetches PDFs and HTML politely, stages English text units, and records verdicts, with jobs, progress and ETA.
 
 **Deliverables:**
-- Configuration: `LIBRARY_DIR` and `LIBRARY_CONTACT` in `.env.example`; `deploy/compose.library.yaml`, added by `make cache-up`, `make operator-up` and `scripts/ops/stack-up.sh` when `LIBRARY_DIR` is set; `make install` staging `~/.devai/library`; the optional lab mount in the Makefile, `bin/devai-agent` and Phase 12's `scripts/ops/lab-start.sh`, with `devai-library` in both NO_PROXY lists; `LIBRARY_DIR` among devai-operator's path-identity mounts (C6), so `make cache-up`'s checks work from there; `~/.config/devai/library/` in devai-backup's manifest; LS15's three checks in `make cache-up` and the service.
+- Configuration: `LIBRARY_DIR` and `LIBRARY_CONTACT` in `.env.example`; `deploy/compose.library.yaml`, added by `make cache-up` and `scripts/ops/stack-up.sh`, and `deploy/compose.operator-library.yaml`, added by `make operator-up`, each only when `LIBRARY_DIR` is set; `make install` staging `~/.devai/library`; the optional lab mount in the Makefile, `bin/devai-agent` and Phase 12's `scripts/ops/lab-start.sh`, with `devai-library` in both NO_PROXY lists; `LIBRARY_DIR` among devai-operator's path-identity mounts (C6), so the stack-up action's checks and the alerts listing work from there; `~/.config/devai/library/` in devai-backup's manifest; LS15's three checks in `make cache-up` and the service.
 - Images and services: `deploy/Dockerfile.library` and `deploy/Dockerfile.library-extract` (hash-locked, on `devai-base`), `deploy/Dockerfile.grobid` (LS29), `devai-library`, `devai-library-extract`, `devai-grobid`, the `devai-library-internal` network; `make build-library`, `make build-grobid`, `make test-library`, `make library-init` (LS30); each a C8 action once Phase 7 has landed, `library-init` of kind `host`.
 - `deploy/library-sources.yaml` with the arXiv rate groups; the politeness engine, the RFC 9309 wrapper with the stricter 4xx rule, the redirect and address checks, the breakers, the stops, recognition of pipelock's responses.
 - The store: layout, append-only records and their fold, alias resolution with a single writer, tombstones, the maintenance job (staging TTL, and the 30-day trash of revoked items, LS28).
@@ -2418,6 +2586,7 @@ Each key the library uses is a plain file the owner writes once into `~/.config/
 **Exit criteria:**
 - Unit tests with a fake upstream: intervals and crawl delays per rate group (search and OAI-PMH never overlap); 429 and 503 with and without `Retry-After` (a wait, never a breaker); sustained 429s (the self-clearing overload pause) and an origin 403 (the denial breaker, cleared only by the operator); a fake pipelock block that must not open arXiv's breaker; robots outcomes (`robots_disallowed`, `robots_denied`, `robots_unreachable`, 404 as allow) and the LS5 exemption; the stops' 503 and per-source error shapes; a cross-host redirect and a redirect to an internal name, both refused; every per-item outcome in aiagent's section 3.1; HTML present, absent and broken; verdict rules and the fold; the stops as `/health` and ETA show them; `LIBRARY_DIR` unset, relative, missing, and not writable (each refused, naming the requirement), and valid on an empty and on a non-empty directory (the layout written on first start, other files left alone).
 - A layout test at scale: synthetic items and objects in the hundreds of thousands, timing `find` and a full fold.
+- `LIBRARY_DIR` set in `.env` while devai-operator has no library mount: the stack-up action refuses the library naming `make operator-up`, not a missing directory.
 - A live smoke run, once the contact address exists: one small arXiv query, a fetch of two papers (one with HTML, one without), units with anchors and pages, a reject that purges and answers 410, an accept that keeps, all within arXiv's limits.
 
 ### 20.2 -- OpenAlex, open-access locations, index
@@ -2487,7 +2656,7 @@ Small items left by finished plans. (The laya trainer's Phase 4, once listed her
 
 | Item | From | What is left |
 |---|---|---|
-| pin pi | pi-coding-agent | `make fetch-cli` downloads pi from `releases/latest`; pin a version, as every other download is pinned |
+| pin pi | pi-coding-agent | `make fetch-cli` downloads pi from `releases/latest`; pin a version, as `dsh` is. (This row used to say every other download was pinned. It is not: 12 of the 13 `fetch-cli` downloads take the latest release. Pinning the others is not planned here.) |
 | pi's two notes | pi-coding-agent | document the cold start a `/model` switch can cause (the GPU is exclusive), and how Pi picks up AGENTS.md |
 | parser provenance | card-derived-hints-and-bench-sync | document the fields the probers stamp into the probe caches (`tool_parser_source`, `reasoning_parser_source`, `parser_disagreement`, `card_sampling`) in docs/backends.md. The card branch's first real run goes with Phase 4's re-probe |
 
@@ -2512,16 +2681,17 @@ Each row is its own small change; none depends on another phase.
 | GPU accounting by sampling is coarser than Slurm's own | 5 | one GPU job at a time, so the whole card is the job's; 5 s samples plus NVML's energy counter |
 | Slurm reports no GPU energy on NVIDIA | 5 | devai reads NVML's energy counter at the start and end of each job (I3) |
 | the web login controls the host user, on the LAN | 6 | TLS, one htpasswd account, CSRF, no shell; login attempts logged |
-| a sleeping model's VRAM leaves too little for the next load | 8 | `devai-control` lowers the next load's memory fraction by the sleeper's `used_mib` (not for a model whose recovery flags set the fraction); otherwise it unloads the sleeper and loads again |
+| a sleeping model's VRAM leaves too little for the next load | 8 | for a vLLM load, `devai-control` lowers the utilization by the sleeper's `used_mib`, unless recovery flags set it (SGLang sizes from free memory; a pool below its context counts as a failure); otherwise it unloads the sleeper and loads again |
+| a job signals or reads what it should not | 5 | jobs run as a subordinate uid: no key but their bus password, no signal to the host user's processes; no devai service shares that uid (I26) |
 | an action outlives its job (its script killed, `devai-slurm` restarted) | 5, 10 | the action's lease: `devai-control` stops its process group 60 s after the last renewal |
-| a recovery file rewritten by rename stays invisible to `devai-engines` | 8, 17, 18 | `deploy/` mounted as a directory, not as single files (I25) |
+| a recovery file rewritten by rename stays invisible | 8, 17, 18 | `${DEVAI_REPO}/deploy` mounted as a directory, and both files re-read at each launch (I25) |
 | a job held after a prolog failure starts only after Slurm's requeue delay | 9 | the router cancels it; the next request submits a new job, never releasing a held one |
 | a keep-warm engine job blocks a queued trainer or probe job forever | 9 | the router yields to a pending trainer or probe job |
 | no fallback inside the router after the cut-over | 9 | Phase 8's live checks first; rollback by reverting Phase 9 (I10) |
 | a sleeper nobody needs keeps host RAM and VRAM while the router is down | 9 | the router unloads it when it is back (I9) |
 | an interrupt with another model costs a cold start (about 95 s for Qwen3.8-27B) | 10 | the sleep fast path for vLLM and SGLang; the same-model path needs nothing |
 | submitting a job can run any registered action, destructive ones included | 5-10 | the JWT key only in `devai-slurm`, the router and `devai-operator`; nothing published; bus users limited to their subjects |
-| SGLang is kept or frozen on a measurement of the wrong thing | 15 | the radix-on / radix-off validation on one engine first; thresholds fixed before the runs (I16) |
+| SGLang is kept or frozen on a measurement of the wrong thing | 15 | the instrument's dry run before the measured run; thresholds fixed before the runs, and a failed condition is a freeze, not a re-run (I16) |
 | a recipe or a guessed parser misleads a probe | 17 | curated and card-derived values win; the probe is the authority; recipe flags reach the generated recovery file only after review, and never a C2 setting |
 | alternating lanes thrash cold starts | 19 | opt-in; documented |
 | a short-circuit answers a real request with a canned string | 16 | all markers must co-occur; off by default; every hit logged |
@@ -2543,7 +2713,7 @@ Each row is its own small change; none depends on another phase.
 - **Phase 15:** a freeze is undone through its `RESTORE.md`; the documentation corrections stand either way.
 - **Phases 16 and 19:** off by default (`DEVAI_SHORTCIRCUIT`, `DEVAI_FANOUT_PORT`); turned off, the router behaves byte for byte as before.
 - **Phases 17 and 18:** recipe flags and automatic fixes live only in `deploy/recovery-flags.generated.json` (I25), each group marked `recipe` or `auto-fix`; removing a group, or the file, reverts them, and the curated file is never touched.
-- **Phase 20:** `deploy/compose.library.yaml` is added only with `LIBRARY_DIR` set; unset, the library is off. The library directory itself is the operator's and is never deleted.
+- **Phase 20:** `deploy/compose.library.yaml` and `deploy/compose.operator-library.yaml` are added only with `LIBRARY_DIR` set; unset, the library is off. The library directory itself is the operator's and is never deleted.
 - **Phase 21:** reverts change by change.
 - **Existing hosts:**
   - delete the registry mirror stanza from `~/.config/containers/registries.conf` (Phase 2);
@@ -2583,7 +2753,7 @@ Estimates, not measurements. Phases 5-7, 15-17, 20 and 21 run beside others, so 
 
 - [docs/slurm.md](../slurm.md) -- the architecture this plan builds.
 - Slurm documentation (slurm.schedmd.com):
-  - slurm.conf: `Licenses`, `CompleteWait`, `KillWait`, `PrologFlags`, `HealthCheckProgram`, `SlurmdParameters`;
+  - slurm.conf: `Licenses`, `PrologEpilogTimeout`, `BatchStartTimeout`, `KillWait`, `PrologFlags`, `HealthCheckProgram`, `SlurmdParameters`;
   - cgroup.conf (`IgnoreSystemd`), for the fallback;
   - accounting;
   - slurmrestd, and rest_api (JWT).
