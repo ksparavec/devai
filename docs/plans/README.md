@@ -1,6 +1,6 @@
 # devai plans
 
-There is one plan: [platform-rebuild](./platform-rebuild.md) (Draft, 2026-10-05). It holds all of devai's planned work: Phases 1-14 build the new architecture ([docs/slurm.md](../slurm.md)); Phases 15-21 are the independent work folded in from earlier plans. A new plan starts from [TEMPLATE.md](./TEMPLATE.md).
+There is one plan: [platform-rebuild](./platform-rebuild.md) (Draft, 2026-10-05; revised 2026-10-06). It holds all of devai's planned work: Phases 1-14 build the new architecture ([docs/slurm.md](../slurm.md)); Phases 15-21 are the independent work folded in from earlier plans; Phases 22-23 are the laya 0.3.28 sync and System One (the operator's E1-E6 of 2026-10-06). A new plan starts from [TEMPLATE.md](./TEMPLATE.md).
 
 ## Status legend
 

@@ -135,7 +135,7 @@ def draw() -> str:
         "podman socket (scripts, log follower); GPU when present (probes)"],
         fill="#FDF6EC", stroke=ORANGE, width=2.2)
     box(620, 240, 640, 90, "devai-router  (own unprivileged container, small image)", [
-        ":11434 ollama    :11435 vllm    :11436 sglang    :11438 laya-trainer",
+        ":11434 ollama  :11435 vllm  :11436 sglang  :11438 laya-trainer  :11440 System One",
         "request path unchanged; launch layer = Slurm client (REST + self-signed JWT)",
         "engine state from the bus; blocks engine control routes; no podman socket"],
         fill="#FFF3DC", stroke=ORANGE, width=2.2)
@@ -161,12 +161,15 @@ def draw() -> str:
     # backend containers: always running, no Slurm
     zone(580, 360, 440, 240, "devai-engines  (image + container; no Slurm)", "#EEF7EE", "#4F9A5A")
     eng = dict(fill="#E0F1E0", stroke="#4F9A5A")
-    box(600, 390, 400, 44, "ollama serve  :11434", ["always running; loads and unloads on a job's command"], **eng)
-    box(600, 440, 400, 44, "vLLM 0.28 + HyperQwen  :11435", ["one model process while loaded; sleep = fast path"], **eng)
-    box(600, 490, 400, 44, "SGLang 0.5.16  :11436", ["one model process while loaded; sleep = fast path"], **eng)
+    box(600, 390, 400, 40, "ollama serve  :11434", ["always running; loads and unloads on a job's command"], **eng)
+    box(600, 434, 400, 56, "vLLM 0.30 + HyperQwen  :11435", ["one model process while loaded; sleep = fast path",
+        "vllm-s1: stock vLLM 0.31, DiffusionGemma System One :11441/:11442"], **eng)
+    box(600, 494, 400, 40, "SGLang 0.5.16  :11436", ["one model process while loaded; sleep = fast path"], **eng)
     box(600, 540, 400, 48, "supervisord + devai-control", ["keeps the engines running; takes commands from the bus"], **bus)
     zone(1040, 360, 410, 240, "devai-laya-trainer  (own image; no Slurm)", "#EEF7EE", "#4F9A5A")
     box(1060, 400, 370, 64, "trainer runs", ["one fine-tuning run per trainer job", "started and stopped by devai-control"], **eng)
+    box(1060, 474, 370, 56, "systemone  :11443", ["laya students on the CPU (E-cores), no GPU",
+        "behind the router's System One port :11440"], **eng)
     box(1060, 540, 370, 48, "supervisord + devai-control", ["keeps the trainer running; bus commands"], **bus)
 
     # the bus, drawn as a bar every devai-control hangs off
@@ -190,7 +193,7 @@ def draw() -> str:
     folder(840, 1017, 180, 80, "engine caches", ["FlashInfer, SGLang", "(named volumes)"])
 
     # ----------------------------------------------------------------- arrows
-    arrow([(1100, 178), (1100, 240)], "data", 1, (1100, 207), "inference API; fine-tuning jobs on :11438", (1116, 211))
+    arrow([(1100, 178), (1100, 240)], "data", 1, (1100, 207), "inference API; fine-tuning jobs on :11438; System One on :11440", (1116, 211))
     arrow([(1000, 330), (1000, 360)], "data", 2, (1000, 345), "proxied requests to devai-engines:<port>", (988, 350),
           anchor="end", width=2.4)
     arrow([(620, 300), (540, 300), (540, 431), (480, 431)], "control", 3, (540, 380), width=2.2)

@@ -65,7 +65,7 @@ Proposed:
 - **Only `devai-operator` holds the host's podman socket** (builds, compose,
   lab containers, and the log follower, which moves into it from its own
   container; plan I20). `devai-slurm` and the router do not.
-- **One version per backend, CUDA 13.1, everything compiled here** (D8, D11).
+- **One version per backend, with recorded exceptions, CUDA 13.1, everything compiled here** (D8, D11; exceptions under plan E2 -- the first, `vllm-s1`, stock vLLM 0.31.0 for DiffusionGemma's System One, plan E3).
 - **The GPU is optional** (M15): one host check decides
   at launch; a host without an NVIDIA GPU runs only Ollama (CPU) and the laya
   trainer, and `devai-slurm` skips the guard and the sampler.
@@ -80,7 +80,7 @@ Source: [`scripts/diagrams/slurm_architecture.py`](../scripts/diagrams/slurm_arc
 
 | # | From -> to | What | How | Status |
 |---|---|---|---|---|
-| 1 | lab agents -> router | inference (OpenAI, Anthropic, Ollama APIs); fine-tuning jobs on :11438 | HTTP, `devai-lab-egress` | unchanged |
+| 1 | lab agents -> router | inference (OpenAI, Anthropic, Ollama APIs); fine-tuning jobs on :11438; from the plan's Phase 23, System One reads on :11440 | HTTP, `devai-lab-egress` | unchanged; :11440 proposed |
 | 2 | router -> engine | proxied requests to `devai-engines:<port>` | HTTP, `devai-net` | today's path, new host name |
 | 3 | router -> slurmrestd | submit, cancel, job and node state | REST v0.0.42, JWT the router signs itself | measured on 26.05 (v0.0.44) |
 | 4 | slurmrestd -> slurmctld | the same, as Slurm RPC | inside `devai-slurm` | measured |
@@ -103,8 +103,8 @@ Source: [`scripts/diagrams/slurm_architecture.py`](../scripts/diagrams/slurm_arc
 | Container | Image | Holds | Privileges |
 |---|---|---|---|
 | `devai-slurm` | `devai-slurm` (new, built here on the pinned `debian:trixie-slim`) | slurmctld, slurmdbd, slurmrestd, MariaDB, slurmd, nats-server, the GPU guard, the GPU sampler, the bus log, `devai-bus`, `devai-jobs` | `--pid=host`; podman's default user namespace, so its root is the host user (plan I26); the GPU via CDI, for NVML only, when the host has one; `--privileged --cgroupns=private` only if slurmd turns out to need them (Sec. 3.1) |
-| `devai-engines` | `devai-engines` (the plan's Phase 4) | supervisord, `devai-control`, Ollama, vLLM 0.28 + HyperQwen, SGLang 0.5.16, each in its own env and on its own port (11434, 11435, 11436) | GPU via CDI when present |
-| `devai-laya-trainer` | `devai-laya-trainer` (its own image, as today, on `devai-base`; the plan's Phase 3) | supervisord, `devai-control`, the laya trainer | GPU via CDI when present |
+| `devai-engines` | `devai-engines` (the plan's Phase 4) | supervisord, `devai-control`, Ollama, vLLM 0.30 + HyperQwen, SGLang 0.5.16, each in its own env and on its own port (11434, 11435, 11436); from the plan's Phase 23, `vllm-s1`, stock vLLM 0.31.0 for DiffusionGemma's System One (plan E3, I29), in its own env: the engine on 11441 and the vendored System One server on 11442, one service that one load starts and one unload stops | GPU via CDI when present |
+| `devai-laya-trainer` | `devai-laya-trainer` (its own image, as today, on `devai-base`; the plan's Phase 3) | supervisord, `devai-control`, the laya trainer; from the plan's Phase 23, the student service `systemone` on 11443, which serves trained laya students on the CPU only (plan I28) | GPU via CDI when present |
 | `devai-operator` | `devai-operator` ([the plan](plans/platform-rebuild.md), Phase 6) | supervisord, Apache + mod_wsgi, `devai-control`, `devai-bus`, `devai-jobs`, devai's scripts and the tools they call, the log follower (plan I20) | runs as `devai` with `--userns=keep-id` (plan I19); the host's podman socket read-write; the GPU when present (probes); HTTPS published on the LAN (O6) |
 | `devai-router` | its own small image | the router, with a bus client that follows engine state and unloads a sleeper no job needs (I9) | none |
 
@@ -203,13 +203,13 @@ load request.
 
 | Verb | Sent by | What `devai-control` does |
 |---|---|---|
-| `start`, `stop`, `restart` | operator | the same on the service's supervisord program |
-| `reload` | operator | re-reads the program's configuration and restarts it if it changed |
+| `start`, `stop`, `restart` | operator | the same on the service's supervisord program. On an engine they need no ownership: `stop` unloads the model, the sleeping one too, and the job that owned it ends; `restart` is refused (`busy`) while a model is loaded, loading or sleeping; `start` only starts `ollama serve` (plan C1) |
+| `reload` | operator | re-reads the program's configuration and restarts it if it changed; on an engine, refused while a model is loaded, as `restart` |
 | `state` | router, operator, jobs | answers: idle, loading, serving *model*, sleeping *model*, unloading, failed (with the log tail) |
 | `load` | engine and probe jobs | loads the model (below); answers when it serves or has failed |
-| `unload` | engine and probe jobs, the guard; the router, for a sleeper no job needs (I9) | frees the GPU (the loaded model, or the sleeping one); answers once the program has exited and NVML's used memory is back to where it was before that load |
-| `sleep` | engine jobs (fast path) | puts a vLLM or SGLang model to sleep (below); it sleeps until a load wakes or replaces it, or the router unloads it |
-| `lease` | the job that loaded the model or started the action, every 10 s | no answer; after 60 s without one, `devai-control` unloads the model, or stops the action's process group |
+| `unload` | engine and probe jobs, the guard; the router, for a sleeper no job needs (I9) | frees the GPU (the loaded model, or the sleeping one); answers once the program has exited and NVML's used memory is back to where it was before that load. It also stops a model that is still loading or waking; a repeated `unload` joins the one in progress, and one with nothing left to unload is a no-op |
+| `sleep` | engine jobs (fast path) | puts a serving vLLM or SGLang model to sleep (below), and refuses one that is not serving; it sleeps until a load wakes or replaces it, or the router unloads it |
+| `lease` | the job that loaded the model or started the action, every 10 s | no answer; after 60 s without one, `devai-control` unloads the model, or stops the action's process group. The 60 s are counted from the later of the last lease and the end of the job's `load` (a wake included), `train` or `run` request, so a cold start needs no lease; a load whose job stopped leasing is unloaded 60 s after it reached serving (plan C1) |
 
 The laya trainer takes `train` and `cancel` (`devai.laya-trainer.trainer.*`);
 `devai-operator` takes `run` and `stop` (`devai.operator.actions.*`), and runs
@@ -234,8 +234,10 @@ What load and unload mean for each engine:
   the router forwards only requests for the loaded model, and nothing else
   reaches `devai-engines` (Sec. 12).
 - **vLLM and SGLang** serve one model per process, with the model, context,
-  KV type, parsers and MTP fixed when the process starts (measured in the vLLM
-  0.28 source and the SGLang 0.5.16 image: neither can switch models in a
+  KV type, parsers and MTP fixed when the process starts (for vLLM 0.30, the
+  version devai serves (plan E1): read in the 0.28 and 0.31 sources, and
+  re-read in 0.30's in the plan's Phase 4 step 4v; measured in the SGLang
+  0.5.16 image: neither can switch models in a
   running process). So the part that runs all the time is `devai-control`
   (D15).
   - The `load` request carries today's router launch configuration as data,
@@ -285,7 +287,11 @@ What load and unload mean for each engine:
 - **The laya trainer:** the controller, which serves the :11438 API, runs all
   the time and no longer starts runs itself. `train` starts one run
   (`laya_trainer.run_job`, which the controller used to spawn) as a
-  supervisord program; `cancel` stops it (I11).
+  supervisord program; `cancel` stops it (I11). `cancel` answers only once
+  the run has exited, its record is final and the card is back where it was
+  before the run, so a trainer job ends only with the GPU free; a time limit
+  reaches the record as the cancel's reason (`time_limit`). The trainer job
+  script, `trainer.sh`, is written out in the plan's C3.
 
 The engine job script. The router submits only
 `exec /usr/local/lib/devai/jobs/engine.sh`; the job scripts ship in the
@@ -296,24 +302,27 @@ configuration, arrives in the job's environment:
 #!/bin/bash
 umask 0002
 S=devai.engines.$DEVAI_BACKEND J=$SLURM_JOB_ID
-trap 'devai-bus request $S.unload "{\"job\":$J}" --timeout 25s; exit 0' TERM INT
-trap 'devai-bus request $S.sleep "{\"job\":$J}" --timeout 120s; exit 0' USR1
+trap 'devai-bus request $S.unload "{}" --job "$J" --timeout 25s; exit 0' TERM INT
+trap 'devai-bus request $S.sleep "{}" --job "$J" --timeout 120s; exit 0' USR1   # refused unless serving (C1); the epilog then unloads
 devai-bus request $S.load "$DEVAI_LOAD" --job "$J" --timeout 660s || exit $?
 devai-bus hold $S --job "$J" --parent $$ &   # a lease every 10 s; ignores TERM and INT; exits 0 when the service stops serving this job, 3 on failed
 wait $!
 ```
 
 If the trap's `unload` does not finish within `KillWait`, the epilog sends it
-again and waits up to 60 s.
+again and waits up to 60 s. `devai-bus request` adds the envelope's version
+and the job id from `--job`, which every call passes (plan C3). A job's
+`devai-bus hold` rides out a bus outage: it reconnects without limit, renews
+its lease, and asks for its service's state again after every reconnect.
 
 | Concern | Who does it |
 |---|---|
 | a model onto the GPU | the job's `load`; `devai-control` starts or loads it |
 | cancel (`scancel`, time limit) | Slurm sends SIGTERM to the job script and every process it started (`devai-bus hold` ignores it, and dies with its script); the script's trap sends `unload`; the epilog sends `unload` again and checks the card (Sec. 6) |
-| switch away, fast path | the router cancels with `scancel --signal=USR1 --batch`; the trap sends `sleep` |
+| switch away, fast path | the router signals a job whose engine is serving with `scancel --signal=USR1 --batch`; the trap sends `sleep`. A job whose engine is still loading or waking is cancelled instead: bash runs the USR1 trap only after the foreground `load` returns |
 | the engine fails | `devai-control` publishes `failed`; `devai-bus hold` exits; the job ends non-zero |
 | the job disappears without its trap or epilog (`devai-slurm` restarts) | the lease runs out after 60 s and `devai-control` unloads |
-| GPU memory and utilisation (a host with a GPU) | a sampler started by the prolog of an engine, trainer or probe job polls NVML every 5 s and writes `results/<jobid>/gpu.json`; the epilog stores its peak and mean in the job's `AdminComment`. There is one GPU job at a time, so the whole card is the job's |
+| GPU memory and utilisation (a host with a GPU) | a sampler started by the prolog of an engine, trainer, probe or GPU-action job polls NVML every 5 s and writes `results/<jobid>/gpu.json`; the epilog stores its peak and mean in the job's `AdminComment`. There is one GPU job at a time, so the whole card is the job's |
 | GPU energy | NVML's energy counter at prolog and epilog, read through `ctypes` (I3); Slurm reads none on NVIDIA (measured) |
 
 devai does not use Slurm's own suspend: a suspended job script would stop
@@ -328,7 +337,7 @@ with `sleep` or `unload`.
 | trainer | `-L engine` | `devai.laya-trainer.trainer` | one fine-tuning run | `LAYA_MAX_HOLD_S` (900 s), whether or not another backend waits (I11) | router (:11438 API), once the controller has accepted the job |
 | probe | `-L engine` | `devai.operator.actions` (the per-model probe action), whose prober loads through `devai.engines.<backend>` | load with the probe's settings, measure, unload | 60 min | `devai-operator` (probe actions, which only submit) |
 | bench | `-L bench` | `devai.operator.actions` (the bench-task action) | one bench task: hold, run, `result.json`, release | `--time=32 --signal=B:INT@120` | `devai-operator` (`bench-sync.py --submit`) |
-| operator action | none | `devai.operator.actions` | one of devai's scripts: pull, build, backup, ... | per action | `devai-operator` |
+| operator action | none; `-L engine` for a GPU action (plan C8) | `devai.operator.actions` | one of devai's scripts: pull, build, backup, ...; a GPU action computes on the card itself (from the plan's Phase 10, every one-shot GPU-exclusive measurement) | per action; required for a GPU action | `devai-operator` |
 
 A bench uses the GPU only through the router and keeps its engine with a hold
 (Sec. 7). So it takes no engine license; if it did, its own engine job could
@@ -340,7 +349,9 @@ its epilog has finished, and starts nothing on a node that still has a
 completing job. So the next GPU job's prolog always follows the previous one's
 epilog (read in the 24.11.5 source; checked in the plan's Phase 5). On a host
 without a GPU the router submits only Ollama and trainer jobs; vLLM and SGLang
-requests are refused before anything is submitted. Every job carries a JSON
+requests are refused before anything is submitted. The router tells the jobs
+that keep it off the card -- trainer, probe and GPU-action jobs -- by the
+engine license they request, not by their kind (Sec. 7). Every job carries a JSON
 comment (kind, backend, model, context, MTP, hold, requester, git commit);
 submitted through REST it arrives intact (measured). Every job runs as the
 Slurm user `devai` (I6), and keeps its log and results in
@@ -350,19 +361,24 @@ Slurm user `devai` (I6), and keeps its log and results in
 
 The prolog runs for every job (`PrologFlags=Alloc`) and first creates the
 job's results directory. On a host with a GPU, the prolog of every engine,
-trainer and probe job, in `devai-slurm`:
+trainer, probe and GPU-action job (an operator action that computes on the GPU
+itself, plan C8), in `devai-slurm`:
 
 1. waits up to 10 s for an idle card: no compute process and at most 512 MiB
    used, apart from a sleeping devai model, whose use it takes from that
-   engine's state (the sleeper's `used_mib`, plan C1). A probe job's prolog
-   unloads the sleeper instead: a probe measures an empty card;
+   engine's state (the sleeper's `used_mib`, plan C1). A probe or GPU-action
+   job's prolog, and an engine job's for `vllm-s1` (plan Phase 23: DiffusionGemma
+   is sized for the whole card) unless the sleeper is that job's own `vllm-s1`
+   launch, which its load wakes, unloads the sleeper instead: it needs an empty
+   card;
 2. otherwise asks each devai engine that holds the card to `unload`, over the
    bus, and waits up to 60 s. The guard matches NVML's PIDs to a container
    through `/proc/<pid>/cgroup`: a PID's cgroup is compared with that of the
    `devai-control` process whose command line names the container. A devai engine is
    asked, not killed: its supervisor would start a killed service again.
    - A laya trainer run that holds the card gets `cancel` with `force`.
-   - A holder in `devai-operator` (a prober or its ballast) is stale here,
+   - A holder with a `DEVAI_JOB_ID` -- a prober or its ballast in
+     `devai-operator`, or a GPU action's container -- is stale here,
      since this job holds the only engine license. The guard finds its run
      through the `DEVAI_JOB_ID` in its `/proc/<pid>/environ` and sends `stop`
      with `force` for that run (TERM, 5 s grace). It kills the holder if it
@@ -385,13 +401,13 @@ trainer and probe job, in `devai-slurm`:
 The waits add up to about 140 s at most (10 + 60 + 60 + 5 + 5 s and the bus
 round trips), within `PrologEpilogTimeout`.
 
-The epilog of an engine, trainer or probe job stops the sampler, writes
+The epilog of an engine, trainer, probe or GPU-action job stops the sampler, writes
 `gpu.json`, ends the job's service as its script would -- `unload` for an
 engine or probe job's engine unless the job ended with `sleep`, `cancel` for a
 trainer job's run (a no-op once it has ended) -- and checks the card is idle again (apart from a sleeping model); if not, it
-exits 1 and the node drains. A probe job's epilog first stops its action if
-it still runs. Slurm starts nothing on the node until the epilog has finished,
-so this check cannot race the next job. Bench and action jobs run beside a serving engine
+exits 1 and the node drains. A probe or GPU-action job's epilog first stops
+its action if it still runs. Slurm starts nothing on the node until the epilog has finished,
+so this check cannot race the next job. Bench jobs and the other action jobs run beside a serving engine
 job, so their prolog and epilog leave the card and the engines alone. On a host
 without a GPU, the epilog only sends that `unload` or `cancel`.
 
@@ -435,21 +451,37 @@ A request that needs an engine:
 1. the right engine job is running and its engine is serving: proxy;
 2. the job is pending, or its engine is loading or waking: wait, with SSE
    keepalive;
-3. the GPU holds something else: a trainer job, or an engine bound to an active
-   hold, gets the client a 503 with `Retry-After`; an ordinary engine is
-   drained and its job ended -- with `sleep` if a pending job needs that model
-   and the new one is on another backend, with `unload` otherwise -- and a new
+3. the GPU holds something else: a trainer, probe or GPU-action job, or an
+   engine bound to an active hold, gets the client a 503 with `Retry-After`;
+   an ordinary engine is drained and its job ended -- with `sleep` if its
+   engine is serving, its launch was started with sleep mode on (the launch's
+   `sleep_mode`, plan C2, never the backend's name), a pending job needs that
+   model and the new one is on another backend, with `unload` otherwise (an engine still loading or waking is always cancelled,
+   since its script runs a trap only after the `load` returns) -- and a new
    engine job submitted;
 4. the new job is refused by the guard: cancel it and return 503 naming the
    holder, without charging the launch breaker; the next request submits a
    new job rather than releasing the held one (Slurm delays a requeued job --
    one the prolog refused -- by about 2 minutes; measured); the load fails: 502
    with the engine's log tail
-   from `devai-control`, breaker charged.
+   from `devai-control`, breaker charged;
+5. the new job ends, or the launch times out, without its engine ever serving
+   or failing -- a refused `load` (`busy`, `unknown_model`, `bad_request`)
+   publishes nothing, a job script that cannot reach the bus exits 2, a job
+   may be cancelled from elsewhere: the router asks the engine's state once,
+   treats a `failed` state for that job as a failed load, and otherwise answers
+   503 `engine_job_ended` with the job's Slurm state and exit code, charging
+   the breaker only for exit 1, so a refusal that repeats stops as a crash loop
+   does.
 
-**Yielding.** A pending trainer or probe job makes the router end its engine
-job, unless a hold binds that engine. Otherwise a keep-warm engine job would
-keep the engine license forever.
+**Yielding.** A pending, unheld trainer, probe or GPU-action job -- any job
+other than an engine job that requests the engine license and that Slurm can
+start -- makes the router end its engine job, unless a hold binds that engine.
+A held job (the operator's `hold`, or the requeue hold after a prolog failure)
+is ignored, here and for the 503 of step 3. A trainer job the guard refused is
+not left held: the router cancels it and fails its fine-tuning job with
+`gpu_held_by_foreign_process`, naming the holders. Otherwise a keep-warm engine job
+would keep the engine license forever.
 
 **The sleeper.** Once no pending job, active hold or running engine job names
 the sleeping model any more, and no running bench, probe or action job that
@@ -470,6 +502,27 @@ the record.
 controller. Once the controller has accepted the job, the router submits the
 trainer job. A cancel is forwarded to the controller and the trainer job is
 cancelled. Reads go to the controller, which always runs (I11).
+
+**System One on :11440** (plan I27, Phase 23; off unless
+`DEVAI_SYSTEMONE_PORT` is set). `POST /v1/systemone` is dispatched by its
+`model`. DiffusionGemma goes to `vllm-s1` in `devai-engines` through an
+ordinary engine job, with the engine license and the guard. While that engine
+is not serving, the router answers 503 with `Retry-After` itself and forwards
+nothing, so no request waits on the switch. The router therefore watches that
+engine job itself: it cancels the job once no System One request has named it
+for `HEALTH_TIMEOUT_SECONDS`, charges the breaker for a failed load as for any
+engine, and answers the next request with the failure once. A System One
+request never switches away from an engine that is still loading or waking.
+The rule is one-way: a request on any other port still cancels a loading
+`vllm-s1` job, so chat wins, and DiffusionGemma serves only in a gap in other
+GPU traffic longer than its load. A switch into `vllm-s1` always cancels the
+job it replaces: its prolog unloads any sleeper, as a probe job's does
+(Sec. 6), unless the sleeper is that job's own `vllm-s1` launch, which its
+load wakes. On a host without a GPU a
+DiffusionGemma read gets the no-GPU error before anything is submitted. Every
+other name goes to the student service in `devai-laya-trainer`, on the CPU,
+with no job, on a host with or without a GPU. Answers and statuses pass
+through unchanged.
 
 Measured timings that carry over: REST submit to running 1.0-1.3 s; the 27B
 engine healthy about 95 s after a cold start. Waking a sleeping model: not
@@ -521,15 +574,19 @@ measured.
 slurmdbd keeps every job: times, state, exit code, the comment, the job script,
 and the GPU summary the epilog puts in `AdminComment`. Each job's
 `/var/cache/devai/jobs/results/<jobid>/` holds its log, `result.json` (written
-by the job), `gpu.json` (engine, trainer and probe jobs: samples, peak, mean,
-energy), `guard.json` (the prolog's verdict) and artifacts. A vLLM or SGLang model process logs to
+per kind: by `devai-control` for an action, by the bench task or the prober
+otherwise, with `devai-control` writing one only when they left none; plan
+C4), `gpu.json` (engine, trainer, probe and GPU-action jobs: samples, peak,
+mean, energy), `guard.json` (the prolog's verdict) and artifacts. A vLLM or SGLang model process logs to
 `/var/cache/devai/jobs/engines/<backend>/<jobid>.log`, which the probers read
 too. The bus
 log, a subscriber in `devai-slurm`, writes every state event -- load, serving,
 sleep, wake, unload, failed, a service restarted -- to
 `/var/cache/devai/jobs/bus/<date>.jsonl`. `devai-jobs` (devai-tools) joins the
 three. It runs in `devai-slurm` and `devai-operator`, and the host calls it
-through `podman exec` (I13). Its commands: `devai-jobs list --since yesterday`, `show <id>`, `queue`, `cancel`,
+through `podman exec` (I13): `submit`, `suspend` and `interrupt` (which
+resubmit a bench task) in `devai-operator`, the only container that mounts the
+action registry (plan C8), every other command in `devai-slurm`. Its commands: `devai-jobs list --since yesterday`, `show <id>`, `queue`, `cancel`,
 `hold` / `release`, `suspend` / `resume` (D13), `interrupt`, `engines` (what
 each engine is doing now). The bench leaderboard stays and records each task's
 job id.
@@ -563,14 +620,14 @@ creates the operator's htpasswd entry and its TLS certificate under
 
 | Failure | Effect | Handling |
 |---|---|---|
-| a Slurm daemon or nats-server exits | supervisord restarts it; loaded engines keep serving | the router answers 503 while it cannot launch; leases resume |
+| a Slurm daemon or nats-server exits | supervisord restarts it; loaded engines keep serving | the router answers 503 while it cannot launch; the jobs' holds reconnect, renew their leases and ask for their service's state again, so a run that ended meanwhile still ends its job |
 | MariaDB or slurmdbd down | jobs run; history is delayed | slurmctld spools the records |
 | GPU held outside devai | killed by the guard, or node drained | 503 naming the holder |
 | the node is drained | nothing GPU-bound starts | the health check resumes it once the card is idle (I7) |
 | a model process crashes | `devai-control` publishes `failed`; the job ends non-zero | the next request loads again (breaker) |
 | a job script killed before its trap ran | the model stays loaded, or the action keeps running | the epilog's `unload`; the lease as a backstop, which also stops an action |
 | `devai-slurm` restarts | job scripts and the bus gone | leases run out after 60 s and the engines unload |
-| the bus is down longer than a lease | engines unload although their jobs still run | the jobs see their engine leave `serving` and end; the router resubmits |
+| the bus is down longer than a lease | engines unload, and runs stop, although their jobs still run | once reconnected, the jobs' holds ask for the state again, see their engine no longer serving them or their run stopped, and end; the router resubmits |
 | `devai-control` restarts | its model process keeps running | it takes it over again from supervisord's status |
 | an engine container restarts | its models are gone; its jobs fail | the router resubmits on demand |
 | a sleeping model leaves too little VRAM for the next load | the load fails (vLLM, Ollama), or an SGLang pool comes up below its context | `devai-control` unloads the sleeping model and loads once more |
@@ -631,9 +688,11 @@ creates the operator's htpasswd entry and its TLS certificate under
 | results scattered | slurmdbd + `jobs/results/` + the bus log + `devai-jobs` | 5, 13 |
 | operations are Makefile targets in a host shell | `devai-operator`, a web service running devai's scripts as jobs; the Makefile stays for development | 6, 7, 10, 12 |
 | lab containers have the GPU | no GPU device in the lab | 14 |
+| diffusiongemma on its own per-model vLLM image (`image` in `deploy/recovery-flags.json`) | dropped from `vllm` in Phase 4 (M8); back on `vllm-s1` in `devai-engines`, stock vLLM 0.31.0, behind System One on :11440, taking turns under `engine:1` (plan E2, E3; only if it passes its gate, I30) | 4, 23 |
 
-The re-probe on the single backend versions, and dropping what fails, belong to
-the plan's Phase 4.
+The re-probe on each backend's version, and dropping what fails there, belong
+to the plan's Phase 4; an exception backend (plan E2) is probed in the phase
+that adds it.
 
 ## 14. Open points
 
