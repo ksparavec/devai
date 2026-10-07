@@ -159,14 +159,24 @@ fetch_source() {
     [ "$have" = "$ref" ] || die "$dest is at '$have', expected $label $ref"
 }
 
+# One attempt at downloading `url` to `dest`, through "$dest.part", so an
+# interrupted download never looks like a finished one.
+fetch_file() {
+    local url="$1" dest="$2"
+    curl -fsSL -o "$dest.part" "$url" && mv "$dest.part" "$dest"
+}
+
 fetch_sdist() {
     local tarball="$BUILD_ROOT/src/vllm-$VLLM_VERSION.tar.gz"
     mkdir -p "$BUILD_ROOT/src"
     if [ ! -f "$tarball" ]; then
         say "fetching vLLM $VLLM_VERSION sdist"
-        retry3 "fetching the vLLM sdist" "$PYTHON" -m pip download "vllm==$VLLM_VERSION" \
-            --no-binary=:all: --no-deps --no-build-isolation --no-cache-dir -q \
-            -d "$BUILD_ROOT/src"
+        # The file, not `pip download`: pip prepares the sdist's metadata,
+        # which runs its setup.py, and 0.30.0's needs setuptools_rust in
+        # the host Python. The sha256 below is the check either way.
+        retry3 "fetching the vLLM sdist" fetch_file \
+            "https://files.pythonhosted.org/packages/source/v/vllm/vllm-$VLLM_VERSION.tar.gz" \
+            "$tarball" || { rm -f "$tarball.part"; return 1; }
     fi
     local have
     have="$(sha256sum "$tarball" | cut -d' ' -f1)"

@@ -447,6 +447,35 @@ class BuildRecordTest(_ScriptCase):
         self.assertEqual(self._fetches(), 0)
         self.assertFalse((root / "HyperQwen").exists())
 
+    def test_the_sdist_is_fetched_as_a_file_from_pypi_and_retried(self) -> None:
+        # Not `pip download`: pip prepares the sdist's metadata, which runs
+        # its setup.py, and 0.30.0's needs setuptools_rust in the host
+        # Python (the first 0.30.0 build died there, 2026-10-07).
+        payload = b"sdist bytes"
+        sha = hashlib.sha256(payload).hexdigest()
+        curl = self.tmp / "bin" / "curl"
+        curl.write_text(f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "{self.calls}"
+n=$(wc -l < "{self.calls}")
+out=""
+while [ $# -gt 0 ]; do [ "$1" = -o ] && {{ out="$2"; shift; }}; shift; done
+printf 'partial' > "$out"
+[ "$n" -le 1 ] && exit 22
+printf 'sdist bytes' > "$out"
+""")
+        curl.chmod(curl.stat().st_mode | stat.S_IEXEC)
+        root = self.tmp / "root"
+        self._write_record("9.9.9", _record(sdist=sha, hq="", skip=""))
+        r = self._sh("fetch_sdist", VLLM_VERSION="9.9.9",
+                     VLLM_RECORD_DIR=str(self.records), VLLM_BUILD_ROOT=str(root))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = self.calls.read_text().splitlines()
+        self.assertEqual(len(calls), 2)
+        self.assertIn("https://files.pythonhosted.org/packages/source/v/vllm/vllm-9.9.9.tar.gz",
+                      calls[-1])
+        self.assertEqual((root / "src" / "vllm-9.9.9.tar.gz").read_bytes(), payload)
+        self.assertEqual(sorted(p.name for p in (root / "src").iterdir()), ["vllm-9.9.9.tar.gz"])
+
     def test_a_sdist_with_another_hash_is_refused(self) -> None:
         root = self.tmp / "root"
         (root / "src").mkdir(parents=True)
