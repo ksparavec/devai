@@ -896,7 +896,7 @@ reports only) writes one group with `"source": "recipe"` into
 file"), scoped to `["vllm-devai"]`, the backend that runs the vLLM
 `scripts/build-vllm.sh` builds -- until Phase 4 step 4e renames it to
 `vllm` and rewrites these groups. It refuses unless `min_vllm_version`
-admits that build's default `VLLM_VERSION` (0.28.0 today; a `nightly`
+admits that build's default `VLLM_VERSION` (0.30.0 since 2026-10-07; a `nightly`
 minimum admits nothing). It writes only flags the argument builders never
 emit and reports the rest, because the last flag wins and such a flag
 would pin every launch of the model (I18): the excluded set is every flag
@@ -985,9 +985,11 @@ launches, before the engine caches were persisted).
 ### The vllm-devai backend
 
 Since 2026-09-22 the router serves a FOURTH backend, `vllm-devai`, on port
-11437: the home-built, HyperQwen-patched vLLM 0.28.0 image
-(`docker.io/devai/vllm-devai:v0.28.0-cu131-debian13-hq.c0c81bb`, also tagged
-`latest`; built by `make build-vllm`, present only in the local image store,
+11437: the home-built, HyperQwen-patched vLLM image -- 0.30.0 since
+2026-10-07 (`docker.io/devai/vllm-devai:v0.30.0-cu131-debian13-hq.7af097b`,
+also tagged `latest`; see "vLLM 0.30.0" below), before that 0.28.0
+(`...:v0.28.0-cu131-debian13-hq.c0c81bb`, kept as the rollback); built by
+`make build-vllm`, present only in the local image store,
 never pushed or pulled -- compose sets `pull_policy: never` and `make
 pull-images` filters it out). It has the same engine, launch argv and model
 store as `vllm`, and its own container (`devai-vllm-devai`), probe cache
@@ -1006,6 +1008,84 @@ the router-recreated `devai-vllm-devai` by name, exactly as it does for
 no compose labels, so `compose down` leaves it behind; when this name was
 missing from the list it survived holding 21.8 GiB, every probe launch
 failed `kind=infra`, and the next `cache-up` died on the name collision).
+
+### vLLM 0.30.0
+
+Plan platform-rebuild, Phase 4 step 4v (E1), accepted on 2026-10-07 under
+E7: both prepared Qwen3.8 rows keep their contexts with MTP and pass the
+load probe there; quality and speed are recorded, not compared with 0.28.0
+(the operator dropped the 0.28.0 arm). Every number below is one run on
+this host's RTX PRO 4000 Blackwell (24 GB), 2026-10-07.
+
+**Build.** `make build-vllm VLLM_VERSION=0.30.0` from the build record
+`deploy/vllm-builds/0.30.0.sh`: the PyPI sdist (sha256-checked), HyperQwen
+`7af097b` (46 of 46 patches at `--fuzz 0`) and devai's MTP patch (at
+`--fuzz 0`), sm120 only, runtime set from the hash lock
+`deploy/vllm-builds/0.30.0.lock`. Image
+`docker.io/devai/vllm-devai:v0.30.0-cu131-debian13-hq.7af097b` (id
+`2cc2e8bfc2f7`, digest `sha256:bbf7b40f...`, 9.95 GB). Two host fixes were
+needed: the sdist is fetched as a file (pip download ran its `setup.py`,
+which needs `setuptools_rust`), and `libdw-dev` is a host prerequisite
+(the DeepGEMM fork's `deep_jit` includes `elfutils/libdwfl.h`; at run time
+it only dlopens `libdw.so.1`, optionally). Both parser plugins
+(`deepseek_string`, `nemotron_json`) register; `make verify-backend-flags`
+finds all 23 pinned and recovery flags.
+
+**FlashInfer without run-time cubins.** With the vllm-devai FlashInfer
+volume emptied and `FLASHINFER_CUBINS_REPOSITORY=file:///nonexistent/`, the
+first request (`Qwen3.8-27B-MTP-devai-NVFP4::mtp@118784`) answered after
+342 s from cold, with torch.compile cold too (one launch; 0.28.0 measured
+261-278 s, n=7, 2026-09-22). FlashInfer JIT-compiled 83 files into the
+volume (the sm120 FP4 GEMM kernels among them) with the host toolkit's
+nvcc 13.1 (`cuda_home = /usr/local/cuda`). The pip `nvidia-cuda-nvcc` 13.0
+that HyperQwen's requirements bring into the lock is installed and unused.
+
+**Engine-log facts.** `Using FlashInferCutlassNvFp4LinearKernel for NVFP4
+GEMM`; `Using FlashInfer GDN prefill kernel (requested=auto,
+head_k_dim=128)`; `Using FLASHINFER attention backend`; and, under MTP,
+`Fused multi-step draft decode is not supported by attention backend(s)
+FLASHINFER; falling back to rebuilding attention metadata between draft
+steps`.
+
+**Context (deciding).** Exact-context probes with MTP, the recovery flags
+unchanged:
+
+| Row | Context | MTP fits | VRAM | `--gpu-memory-utilization` |
+|---|---|---|---|---|
+| Qwen3.8-27B-MTP-devai-NVFP4 | 118,784 | yes | 22.45 GiB | 0.96 |
+| Qwen3.8-27B-W4A16-devai-AutoRound | 131,072 | yes | 22.09 GiB | 0.93 (the 0.96 retry was not needed) |
+
+**Load (deciding).** Serving-time load probes with MTP at those contexts
+(`make probe-load-vllm-devai PROBE_MTP=1`): NVFP4 served 116,425 prompt
+tokens (fill 0.98), peak 22.96 GiB, needle recalled; AutoRound 128,726
+tokens (fill 0.98), peak 22.86 GiB, needle recalled. Both cells stayed at
+their own contexts (the load probe used to step a non-32K-multiple cell
+down to 98,304; fixed in 4v).
+
+**Quality and speed (recorded).** The teacher, MTP on, 4 connections:
+gsm8k 1,269 of 1,319 = 0.962 (95% Clopper-Pearson 0.950-0.972), humaneval
+158 of 164 = 0.963 (0.922-0.987); no time-out, limit or error. Latency
+prompts (40, engine-counted tokens): teacher 92.8 tok/s decode, TTFT p50
+81 ms, p95 102 ms; AutoRound 93.6 tok/s, p50 82 ms, p95 86 ms; no leaks.
+
+**Prefix-cache retention (adopted).** 0.30.0 defaults
+`--prefix-cache-retention-interval` to 0, which under MTP keeps less of
+each previous turn. On the teacher (`::nothink::mtp@118784`, 5-turn
+sessions, 1,024-token replies, 8 sessions per setting, salted per
+session, engine restarted between the settings), `None` cached 29,120
+prompt tokens per session on turns 2-5 against 24,128 under the default
+(rule a, every session), and its median turn-2+ TTFT was 0.72x the
+default's (about 906 against 1,253 ms; 95% percentile bootstrap
+0.722-0.725, approximate with 8 sessions; rule b). With the flag, both
+prepared rows pass their exact-context and load probes unchanged (rule
+c). So every vllm-devai launch carries it, from the argument builders
+(gpu-arbiter `engineArgDefaults`, `probe-vllm-devai-reasoning.py`
+`PREFIX_CACHE_RETENTION_ARGS`), pinned in `deploy/backend-flags.yaml`'s
+`vllm-devai` section; stock vLLM 0.22.1 has no such flag.
+
+**Re-probes.** Phase 15's baseline, Qwen3.5-9B-NVFP4, fits 262,144 on
+0.30.0 (22.71 GiB, MTP fits). The other rows are re-probed in Phase 4 step
+4g. Raw logs and reports: `/var/cache/devai/bench/4v/v0.30.0/`.
 
 ### Prepared checkpoints (`make model-prepare`)
 
