@@ -8,6 +8,8 @@ LAB_PORT ?= 8888
 DSH_PORT ?= 3080
 # Pinned -- see the DeepSeek Harness block in fetch-cli.
 DSH_VERSION ?= 0.1.5-rc.2
+# Pinned -- see the Pi block in fetch-cli.
+PI_VERSION ?= 0.87.1
 WEBUI_PORT ?= 8443
 HOST_WORK_DIR ?= .
 HOST_HOME_DIR ?= $(HOME)
@@ -314,21 +316,29 @@ fetch-cli: ## Download all external binaries and packages to local cache (uses E
 	@# Pi (earendil-works/pi, pi.dev): Bun-compiled binary that loads sidecar
 	@# assets (wasm, themes, export-html) from its own directory, so the whole
 	@# `pi/` tree is kept together and only the binary is symlinked onto PATH
-	@# (Dockerfile.lab). The asset name carries no version: latest/download works.
-	@ARCH=$$(dpkg --print-architecture) \
+	@# (Dockerfile.lab). PINNED, like DeepSeek Harness: the picker writes Pi's
+	@# models.json and relies on how Pi matches --model (test_picker_pi.py,
+	@# verified on 0.87.1). Bump PI_VERSION deliberately and re-test. Fetched to
+	@# a temp dir and checked against PI_VERSION, so a failed download or a
+	@# binary of another version leaves the previous tree in place.
+	@if [ "$$(cat $(ETAG_DIR)/pi.version 2>/dev/null)" = "$(PI_VERSION)" ] && [ -x $(CACHE_DIR)/pip/bin/pi/pi ]; then \
+		echo "Pi: up to date ($(PI_VERSION))"; \
+	else \
+		ARCH=$$(dpkg --print-architecture) \
 		&& case "$$ARCH" in amd64) PI_ARCH=x64;; arm64) PI_ARCH=arm64;; esac \
-		&& HTTP_CODE=$$(curl -fsSL -w '%{http_code}' -o $(CACHE_DIR)/pip/bin/pi.tar.gz \
-			--etag-compare $(ETAG_DIR)/pi.etag --etag-save $(ETAG_DIR)/pi.etag \
-			"https://github.com/earendil-works/pi/releases/latest/download/pi-linux-$${PI_ARCH}.tar.gz") \
-		&& if [ "$$HTTP_CODE" = "304" ] || [ ! -s $(CACHE_DIR)/pip/bin/pi.tar.gz ]; then \
-			rm -f $(CACHE_DIR)/pip/bin/pi.tar.gz; STATE="up to date"; \
-		else \
-			rm -rf $(CACHE_DIR)/pip/bin/pi \
-			&& tar -xzf $(CACHE_DIR)/pip/bin/pi.tar.gz -C $(CACHE_DIR)/pip/bin pi \
-			&& chmod +x $(CACHE_DIR)/pip/bin/pi/pi \
-			&& rm -f $(CACHE_DIR)/pip/bin/pi.tar.gz && STATE="updated"; fi \
-		&& VERSION=$$(PI_OFFLINE=1 $(CACHE_DIR)/pip/bin/pi/pi --version </dev/null 2>&1 | awk '{print $$1; exit}') \
-		&& echo "Pi: $$STATE ($$VERSION)"
+		&& rm -rf $(CACHE_DIR)/pip/bin/pi.tmp && mkdir -p $(CACHE_DIR)/pip/bin/pi.tmp \
+		&& curl -fsSL -o $(CACHE_DIR)/pip/bin/pi.tmp/pi.tar.gz \
+			"https://github.com/earendil-works/pi/releases/download/v$(PI_VERSION)/pi-linux-$${PI_ARCH}.tar.gz" \
+		&& tar -xzf $(CACHE_DIR)/pip/bin/pi.tmp/pi.tar.gz -C $(CACHE_DIR)/pip/bin/pi.tmp pi \
+		&& chmod +x $(CACHE_DIR)/pip/bin/pi.tmp/pi/pi \
+		&& VERSION=$$(PI_OFFLINE=1 $(CACHE_DIR)/pip/bin/pi.tmp/pi/pi --version </dev/null 2>&1 | awk '{print $$1; exit}') \
+		&& [ "$$VERSION" = "$(PI_VERSION)" ] \
+		&& rm -rf $(CACHE_DIR)/pip/bin/pi && mv $(CACHE_DIR)/pip/bin/pi.tmp/pi $(CACHE_DIR)/pip/bin/pi \
+		&& rm -rf $(CACHE_DIR)/pip/bin/pi.tmp \
+		&& echo "$(PI_VERSION)" > $(ETAG_DIR)/pi.version \
+		&& echo "Pi: updated ($(PI_VERSION))" \
+		|| { rm -rf $(CACHE_DIR)/pip/bin/pi.tmp; echo "ERROR: Pi $(PI_VERSION) download failed, or the binary is not $(PI_VERSION)" >&2; exit 1; }; \
+	fi
 	@# DeepSeek Harness (deepseek-ai/deepseek-harness): an npm app with ~500
 	@# transitive packages, so it needs a real `npm install` -- run inside the
 	@# base image (built just before this by build-cpu/build-gpu), not with a

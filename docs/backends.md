@@ -716,6 +716,31 @@ probe, so `PROBE_FORCE_ARCH=1` on its own reports `0 probe(s); 1 band(s)
 fully cached` and never re-runs the parser round-trip. Both flags
 together re-probe the cell and re-derive the capability.
 
+#### Provenance fields in the HF probe caches
+
+Every model row the vLLM / vllm-devai / SGLang prober writes carries four
+additive fields beside `reasoning_parser` and `tool_parser` (no schema
+bump; written in `scripts/_probe_hf_common.py`, where the parsers are
+resolved, about lines 2405-2473). The Ollama cache has none of them.
+
+| Field | Values | Meaning |
+|---|---|---|
+| `tool_parser_source`, `reasoning_parser_source` | `"curated"`, `"card"` or `null` | where the row's parser came from: `curated` = the family's `parsers:` block in `deploy/models.yaml` (`curated_parsers`); `card` = derived from the checkpoint's own chat template (`derive_parser_for`, `scripts/_card_hints.py`), used only when no curated value exists; `null` = neither, so no parser flag is emitted |
+| `parser_disagreement` | `{"tool" or "reasoning": {"curated": X, "derived": Y}}` | present only when the card derivation names a DIFFERENT parser than the curated block; the curated value is still served, and the prober also prints a WARNING. Removed again when a re-probe finds them in agreement |
+| `card_sampling` | a subset of `temperature`, `top_p`, `top_k`, `eos_token_id` | the checkpoint's own `generation_config.json` (`_card_hints.sampling_defaults`), read host-side at probe time; omitted when the file is absent or holds none of these keys |
+
+A row probed before these fields existed has none of them: absent means
+"not recorded", not `null`. State of the caches on 2026-10-07: no row
+anywhere has `card` as a source and no row has a `parser_disagreement`;
+the first real run of the card branch comes with the platform-rebuild
+re-probe (Phase 4, I24).
+
+Readers: only the prober itself, which prints the sources in its progress
+line (`R=<parser>(curated) T=<parser>(card)`). The router, the picker
+and the bench do not read any of the four. In particular `card_sampling`
+was stamped so that the bench could read sampling defaults without a
+weights mount, but no bench code reads it (checked 2026-10-07).
+
 ### Probe knobs
 
 | Env / Make var | Effect |
