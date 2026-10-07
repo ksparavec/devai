@@ -82,8 +82,9 @@ protocol fields, not by prompt hacks in agents. The current reasoning semantics
 are documented in `docs/ollama_models.md`.
 
 The router also refuses model-store mutations. `/api/pull`, `/api/create`,
-`/api/push`, `/api/copy` and `/api/delete` return 403 on every backend
-listener, for every HTTP method, before the catch-all proxy sees them
+`/api/push`, `/api/copy`, `/api/delete` and `/api/blobs/...` return 403 on
+every backend listener, for every HTTP method, before the catch-all proxy
+sees them, also when a slash in the path is percent-encoded
 (`ollamaMutationPaths` / `makeMutationGuard` / `newBackendMux` in
 `gpu-arbiter/main.go`). Without that guard anything in the lab could pull an
 unprobed model and then serve it, bypassing the probe-cache fit gate. The

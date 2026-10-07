@@ -910,6 +910,14 @@ type arbiter struct {
 	// See sse_keepalive.go.
 	keepaliveInterval time.Duration
 	keepaliveGrace    time.Duration
+	// fingerprint logs one content-free shape line per POST
+	// (DEVAI_REQUEST_FINGERPRINT / _RAW, fingerprint.go). Off by default.
+	// Raw mode writes bodies to fingerprintDir ("" = fingerprintRawDir)
+	// until fingerprintRawBytes passes fingerprintRawCapBytes.
+	fingerprint         fingerprintMode
+	fingerprintDir      string
+	fingerprintRawBytes atomic.Int64
+	fingerprintCapHit   atomic.Bool
 	// Size and declared-context are keyed by (backend, model name) for the
 	// same reason every other lookup below is: a model probed on BOTH vLLM
 	// and SGLang has an independent row per backend, and a name-only map
@@ -1966,6 +1974,7 @@ func buildArbiter() *arbiter {
 		maxConcurrent:        int64(envIntAllowZero("MAX_CONCURRENT_REQUESTS", 32)),
 		keepaliveInterval:    time.Duration(envIntAllowZero("DEVAI_SSE_KEEPALIVE_SECONDS", sseKeepaliveIntervalDefault)) * time.Second,
 		keepaliveGrace:       time.Duration(envIntAllowZero("DEVAI_SSE_KEEPALIVE_GRACE_SECONDS", sseKeepaliveGraceDefault)) * time.Second,
+		fingerprint:          fingerprintModeFromEnv(),
 		modelSizes:           modelSizes,
 		modelContexts:        modelContexts,
 		benchedModels:        benchedModels,
@@ -1987,6 +1996,23 @@ func buildArbiter() *arbiter {
 		recoveryRegistry:     recoveryRegistry,
 		healthClient:         &http.Client{Timeout: 2 * time.Second},
 		holdCacheTTL:         jobHoldRetryAfter * time.Second,
+	}
+	for _, w := range fingerprintEnvWarnings() {
+		log.Printf("WARNING: %s", w)
+	}
+	switch a.fingerprint {
+	case fingerprintOn:
+		log.Printf("request fingerprints ON (DEVAI_REQUEST_FINGERPRINT=on): one content-free line per POST")
+	case fingerprintRaw:
+		log.Printf("WARNING: request fingerprints RAW (DEVAI_REQUEST_FINGERPRINT_RAW=on): every POST body is written in full to %s (in this container), up to %d MiB",
+			fingerprintRawDir, fingerprintRawCapBytes>>20)
+	}
+	if a.fingerprint != fingerprintRaw {
+		// Bodies captured by an earlier raw-mode run of this container
+		// (a `podman restart` keeps its filesystem) do not outlive it.
+		if err := os.RemoveAll(fingerprintRawDir); err != nil {
+			log.Printf("WARNING: could not remove %s: %v", fingerprintRawDir, err)
+		}
 	}
 
 	// Image-drift detection (Phase C): compare each HF backend's running
@@ -2069,6 +2095,10 @@ var ollamaMutationPaths = []string{
 	"/api/push",
 	"/api/copy",
 	"/api/delete",
+	// A subtree pattern: Ollama's blob routes carry the digest in the path
+	// (POST/HEAD /api/blobs/sha256:<hex>). Uploading a blob is the first
+	// step of an `ollama create` from a local file.
+	"/api/blobs/",
 }
 
 // makeMutationGuard refuses a model-store mutation with 403 and names the
@@ -2078,14 +2108,48 @@ var ollamaMutationPaths = []string{
 // from an upstream that never implemented the endpoint.
 func (a *arbiter) makeMutationGuard(backendName string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("[%s] REFUSED %s %s from %s -- model-store mutation via router",
+		// %q and json.Marshal: the path is the client's, and since the
+		// /api/blobs/ subtree it is not one of a fixed set.
+		log.Printf("[%s] REFUSED %s %q from %s -- model-store mutation via router",
 			backendName, r.Method, r.URL.Path, r.RemoteAddr)
+		body, _ := json.Marshal(map[string]string{"error": r.URL.Path +
+			" is disabled at the router: models must be probed before they can be served. " +
+			"Use 'make model-pull' on the host, then 'make probe' (or probe-vllm/probe-sglang)."})
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusForbidden)
-		_, _ = fmt.Fprintf(w,
-			`{"error":"%s is disabled at the router: models must be probed before they can be served. `+
-				`Use 'make model-pull' on the host, then 'make probe' (or probe-vllm/probe-sglang)."}`+"\n",
-			r.URL.Path)
+		_, _ = w.Write(append(body, '\n'))
+	}
+}
+
+// isMutationPath reports whether a DECODED, cleaned request path is one of
+// ollamaMutationPaths. ServeMux matches on the escaped path, so
+// `/api%2Fdelete` is one segment that misses the `/api/delete` pattern and
+// lands on the catch-all, which would proxy it raw -- and Ollama decodes it
+// and runs the delete. The catch-all therefore checks the decoded path too.
+func isMutationPath(p string) bool {
+	c := path.Clean(p)
+	for _, m := range ollamaMutationPaths {
+		if base, subtree := strings.CutSuffix(m, "/"); subtree {
+			if c == base || strings.HasPrefix(c, m) {
+				return true
+			}
+		} else if c == m {
+			return true
+		}
+	}
+	return false
+}
+
+// refuseMutation puts the mutation guard in front of the catch-all for
+// paths ServeMux could not match because a slash in them was encoded.
+func (a *arbiter) refuseMutation(backendName string, next http.HandlerFunc) http.HandlerFunc {
+	guard := a.makeMutationGuard(backendName)
+	return func(w http.ResponseWriter, r *http.Request) {
+		if isMutationPath(r.URL.Path) {
+			guard(w, r)
+			return
+		}
+		next(w, r)
 	}
 }
 
@@ -2103,7 +2167,7 @@ func (a *arbiter) newBackendMux(name string) *http.ServeMux {
 	for _, p := range ollamaMutationPaths {
 		mux.HandleFunc(p, a.makeMutationGuard(name))
 	}
-	mux.HandleFunc("/", a.makeRequestHandler(name))
+	mux.HandleFunc("/", a.refuseMutation(name, a.makeRequestHandler(name)))
 	return mux
 }
 
@@ -3760,6 +3824,7 @@ func (a *arbiter) makeRequestHandler(backendName string) http.HandlerFunc {
 				http.Error(w, `{"error":"failed to read body or body too large"}`, http.StatusRequestEntityTooLarge)
 				return
 			}
+			a.logFingerprint(backendName, req.URL.Path, body)
 
 			var parsed struct {
 				Model string `json:"model"`

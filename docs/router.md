@@ -18,6 +18,7 @@ caches consumed, and failure modes.
 - [Architecture](#architecture)
 - [Port layout](#port-layout)
 - [What the router advertises](#what-the-router-advertises)
+- [Model-store mutation guard](#model-store-mutation-guard)
 - [Backend lifecycle](#backend-lifecycle)
   - [Job runners (the laya trainer)](#job-runners-the-laya-trainer)
 - [Request rewrite chain](#request-rewrite-chain)
@@ -34,6 +35,7 @@ caches consumed, and failure modes.
 - [Configuration (env vars)](#configuration-env-vars)
 - [Failure modes](#failure-modes)
 - [Operator tasks](#operator-tasks)
+  - [Request fingerprints](#request-fingerprints-find-claude-codes-throwaway-requests)
 - [Benchmark harness](#benchmark-harness)
 
 ---
@@ -403,6 +405,50 @@ recorded at ctx N applies at N and above, and one with no recorded ctx
 applies everywhere.
 
 See `gpu-arbiter/advertise.go`.
+
+## Model-store mutation guard
+
+The probe caches are the fit gate: nothing should serve unless a probe
+measured that it fits and serves at the requested context. For vLLM and
+SGLang the router enforces that directly (the allowlist in
+`makeRequestHandler`). For Ollama it relies on upstream serving only the
+locally pulled tags, which holds only while nothing but the probe
+pipeline changes that set. So the router refuses Ollama's store-changing
+routes on EVERY backend listener, for every HTTP method, before the
+catch-all proxy sees them (`ollamaMutationPaths`, `makeMutationGuard`,
+registered by `newBackendMux` in `gpu-arbiter/main.go`):
+
+| Route | Why |
+|---|---|
+| `/api/pull` | adds an unprobed model, which would then serve with no fit data |
+| `/api/create` | the same, from a Modelfile |
+| `/api/push`, `/api/copy` | change or publish the store |
+| `/api/delete` | removes a model the probe cache still advertises |
+| `/api/blobs/<digest>` (a subtree) | the blob upload (POST) and existence check (HEAD) that precede an `ollama create` from a local file; added 2026-10-07 (platform-rebuild 16e) |
+
+ServeMux matches routes on the ESCAPED path, so `/api%2Fdelete` is a
+single segment that misses the `/api/delete` pattern and lands on the
+catch-all, which proxies the raw path -- and Ollama decodes it and runs
+the delete. The catch-all therefore checks the decoded, cleaned path as
+well (`isMutationPath`, `refuseMutation`), which also covers `/api//pull`
+and `/api/delete/`. Until 2026-10-07 it did not: a review verified
+`DELETE /api%2Fdelete` reaching Ollama's delete handler and
+`POST /api/blobs%2Fsha256:...` writing a blob, against devai-ollama 0.34.2.
+
+A refused request gets `403` with `Content-Type: application/json` and a
+JSON body naming the route and the sanctioned path (`make model-pull` on
+the host, then `make probe`), and the router logs
+`[<backend>] REFUSED <method> "<path>" from <addr> -- model-store mutation
+via router` (the path quoted, since it is the client's). The other
+`/api/*` routes (`/api/chat`, `/api/generate`, `/api/show`, `/api/embed`,
+`/api/tags`) are untouched, and near misses such as `/api/pullxyz` and
+`/api/blobsx` fall through to the proxy. `/api/blobs` without a trailing
+slash gets ServeMux's redirect to `/api/blobs/`, which is refused.
+
+devai's own pipeline never goes through the router for these:
+`scripts/select-models.py` runs `ollama pull` / `ollama create` with
+`podman exec` in the Ollama container, and the Ollama prober talks to that
+container directly. Tests: `gpu-arbiter/mutation_guard_test.go`.
 
 ## Request rewrite chain
 
@@ -1077,6 +1123,8 @@ the shell when invoking compose.
 | `DEVAI_SSE_KEEPALIVE_GRACE_SECONDS` | `5` | how long a launch may take before the first frame is sent (and the response is committed as SSE) |
 | `LAYA_MAX_HOLD_S`         | `900`   | longest a busy job runner may refuse other backends, counted from its job's `started_at`; `0` = no cap. An engineering margin set by the owner, not an estimate: the three measured campaign jobs held 123.3 / 135.2 / 140.4 s (1,448-1,789 training rows x 4 epochs, single runs, 2026-09-25; docs/laya-trainer.md "Measurements"). A straight line through two job sizes puts 900 s at roughly 10x that dataset at the same short texts, 4 epochs and lean mode -- an extrapolation the two points cannot test. A job past it fails as `trainer_stopped`. |
 | `LAYA_JOB_TIMEOUT_S`      | `0`     | forwarded to the trainer: per-job wall-clock limit (exit 124); `0` = none |
+| `DEVAI_REQUEST_FINGERPRINT` | `off` | `on` logs one content-free `fingerprint:` line per POST; see [Request fingerprints](#request-fingerprints-find-claude-codes-throwaway-requests) |
+| `DEVAI_REQUEST_FINGERPRINT_RAW` | `off` | `on` turns fingerprints on AND writes every POST body, verbatim, to a file inside the router container (`raw_file` in the line): content-revealing, for capturing a fixture only. Any value other than `on`/`off` counts as off, with a startup warning |
 | `DEVAI_MAX_FAILED_LAUNCHES` | `3` | consecutive launches of the same `(model, ctx)` that may fail to produce a real engine response before the router refuses; `0` disables the breaker. See [Launch circuit breaker](#launch-circuit-breaker-engine-dies-after-passing-health). |
 
 ### SSE keepalive during cold start
@@ -1344,6 +1392,81 @@ Useful log lines:
 | `ERROR: <cache> failed to parse: ... -- ZERO <backend> models registered` | probe cache unreadable; the router will 404 every request for that backend and the picker lists none. Replaces the older `warning: probe cache parse failed`. |
 | `error: unloadOllama: keep_alive=0 for <model> failed/returned <status> -- GPU may still be held by ollama` | the Ollama unload that precedes a backend switch did not take; VRAM may still be held |
 | `recovery registry: entry for <model> is scoped to [vllm] -- not applied to sglang` | a per-model recovery entry was skipped because of its `backends` allow-list |
+
+### Request fingerprints (find Claude Code's throwaway requests)
+
+Claude Code sends requests whose answers it throws away -- a quota check,
+title generation, suggestion mode, command-prefix detection, file-path
+extraction -- and each can trigger a cold start. Before any of them is
+answered in the router (platform-rebuild Phase 16b-16c, not built), they
+are found by their shape on real traffic. The fingerprint is observe only:
+the request is neither changed nor answered differently, and with both
+switches off (the default) the request path is unchanged
+(`gpu-arbiter/fingerprint.go`, `fingerprint_test.go`).
+
+With `DEVAI_REQUEST_FINGERPRINT=on` the router logs, for every POST whose
+body it reads (one refused by `MAX_CONCURRENT_REQUESTS` or too large is
+not read), one line:
+
+```
+[vllm] fingerprint: {"path":"/v1/messages","model":"claude-haiku-4-5","max_tokens":1,"n_messages":1,"has_system":false,"system_sha256_12":"","has_tools":false,"stream":false,"body_bytes":213}
+```
+
+- The system text is the top-level `system` (a string or text blocks)
+  plus every `role:"system"` message, as the client sent them (before the
+  router's own normalisation). It appears only as the first 12 hex digits
+  of its SHA-256 -- unsalted, so it can confirm a GUESSED short system
+  prompt, but it does not reveal one. No message, system or tool text is
+  logged; `model` is the client's string, cut at 256 bytes.
+- A body that is not JSON, or a field of an unexpected type, gives zero
+  values for what could not be read (all nine keys are always present).
+- Only `messages`, `system`, `tools`, `max_tokens` / `max_completion_tokens`
+  and `stream` are read: a Responses API body (`input`, `instructions`,
+  `max_output_tokens`), a `developer` role and Ollama's
+  `options.num_predict` are not, so such a line shows `n_messages: 0`.
+  That is enough for Claude Code, whose calls go to `/v1/messages`.
+
+`DEVAI_REQUEST_FINGERPRINT_RAW=on` (fingerprints on, whatever
+`DEVAI_REQUEST_FINGERPRINT` says) also writes each body, byte for byte, to
+its own file under `/tmp/devai-fingerprints/` INSIDE the router container,
+named `<unix-ns>-<backend>-<system_sha256_12 or nosystem>.json` (mode
+0600), and adds `"raw_file":"<name>"` to the line. Capture stops after 256
+MiB per router run (logged once). Bodies never go to the log: conmon
+splits long lines into 8 KiB chunks and the logger's
+`podman logs --timestamps` puts a stamp into every chunk, which corrupts
+a body taken from the log; and the log is persisted. Raw mode captures
+EVERY client's requests, prompts and file contents included. The files
+live only in the container's own filesystem: recreating the container
+removes them, and the router also deletes the directory at start whenever
+raw mode is off.
+
+The runbook (the stack runs under root's podman, hence `sudo`):
+
+1. Set `DEVAI_REQUEST_FINGERPRINT=on` in `.env` and run `make cache-up`
+   (compose recreates the router for the changed environment); the
+   startup log says `request fingerprints ON`.
+2. Run a real Claude Code session against the router.
+3. Bucket the lines by `(path, has_system, system_sha256_12, max_tokens,
+   has_tools)`, from the persisted log (`make logs` follows forever):
+
+   ```bash
+   sed -n 's/^[^ ]* [^ ]* [^ ]* \[[a-z0-9-]*\] fingerprint: //p' \
+       /var/cache/devai/logs/devai-router.log \
+     | jq -cR 'fromjson? // empty | [.path, .has_system, .system_sha256_12, .max_tokens, .has_tools]' \
+     | sort | uniq -c | sort -rn
+   ```
+
+4. For each frequent bucket whose answer is a constant or a pure function
+   of the request, capture ONE body as a fixture under
+   `tests/fixtures/claude-code-probes/`: set
+   `DEVAI_REQUEST_FINGERPRINT_RAW=on`, `make cache-up`, trigger the
+   request, then
+   `sudo podman cp devai-router:/tmp/devai-fingerprints ./fingerprints`
+   and pick the file the bucket's line names in `raw_file`. Check a
+   fixture for anything private before committing it.
+5. Set both back to `off` and run `make cache-up`; the recreated router
+   no longer holds any captured body. Delete the local `./fingerprints`
+   copy.
 
 ### Verify a single request end-to-end
 

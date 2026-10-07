@@ -232,7 +232,7 @@ The router (`devai-router`) is a small Go reverse proxy (~9 MB distroless) that:
 - Sizes vLLM/SGLang launches dynamically (`--gpu-memory-utilization`, `--mem-fraction-static`, `--max-model-len`) from per-model VRAM budgets.
 - Keeps a loaded backend warm by default (`IDLE_TIMEOUT=0`): it is unloaded when a *different* model is requested, not on a timer. Set `IDLE_TIMEOUT` to a positive number of seconds to restore time-based auto-stop.
 - Applies the **reasoning policy** to each request (see below).
-- Refuses the Ollama **write endpoints** (`/api/pull`, `/api/create`, `/api/push`, `/api/copy`, `/api/delete`) with 403 on every backend listener, so an agent in the lab or an Open WebUI user cannot pull an unprobed model and then serve it around the probe-cache fit gate. The sanctioned path is still `make model-pull`; `scripts/select-models.py` reaches Ollama via `podman exec`, never through the router, so it is unaffected.
+- Refuses the Ollama **write endpoints** (`/api/pull`, `/api/create`, `/api/push`, `/api/copy`, `/api/delete`, `/api/blobs/...`) with 403 on every backend listener, also when a slash in the path is percent-encoded, so an agent in the lab or an Open WebUI user cannot pull an unprobed model and then serve it around the probe-cache fit gate. The sanctioned path is still `make model-pull`; `scripts/select-models.py` reaches Ollama via `podman exec`, never through the router, so it is unaffected.
 
 > **Status:** all three backends are wired. vLLM and SGLang start as `sleep infinity` placeholders (compose can't know which model the user will pick); the router replaces them on demand via libpod when a request arrives on port 11435 / 11436. The picker shows HF rows once they have a fitting probe entry.
 >

@@ -264,11 +264,15 @@ class RouterEnvKnobsAreForwardedTest(unittest.TestCase):
         """Generalised deliberately. Scoping this to DEVAI_SSE_* would
         have passed while DEVAI_GPU_DEVICE -- the first instance of this
         bug, and the more damaging one -- stayed broken."""
-        go = (REPO_ROOT / "gpu-arbiter" / "main.go").read_text()
-        env = "\n".join(self._router_env())
+        go = "\n".join(
+            f.read_text() for f in sorted((REPO_ROOT / "gpu-arbiter").glob("*.go"))
+            if not f.name.endswith("_test.go"))
+        # Exact names, not substrings: DEVAI_REQUEST_FINGERPRINT is a
+        # prefix of DEVAI_REQUEST_FINGERPRINT_RAW.
+        env = {e.split("=", 1)[0] for e in self._router_env()}
         import re
         names = set(re.findall(r'env\w*\("(DEVAI_[A-Z_]+)"', go))
-        self.assertTrue(names, "no DEVAI_* env knobs found in main.go")
+        self.assertTrue(names, "no DEVAI_* env knobs found in gpu-arbiter/*.go")
         for name in sorted(names - EXEMPT_FROM_COMPOSE):
             with self.subTest(var=name):
                 self.assertIn(name, env,
@@ -288,7 +292,9 @@ class RouterEnvKnobsAreForwardedTest(unittest.TestCase):
     def test_knobs_are_documented_for_operators(self):
         example = (REPO_ROOT / ".env.example").read_text()
         for name in ("DEVAI_SSE_KEEPALIVE_SECONDS",
-                     "DEVAI_SSE_KEEPALIVE_GRACE_SECONDS"):
+                     "DEVAI_SSE_KEEPALIVE_GRACE_SECONDS",
+                     "DEVAI_REQUEST_FINGERPRINT",
+                     "DEVAI_REQUEST_FINGERPRINT_RAW"):
             self.assertIn(name, example)
 
 

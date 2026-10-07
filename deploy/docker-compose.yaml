@@ -200,6 +200,10 @@ services:
       # Launch circuit breaker: consecutive failed launches of the same
       # (model, ctx) before the router refuses to keep retrying. 0 disables.
       - DEVAI_MAX_FAILED_LAUNCHES=${DEVAI_MAX_FAILED_LAUNCHES:-3}
+      # Request fingerprints (docs/router.md "Request fingerprints"): one
+      # content-free line per POST when on; _RAW logs every body in full.
+      - DEVAI_REQUEST_FINGERPRINT=${DEVAI_REQUEST_FINGERPRINT:-off}
+      - DEVAI_REQUEST_FINGERPRINT_RAW=${DEVAI_REQUEST_FINGERPRINT_RAW:-off}
       - GPU_MEMORY_GB=${GPU_MEMORY_GB:-24}
       # The CDI device string the router stamps onto the vLLM/SGLang
       # containers it recreates (main.go, containerRecreate). The compose
