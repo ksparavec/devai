@@ -12,8 +12,10 @@ deploy/recovery-flags.generated.json:
 Rules:
 
   - Only when the recipe's min_vllm_version admits the vLLM in service: the
-    default VLLM_VERSION of scripts/build-vllm.sh (0.28.0 today; Phase 4 step
-    4v moves the default). A `nightly` or missing minimum admits nothing.
+    default VLLM_VERSION of scripts/build-vllm.sh (0.30.0 since Phase 4 step
+    4v; until 4v's acceptance rule passes, 0.28.0 still serves on vllm-devai,
+    so a recipe whose minimum is 0.29 or 0.30 is admitted before that vLLM
+    serves). A `nightly` or missing minimum admits nothing.
   - Scoped to `vllm-devai`, the backend that runs that build, until Phase 4
     step 4e renames it to `vllm` (which also rewrites the groups written
     here). Backends match by engine, so a ["vllm"] group would also reach

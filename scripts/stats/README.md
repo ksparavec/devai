@@ -75,6 +75,39 @@ python3 scripts/stats/bench_timeouts.py $L $O/timeouts.tsv
 - `bench_timeouts.py`: every log with a sample that hit the per-sample time
   limit.
 
+## vLLM 0.30.0 acceptance (docs/backends.md "vLLM 0.30.0"; platform-rebuild Phase 4, step 4v)
+
+```bash
+B=/var/cache/devai/bench/4v; O=~/.cache/devai/stats/4v; mkdir -p $O
+OLD=$B/<0.28.0 arm>; NEW=$B/<0.30.0 arm>   # each arm's BENCH_LOG_DIR parent
+podman run --rm --network=none --entrypoint python3 -v $PWD:/repo:ro -v $B:$B:ro -v $O:$O \
+    localhost/devai-lab-gpu:latest /repo/scripts/stats/vllm_upgrade_accept.py accept \
+    --old-logs $OLD/logs --new-logs $NEW/logs \
+    --old-tag-id <id> --old-served-id <id> --new-tag-id <id> --new-served-id <id> \
+    --old-speed $OLD/speed.json --new-speed $NEW/speed.json --out $O/accept.json
+python3 scripts/stats/vllm_upgrade_accept.py retention \
+    --default $B/retention/default/*.json --none $B/retention/none/*.json --out $O/retention.json
+```
+
+- `vllm_upgrade_accept.py accept`: the acceptance rule's quality verdict
+  (pass, fail or inconclusive) on the two builds' gsm8k and humaneval logs,
+  items paired by id: Newcombe upper bounds against the 3- and 5-point
+  margins (time-outs wrong on 0.30.0, right on 0.28.0), exact McNemar with
+  Holm (time-outs wrong), Fail taking precedence; each build's time-outs and
+  expected half-widths. With the speed manifests (format in the module
+  docstring) it adds the TTFT and decode-rate ratios over the per-prompt
+  latency records (prompts 1-39, geometric mean, bootstrap interval) and the
+  MTP acceptance length from the saved `/metrics` texts. It refuses a
+  verdict (exit 3) when both arms' tags name one image id, or when an arm's
+  served id differs from its tag's. The logs are zstd, so it runs in the lab
+  image (Python 3.14), as the other log readers do.
+- `vllm_upgrade_accept.py retention`: the prefix-cache retention rule (a)-(b)
+  over the per-session `bench_concurrency.py --mode multiturn` reports of the
+  two arms (one JSON file per session, paired by salt; save them with
+  `make -s` so make's own echo stays out of the file). Rule (c), the
+  exact-context probes with the flag, is not evaluated here.
+- Tested by `tests/python/test_stats_vllm_upgrade_accept.py`.
+
 ## Use-case scores (owner's four use cases)
 
 ```bash

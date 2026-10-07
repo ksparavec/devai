@@ -489,6 +489,122 @@ class TestVerifyBackendFlagsExactMatch(unittest.TestCase):
                              "--kv-cache-dtype", backend)
 
 
+class TestVerifyBackendFlagsVllmDevai(unittest.TestCase):
+    """`make verify-backend-flags` also checks VLLM_DEVAI_IMAGE (plan 4v):
+    the pinned vLLM flag names plus every flag NAME a recovery entry scoped
+    to vllm-devai appends -- curated and generated, gated as a launch gates
+    them. No podman: the --help text and the files are stubs."""
+
+    def setUp(self) -> None:
+        self.mod = _load_script("_verify_backend_flags_devai_under_test",
+                                "verify-backend-flags.py")
+
+    ENTRIES = [
+        ("A", "curated", ["--language-model-only", "--max-num-seqs", "4",
+                          "--gpu-memory-utilization=0.96"], None),
+        ("B", "generated", ["--language-model-only", "--max-num-seqs", "8"], None),
+        ("C", "curated", ["--only-on-its-own-image"], "docker.io/vllm/vllm-openai:old"),
+        ("D", "curated", ["--limit-mm-per-prompt", '{"image": 7}'], None),
+    ]
+
+    def test_recovery_flags_are_names_only_and_skip_image_pinned_entries(self) -> None:
+        flags, skipped = self.mod.recovery_flags(self.ENTRIES)
+        self.assertEqual(sorted(flags.values()),
+                         ["--gpu-memory-utilization", "--language-model-only",
+                          "--limit-mm-per-prompt", "--max-num-seqs"])
+        self.assertEqual(len(skipped), 1)
+        self.assertIn("C (curated; launches on docker.io/vllm/vllm-openai:old)", skipped)
+        # Two flags appended by the same models stay two checks.
+        key = next(k for k, v in flags.items() if v == "--max-num-seqs")
+        self.assertIn("A (curated)", key)
+        self.assertIn("B (generated)", key)
+
+    def _help(self, *flags: str) -> str:
+        return "\n".join(f"  {f} X" for f in flags)
+
+    def test_a_missing_recovery_flag_fails_naming_its_models(self) -> None:
+        pinned = {"model": "--model", "max_num_seqs": "--max-num-seqs"}
+        cfg = {"vllm": pinned}
+        ok_help = self._help("--model", "--max-num-seqs", "--language-model-only",
+                             "--gpu-memory-utilization", "--limit-mm-per-prompt")
+        missing, skipped, n = self.mod.check_vllm_devai(cfg, ok_help, self.ENTRIES)
+        self.assertEqual(missing, [])
+        self.assertEqual(n, 5, "a pinned flag is checked once")
+        missing, _, _ = self.mod.check_vllm_devai(
+            cfg, self._help("--model", "--max-num-seqs", "--gpu-memory-utilization",
+                            "--limit-mm-per-prompt"), self.ENTRIES)
+        self.assertEqual(len(missing), 1)
+        self.assertIn("--language-model-only", missing[0])
+        self.assertIn("A (curated)", missing[0])
+        missing, _, _ = self.mod.check_vllm_devai(
+            cfg, self._help("--max-num-seqs", "--language-model-only",
+                            "--gpu-memory-utilization", "--limit-mm-per-prompt"), self.ENTRIES)
+        self.assertEqual(missing, ["model=--model"])
+
+    def test_main_checks_the_devai_image_with_help_all_and_fails_on_drift(self) -> None:
+        import yaml
+        cfg = yaml.safe_load((REPO_ROOT / "deploy" / "backend-flags.yaml").read_text())
+        everything = self._help(*cfg["vllm"].values(), *cfg["sglang"].values())
+        calls = []
+
+        def fake_help(image, args, gpu, help_arg="--help"):
+            calls.append((image, help_arg, gpu))
+            return everything
+        self.mod._help_text = fake_help
+        self.mod.VLLM_DEVAI_IMAGE = "docker.io/devai/vllm-devai:v-test"
+        self.mod._vllm_devai_entries = lambda: [("A", "curated", ["--gone-upstream"], None)]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(SystemExit) as cm:
+            self.mod.main()
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn(("docker.io/devai/vllm-devai:v-test", "--help=all", True), calls)
+        self.assertIn((self.mod.VLLM_IMAGE, "--help", True), calls, "stock check unchanged")
+        self.assertIn("--gone-upstream", out.getvalue())
+        self.assertIn("vllm-devai", out.getvalue().split("[fail]", 1)[1])
+        # With every flag present the gate passes.
+        self.mod._vllm_devai_entries = lambda: [("A", "curated", ["--model"], None)]
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.mod.main()
+
+    def test_the_default_image_is_the_makefiles(self) -> None:
+        import os
+        from unittest import mock
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("VLLM_DEVAI_IMAGE", None)
+            mod = _load_script("_verify_backend_flags_default", "verify-backend-flags.py")
+        self.assertEqual(mod.VLLM_DEVAI_IMAGE, "docker.io/devai/vllm-devai:latest")
+
+    def test_the_entries_are_the_probers_scoped_reader(self) -> None:
+        # Same gate a vllm-devai launch applies: by name or by engine, both
+        # files; an sglang-only entry is not this image's.
+        import _probe_hf_common as hf
+        saved = (hf.RECOVERY_FLAGS_PATH, hf.RECOVERY_GENERATED_PATH, hf._RECOVERY_REGISTRY,
+                 hf._RECOVERY_GENERATED, list(hf._RECOVERY_SIGS))
+        with tempfile.TemporaryDirectory() as td:
+            cur, gen = Path(td) / "c.json", Path(td) / "g.json"
+            cur.write_text(json.dumps({"models": {
+                "byname": {"backends": ["vllm-devai"], "engine_flags": ["--a"]},
+                "byengine": {"backends": ["vllm"], "engine_flags": ["--b"]},
+                "other": {"backends": ["sglang"], "engine_flags": ["--c"]},
+                "pinned": {"backends": ["vllm"], "engine_flags": ["--d"], "image": "img:x"}}}))
+            gen.write_text(json.dumps({"version": 1, "models": {
+                "byname": [{"backends": ["vllm-devai"], "engine_flags": ["--e"]},
+                           {"backends": ["sglang"], "engine_flags": ["--f"]}]}}))
+            hf.RECOVERY_FLAGS_PATH, hf.RECOVERY_GENERATED_PATH = cur, gen
+            hf._RECOVERY_SIGS[:] = [hf._UNSEEN, hf._UNSEEN]
+            try:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    got = hf.recovery_entries_for_backend("vllm-devai")
+            finally:
+                (hf.RECOVERY_FLAGS_PATH, hf.RECOVERY_GENERATED_PATH, hf._RECOVERY_REGISTRY,
+                 hf._RECOVERY_GENERATED, sigs) = saved
+                hf._RECOVERY_SIGS[:] = sigs
+        self.assertEqual(got, [("byengine", "curated", ["--b"], None),
+                               ("byname", "curated", ["--a"], None),
+                               ("pinned", "curated", ["--d"], "img:x"),
+                               ("byname", "generated", ["--e"], None)])
+
+
 class TestOllamaDisableProbeError(unittest.TestCase):
     """probe-ollama-reasoning must never write a STRING into
     disable_verified: the router decodes it as *bool and unmarshals the

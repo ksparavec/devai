@@ -96,10 +96,12 @@ from _probe_hf_common import (
     http_post,
     install_probe_cleanup,
     is_downloaded,
+    ledger_file_args,
     load_catalog_hf_rows,
     model_size_gb_from_row,
     recovery_image,
     recovery_overrides,
+    row_speculative_config,
 )
 
 # bench/ is a package; VramSampler polls nvidia-smi on a fixed cadence.
@@ -583,6 +585,7 @@ def load_probe_one_cell(
     corpus: str,
     needle_depth: float,
     kv_cache_dtype: str | None = None,
+    speculative_config: str | None = None,
 ) -> dict:
     """Launch the backend at ``requested_ctx`` exactly as the router
     would (same parsers, KV dtype, recovery flags, image override), send
@@ -592,7 +595,8 @@ def load_probe_one_cell(
 
     ``kv_cache_dtype`` is the dtype the target cell was FIT-probed under
     (its stamped ``kv_cache_type``), not this pass's default -- see
-    run_load_probe_pass.
+    run_load_probe_pass. ``speculative_config`` is the row's MTP drafter
+    (``--mtp``; row_speculative_config), None for a launch without one.
     """
     started = time.time()
     host_frac = host_scaled_fraction(
@@ -606,7 +610,7 @@ def load_probe_one_cell(
         reasoning_parser=reasoning_parser, tool_parser=tool_parser,
         reasoning_parser_plugin=reasoning_plugin_path,
         tool_parser_plugin=tool_plugin_path,
-        speculative_config=None,
+        speculative_config=speculative_config,
         kv_cache_dtype=kv_cache_dtype,
     )
     env_vars = {"VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1"}
@@ -926,6 +930,17 @@ def run_load_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
 
     Backend-agnostic: identical for vLLM and SGLang via their BackendSpec.
 
+    ``--mtp`` (plan 4v): a row whose fit cell records ``mtp_fits: true`` is
+    relaunched with its catalog drafter (row_speculative_config, the fit
+    pass's own builder), as the picker serves it, and the cell is stamped
+    ``serving_mtp: true``; every other row, and every row without
+    ``--mtp``, is relaunched without a drafter, and a rewritten cell then
+    carries no ``serving_mtp``. Under ``--mtp`` a cell whose serving verdict
+    was measured without the drafter is not treated as cached.
+
+    ``--ledger`` reads and writes that file instead of
+    deploy/.model-status.json (ledger_file_args).
+
     PROBE_IGNORE_CURATED_PARSERS (plan I24) is refused here: this pass
     relaunches with the parsers the fit pass recorded, so the switch would
     mean nothing, and its scratch-cache contract is the fit pass's.
@@ -976,7 +991,9 @@ def run_load_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
         cache, digest=run_image_digest, image_ref=args.image)
     if not args.no_cache_write:
         save_cache(args.cache, cache)
-    ledger = _load_ledger()
+    ledger_args = ledger_file_args(args)
+    ledger = _load_ledger(*ledger_args)
+    use_mtp = bool(getattr(args, "mtp", False))
     corpus = load_corpus()
     band_gb = int(args.host_vram_gb)
     needle_depth = float(getattr(args, "needle_depth", 0.5))
@@ -989,6 +1006,11 @@ def run_load_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
     print(f"  ctx search grid:{','.join(context_label(c) for c in search_grid)}",
           file=sys.stderr)
     print(f"  needle depth:   {needle_depth:.2f}", file=sys.stderr)
+    if use_mtp:
+        print("  mtp:            rows whose cell records mtp_fits: true are "
+              "relaunched with their drafter", file=sys.stderr)
+    if ledger_args:
+        print(f"  ledger:         {ledger_args[0]} (scratch)", file=sys.stderr)
     print(f"  {spec.name} image:     {args.image}", file=sys.stderr)
     print(file=sys.stderr)
 
@@ -1030,8 +1052,23 @@ def run_load_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
         max_fit_ctx = max(fitting)
         fit_cell = fitting[max_fit_ctx]
 
-        # Cached: the single cell already carries a serving verdict.
-        if fit_cell.get("serving_ok") is not None and not args.force:
+        # --mtp: serve the row as the picker does, with its drafter, when the
+        # fit pass proved the drafter fits here. vLLM only: SGLang's build
+        # discards the speculative config, so a stamp would claim a drafter
+        # that never ran.
+        spec_cfg = None
+        if (use_mtp and fit_cell.get("mtp_fits") is True
+                and engine_of(spec.name) == "vllm"):
+            spec_cfg = row_speculative_config(row)
+            if spec_cfg is None:
+                print(f"  [warn] {name}: the cell records mtp_fits but the "
+                      f"catalog row declares no mtp: block; load-probing "
+                      f"without a drafter", file=sys.stderr)
+
+        # Cached: the single cell already carries a serving verdict -- under
+        # --mtp, one measured with the drafter.
+        if (fit_cell.get("serving_ok") is not None and not args.force
+                and (spec_cfg is None or fit_cell.get("serving_mtp") is True)):
             print(f"    {context_label(max_fit_ctx):>4s}  cached "
                   f"serving_ok={fit_cell.get('serving_ok')}", file=sys.stderr)
             skipped += 1
@@ -1061,7 +1098,8 @@ def run_load_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
 
         def _serving_works(ctx: int) -> bool:
             print(f"  {name} @ {vram_label(band_gb)} "
-                  f"ctx={context_label(ctx)} kv={cell_kv or 'engine-default'}: "
+                  f"ctx={context_label(ctx)} kv={cell_kv or 'engine-default'}"
+                  f"{' mtp' if spec_cfg else ''}: "
                   f"load-probing ...", file=sys.stderr)
             rec = load_probe_one_cell(
                 spec,
@@ -1080,7 +1118,10 @@ def run_load_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
                 corpus=corpus,
                 needle_depth=needle_depth,
                 kv_cache_dtype=cell_kv,
+                speculative_config=spec_cfg,
             )
+            if spec_cfg:
+                rec["serving_mtp"] = True
             probed_cells[ctx] = rec
             ok = rec.get("serving_ok")
             print(f"    {context_label(ctx):>4s}  serving_ok={ok} "
@@ -1090,8 +1131,23 @@ def run_load_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
                   file=sys.stderr)
             return bool(ok)
 
+        # The fit cell's own context is the top of this row's grid, even when
+        # it is no 32K multiple: a cell an exact-context probe confirmed
+        # (PROBE_CTX_EXACT, e.g. 118,784) is served at that context first.
+        # Searching search_grid alone under the cap tried 98,304 at most and
+        # MOVED such a cell down, although 4v's rule (and 4g's) needs it load-
+        # probed at its own context. A cell above the requested ceiling keeps
+        # the requested cap, as before.
+        row_grid = search_grid
+        if max_fit_ctx <= ctx_ceiling:
+            row_grid = tuple(sorted(
+                {c for c in search_grid if c < max_fit_ctx} | {max_fit_ctx}))
         max_serving = binary_search_max_ctx(
-            _serving_works, position_limit=serving_cap, grid=search_grid)
+            _serving_works, position_limit=serving_cap, grid=row_grid)
+        if probed_cells:
+            # Every branch below rewrites the cell from this pass's records;
+            # a drafter stamp from an earlier pass must not outlive them.
+            fit_cell.pop("serving_mtp", None)
 
         if max_serving is not None:
             load_rec = probed_cells[max_serving]
@@ -1169,7 +1225,7 @@ def run_load_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
             save_cache(args.cache, cache)
 
     if not args.no_cache_write:
-        _save_ledger(ledger, host_vram_gb=args.host_vram_gb)
+        _save_ledger(ledger, *ledger_args, host_vram_gb=args.host_vram_gb)
 
     print(file=sys.stderr)
     print(f"  load-probe done: {probed} model(s) probed, {skipped} skipped",

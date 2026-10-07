@@ -722,20 +722,28 @@ class GuessesAndCurationTest(unittest.TestCase):
             self.assertEqual(P.classify_failure_logs("x\n" + line + "\n")["kind"], "launch_args")
 
     def test_ignore_curated_needs_a_scoped_scratch_run(self) -> None:
+        # Scoped rows, a scratch cache AND (since 4v) a scratch ledger: the
+        # run's cells and its exclusion verdicts both come from card-derived
+        # parsers only (plan I24).
         spec = mock.Mock(cache_path=REPO_ROOT / "deploy" / ".vllm-reasoning-cache.json")
         import argparse
+        real_ledger = REPO_ROOT / "deploy" / ".model-status.json"
+        scratch = {"cache": Path("/tmp/scratch.json"), "ledger": Path("/tmp/scratch-ledger.json")}
         base = dict(ignore_curated_parsers=True, repo="gpt-oss", no_cache_write=False,
-                    cache=spec.cache_path)
+                    cache=spec.cache_path, ledger=None)
         with contextlib.redirect_stderr(io.StringIO()):
-            for bad in ({}, {"repo": ""}):
-                with self.assertRaises(SystemExit):
+            for bad in ({}, {"repo": ""}, {"ledger": scratch["ledger"]},
+                        {"cache": scratch["cache"]},
+                        {"cache": scratch["cache"], "ledger": real_ledger},
+                        {**scratch, "repo": ""}):
+                with self.subTest(bad=bad), self.assertRaises(SystemExit):
                     P.check_ignore_curated(spec, argparse.Namespace(**{**base, **bad}))
             self.assertTrue(P.check_ignore_curated(
-                spec, argparse.Namespace(**{**base, "cache": Path("/tmp/scratch.json")})))
+                spec, argparse.Namespace(**{**base, **scratch})))
             # --no-cache-write makes an already-fitting row look fully
             # cached, so the run would probe nothing: refused.
             for bad in ({"no_cache_write": True},
-                        {"no_cache_write": True, "cache": Path("/tmp/scratch.json")}):
+                        {"no_cache_write": True, **scratch}):
                 with self.assertRaises(SystemExit):
                     P.check_ignore_curated(spec, argparse.Namespace(**{**base, **bad}))
             self.assertFalse(P.check_ignore_curated(

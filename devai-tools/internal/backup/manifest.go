@@ -45,6 +45,10 @@ func Manifest(repoRoot, homeDir string) []Entry {
 		{SourcePath: filepath.Join(deploy, ".ollama-reasoning-cache.json"), ArchivePath: "deploy/.ollama-reasoning-cache.json"},
 		{SourcePath: filepath.Join(deploy, ".vllm-reasoning-cache.json"), ArchivePath: "deploy/.vllm-reasoning-cache.json"},
 		{SourcePath: filepath.Join(deploy, ".sglang-reasoning-cache.json"), ArchivePath: "deploy/.sglang-reasoning-cache.json"},
+		// The vllm-devai backend's cache: platform-rebuild 4v probes the
+		// 0.30.0 build into it, and 4v's rollback restores this file alone
+		// from the archive taken before the first probe.
+		{SourcePath: filepath.Join(deploy, ".vllm-devai-reasoning-cache.json"), ArchivePath: "deploy/.vllm-devai-reasoning-cache.json"},
 		{SourcePath: filepath.Join(deploy, ".model-status.json"), ArchivePath: "deploy/.model-status.json"},
 		{SourcePath: filepath.Join(devaiHome, "preferences.yaml"), ArchivePath: "devai-home/preferences.yaml"},
 		{SourcePath: filepath.Join(devaiHome, "sessions"), ArchivePath: "devai-home/sessions", Dir: true},

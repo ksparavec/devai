@@ -74,6 +74,11 @@ def run(
     Returned ``leaked_markers`` is a flat dict keyed by the
     human-readable marker label (e.g. ``"<|im_end|>"``); zero-count
     markers are present so cross-model comparison is straightforward.
+
+    ``records`` holds one dict per prompt sent, in send order (see
+    ``_record``), so two builds can be compared prompt by prompt, paired
+    by ``id`` -- the aggregates above cannot be paired. The runner writes
+    them to ``<log-dir>/latency-<alias>.jsonl``, not into the cache row.
     """
     prompts = load_prompts(prompts_path)[:n]
     if not prompts:
@@ -85,6 +90,7 @@ def run(
     tps_token_sources: dict[str, int] = {}
     content_blobs: list[str] = []
     errors: list[dict] = []
+    records: list[dict] = []
 
     for i, item in enumerate(prompts):
         body = {
@@ -97,7 +103,9 @@ def run(
             res = stream_chat_completion(router_url, body, timeout=timeout_s)
         except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
             errors.append({"id": item.get("id", str(i)), "error": str(e)})
+            records.append(_record(i, item, None, error=str(e)))
             continue
+        records.append(_record(i, item, res))
 
         if res["t_first_token"] is not None:
             ttft_ms = (res["t_first_token"] - res["t_open"]) * 1000
@@ -143,6 +151,34 @@ def run(
             if patterns else 0.0
         ),
         "leaked_markers": leaks,
+        "records": records,
+    }
+
+
+def _record(i: int, item: dict, res: dict | None, *, error: str | None = None) -> dict:
+    """One prompt's measurement, for the per-prompt latency file.
+
+    ``ttft_ms`` and ``stream_seconds`` (first token to end of stream) are
+    None when no token arrived; every numeric field is None, and ``error``
+    holds the message, when the request failed. ``effective_tokens`` is
+    the engine's own count when ``token_source`` is ``usage``, else the
+    chars/4 estimate.
+    """
+    if res is None:
+        return {"i": i, "id": item.get("id", str(i)), "ttft_ms": None,
+                "effective_tokens": None, "token_source": None,
+                "stream_seconds": None, "finish_reason": None, "error": error}
+    t_first = res.get("t_first_token")
+    return {
+        "i": i,
+        "id": item.get("id", str(i)),
+        "ttft_ms": round((t_first - res["t_open"]) * 1000, 3) if t_first is not None else None,
+        "effective_tokens": res.get("effective_tokens"),
+        "token_source": res.get("token_source"),
+        "stream_seconds": (round(res["t_done"] - t_first, 6)
+                           if t_first is not None else None),
+        "finish_reason": res.get("finish_reason"),
+        "error": None,
     }
 
 

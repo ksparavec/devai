@@ -30,7 +30,18 @@ these scripts, never edits them, from `scripts/prepare-checkpoint.py`
 | `draft_vocab_ids.json` | the shipped id list, counted over 5.4M tokens of the model's own outputs (97.5% coverage per upstream) |
 
 The vLLM patch series these scripts pair with is NOT vendored: scripts/build-vllm.sh
-fetches the same pinned commit at build time and applies it to the source tree.
+fetches it at build time, at the commit its build record names, and applies it to
+the source tree.
+
+## Which commit, and why it stays
+
+c0c81bb is the commit the two prepared Qwen3.8 checkpoints were made with, and the
+HyperQwen commit of the vLLM 0.28.0 build record (`deploy/vllm-builds/0.28.0.sh`).
+Since platform-rebuild Phase 4 step 4v the vLLM build applies the series of its own
+record -- vLLM 0.30.0 with HyperQwen 7af097b (`deploy/vllm-builds/0.30.0.sh`) -- but
+4v does not prepare the checkpoints again, so the scripts here stay at c0c81bb.
+tests/python/test_prepare_checkpoint.py compares this commit with the 0.28.0
+record, not with the build's default.
 
 ## Upstream's own documentation
 

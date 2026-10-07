@@ -20,6 +20,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import re
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -53,14 +54,54 @@ class ImageNameTest(unittest.TestCase):
     def test_build_tags_the_versioned_and_the_latest_name(self) -> None:
         recipe = MAKEFILE.split("\nbuild-vllm-image:", 1)[1].split("\n\n", 1)[0]
         self.assertIn("-t $(VLLM_DEVAI_IMAGE_TAG) -t $(VLLM_DEVAI_IMAGE)", recipe)
-        self.assertRegex(MAKEFILE, rf"(?m)^VLLM_DEVAI_IMAGE_TAG \?= {re.escape(IMAGE)}$")
         self.assertNotIn("-t devai-vllm ", recipe + " ")
+
+    def _rendered_tags(self, *args: str) -> str:
+        # `make -n` prints the build command without running it; the
+        # recipe's tests and podman are not executed.
+        r = subprocess.run(["make", "-n", "build-vllm-image", *args], cwd=REPO_ROOT,
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout
+
+    def test_the_versioned_tag_follows_vllm_version(self) -> None:
+        # v<version>-cu131-debian13-hq.<HyperQwen commit, 7 hex> from the
+        # record (4v); 0.28.0's is the tag the kept rollback image carries.
+        self.assertIn(f"-t {IMAGE} -t {IMAGE_LATEST}", self._rendered_tags("VLLM_VERSION=0.28.0"))
+        self.assertIn("-t docker.io/devai/vllm-devai:v0.30.0-cu131-debian13-hq.7af097b",
+                      self._rendered_tags())
+        # 4v builds with VLLM_DEVAI_IMAGE set to the new tag, so :latest
+        # stays on 0.28.0 until the acceptance rule passes.
+        new = "docker.io/devai/vllm-devai:v0.30.0-cu131-debian13-hq.7af097b"
+        out = self._rendered_tags("VLLM_VERSION=0.30.0", f"VLLM_DEVAI_IMAGE={new}")
+        self.assertIn(f"-t {new} -t {new} ", out)
+        self.assertNotIn(":latest", out)
+        self.assertIn("vllm-build/0.30.0/dist:/var/cache/vllm-dist:ro", out)
+
+    def test_a_record_without_hyperqwen_gets_a_stock_tag(self) -> None:
+        self.assertRegex(MAKEFILE, r"(?m)^VLLM_DEVAI_IMAGE_TAG \?= docker\.io/devai/vllm-devai:"
+                                   r"v\$\(VLLM_VERSION\)-cu131-debian13-\$\(if \$\(VLLM_HYPERQWEN_SHORT\),"
+                                   r"hq\.\$\(VLLM_HYPERQWEN_SHORT\),stock\)$")
+
+    def test_image_selection_reaches_the_probers_and_compose(self) -> None:
+        # Without the export a .env or command-line value never reached the
+        # probers or compose, which fell back to :latest -- both arms of 4v's
+        # comparison could silently run one build.
+        self.assertRegex(MAKEFILE, r"(?m)^export VLLM_DEVAI_IMAGE$")
+        r = subprocess.run(["make", "-s", "--no-print-directory", "-f", "Makefile", "-f", "-",
+                            "_devai_env", "VLLM_DEVAI_IMAGE=docker.io/devai/vllm-devai:vX"],
+                           input="_devai_env:\n\t@printenv VLLM_DEVAI_IMAGE\n", cwd=REPO_ROOT,
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "docker.io/devai/vllm-devai:vX")
 
     def test_tag_quotes_the_real_versions(self) -> None:
         build = (REPO_ROOT / "scripts" / "build-vllm.sh").read_text()
-        self.assertIn('VLLM_VERSION="${VLLM_VERSION:-0.28.0}"', build)
+        self.assertIn('VLLM_VERSION="${VLLM_VERSION:-0.30.0}"', build)
         self.assertIn('CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-13.1}"', build)
-        self.assertIn("HYPERQWEN_COMMIT:-c0c81bb", build)
+        records = REPO_ROOT / "deploy" / "vllm-builds"
+        self.assertIn("HYPERQWEN_COMMIT=c0c81bb", (records / "0.28.0.sh").read_text())
+        self.assertIn("HYPERQWEN_COMMIT=7af097b", (records / "0.30.0.sh").read_text())
         self.assertIn("debian:trixie-slim", (REPO_ROOT / "deploy" / "Dockerfile.vllm").read_text())
 
     def test_pull_images_can_never_pull_it(self) -> None:
@@ -117,13 +158,92 @@ class ProberTest(unittest.TestCase):
         self.assertEqual(hf.engine_of("vllm-devai"), "vllm")
         self.assertEqual(hf.engine_of("sglang"), "sglang")
 
+    def test_vllm_devai_launches_fetch_no_flashinfer_cubins_at_run_time(self) -> None:
+        # Plan 4v: every vllm-devai launch runs with run-time cubin downloads
+        # off, as 4d's launcher will serve; vllm and sglang launches do not
+        # carry it. Pinned to the router's buildContainerSpec on the Go side.
+        import _probe_hf_common as hf
+        want = "FLASHINFER_CUBINS_REPOSITORY=file:///nonexistent/"
+
+        def argv(backend, env=None):
+            return hf.container_run_args(
+                "podman", "c", "img", 18000, "/m", env or {"A": "1"},
+                "python3", ["-m", "x"], backend=backend)
+
+        def envs(a):
+            return [a[i + 1] for i, t in enumerate(a) if t == "--env"]
+        self.assertIn(want, envs(argv("vllm-devai")))
+        self.assertIn("A=1", envs(argv("vllm-devai")))
+        for other in ("vllm", "sglang", None):
+            self.assertFalse(any(e.startswith("FLASHINFER_CUBINS_REPOSITORY=")
+                                 for e in envs(argv(other))), other)
+        # A per-model environment cannot turn the downloads back on.
+        a = argv("vllm-devai", {"FLASHINFER_CUBINS_REPOSITORY": "https://example"})
+        self.assertEqual([e for e in envs(a) if e.startswith("FLASHINFER_")], [want])
+        # Both launch sites pass the backend through.
+        import inspect
+        import _probe_load as lp
+        self.assertIn("backend=spec.name", inspect.getsource(hf.probe_one_cell))
+        self.assertIn("backend=spec.name", inspect.getsource(lp.load_probe_one_cell))
+
     def test_make_targets(self) -> None:
         recipe = MAKEFILE.split("\nprobe-vllm-devai:", 1)[1].split("\n\n", 1)[0]
         self.assertIn("scripts/probe-vllm-devai-reasoning.py", recipe)
         self.assertIn("--models-dir $(VLLM_MODELS_DIR)", recipe)
         self.assertIn("$(if $(PROBE_CTX_EXACT),--ctx-exact $(PROBE_CTX_EXACT),)", recipe)
+        self.assertIn("$(if $(PROBE_LEDGER),--ledger '$(PROBE_LEDGER)',)", recipe)
         bench = MAKEFILE.split("\nbench-vllm-devai:", 1)[1].split("\n\n", 1)[0]
         self.assertIn("--backend vllm-devai", bench)
+
+
+class Phase4vMakefileWiringTest(unittest.TestCase):
+    """The knobs 4v's runs use, from the Makefile to the scripts' flags."""
+
+    @staticmethod
+    def _recipe(target: str) -> str:
+        return MAKEFILE.split(f"\n{target}:", 1)[1].split("\n\n", 1)[0]
+
+    def test_load_probes_take_the_drafter_a_scratch_cache_and_a_scratch_ledger(self) -> None:
+        self.assertIn("$(if $(PROBE_MTP),--mtp,)", self._recipe("probe-load-vllm"))
+        devai = self._recipe("probe-load-vllm-devai")
+        self.assertRegex(devai.split("\n", 1)[0], r"^ ## \S", "documented target")
+        self.assertIn("python3 scripts/probe-vllm-devai-reasoning.py --load", devai)
+        for flag in ("$(if $(PROBE_MTP),--mtp,)", "$(if $(PROBE_CACHE),--cache '$(PROBE_CACHE)',)",
+                     "$(if $(PROBE_LEDGER),--ledger '$(PROBE_LEDGER)',)", "$(if $(PROBE_FORCE),--force,)",
+                     "$(if $(PROBE_REPO),--repo '$(PROBE_REPO)',)"):
+            self.assertIn(flag, devai)
+        self.assertRegex(MAKEFILE, r"(?m)^\.PHONY:.*\bprobe-load-vllm-devai\b")
+
+    def test_bench_runs_take_a_scratch_cache_logs_mtp_and_connections(self) -> None:
+        flags = MAKEFILE.split("\nBENCH_RUN_FLAGS = \\\n", 1)[1].split("\n\n", 1)[0]
+        for flag in ("$(if $(BENCH_CACHE),--cache '$(BENCH_CACHE)',)",
+                     "$(if $(BENCH_LOG_DIR),--log-dir '$(BENCH_LOG_DIR)',)",
+                     "$(if $(BENCH_MTP),--mtp,)",
+                     "$(if $(BENCH_MAX_CONNECTIONS),--max-connections $(BENCH_MAX_CONNECTIONS),)"):
+            self.assertIn(flag, flags)
+        self.assertIn("$(BENCH_RUN_FLAGS)", self._recipe("bench-vllm-devai"))
+
+    def test_scratch_bench_paths_must_lie_under_the_bench_mount(self) -> None:
+        # The bench container's only read-write mount besides deploy/ is
+        # $(CACHE_DIR)/bench; a scratch path elsewhere would vanish with the
+        # container. Checked at parse time, so `make help` shows it.
+        for var in ("BENCH_CACHE", "BENCH_LOG_DIR"):
+            r = subprocess.run(["make", "-n", "help", f"{var}=/tmp/x/cache.json"], cwd=REPO_ROOT,
+                               capture_output=True, text=True, timeout=60)
+            self.assertNotEqual(r.returncode, 0, var)
+            self.assertIn(f"{var}=/tmp/x/cache.json must lie under /var/cache/devai/bench/", r.stderr)
+            ok = subprocess.run(["make", "-n", "help", f"{var}=/var/cache/devai/bench/4v/t/x"],
+                                cwd=REPO_ROOT, capture_output=True, text=True, timeout=60)
+            self.assertEqual(ok.returncode, 0, ok.stderr)
+
+    def test_bench_concurrency_passes_salt_min_tokens_and_metrics_url(self) -> None:
+        recipe = self._recipe("bench-concurrency")
+        for flag in ("$(if $(SALT),--salt '$(SALT)',)", "$(if $(MIN_TOKENS),--min-tokens $(MIN_TOKENS),)",
+                     "$(if $(METRICS_URL),--metrics-url '$(METRICS_URL)',)"):
+            self.assertIn(flag, recipe)
+        # The report is captured as `make bench-concurrency ... > session.json`:
+        # the container command must not be echoed into it.
+        self.assertIn("\t@$(CONTAINER_RUNTIME) run --rm", recipe)
 
 
 class ToolingTest(unittest.TestCase):

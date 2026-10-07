@@ -65,11 +65,26 @@ export GPU_MEMORY_GB MAX_CONTEXT_LEN
 VLLM_IMAGE ?= docker.io/vllm/vllm-openai:latest-x86_64-cu129-ubuntu2404
 export VLLM_IMAGE
 SGLANG_IMAGE ?= docker.io/lmsysorg/sglang:v0.5.16-cu130
-# The home-built, HyperQwen-patched vLLM 0.28.0 (make build-vllm). A docker.io
+# The home-built, HyperQwen-patched vLLM (make build-vllm). A docker.io
 # name so it can be pushed one day; today it exists only in the local image
 # store (never pulled: pull-images filters on `devai-`).
+#
+# Exported for the reason VLLM_IMAGE is: a value from .env or the command
+# line must reach the probers and compose. Without the export they fell back
+# to `:latest`, so `make probe-vllm-devai VLLM_DEVAI_IMAGE=<tag>` probed
+# whatever `:latest` was -- both arms of a version comparison could silently
+# run one build (platform-rebuild 4v). Every 4v target runs as
+# `make <target> VLLM_DEVAI_IMAGE=<tag>`.
 VLLM_DEVAI_IMAGE ?= docker.io/devai/vllm-devai:latest
-VLLM_DEVAI_IMAGE_TAG ?= docker.io/devai/vllm-devai:v0.28.0-cu131-debian13-hq.c0c81bb
+export VLLM_DEVAI_IMAGE
+# The vLLM build record scripts/build-vllm.sh builds (deploy/vllm-builds/
+# <version>.sh; E1 moved the default to 0.30.0). The image tag, the build root
+# and the wheelhouse follow it: v<version>-cu131-debian13-hq.<HyperQwen
+# commit, 7 hex>, or -stock for a record without HyperQwen.
+VLLM_VERSION ?= 0.30.0
+VLLM_BUILD_RECORD = deploy/vllm-builds/$(VLLM_VERSION).sh
+VLLM_HYPERQWEN_SHORT = $(shell sed -n 's/^HYPERQWEN_COMMIT=\([0-9a-f]\{7\}\)[0-9a-f]\{33\}$$/\1/p' $(VLLM_BUILD_RECORD) 2>/dev/null)
+VLLM_DEVAI_IMAGE_TAG ?= docker.io/devai/vllm-devai:v$(VLLM_VERSION)-cu131-debian13-$(if $(VLLM_HYPERQWEN_SHORT),hq.$(VLLM_HYPERQWEN_SHORT),stock)
 export SGLANG_IMAGE
 # The Ollama image is BUILT HERE (`make build-ollama`), not pulled: Ollama
 # compiled from source on the host, on debian:trixie-slim, CUDA 13 for this
@@ -243,6 +258,7 @@ endif
 
 .PHONY: all build build-cpu build-gpu build-base-cpu build-base-gpu build-router
 .PHONY: build-laya-trainer test-laya-trainer laya-trainer-lock lab-lock laya-check
+.PHONY: vllm-lock
 .PHONY: lab-cpu lab-gpu shell-cpu shell-gpu
 .PHONY: cache-up cache-down cache-status cache-clean logs setup-logs
 .PHONY: ollama-rm ollama-list ollama-status ollama-clean ollama-df
@@ -250,7 +266,7 @@ endif
 .PHONY: clean clean-cpu clean-gpu clean-router prune
 .PHONY: fetch-cli pull-images install install-systemd uninstall test test-router test-ollama test-agents test-models test-probe-vllm test-probe-sglang test-probe-ollama-idempotent test-vllm test-sglang test-e2e test-full help
 .PHONY: fetch-vllm-recipes recipe-apply
-.PHONY: catalog-regen catalog-suggest catalog-discover catalog-discover-add probe probe-vllm probe-sglang probe-load-vllm probe-load-sglang probe-check probe-ornith-arch model-fit model-pull model-status model-sync vram-fit verify-backend-flags ollama-cleanup-ctx-variants
+.PHONY: catalog-regen catalog-suggest catalog-discover catalog-discover-add probe probe-vllm probe-sglang probe-load-vllm probe-load-vllm-devai probe-load-sglang probe-check probe-ornith-arch model-fit model-pull model-status model-sync vram-fit verify-backend-flags ollama-cleanup-ctx-variants
 .PHONY: bench bench-vllm bench-sglang bench-ollama bench-report bench-harvest test-bench-smoke
 .PHONY: test-python build-backup-tool build-devai-tools test-devai-tools
 .PHONY: backup-create backup-list backup-verify backup-restore test-backup-restore
@@ -1309,8 +1325,9 @@ probe-vllm: ## Probe every downloaded vLLM/HF model per (VRAM, CONTEXT) cell.
 	@#   PROBE_IGNORE_CURATED_PARSERS=1  card-derived parsers only: skip the
 	@#                               curated block, recipe seed and name
 	@#                               heuristic (plan I24); the prober refuses
-	@#                               it without PROBE_REPO and a scratch
-	@#                               --cache (run the script directly)
+	@#                               it without PROBE_REPO, a scratch --cache
+	@#                               and a scratch --ledger (run the script
+	@#                               directly)
 	PROBE_KV_CACHE_TYPE="$(PROBE_KV_CACHE_TYPE)" \
 	PROBE_IGNORE_CURATED_PARSERS="$(PROBE_IGNORE_CURATED_PARSERS)" \
 	python3 scripts/probe-vllm-reasoning.py \
@@ -1323,7 +1340,7 @@ probe-vllm: ## Probe every downloaded vLLM/HF model per (VRAM, CONTEXT) cell.
 	    $(if $(PROBE_FORCE_ARCH),--force-arch,) \
 	    $(if $(PROBE_CTX_EXACT),--ctx-exact $(PROBE_CTX_EXACT),)
 
-probe-vllm-devai: ## Probe every downloaded HF model on the vllm-devai backend (home-built vLLM 0.28 + patches; own cache) per (VRAM, CONTEXT) cell.
+probe-vllm-devai: ## Probe every downloaded HF model on the vllm-devai backend (home-built, patched vLLM; VLLM_DEVAI_IMAGE; own cache) per (VRAM, CONTEXT) cell. PROBE_LEDGER=<file> keeps verdicts out of deploy/.model-status.json.
 	@# Pre-condition: devai-router, devai-vllm, and devai-sglang must
 	@# be stopped — the prober launches devai-vllm-probe with explicit
 	@# GPU exclusivity. The script self-checks and aborts otherwise.
@@ -1339,8 +1356,13 @@ probe-vllm-devai: ## Probe every downloaded HF model on the vllm-devai backend (
 	@#   PROBE_IGNORE_CURATED_PARSERS=1  card-derived parsers only: skip the
 	@#                               curated block, recipe seed and name
 	@#                               heuristic (plan I24); the prober refuses
-	@#                               it without PROBE_REPO and a scratch
-	@#                               --cache (run the script directly)
+	@#                               it without PROBE_REPO, a scratch --cache
+	@#                               and a scratch --ledger (run the script
+	@#                               directly for the cache)
+	@#   PROBE_LEDGER=<file>         read and write this exclusion ledger
+	@#                               instead of deploy/.model-status.json
+	@#                               (a scratch ledger: 4v's probes, I24)
+	@#   VLLM_DEVAI_IMAGE=<tag>      the build to probe (exported; default :latest)
 	PROBE_KV_CACHE_TYPE="$(PROBE_KV_CACHE_TYPE)" \
 	PROBE_IGNORE_CURATED_PARSERS="$(PROBE_IGNORE_CURATED_PARSERS)" \
 	python3 scripts/probe-vllm-devai-reasoning.py \
@@ -1351,7 +1373,8 @@ probe-vllm-devai: ## Probe every downloaded HF model on the vllm-devai backend (
 	    $(if $(PROBE_REPO),--repo '$(PROBE_REPO)',) \
 	    $(if $(PROBE_FORCE),--force,) \
 	    $(if $(PROBE_FORCE_ARCH),--force-arch,) \
-	    $(if $(PROBE_CTX_EXACT),--ctx-exact $(PROBE_CTX_EXACT),)
+	    $(if $(PROBE_CTX_EXACT),--ctx-exact $(PROBE_CTX_EXACT),) \
+	    $(if $(PROBE_LEDGER),--ledger '$(PROBE_LEDGER)',)
 
 probe-sglang: ## Probe every downloaded SGLang/HF model per (VRAM, CONTEXT) cell.
 	@# Pre-condition: same as probe-vllm — all GPU-owning backends down.
@@ -1367,7 +1390,8 @@ probe-sglang: ## Probe every downloaded SGLang/HF model per (VRAM, CONTEXT) cell
 	@#                               reproduces the measured dtype
 	@#   PROBE_IGNORE_CURATED_PARSERS=1  card-derived parsers only: skip the
 	@#                               curated block and name heuristic (plan I24);
-	@#                               refused without PROBE_REPO and a scratch --cache
+	@#                               refused without PROBE_REPO, a scratch --cache
+	@#                               and a scratch --ledger
 	PROBE_KV_CACHE_TYPE="$(PROBE_KV_CACHE_TYPE)" \
 	PROBE_IGNORE_CURATED_PARSERS="$(PROBE_IGNORE_CURATED_PARSERS)" \
 	python3 scripts/probe-sglang-reasoning.py \
@@ -1393,6 +1417,9 @@ probe-load-vllm: ## Serving-time LOAD probe for vLLM: augment fit cache with ser
 	@#                               the dtype the target cells were fit-probed
 	@#                               with (default fp8), or serving numbers are
 	@#                               measured under the wrong dtype
+	@#   PROBE_MTP=1                 relaunch a row whose cell records
+	@#                               mtp_fits: true with its drafter, as the
+	@#                               picker serves it (stamps serving_mtp)
 	PROBE_KV_CACHE_TYPE="$(PROBE_KV_CACHE_TYPE)" \
 	python3 scripts/probe-vllm-reasoning.py --load \
 	    --host-vram-gb $(GPU_MEMORY_GB) \
@@ -1400,11 +1427,29 @@ probe-load-vllm: ## Serving-time LOAD probe for vLLM: augment fit cache with ser
 	    $(if $(PROBE_CONTEXTS),--ctx $(PROBE_CONTEXTS),) \
 	    $(if $(PROBE_REPO),--repo '$(PROBE_REPO)',) \
 	    $(if $(PROBE_FORCE),--force,) \
+	    $(if $(PROBE_MTP),--mtp,) \
+	    $(if $(PROBE_NEEDLE_DEPTH),--needle-depth $(PROBE_NEEDLE_DEPTH),)
+
+probe-load-vllm-devai: ## Serving-time LOAD probe on the vllm-devai backend (VLLM_DEVAI_IMAGE): as probe-load-vllm, plus PROBE_MTP=1 (with the drafter), PROBE_CACHE=<file> (a copy of the vllm-devai cache) and PROBE_LEDGER=<file> (a scratch ledger).
+	@# Layers onto deploy/.vllm-devai-reasoning-cache.json, or onto
+	@# PROBE_CACHE -- run `make probe-vllm-devai` first so the fit cells exist.
+	@# A cell that already carries serving_ok is skipped (PROBE_FORCE=1
+	@# re-runs it), so a per-tag comparison takes a NEW copy of the cache
+	@# per tag (plan 4v). Same precondition + knobs as probe-load-vllm.
+	PROBE_KV_CACHE_TYPE="$(PROBE_KV_CACHE_TYPE)" \
+	python3 scripts/probe-vllm-devai-reasoning.py --load \
+	    --host-vram-gb $(GPU_MEMORY_GB) \
+	    --models-dir $(VLLM_MODELS_DIR) \
+	    $(if $(PROBE_CONTEXTS),--ctx $(PROBE_CONTEXTS),) \
+	    $(if $(PROBE_REPO),--repo '$(PROBE_REPO)',) \
+	    $(if $(PROBE_FORCE),--force,) \
+	    $(if $(PROBE_MTP),--mtp,) \
+	    $(if $(PROBE_CACHE),--cache '$(PROBE_CACHE)',) \
+	    $(if $(PROBE_LEDGER),--ledger '$(PROBE_LEDGER)',) \
 	    $(if $(PROBE_NEEDLE_DEPTH),--needle-depth $(PROBE_NEEDLE_DEPTH),)
 
 probe-load-sglang: ## Serving-time LOAD probe for SGLang: same as probe-load-vllm against the SGLang cache.
-	@# Layers onto deploy/.sglang-reasoning-cache.json (the vllm-devai backend
-	@# has no load probe target yet; deploy/.vllm-devai-reasoning-cache.json) -- run `make probe-sglang`
+	@# Layers onto deploy/.sglang-reasoning-cache.json -- run `make probe-sglang`
 	@# first. Same precondition + knobs as probe-load-vllm.
 	PROBE_KV_CACHE_TYPE="$(PROBE_KV_CACHE_TYPE)" \
 	python3 scripts/probe-sglang-reasoning.py --load \
@@ -1703,26 +1748,44 @@ build-ollama-image: ## Build the devai-ollama image (debian:trixie-slim + the ho
 		-f deploy/Dockerfile.ollama \
 		-t devai-ollama .
 
-# Where scripts/build-vllm.sh leaves the wheelhouse. NOT under $(CACHE_DIR),
-# for the same reason as OLLAMA_DIST.
-VLLM_DIST ?= $(HOME)/.cache/devai/vllm-build/dist
+# Where scripts/build-vllm.sh builds VLLM_VERSION and leaves its wheelhouse:
+# one root per version, so a build never touches another version's wheelhouse
+# (the rollback). NOT under $(CACHE_DIR), for the same reason as OLLAMA_DIST.
+VLLM_BUILD_ROOT ?= $(HOME)/.cache/devai/vllm-build/$(VLLM_VERSION)
+VLLM_DIST ?= $(VLLM_BUILD_ROOT)/dist
 # The host CUDA toolkit vLLM was compiled with. Its nvcc, nvvm, headers and
 # libcudart are copied into the image: FlashInfer JIT-compiles attention
 # kernels at first use, so the RUNTIME image needs a CUDA compiler too.
 VLLM_CUDA_HOME ?= /usr/local/cuda-13.1
+# The interpreter build-vllm.sh builds with (its PYTHON: Debian's python3,
+# the same Python the image installs from debian:trixie-slim). vllm-lock
+# resolves for it.
+VLLM_PYTHON ?= /usr/bin/python3
 
-build-vllm: build-vllm-dist build-vllm-image ## Compile vLLM from source on the host (HyperQwen patches applied), then build the devai-vllm image from it.
+build-vllm: build-vllm-dist build-vllm-image ## Compile vLLM VLLM_VERSION (default 0.30.0) from source on the host as its build record says, then build the devai-vllm image from it. VLLM_DEVAI_IMAGE=<tag> keeps :latest where it is.
 
-build-vllm-dist: ## Compile vLLM FROM SOURCE on the host for this GPU only (compute capability 12.0) with the HyperQwen patch series applied --fuzz 0. LONG. Needs the CUDA 13 dev packages, uv and a rustup toolchain; see scripts/build-vllm.sh.
-	PATH="$(HOME)/.cargo/bin:$$PATH" bash scripts/build-vllm.sh
+build-vllm-dist: ## Compile vLLM FROM SOURCE on the host for this GPU only (compute capability 12.0), from the build record deploy/vllm-builds/$(VLLM_VERSION).sh (its patch series applied --fuzz 0, its hash-locked runtime set). LONG. Needs the CUDA 13 dev packages, uv and a rustup toolchain; see scripts/build-vllm.sh.
+	PATH="$(HOME)/.cargo/bin:$$PATH" VLLM_VERSION=$(VLLM_VERSION) VLLM_BUILD_ROOT=$(VLLM_BUILD_ROOT) \
+		bash scripts/build-vllm.sh
 
-build-vllm-image: ## Build the devai-vllm image (debian:trixie-slim + the host-compiled, patched vLLM, installed offline). No upstream vLLM image is used, not even as a build input.
+vllm-lock: ## Write deploy/vllm-builds/$(VLLM_VERSION).in from the build record's sources (scripts/build-vllm.sh --write-in) and hash-lock it as $(VLLM_VERSION).lock: PyPI alone, binary wheels, for VLLM_PYTHON. Keeps every locked version the input still allows; UPGRADE=1 re-resolves. Review the diff of both.
+	@test -f $(VLLM_BUILD_RECORD) || { echo "error: no build record $(VLLM_BUILD_RECORD)" >&2; exit 1; }
+	VLLM_VERSION=$(VLLM_VERSION) VLLM_BUILD_ROOT=$(VLLM_BUILD_ROOT) PYTHON=$(VLLM_PYTHON) \
+		bash scripts/build-vllm.sh --write-in
+	env -u UV_INDEX -u UV_INDEX_URL -u UV_DEFAULT_INDEX -u UV_EXTRA_INDEX_URL -u UV_FIND_LINKS \
+		uv pip compile deploy/vllm-builds/$(VLLM_VERSION).in --no-config \
+			--default-index https://pypi.org/simple --only-binary :all: \
+			--python $(VLLM_PYTHON) --generate-hashes $(if $(UPGRADE),--upgrade,) \
+			--custom-compile-command "make vllm-lock VLLM_VERSION=$(VLLM_VERSION)" \
+			-o deploy/vllm-builds/$(VLLM_VERSION).lock
+
+build-vllm-image: ## Build the devai-vllm image (debian:trixie-slim + the host-compiled, patched vLLM and its hash-locked runtime set, installed offline) as VLLM_DEVAI_IMAGE_TAG and VLLM_DEVAI_IMAGE. No upstream vLLM image is used, not even as a build input.
 	@test -f $(VLLM_DIST)/PATCHES.applied || { echo "error: no build at $(VLLM_DIST) -- run 'make build-vllm-dist' first" >&2; exit 1; }
 	@test -x $(VLLM_CUDA_HOME)/bin/nvcc || { echo "error: no nvcc under $(VLLM_CUDA_HOME) (set VLLM_CUDA_HOME)" >&2; exit 1; }
 	$(CONTAINER_RUNTIME) build --network=host \
 		$(PROXY_BUILD_ARGS) \
 		$(APT_PROXY_ARG) \
-		--build-arg DIST_ID=$$(cat $(VLLM_DIST)/wheels/vllm-*.whl $(VLLM_DIST)/PATCHES.applied | sha256sum | cut -c1-16) \
+		--build-arg DIST_ID=$$(cat $(VLLM_DIST)/wheels/vllm-*.whl $(VLLM_DIST)/PATCHES.applied $(VLLM_DIST)/requirements.txt | sha256sum | cut -c1-16) \
 		-v $(VLLM_DIST):/var/cache/vllm-dist:ro \
 		-v $(VLLM_CUDA_HOME):/var/cache/cuda-toolkit:ro \
 		-f deploy/Dockerfile.vllm \
@@ -1912,6 +1975,24 @@ HF_TOKEN_FILE ?= $(HOME)/.cache/huggingface/token
 # n-knobs surface to the runner as both env (for inspect_ai's task
 # constructors that read defaults) and CLI flags (the runner reads them
 # either way; CLI takes precedence).
+#
+# BENCH_CACHE / BENCH_LOG_DIR point a run at a scratch cache and log
+# directory (plan 4v: neither arm may write deploy/.bench-cache.json). They
+# must lie under $(CACHE_DIR)/bench, the bench container's only read-write
+# mount besides deploy/, or the container writes them into its own layer and
+# they vanish with it. BENCH_MTP=1 serves every row as `<name>::mtp@<ctx>`
+# (refused for a row whose cell does not record mtp_fits: true);
+# BENCH_MAX_CONNECTIONS=N overrides the per-backend concurrency (recorded).
+ifneq ($(BENCH_CACHE),)
+ifeq ($(filter $(CACHE_DIR)/bench/%,$(BENCH_CACHE)),)
+$(error BENCH_CACHE=$(BENCH_CACHE) must lie under $(CACHE_DIR)/bench/, the bench container's read-write mount)
+endif
+endif
+ifneq ($(BENCH_LOG_DIR),)
+ifeq ($(filter $(CACHE_DIR)/bench/%,$(BENCH_LOG_DIR)),)
+$(error BENCH_LOG_DIR=$(BENCH_LOG_DIR) must lie under $(CACHE_DIR)/bench/, the bench container's read-write mount)
+endif
+endif
 BENCH_RUN_FLAGS = \
 	$(if $(BENCH_TASKS),--tasks '$(BENCH_TASKS)',) \
 	$(if $(BENCH_REPO),--repo '$(BENCH_REPO)',) \
@@ -1927,7 +2008,11 @@ BENCH_RUN_FLAGS = \
 	$(if $(BENCH_NO_EARLY_DROP),--no-early-drop,) \
 	$(if $(BENCH_N_LEAK_PROMPTS),--n-leak-prompts $(BENCH_N_LEAK_PROMPTS),) \
 	$(if $(BENCH_N_LONGCTX_FRACTION),--n-longctx-fraction $(BENCH_N_LONGCTX_FRACTION),) \
-	$(if $(BENCH_N_LONGCTX_MAX_TOKENS),--n-longctx-max-tokens $(BENCH_N_LONGCTX_MAX_TOKENS),)
+	$(if $(BENCH_N_LONGCTX_MAX_TOKENS),--n-longctx-max-tokens $(BENCH_N_LONGCTX_MAX_TOKENS),) \
+	$(if $(BENCH_CACHE),--cache '$(BENCH_CACHE)',) \
+	$(if $(BENCH_LOG_DIR),--log-dir '$(BENCH_LOG_DIR)',) \
+	$(if $(BENCH_MTP),--mtp,) \
+	$(if $(BENCH_MAX_CONNECTIONS),--max-connections $(BENCH_MAX_CONNECTIONS),)
 
 bench: bench-vllm bench-sglang bench-ollama ## Bench every probed model on every backend
 	@echo
@@ -2021,16 +2106,24 @@ bench-harvest: ## (used by bench-sync) Score a task stopped at its deadline from
 		$(IMAGE_NAME_GPU) \
 		/scripts/bench/harvest_truncated.py $(HARVEST_ARGS)
 
-bench-concurrency: ## Sweep concurrency x prefix-sharing for ONE model (MODEL=, PORT=11435|11436)
+bench-concurrency: ## Sweep concurrency x prefix-sharing for ONE model (MODEL=, PORT=11435|11436|11437); MODE=multiturn takes SALT=, MIN_TOKENS=, METRICS_URL=. The JSON report goes to stdout alone.
 	@# Deliberately NOT part of `make bench`: this answers a backend
 	@# selection question (does prefix caching pay off here?), not a
 	@# per-model leaderboard question, and it is GPU-exclusive.
 	@# Requires the model to be the one already resident, or it pays a
 	@# cold start -- the warmup request absorbs that either way.
+	@# MODE=multiturn only: SALT=<s> leads every prefix of the session
+	@# (default: a fresh per-run nonce, printed in the report), so repeated
+	@# sessions share no prefix; MIN_TOKENS=<n> puts min_tokens at the top
+	@# level of every turn; METRICS_URL=<engine /metrics> records the
+	@# engine's prefix-cache and speculative-decoding counters before and
+	@# after each turn (e.g. http://devai-vllm-devai:11434/metrics).
+	@# The command is not echoed, so `> session.json` captures the report alone
+	@# (progress goes to stderr).
 	@if [ -z "$(MODEL)" ]; then \
-	  echo "usage: make bench-concurrency MODEL=<served-name> [PORT=11436] [MODE=sweep|multiturn] [LEVELS=1,2,4,8,16,32] [TURNS=8]"; \
+	  echo "usage: make bench-concurrency MODEL=<served-name> [PORT=11436] [MODE=sweep|multiturn] [LEVELS=1,2,4,8,16,32] [TURNS=8] [SALT=..] [MIN_TOKENS=..] [METRICS_URL=..]"; \
 	  echo "  e.g. make bench-concurrency MODEL=gpt-oss-20b@131072 PORT=11436"; exit 2; fi
-	$(CONTAINER_RUNTIME) run --rm \
+	@$(CONTAINER_RUNTIME) run --rm \
 		--network $(DEVAI_NETWORK) \
 		-v $(CURDIR)/scripts:/scripts:ro \
 		--entrypoint python3 \
@@ -2043,7 +2136,10 @@ bench-concurrency: ## Sweep concurrency x prefix-sharing for ONE model (MODEL=, 
 			$(if $(TURNS),--turns $(TURNS),) \
 			$(if $(PREFIX_TOKENS),--prefix-tokens $(PREFIX_TOKENS),) \
 			$(if $(GROWTH_TOKENS),--growth-tokens $(GROWTH_TOKENS),) \
-			$(if $(MAX_TOKENS),--max-tokens $(MAX_TOKENS),)
+			$(if $(MAX_TOKENS),--max-tokens $(MAX_TOKENS),) \
+			$(if $(SALT),--salt '$(SALT)',) \
+			$(if $(MIN_TOKENS),--min-tokens $(MIN_TOKENS),) \
+			$(if $(METRICS_URL),--metrics-url '$(METRICS_URL)',)
 
 bench-report: ## Print a Markdown leaderboard from .bench-cache.json
 	@$(CONTAINER_RUNTIME) run --rm \

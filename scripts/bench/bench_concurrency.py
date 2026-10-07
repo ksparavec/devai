@@ -54,17 +54,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import secrets
 import sys
 import time
 import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from bench._bench_core import (  # noqa: E402
+    ENGINE_COUNTERS,
     p50,
     p95,
+    parse_prometheus_counters,
     stream_chat_completion,
 )
 
@@ -262,10 +266,21 @@ def run(
 
 
 def _turn(router_url: str, model: str, messages: list[dict],
-          max_tokens: int, timeout_s: float) -> dict:
-    """One conversational turn carrying the whole history so far."""
+          max_tokens: int, timeout_s: float,
+          min_tokens: int | None = None) -> dict:
+    """One conversational turn carrying the whole history so far.
+
+    ``min_tokens`` goes at the TOP LEVEL of the body, where vLLM's and
+    SGLang's OpenAI servers read it (an ``extra_body`` key is the Python
+    client's splice instruction, which neither engine reads). It makes
+    every reply as long as the measurement needs: 4v's prefix-cache
+    retention arms differ only in how much of the previous reply is
+    kept, and a 2-token "OK" leaves nothing to keep.
+    """
     body = {"model": model, "messages": messages,
             "max_tokens": max_tokens, "temperature": 0}
+    if min_tokens is not None:
+        body["min_tokens"] = min_tokens
     try:
         res = stream_chat_completion(router_url, body, timeout=timeout_s)
     except urllib.error.HTTPError as e:
@@ -278,7 +293,44 @@ def _turn(router_url: str, model: str, messages: list[dict],
         "ttft_ms": ((t_first - res["t_open"]) * 1000) if t_first else None,
         "content": res.get("content") or "",
         "tokens": res.get("effective_tokens") or res.get("completion_tokens") or 0,
+        # The engine's own count when the stream carried usage (the helper
+        # requests it), else the chars/4 estimate; token_source says which.
+        "completion_tokens": res.get("effective_tokens"),
+        "token_source": res.get("token_source"),
     }
+
+
+def _fetch_text(url: str, timeout_s: float) -> str:
+    """GET ``url`` and return its body as text (the engine's /metrics)."""
+    with urllib.request.urlopen(url, timeout=timeout_s) as resp:   # noqa: S310
+        return resp.read().decode("utf-8", "replace")
+
+
+# A /metrics read is local and small; a slow one means the engine is in
+# trouble, which the turn itself will report.
+METRICS_TIMEOUT_S = 10.0
+
+
+def _read_counters(metrics_url: str) -> tuple[dict[str, float] | None, str | None]:
+    """The engine counters at ``metrics_url``: (counters, None) or (None, error)."""
+    try:
+        text = _fetch_text(metrics_url, METRICS_TIMEOUT_S)
+    except Exception as e:                                     # noqa: BLE001
+        return None, f"{type(e).__name__}: {e}"
+    return parse_prometheus_counters(text, ENGINE_COUNTERS), None
+
+
+def _counter_delta(before: dict[str, float] | None,
+                   after: dict[str, float] | None) -> dict[str, float] | None:
+    """after - before for every counter present in both reads."""
+    if before is None or after is None:
+        return None
+    return {k: after[k] - before[k] for k in after if k in before}
+
+
+def new_salt() -> str:
+    """A per-run nonce: two runs, or two sessions, never share a prefix."""
+    return secrets.token_hex(6)
 
 
 def _slope_ms_per_1k(points: list[tuple[float, float]]) -> float | None:
@@ -313,7 +365,9 @@ def run_multiturn(
     growth_tokens: int = 4096,
     max_tokens: int = DEFAULT_MAX_TOKENS,
     timeout_s: float = 900.0,
-    salt: str = "mt",
+    salt: str | None = None,
+    min_tokens: int | None = None,
+    metrics_url: str | None = None,
 ) -> dict:
     """Sequential agent-style session: N turns over a GROWING history.
 
@@ -328,13 +382,32 @@ def run_multiturn(
     history. Turn 1 pays full prefill; every later turn re-sends
     everything it already sent, so a working prefix cache should make
     turns 2..N cost only their new tokens.
+
+    ``salt`` leads every prefix of the session. It used to be the constant
+    "mt", so a second session against the same engine found the first
+    one's prefix in the cache and its turn 1 read as a hit it did not
+    earn. The default is a fresh nonce per call (``new_salt``); a caller
+    that pairs sessions across arms (4v's retention measurement, Phase
+    15's sessions) passes its own, and the report carries it either way.
+
+    ``metrics_url`` (the engine's /metrics, not the router's) is read
+    before and after every turn; each turn record carries both reads of
+    ENGINE_COUNTERS and their difference, so prefix-cache hits and queries
+    -- and speculative-decoding drafts and accepted tokens -- can be
+    attributed to that turn. A failed read is recorded on the turn
+    (``metrics_error``) and the session goes on; ``metrics_complete``
+    says whether every answered turn has both reads.
     """
+    if salt is None:
+        salt = new_salt()
     # Warm the model OUTSIDE the measured turns. Without this, turn 1
     # carries the container cold start -- measured at 76,332 ms on
     # gpt-oss-20b, i.e. ~130x a warm turn -- which dominates the
     # least-squares fit and drove the slope NEGATIVE, reporting
     # "TTFT falls as history grows". A deliberately tiny prompt with a
     # different salt, so it cannot seed the prefix being measured.
+    # It runs before the first counter read, so its prefill is not
+    # charged to turn 1.
     _one_request(router_url, model, f"# warmup {salt}\nReply with OK.",
                  8, timeout_s)
 
@@ -348,7 +421,18 @@ def run_multiturn(
     for i in range(turns):
         hist_chars = sum(len(m["content"]) for m in messages)
         hist_tokens = hist_chars / _CHARS_PER_TOKEN
-        r = _turn(router_url, model, messages, max_tokens, timeout_s)
+        before = after = None
+        metrics_errors: list[str] = []
+        if metrics_url:
+            before, err = _read_counters(metrics_url)
+            if err:
+                metrics_errors.append(f"before: {err}")
+        r = _turn(router_url, model, messages, max_tokens, timeout_s,
+                  min_tokens=min_tokens)
+        if metrics_url:
+            after, err = _read_counters(metrics_url)
+            if err:
+                metrics_errors.append(f"after: {err}")
         rec = {
             "turn": i + 1,
             "history_tokens": int(hist_tokens),
@@ -356,12 +440,19 @@ def run_multiturn(
             "ok": r["ok"],
             "capped": r.get("capped", False),
             "error": r.get("error"),
+            "completion_tokens": r.get("completion_tokens"),
+            "token_source": r.get("token_source"),
+            "counters_before": before,
+            "counters_after": after,
+            "counters_delta": _counter_delta(before, after),
+            "metrics_error": "; ".join(metrics_errors) or None,
         }
         records.append(rec)
         print(f"    turn {i+1:<2} history={int(hist_tokens):>7} tok  "
               f"ttft={str(rec['ttft_ms']):>9} ms"
               f"{'  [429]' if rec['capped'] else ''}"
-              f"{'  ' + str(r.get('error')) if not r['ok'] else ''}",
+              f"{'  ' + str(r.get('error')) if not r['ok'] else ''}"
+              f"{'  [metrics: ' + rec['metrics_error'] + ']' if rec['metrics_error'] else ''}",
               file=sys.stderr)
         if not r["ok"]:
             break
@@ -376,7 +467,18 @@ def run_multiturn(
                         + f"\n\nGiven the file above, reply with OK ({i}).")})
 
     ok = [r for r in records if r["ok"] and r["ttft_ms"] is not None]
+    answered = [r for r in records if r["ok"]]
     return {
+        "mode": "multiturn",
+        "model": model,
+        "salt": salt,
+        "min_tokens": min_tokens,
+        "max_tokens": max_tokens,
+        "metrics_url": metrics_url,
+        # True only when every answered turn has both counter reads.
+        "metrics_complete": bool(metrics_url) and bool(answered) and all(
+            r["counters_before"] is not None and r["counters_after"] is not None
+            for r in answered),
         "turns": records,
         "n_ok": len(ok),
         # THE headline: ms of TTFT added per 1K tokens of history.
@@ -405,13 +507,31 @@ def _cli() -> None:
                          "multiturn = sequential growing-history session")
     ap.add_argument("--turns", type=int, default=8)
     ap.add_argument("--growth-tokens", type=int, default=4096)
+    ap.add_argument("--salt", default=None,
+                    help="multiturn: the salt that leads every prefix of the "
+                         "session (default: a random per-run nonce, printed "
+                         "in the report); pass the same value to pair a "
+                         "session across arms")
+    ap.add_argument("--min-tokens", type=int, default=None,
+                    help="multiturn: `min_tokens` at the top level of every "
+                         "turn's request (default: not sent)")
+    ap.add_argument("--metrics-url", default=None,
+                    help="multiturn: the ENGINE's Prometheus endpoint (e.g. "
+                         "http://devai-vllm-devai:11434/metrics), read before "
+                         "and after every turn")
     args = ap.parse_args()
+    if args.min_tokens is not None and args.min_tokens < 0:
+        ap.error("--min-tokens must be >= 0")
     if args.mode == "multiturn":
         print(json.dumps(run_multiturn(
             model=args.model, router_url=args.router_url, turns=args.turns,
             prefix_tokens=args.prefix_tokens, growth_tokens=args.growth_tokens,
-            max_tokens=args.max_tokens, timeout_s=args.timeout), indent=2))
+            max_tokens=args.max_tokens, timeout_s=args.timeout,
+            salt=args.salt or None, min_tokens=args.min_tokens,
+            metrics_url=args.metrics_url or None), indent=2))
         return
+    if args.salt or args.min_tokens is not None or args.metrics_url:
+        ap.error("--salt, --min-tokens and --metrics-url apply to --mode multiturn only")
     out = run(
         model=args.model,
         router_url=args.router_url,

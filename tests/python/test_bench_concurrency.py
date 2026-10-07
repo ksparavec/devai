@@ -259,7 +259,7 @@ class TestMultiturn(unittest.TestCase):
     def test_history_grows_and_slope_is_reported(self) -> None:
         seen = []
 
-        def fake(router_url, model, messages, max_tokens, timeout_s):
+        def fake(router_url, model, messages, max_tokens, timeout_s, **_):
             seen.append(sum(len(m["content"]) for m in messages))
             return {"ok": True, "capped": False, "ttft_ms": 100.0,
                     "content": "OK", "tokens": 2}
@@ -277,7 +277,7 @@ class TestMultiturn(unittest.TestCase):
     def test_stops_on_first_error_and_reports_it(self) -> None:
         calls = {"n": 0}
 
-        def fake(router_url, model, messages, max_tokens, timeout_s):
+        def fake(router_url, model, messages, max_tokens, timeout_s, **_):
             calls["n"] += 1
             if calls["n"] == 3:
                 return {"ok": False, "capped": False, "error": "HTTP 500"}
@@ -298,6 +298,219 @@ class TestMultiturn(unittest.TestCase):
         out = B.run_multiturn("m", "u", turns=3, prefix_tokens=256)
         self.assertTrue(out["any_capped"])
         self.assertEqual(out["n_ok"], 0)
+
+
+class TestMultiturnSaltMinTokensCounters(unittest.TestCase):
+    """4v (platform-rebuild Phase 4): what the retention arms and Phase 15 build on.
+
+    * The salt used to be the constant "mt", so a second session against
+      the same engine found the first one's prefix cached: sessions were
+      not independent. It is now a per-run nonce, or the caller's value
+      (sessions paired across arms), and the report carries it.
+    * min_tokens rides at the TOP LEVEL of every turn, where the engines
+      read it; the retention arms need long replies.
+    * --metrics-url reads the engine's counters before and after each
+      turn, so a turn's prefix-cache hits can be attributed to it.
+    """
+
+    _METRICS = (
+        "# HELP vllm:prefix_cache_hits Prefix cache hits\n"
+        "# TYPE vllm:prefix_cache_hits counter\n"
+        'vllm:prefix_cache_hits_total{{engine="0",model_name="m"}} {hits}\n'
+        'vllm:prefix_cache_hits_created{{engine="0",model_name="m"}} 1.7e9\n'
+        'vllm:prefix_cache_queries_total{{engine="0",model_name="m"}} {queries}\n'
+    )
+
+    def setUp(self) -> None:
+        self._orig_req = B._one_request
+        self._orig_stream = B.stream_chat_completion
+        self._orig_fetch = B._fetch_text
+        self.warmups: list[str] = []
+        self.bodies: list[dict] = []
+        B._one_request = lambda u, m, p, mt, ts: (
+            self.warmups.append(p) or
+            {"ok": True, "capped": False, "ttft_ms": 1.0, "tokens": 1, "wall_s": 0.01})
+
+        def fake_stream(url, body, timeout=600.0):
+            self.bodies.append(body)
+            return {"content": "x" * 40, "t_open": 0.0, "t_first_token": 0.25,
+                    "t_done": 1.0, "effective_tokens": 1024, "completion_tokens": 1024,
+                    "token_source": "usage", "finish_reason": "length"}
+        B.stream_chat_completion = fake_stream
+
+    def tearDown(self) -> None:
+        B._one_request = self._orig_req
+        B.stream_chat_completion = self._orig_stream
+        B._fetch_text = self._orig_fetch
+
+    def _counting_metrics(self, fail_on: set[int] | None = None):
+        """A /metrics stub whose hit counter grows 100 per read."""
+        reads = {"n": 0}
+
+        def fetch(url, timeout_s):
+            reads["n"] += 1
+            if fail_on and reads["n"] in fail_on:
+                raise OSError("connection refused")
+            return self._METRICS.format(hits=100 * reads["n"], queries=1000 * reads["n"])
+        return fetch, reads
+
+    def test_default_salt_is_a_fresh_nonce_per_run_and_reported(self) -> None:
+        a = B.run_multiturn("m", "u", turns=1, prefix_tokens=64)
+        b = B.run_multiturn("m", "u", turns=1, prefix_tokens=64)
+        self.assertNotEqual(a["salt"], b["salt"])
+        self.assertNotIn(a["salt"], ("mt", ""))
+        # The salt leads the measured system prefix of its own run only.
+        first_system = self.bodies[0]["messages"][0]["content"]
+        second_system = self.bodies[1]["messages"][0]["content"]
+        self.assertTrue(first_system.startswith(f"# session {a['salt']}\n"))
+        self.assertTrue(second_system.startswith(f"# session {b['salt']}\n"))
+
+    def test_explicit_salt_reaches_every_prefix_and_the_report(self) -> None:
+        out = B.run_multiturn("m", "u", turns=3, prefix_tokens=64, growth_tokens=64,
+                              salt="nonce7-3")
+        self.assertEqual(out["salt"], "nonce7-3")
+        last = self.bodies[-1]["messages"]
+        self.assertTrue(last[0]["content"].startswith("# session nonce7-3\n"))
+        self.assertTrue(last[3]["content"].startswith("# session nonce7-3-t0\n"))
+        # The warm-up carries the salt but not the measured prefix's opening.
+        self.assertEqual(len(self.warmups), 1)
+        self.assertIn("nonce7-3", self.warmups[0])
+        self.assertFalse(self.warmups[0].startswith("# session"))
+
+    def test_min_tokens_is_top_level_in_every_turn_when_set(self) -> None:
+        out = B.run_multiturn("m", "u", turns=3, prefix_tokens=64, growth_tokens=64,
+                              max_tokens=1024, min_tokens=1024)
+        self.assertEqual(len(self.bodies), 3)
+        for body in self.bodies:
+            self.assertEqual(body["min_tokens"], 1024)
+            self.assertEqual(body["max_tokens"], 1024)
+            self.assertNotIn("extra_body", body)
+        self.assertEqual(out["min_tokens"], 1024)
+        self.assertEqual(out["max_tokens"], 1024)
+
+    def test_min_tokens_is_absent_when_unset(self) -> None:
+        out = B.run_multiturn("m", "u", turns=2, prefix_tokens=64, growth_tokens=64)
+        for body in self.bodies:
+            self.assertNotIn("min_tokens", body)
+        self.assertIsNone(out["min_tokens"])
+
+    def test_report_names_its_mode_model_and_completion_tokens(self) -> None:
+        out = B.run_multiturn("Q::mtp@118784", "u", turns=2, prefix_tokens=64,
+                              growth_tokens=64)
+        self.assertEqual(out["mode"], "multiturn")
+        self.assertEqual(out["model"], "Q::mtp@118784")
+        for rec in out["turns"]:
+            self.assertEqual(rec["completion_tokens"], 1024)
+            self.assertEqual(rec["token_source"], "usage")
+            for k in ("turn", "history_tokens", "ttft_ms", "ok", "capped", "error",
+                      "completion_tokens", "token_source", "counters_before",
+                      "counters_after", "counters_delta", "metrics_error"):
+                self.assertIn(k, rec)
+
+    def test_counters_are_read_before_and_after_every_turn(self) -> None:
+        fetch, reads = self._counting_metrics()
+        B._fetch_text = fetch
+        out = B.run_multiturn("m", "u", turns=3, prefix_tokens=64, growth_tokens=64,
+                              metrics_url="http://devai-vllm-devai:11434/metrics")
+        self.assertEqual(reads["n"], 6)
+        self.assertEqual(out["metrics_url"], "http://devai-vllm-devai:11434/metrics")
+        self.assertTrue(out["metrics_complete"])
+        t1, t2 = out["turns"][0], out["turns"][1]
+        self.assertEqual(t1["counters_before"]["vllm:prefix_cache_hits_total"], 100.0)
+        self.assertEqual(t1["counters_after"]["vllm:prefix_cache_hits_total"], 200.0)
+        self.assertEqual(t1["counters_delta"], {"vllm:prefix_cache_hits_total": 100.0,
+                                                "vllm:prefix_cache_queries_total": 1000.0})
+        self.assertEqual(t2["counters_before"]["vllm:prefix_cache_hits_total"], 300.0)
+        # Only ENGINE_COUNTERS are kept: no `_created` sample, no absent name.
+        self.assertNotIn("vllm:prefix_cache_hits_created", t1["counters_after"])
+        self.assertNotIn("sglang:cached_tokens_total", t1["counters_after"])
+        self.assertIsNone(t1["metrics_error"])
+
+    def test_warm_up_runs_before_the_first_counter_read(self) -> None:
+        order: list[str] = []
+        B._one_request = lambda u, m, p, mt, ts: (
+            order.append("warmup") or
+            {"ok": True, "capped": False, "ttft_ms": 1.0, "tokens": 1, "wall_s": 0.01})
+        fetch, _ = self._counting_metrics()
+        B._fetch_text = lambda url, t: (order.append("metrics") or fetch(url, t))
+        B.run_multiturn("m", "u", turns=1, prefix_tokens=64, metrics_url="http://e/metrics")
+        self.assertEqual(order[:2], ["warmup", "metrics"])
+
+    def test_a_failed_read_is_recorded_and_the_session_goes_on(self) -> None:
+        fetch, _ = self._counting_metrics(fail_on={3})   # turn 2's "before"
+        B._fetch_text = fetch
+        out = B.run_multiturn("m", "u", turns=3, prefix_tokens=64, growth_tokens=64,
+                              metrics_url="http://e/metrics")
+        self.assertEqual(len(out["turns"]), 3)
+        t2 = out["turns"][1]
+        self.assertIn("before: OSError", t2["metrics_error"])
+        self.assertIsNone(t2["counters_before"])
+        self.assertIsNotNone(t2["counters_after"])
+        self.assertIsNone(t2["counters_delta"])
+        self.assertIsNone(out["turns"][0]["metrics_error"])
+        self.assertFalse(out["metrics_complete"])
+
+    def test_without_a_metrics_url_nothing_is_read(self) -> None:
+        def boom(url, t):
+            raise AssertionError("read without --metrics-url")
+        B._fetch_text = boom
+        out = B.run_multiturn("m", "u", turns=2, prefix_tokens=64, growth_tokens=64)
+        self.assertIsNone(out["metrics_url"])
+        self.assertFalse(out["metrics_complete"])
+        self.assertIsNone(out["turns"][0]["counters_before"])
+
+    def test_cli_passes_the_three_flags_to_multiturn(self) -> None:
+        seen: dict = {}
+        orig = B.run_multiturn
+        B.run_multiturn = lambda **kw: seen.update(kw) or {"ok": True}
+        argv = sys.argv
+        sys.argv = ["bench_concurrency.py", "--model", "m", "--router-url", "u",
+                    "--mode", "multiturn", "--salt", "abc-1", "--min-tokens", "1024",
+                    "--metrics-url", "http://e/metrics"]
+        try:
+            import contextlib
+            import io
+            with contextlib.redirect_stdout(io.StringIO()):
+                B._cli()
+        finally:
+            B.run_multiturn = orig
+            sys.argv = argv
+        self.assertEqual(seen["salt"], "abc-1")
+        self.assertEqual(seen["min_tokens"], 1024)
+        self.assertEqual(seen["metrics_url"], "http://e/metrics")
+
+    def test_cli_default_salt_is_left_to_run_multiturn(self) -> None:
+        seen: dict = {}
+        orig = B.run_multiturn
+        B.run_multiturn = lambda **kw: seen.update(kw) or {}
+        argv = sys.argv
+        sys.argv = ["bench_concurrency.py", "--model", "m", "--router-url", "u",
+                    "--mode", "multiturn"]
+        try:
+            import contextlib
+            import io
+            with contextlib.redirect_stdout(io.StringIO()):
+                B._cli()
+        finally:
+            B.run_multiturn = orig
+            sys.argv = argv
+        self.assertIsNone(seen["salt"])
+        self.assertIsNone(seen["min_tokens"])
+        self.assertIsNone(seen["metrics_url"])
+
+    def test_cli_refuses_multiturn_flags_in_sweep_mode(self) -> None:
+        argv = sys.argv
+        sys.argv = ["bench_concurrency.py", "--model", "m", "--router-url", "u",
+                    "--salt", "x"]
+        try:
+            import contextlib
+            import io
+            with contextlib.redirect_stderr(io.StringIO()), \
+                    self.assertRaises(SystemExit) as cm:
+                B._cli()
+        finally:
+            sys.argv = argv
+        self.assertNotEqual(cm.exception.code, 0)
 
 
 if __name__ == "__main__":

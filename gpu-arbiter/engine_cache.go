@@ -72,3 +72,31 @@ func engineCacheVolumes(backend string) []map[string]any {
 		"Name": engineCacheVolumeName(backend, engine), "Dest": "/root/.cache/" + engine,
 	})
 }
+
+// Run-time FlashInfer cubin downloads are disabled for these backends
+// (platform-rebuild Phase 4 step 4v, "Run-time cubins off for every 4v
+// launch"). Without the variable, vLLM GETs NVIDIA's artifactory at
+// startup (0.28.0 vllm/utils/flashinfer.py:367-414) and, if it answers,
+// may select the TRTLLM XQA decode kernels on SM12x; with it, every kernel
+// comes from the image or its nvcc JIT compile, as Phase 4d's launcher
+// will serve. Scoped to the home-built vLLM only: the stock image is not
+// part of 4v's measurement. The probers set the same value for the same
+// backends (scripts/_probe_hf_common.py, NO_RUNTIME_CUBINS_ENV); the tests
+// on both sides pin it. Phase 8 moves the constant into pkg/engineargs.
+const (
+	flashinferCubinsRepositoryEnv = "FLASHINFER_CUBINS_REPOSITORY"
+	noRuntimeCubinsRepository     = "file:///nonexistent/"
+)
+
+var noRuntimeCubinsBackends = map[string]bool{"vllm-devai": true}
+
+// engineEnvDefaults is the engine environment every launch on `backend`
+// carries, whatever the model. buildContainerSpec applies it last, so
+// neither the backend's EnvVars nor a model's recovery env can re-enable
+// run-time downloads (the probers use the same precedence).
+func engineEnvDefaults(backend string) map[string]string {
+	if !noRuntimeCubinsBackends[backend] {
+		return nil
+	}
+	return map[string]string{flashinferCubinsRepositoryEnv: noRuntimeCubinsRepository}
+}

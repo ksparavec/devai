@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""Probe the vLLM-devai backend: the home-built, HyperQwen-patched vLLM 0.28.0.
+"""Probe the vLLM-devai backend: the home-built, HyperQwen-patched vLLM.
 
 Same engine, launch argv, KV dtypes and model store as probe-vllm-reasoning.py
 (it reuses that script's SPEC wholesale); its own name, image, probe container
 and cache file. The cache is separate because every cell is stamped with the
 image it was measured on, and this backend's image is not vllm's -- mixing
-them in one cache is what the drift check treats as invalid.
+them in one cache is what the drift check treats as invalid. The vLLM version
+is the build record scripts/build-vllm.sh built the image from
+(VLLM_DEVAI_IMAGE selects the tag). Every launch carries
+FLASHINFER_CUBINS_REPOSITORY=file:///nonexistent/ (_probe_hf_common
+NO_RUNTIME_CUBINS_ENV, plan 4v).
 
 Usage is identical to probe-vllm-reasoning.py (`make probe-vllm-devai`, same
 PROBE_* knobs). The two prepared Qwen3.8 checkpoints only serve here.

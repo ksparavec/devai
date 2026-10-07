@@ -25,6 +25,8 @@ func TestManifestCacheFilesUnderDeploy(t *testing.T) {
 		"deploy/.ollama-reasoning-cache.json",
 		"deploy/.vllm-reasoning-cache.json",
 		"deploy/.sglang-reasoning-cache.json",
+		// 4v's rollback restores this one from the archive (platform-rebuild).
+		"deploy/.vllm-devai-reasoning-cache.json",
 		"deploy/.model-status.json",
 	}
 	got := map[string]bool{}

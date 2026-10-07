@@ -2927,6 +2927,11 @@ func buildContainerSpec(
 			envMap[k] = v
 		}
 	}
+	// The backend's fixed engine environment (engine_cache.go) goes last:
+	// it must hold whatever a model's recovery env says.
+	for k, v := range engineEnvDefaults(cfg.Name) {
+		envMap[k] = v
+	}
 	if len(envMap) > 0 {
 		spec["env"] = envMap
 	}

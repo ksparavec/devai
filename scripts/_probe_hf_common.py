@@ -78,6 +78,7 @@ from _probe_core import (  # noqa: E402
 )
 from _vllm_plugins import PluginEntry, PluginRegistry, get_registry  # noqa: E402
 from _model_status import (  # noqa: E402
+    LEDGER_PATH as _LEDGER_PATH,
     clear as _ledger_clear,
     exclusion_reason as _ledger_reason,
     implied_vram_exclusion as _ledger_implied_vram_exclusion,
@@ -451,6 +452,30 @@ def recovery_overrides(
             flags += f
             env.update(e)
     return flags, env
+
+
+def recovery_entries_for_backend(backend: str) -> list[tuple[str, str, list[str], str | None]]:
+    """Every recovery entry that applies to `backend`, for flag checks.
+
+    (model, origin, engine_flags, image) per curated entry gated in by its
+    `backends` (contract C2) and per generated group naming `backend` or
+    its engine (I25), in file order; origin is "curated" or "generated",
+    image the curated entry's override or None. Both files are re-read
+    first when changed, as for a launch.
+    """
+    _refresh_recovery()
+    out: list[tuple[str, str, list[str], str | None]] = []
+    for name in sorted(_RECOVERY_REGISTRY):
+        entry = _recovery_entry(name, backend)
+        if entry:
+            image = entry.get("image")
+            out.append((name, "curated", _flags_env(entry)[0],
+                        image if isinstance(image, str) and image else None))
+    for name in sorted(_RECOVERY_GENERATED):
+        for group in _RECOVERY_GENERATED[name]:
+            if _entry_applies_to_backend(group, backend, name):
+                out.append((name, "generated", _flags_env(group)[0], None))
+    return out
 
 
 def recovery_image(model_name: str, backend: str) -> str | None:
@@ -1071,6 +1096,26 @@ def container_state(runtime: str, name: str) -> str:
 ENGINE_CACHE_VOLUME_PREFIX = "devai-engine-cache-"
 
 
+# Run-time FlashInfer cubin downloads are disabled for these backends (plan
+# Phase 4, step 4v, "Run-time cubins off for every 4v launch"). Without the
+# variable, vLLM GETs NVIDIA's artifactory at startup (0.28.0
+# vllm/utils/flashinfer.py:367-414) and, if it answers, may select the
+# TRTLLM XQA decode kernels on SM12x; with it, every kernel comes from the
+# image or its nvcc JIT compile, as 4d's launcher will serve. Scoped to the
+# home-built vLLM only: the stock image is not part of 4v's measurement.
+# Pinned to the router's buildContainerSpec by the tests on both sides.
+NO_RUNTIME_CUBINS_ENV = {"FLASHINFER_CUBINS_REPOSITORY": "file:///nonexistent/"}
+NO_RUNTIME_CUBINS_BACKENDS = frozenset({"vllm-devai"})
+
+
+def engine_env_defaults(backend: str | None) -> dict[str, str]:
+    """Engine environment every launch on `backend` carries, whatever the
+    model: today only NO_RUNTIME_CUBINS_ENV on the backends it is scoped to."""
+    if backend in NO_RUNTIME_CUBINS_BACKENDS:
+        return dict(NO_RUNTIME_CUBINS_ENV)
+    return {}
+
+
 def engine_cache_volumes(backend: str) -> list[tuple[str, str]]:
     """(volume name, container path) pairs for an HF backend; [] otherwise."""
     engine = engine_of(backend)
@@ -1098,7 +1143,9 @@ def container_run_args(
 
     `backend` adds that backend's persistent engine-cache volumes (see
     engine_cache_volumes); a named volume takes the same `--volume
-    name:dest:mode` form as a bind and is created on demand.
+    name:dest:mode` form as a bind and is created on demand. It also adds
+    the backend's fixed engine environment (engine_env_defaults), applied
+    last so no per-model entry can turn run-time cubin downloads back on.
     """
     args = [
         runtime, "run", "--detach",
@@ -1113,7 +1160,8 @@ def container_run_args(
         args.extend(["--volume", f"{host}:{dst}:{mode}"])
     for vol, dst in engine_cache_volumes(backend) if backend else []:
         args.extend(["--volume", f"{vol}:{dst}:rw"])
-    for k, v in env_vars.items():
+    env = {**env_vars, **engine_env_defaults(backend)}
+    for k, v in env.items():
         args.extend(["--env", f"{k}={v}"])
     args.append(image)
     args.extend(command)
@@ -1821,6 +1869,42 @@ def run_tool_probe(
     }
 
 
+def speculative_config_json(
+    mtp_method: str | None,
+    mtp_drafter: str | None = None,
+    mtp_num_tokens: int | None = None,
+) -> str | None:
+    """The `--speculative-config` JSON for a catalog `mtp:` block, or None.
+
+    Built JSON-side so the same blob ends up in both probe-time and
+    serve-time (router) launches; the fit pass's MTP launch and the load
+    pass's `--mtp` relaunch both build it here. SGLang discards it (its MTP
+    path is unvalidated on this fleet); vLLM appends `--speculative-config
+    <json>` when present.
+    """
+    if not mtp_method:
+        return None
+    payload: dict[str, object] = {
+        "method": mtp_method,
+        "num_speculative_tokens": int(mtp_num_tokens or 1),
+    }
+    if mtp_drafter:
+        # The drafter directory must already be on disk inside the bound
+        # /models tree. Mirror the router's path convention so the same JSON
+        # works at probe and serve time.
+        payload["model"] = f"/models/{mtp_drafter.split('/')[-1]}"
+    return json.dumps(payload, separators=(",", ":"))
+
+
+def row_speculative_config(row: dict) -> str | None:
+    """speculative_config_json for a catalog row's `mtp:` block, or None."""
+    mtp = row.get("mtp") if isinstance(row.get("mtp"), dict) else None
+    if not mtp:
+        return None
+    return speculative_config_json(
+        mtp.get("method"), mtp.get("drafter"), mtp.get("num_speculative_tokens"))
+
+
 def probe_one_cell(
     spec: BackendSpec,
     *,
@@ -1869,23 +1953,9 @@ def probe_one_cell(
     plugin_volume, tool_plugin_path, reasoning_plugin_path = _resolve_plugins(
         spec, reasoning_parser, tool_parser,
     )
-    # Multi-token-prediction launch flag. Built JSON-side so the same
-    # blob ends up in both probe-time and serve-time (router) launches.
-    # SGLang discards this (its MTP path is unvalidated on this fleet -- NVFP4
-    # loading itself is fixed via --disable-piecewise-cuda-graph); vLLM
-    # appends `--speculative-config <json>` when present.
-    speculative_config_json: str | None = None
-    if mtp_method:
-        spec_payload: dict[str, object] = {
-            "method": mtp_method,
-            "num_speculative_tokens": int(mtp_num_tokens or 1),
-        }
-        if mtp_drafter:
-            # The drafter directory must already be on disk inside the
-            # bound /models tree. Mirror the router's path convention so
-            # the same JSON works at probe and serve time.
-            spec_payload["model"] = f"/models/{mtp_drafter.split('/')[-1]}"
-        speculative_config_json = json.dumps(spec_payload, separators=(",", ":"))
+    # Multi-token-prediction launch flag (see speculative_config_json).
+    speculative_config = speculative_config_json(
+        mtp_method, mtp_drafter, mtp_num_tokens)
     # Fail before touching the GPU: the two engines accept DIFFERENT KV
     # dtype spellings and PROBE_KV_CACHE_TYPE is one knob shared by both.
     validate_kv_dtype(spec, spec.kv_cache_dtype)
@@ -1894,7 +1964,7 @@ def probe_one_cell(
         reasoning_parser=reasoning_parser, tool_parser=tool_parser,
         reasoning_parser_plugin=reasoning_plugin_path,
         tool_parser_plugin=tool_plugin_path,
-        speculative_config=speculative_config_json,
+        speculative_config=speculative_config,
         kv_cache_dtype=spec.kv_cache_dtype,
     )
 
@@ -2680,7 +2750,28 @@ def build_argparser(spec: BackendSpec, doc: str) -> argparse.ArgumentParser:
                     help="fractional depth (0.0=top, 1.0=bottom) at which "
                          "the load probe inserts its recall needle "
                          "(default 0.5)")
+    ap.add_argument("--mtp", action="store_true",
+                    help="--load only: relaunch a row whose fit cell records "
+                         "mtp_fits: true with its catalog MTP drafter (the "
+                         "speculative config the fit pass builds), as the "
+                         "picker serves it, and stamp serving_mtp: true on "
+                         "the cell; other rows are load-probed without one "
+                         "(Make PROBE_MTP=1)")
+    ap.add_argument("--ledger", type=Path, default=None,
+                    help="exclusion ledger to read and write instead of "
+                         "deploy/.model-status.json, so a scratch run leaves "
+                         "the real one alone; a missing file reads as empty "
+                         "(Make PROBE_LEDGER=<file>)")
     return ap
+
+
+def ledger_file_args(args: argparse.Namespace) -> tuple[Path, ...]:
+    """The ledger path argument for _load_ledger / _save_ledger: () for the
+    real ledger (deploy/.model-status.json, _model_status's default), or
+    (--ledger,). Read like `no_mtp`: hand-built Namespaces in the tests
+    predate the flag."""
+    path = getattr(args, "ledger", None)
+    return (Path(path),) if path else ()
 
 
 # ── Main loop ────────────────────────────────────────────────────────────────
@@ -2689,32 +2780,43 @@ def check_ignore_curated(spec: BackendSpec, args: argparse.Namespace) -> bool:
     """I24's switch, refused where it would rewrite production data.
 
     PROBE_IGNORE_CURATED_PARSERS=1 probes with the card-derived parsers
-    alone, so its cells must not replace the curated ones: it is accepted
-    only scoped to rows (`--repo`) and with a scratch cache (`--cache` other
-    than the backend's own). `--no-cache-write` is refused: it makes a row
-    that already fits look fully cached, so the run would probe nothing.
-    The exclusion ledger is not written (Phase 4v adds a scratch
-    `--ledger`). The --load pass refuses the switch (run_load_probe_pass).
-    Read like `no_mtp`: hand-built Namespaces in the tests predate the flag.
+    alone, so neither its cells nor its verdicts may replace the curated
+    run's: it is accepted only scoped to rows (`--repo`), with a scratch
+    cache (`--cache` other than the backend's own) and a scratch exclusion
+    ledger (`--ledger` other than deploy/.model-status.json), which the run
+    reads and writes. `--no-cache-write` is refused: it makes a row that
+    already fits look fully cached, so the run would probe nothing. The
+    --load pass refuses the switch (run_load_probe_pass). Read like
+    `no_mtp`: hand-built Namespaces in the tests predate the flag.
     """
     if not getattr(args, "ignore_curated_parsers", False):
         return False
     scratch = Path(args.cache).resolve() != Path(spec.cache_path).resolve()
-    if not args.repo or not scratch or getattr(args, "no_cache_write", False):
+    ledger = getattr(args, "ledger", None)
+    scratch_ledger = bool(ledger) and (
+        Path(ledger).resolve() != Path(_LEDGER_PATH).resolve())
+    if (not args.repo or not scratch or not scratch_ledger
+            or getattr(args, "no_cache_write", False)):
         sys.exit("error: PROBE_IGNORE_CURATED_PARSERS=1 / --ignore-curated-parsers "
-                 "needs --repo <regex> (PROBE_REPO) and a scratch --cache <file> "
-                 "other than the backend's own, and refuses --no-cache-write: its "
-                 "cells carry card-derived parsers only and must not replace the "
-                 "curated ones (plan I24)")
+                 "needs --repo <regex> (PROBE_REPO), a scratch --cache <file> "
+                 "other than the backend's own and a scratch --ledger <file> "
+                 "(PROBE_LEDGER) other than deploy/.model-status.json, and "
+                 "refuses --no-cache-write: its cells and verdicts come from "
+                 "card-derived parsers only and must not replace the curated "
+                 "ones (plan I24)")
     print("PROBE_IGNORE_CURATED_PARSERS: curated parsers, recipe seeds and "
           "the name heuristic are ignored; only card-derived parsers drive "
-          "the launch; the exclusion ledger is not written", file=sys.stderr)
+          f"the launch; exclusion verdicts go to the scratch ledger {ledger}",
+          file=sys.stderr)
     return True
 
 
 def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
     """Run one probe pass with the given backend spec and argparse args."""
     ignore_curated = check_ignore_curated(spec, args)
+    if getattr(args, "mtp", False):
+        sys.exit("error: --mtp (PROBE_MTP) applies to the --load pass; the fit "
+                 "pass probes a row's MTP drafter on its own unless --no-mtp")
     assert_no_active_backends(args.runtime)
     install_probe_cleanup()
 
@@ -2780,10 +2882,13 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
         cache, digest=run_image_digest, image_ref=args.image)
     if not args.no_cache_write:
         save_cache(args.cache, cache)
-    ledger = _load_ledger()
+    ledger_args = ledger_file_args(args)
+    ledger = _load_ledger(*ledger_args)
 
     print(f"  prober:         probe-{spec.name}-reasoning", file=sys.stderr)
     print(f"  cache:          {args.cache} ({len(cache)} entries)", file=sys.stderr)
+    if ledger_args:
+        print(f"  ledger:         {ledger_args[0]} (scratch)", file=sys.stderr)
     print(f"  catalog rows:   {len(catalog_rows)} (after --repo filter)",
           file=sys.stderr)
     print(f"  vram bands:     {','.join(vram_label(v) for v in vrams)}",
@@ -3368,8 +3473,10 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
     pruned = prune_orphaned_shas(cache, catalog_rows)
     if pruned and not args.no_cache_write:
         save_cache(args.cache, cache)
-    if not args.no_cache_write and not ignore_curated:
-        _save_ledger(ledger, host_vram_gb=args.host_vram_gb)
+    # Under the I24 switch ledger_args is the scratch ledger
+    # (check_ignore_curated refuses the run without one).
+    if not args.no_cache_write:
+        _save_ledger(ledger, *ledger_args, host_vram_gb=args.host_vram_gb)
 
     print(file=sys.stderr)
     by_cap: dict[str, int] = {}

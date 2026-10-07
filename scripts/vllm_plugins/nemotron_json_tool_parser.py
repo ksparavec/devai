@@ -13,12 +13,20 @@ from pydantic import Field
 # plugin runs under; see deploy/recovery-flags.json). Upstream shipped this
 # for an older vLLM layout where protocol types lived in one module and the
 # tool-parser ABC under entrypoints.openai; both moved. Logic is byte-for-byte
-# NVIDIA's -- only these imports changed.
+# NVIDIA's -- only these imports changed. vLLM 0.29 moved the protocol types
+# again, to vllm.entrypoints.generate.base.protocol, and removed
+# vllm.entrypoints.openai.engine.protocol (vllm#54492): the new module first,
+# the old one as the fallback, so one file serves 0.25.1, 0.28.0 and 0.30.0.
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest)
-from vllm.entrypoints.openai.engine.protocol import (
-    DeltaFunctionCall, DeltaMessage, DeltaToolCall,
-    ExtractedToolCallInformation, FunctionCall, ToolCall)
+try:
+    from vllm.entrypoints.generate.base.protocol import (
+        DeltaFunctionCall, DeltaMessage, DeltaToolCall,
+        ExtractedToolCallInformation, FunctionCall, ToolCall)
+except ImportError:
+    from vllm.entrypoints.openai.engine.protocol import (
+        DeltaFunctionCall, DeltaMessage, DeltaToolCall,
+        ExtractedToolCallInformation, FunctionCall, ToolCall)
 from vllm.tool_parsers.abstract_tool_parser import (ToolParser,
                                                     ToolParserManager)
 from vllm.logger import init_logger

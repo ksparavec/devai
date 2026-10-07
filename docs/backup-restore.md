@@ -15,6 +15,7 @@ snapshots and restores exactly this set.
 | `deploy/.ollama-reasoning-cache.json` | Ollama probe cache | skipped, snapshot continues |
 | `deploy/.vllm-reasoning-cache.json` | vLLM probe cache | skipped, snapshot continues |
 | `deploy/.sglang-reasoning-cache.json` | SGLang probe cache | skipped, snapshot continues |
+| `deploy/.vllm-devai-reasoning-cache.json` | vllm-devai probe cache (the home-built vLLM). Tracked in git, unlike the three above, but the working copy is what the probers rewrite. Platform-rebuild 4v probes vLLM 0.30.0 into it, and 4v's rollback restores it from the archive taken before the first probe | skipped, snapshot continues |
 | `deploy/.model-status.json` | host-local model exclusion ledger | skipped, snapshot continues |
 | `deploy/*.sops.env` | encrypted secrets files, if any exist (none do since the sops/age scaffold moved to the attic; the glob stays) | skipped, snapshot continues |
 | `~/.devai/preferences.yaml` | last-used model/agent/vram/context | skipped, snapshot continues |
@@ -91,6 +92,19 @@ for the whole run) rather than deleting it. This means:
   `.before-restore-*` sibling until you clean it up yourself.
 
 `restore` requires `--yes`; there is no interactive prompt.
+
+`restore` has no path filter: it puts back every file the archive holds.
+To restore ONE file (platform-rebuild 4v's rollback restores only
+`deploy/.vllm-devai-reasoning-cache.json`), check the archive with
+`make backup-verify ARCHIVE=<archive>`, move the current file aside, and
+extract that entry alone from the repository root; archive entries are
+named by the paths in the table above:
+
+```bash
+make backup-verify ARCHIVE=<archive>
+mv deploy/.vllm-devai-reasoning-cache.json deploy/.vllm-devai-reasoning-cache.json.before-restore
+tar -xzf <archive> deploy/.vllm-devai-reasoning-cache.json
+```
 
 ## Recovery walkthrough
 

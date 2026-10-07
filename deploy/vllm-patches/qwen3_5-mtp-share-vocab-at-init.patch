@@ -1,11 +1,21 @@
 Do not allocate the MTP drafter's embed_tokens and lm_head: vLLM throws them away.
 
-For MTP drafters the proposer (v1/spec_decode/llm_base_proposer.py,
-_maybe_share_embeddings and _maybe_share_lm_head) ALWAYS deletes the drafter's own
-embed_tokens and lm_head after loading and points the drafter at the target
-model's. Until that moment both copies are resident. Qwen3.5/3.6/3.8 have a
+vLLM ALWAYS replaces an MTP drafter's own embed_tokens and lm_head with the
+target model's after loading, on both model runners:
+
+  * Model Runner V1: the proposer, v1/spec_decode/llm_base_proposer.py,
+    _maybe_share_embeddings and _maybe_share_lm_head (their "MTP model"
+    branch: an MTP drafter declares no has_own_embed_tokens / has_own_lm_head,
+    so it always shares);
+  * Model Runner V2, the default since 0.29 (vllm#53183): the MTP speculator
+    loads its drafter with load_eagle_model in
+    v1/worker/gpu/spec_decode/eagle/utils.py, which shares whenever the drafter
+    declares no copy of its own (_should_share); Qwen3.5's drafter declares none.
+
+Until that moment both copies are resident. Qwen3.5/3.6/3.8 have a
 248,320-row vocabulary, so that is 2 x 2.37 GiB (bf16) allocated, loaded from the
-checkpoint, and then freed.
+checkpoint, and then freed. Upstream still allocates both (0.30.0
+qwen3_5_mtp.py:85 and :246).
 
 On a 24 GiB card the second allocation does not fit next to a ~18 GiB model:
   torch.OutOfMemoryError: Tried to allocate 2.37 GiB ... 1.85 GiB is free
@@ -14,18 +24,24 @@ Measured identically on vLLM 0.22.1 and 0.28.0 with Qwen3.8-27B-MTP-NVFP4
 It fails at MODEL LOAD, before any KV cache exists, so no serving flag
 (--gpu-memory-utilization, --max-model-len, --enforce-eager) can reach it.
 
-With this patch the drafter builds placeholders instead, skips those tensors in
-load_weights, and the proposer's sharing step fills them in as before. Verified
-2026-09-21 on RTX PRO 4000 Blackwell: "Model loading took 18.65 GiB" (17.86 GiB
-body + the MTP layer), both "Sharing target model ..." lines logged, 40/40
-requests served, 61.6 tok/s against 33.3 tok/s without MTP, mean acceptance
-length 2.6-3.4 at 3 draft tokens.
+With this patch the drafter builds placeholders (PPMissingLayer) instead, skips
+those tensors in load_weights, and the runner's sharing step fills them in as
+before: V1 deletes the placeholder and assigns the target's layer; V2's
+_should_share returns true for a drafter without has_own_* flags, and it then
+does the same. Verified 2026-09-21 on RTX PRO 4000 Blackwell (vLLM 0.28.0,
+Model Runner V1 path): "Model loading took 18.65 GiB" (17.86 GiB body + the MTP
+layer), both "Sharing target model ..." lines logged, 40/40 requests served,
+61.6 tok/s against 33.3 tok/s without MTP, mean acceptance length 2.6-3.4 at 3
+draft tokens. Not yet run on 0.30.0 (V2 logs no sharing line).
 
 Sharing only happens at pipeline-parallel size 1; the stock behaviour is kept
 otherwise. DEVAI_MTP_SHARE_VOCAB_AT_INIT=0 restores it unconditionally.
 
 Applies AFTER the HyperQwen series (qwen3_5-embed-quant and
-qwen3_5-mtp-draft-vocab touch the same file). Validated against vLLM 0.28.0.
+qwen3_5-mtp-draft-vocab touch the same file), with `patch -p1 --fuzz 0`, on
+both build records: vLLM 0.28.0 + HyperQwen c0c81bb and vLLM 0.30.0 + HyperQwen
+7af097b (dry-run checked on both trees, 2026-10-07). The hunks are cut against
+0.30.0; on 0.28.0 they apply at offsets with exact context.
 
 --- a/model_executor/models/qwen3_5_mtp.py
 +++ b/model_executor/models/qwen3_5_mtp.py
@@ -37,7 +53,7 @@ qwen3_5-mtp-draft-vocab touch the same file). Validated against vLLM 0.28.0.
  from collections.abc import Iterable
  
  import torch
-@@ -79,12 +80,34 @@
+@@ -82,12 +83,37 @@
          self.mtp_start_layer_idx = config.num_hidden_layers
          self.num_mtp_layers = getattr(config, "mtp_num_hidden_layers", 1)
  
@@ -48,16 +64,19 @@ qwen3_5-mtp-draft-vocab touch the same file). Validated against vLLM 0.28.0.
 -            prefix=maybe_prefix(prefix, "embed_tokens"),
 -        )
 +        # devai patch: do not build vocabulary-sized layers that are thrown
-+        # away. For MTP drafters the proposer (llm_base_proposer.py,
-+        # _maybe_share_embeddings / _maybe_share_lm_head) ALWAYS deletes the
-+        # drafter's embed_tokens and lm_head after loading and points it at
-+        # the target model's. Until then both copies are resident: for a
-+        # 248k-row vocabulary that is 2 x 2.37 GiB allocated only to be freed,
-+        # and on a 24 GiB card the second one does not fit ("Tried to
-+        # allocate 2.37 GiB ... 1.85 GiB is free", measured on 0.22.1 and
-+        # 0.28.0). Sharing only happens at pipeline-parallel size 1, so the
-+        # stock behaviour is kept otherwise. DEVAI_MTP_SHARE_VOCAB_AT_INIT=0
-+        # restores it unconditionally.
++        # away. vLLM ALWAYS replaces an MTP drafter's embed_tokens and
++        # lm_head with the target model's after loading, on both model
++        # runners: V1 in v1/spec_decode/llm_base_proposer.py
++        # (_maybe_share_embeddings / _maybe_share_lm_head), V2 -- the default
++        # since 0.29 -- in v1/worker/gpu/spec_decode/eagle/utils.py
++        # (load_eagle_model, which shares whenever the drafter declares no
++        # copy of its own, _should_share). Until then both copies are
++        # resident: for a 248k-row vocabulary that is 2 x 2.37 GiB allocated
++        # only to be freed, and on a 24 GiB card the second one does not fit
++        # ("Tried to allocate 2.37 GiB ... 1.85 GiB is free", measured on
++        # 0.22.1 and 0.28.0). Sharing only happens at pipeline-parallel
++        # size 1, so the stock behaviour is kept otherwise.
++        # DEVAI_MTP_SHARE_VOCAB_AT_INIT=0 restores it unconditionally.
 +        self.shares_target_vocab = (
 +            get_pp_group().world_size == 1
 +            and os.environ.get("DEVAI_MTP_SHARE_VOCAB_AT_INIT", "1") != "0"
@@ -78,7 +97,7 @@ qwen3_5-mtp-draft-vocab touch the same file). Validated against vLLM 0.28.0.
  
          # syv patch: vocab-truncated draft head. If the checkpoint ships
          # mtp_draft_vocab_ids.pt (built by build_draft_vocab.py) the drafter
-@@ -258,7 +281,10 @@
+@@ -264,7 +290,10 @@
              vllm_config=vllm_config, prefix=maybe_prefix(prefix, "mtp")
          )
  
@@ -90,7 +109,7 @@ qwen3_5-mtp-draft-vocab touch the same file). Validated against vLLM 0.28.0.
              self.lm_head = ParallelLMHead(
                  config.vocab_size,
                  config.hidden_size,
-@@ -346,6 +372,10 @@
+@@ -356,6 +385,10 @@
                  if name.startswith("mtp."):
                      name = name.replace("mtp.", "model.")
                  elif any(key in name for key in ["embed_tokens", "lm_head"]):

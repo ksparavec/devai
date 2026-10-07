@@ -406,9 +406,16 @@ class VendorAndWiringTest(unittest.TestCase):
         self.assertTrue((REPO_ROOT / "third_party" / "hyperqwen" / "LICENSE").exists())
         self.assertTrue(all(ord(c) < 128 for c in readme), "markdown must be ASCII")
 
-    def test_vendor_commit_matches_the_build_scripts_pin(self) -> None:
-        build = (REPO_ROOT / "scripts" / "build-vllm.sh").read_text()
-        self.assertIn(f'HYPERQWEN_COMMIT="${{HYPERQWEN_COMMIT:-{pc.VENDOR_COMMIT}}}"', build)
+    def test_vendor_commit_is_the_0_28_0_records(self) -> None:
+        # The vendored scripts stay at c0c81bb, the commit the prepared
+        # checkpoints were made with (plan 4v); the build's HyperQwen commit
+        # is its record's (0.30.0: 7af097b), so this compares with the
+        # 0.28.0 record, not with the build's default.
+        self.assertEqual(pc.VENDOR_COMMIT, "c0c81bbbbf91f11b54af7b95f49bd6d1570c2ba0")
+        record = (REPO_ROOT / "deploy" / "vllm-builds" / "0.28.0.sh").read_text()
+        self.assertRegex(record, rf"(?m)^HYPERQWEN_COMMIT={pc.VENDOR_COMMIT}$")
+        readme = (REPO_ROOT / "third_party" / "hyperqwen" / "README.md").read_text()
+        self.assertIn("deploy/vllm-builds/0.28.0.sh", readme)
 
     def test_make_target_exists_and_forwards_name(self) -> None:
         recipe = MAKEFILE.split("\nmodel-prepare:", 1)[1].split("\n\n", 1)[0]

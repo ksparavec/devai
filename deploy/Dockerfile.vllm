@@ -6,10 +6,15 @@
 # The wheelhouse is produced by scripts/build-vllm.sh (`make build-vllm-dist`)
 # and bind-mounted read-only at /var/cache/vllm-dist. The install below is
 # OFFLINE (`--no-index`): every wheel was fetched, with retries, on the host,
-# and the vLLM wheel among them is ours. The build FAILS if the wheelhouse is
-# absent, if it still carries a PyPI vLLM wheel, or if the installed package
-# lacks the HyperQwen patches -- an image without them starts fine and merely
-# behaves like stock vLLM.
+# and the vLLM wheel among them is ours. It runs in three steps: the runtime
+# set, which is the build record's hash lock (requirements.txt), with
+# --require-hashes; then the vLLM wheel built here with --no-deps (the lock
+# holds every dependency and not vLLM itself); then `pip check`, which fails
+# the build on any unmet requirement. The build also FAILS if the wheelhouse
+# is absent, if it still carries a PyPI vLLM wheel, or, when BUILD_INFO names
+# a HyperQwen commit, if the installed package lacks the HyperQwen patches --
+# an image without them starts fine and merely behaves like stock vLLM. A
+# record without HyperQwen (`hyperqwen=none`) skips that check.
 #
 # Runtime contract matches what gpu-arbiter's vllmEntrypoint launches:
 #   python3 -m vllm.entrypoints.openai.api_server --model /models/<name> ...
@@ -46,7 +51,7 @@ ARG DIST_ID=unset
 RUN set -eu; \
     echo "wheelhouse $DIST_ID"; \
     D=/var/cache/vllm-dist; \
-    test -f "$D/requirements.txt" && test -f "$D/PATCHES.applied" \
+    test -f "$D/requirements.txt" && test -f "$D/PATCHES.applied" && test -f "$D/BUILD_INFO" \
         || { echo "error: no wheelhouse mounted at $D -- run 'make build-vllm-dist' first" >&2; exit 1; }; \
     n=$(ls "$D"/wheels/vllm-*.whl | wc -l); \
     [ "$n" -eq 1 ] || { echo "error: expected exactly one vLLM wheel in $D/wheels, found $n" >&2; exit 1; }; \
@@ -54,12 +59,15 @@ RUN set -eu; \
         *manylinux*) echo "error: the vLLM wheel in $D/wheels is the PyPI build, not the host-compiled one" >&2; exit 1;; \
     esac; \
     python3 -m venv /opt/vllm; \
-    /opt/vllm/bin/pip install --no-cache-dir --no-index --find-links "$D/wheels" \
-        -r "$D/requirements.txt"; \
-    install -m 0644 "$D/PATCHES.applied" "$D/BUILD_INFO" /opt/vllm/; \
+    /opt/vllm/bin/pip install --no-cache-dir --no-index --find-links "$D/wheels" --require-hashes -r "$D/requirements.txt"; \
+    /opt/vllm/bin/pip install --no-cache-dir --no-index --no-deps "$D"/wheels/vllm-*.whl; \
+    /opt/vllm/bin/pip check; \
+    install -m 0644 "$D/PATCHES.applied" "$D/BUILD_INFO" "$D/requirements.txt" /opt/vllm/; \
     SP=$(/opt/vllm/bin/python -c 'import vllm, os; print(os.path.dirname(vllm.__file__))' | tail -n1); \
-    grep -q draft_vocab_ids "$SP/model_executor/models/qwen3_5_mtp.py" \
-        || { echo "error: the installed vLLM lacks the HyperQwen patches" >&2; exit 1; }; \
+    if grep -Eq '^hyperqwen=[0-9a-f]{40}$' "$D/BUILD_INFO"; then \
+        grep -q draft_vocab_ids "$SP/model_executor/models/qwen3_5_mtp.py" \
+            || { echo "error: the installed vLLM lacks the HyperQwen patches" >&2; exit 1; }; \
+    fi; \
     ls "$SP"/_C*.so >/dev/null \
         || { echo "error: the installed vLLM has no compiled _C extension" >&2; exit 1; }; \
     /opt/vllm/bin/python -c 'import vllm; print("vllm", vllm.__version__)'
