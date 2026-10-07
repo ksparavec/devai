@@ -359,6 +359,37 @@ class BuildVllmScriptTest(_ScriptCase):
         self.assertTrue("nvcc" in r.stderr or "not found on PATH" in r.stderr, r.stderr)
 
 
+    def test_missing_libdw_headers_are_a_clear_error_before_any_compile(self) -> None:
+        # vLLM 0.30.0's DeepGEMM fork includes elfutils/libdwfl.h (its
+        # deep_jit submodule); without libdw-dev the first 0.30.0 compile
+        # died twenty minutes in (2026-10-07).
+        bindir = self.tmp / "bin"
+        for tool in ("cmake", "ninja", "gcc", "g++", "patch", "uv", "cargo", "sha256sum", "py"):
+            f = bindir / tool
+            f.write_text("#!/bin/sh\nexit 0\n")
+            f.chmod(f.stat().st_mode | stat.S_IEXEC)
+        cuda = self.tmp / "cuda"
+        (cuda / "bin").mkdir(parents=True)
+        (cuda / "bin" / "nvcc").write_text("#!/bin/sh\n")
+        (cuda / "bin" / "nvcc").chmod(0o755)
+        for h in ("cublas_v2.h", "cusparse.h", "cusolverDn.h", "cufft.h", "curand.h", "nvrtc.h",
+                  "nvJitLink.h", "cufile.h", "cuda_profiler_api.h", "nvtx3/nvToolsExt.h"):
+            (cuda / "include" / h).parent.mkdir(parents=True, exist_ok=True)
+            (cuda / "include" / h).write_text("")
+        include = self.tmp / "include"
+        include.mkdir()
+        r = self._sh("preflight", CUDA_HOME=str(cuda), PYTHON=str(bindir / "py"),
+                     VLLM_HOST_INCLUDE=str(include))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("elfutils/libdwfl.h", r.stderr)
+        self.assertIn("libdw-dev", r.stderr)
+        (include / "elfutils").mkdir()
+        (include / "elfutils" / "libdwfl.h").write_text("")
+        r = self._sh("preflight", CUDA_HOME=str(cuda), PYTHON=str(bindir / "py"),
+                     VLLM_HOST_INCLUDE=str(include))
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+
 class BuildRecordTest(_ScriptCase):
     """The records themselves, as the script loads them."""
 

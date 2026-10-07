@@ -58,6 +58,9 @@
 #
 # Host prerequisites -- Debian packages, installed once by the operator:
 #   cmake ninja-build gcc g++ git patch python3 python3-dev        (Debian main)
+#   libdw-dev    (Debian main; elfutils/libdwfl.h, which 0.30.0's DeepGEMM
+#                 fork includes; at run time it only dlopens libdw.so.1,
+#                 optionally, for stack-trace symbols)
 #   cuda-nvcc-13-1 cuda-cudart-dev-13-1 cuda-cccl-13-1 libcublas-dev-13-1
 #   libcusparse-dev-13-1 libcusolver-dev-13-1 libcufft-dev-13-1
 #   libcurand-dev-13-1 cuda-nvrtc-dev-13-1 libnvjitlink-dev-13-1
@@ -86,6 +89,9 @@ BUILD_ROOT="${VLLM_BUILD_ROOT:-$HOME/.cache/devai/vllm-build/$VLLM_VERSION}"
 JOBS="${JOBS:-16}"
 FETCH_RETRY_DELAY="${FETCH_RETRY_DELAY:-5}"
 PYTHON="${PYTHON:-/usr/bin/python3}"
+# Where host development headers outside the CUDA toolkit live (tests point
+# it elsewhere).
+VLLM_HOST_INCLUDE="${VLLM_HOST_INCLUDE:-/usr/include}"
 
 die() { echo "error: $*" >&2; exit 1; }
 say() { echo "==> $*"; }
@@ -335,6 +341,8 @@ preflight() {
         [ -f "$CUDA_HOME/include/$f" ] \
             || die "no $f under $CUDA_HOME/include (see the package list at the top of this script)"
     done
+    [ -f "$VLLM_HOST_INCLUDE/elfutils/libdwfl.h" ] \
+        || die "no elfutils/libdwfl.h under $VLLM_HOST_INCLUDE: install libdw-dev (sudo apt install libdw-dev)"
 }
 
 # Refuse to build against a pin or a repository the source tree no longer
