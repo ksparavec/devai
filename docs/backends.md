@@ -1038,7 +1038,8 @@ first request (`Qwen3.8-27B-MTP-devai-NVFP4::mtp@118784`) answered after
 261-278 s, n=7, 2026-09-22). FlashInfer JIT-compiled 83 files into the
 volume (the sm120 FP4 GEMM kernels among them) with the host toolkit's
 nvcc 13.1 (`cuda_home = /usr/local/cuda`). The pip `nvidia-cuda-nvcc` 13.0
-that HyperQwen's requirements bring into the lock is installed and unused.
+that HyperQwen's requirements brought into the lock was installed and
+unused; plan E8 removed it (below).
 
 **Engine-log facts.** `Using FlashInferCutlassNvFp4LinearKernel for NVFP4
 GEMM`; `Using FlashInfer GDN prefill kernel (requested=auto,
@@ -1086,6 +1087,23 @@ c). So every vllm-devai launch carries it, from the argument builders
 **Re-probes.** Phase 15's baseline, Qwen3.5-9B-NVFP4, fits 262,144 on
 0.30.0 (22.71 GiB, MTP fits). The other rows are re-probed in Phase 4 step
 4g. Raw logs and reports: `/var/cache/devai/bench/4v/v0.30.0/`.
+
+**No CUDA compiler from PyPI (E8).** The runtime set no longer carries
+pip's CUDA 13.0 compiler packages (`nvidia-cuda-nvcc`, `-crt`, `-cccl`,
+`nvidia-nvvm`; from HyperQwen's requirements and from vLLM's own
+`humming-kernels[cu13]` extra): the image's CUDA 13.1 toolkit serves. The
+rebuilt image, same tag, is id `5ab31d2b6ebc`, digest
+`sha256:6c2ad8b6...`, 9.67 GB; `pip list` in it shows none of the four,
+and humming-kernels resolves `/usr/local/cuda/bin/nvcc`. Re-probed on it
+the same evening (one run each), with the FlashInfer volume emptied
+first: the first launch started in 275 s and FlashInfer JIT-compiled the
+same 83 files (the sm120 FP4 GEMM among them); NVFP4 fits 118,784 with
+MTP at 22.45 GiB, AutoRound 131,072 at 22.09 GiB; their MTP load probes
+peak at 22.96 and 22.86 GiB with the needle recalled; Qwen3.5-9B-NVFP4
+fits 262,144 at 22.71 GiB, MTP fits -- every value equal to the first
+0.30.0 build's to the hundredth of a GiB. `:latest` points at it since;
+the first build is left untagged. Raw log:
+`/var/cache/devai/bench/4v/v0.30.0-e8/`.
 
 ### Prepared checkpoints (`make model-prepare`)
 

@@ -250,6 +250,7 @@ The operator's answers after two research rounds on 2026-10-06: vLLM after 0.28,
   - The runtime sets leave out pip's CUDA compiler packages (`nvidia-cuda-nvcc`, `nvidia-cuda-crt`, `nvidia-cuda-cccl`, `nvidia-nvvm`), from HyperQwen's `docker/requirements.txt` and from vLLM's own `humming-kernels[cu13]` extra alike (the package stays, without the extra). HyperQwen pins pip's 13.0 set because its image has no toolkit; devai's carries the host's CUDA 13.1 (M2).
   - Checked in the 0.30.0 image on 2026-10-07: FlashInfer JIT-compiled its kernels with `/usr/local/cuda` (13.1), and humming-kernels, the only other package that compiles with nvcc at run time, picks the system toolkit over pip's when both are present. Neither Qwen3.8 row uses humming (NVFP4 on FlashInfer CUTLASS, int8 layers on Marlin).
   - It amends step 4v's runtime-set rule ("without its `vllm`, `flashinfer-cubin` and extra-index lines"): `scripts/build-vllm.sh` drops these four packages and those extras when it writes `<version>.in`.
+  - Done 2026-10-07: both locks regenerated (each lost exactly the four packages); the 0.30.0 image rebuilt without them (`5ab31d2b6ebc`) and re-probed with the FlashInfer cache emptied -- both prepared rows keep their contexts with MTP and pass the load probe, Qwen3.5-9B-NVFP4 keeps 262,144, every value equal to the first build's (docs/backends.md "vLLM 0.30.0"); `:latest` moved to it.
 
 ## Implementation decisions (2026-10-05)
 

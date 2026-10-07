@@ -1,11 +1,15 @@
 {
   "_meta": {
-    "current_image_digest": "sha256:bbf7b40f09756a300e21d806dcae5f37480b0ada412a87bdcda20bd78ef75f14",
-    "current_image_ref": "docker.io/devai/vllm-devai:latest",
+    "current_image_digest": "sha256:6c2ad8b6282f0d5f44eb30d194e75c04ba8f8ffd3d5495ce1047a9eecb23d939",
+    "current_image_ref": "docker.io/devai/vllm-devai:v0.30.0-cu131-debian13-hq.7af097b",
     "image_history": {
       "sha256:0a94e7982b85849790a0b381725644bae0e91cea5a46257843c42df69cd8a4b6": {
         "first_seen": "2026-09-22T09:53:06+00:00",
         "image_ref": "docker.io/devai/vllm-devai:latest"
+      },
+      "sha256:6c2ad8b6282f0d5f44eb30d194e75c04ba8f8ffd3d5495ce1047a9eecb23d939": {
+        "first_seen": "2026-10-07T17:48:54+00:00",
+        "image_ref": "docker.io/devai/vllm-devai:v0.30.0-cu131-debian13-hq.7af097b"
       },
       "sha256:8a892fea3cd217687a377c5581fe4b9d1f9d1c2f7d48cb1c72a57096e0d35abf": {
         "first_seen": "2026-09-25T14:21:54+00:00",
@@ -21,7 +25,7 @@
     "aliases": [
       "Qwen3.8-27B-MTP-devai-NVFP4"
     ],
-    "backend_image_digest": "sha256:bbf7b40f09756a300e21d806dcae5f37480b0ada412a87bdcda20bd78ef75f14",
+    "backend_image_digest": "sha256:6c2ad8b6282f0d5f44eb30d194e75c04ba8f8ffd3d5495ce1047a9eecb23d939",
     "capability": "structured",
     "card_sampling": {
       "eos_token_id": [
@@ -51,8 +55,8 @@
       "tool_parser_attempted": "qwen3_xml"
     },
     "first_probed_at": "2026-09-22T10:03:10+00:00",
-    "last_load_probed_at": "2026-10-07T15:42:16+00:00",
-    "last_probed_at": "2026-10-07T15:32:02+00:00",
+    "last_load_probed_at": "2026-10-07T18:03:51+00:00",
+    "last_probed_at": "2026-10-07T17:53:54+00:00",
     "max_context": 118784,
     "model_kind": "dense",
     "position_limit": 262144,
@@ -92,8 +96,8 @@
           "needle_score": 1.0,
           "needle_valid": true,
           "predicted_logits_gb": 2.034,
-          "probe_seconds": 135.7,
-          "probed_at": "2026-10-07T15:32:02+00:00",
+          "probe_seconds": 299.33,
+          "probed_at": "2026-10-07T17:53:54+00:00",
           "reasoning_parser": "qwen3",
           "serving_baseline_gb": 22.95,
           "serving_chat_timeout_s": 417.0,
@@ -105,11 +109,11 @@
           "serving_input_tokens": 116425,
           "serving_mtp": true,
           "serving_ok": true,
-          "serving_output_tokens": 195,
+          "serving_output_tokens": 82,
           "serving_peak_gb": 22.96,
-          "serving_probed_at": "2026-10-07T15:42:16+00:00",
-          "serving_seconds": 214.8,
-          "startup_seconds": 111.68,
+          "serving_probed_at": "2026-10-07T18:03:51+00:00",
+          "serving_seconds": 202.9,
+          "startup_seconds": 275.27,
           "tool_parser": "qwen3_xml",
           "transient_gb": 0.01,
           "vram_gb": 24
@@ -130,7 +134,7 @@
     "aliases": [
       "Qwen3.8-27B-W4A16-devai-AutoRound"
     ],
-    "backend_image_digest": "sha256:bbf7b40f09756a300e21d806dcae5f37480b0ada412a87bdcda20bd78ef75f14",
+    "backend_image_digest": "sha256:6c2ad8b6282f0d5f44eb30d194e75c04ba8f8ffd3d5495ce1047a9eecb23d939",
     "capability": "structured",
     "card_sampling": {
       "eos_token_id": [
@@ -143,15 +147,15 @@
     },
     "disable_verified": true,
     "evidence": {
-      "content_preview": "\n\nStep by step:\n\n1. **First hour:**  \n   The train travels 60 miles.\n\n2. **Second hour:**  \n   Its speed increases by 20",
+      "content_preview": "\n\nStep 1: In the first hour, the train travels **60 miles**.\n\nStep 2: In the second hour, its speed increases by 20 mph,",
       "disable": {
         "verified": true
       },
       "finish_reason": "stop",
-      "full_content": "\n\nStep by step:\n\n1. **First hour:**  \n   The train travels 60 miles.\n\n2. **Second hour:**  \n   Its speed increases by 20 mph, so it travels at 80 mph.  \n   Distance = 80 miles.\n\n3. **Third hour:**  \n   Its speed increases by another 20 mph, so it travels at 100 mph.  \n   Distance = 100 miles.\n\nTotal distance after 3 hours:\n\n\\[\n60 + 80 + 100 = 240\n\\]\n\n**Final number: 240 miles**",
-      "full_reasoning_content": "We need answer simple math. Need solve step by step, show reasoning, final number. Problem: train travels 60 miles in first hour, then increases speed by 20 mph each hour. How far after 3 hours? Interpret: first hour speed 60 mph => distance 60. Then increases speed by 20 mph each hour: second hour speed 80 mph => distance 80. third hour speed 100 mph => distance 100. Total 240 miles. Need be careful: \"increases speed by 20 mph each hour\" could mean after first hour, speed increases by 20 mph each subsequent hour. Yes.\nFinal answer with reasoning.\n",
+      "full_content": "\n\nStep 1: In the first hour, the train travels **60 miles**.\n\nStep 2: In the second hour, its speed increases by 20 mph, so it travels at **80 mph** for 1 hour, covering **80 miles**.\n\nStep 3: In the third hour, its speed increases by another 20 mph, so it travels at **100 mph** for 1 hour, covering **100 miles**.\n\nTotal distance after 3 hours:\n\n\\[\n60 + 80 + 100 = 240\n\\]\n\n**Final number: 240 miles**",
+      "full_reasoning_content": "We need answer user's simple math problem step by step. Need produce final with reasoning and final number. Let's solve: first hour 60 miles. Increases speed by 20 mph each hour. Ambiguity: after first hour, second hour speed 80 mph, third hour speed 100 mph. Distance = 60+80+100=240 miles. Need state final number. Ensure step-by-step.\n",
       "reasoning_parser_attempted": "qwen3",
-      "reasoning_preview": "We need answer simple math. Need solve step by step, show reasoning, final number. Problem: train travels 60 miles in first hour, then increases speed by 20 mph each hour. How far after 3 hours? Inter",
+      "reasoning_preview": "We need answer user's simple math problem step by step. Need produce final with reasoning and final number. Let's solve: first hour 60 miles. Increases speed by 20 mph each hour. Ambiguity: after firs",
       "structured_reason": "reasoning_content_populated",
       "tool": {
         "mode": "auto",
@@ -160,8 +164,8 @@
       "tool_parser_attempted": "qwen3_xml"
     },
     "first_probed_at": "2026-09-22T09:55:39+00:00",
-    "last_load_probed_at": "2026-10-07T15:46:26+00:00",
-    "last_probed_at": "2026-10-07T15:36:30+00:00",
+    "last_load_probed_at": "2026-10-07T18:08:00+00:00",
+    "last_probed_at": "2026-10-07T17:58:22+00:00",
     "max_context": 131072,
     "model_kind": "dense",
     "position_limit": 262144,
@@ -174,15 +178,15 @@
           "ctx": 131072,
           "disable_verified": true,
           "evidence": {
-            "content_preview": "\n\nStep by step:\n\n1. **First hour:**  \n   The train travels 60 miles.\n\n2. **Second hour:**  \n   Its speed increases by 20",
+            "content_preview": "\n\nStep 1: In the first hour, the train travels **60 miles**.\n\nStep 2: In the second hour, its speed increases by 20 mph,",
             "disable": {
               "verified": true
             },
             "finish_reason": "stop",
-            "full_content": "\n\nStep by step:\n\n1. **First hour:**  \n   The train travels 60 miles.\n\n2. **Second hour:**  \n   Its speed increases by 20 mph, so it travels at 80 mph.  \n   Distance = 80 miles.\n\n3. **Third hour:**  \n   Its speed increases by another 20 mph, so it travels at 100 mph.  \n   Distance = 100 miles.\n\nTotal distance after 3 hours:\n\n\\[\n60 + 80 + 100 = 240\n\\]\n\n**Final number: 240 miles**",
-            "full_reasoning_content": "We need answer simple math. Need solve step by step, show reasoning, final number. Problem: train travels 60 miles in first hour, then increases speed by 20 mph each hour. How far after 3 hours? Interpret: first hour speed 60 mph => distance 60. Then increases speed by 20 mph each hour: second hour speed 80 mph => distance 80. third hour speed 100 mph => distance 100. Total 240 miles. Need be careful: \"increases speed by 20 mph each hour\" could mean after first hour, speed increases by 20 mph each subsequent hour. Yes.\nFinal answer with reasoning.\n",
+            "full_content": "\n\nStep 1: In the first hour, the train travels **60 miles**.\n\nStep 2: In the second hour, its speed increases by 20 mph, so it travels at **80 mph** for 1 hour, covering **80 miles**.\n\nStep 3: In the third hour, its speed increases by another 20 mph, so it travels at **100 mph** for 1 hour, covering **100 miles**.\n\nTotal distance after 3 hours:\n\n\\[\n60 + 80 + 100 = 240\n\\]\n\n**Final number: 240 miles**",
+            "full_reasoning_content": "We need answer user's simple math problem step by step. Need produce final with reasoning and final number. Let's solve: first hour 60 miles. Increases speed by 20 mph each hour. Ambiguity: after first hour, second hour speed 80 mph, third hour speed 100 mph. Distance = 60+80+100=240 miles. Need state final number. Ensure step-by-step.\n",
             "reasoning_parser_attempted": "qwen3",
-            "reasoning_preview": "We need answer simple math. Need solve step by step, show reasoning, final number. Problem: train travels 60 miles in first hour, then increases speed by 20 mph each hour. How far after 3 hours? Inter",
+            "reasoning_preview": "We need answer user's simple math problem step by step. Need produce final with reasoning and final number. Let's solve: first hour 60 miles. Increases speed by 20 mph each hour. Ambiguity: after firs",
             "structured_reason": "reasoning_content_populated",
             "tool": {
               "mode": "auto",
@@ -201,8 +205,8 @@
           "needle_score": 1.0,
           "needle_valid": true,
           "predicted_logits_gb": 2.034,
-          "probe_seconds": 116.6,
-          "probed_at": "2026-10-07T15:36:30+00:00",
+          "probe_seconds": 115.14,
+          "probed_at": "2026-10-07T17:58:22+00:00",
           "reasoning_parser": "qwen3",
           "serving_baseline_gb": 22.53,
           "serving_chat_timeout_s": 447.7,
@@ -214,11 +218,11 @@
           "serving_input_tokens": 128726,
           "serving_mtp": true,
           "serving_ok": true,
-          "serving_output_tokens": 205,
+          "serving_output_tokens": 172,
           "serving_peak_gb": 22.86,
-          "serving_probed_at": "2026-10-07T15:46:26+00:00",
-          "serving_seconds": 248.1,
-          "startup_seconds": 96.54,
+          "serving_probed_at": "2026-10-07T18:08:00+00:00",
+          "serving_seconds": 247.8,
+          "startup_seconds": 96.55,
           "tool_parser": "qwen3_xml",
           "transient_gb": 0.33,
           "vram_gb": 24
@@ -239,7 +243,7 @@
     "aliases": [
       "Qwen3.5-9B-NVFP4"
     ],
-    "backend_image_digest": "sha256:bbf7b40f09756a300e21d806dcae5f37480b0ada412a87bdcda20bd78ef75f14",
+    "backend_image_digest": "sha256:6c2ad8b6282f0d5f44eb30d194e75c04ba8f8ffd3d5495ce1047a9eecb23d939",
     "capability": "structured",
     "card_sampling": {
       "eos_token_id": 248044
@@ -251,10 +255,10 @@
         "verified": true
       },
       "finish_reason": "stop",
-      "full_content": "\n\nHere is the step-by-step reasoning to solve the problem:\n\n**Step 1: Analyze the first hour**\nThe problem states the train travels **60 miles** in the first hour.\n*   Distance (Hour 1) = 60 miles\n\n**Step 2: Analyze the second hour**\nThe speed increases by 20 mph each hour.\n*   Speed in Hour 1 = 60 mph\n*   Speed in Hour 2 = 60 mph + 20 mph = 80 mph\n*   Distance (Hour 2) = 80 miles\n\n**Step 3: Analyze the third hour**\nThe speed increases by another 20 mph compared to the previous hour.\n*   Speed in Hour 2 = 80 mph\n*   Speed in Hour 3 = 80 mph + 20 mph = 100 mph\n*   Distance (Hour 3) = 100 miles\n\n**Step 4: Calculate the total distance**\nAdd the distances traveled in each of the three hours together.\n*   Total Distance = 60 + 80 + 100\n*   Total Distance = 240 miles\n\n**Final Answer:**\n240",
-      "full_reasoning_content": "Here's a thinking process that leads to the solution:\n\n1.  **Analyze the Request:**\n    *   **Problem:** A train travels 60 miles in the first hour, then increases speed by 20 mph each hour. How far has it traveled after 3 hours?\n    *   **Requirements:** Show reasoning step by step, then state the final number.\n\n2.  **Deconstruct the Problem:**\n    *   **Hour 1:** Distance = 60 miles.\n    *   **Speed Change:** Increases by 20 mph *each hour*.\n    *   **Goal:** Calculate total distance after 3 hours.\n\n3.  **Step-by-Step Calculation:**\n\n    *   **Hour 1:**\n        *   Distance traveled = 60 miles.\n        *   (Implied speed = 60 mph).\n\n    *   **Hour 2:**\n        *   The speed increases by 20 mph compared to the previous hour.\n        *   Previous speed = 60 mph.\n        *   New speed = $60 + 20 = 80$ mph.\n        *   Distance traveled in this hour = 80 miles.\n\n    *   **Hour 3:**\n        *   The speed increases by 20 mph compared to the previous hour.\n        *   Previous speed = 80 mph.\n        *   New speed = $80 + 20 = 100$ mph.\n        *   Distance traveled in this hour = 100 miles.\n\n    *   **Total Distance:**\n        *   Sum of distances for Hour 1, Hour 2, and Hour 3.\n        *   Total = $60 + 80 + 100$.\n\n4.  **Perform the Addition:**\n    *   $60 + 80 = 140$\n    *   $140 + 100 = 240$\n\n5.  **Review and Verify:**\n    *   Does \"increases speed by 20 mph each hour\" mean the speed is constant for that hour? Yes, usually in these types of math problems, it implies a constant speed for the duration of that specific hour.\n    *   Hour 1: 60 miles.\n    *   Hour 2: Speed is $60+20=80$. Distance is 80 miles.\n    *   Hour 3: Speed is $80+20=100$. Distance is 100 miles.\n    *   Total: $60+80+100 = 240$.\n    *   Logic holds up.\n\n6.  **Draft the Response:**\n    *   Start with the reasoning.\n    *   Break it down by hour.\n    *   Sum the distances.\n    *   State the final answer clearly.\n\n7.  **Final Output Generation:** (Matches the drafted response)\n    *   Hour 1: 60 mile",
+      "full_content": "\n\nHere is the step-by-step reasoning to solve the problem:\n\n**Step 1: Analyze the first hour**\nThe problem states the train travels 60 miles in the first hour.\n*   **Distance in Hour 1:** 60 miles\n\n**Step 2: Analyze the second hour**\nThe speed increases by 20 mph each hour.\n*   **Speed in Hour 2:** $60 \\text{ mph} + 20 \\text{ mph} = 80 \\text{ mph}$\n*   **Distance in Hour 2:** Since the speed is constant for the hour, the train travels 80 miles.\n\n**Step 3: Analyze the third hour**\nThe speed increases by another 20 mph from the previous hour.\n*   **Speed in Hour 3:** $80 \\text{ mph} + 20 \\text{ mph} = 100 \\text{ mph}$\n*   **Distance in Hour 3:** Since the speed is constant for the hour, the train travels 100 miles.\n\n**Step 4: Calculate the total distance**\nAdd the distances traveled in each of the three hours together.\n*   **Total Distance:** $60 \\text{ miles} + 80 \\text{ miles} + 100 \\text{ miles} = 240 \\text{ miles}$\n\n**Final Number:**\n240",
+      "full_reasoning_content": "Here's a thinking process that leads to the solution:\n\n1.  **Analyze the Problem:**\n    *   **Initial Condition:** A train travels 60 miles in the first hour.\n    *   **Rate of Change:** The speed increases by 20 mph *each hour*.\n    *   **Goal:** Calculate the total distance traveled after 3 hours.\n\n2.  **Break Down the Timeline:**\n    *   **Hour 1:**\n        *   Speed: 60 mph (given).\n        *   Distance: Speed $\\times$ Time = $60 \\text{ mph} \\times 1 \\text{ hour} = 60 \\text{ miles}$.\n    *   **Hour 2:**\n        *   Speed: The speed increases by 20 mph from the previous hour.\n        *   Previous speed: 60 mph.\n        *   New speed: $60 + 20 = 80 \\text{ mph}$.\n        *   Distance: $80 \\text{ mph} \\times 1 \\text{ hour} = 80 \\text{ miles}$.\n    *   **Hour 3:**\n        *   Speed: The speed increases by 20 mph from the previous hour.\n        *   Previous speed: 80 mph.\n        *   New speed: $80 + 20 = 100 \\text{ mph}$.\n        *   Distance: $100 \\text{ mph} \\times 1 \\text{ hour} = 100 \\text{ miles}$.\n\n3.  **Calculate Total Distance:**\n    *   Total Distance = (Distance in Hour 1) + (Distance in Hour 2) + (Distance in Hour 3)\n    *   Total Distance = $60 + 80 + 100$\n\n4.  **Perform the Addition:**\n    *   $60 + 80 = 140$\n    *   $140 + 100 = 240$\n\n5.  **Review and Verify:**\n    *   Does the interpretation of \"increases speed by 20 mph each hour\" mean the speed is constant for that hour? Yes, usually in these types of word problems, it implies a step function where the speed is constant for the duration of the hour.\n    *   Hour 1: 60 miles.\n    *   Hour 2: Speed is $60+20=80$. Distance is 80.\n    *   Hour 3: Speed is $80+20=100$. Distance is 100.\n    *   Sum: $60+80+100 = 240$.\n\n6.  **Construct the Final Output:**\n    *   State the reasoning clearly for each hour.\n    *   Sum the distances.\n    *   State the final number.\n\n    *Self-Correction/Refinement:* Is there any ambiguity? \"Increases speed by 20 mph each hour.\"\n    *   Interpretation A: Speed at $t=0$ is 60. ",
       "reasoning_parser_attempted": "qwen3",
-      "reasoning_preview": "Here's a thinking process that leads to the solution:\n\n1.  **Analyze the Request:**\n    *   **Problem:** A train travels 60 miles in the first hour, then increases speed by 20 mph each hour. How far h",
+      "reasoning_preview": "Here's a thinking process that leads to the solution:\n\n1.  **Analyze the Problem:**\n    *   **Initial Condition:** A train travels 60 miles in the first hour.\n    *   **Rate of Change:** The speed inc",
       "structured_reason": "reasoning_content_populated",
       "tool": {
         "mode": "auto",
@@ -263,7 +267,7 @@
       "tool_parser_attempted": "qwen3_xml"
     },
     "first_probed_at": "2026-10-07T15:48:37+00:00",
-    "last_probed_at": "2026-10-07T15:48:37+00:00",
+    "last_probed_at": "2026-10-07T18:10:14+00:00",
     "max_context": 262144,
     "model_kind": "dense",
     "position_limit": 262144,
@@ -281,10 +285,10 @@
               "verified": true
             },
             "finish_reason": "stop",
-            "full_content": "\n\nHere is the step-by-step reasoning to solve the problem:\n\n**Step 1: Analyze the first hour**\nThe problem states the train travels **60 miles** in the first hour.\n*   Distance (Hour 1) = 60 miles\n\n**Step 2: Analyze the second hour**\nThe speed increases by 20 mph each hour.\n*   Speed in Hour 1 = 60 mph\n*   Speed in Hour 2 = 60 mph + 20 mph = 80 mph\n*   Distance (Hour 2) = 80 miles\n\n**Step 3: Analyze the third hour**\nThe speed increases by another 20 mph compared to the previous hour.\n*   Speed in Hour 2 = 80 mph\n*   Speed in Hour 3 = 80 mph + 20 mph = 100 mph\n*   Distance (Hour 3) = 100 miles\n\n**Step 4: Calculate the total distance**\nAdd the distances traveled in each of the three hours together.\n*   Total Distance = 60 + 80 + 100\n*   Total Distance = 240 miles\n\n**Final Answer:**\n240",
-            "full_reasoning_content": "Here's a thinking process that leads to the solution:\n\n1.  **Analyze the Request:**\n    *   **Problem:** A train travels 60 miles in the first hour, then increases speed by 20 mph each hour. How far has it traveled after 3 hours?\n    *   **Requirements:** Show reasoning step by step, then state the final number.\n\n2.  **Deconstruct the Problem:**\n    *   **Hour 1:** Distance = 60 miles.\n    *   **Speed Change:** Increases by 20 mph *each hour*.\n    *   **Goal:** Calculate total distance after 3 hours.\n\n3.  **Step-by-Step Calculation:**\n\n    *   **Hour 1:**\n        *   Distance traveled = 60 miles.\n        *   (Implied speed = 60 mph).\n\n    *   **Hour 2:**\n        *   The speed increases by 20 mph compared to the previous hour.\n        *   Previous speed = 60 mph.\n        *   New speed = $60 + 20 = 80$ mph.\n        *   Distance traveled in this hour = 80 miles.\n\n    *   **Hour 3:**\n        *   The speed increases by 20 mph compared to the previous hour.\n        *   Previous speed = 80 mph.\n        *   New speed = $80 + 20 = 100$ mph.\n        *   Distance traveled in this hour = 100 miles.\n\n    *   **Total Distance:**\n        *   Sum of distances for Hour 1, Hour 2, and Hour 3.\n        *   Total = $60 + 80 + 100$.\n\n4.  **Perform the Addition:**\n    *   $60 + 80 = 140$\n    *   $140 + 100 = 240$\n\n5.  **Review and Verify:**\n    *   Does \"increases speed by 20 mph each hour\" mean the speed is constant for that hour? Yes, usually in these types of math problems, it implies a constant speed for the duration of that specific hour.\n    *   Hour 1: 60 miles.\n    *   Hour 2: Speed is $60+20=80$. Distance is 80 miles.\n    *   Hour 3: Speed is $80+20=100$. Distance is 100 miles.\n    *   Total: $60+80+100 = 240$.\n    *   Logic holds up.\n\n6.  **Draft the Response:**\n    *   Start with the reasoning.\n    *   Break it down by hour.\n    *   Sum the distances.\n    *   State the final answer clearly.\n\n7.  **Final Output Generation:** (Matches the drafted response)\n    *   Hour 1: 60 mile",
+            "full_content": "\n\nHere is the step-by-step reasoning to solve the problem:\n\n**Step 1: Analyze the first hour**\nThe problem states the train travels 60 miles in the first hour.\n*   **Distance in Hour 1:** 60 miles\n\n**Step 2: Analyze the second hour**\nThe speed increases by 20 mph each hour.\n*   **Speed in Hour 2:** $60 \\text{ mph} + 20 \\text{ mph} = 80 \\text{ mph}$\n*   **Distance in Hour 2:** Since the speed is constant for the hour, the train travels 80 miles.\n\n**Step 3: Analyze the third hour**\nThe speed increases by another 20 mph from the previous hour.\n*   **Speed in Hour 3:** $80 \\text{ mph} + 20 \\text{ mph} = 100 \\text{ mph}$\n*   **Distance in Hour 3:** Since the speed is constant for the hour, the train travels 100 miles.\n\n**Step 4: Calculate the total distance**\nAdd the distances traveled in each of the three hours together.\n*   **Total Distance:** $60 \\text{ miles} + 80 \\text{ miles} + 100 \\text{ miles} = 240 \\text{ miles}$\n\n**Final Number:**\n240",
+            "full_reasoning_content": "Here's a thinking process that leads to the solution:\n\n1.  **Analyze the Problem:**\n    *   **Initial Condition:** A train travels 60 miles in the first hour.\n    *   **Rate of Change:** The speed increases by 20 mph *each hour*.\n    *   **Goal:** Calculate the total distance traveled after 3 hours.\n\n2.  **Break Down the Timeline:**\n    *   **Hour 1:**\n        *   Speed: 60 mph (given).\n        *   Distance: Speed $\\times$ Time = $60 \\text{ mph} \\times 1 \\text{ hour} = 60 \\text{ miles}$.\n    *   **Hour 2:**\n        *   Speed: The speed increases by 20 mph from the previous hour.\n        *   Previous speed: 60 mph.\n        *   New speed: $60 + 20 = 80 \\text{ mph}$.\n        *   Distance: $80 \\text{ mph} \\times 1 \\text{ hour} = 80 \\text{ miles}$.\n    *   **Hour 3:**\n        *   Speed: The speed increases by 20 mph from the previous hour.\n        *   Previous speed: 80 mph.\n        *   New speed: $80 + 20 = 100 \\text{ mph}$.\n        *   Distance: $100 \\text{ mph} \\times 1 \\text{ hour} = 100 \\text{ miles}$.\n\n3.  **Calculate Total Distance:**\n    *   Total Distance = (Distance in Hour 1) + (Distance in Hour 2) + (Distance in Hour 3)\n    *   Total Distance = $60 + 80 + 100$\n\n4.  **Perform the Addition:**\n    *   $60 + 80 = 140$\n    *   $140 + 100 = 240$\n\n5.  **Review and Verify:**\n    *   Does the interpretation of \"increases speed by 20 mph each hour\" mean the speed is constant for that hour? Yes, usually in these types of word problems, it implies a step function where the speed is constant for the duration of the hour.\n    *   Hour 1: 60 miles.\n    *   Hour 2: Speed is $60+20=80$. Distance is 80.\n    *   Hour 3: Speed is $80+20=100$. Distance is 100.\n    *   Sum: $60+80+100 = 240$.\n\n6.  **Construct the Final Output:**\n    *   State the reasoning clearly for each hour.\n    *   Sum the distances.\n    *   State the final number.\n\n    *Self-Correction/Refinement:* Is there any ambiguity? \"Increases speed by 20 mph each hour.\"\n    *   Interpretation A: Speed at $t=0$ is 60. ",
             "reasoning_parser_attempted": "qwen3",
-            "reasoning_preview": "Here's a thinking process that leads to the solution:\n\n1.  **Analyze the Request:**\n    *   **Problem:** A train travels 60 miles in the first hour, then increases speed by 20 mph each hour. How far h",
+            "reasoning_preview": "Here's a thinking process that leads to the solution:\n\n1.  **Analyze the Problem:**\n    *   **Initial Condition:** A train travels 60 miles in the first hour.\n    *   **Rate of Change:** The speed inc",
             "structured_reason": "reasoning_content_populated",
             "tool": {
               "mode": "auto",
@@ -299,10 +303,10 @@
           "mtp_fits": true,
           "mtp_method": "qwen3_5_mtp",
           "mtp_overhead_gb": 0.54,
-          "probe_seconds": 129.71,
-          "probed_at": "2026-10-07T15:48:37+00:00",
+          "probe_seconds": 132.95,
+          "probed_at": "2026-10-07T18:10:14+00:00",
           "reasoning_parser": "qwen3",
-          "startup_seconds": 101.77,
+          "startup_seconds": 96.44,
           "tool_parser": "qwen3_xml",
           "vram_gb": 24
         }
