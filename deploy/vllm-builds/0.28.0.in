@@ -3,7 +3,8 @@
 # Do not edit it: change the build record and run make vllm-lock.
 #
 # vllm-0.28.0 sdist: requirements/cuda.txt and the files it includes,
-# without vllm, flashinfer-cubin and index lines (PyPI alone).
+# without vllm, flashinfer-cubin, the CUDA compiler packages and index lines
+# (PyPI alone).
 regex
 cachetools
 psutil
@@ -77,10 +78,11 @@ fastsafetensors >= 0.3.3
 nvidia-cutlass-dsl[cu13]==4.6.2
 quack-kernels==0.6.4
 tokenspeed-mla==0.1.8; platform_system == "Linux"
-humming-kernels[cu13]==0.1.12
+humming-kernels==0.1.12
 #
 # HyperQwen c0c81bbbbf91f11b54af7b95f49bd6d1570c2ba0: docker/requirements.txt,
-# without vllm, flashinfer-cubin and index lines.
+# without vllm, flashinfer-cubin, the CUDA compiler packages (the image carries
+# the host's CUDA 13.1 toolkit, M2) and index lines.
 transformers==5.15.0
 tokenizers==0.22.2
 compressed-tensors==0.17.0

@@ -212,7 +212,10 @@ unpack_sdist() {
 # includes) followed, for a HyperQwen record, by HyperQwen's
 # docker/requirements.txt -- without vllm (built here), flashinfer-cubin
 # (published only on flashinfer.ai's index since 0.6.14; FlashInfer
-# JIT-compiles instead) and index lines (PyPI alone, M3). The release's torch
+# JIT-compiles instead), the CUDA compiler packages (nvidia-cuda-nvcc,
+# -crt, -cccl, nvidia-nvvm: HyperQwen pins pip's 13.0 set because its image
+# has no toolkit; ours carries the host's CUDA 13.1, which FlashInfer
+# compiles with -- M2, plan E8) and index lines (PyPI alone, M3). The release's torch
 # pin must be the record's. Where both name a package, uv applies both
 # specifiers, so a HyperQwen pin the release's specifier refuses fails
 # `make vllm-lock`. Inline comments are dropped; markers are kept.
@@ -226,7 +229,14 @@ import sys
 from pathlib import Path
 
 cuda_txt, hq_req, version, hq_commit, torch_pin = sys.argv[1:6]
-DROP = {"vllm", "flashinfer-cubin"}
+DROP = {"vllm", "flashinfer-cubin",
+        "nvidia-cuda-nvcc", "nvidia-cuda-crt", "nvidia-cuda-cccl", "nvidia-nvvm"}
+# Extras that exist only to bring pip's CUDA compiler (nvcc, cccl) for a
+# host without a toolkit: humming-kernels' cu12/cu13 add nvcc and cccl
+# beside the runtime and nvrtc torch requires anyway. Humming picks the
+# system toolkit over pip's when both are present (checked in the 0.30.0
+# image: /usr/local/cuda, 13.1), so the image's CUDA_HOME serves it.
+DROP_EXTRAS = {"humming-kernels": {"cu12", "cu13"}}
 INDEX_OPTIONS = {"-i", "--index-url", "--extra-index-url", "-f", "--find-links"}
 INCLUDE_OPTIONS = {"-r", "--requirement"}
 
@@ -259,6 +269,13 @@ def requirements(path, seen):
             sys.exit(f"error: {path}: cannot read {raw!r}")
         if norm(m.group(0)) in DROP:
             continue
+        drop = DROP_EXTRAS.get(norm(m.group(0)))
+        if drop:
+            rest = line[m.end():]
+            e = re.match(r"\s*\[([^\]]*)\]", rest)
+            if e:
+                keep = [x.strip() for x in e.group(1).split(",") if x.strip() and x.strip() not in drop]
+                line = m.group(0) + (f"[{','.join(keep)}]" if keep else "") + rest[e.end():]
         out.append(line)
     return out
 
@@ -276,13 +293,15 @@ print(f"# (make vllm-lock VLLM_VERSION={version}) and hash-locked as {version}.l
 print("# Do not edit it: change the build record and run make vllm-lock.")
 print("#")
 print(f"# vllm-{version} sdist: requirements/cuda.txt and the files it includes,")
-print("# without vllm, flashinfer-cubin and index lines (PyPI alone).")
+print("# without vllm, flashinfer-cubin, the CUDA compiler packages and index lines")
+print("# (PyPI alone).")
 print("\n".join(release))
 if hq_req:
     hq = requirements(Path(hq_req).resolve(), frozenset())
     print("#")
     print(f"# HyperQwen {hq_commit}: docker/requirements.txt,")
-    print("# without vllm, flashinfer-cubin and index lines.")
+    print("# without vllm, flashinfer-cubin, the CUDA compiler packages (the image carries")
+    print("# the host's CUDA 13.1 toolkit, M2) and index lines.")
     print("\n".join(hq))
 PY
 }

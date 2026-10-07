@@ -526,10 +526,13 @@ class RuntimeSetTest(_ScriptCase):
     _CUDA = ("# Common dependencies\n-r common.txt\n\ntorch==2.13.0\n"
              "--extra-index-url https://flashinfer.ai/whl/\n"
              "flashinfer-python==0.6.18.post1\nflashinfer-cubin==0.6.18.post1\n"
-             "tokenspeed-mla==0.1.8; platform_system == \"Linux\"\n")
+             "tokenspeed-mla==0.1.8; platform_system == \"Linux\"\n"
+             "humming-kernels[cu13]==0.1.12\n")
     _HQ_REQ = ("# header\nvllm==0.30.0\ntransformers==5.15.0\n"
                "--extra-index-url https://download.pytorch.org/whl/cu130\n"
-               "flashinfer-cubin==0.6.18.post1\npandas==3.0.5\n")
+               "flashinfer-cubin==0.6.18.post1\npandas==3.0.5\n"
+               "nvidia-cuda-nvcc==13.0.88\nnvidia_cuda_crt==13.0.88\n"
+               "nvidia-cuda-cccl==13.0.85\nNVIDIA-NVVM==13.0.88\n")
 
     def _tree(self, *, cuda: str | None = None, hq_req: str | None = None) -> Path:
         root = self.tmp / "root"
@@ -558,6 +561,7 @@ class RuntimeSetTest(_ScriptCase):
             "regex", "numpy", "transformers >= 5.10.4", "six>=1.16.0; python_version > '3.11'",
             "torch==2.13.0", "flashinfer-python==0.6.18.post1",
             'tokenspeed-mla==0.1.8; platform_system == "Linux"',
+            "humming-kernels==0.1.12",
             "transformers==5.15.0", "pandas==3.0.5"])
         self.assertIn(f"# HyperQwen {_HQ}: docker/requirements.txt", r.stdout)
 
@@ -566,6 +570,22 @@ class RuntimeSetTest(_ScriptCase):
         reqs = self._reqs(r.stdout)
         self.assertFalse([ln for ln in reqs if re.match(r"(vllm|flashinfer[-_]cubin)\b", ln, re.I)])
         self.assertFalse([ln for ln in reqs if ln.startswith("-")])
+
+    def test_no_cuda_compiler_package_from_pypi(self) -> None:
+        # HyperQwen pins pip's CUDA 13.0 compiler set because its image has
+        # no toolkit; devai's carries the host's CUDA 13.1 and FlashInfer
+        # compiles with that (M2, plan E8, 2026-10-07).
+        r = self._runtime_in(self._tree(hq_req=self._HQ_REQ), _record())
+        self.assertEqual(r.returncode, 0, r.stderr)
+        reqs = self._reqs(r.stdout)
+        self.assertFalse([ln for ln in reqs if re.match(r"nvidia[-_.](cuda[-_.](nvcc|crt|cccl)|nvvm)\b", ln, re.I)],
+                         reqs)
+        # vLLM 0.30.0's humming-kernels[cu13]: the extra only brings pip's
+        # nvcc and cccl (runtime and nvrtc come with torch anyway); humming
+        # prefers the system toolkit when both exist (checked in the image).
+        self.assertIn("humming-kernels==0.1.12", reqs)
+        self.assertFalse([ln for ln in reqs if "[cu1" in ln], reqs)
+        self.assertIn("CUDA compiler packages", r.stdout)
 
     def test_a_record_without_hyperqwen_gets_the_release_set_alone(self) -> None:
         r = self._runtime_in(self._tree(hq_req=self._HQ_REQ), _record(hq="", skip=""))

@@ -2456,29 +2456,11 @@ nvidia-cublas==13.1.1.3 \
     #   cuda-toolkit
     #   nvidia-cudnn-cu13
     #   nvidia-cusolver
-nvidia-cuda-cccl==13.3.4.3.1 \
-    --hash=sha256:48ba8e44a1162face51306d5bfd67604d9949be5acb9105dbb93734d2df8b3a4 \
-    --hash=sha256:ccb02901bb259997c4bc198ad6f96f9a4fa260d9823d8a5aceabf3e3b244336f \
-    --hash=sha256:cd47e7823e3ab369a3e3df3a4c6dbb4cb02176cb85b251eec5f7c9cdfa528ec4 \
-    --hash=sha256:d7879f58820f863c4db4237200a764d5cb992dbf99089d31aee6f2998750b002
-    # via humming-kernels
-nvidia-cuda-crt==13.4.92 \
-    --hash=sha256:12df5a6cae984e5fea929f20e26ac9d652720258673bb8c7d9b26d931b4d4554 \
-    --hash=sha256:212dbd6410b090f5c5b88e8671e44df5d43c591c12f232dae3197b137b616009 \
-    --hash=sha256:731ce3de11df8add8306404417a1edaede225dbe27eb233aed37c8de9d4fe720 \
-    --hash=sha256:89c4550c60883ffb901ea7309662fb6495122d06abed2ef2d0dba11a398a14e9
-    # via nvidia-cuda-nvcc
 nvidia-cuda-cupti==13.0.85 \
     --hash=sha256:4eb01c08e859bf924d222250d2e8f8b8ff6d3db4721288cf35d14252a4d933c8 \
     --hash=sha256:683f58d301548deeefcb8f6fac1b8d907691b9d8b18eccab417f51e362102f00 \
     --hash=sha256:796bd679890ee55fb14a94629b698b6db54bcfd833d391d5e94017dd9d7d3151
     # via cuda-toolkit
-nvidia-cuda-nvcc==13.4.92 \
-    --hash=sha256:4e0f5af276baf0abb9f8305e3d4cf2c70eb0202f80b33be5e8fcefedf7226234 \
-    --hash=sha256:a1f3bfb27299e060b444d5df1f4bcd762501326cf0fd3141ed61756816ab9a0e \
-    --hash=sha256:d6fc9f720c3b73b9e526f4c759dbc6581e1a300ba2c8191e3f0ed91c848a92c8 \
-    --hash=sha256:facb6509ab98a1a4309c28d93bcf3144964a2fcdd411e9bfd320566d1180b261
-    # via humming-kernels
 nvidia-cuda-nvdisasm==13.4.92 \
     --hash=sha256:600c43bde6b323be4d950e33a248aa97ff9cdea28a4b7dae083680f092bdd230 \
     --hash=sha256:624a3406572a983079edce35284cc5b6b1a3f23b02a62057b49a79be33d76252 \
@@ -2495,16 +2477,12 @@ nvidia-cuda-nvrtc==13.0.88 \
     --hash=sha256:d27f20a0ca67a4bb34268a5e951033496c5b74870b868bacd046b1b8e0c3267b
     # via
     #   cuda-toolkit
-    #   humming-kernels
     #   nvidia-cublas
 nvidia-cuda-runtime==13.0.96 \
     --hash=sha256:7f82250d7782aa23b6cfe765ecc7db554bd3c2870c43f3d1821f1d18aebf0548 \
     --hash=sha256:ef9bcbe90493a2b9d810e43d249adb3d02e98dd30200d86607d8d02687c43f55 \
     --hash=sha256:f79298c8a098cec150a597c8eba58ecdab96e3bdc4b9bc4f9983635031740492
-    # via
-    #   cuda-toolkit
-    #   humming-kernels
-    #   nvidia-cuda-nvcc
+    # via cuda-toolkit
 nvidia-cudnn-cu13==9.20.0.48 \
     --hash=sha256:0c45dd8eeb50b603f07995b1b300c62ffe6a1980482b82b3bcf94a4ca9d49304 \
     --hash=sha256:af8139732b99c0118be65ea5aac97f0d46018f8c552889e49d2fb0c6261a4a24 \
@@ -2648,12 +2626,6 @@ nvidia-nvtx==13.0.85 \
     --hash=sha256:cb7780edb6b14107373c835bf8b72e7a178bac7367e23da7acb108f973f157a6 \
     --hash=sha256:d66ea44254dd3c6eacc300047af6e1288d2269dd072b417e0adffbf479e18519
     # via cuda-toolkit
-nvidia-nvvm==13.4.92 \
-    --hash=sha256:6b70f49442461c1b1033e599ff021676ea3d20840be1e7f92e1d6560daf08637 \
-    --hash=sha256:b5e52e835458ccb8ff4cfd347e5290ee9d1a62cfa3cad87514fbe92b20ee4b85 \
-    --hash=sha256:ce766bd2e45b085cd181a0917a8df3174868acf95c621ae2c6c3828ae91c41f2 \
-    --hash=sha256:e4c81cb321dd9743bcf871c5e7e8fecd7f05dea607944426e102bdda8d49e137
-    # via nvidia-cuda-nvcc
 nvtx==0.2.15 \
     --hash=sha256:02bca69ee55e0be41eabf908de9dbcdd18e702c7f49f9aa63fd396ce684ff5d5 \
     --hash=sha256:10749686633f880ad53dcdbb2179fad41b45dcf5b7631d4a1070a577577bd386 \
