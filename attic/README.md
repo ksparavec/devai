@@ -13,6 +13,8 @@ to thaw it without re-deriving the design.
 | Subtree | What it is | Frozen on | Why |
 | --- | --- | --- | --- |
 | [cluster-mode/](./cluster-mode/) | Multi-host cluster mode (`--mode=worker\|head`) and the SkyPilot cloud-burst fleet provisioner | 2026-07-25 | Built for a fleet this project does not have. Never functioned end to end. See below. |
+| [amd-rocm/](./amd-rocm/) | The AMD/ROCm GPU-vendor overlay: `make gpu-vendor`, `devai-gpu-vendor`, the ROCm branches of the lab image and the launcher | 2026-10-07 | Platform-rebuild Phase 1, operator decision M11: never ran on ROCm hardware, and the rocm6.4 index has no torch for Python 3.14. devai is NVIDIA-only until it is restored. See [amd-rocm/RESTORE.md](./amd-rocm/RESTORE.md). |
+| [sops-age/](./sops-age/) | The sops + age secret-store scaffold: `.sops.yaml`, the key and render scripts, the tmpfs mount, the `secrets-*` targets | 2026-10-07 | Platform-rebuild Phase 1, operator decision M12: its last consumer, the MCP gateway, was deleted the same day (M10). The Slurm work may restore it for its JWT key and MariaDB password. See [sops-age/RESTORE.md](./sops-age/RESTORE.md). |
 
 ## Why cluster-mode was frozen
 
@@ -57,6 +59,9 @@ mode. `gpu-arbiter` still accepts `--mode`, but any value other than
 doing nothing.
 
 ## How to thaw
+
+Each subtree has its own RESTORE.md; read it first. The rest of this
+section is cluster-mode's.
 
 The Go sources under `cluster-mode/gpu-arbiter/` each carry a
 `//go:build devai_frozen_cluster` tag, and `attic/` sits outside every

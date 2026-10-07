@@ -3,7 +3,7 @@
 # Create a dedicated 100 GB XFS volume at /var/cache/devai/logs.
 #
 # Aligns with the existing devai storage layout: every other cache subdir
-# (apt, npm, pip, registry, ollama, open-webui) is its own LVM logical
+# (apt, npm, pip, registry, ollama) is its own LVM logical
 # volume in the `vgais` volume group, mounted via /etc/fstab. This script
 # adds `cache_logs` alongside them.
 #

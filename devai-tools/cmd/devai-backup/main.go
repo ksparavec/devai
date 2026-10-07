@@ -1,6 +1,6 @@
 // Command devai-backup snapshots and restores devai's irreplaceable
-// host-local state: probe/bench caches, ~/.devai/ preferences+sessions, and
-// the sops/age secret scaffold. See docs/backup-restore.md.
+// host-local state: probe/bench caches and ~/.devai/ preferences+sessions.
+// See docs/backup-restore.md.
 package main
 
 import (
@@ -47,7 +47,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `usage: devai-backup <command> [flags]
 
 commands:
-  snapshot [--dest DIR] [--exclude-age-key] [--repo-root DIR] [--home-dir DIR]
+  snapshot [--dest DIR] [--repo-root DIR] [--home-dir DIR]
   list     [--dest DIR] [--home-dir DIR]
   verify   --archive PATH
   restore  --archive PATH --yes [--repo-root DIR] [--home-dir DIR]`)
@@ -76,7 +76,6 @@ func defaultBackupDir(homeDir string) string {
 func runSnapshot(args []string) error {
 	fs := flag.NewFlagSet("snapshot", flag.ExitOnError)
 	dest := fs.String("dest", "", "destination directory (default $DEVAI_BACKUP_DIR or ~/.devai/backups)")
-	excludeAgeKey := fs.Bool("exclude-age-key", false, "do not include ~/.config/sops/age/keys.txt")
 	repoRoot := fs.String("repo-root", "", "devai repo root (default: cwd)")
 	homeDir := fs.String("home-dir", "", "home directory override (default: $HOME)")
 	if err := fs.Parse(args); err != nil {
@@ -96,7 +95,7 @@ func runSnapshot(args []string) error {
 		d = defaultBackupDir(hd)
 	}
 
-	manifest := backup.Manifest(rr, hd, *excludeAgeKey)
+	manifest := backup.Manifest(rr, hd)
 	timestamp := time.Now().UTC().Format("20060102T150405Z")
 	path, err := backup.Snapshot(d, manifest, timestamp)
 	if err != nil {

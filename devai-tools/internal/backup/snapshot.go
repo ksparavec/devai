@@ -62,14 +62,6 @@ func addEntry(tw *tar.Writer, e Entry) error {
 	info, err := os.Lstat(e.SourcePath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			if e.IsAgeKey {
-				fmt.Fprintf(os.Stderr,
-					"WARNING: age key not found at %s -- skipping. "+
-						"sops+age has no backdoor: losing this key means losing "+
-						"every secret encrypted with its public key. Run "+
-						"`make age-keygen-host` if this host should have one.\n",
-					e.SourcePath)
-			}
 			return nil
 		}
 		return fmt.Errorf("stat %s: %w", e.SourcePath, err)

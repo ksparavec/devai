@@ -28,7 +28,7 @@ discussion: both emitters should move to `--tp-size` before upstream
 adds a second `--tp*` option.
 
 All three are reachable via the router from inside the `devai-net` Podman
-network. Agents (Claude Code, Codex, OpenCode, Pi, DeepSeek Harness, Open WebUI) talk to the
+network. Agents (Claude Code, Codex, OpenCode, Pi, DeepSeek Harness) talk to the
 router on the appropriate port; the picker emits the right port based on
 the chosen model's backend.
 
@@ -36,9 +36,8 @@ the chosen model's backend.
 
 `make cache-up` brings up:
 
-- **Always running**: `devai-ollama`, `devai-router`, `devai-open-webui`,
-  `devai-webui-proxy`, `devai-apt-cache`, `devai-registry-cache`,
-  `devai-logger`.
+- **Always running**: `devai-ollama`, `devai-router`, `devai-apt-cache`,
+  `devai-registry-cache`, `devai-logger`.
 - **Idle placeholders**: `devai-vllm` and `devai-sglang` start with
   `entrypoint: ["sleep", "infinity"]`. They hold the service definition
   (image, mounts, GPU device, network) but consume no GPU resources.
@@ -139,9 +138,6 @@ miss at the requested tier means that tier was never probed.
 Every consumer clamps the request to the entry's own `max_context`
 first (`eff = min(ctx, max_context)`) before looking a cell up, on both
 backends -- asking a 65K-ceiling model for 256K just asks it for 65K.
-`devai-model-status`'s `list_fitting_models` reproduces the same two
-readers; see
-[docs/mcp-model-status.md](mcp-model-status.md#list_fitting_models).
 
 ### vLLM vs SGLang -- measured, 2026-07-29
 

@@ -10,7 +10,6 @@ DSH_PORT ?= 3080
 DSH_VERSION ?= 0.1.5-rc.2
 # Pinned -- see the Pi block in fetch-cli.
 PI_VERSION ?= 0.87.1
-WEBUI_PORT ?= 8443
 HOST_WORK_DIR ?= .
 HOST_HOME_DIR ?= $(HOME)
 HOME_VOLUME ?= $(HOME)/devai-home
@@ -81,8 +80,8 @@ OLLAMA_IMAGE ?= localhost/devai-ollama:latest
 export OLLAMA_IMAGE
 # Exported for the same reason: the probers launch their own containers
 # on the host and must use the same CDI device string the compose
-# services do (written into .env by `make gpu-vendor`). Defaulted so an
-# install without .env still resolves.
+# services do (NVIDIA's CDI string unless .env overrides it). Defaulted so
+# an install without .env still resolves.
 DEVAI_GPU_DEVICE ?= nvidia.com/gpu=all
 export DEVAI_GPU_DEVICE
 CACHE_COMPOSE = $(CURDIR)/deploy/docker-compose.yaml
@@ -91,9 +90,8 @@ CACHE_COMPOSE = $(CURDIR)/deploy/docker-compose.yaml
 # explicitly because cache-up must name them one by one -- see the
 # router-managed-container note in that target. Keep in sync with
 # deploy/docker-compose.yaml; `make cache-services-check` asserts it.
-# mcp-gateway is deliberately absent: it sits behind the `mcp` profile.
 CACHE_SERVICES = apt-cache registry-cache ollama vllm vllm-devai laya-trainer sglang router \
-                 open-webui webui-proxy logger pipelock
+                 logger pipelock
 
 # The five the router recreates on demand. cache-up skips any of these
 # that already exist rather than colliding with the router's container.
@@ -156,7 +154,7 @@ PROXY_RUN_ENV = \
 # Egress-lock env for the interactive lab/shell targets: force ALL egress
 # through the pipelock MITM proxy; internal hosts (router, caches) bypass it.
 PIPELOCK_PROXY = http://devai-pipelock:8888
-PIPELOCK_NO_PROXY = devai-router,router,apt-cache,registry-cache,ollama,devai-mcp-gateway,mcp-gateway,localhost,127.0.0.1,::1
+PIPELOCK_NO_PROXY = devai-router,router,apt-cache,registry-cache,ollama,localhost,127.0.0.1,::1
 EGRESS_PROXY_ENV = \
 	-e HTTP_PROXY=$(PIPELOCK_PROXY) \
 	-e HTTPS_PROXY=$(PIPELOCK_PROXY) \
@@ -166,15 +164,10 @@ EGRESS_PROXY_ENV = \
 	-e no_proxy=$(PIPELOCK_NO_PROXY)
 
 
-# GPU build settings. Base image defaults on DEVAI_GPU_VENDOR (from .env,
-# via -include .env above; set by `make gpu-vendor VENDOR=amd`) -- an
-# explicit GPU_BASE_IMAGE in .env or the shell still wins either way
-# (?= only assigns when unset). See docs/gpu-vendors.md.
-ifeq ($(DEVAI_GPU_VENDOR),amd)
-GPU_BASE_IMAGE ?= docker.io/rocm/dev-ubuntu-24.04:6.4.3-complete
-else
+# GPU build settings. An explicit GPU_BASE_IMAGE in .env or the shell wins
+# (?= only assigns when unset). NVIDIA only: the AMD/ROCm branch moved to
+# attic/amd-rocm/ on 2026-10-07 (platform-rebuild Phase 1, M11).
 GPU_BASE_IMAGE ?= docker.io/nvidia/cuda:12.9.1-cudnn-runtime-ubuntu24.04
-endif
 
 # Mount host config files (gitconfig, ssh) to staging dir for entrypoint to copy
 HOME_MOUNT_ARG =
@@ -232,9 +225,8 @@ ifeq ($(findstring podman,$(CONTAINER_RUNTIME)),podman)
 endif
 
 # GPU runtime flags
-# DEVAI_GPU_DEVICE comes from .env (via -include .env above), written by
-# `make gpu-vendor VENDOR=amd` (devai-tools/cmd/devai-gpu-vendor). Defaults
-# to NVIDIA's CDI device string when unset -- see docs/gpu-vendors.md.
+# DEVAI_GPU_DEVICE (the CDI device string) may come from .env (via -include
+# .env above); it defaults to NVIDIA's when unset.
 GPU_FLAGS =
 ifeq ($(findstring podman,$(CONTAINER_RUNTIME)),podman)
 	GPU_FLAGS += --device $(or $(DEVAI_GPU_DEVICE),nvidia.com/gpu=all) --security-opt=label=disable
@@ -254,11 +246,8 @@ endif
 .PHONY: fetch-cli pull-images install install-systemd uninstall test test-router test-ollama test-agents test-models test-probe-vllm test-probe-sglang test-probe-ollama-idempotent test-vllm test-sglang test-e2e test-full help
 .PHONY: catalog-regen catalog-suggest catalog-discover catalog-discover-add probe probe-vllm probe-sglang probe-load-vllm probe-load-sglang probe-check probe-ornith-arch model-fit model-pull model-status model-sync vram-fit verify-backend-flags ollama-cleanup-ctx-variants
 .PHONY: bench bench-vllm bench-sglang bench-ollama bench-report bench-harvest test-bench-smoke
-.PHONY: secrets-tmpfs secrets-edit secrets-render secrets-rotate age-keygen-host test-python
-.PHONY: build-backup-tool build-gpu-vendor-tool build-mcp-modelstatus build-mcp-modelstatus-image build-devai-tools test-devai-tools
-.PHONY: gpu-vendor test-gpu-vendor
+.PHONY: test-python build-backup-tool build-devai-tools test-devai-tools
 .PHONY: backup-create backup-list backup-verify backup-restore test-backup-restore
-.PHONY: mcp-up mcp-down mcp-logs mcp-test mcp-health mcp-secrets-render test-mcp-modelstatus
 
 all: help
 
@@ -411,39 +400,6 @@ fetch-cli: ## Download all external binaries and packages to local cache (uses E
 			&& ln -sf ../lib/node_modules/@google/gemini-cli/bundle/gemini.js $(CACHE_DIR)/pip/bin/gemini/bin/gemini \
 			&& echo "$$LATEST" > $(ETAG_DIR)/gemini.version \
 			&& echo "Gemini CLI: updated to $$LATEST"; fi
-	@# sops + age (sops-age-secrets plan): static Go binaries from GitHub
-	@# releases. ETag-stamped per the existing CLI pattern. Both projects
-	@# publish single-arch binaries with a -linux-${arch}.tar.gz naming
-	@# convention; we curl the asset, verify it's non-empty, and unpack
-	@# into /var/cache/devai/pip/bin/.
-	@ARCH=$$(dpkg --print-architecture) \
-		&& case "$$ARCH" in amd64) SOPS_ARCH=amd64;; arm64) SOPS_ARCH=arm64;; esac \
-		&& SOPS_VERSION=$$(curl -fsSL https://api.github.com/repos/getsops/sops/releases/latest | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])") \
-		&& HTTP_CODE=$$(curl -fsSL -w '%{http_code}' -o $(CACHE_DIR)/pip/bin/sops.tmp \
-			--etag-compare $(ETAG_DIR)/sops.etag --etag-save $(ETAG_DIR)/sops.etag \
-			"https://github.com/getsops/sops/releases/latest/download/sops-$${SOPS_VERSION}.linux.$${SOPS_ARCH}") \
-		&& if [ "$$HTTP_CODE" = "304" ] || [ ! -s $(CACHE_DIR)/pip/bin/sops.tmp ]; then \
-			rm -f $(CACHE_DIR)/pip/bin/sops.tmp; STATE="up to date"; \
-		else \
-			mv $(CACHE_DIR)/pip/bin/sops.tmp $(CACHE_DIR)/pip/bin/sops \
-			&& chmod +x $(CACHE_DIR)/pip/bin/sops && STATE="updated"; fi \
-		&& VERSION=$$($(CACHE_DIR)/pip/bin/sops --version 2>&1 | awk '{print $$2; exit}' || echo "?") \
-		&& echo "sops: $$STATE ($$VERSION)"
-	@# age + age-keygen ship in one tarball.
-	@ARCH=$$(dpkg --print-architecture) \
-		&& case "$$ARCH" in amd64) AGE_ARCH=amd64;; arm64) AGE_ARCH=arm64;; esac \
-		&& AGE_VERSION=$$(curl -fsSL https://api.github.com/repos/FiloSottile/age/releases/latest | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])") \
-		&& HTTP_CODE=$$(curl -fsSL -w '%{http_code}' -o $(CACHE_DIR)/pip/bin/age.tar.gz \
-			--etag-compare $(ETAG_DIR)/age.etag --etag-save $(ETAG_DIR)/age.etag \
-			"https://github.com/FiloSottile/age/releases/latest/download/age-$${AGE_VERSION}-linux-$${AGE_ARCH}.tar.gz") \
-		&& if [ "$$HTTP_CODE" = "304" ] || [ ! -s $(CACHE_DIR)/pip/bin/age.tar.gz ]; then \
-			rm -f $(CACHE_DIR)/pip/bin/age.tar.gz; STATE="up to date"; \
-		else \
-			tar -xzf $(CACHE_DIR)/pip/bin/age.tar.gz -C $(CACHE_DIR)/pip/bin --strip-components=1 age/age age/age-keygen \
-			&& chmod +x $(CACHE_DIR)/pip/bin/age $(CACHE_DIR)/pip/bin/age-keygen \
-			&& rm -f $(CACHE_DIR)/pip/bin/age.tar.gz && STATE="updated"; fi \
-		&& VERSION=$$($(CACHE_DIR)/pip/bin/age --version 2>&1 | head -n1 || echo "?") \
-		&& echo "age: $$STATE ($$VERSION)"
 	@# aiagent (devitops-com/aiagent): a self-extracting makeself bundle (~63 MB)
 	@# that carries its own CPython 3.13, so the lab image needs no extra Python
 	@# or zstd to run it. ETag-stamped like the other CLIs, which keeps the lab
@@ -544,7 +500,6 @@ build-gpu: build-base-gpu fetch-cli ## Build the container image (GPU/CUDA)
 		$(CACHE_BUILD_ARGS) \
 		--build-arg BASE_IMAGE=$(BASE_IMAGE_NAME_GPU) \
 		--build-arg GPU_BUILD=true \
-		--build-arg GPU_VENDOR=$(or $(DEVAI_GPU_VENDOR),nvidia) \
 		--build-arg OLLAMA_HOST=$(OLLAMA_HOST) \
 		--build-arg OLLAMA_DEFAULT_MODEL=$(OLLAMA_DEFAULT_MODEL) \
 		-f deploy/Dockerfile.lab \
@@ -665,44 +620,8 @@ clean-router: ## Remove the router image
 prune: ## Clean up dangling images only (keeps tagged images and volumes)
 	$(CONTAINER_RUNTIME) image prune -f
 
-# sops/age secret-store scaffold (per docs/plans/sops-age-secrets.md).
-# A consumer wraps secrets-render with its own (input, output) pair and
-# gates cache-up on the result. mcp-gateway Tier 2 is the only live
-# consumer; the cluster-mode and SkyPilot-fleet consumers were frozen on
-# 2026-07-25 (see attic/README.md).
-SOPS_FILE ?=
-
-secrets-tmpfs: ## Mount /run/devai as a 4 MiB tmpfs (one-time per boot)
-	@# Idempotent. Sudo because tmpfs requires CAP_SYS_ADMIN.
-	sudo bash deploy/setup-secrets-tmpfs.sh
-
-secrets-edit: ## Edit a sops-encrypted file in place. Pass SOPS_FILE=deploy/<name>.sops.env
-	@if [ -z "$(SOPS_FILE)" ]; then \
-		echo "ERROR: pass SOPS_FILE=deploy/<name>.sops.env" >&2; exit 2; \
-	fi
-	sops "$(SOPS_FILE)"
-
-secrets-render: ## Generic single-file render: pass SOPS_FILE and DEST. Consumer plans wrap this with concrete pairs.
-	@if [ -z "$(SOPS_FILE)" ] || [ -z "$(DEST)" ]; then \
-		echo "ERROR: pass SOPS_FILE=deploy/<name>.sops.env DEST=/run/devai/<name>.env" >&2; \
-		echo "       Or use a consumer-plan target (e.g. 'make mcp-secrets-render')." >&2; \
-		exit 2; \
-	fi
-	bash scripts/render-secret.sh "$(SOPS_FILE)" "$(DEST)"
-
-secrets-rotate: ## Re-key every deploy/*.sops.env file against the current .sops.yaml recipient list
-	@for f in deploy/*.sops.env; do \
-		if [ -f "$$f" ]; then \
-			echo ">>> updating keys for $$f"; \
-			sops updatekeys -y "$$f"; \
-		fi; \
-	done
-
-age-keygen-host: ## Generate a per-host age keypair under ~/.config/sops/age/ and print the public key
-	bash scripts/age-keygen-host.sh
-
 # devai-tools (devai-tools/go.mod): first-party Go CLIs sibling to
-# gpu-arbiter -- devai-backup, devai-mcp-modelstatus, devai-gpu-vendor.
+# gpu-arbiter -- devai-backup.
 # Built/tested with the host's own Go toolchain (consolidated to the
 # current stable release across both modules -- see gpu-arbiter/go.mod),
 # not a pinned container: needs Go >= the go.mod floor on PATH.
@@ -710,35 +629,15 @@ age-keygen-host: ## Generate a per-host age keypair under ~/.config/sops/age/ an
 build-backup-tool: ## Build devai-tools/bin/devai-backup
 	cd devai-tools && mkdir -p bin && go build -o bin/devai-backup ./cmd/devai-backup
 
-build-mcp-modelstatus: ## Build devai-tools/bin/devai-mcp-modelstatus
-	cd devai-tools && mkdir -p bin && go build -o bin/devai-mcp-modelstatus ./cmd/devai-mcp-modelstatus
+build-devai-tools: build-backup-tool ## Build every devai-tools/ binary
 
-build-mcp-modelstatus-image: ## Build the devai-mcp-modelstatus container image (for the MCP gateway catalog)
-	$(CONTAINER_RUNTIME) build --network=host \
-		-f deploy/Dockerfile.mcp-modelstatus \
-		-t devai-mcp-modelstatus .
-
-build-gpu-vendor-tool: ## Build devai-tools/bin/devai-gpu-vendor
-	cd devai-tools && mkdir -p bin && go build -o bin/devai-gpu-vendor ./cmd/devai-gpu-vendor
-
-gpu-vendor: build-gpu-vendor-tool ## Switch GPU vendor in .env. VENDOR=nvidia|amd (required)
-	@if [ "$(VENDOR)" != "nvidia" ] && [ "$(VENDOR)" != "amd" ]; then \
-		echo "ERROR: pass VENDOR=nvidia or VENDOR=amd" >&2; exit 2; \
-	fi
-	devai-tools/bin/devai-gpu-vendor --env-file .env --vendor $(VENDOR)
-
-test-gpu-vendor: ## Verify the GPU-vendor overlay renders correctly both directions
-	bash tests/test-gpu-vendor.sh
-
-build-devai-tools: build-backup-tool build-mcp-modelstatus build-gpu-vendor-tool ## Build every devai-tools/ binary
-
-test-devai-tools: ## Run Go unit tests for devai-tools/ (backup, modelcache, routerclient, gpu-vendor)
+test-devai-tools: ## Run Go unit tests for devai-tools/ (backup)
 	cd devai-tools && go test -race -v -count=1 ./...
 
 # Backup/restore (devai-tools/cmd/devai-backup; see docs/backup-restore.md).
-# Snapshots probe/bench caches, ~/.devai/ preferences+sessions, and the
-# sops/age key. YES=1 mirrors the confirm-flag convention catalog-discover-add
-# already uses for a destructive default-off operation.
+# Snapshots probe/bench caches and ~/.devai/ preferences+sessions. YES=1
+# mirrors the confirm-flag convention catalog-discover-add already uses for
+# a destructive default-off operation.
 
 backup-create: build-backup-tool ## Snapshot host-local state. DEST=<dir> to override.
 	devai-tools/bin/devai-backup snapshot $(if $(DEST),--dest $(DEST))
@@ -757,51 +656,6 @@ backup-restore: build-backup-tool ## Restore from an archive. ARCHIVE=<path> YES
 
 test-backup-restore: test-devai-tools ## devai-tools Go tests + tests/test-backup-restore.sh
 	./tests/test-backup-restore.sh
-
-# MCP gateway (see docs/mcp.md, the source of truth). Third-party
-# servers resolve from Docker's official catalog; deploy/mcp-catalog-devai.yaml
-# adds only the first-party devai-model-status. Opt-in via the 'mcp'
-# compose profile -- cache-up does NOT start it. Two of the 15 enabled
-# servers (filesystem, arxiv-mcp-server) currently fail to start pending
-# config; the other 13 served 134 tools when last verified.
-mcp-up: ## Start the MCP gateway (15 servers; secrets optional)
-	$(COMPOSE) -f $(CACHE_COMPOSE) --profile mcp up -d mcp-gateway
-
-mcp-down: ## Stop the MCP gateway
-	$(COMPOSE) -f $(CACHE_COMPOSE) stop mcp-gateway || true
-	$(COMPOSE) -f $(CACHE_COMPOSE) rm -f mcp-gateway || true
-
-mcp-logs: ## Tail the MCP gateway log
-	$(CONTAINER_RUNTIME) logs -f devai-mcp-gateway
-
-mcp-test: ## Smoke-test the running MCP gateway (requires `make mcp-up`)
-	bash tests/test-mcp.sh
-
-test-mcp-modelstatus: ## End-to-end test of the devai-model-status MCP server against the live gateway
-	bash tests/test-mcp-modelstatus.sh
-
-mcp-health: ## Lightweight /health probe against the running MCP gateway
-	bash scripts/mcp-health.sh
-
-mcp-secrets-render: secrets-tmpfs ## Render deploy/mcp-secrets.sops.env to /run/devai/mcp-secrets.env
-	@# Phase 2 wrapper around the shared scripts/render-secret.sh.
-	@# Operator must have:
-	@#   1. ran `make age-keygen-host` once (ships under sops-age plan)
-	@#   2. added the printed public key to .sops.yaml
-	@#   3. encrypted real values into deploy/mcp-secrets.sops.env via
-	@#      `cp .../mcp-secrets.sops.env.example /tmp/mcp.env`,
-	@#      `sops --encrypt /tmp/mcp.env > deploy/mcp-secrets.sops.env`,
-	@#      `shred -u /tmp/mcp.env`
-	@if [ ! -f deploy/mcp-secrets.sops.env ]; then \
-		echo "ERROR: deploy/mcp-secrets.sops.env not present." >&2; \
-		echo "       See deploy/mcp-secrets.sops.env.example for the" >&2; \
-		echo "       expected variable names. Encrypt your file with" >&2; \
-		echo "       sops, then re-run this target." >&2; \
-		exit 1; \
-	fi
-	bash scripts/render-secret.sh \
-	     deploy/mcp-secrets.sops.env \
-	     /run/devai/mcp-secrets.env
 
 # pipelock egress proxy (per docs/pipelock.md). Always-on infra service (no
 # profile) brought up by `make cache-up`, which mounts the host CA key.
@@ -921,7 +775,7 @@ test-agents: ## Smoke-test every (agent × backend) cell against the live router
 		$(IMAGE_NAME_GPU) /usr/local/bin/agent-matrix
 	@echo "  logs preserved at $(CURDIR)/tests/.matrix-logs/"
 
-test: test-router test-devai-tools test-python test-backup-restore test-gpu-vendor test-probe-ollama-idempotent test-ollama test-e2e test-vllm test-sglang test-models ## Run every available test in sequence (Go unit + Python unit + Ollama + E2E + vLLM/SGLang integration + matrix + probes; ~30-60 min)
+test: test-router test-devai-tools test-python test-backup-restore test-probe-ollama-idempotent test-ollama test-e2e test-vllm test-sglang test-models ## Run every available test in sequence (Go unit + Python unit + Ollama + E2E + vLLM/SGLang integration + matrix + probes; ~30-60 min)
 	@# The cache-up suite runs as prerequisites above. Probe smoke tests
 	@# require the live backends to be DOWN (the prober self-checks for
 	@# router/vllm/sglang containers and aborts otherwise) — they run
@@ -930,8 +784,7 @@ test: test-router test-devai-tools test-python test-backup-restore test-gpu-vend
 	@# captured and re-emitted after `cache-up` so we never leave the
 	@# stack down.
 	@#
-	@# rc=77 is the repo-wide "skipped, precondition absent" convention, the
-	@# same one tests/test-mcp.sh and tests/test-gpu-vendor.sh use. Both probe
+	@# rc=77 is the repo-wide "skipped, precondition absent" convention. Both probe
 	@# smoke tests exit 77 when the model they would probe has no weights on
 	@# disk -- a host data condition, not a failure. Anything else is real.
 	@set -u; \
@@ -984,10 +837,10 @@ help: ## Show this help message
 	@printf "\n"
 
 # =============================================================================
-# Infrastructure services (caches + Ollama + vLLM + Open WebUI)
+# Infrastructure services (caches + Ollama + vLLM + router)
 # =============================================================================
 
-cache-up: ## Start all infrastructure (caches + Ollama + router + Open WebUI; vLLM/SGLang as `sleep` placeholders, recreated on demand)
+cache-up: ## Start all infrastructure (caches + Ollama + router; vLLM/SGLang as `sleep` placeholders, recreated on demand)
 	@# nvidia_uvm and nvidia_uvm_tools are not pulled in by the display
 	@# stack at boot — only by the first CUDA process. The CDI spec
 	@# references /dev/nvidia-uvm and /dev/nvidia-uvm-tools, so without
@@ -1054,7 +907,6 @@ cache-up: ## Start all infrastructure (caches + Ollama + router + Open WebUI; vL
 	@echo "  Ollama:            devai-ollama:11434 (GGUF models)"
 	@echo "  vLLM/SGLang:       devai-router:11435 / 11436 (recreated on first request — see docs/backends.md)"
 	@echo "  laya trainer:      devai-router:11438 (job runner, recreated on the first job -- see docs/laya-trainer.md)"
-	@echo "  Open WebUI:        https://localhost:$(WEBUI_PORT)"
 	@echo "  Logger:            $(CACHE_DIR)/logs/<container>.log (per-service stdout)"
 	@echo ""
 	@echo "To pull and probe models:  make model-pull [FAMILY=qwen3.5] && make probe"
@@ -1945,7 +1797,6 @@ install-systemd: ## Install and enable systemd service for infrastructure
 	ln -sfn $(CURDIR)/deploy/.vllm-reasoning-cache.json    $(HOME)/.config/devai/.vllm-reasoning-cache.json
 	ln -sfn $(CURDIR)/deploy/.sglang-reasoning-cache.json  $(HOME)/.config/devai/.sglang-reasoning-cache.json
 	ln -sfn $(CURDIR)/deploy/.vllm-devai-reasoning-cache.json  $(HOME)/.config/devai/.vllm-devai-reasoning-cache.json
-	ln -sfn $(CURDIR)/deploy/webui-proxy                   $(HOME)/.config/devai/webui-proxy
 	cp deploy/systemd/devai-infra.service $(HOME)/.config/systemd/user/
 	systemctl --user daemon-reload
 	systemctl --user enable --now podman.socket
@@ -1966,7 +1817,6 @@ uninstall-systemd: ## Stop, disable and remove the systemd infrastructure unit
 	rm -f $(HOME)/.config/devai/.vllm-reasoning-cache.json
 	rm -f $(HOME)/.config/devai/.sglang-reasoning-cache.json
 	rm -f $(HOME)/.config/devai/.vllm-devai-reasoning-cache.json
-	rm -f $(HOME)/.config/devai/webui-proxy
 	rmdir $(HOME)/.config/devai 2>/dev/null || true
 	systemctl --user daemon-reload
 	@echo "Removed devai-infra.service and $(HOME)/.config/devai/"

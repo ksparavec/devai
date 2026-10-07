@@ -43,7 +43,7 @@ be set in the environment or `.env` **before** the agent starts.
 |-----|----------|-----------------|
 | D1  | Hypervisor = libvirt + QEMU/KVM. No Hyper-V, VMware, VirtualBox, Proxmox CLI. | `HOST_VFIO_SETUP.md` documents only this stack. |
 | D2  | Guest OS = Debian 13 (Trixie) generic cloud image, x86_64. | Project reference platform; every `apt-get`, NVIDIA-driver path, and `docker-compose` step in section 4 targets Trixie directly. |
-| D3  | Two VM disks: `vda` qcow2, 50 GiB (root, expanded in place from the Debian cloud image's ~3 GiB ext4 partition) and `vdb` qcow2, 200 GiB (raw block device used as the single `vgais` LVM PV -- no partition table on `vdb`). | The cloud image is UEFI-first and trying to split a single 250 GiB `vda` into `vda1`=50G + `vda2`=200G has two failure modes that bit us during development: (a) Debian's `cloud-initramfs-growroot` runs from initramfs before cloud-init can honour `growpart.mode` and unconditionally extends the root partition to fill the disk; (b) any in-VM `runcmd` that tries to shrink the mounted ext4 back to 50 GiB fails because `resize2fs` cannot shrink a mounted live root. Splitting storage at the libvirt-disk boundary sidesteps both issues entirely. `vdb` carries the LVM thin pool (`cachepool` + the seven `cache_*` LVs from section 6) and stays a separate qcow2 so the operator can re-create or snapshot the cache substrate independently of the root. |
+| D3  | Two VM disks: `vda` qcow2, 50 GiB (root, expanded in place from the Debian cloud image's ~3 GiB ext4 partition) and `vdb` qcow2, 200 GiB (raw block device used as the single `vgais` LVM PV -- no partition table on `vdb`). | The cloud image is UEFI-first and trying to split a single 250 GiB `vda` into `vda1`=50G + `vda2`=200G has two failure modes that bit us during development: (a) Debian's `cloud-initramfs-growroot` runs from initramfs before cloud-init can honour `growpart.mode` and unconditionally extends the root partition to fill the disk; (b) any in-VM `runcmd` that tries to shrink the mounted ext4 back to 50 GiB fails because `resize2fs` cannot shrink a mounted live root. Splitting storage at the libvirt-disk boundary sidesteps both issues entirely. `vdb` carries the LVM thin pool (`cachepool` + the six `cache_*` LVs from section 6) and stays a separate qcow2 so the operator can re-create or snapshot the cache substrate independently of the root. |
 | D4  | VM resources: 4 vCPUs, 16 GiB RAM. | Minimum that completes `make build` + vLLM/SGLang cold-start without OOM on a 24 GiB-class GPU while leaving host headroom for the desktop / hypervisor. |
 | D5  | VM name = `devai-vm`. | Single canonical name. If a VM of that name already exists, the agent refuses to clobber it without an explicit `DEVAI_VM_RECREATE=1`. |
 | D6  | Network = libvirt `default` NAT. SSH to the VM uses the NAT lease. | Per `HOST_VFIO_SETUP.md` section 7. No bridges, no macvtap. |
@@ -702,9 +702,9 @@ Why these specific packages:
   auto-activation at boot. Without it, the `cache_*` LVs come up
   inactive and every `/var/cache/devai/*` mount fails silently
   (see section 6.7 `nofail` requirement).
-- `mkcert` is optional for browser-trusted certs; the agent only
-  uses it as a fallback if `openssl req` fails (it shouldn't, since
-  the package is present).
+- `mkcert` is optional: it makes browser-trusted certificates, which
+  JupyterLab picks up from `~/devai-home/.jupyter/ssl/`. No step in this
+  procedure needs it.
 
 ### 4.2 Install Go-based `docker-compose` v2 (D13)
 
@@ -902,7 +902,7 @@ already ran.
 ## 6. Provision storage on `/dev/vdb`
 
 The 200 GiB whole-disk `vdb` (no partition table -- D3) becomes
-`vgais`, holding one ~200 GiB thin pool and seven thin LVs (section 6.1).
+`vgais`, holding one ~200 GiB thin pool and six thin LVs (section 6.1).
 
 ### 6.1 Target layout
 
@@ -913,12 +913,18 @@ The 200 GiB whole-disk `vdb` (no partition table -- D3) becomes
 | `cache_pip` | 30G | `/var/cache/devai/pip` | xfs | `devai` |
 | `cache_apt` | 10G | `/var/cache/devai/apt` | xfs | `devai` |
 | `cache_npm` | 10G | `/var/cache/devai/npm` | xfs | `devai` |
-| `cache_open_webui` | 5G | `/var/cache/devai/open-webui` | xfs | `devai` |
 | `cache_logs` | 100G | `/var/cache/devai/logs` | xfs | `devai` |
 
-Sum of virtual sizes ~ 555 GiB. The thin pool is **exactly 200 GiB**,
+Sum of virtual sizes ~ 550 GiB. The thin pool is **exactly 200 GiB**,
 intentionally over-committed; thin provisioning charges only written
 extents.
+
+Hosts installed before 2026-10-07 also have a seventh LV,
+`cache_open_webui` (5G, `/var/cache/devai/open-webui`), which held Open
+WebUI's data. Open WebUI was removed that day (platform-rebuild Phase 1,
+M9; browser chat is the dsh web UI), so new installs do not create it; on
+an existing host the LV, its data and its fstab line are left for the
+operator to remove.
 
 ### 6.2 Volume group
 
@@ -961,7 +967,6 @@ The pool is thin-provisioned and intentionally over-committed by section 6.1.
         "cache_pip:30G" \
         "cache_apt:10G" \
         "cache_npm:10G" \
-        "cache_open_webui:5G" \
         "cache_logs:100G"; do
             lv="${spec%%:*}"; size="${spec##*:}"
             if ! lvs "vgais/${lv}" >/dev/null 2>&1; then
@@ -973,7 +978,7 @@ The pool is thin-provisioned and intentionally over-committed by section 6.1.
 ### 6.5 Filesystems
 
 ```bash
-[vm] # for lv in cache_ollama cache_registry cache_pip cache_apt cache_npm cache_open_webui cache_logs; do
+[vm] # for lv in cache_ollama cache_registry cache_pip cache_apt cache_npm cache_logs; do
             dev="/dev/vgais/${lv}"
             blkid -p "${dev}" >/dev/null 2>&1 && continue
             mkfs.xfs -q "${dev}"
@@ -983,8 +988,8 @@ The pool is thin-provisioned and intentionally over-committed by section 6.1.
 ### 6.6 Mounts and fstab
 
 ```bash
-[vm] # mkdir -p /var/cache/devai/{ollama,registry,pip,apt,npm,open-webui,logs}
-[vm] # for lv in cache_ollama cache_registry cache_pip cache_apt cache_npm cache_open_webui cache_logs; do
+[vm] # mkdir -p /var/cache/devai/{ollama,registry,pip,apt,npm,logs}
+[vm] # for lv in cache_ollama cache_registry cache_pip cache_apt cache_npm cache_logs; do
             dev="/dev/vgais/${lv}"
             uuid="$(blkid -s UUID -o value "${dev}")"
             case "${lv}" in
@@ -993,7 +998,6 @@ The pool is thin-provisioned and intentionally over-committed by section 6.1.
                 cache_pip)        mp="/var/cache/devai/pip" ;;
                 cache_apt)        mp="/var/cache/devai/apt" ;;
                 cache_npm)        mp="/var/cache/devai/npm" ;;
-                cache_open_webui) mp="/var/cache/devai/open-webui" ;;
                 cache_logs)       mp="/var/cache/devai/logs" ;;
             esac
             findmnt -no SOURCE --mountpoint "${mp}" 2>/dev/null | grep -q "${dev}$" && continue
@@ -1102,8 +1106,7 @@ ubuntu24.04`, `docker.io/library/golang:1.23-bookworm`,
 `registry:2`, `ollama/ollama:latest`,
 `docker.io/vllm/vllm-openai:latest-cu130-ubuntu2404`,
 `docker.io/lmsysorg/sglang:v0.5.10.post1-cu130`,
-`ghcr.io/open-webui/open-webui:main`,
-`docker.io/library/nginx:alpine`, `quay.io/podman/stable`.
+`quay.io/podman/stable`.
 
 If any pull fails, the agent halts. Re-running `make pull-images` is
 idempotent (digest match -> no-op).
@@ -1130,7 +1133,7 @@ Section 9 is offline.
 
 ```bash
 [vm] [verify] $ podman images --format '{{.Repository}}:{{.Tag}}' \
-                | grep -E '(debian|nvidia/cuda|golang|distroless|apt-cacher|registry|ollama|vllm|sglang|open-webui|nginx|podman/stable)' \
+                | grep -E '(debian|nvidia/cuda|golang|distroless|apt-cacher|registry|ollama|vllm|sglang|podman/stable)' \
                 | sort -u
 [vm] [verify] $ ls -1 /var/cache/devai/pip/bin/ \
                 | grep -E '^(claude|codex|ollama|code-server|uv|uvx|gemini)$'
@@ -1179,27 +1182,7 @@ Expected: five entries.
 
 ## 10. Start infrastructure
 
-### 10.1 TLS certificates for `devai-webui-proxy`
-
-`nginx:alpine` has no `openssl` binary, so the entrypoint's
-"self-signed fallback" silently fails (the `openssl req` call exits
-with "command not found", swallowed by `2>/dev/null`). nginx then
-loops on "cannot load certificate" and the container restarts
-forever. Pre-generate certs **on the VM filesystem** so the
-entrypoint takes the "found existing" branch:
-
-```bash
-[vm] $ SSL_DIR=${HOME}/devai-home/.jupyter/ssl
-[vm] $ mkdir -p "${SSL_DIR}"
-[vm] $ test -f "${SSL_DIR}/cert.pem" || openssl req -x509 -nodes -days 365 \
-            -newkey rsa:2048 \
-            -keyout "${SSL_DIR}/key.pem" -out "${SSL_DIR}/cert.pem" \
-            -subj "/CN=devai-webui"
-[vm] $ chmod 600 "${SSL_DIR}/key.pem"
-[vm] [verify] $ ls "${SSL_DIR}"/cert.pem "${SSL_DIR}"/key.pem
-```
-
-### 10.2 Bring the stack up
+### 10.1 Bring the stack up
 
 ```bash
 [vm] $ make cache-up
@@ -1212,25 +1195,23 @@ This:
 - Runs `podman compose -f deploy/docker-compose.yaml up -d` (via
   `docker-compose` v2 -- D13), starting `devai-apt-cache`,
   `devai-registry-cache`, `devai-ollama`, `devai-vllm` (placeholder),
-  `devai-sglang` (placeholder), `devai-router`, `devai-open-webui`,
-  `devai-webui-proxy`, `devai-logger`.
+  `devai-sglang` (placeholder), `devai-router`, `devai-logger`.
 
 `devai-vllm` and `devai-sglang` launch with `entrypoint: ["sleep",
 "infinity"]` and do not serve traffic; the router replaces each
 container on demand when a request first hits ports 11435/11436.
 
-### 10.3 Verification
+### 10.2 Verification
 
 ```bash
 [vm] [verify] $ podman ps --format '{{.Names}}\t{{.Status}}' | grep -E '^devai-' | sort
 [vm] [verify] $ curl -fsS http://localhost:11434/v1/models
-[vm] [verify] $ curl -k -fsS https://localhost:8443/
 ```
 
 The probe-cache files in `deploy/.*-reasoning-cache.json` may not
 exist on first `cache-up` -- that's fine, section 11 populates them.
 
-### 10.4 Recovery
+### 10.3 Recovery
 
 | Symptom | Recovery |
 |---|---|
@@ -1615,7 +1596,6 @@ all up.
 [vm] [verify] $ curl -fsS http://localhost:11434/api/chat \
                   -H 'content-type: application/json' \
                   -d '{"model":"qwen3.5:9b-q8_0","messages":[{"role":"user","content":"reply with the single word PONG"}],"stream":false}'
-[vm] [verify] $ curl -k -fsS https://localhost:8443/      | head -c 200
 [vm] [verify] $ curl -fsS http://localhost:8888/ -o /dev/null && echo lab_up
 ```
 
@@ -1624,7 +1604,7 @@ keyword sweep and judge pass each printing PASS) means the agent has
 finished correctly.
 
 For a manual external test from the host: `ssh -L
-8888:localhost:8888 -L 11434:localhost:11434 -L 8443:localhost:8443
+8888:localhost:8888 -L 11434:localhost:11434
 -i ~/.ssh/devai-vm devai@${VM_IP}` then hit
 `http://localhost:8888/` etc. from a browser on the host.
 
@@ -1649,7 +1629,6 @@ validation.
 |       +-- blobs/         (Ollama GGUF + manifests)
 |       +-- manifests/
 |       +-- vllm/          (HF safetensors per repo dir)
-+-- open-webui/      <- cache_open_webui
 +-- logs/            <- cache_logs
 
 ${REPO_DIR}/
@@ -1684,7 +1663,6 @@ The VM lives on `192.168.122.0/24` (libvirt `default` NAT) at
 host[clients] -- NAT -- vm[${VM_IP}]:11434 -> devai-router:11434 -> devai-ollama:11434
                                        :11435 -> devai-router:11435 -> devai-vllm:11434
                                        :11436 -> devai-router:11436 -> devai-sglang:11434
-                                       :8443  -> devai-webui-proxy:443 -> devai-open-webui:8080 -> devai-router:11434
                                        :8888  -> devai-lab-gpu:8888
 ```
 
@@ -1708,7 +1686,6 @@ only the router ports (`11434/11435/11436`).
 | `/var/cache/devai/apt/` / `pip/` / `npm/` | regenerable build caches | yes (forces full rebuild) |
 | `/var/cache/devai/ollama/models/blobs/` | downloaded GGUFs | costly to re-pull |
 | `/var/cache/devai/vllm/` and `/var/cache/devai/sglang/` | downloaded NVFP4 weights | costly to re-pull |
-| `/var/cache/devai/open-webui/` | chat history & users | preserve unless intentional reset |
 | `/var/cache/devai/logs/` | container stdout logs | yes |
 | `${REPO_DIR}/deploy/.*-reasoning-cache.json` | probe results | yes (next probe regenerates) |
 | `${REPO_DIR}/deploy/.bench-cache.json` | bench scores | yes |

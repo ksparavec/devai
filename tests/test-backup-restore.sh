@@ -2,10 +2,10 @@
 # End-to-end smoke test for devai-backup (docs/backup-restore.md).
 #
 # Builds the real binary and drives it as a subprocess against temp
-# directories standing in for deploy/, ~/.devai/, and ~/.config/sops/age/
-# (via --repo-root/--home-dir overrides), so the real $HOME is never
-# touched. Runs snapshot -> list -> verify -> delete originals ->
-# restore --yes -> diff.
+# directories standing in for deploy/ and ~/.devai/ (via
+# --repo-root/--home-dir overrides), so the real $HOME is never touched.
+# Runs snapshot -> list -> verify -> delete originals -> restore --yes ->
+# diff.
 #
 # No exit-77 skip -- the binary is always buildable locally, no external
 # prerequisite (unlike the GPU-backed probe/bench tests).
@@ -25,17 +25,15 @@ FAKE_HOME="${WORKDIR}/home"
 BACKUP_DIR="${WORKDIR}/backups"
 
 echo ">>> test-backup-restore: building devai-backup"
-if [[ ! -x "${BIN}" ]]; then
-    (cd "${REPO_ROOT}/devai-tools" && go build -o bin/devai-backup ./cmd/devai-backup)
-fi
+# Always rebuild (go build is incremental): a binary left in bin/ from an
+# older tree would test that tree, not this one.
+(cd "${REPO_ROOT}/devai-tools" && go build -o bin/devai-backup ./cmd/devai-backup)
 
 echo ">>> seeding fake repo + home state"
-mkdir -p "${FAKE_REPO}/deploy" "${FAKE_HOME}/.devai/sessions" "${FAKE_HOME}/.config/sops/age"
+mkdir -p "${FAKE_REPO}/deploy" "${FAKE_HOME}/.devai/sessions"
 echo '{"bench":"fixture"}' > "${FAKE_REPO}/deploy/.bench-cache.json"
 echo 'vram: 24' > "${FAKE_HOME}/.devai/preferences.yaml"
 echo '{"turn":1}' > "${FAKE_HOME}/.devai/sessions/claude.jsonl"
-echo 'AGE-SECRET-KEY-1FIXTUREFIXTUREFIXTURE' > "${FAKE_HOME}/.config/sops/age/keys.txt"
-chmod 600 "${FAKE_HOME}/.config/sops/age/keys.txt"
 
 echo ">>> snapshot"
 ARCHIVE="$("${BIN}" snapshot --repo-root "${FAKE_REPO}" --home-dir "${FAKE_HOME}" --dest "${BACKUP_DIR}")"
@@ -61,11 +59,6 @@ echo ">>> diffing restored content"
     || { echo "FAIL: preferences content mismatch after restore" >&2; exit 1; }
 [[ "$(cat "${FAKE_HOME}/.devai/sessions/claude.jsonl")" == '{"turn":1}' ]] \
     || { echo "FAIL: session content mismatch after restore" >&2; exit 1; }
-[[ "$(cat "${FAKE_HOME}/.config/sops/age/keys.txt")" == 'AGE-SECRET-KEY-1FIXTUREFIXTUREFIXTURE' ]] \
-    || { echo "FAIL: age key content mismatch after restore" >&2; exit 1; }
-
-MODE="$(stat -c '%a' "${FAKE_HOME}/.config/sops/age/keys.txt" 2>/dev/null || stat -f '%Lp' "${FAKE_HOME}/.config/sops/age/keys.txt")"
-[[ "${MODE}" == "600" ]] || { echo "FAIL: age key mode = ${MODE}, want 600" >&2; exit 1; }
 
 echo ">>> test-backup-restore OK"
 exit 0

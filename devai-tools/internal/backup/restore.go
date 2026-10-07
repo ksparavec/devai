@@ -16,22 +16,40 @@ type plannedEntry struct {
 	data   []byte
 }
 
+// skippedEntry is an archive member under a retired root: reported, never
+// written.
+type skippedEntry struct {
+	name    string // archive member name
+	root    string // its retired top-level segment
+	seeAlso string // where that root's content lives now
+}
+
+// warnOut receives Restore's skip warnings. A variable so tests can capture
+// them; os.Stderr otherwise.
+var warnOut io.Writer = os.Stderr
+
 // Restore extracts archivePath into repoRoot/homeDir, the inverse of
 // Manifest via ArchiveRoots. It validates every entry before touching
 // anything (Verify, then a second structural pass), then for each target
 // that already exists renames it aside to "<path>.before-restore-<ts>"
 // instead of deleting it, so a partial archive never destroys unrelated
-// files. Finally it re-asserts 0600 on the age key as defense-in-depth.
-// Callers gate this behind an explicit confirmation flag; Restore itself
-// does not prompt.
+// files. Members under a retired archive root (retiredArchiveRoots, e.g.
+// the sops/age key older snapshots carry) are skipped with a warning on
+// stderr, never written. Callers gate this behind an explicit confirmation
+// flag; Restore itself does not prompt.
 func Restore(archivePath, repoRoot, homeDir, timestamp string) error {
 	if err := Verify(archivePath); err != nil {
 		return fmt.Errorf("archive failed validation, aborting before any writes: %w", err)
 	}
 
-	planned, err := planEntries(archivePath, ArchiveRoots(repoRoot, homeDir))
+	planned, skipped, err := planEntries(archivePath, ArchiveRoots(repoRoot, homeDir))
 	if err != nil {
 		return fmt.Errorf("archive failed validation, aborting before any writes: %w", err)
+	}
+	for _, s := range skipped {
+		_, _ = fmt.Fprintf(warnOut,
+			"WARNING: skipping %s: archive root %q is retired and nothing restores it any more (see %s)\n",
+			s.name, s.root, s.seeAlso)
 	}
 
 	for _, p := range planned {
@@ -52,39 +70,35 @@ func Restore(archivePath, repoRoot, homeDir, timestamp string) error {
 		}
 	}
 
-	ageKeyPath := filepath.Join(homeDir, ".config", "sops", "age", "keys.txt")
-	if _, err := os.Stat(ageKeyPath); err == nil {
-		_ = os.Chmod(ageKeyPath, 0o600)
-	}
-
 	return nil
 }
 
-func planEntries(archivePath string, roots map[string]string) ([]plannedEntry, error) {
+func planEntries(archivePath string, roots map[string]string) ([]plannedEntry, []skippedEntry, error) {
 	f, err := os.Open(archivePath)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer func() { _ = f.Close() }()
 
 	gz, err := gzip.NewReader(f)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer func() { _ = gz.Close() }()
 
 	tr := tar.NewReader(gz)
 	var planned []plannedEntry
+	var skipped []skippedEntry
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if err := ValidateHeader(hdr); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		// Belt-and-suspenders on top of ValidateHeader/ValidateName: reject
 		// any entry name containing ".." right before it's used to build a
@@ -92,15 +106,22 @@ func planEntries(archivePath string, roots map[string]string) ([]plannedEntry, e
 		// that reaches resolveTarget below rather than only inside a
 		// helper several calls away.
 		if strings.Contains(hdr.Name, "..") {
-			return nil, fmt.Errorf("rejected: path traversal %q", hdr.Name)
+			return nil, nil, fmt.Errorf("rejected: path traversal %q", hdr.Name)
+		}
+		// Only AFTER the traversal guard: a retired root must never become
+		// a way to slip a hostile name past it ("sops-age/../evil" is still
+		// rejected above, not skipped here).
+		if root := strings.SplitN(filepath.ToSlash(hdr.Name), "/", 2)[0]; retiredArchiveRoots[root] != "" {
+			skipped = append(skipped, skippedEntry{name: hdr.Name, root: root, seeAlso: retiredArchiveRoots[root]})
+			continue
 		}
 		target, err := resolveTarget(roots, hdr.Name)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		data, err := io.ReadAll(tr)
 		if err != nil {
-			return nil, fmt.Errorf("read entry %s: %w", hdr.Name, err)
+			return nil, nil, fmt.Errorf("read entry %s: %w", hdr.Name, err)
 		}
 		mode := os.FileMode(hdr.Mode)
 		if mode == 0 {
@@ -108,7 +129,7 @@ func planEntries(archivePath string, roots map[string]string) ([]plannedEntry, e
 		}
 		planned = append(planned, plannedEntry{target: target, mode: mode, data: data})
 	}
-	return planned, nil
+	return planned, skipped, nil
 }
 
 func resolveTarget(roots map[string]string, name string) (string, error) {

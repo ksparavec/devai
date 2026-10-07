@@ -1665,9 +1665,10 @@ func TestBuildContainerSpecImageOverride(t *testing.T) {
 	}
 }
 
-// TestBuildContainerSpecGPUDevice locks the GPU-vendor overlay contract
-// (docs/gpu-vendors.md): DEVAI_GPU_DEVICE overrides the CDI device string,
-// defaulting to NVIDIA's when unset so an nvidia-only host needs no config.
+// TestBuildContainerSpecGPUDevice locks the CDI device contract:
+// DEVAI_GPU_DEVICE overrides the CDI device string, defaulting to NVIDIA's
+// when unset so a host needs no config. (Its AMD case went with the ROCm
+// overlay to attic/amd-rocm/ on 2026-10-07, platform-rebuild Phase 1.)
 func TestBuildContainerSpecGPUDevice(t *testing.T) {
 	cfg := backendConfig{
 		Name:          "vllm",
@@ -1690,11 +1691,11 @@ func TestBuildContainerSpecGPUDevice(t *testing.T) {
 	})
 
 	t.Run("DEVAI_GPU_DEVICE overrides", func(t *testing.T) {
-		t.Setenv("DEVAI_GPU_DEVICE", "amd.com/gpu=all")
+		t.Setenv("DEVAI_GPU_DEVICE", "nvidia.com/gpu=0")
 		spec := buildContainerSpec(cfg, "m", launchConfig{}, nil, nil)
 		devices := spec["devices"].([]map[string]any)
-		if got := devices[0]["path"]; got != "amd.com/gpu=all" {
-			t.Errorf("devices[0][path] = %v, want amd.com/gpu=all", got)
+		if got := devices[0]["path"]; got != "nvidia.com/gpu=0" {
+			t.Errorf("devices[0][path] = %v, want nvidia.com/gpu=0", got)
 		}
 	})
 }

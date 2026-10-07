@@ -1,7 +1,7 @@
 # DevAI Router (`gpu-arbiter`)
 
 The router is the central component of the DevAI stack. Every model
-request from agents (Claude Code, Codex, OpenCode, Pi, DeepSeek Harness, Open WebUI, raw curl)
+request from agents (Claude Code, Codex, OpenCode, Pi, DeepSeek Harness, raw curl)
 goes through it. The router is responsible for: which backend serves a
 model, which model is currently loaded in that backend, what context
 length and parser flags the backend was launched with, and how every
@@ -69,7 +69,7 @@ This document covers single mode, which is all of it.
 | (Claude Code,|                         |                              |
 |  OpenCode,   |  POST /v1/...           |  port 11434  -->  ollama     |
 |  Codex, Pi,  | ------------------>     |  port 11435  -->  vllm       |
-|  Open WebUI, |                         |  port 11436  -->  sglang     |
+|  dsh,        |                         |  port 11436  -->  sglang     |
 |  curl, ...)  |                         |                              |
 +--------------+                         |  GPU mutex * request rewrite |
                                          |  container lifecycle         |
@@ -130,8 +130,10 @@ when they were parked.
 | 11438 | laya-trainer | recreated on the first job | a job runner, not an engine: laya fine-tuning jobs (see [Job runners](#job-runners-the-laya-trainer)) |
 
 The router is internal to `devai-net`. It is **not** published to the
-host. Reach it from sibling containers (`devai-open-webui`,
-`devai-lab-*`) or from your own container with `--network devai-net`.
+host. Reach it from the lab (`devai-lab-*`, on `devai-lab-egress`, where
+the router is dual-homed) or from your own container with
+`--network devai-net` -- the live test scripts start a throwaway one
+(`tests/lib/devai-net-client.sh`).
 
 ---
 

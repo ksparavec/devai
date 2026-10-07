@@ -7,9 +7,6 @@ ARG HTTP_PROXY
 ARG HTTPS_PROXY
 ARG NO_PROXY
 ARG GPU_BUILD=false
-# Separate from GPU_BUILD ("is this a GPU build at all"): which vendor's
-# wheel index to use when it is. See docs/gpu-vendors.md.
-ARG GPU_VENDOR=nvidia
 ARG OLLAMA_HOST=http://devai-router:11434
 ARG OLLAMA_DEFAULT_MODEL=qwen3.5:9b
 
@@ -138,13 +135,11 @@ RUN cp -a /var/cache/bin/gemini/lib/node_modules/@google /usr/local/lib/node_mod
 # `uv pip check` then fails the build on any unmet requirement.
 # Host cache dirs are bind-mounted via -v at build time (see Makefile).
 # tests/python/test_lab_python_and_torch.py.
-# ROCm: the rocm6.4 index carries no cp314 torch at all (checked 2026-09-27;
-# rocm7.2 has 2.14.0), so the amd path cannot build on Python 3.14 as is.
+# NVIDIA only: the ROCm branch of this step moved to attic/amd-rocm/ on
+# 2026-10-07 (platform-rebuild Phase 1, M11).
 
 COPY requirements-torch.txt requirements-lab.lock /tmp/
-RUN if [ "$GPU_BUILD" = "true" ] && [ "$GPU_VENDOR" = "amd" ]; then \
-        TORCH_INDEX="--index-url https://download.pytorch.org/whl/rocm6.4"; \
-    elif [ "$GPU_BUILD" = "true" ]; then \
+RUN if [ "$GPU_BUILD" = "true" ]; then \
         TORCH_INDEX=""; \
     else \
         TORCH_INDEX="--index-url https://download.pytorch.org/whl/cpu"; \

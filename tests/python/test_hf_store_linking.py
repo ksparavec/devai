@@ -249,9 +249,9 @@ class RouterEnvKnobsAreForwardedTest(unittest.TestCase):
     """A knob the router reads but compose does not forward is inert --
     and silently so, which is the worst shape for a documented setting.
 
-    The repo already carries one instance of this class of bug (the
-    router container is never handed DEVAI_GPU_DEVICE, per
-    docs/gpu-vendors.md), so it is worth a test rather than a habit.
+    The repo already carried one instance of this class of bug (the
+    router container was never handed DEVAI_GPU_DEVICE, fixed 2026-07-27),
+    so it is worth a test rather than a habit.
     """
 
     def _router_env(self) -> list[str]:
@@ -282,8 +282,8 @@ class RouterEnvKnobsAreForwardedTest(unittest.TestCase):
     def test_gpu_device_reaches_the_router(self):
         """vLLM and SGLang start as `sleep infinity` placeholders and are
         ALWAYS recreated by the router, so this variable not reaching the
-        router meant the amd overlay never reached the two services it
-        matters most for."""
+        router meant a DEVAI_GPU_DEVICE override never reached the two
+        services it matters most for."""
         self.assertTrue(
             any(e.startswith("DEVAI_GPU_DEVICE=") for e in self._router_env()),
             "the router recreates every HF backend container; without this "

@@ -35,7 +35,6 @@ set -u
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUNTIME="${CONTAINER_RUNTIME:-podman}"
-EXEC_HOST="${TEST_EXEC_HOST:-devai-open-webui}"
 COLD_START_S="${COLD_START_S:-900}"
 HOST_VRAM_GB="${HOST_VRAM_GB:-${GPU_MEMORY_GB:-24}}"
 
@@ -56,6 +55,11 @@ restore_placeholders() {
     cd "$REPO_ROOT" && make cache-up >/dev/null 2>&1 || true
 }
 trap restore_placeholders EXIT
+
+# Curl client on devai-net (the router publishes no host ports): sets EXEC_HOST.
+# shellcheck source=tests/lib/devai-net-client.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/devai-net-client.sh"
+devai_net_client_start || exit 1
 
 PASS=0
 FAIL=0

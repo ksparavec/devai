@@ -17,26 +17,31 @@ pass() { ((PASS++)); echo -e "  ${GREEN}PASS${NC} $1"; }
 fail() { ((FAIL++)); echo -e "  ${RED}FAIL${NC} $1: $2"; }
 info() { echo -e "${YELLOW}$1${NC}"; }
 
+# Curl client on devai-net (the router publishes no host ports): sets EXEC_HOST.
+# shellcheck source=tests/lib/devai-net-client.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/devai-net-client.sh"
+devai_net_client_start || exit 1
+
 ollama_curl() {
-    $RUNTIME exec devai-open-webui curl -sf --max-time "${2:-10}" \
+    $RUNTIME exec "$EXEC_HOST" curl -sf --max-time "${2:-10}" \
         -H "Content-Type: application/json" \
         "http://router:11434$1" ${3:+-d "$3"} 2>&1
 }
 
 ollama_curl_long() {
-    $RUNTIME exec devai-open-webui curl -s --max-time "${2:-200}" \
+    $RUNTIME exec "$EXEC_HOST" curl -s --max-time "${2:-200}" \
         -H "Content-Type: application/json" \
         "http://router:11434$1" -d "$3" 2>&1
 }
 
 vllm_curl() {
-    $RUNTIME exec devai-open-webui curl -sf --max-time "${2:-10}" \
+    $RUNTIME exec "$EXEC_HOST" curl -sf --max-time "${2:-10}" \
         -H "Content-Type: application/json" \
         "http://router:11435$1" ${3:+-d "$3"} 2>&1
 }
 
 sglang_curl() {
-    $RUNTIME exec devai-open-webui curl -sf --max-time "${2:-10}" \
+    $RUNTIME exec "$EXEC_HOST" curl -sf --max-time "${2:-10}" \
         -H "Content-Type: application/json" \
         "http://router:11436$1" ${3:+-d "$3"} 2>&1
 }
@@ -213,7 +218,7 @@ else
     # recreates the Ollama container per model at its probed ctx (like
     # vLLM/SGLang), the first request for a model pays ~40s of container
     # recreate + warm-load before the first SSE chunk. 120s leaves headroom.
-    resp=$($RUNTIME exec devai-open-webui curl -s --max-time 120 -N \
+    resp=$($RUNTIME exec "$EXEC_HOST" curl -s --max-time 120 -N \
         -H "Content-Type: application/json" \
         "http://router:11434/v1/chat/completions" \
         -d "{\"model\":\"$TEST_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Count to 3\"}],\"max_tokens\":20,\"stream\":true}" 2>&1)

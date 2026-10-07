@@ -11,7 +11,6 @@ type Entry struct {
 	SourcePath  string // absolute filesystem path
 	ArchivePath string // path prefix inside the tar archive
 	Dir         bool
-	IsAgeKey    bool // triggers the recovery-critical warning when missing
 }
 
 // ArchiveRoots maps the top-level archive path segment back to the real
@@ -20,16 +19,24 @@ func ArchiveRoots(repoRoot, homeDir string) map[string]string {
 	return map[string]string{
 		"deploy":     filepath.Join(repoRoot, "deploy"),
 		"devai-home": filepath.Join(homeDir, ".devai"),
-		"sops-age":   filepath.Join(homeDir, ".config", "sops", "age"),
 	}
+}
+
+// retiredArchiveRoots are top-level archive segments that older snapshots
+// carry but that no longer map to anything on disk. Restore skips their
+// members with a warning instead of failing on an unknown root, so an
+// archive taken before the root was retired still restores everything
+// else. "sops-age" held ~/.config/sops/age/keys.txt until the sops/age
+// scaffold moved to attic/sops-age/ on 2026-10-07 (platform-rebuild
+// Phase 1, M12); the value is where to look for it now.
+var retiredArchiveRoots = map[string]string{
+	"sops-age": "attic/sops-age",
 }
 
 // Manifest returns every backup source for a given repo checkout and home
 // directory. Missing sources are tolerated (a fresh host may not have probe
-// caches or an age key yet) -- Snapshot skips them silently, except the age
-// key, which gets a loud warning since losing it means losing every secret
-// sops+age encrypted with its public key ("no backdoor" -- docs/secrets.md).
-func Manifest(repoRoot, homeDir string, excludeAgeKey bool) []Entry {
+// caches yet) -- Snapshot skips them silently.
+func Manifest(repoRoot, homeDir string) []Entry {
 	deploy := filepath.Join(repoRoot, "deploy")
 	devaiHome := filepath.Join(homeDir, ".devai")
 
@@ -47,14 +54,6 @@ func Manifest(repoRoot, homeDir string, excludeAgeKey bool) []Entry {
 		for _, m := range matches {
 			entries = append(entries, Entry{SourcePath: m, ArchivePath: "deploy/" + filepath.Base(m)})
 		}
-	}
-
-	if !excludeAgeKey {
-		entries = append(entries, Entry{
-			SourcePath:  filepath.Join(homeDir, ".config", "sops", "age", "keys.txt"),
-			ArchivePath: "sops-age/keys.txt",
-			IsAgeKey:    true,
-		})
 	}
 
 	return entries

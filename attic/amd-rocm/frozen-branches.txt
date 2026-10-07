@@ -1,0 +1,135 @@
+# Frozen live-file branches -- AMD/ROCm GPU-vendor overlay
+#
+# The AMD branches cut out of live files on 2026-10-07 (platform-rebuild
+# Phase 1, operator decision M11), copied verbatim from commit 4614adc. The
+# Makefile's pieces are in Makefile.frozen-targets. Each block names its
+# file and where it sat; `...` marks lines between two cut pieces that stayed
+# live. Read RESTORE.md first.
+
+# ---- deploy/Dockerfile.lab: the GPU_VENDOR build arg, right after `ARG GPU_BUILD=false`.
+# The Makefile's build-gpu passed it (see Makefile.frozen-targets, item 5).
+ARG GPU_BUILD=false
+# Separate from GPU_BUILD ("is this a GPU build at all"): which vendor's
+# wheel index to use when it is. See docs/gpu-vendors.md.
+ARG GPU_VENDOR=nvidia
+
+# ---- deploy/Dockerfile.lab: the end of the comment above the torch step, and the step
+# itself with its ROCm branch (the live step keeps the CUDA/PyPI and CPU branches).
+# tests/python/test_lab_python_and_torch.py.
+# ROCm: the rocm6.4 index carries no cp314 torch at all (checked 2026-09-27;
+# rocm7.2 has 2.14.0), so the amd path cannot build on Python 3.14 as is.
+
+COPY requirements-torch.txt requirements-lab.lock /tmp/
+RUN if [ "$GPU_BUILD" = "true" ] && [ "$GPU_VENDOR" = "amd" ]; then \
+        TORCH_INDEX="--index-url https://download.pytorch.org/whl/rocm6.4"; \
+    elif [ "$GPU_BUILD" = "true" ]; then \
+        TORCH_INDEX=""; \
+    else \
+        TORCH_INDEX="--index-url https://download.pytorch.org/whl/cpu"; \
+    fi \
+    && uv pip install --system -r /tmp/requirements-torch.txt $TORCH_INDEX \
+    && uv pip install --system --no-deps --require-hashes -r /tmp/requirements-lab.lock \
+    && uv pip check --system
+
+# ---- requirements-torch.txt: line 2 of the header comment.
+# carries the right build (CPU / ROCm index, PyPI for CUDA) BEFORE
+
+# ---- bin/devai-agent: module docstring, the gpu_vendor row of the preferences table.
+    gpu_vendor          str       nvidia (default) or amd -- see
+                                  docs/gpu-vendors.md. This launcher does
+                                  not read .env (see below), so ROCm
+                                  operators set this once via
+                                  --gpu-vendor amd; it then persists.
+
+# ---- bin/devai-agent: DEFAULTS.
+DEFAULTS: dict = {
+    "vram": 24,
+    "context": 131072,
+    "last_model": None,
+    "last_agent": None,
+    "last_work_dir": None,        # set by the first run; informational only
+    "agent_session_file": None,
+    "gpu_vendor": "nvidia",
+}
+
+# ---- bin/devai-agent: gpu_flags().
+def gpu_flags(runtime: str, cpu_only: bool, gpu_vendor: str = "nvidia") -> list[str]:
+    if cpu_only:
+        return []
+    if "podman" in runtime:
+        device = "amd.com/gpu=all" if gpu_vendor == "amd" else "nvidia.com/gpu=all"
+        return ["--device", device, "--security-opt=label=disable"]
+    return ["--gpus", "all"]
+
+# ---- bin/devai-agent: build_run_cmd() signature and its gpu_flags call.
+def build_run_cmd(
+    *, runtime: str, image: str, cpu_only: bool,
+    work_dir: Path, prefs: dict,
+    pref_model: str | None, pref_agent: str | None,
+    gpu_vendor: str = "nvidia",
+    prompt: str | None = None,
+    ...
+        *gpu_flags(runtime, cpu_only, gpu_vendor),
+
+# ---- bin/devai-agent: make_parser(), after --cpu.
+    ap.add_argument("--gpu-vendor", choices=("nvidia", "amd"),
+                    help="override gpu_vendor for this run "
+                         "(persisted to preferences on exit; see "
+                         "docs/gpu-vendors.md)")
+
+# ---- bin/devai-agent: main(), after pref_agent; its build_run_cmd call; and after the run.
+    pref_gpu_vendor = args.gpu_vendor or prefs.get("gpu_vendor", "nvidia")
+    ...
+        gpu_vendor=pref_gpu_vendor,
+    ...
+    new_prefs["gpu_vendor"] = pref_gpu_vendor
+
+# ---- bin/devai-agent: read_prefs() merged the raw mapping unfiltered (the live
+# launcher drops RETIRED_PREF_KEYS, which names gpu_vendor; remove it from
+# that tuple on a thaw).
+    merged.update(raw)
+
+# ---- .env.example: after DEVAI_MAX_FAILED_LAUNCHES (the live file keeps a
+# DEVAI_GPU_DEVICE line in its place).
+# GPU vendor (see docs/gpu-vendors.md). Set via `make gpu-vendor VENDOR=nvidia|amd`
+# rather than editing these directly -- devai-tools/cmd/devai-gpu-vendor keeps
+# the 4 vars below in lockstep. NVIDIA is the default; devai is fully verified
+# on NVIDIA only, AMD/ROCm is build-time-verified only (no ROCm hardware
+# tested yet).
+# DEVAI_GPU_VENDOR=nvidia
+# DEVAI_GPU_DEVICE=nvidia.com/gpu=all
+# VLLM_IMAGE=docker.io/vllm/vllm-openai:v0.22.1-x86_64-cu129-ubuntu2404
+# SGLANG_IMAGE=docker.io/lmsysorg/sglang:v0.5.16-cu130
+
+# ---- deploy/docker-compose.yaml: the last two lines of the comment above the
+# router's DEVAI_GPU_DEVICE forward (the forward itself stays live).
+      # nvidia.com/gpu=all default and every router-recreated backend was
+      # NVIDIA regardless of `make gpu-vendor VENDOR=amd`.
+
+# ---- gpu-arbiter/main_test.go: TestBuildContainerSpecGPUDevice's comment and its
+# override subtest (the live test overrides with nvidia.com/gpu=0 instead).
+// TestBuildContainerSpecGPUDevice locks the GPU-vendor overlay contract
+// (docs/gpu-vendors.md): DEVAI_GPU_DEVICE overrides the CDI device string,
+// defaulting to NVIDIA's when unset so an nvidia-only host needs no config.
+func TestBuildContainerSpecGPUDevice(t *testing.T) {
+	...
+	t.Run("DEVAI_GPU_DEVICE overrides", func(t *testing.T) {
+		t.Setenv("DEVAI_GPU_DEVICE", "amd.com/gpu=all")
+		spec := buildContainerSpec(cfg, "m", launchConfig{}, nil, nil)
+		devices := spec["devices"].([]map[string]any)
+		if got := devices[0]["path"]; got != "amd.com/gpu=all" {
+			t.Errorf("devices[0][path] = %v, want amd.com/gpu=all", got)
+		}
+	})
+
+# ---- tests/python/test_lab_python_and_torch.py: TorchStepTest (the live test keeps
+# the CPU assertion only, as test_cpu_torch_comes_from_its_own_index).
+    def test_cpu_and_rocm_torch_come_from_their_own_index(self) -> None:
+        step = _requirements_step()
+        self.assertIn("--index-url https://download.pytorch.org/whl/cpu", step)
+        self.assertIn("--index-url https://download.pytorch.org/whl/rocm6.4", step)
+
+# ---- tests/python/test_hf_store_linking.py and test_ollama_image_cutover.py: only
+# docstrings pointed at docs/gpu-vendors.md and the amd overlay; reworded, no
+# assertion changed.
+

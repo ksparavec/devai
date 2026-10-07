@@ -1,13 +1,11 @@
 # Backup and restore
 
 devai accumulates host-local state that is expensive or impossible to
-regenerate: probe/bench caches (real GPU time to rebuild), the
-`~/.devai/` preferences and agent session history, and the sops+age
-secret scaffold's private key. None of this is backed up by git --
-the caches are gitignored by design (host-specific, VRAM-dependent),
-and the age key must never be committed. `devai-backup`
-(`devai-tools/cmd/devai-backup`) snapshots and restores exactly this
-set.
+regenerate: probe/bench caches (real GPU time to rebuild) and the
+`~/.devai/` preferences and agent session history. None of this is
+backed up by git -- the caches are gitignored by design (host-specific,
+VRAM-dependent). `devai-backup` (`devai-tools/cmd/devai-backup`)
+snapshots and restores exactly this set.
 
 ## What gets backed up
 
@@ -18,10 +16,9 @@ set.
 | `deploy/.vllm-reasoning-cache.json` | vLLM probe cache | skipped, snapshot continues |
 | `deploy/.sglang-reasoning-cache.json` | SGLang probe cache | skipped, snapshot continues |
 | `deploy/.model-status.json` | host-local model exclusion ledger | skipped, snapshot continues |
-| `deploy/*.sops.env` | already git-tracked ciphertext; included anyway for a self-contained archive | skipped, snapshot continues |
+| `deploy/*.sops.env` | encrypted secrets files, if any exist (none do since the sops/age scaffold moved to the attic; the glob stays) | skipped, snapshot continues |
 | `~/.devai/preferences.yaml` | last-used model/agent/vram/context | skipped, snapshot continues |
 | `~/.devai/sessions/` | per-(agent,model) session history | skipped, snapshot continues |
-| `~/.config/sops/age/keys.txt` | **the** recovery-critical file -- see below | loud warning, snapshot continues |
 
 Everything else under `~/.devai/` (the picker script, the probe-cache
 symlinks `make install` stages there) is a symlink back into this
@@ -36,27 +33,22 @@ double-counted.
   directories (see CLAUDE.md's `/var/cache/devai/` convention), and
   hold re-downloadable model weights that would make an archive
   enormous for no recovery benefit.
-- `/run/devai/` -- tmpfs, ephemeral by design; nothing there survives
-  a reboot anyway.
+- `~/.config/sops/age/keys.txt` -- no longer backed up since
+  2026-10-07, when the sops/age scaffold moved to `attic/sops-age/`
+  (platform-rebuild Phase 1, M12). A key already on the host is left
+  where it is; keep an offline copy yourself if anything encrypted with
+  it still matters.
 
-## The age key: no backdoor
+## Archives made before 2026-10-07
 
-Per `docs/secrets.md`: **sops + age has no backdoor.** Losing
-`~/.config/sops/age/keys.txt` means losing access to every secret
-encrypted with its public key, permanently. `devai-backup` includes it
-by default precisely because it is the single highest-value file in
-this whole list -- opt out only if you manage that key's backup some
-other way (`--exclude-age-key`).
+Older archives carry the age key as `sops-age/keys.txt`. Restoring one
+skips every `sops-age/...` member with a warning on stderr naming
+`attic/sops-age`, writes nothing under `~/.config/sops`, and restores
+the rest. The skip comes after the traversal check, so a hostile name
+such as `sops-age/../x` is still rejected, not skipped.
 
-Treat the resulting archive as secret-bearing:
-
-- Store it on encrypted disk, in a password manager's file-attachment
-  feature, or on offline media.
-- **Never** commit it to git, and never upload it to unencrypted cloud
-  storage.
-- The `sops-age/keys.txt` entry inside the archive is restored with
-  its original permission bits, and `devai-backup restore` re-asserts
-  `0600` on it as defense-in-depth regardless.
+Such an archive holds a private key: keep it on encrypted disk or
+offline media, and never commit it or upload it to unencrypted storage.
 
 ## Commands
 
@@ -71,7 +63,7 @@ Or call the binary directly (`devai-tools/bin/devai-backup`, built by
 `make build-backup-tool`):
 
 ```bash
-devai-backup snapshot [--dest DIR] [--exclude-age-key]
+devai-backup snapshot [--dest DIR]
 devai-backup list     [--dest DIR]
 devai-backup verify   --archive PATH
 devai-backup restore  --archive PATH --yes
@@ -91,7 +83,7 @@ For each entry whose target already exists on disk, `restore` renames
 it aside to `<path>.before-restore-<timestamp>` (one shared timestamp
 for the whole run) rather than deleting it. This means:
 
-- A partial archive (e.g. one that only contains the age key) never
+- A partial archive (e.g. one that only contains the bench cache) never
   destroys unrelated files -- only the paths actually present in the
   archive are touched.
 - Restoring never silently clobbers state you didn't mean to
@@ -111,10 +103,6 @@ make backup-verify ARCHIVE=~/.devai/backups/20260615T030000Z.tar.gz
 
 # 3. Restore (on a fresh host, or after losing local state).
 make backup-restore ARCHIVE=~/.devai/backups/20260615T030000Z.tar.gz YES=1
-
-# 4. Verify sops still decrypts against the restored key.
-make secrets-render SOPS_FILE=deploy/mcp-secrets.sops.env DEST=/tmp/check.env
 ```
 
-See `docs/secrets.md` for the sops+age scaffold itself, and
-`docs/backends.md` for what the probe/bench caches actually contain.
+See `docs/backends.md` for what the probe/bench caches actually contain.

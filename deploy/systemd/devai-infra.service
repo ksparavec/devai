@@ -1,5 +1,5 @@
 [Unit]
-Description=DevAI Infrastructure (caches + Ollama + Open WebUI)
+Description=DevAI Infrastructure (caches + Ollama + router)
 Requires=podman.socket
 After=podman.socket
 

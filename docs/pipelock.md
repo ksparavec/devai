@@ -5,9 +5,7 @@ interactive lab container network **fail-closed**: the lab has NO route to the
 internet except through pipelock, which decrypts and inspects outbound TLS,
 DLP-blocks accidental secret egress, and logs every decision.
 
-This is the source of truth for the pipelock integration. See also
-`docs/secrets.md` (the sops/age scaffold the CA key uses) and `docs/mcp.md`
-(the peer opt-in service whose conventions pipelock mirrors).
+This is the source of truth for the pipelock integration.
 
 ## Why
 
@@ -71,7 +69,7 @@ make build-gpu          # or build-cpu -- bakes the CA cert into the lab trust s
 make cache-up           # mounts the host key into devai-pipelock automatically
 ```
 
-No sops, no tmpfs, no `.env` edit. `cache-up` looks for the key at
+No secrets tooling, no tmpfs, no `.env` edit. `cache-up` looks for the key at
 `$(PIPELOCK_CA_KEY)` (default `~/.config/devai/pipelock-ca-key.pem`, override
 via the Make variable) and mounts it; if it is missing, cache-up prints a note
 and pipelock stays unhealthy until you run `make pipelock-ca-init`. Nothing
@@ -163,16 +161,15 @@ Exa tool, enabled in the lab image with `ENV OPENCODE_ENABLE_EXA=1`
 (`deploy/Dockerfile.lab`). Its queries egress through pipelock like everything
 else (and may trip the DLP false-positive above on query content). The other
 agents' built-in search is cloud-provider-coupled and does not function against
-the local router; giving them search uniformly is a backlog item (the MCP
-gateway -- see TODO.md).
+the local router. Nothing gives them search uniformly: the MCP gateway that was
+meant to was removed on 2026-10-07 (platform-rebuild Phase 1, M10).
 
 ## Backlog
 
 Pipelock-related open items live in TODO.md under "Open Items -> pipelock egress
-lockdown": MCP search for all agents, making the MCP gateway reachable from the
-locked lab, fixing web fetch for the Node-runtime agents (Gemini CLI / Claude
-Code), the DLP signed-URL false-positive, and the systemd boot network-create
-gap.
+lockdown": web search for every agent, fixing web fetch for the Node-runtime
+agents (Gemini CLI / Claude Code), the DLP signed-URL false-positive, and the
+systemd boot network-create gap.
 
 ## Logging
 

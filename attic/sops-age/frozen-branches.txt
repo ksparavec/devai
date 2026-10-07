@@ -1,0 +1,66 @@
+# Frozen live-file branches -- sops/age secret-store scaffold
+#
+# The scaffold's pieces cut out of live files on 2026-10-07 (platform-rebuild
+# Phase 1, operator decision M12), copied verbatim from commit 4614adc. The
+# Makefile's pieces are in Makefile.frozen-targets. Each block names its
+# file and where it sat; `...` marks lines that stayed live. Read RESTORE.md
+# first.
+#
+# devai-backup's age-key handling is recorded here too, but restoring it is
+# a choice, not a step: see RESTORE.md. Its tests (manifest_test.go,
+# roundtrip_test.go, the "root-depth-mismatch-escape" case in
+# malicious_test.go) are in git history at the same commit.
+
+# ---- .gitignore: after the Graphify block.
+# sops/age secrets render targets and any plaintext working files.
+# Encrypted *.sops.env files are tracked (see exception below).
+/run/devai
+*.env.plain
+!deploy/*.sops.env
+
+# ---- devai-tools/internal/backup/manifest.go: the age key as a backup source.
+# Entry carried a flag for it, ArchiveRoots a root, Manifest a parameter.
+type Entry struct {
+	...
+	IsAgeKey    bool // triggers the recovery-critical warning when missing
+}
+
+		"sops-age":   filepath.Join(homeDir, ".config", "sops", "age"),
+
+// Manifest returns every backup source for a given repo checkout and home
+// directory. Missing sources are tolerated (a fresh host may not have probe
+// caches or an age key yet) -- Snapshot skips them silently, except the age
+// key, which gets a loud warning since losing it means losing every secret
+// sops+age encrypted with its public key ("no backdoor" -- docs/secrets.md).
+func Manifest(repoRoot, homeDir string, excludeAgeKey bool) []Entry {
+	...
+	if !excludeAgeKey {
+		entries = append(entries, Entry{
+			SourcePath:  filepath.Join(homeDir, ".config", "sops", "age", "keys.txt"),
+			ArchivePath: "sops-age/keys.txt",
+			IsAgeKey:    true,
+		})
+	}
+
+# ---- devai-tools/internal/backup/snapshot.go: addEntry(), on a missing source.
+			if e.IsAgeKey {
+				fmt.Fprintf(os.Stderr,
+					"WARNING: age key not found at %s -- skipping. "+
+						"sops+age has no backdoor: losing this key means losing "+
+						"every secret encrypted with its public key. Run "+
+						"`make age-keygen-host` if this host should have one.\n",
+					e.SourcePath)
+			}
+
+# ---- devai-tools/internal/backup/restore.go: end of Restore() (its doc comment
+# ended "Finally it re-asserts 0600 on the age key as defense-in-depth.").
+	ageKeyPath := filepath.Join(homeDir, ".config", "sops", "age", "keys.txt")
+	if _, err := os.Stat(ageKeyPath); err == nil {
+		_ = os.Chmod(ageKeyPath, 0o600)
+	}
+
+# ---- devai-tools/cmd/devai-backup/main.go: runSnapshot()'s flag (usage line:
+# `snapshot [--dest DIR] [--exclude-age-key] [--repo-root DIR] [--home-dir DIR]`).
+	excludeAgeKey := fs.Bool("exclude-age-key", false, "do not include ~/.config/sops/age/keys.txt")
+	...
+	manifest := backup.Manifest(rr, hd, *excludeAgeKey)

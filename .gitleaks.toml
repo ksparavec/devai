@@ -9,6 +9,12 @@
 #                                 to be copied and encrypted by the operator.
 #   - Hugging Face architecture class names (e.g. NemotronHForCausalLM)
 #     matched as a secret in prose; see below.
+#
+# The sops/age scaffold moved to attic/sops-age/ on 2026-10-07, and no live
+# file matches the two sops paths any more. They stay: the scan covers the
+# whole git history, which still holds deploy/mcp-secrets.sops.env.example,
+# and the unanchored patterns also match
+# attic/cluster-mode/deploy/skypilot-credentials.sops.env.example.
 
 title = "devai gitleaks config"
 

@@ -27,7 +27,6 @@ set -u
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUNTIME="${CONTAINER_RUNTIME:-podman}"
-EXEC_HOST="${TEST_EXEC_HOST:-devai-open-webui}"
 ROUTER_INTERNAL="${TEST_ROUTER_HOST:-router}"
 VLLM_CACHE="$REPO_ROOT/deploy/.vllm-reasoning-cache.json"
 OLLAMA_CACHE="$REPO_ROOT/deploy/.ollama-reasoning-cache.json"
@@ -64,6 +63,11 @@ restore_placeholders() {
     cd "$REPO_ROOT" && make cache-up >/dev/null 2>&1 || true
 }
 trap restore_placeholders EXIT
+
+# Curl client on devai-net (the router publishes no host ports): sets EXEC_HOST.
+# shellcheck source=tests/lib/devai-net-client.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/devai-net-client.sh"
+devai_net_client_start || exit 1
 
 PASS=0
 FAIL=0
@@ -153,7 +157,7 @@ for entry in cache.values():
 PY
 }
 
-# ── HTTP helpers (curl from inside devai-open-webui to use devai-net) ────────
+# ── HTTP helpers (curl from a client container on devai-net) ────────────────
 
 curl_post() {
     local path="$1" timeout="$2" body="$3"

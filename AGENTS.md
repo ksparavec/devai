@@ -3,7 +3,7 @@
 ## Project Overview
 
 DevAI is a containerized local AI development environment. It provides
-JupyterLab, multiple AI CLIs, an interactive model picker, Open WebUI, and a
+JupyterLab, multiple AI CLIs, an interactive model picker, and a
 GPU-aware inference router. All three inference backends (Ollama, vLLM, SGLang)
 are wired and covered by router tests. vLLM and SGLang start as `sleep infinity`
 placeholders so `make cache-up` is hermetic; the router replaces them via libpod
@@ -18,19 +18,12 @@ to return. `gpu-arbiter` still accepts `--mode`, but any value other than
 `single` exits with a pointer to `attic/README.md`. Read that README before
 touching anything cluster- or fleet-shaped.
 
-Optional opt-in surfaces (gated behind compose profiles, default behaviour
-unchanged):
-
-- **MCP gateway** (profile=`mcp`) -- Docker MCP Gateway peer service on port
-  8088, endpoint path `/mcp`, bearer token minted at startup. Third-party
-  servers come from Docker's official catalog; `deploy/mcp-catalog-devai.yaml`
-  adds the one server this repo authors. 15 servers enabled, 134 tools
-  verified live on 2026-07-25. See `docs/mcp.md`.
-- **sops + age secret store** -- shared encrypted-at-rest scaffold. Two of its
-  three intended consumers are now frozen, so the only remaining one is the
-  MCP gateway's `github-official` / `firecrawl` secrets, and that path is
-  unverified. Operators run `make age-keygen-host` once and append their
-  public key to `.sops.yaml`. See `docs/secrets.md`.
+Removed on 2026-10-07 by platform-rebuild Phase 1: Open WebUI and its nginx
+TLS proxy (decision M9; browser chat is the DeepSeek Harness web UI) and the
+MCP gateway with devai's own `devai-model-status` server (M10), both deleted;
+the AMD/ROCm GPU-vendor overlay (M11) and the sops/age secret-store scaffold
+(M12), both moved to `attic/` (`attic/amd-rocm/`, `attic/sops-age/`, each
+with a `RESTORE.md`). devai is NVIDIA-only.
 
 The lab image bundles the `sky` CLI and `/usr/local/bin/sky-setup.sh` for the
 user-facing cloud flow (`docs/skypilot-user-guide.md`). That is a separate
@@ -45,8 +38,7 @@ flags, mounted paths, or runtime environment variables.
 - `gpu-arbiter/`: Go module for the GPU-aware multi-port reverse proxy. Tests
   live beside the source as `*_test.go`.
 - `deploy/`: container and runtime assets, including Dockerfiles,
-  `docker-compose.yaml`, generated model catalogs, systemd units, and WebUI
-  proxy configuration.
+  `docker-compose.yaml`, generated model catalogs, and systemd units.
 - `scripts/`: operational Python and shell tooling. Important scripts include
   `generate-catalog.py`, `probe-ollama-reasoning.py`, `select-models.py`, and
   `model-picker.py`.
@@ -148,26 +140,17 @@ Use `make help` to list supported targets. Common commands:
   Python unit + Ollama integration + matrix + vLLM/SGLang integration +
   E2E + probe smoke. Wall time 30-60+ min. Each layer skips cleanly
   when its prerequisites aren't met.
-- `make test-python`: stdlib-unittest cases (612 collected as of
-  2026-07-27) covering bench v3 schema migration + runner ctx flags
-  + picker keying + report rendering, sops/age scaffold script
-  gates, MCP gateway catalog/compose/Makefile shape, SkyPilot
-  agent-skill, catalog-discover, and the model-lifecycle ledger.
+- `make test-python`: stdlib-unittest cases covering bench v3 schema
+  migration + runner ctx flags + picker keying + report rendering,
+  SkyPilot agent-skill, catalog-discover, and the model-lifecycle
+  ledger.
 
-MCP / secrets targets (opt-in):
-
-- `make mcp-up` / `make mcp-down` / `make mcp-logs` / `make mcp-test` /
-  `make mcp-secrets-render`: MCP gateway (profile=`mcp`).
-  `make mcp-test` does a real handshake, asserts a tool-count floor,
-  and invokes a tool; it skips (77) only when the gateway container
-  is absent. `make mcp-health` is liveness only -- do not read it as
-  a functional check.
-- `make build-mcp-modelstatus-image` / `make test-mcp-modelstatus`:
-  the one MCP server this repo authors. The gateway runs servers with
-  `--pull never`, so build the image before starting the gateway.
-- `make age-keygen-host` / `make secrets-tmpfs` /
-  `make secrets-edit SOPS_FILE=...` / `make secrets-rotate`:
-  shared sops/age scaffold.
+The MCP targets (`mcp-*`, `build-mcp-modelstatus-image`,
+`test-mcp-modelstatus`) were deleted on 2026-10-07 with the gateway.
+The sops/age targets (`secrets-*`, `age-keygen-host`) and the AMD
+overlay's (`gpu-vendor`, `test-gpu-vendor`) are preserved verbatim in
+`attic/sops-age/Makefile.frozen-targets` and
+`attic/amd-rocm/Makefile.frozen-targets`.
 
 The cluster-mode and SkyPilot targets are gone. All 9 of them
 (`cluster-head-up`, `cluster-head-down`, `cluster-status`,
@@ -256,14 +239,6 @@ Important runtime knobs:
   the named tier, ignoring existing cache cells.
 - `DEVAI_REASONING`: `auto|off|low|medium|high`.
 
-MCP env knobs:
-
-- `MCP_PORT`: gateway host port, default 8088, bound to 127.0.0.1.
-  The endpoint is `http://127.0.0.1:${MCP_PORT}/mcp` -- the `/mcp`
-  path is required and a bearer token is mandatory.
-- `MCP_SECRETS_FILE`: host path of the rendered secrets file, mounted
-  at the fixed container path `/secrets/.env`; default `/dev/null`.
-
 `DEVAI_MODE` and the whole `DEVAI_HEAD_*` / `DEVAI_WORKER_*` /
 `SKYPILOT_*` env surface went with the freeze. Their contract table is
 in `attic/cluster-mode/docs/cluster-env.md`.
@@ -341,14 +316,9 @@ or generated logs. `.env` is local configuration; keep `.env.example` generic.
 Proxy variables and runtime settings should be documented without embedding
 private infrastructure details.
 
-Encrypted credentials live in `deploy/*.sops.env` (committed) and are rendered
-to `/run/devai/*.env` (tmpfs, gitignored) by `make *-secrets-render`. Plaintext
-templates are shipped as `*.sops.env.example` so operators see the expected
-variable names without decrypting anything. `.gitignore` blocks `*.env.plain`
-and `/run/devai`; the `!deploy/*.sops.env` exception ensures encrypted files
-stay tracked even under broader rules. Run the sops/age scaffold's pre-commit
-checklist (per `docs/secrets.md`) before any commit that touches `.sops.yaml`
-or a `.sops.env` file -- it catches the literal `age1xxx...` placeholder.
+The repo has no live encrypted-secret store: the sops/age scaffold moved to
+`attic/sops-age/` on 2026-10-07 (platform-rebuild Phase 1, M12). Read its
+`RESTORE.md` before reintroducing encrypted files under `deploy/`.
 
 Prefer Make targets over raw container commands. They preserve expected mounts,
 network names, user settings, and environment variables. If a workflow truly

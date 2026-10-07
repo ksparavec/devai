@@ -164,13 +164,11 @@ class ToolingTest(unittest.TestCase):
                          MAKEFILE.count(".sglang-reasoning-cache.json"),
                          "every Makefile site that names the sglang cache must name this one")
 
-    def test_launcher_mounts_its_cache_and_status_server_bakes_it(self) -> None:
+    def test_launcher_mounts_its_cache(self) -> None:
+        # The MCP status server that baked this cache too was removed on
+        # 2026-10-07 (platform-rebuild Phase 1, M10).
         self.assertIn('"vllm-devai": CONFIG_DIR / ".vllm-devai-reasoning-cache.json"',
                       (REPO_ROOT / "bin" / "devai-agent").read_text())
-        self.assertIn(".vllm-devai-reasoning-cache.json",
-                      (REPO_ROOT / "deploy" / "Dockerfile.mcp-modelstatus").read_text())
-        go = (REPO_ROOT / "devai-tools" / "internal" / "modelcache" / "probecache.go").read_text()
-        self.assertIn('"vllm-devai"', go)
 
 
 if __name__ == "__main__":

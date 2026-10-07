@@ -210,8 +210,8 @@ services:
       # services above interpolate ${DEVAI_GPU_DEVICE} into their OWN
       # device lists, but the router does not inherit the shell that ran
       # compose -- so without this line it fell back to the hardcoded
-      # nvidia.com/gpu=all default and every router-recreated backend was
-      # NVIDIA regardless of `make gpu-vendor VENDOR=amd`.
+      # nvidia.com/gpu=all default and every router-recreated backend got
+      # that default regardless of a DEVAI_GPU_DEVICE override.
       - DEVAI_GPU_DEVICE=${DEVAI_GPU_DEVICE:-nvidia.com/gpu=all}
       - MAX_CONTEXT_LEN=${MAX_CONTEXT_LEN:-262144}
       - DEVAI_REASONING=${DEVAI_REASONING:-auto}
@@ -288,107 +288,6 @@ services:
       - ollama
     restart: unless-stopped
 
-  open-webui:
-    image: ghcr.io/open-webui/open-webui:main
-    container_name: devai-open-webui
-    hostname: open-webui
-    environment:
-      - OLLAMA_BASE_URL=http://router:11434
-    volumes:
-      - /var/cache/devai/open-webui:/app/backend/data
-    depends_on:
-      - router
-    restart: unless-stopped
-
-  webui-proxy:
-    image: docker.io/library/nginx:alpine
-    container_name: devai-webui-proxy
-    hostname: webui-proxy
-    ports:
-      - "${WEBUI_PORT:-8443}:443"
-    environment:
-      - HOST_IP=${HOST_IP:-localhost}
-    volumes:
-      - ./webui-proxy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
-      - ./webui-proxy/entrypoint.sh:/entrypoint.sh:ro
-      - ${HOME}/devai-home/.jupyter/ssl:/ssl:ro
-    entrypoint: ["/bin/sh", "/entrypoint.sh"]
-    depends_on:
-      - open-webui
-    restart: unless-stopped
-
-  # MCP Gateway (per docs/plans/mcp-gateway.md). Phase 1 ships the 10
-  # Tier 1 servers (no secrets). Phase 2 adds the four Tier 2 servers
-  # with sops-rendered secrets at /run/devai/mcp-secrets.env (mounted
-  # only when present; absent on Phase 1 installs).
-  #
-  # Started by default per decision 5 in the plan. Operator can opt
-  # out by setting MCP_PROFILE=mcp-disabled in .env (compose ignores
-  # the service when its profile doesn't match).
-  mcp-gateway:
-    image: docker.io/docker/mcp-gateway:v0.43.3
-    container_name: devai-mcp-gateway
-    hostname: mcp-gateway
-    restart: unless-stopped
-    # Dual-homed, exactly like router/apt-cache/registry-cache/pipelock.
-    # The lab containers sit on devai-lab-egress; a service published only
-    # on devai-net is simply unresolvable from them, which is what made
-    # this gateway unreachable from every agent regardless of its config.
-    networks: [default, devai-lab-egress]
-    # Loopback-only publish. This service holds a READ-WRITE podman socket
-    # (below) and must keep it rw -- creating per-call MCP server containers
-    # is its whole job -- so container-create here is equivalent to host
-    # root. Binding the published port to 127.0.0.1 is the mitigation: it
-    # keeps unauthenticated MCP tool calls off the LAN. Remote clients need
-    # an SSH tunnel or an authenticating reverse proxy in front.
-    ports:
-      - "127.0.0.1:${MCP_PORT:-8088}:8088"
-    volumes:
-      - ${XDG_RUNTIME_DIR:-/run/user/1000}/podman/podman.sock:/var/run/docker.sock:Z
-      # First-party catalog only. Mounted under the gateway's catalogs
-      # directory because v0.43.3 rejects a catalog path outside it --
-      # the old /app/catalog.yaml mount breaks on this version.
-      - ./mcp-catalog-devai.yaml:/root/.docker/mcp/catalogs/devai.yaml:ro
-      # Phase 2 secrets mount. /run/devai/mcp-secrets.env is rendered
-      # by `make mcp-secrets-render` from deploy/mcp-secrets.sops.env;
-      # absent on Phase 1 installs. Compose tolerates the missing
-      # source via the conditional bind path -- Podman will refuse to
-      # start the container if the source doesn't exist, so consumers
-      # who want Tier 2 must run mcp-secrets-render first; consumers
-      # who only want Tier 1 should leave the MCP_SECRETS_FILE env
-      # unset so this volume entry is dropped.
-      - ${MCP_SECRETS_FILE:-/dev/null}:/secrets/.env:ro
-      - mcp-state:/data
-    command:
-      # NOT --catalog: that REPLACES the built-in catalog. --additional-
-      # catalog merges ours on top of Docker's official one, so all the
-      # third-party servers below resolve from upstream (digest-pinned
-      # and maintained there) and only devai-model-status comes from us.
-      - "--additional-catalog=/root/.docker/mcp/catalogs/devai.yaml"
-      # Without --servers the gateway enables NOTHING and serves only its
-      # own mcp-find/mcp-add builtins -- a correct catalog alone yields
-      # "0 tools listed". Names are upstream catalog keys and are
-      # case-sensitive: `SQLite`, not `sqlite`.
-      #
-      # Tier 2 (github-official, firecrawl, hugging-face, context7) are
-      # listed here but only github-official and firecrawl need secrets;
-      # hugging-face and context7 are `type: remote` upstream and connect
-      # anonymously, so they work on a Phase 1 install too.
-      - "--servers=filesystem,git,SQLite,fetch,memory,time,sequentialthinking,duckduckgo,arxiv-mcp-server,wikipedia-mcp,github-official,firecrawl,hugging-face,context7,devai-model-status"
-      - "--port=8088"
-      - "--transport=streaming"
-      - "--block-secrets"
-      # Container-side path of the secrets mount above -- NOT an env-var
-      # indirection. It has to name the same path the volume entry binds
-      # to, otherwise a Phase 2 operator who renders /run/devai/mcp-secrets.env
-      # and sets MCP_SECRETS_FILE still hands the gateway an empty file.
-      # On Phase 1 installs the mount source is /dev/null, so this reads
-      # as an empty secrets file and Tier 2 servers simply stay unusable.
-      - "--secrets=/secrets/.env"
-    security_opt:
-      - "no-new-privileges:true"
-    profiles: [mcp]
-
   # Aggregates stdout from every devai-* service into per-container
   # log files on the host (/var/cache/devai/logs/<name>.log). Survives
   # source-container recreation — the follower reconnects to the new
@@ -459,10 +358,3 @@ networks:
   devai-lab-egress:
     name: devai-lab-egress
     external: true
-
-volumes:
-  # MCP gateway state (server logs, transient working data). Lives in
-  # podman's named-volume storage; survives container restarts. Wipe
-  # via `podman volume rm devai_mcp-state` if it ever gets corrupted.
-  mcp-state:
-
