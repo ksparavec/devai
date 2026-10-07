@@ -1543,7 +1543,7 @@ live only in the container's own filesystem: recreating the container
 removes them, and the router also deletes the directory at start whenever
 raw mode is off.
 
-The runbook (the stack runs under root's podman, hence `sudo`):
+The runbook (the stack runs under your own, rootless podman):
 
 1. Set `DEVAI_REQUEST_FINGERPRINT=on` in `.env` and run `make cache-up`
    (compose recreates the router for the changed environment); the
@@ -1564,7 +1564,7 @@ The runbook (the stack runs under root's podman, hence `sudo`):
    `tests/fixtures/claude-code-probes/`: set
    `DEVAI_REQUEST_FINGERPRINT_RAW=on`, `make cache-up`, trigger the
    request, then
-   `sudo podman cp devai-router:/tmp/devai-fingerprints ./fingerprints`
+   `podman cp devai-router:/tmp/devai-fingerprints ./fingerprints`
    and pick the file the bucket's line names in `raw_file`. Check a
    fixture for anything private before committing it.
 5. Set both back to `off` and run `make cache-up`; the recreated router
