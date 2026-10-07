@@ -777,3 +777,82 @@ class VllmLockTargetTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CompiledWheelReuseTest(_ScriptCase):
+    """A build whose compile inputs are unchanged reuses the compiled wheel.
+
+    The compile takes about 21 minutes and depends only on the build record
+    (sdist, torch pin, HyperQwen commit and skips, EXTERNALS), devai's patch
+    files, the arch list and the toolchain -- not on the runtime lock, which
+    only the wheelhouse and the image read. Added 2026-10-07, after a
+    lock-only change (plan E8) recompiled everything.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.cuda = self.tmp / "cuda"
+        (self.cuda / "bin").mkdir(parents=True)
+        nvcc = self.cuda / "bin" / "nvcc"
+        nvcc.write_text("#!/bin/sh\necho 'Build cuda_13.1.r13.1/compiler.0_0'\n")
+        nvcc.chmod(0o755)
+        self.patches = self.tmp / "patches"
+        self.patches.mkdir()
+        (self.patches / "series").write_text("a.patch\n")
+        (self.patches / "a.patch").write_text("--- a\n+++ b\n")
+        self._write_record("9.9.9", _record(devai="x"))
+        self.lock = self.records / "9.9.9.lock"
+        self.lock.write_text("pandas==3.0.5 --hash=sha256:00\n")
+
+    def _id(self, **env: str) -> str:
+        base = dict(VLLM_VERSION="9.9.9", VLLM_RECORD_DIR=str(self.records),
+                    CUDA_HOME=str(self.cuda), DEVAI_PATCH_DIR=str(self.patches))
+        base.update(env)
+        r = self._sh("compile_id", **base)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertRegex(r.stdout.strip(), r"^[0-9a-f]{16}$")
+        return r.stdout.strip()
+
+    def test_the_id_is_stable_and_ignores_the_runtime_lock(self) -> None:
+        first = self._id()
+        self.assertEqual(self._id(), first)
+        self.lock.write_text("pandas==3.0.6 --hash=sha256:11\n")
+        self.assertEqual(self._id(), first, "the runtime lock is not a compile input")
+
+    def test_every_compile_input_changes_the_id(self) -> None:
+        first = self._id()
+        self._write_record("9.9.9", _record(devai="x", torch="2.14.0"))
+        self.assertNotEqual(self._id(), first, "build record")
+        self._write_record("9.9.9", _record(devai="x"))
+        self.assertEqual(self._id(), first)
+        (self.patches / "a.patch").write_text("--- a\n+++ c\n")
+        self.assertNotEqual(self._id(), first, "a devai patch")
+        (self.patches / "a.patch").write_text("--- a\n+++ b\n")
+        self.assertNotEqual(self._id(CUDA_ARCH_LIST="10.0"), first, "arch list")
+        (self.cuda / "bin" / "nvcc").write_text("#!/bin/sh\necho 'Build cuda_13.2'\n")
+        self.assertNotEqual(self._id(), first, "nvcc")
+
+    def test_the_id_does_not_depend_on_where_the_repository_is(self) -> None:
+        first = self._id()
+        moved = self.tmp / "elsewhere"
+        self.records.rename(moved)
+        self.assertEqual(self._id(VLLM_RECORD_DIR=str(moved)), first)
+
+    def test_a_kept_wheel_is_found_by_its_id_and_only_the_newest_is_kept(self) -> None:
+        root = self.tmp / "root"
+        wheel = self.tmp / "vllm-9.9.9-cp313-linux_x86_64.whl"
+        wheel.write_bytes(b"wheel")
+        src = self.tmp / "src"
+        src.mkdir()
+        (src / "PATCHES.applied").write_text("devai/a.patch\n")
+        env = dict(VLLM_VERSION="9.9.9", VLLM_RECORD_DIR=str(self.records), VLLM_BUILD_ROOT=str(root))
+        for cid in ("aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"):
+            r = self._sh(f'keep_compiled {cid} "{wheel}" "{src}"', **env)
+            self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(sorted(p.name for p in (root / "compiled").iterdir()), ["bbbbbbbbbbbbbbbb"])
+        r = self._sh("compiled_wheel bbbbbbbbbbbbbbbb", **env)
+        self.assertEqual(r.stdout.strip(), str(root / "compiled" / "bbbbbbbbbbbbbbbb" / wheel.name))
+        self.assertEqual((root / "compiled" / "bbbbbbbbbbbbbbbb" / "PATCHES.applied").read_text(),
+                         "devai/a.patch\n")
+        r = self._sh("compiled_wheel aaaaaaaaaaaaaaaa", **env)
+        self.assertEqual(r.stdout.strip(), "")

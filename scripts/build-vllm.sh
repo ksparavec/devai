@@ -73,6 +73,13 @@
 # Each build deletes only its own dist/, so another version's wheelhouse --
 # the rollback -- is never touched.
 #
+# The compile (about 20 minutes) is skipped when its inputs are unchanged:
+# the newest wheel is kept under $BUILD_ROOT/compiled/<compile id>
+# (compile_id hashes the build record, devai's patches, the arch list, the
+# compilers and Python -- not the runtime lock), re-verified, and reused, so
+# a lock-only change rebuilds the wheelhouse in minutes. VLLM_REBUILD=1
+# compiles anyway.
+#
 # Usage: build-vllm.sh             compile and publish $BUILD_ROOT/dist
 #        build-vllm.sh --write-in  write deploy/vllm-builds/$VLLM_VERSION.in only
 set -euo pipefail
@@ -434,23 +441,59 @@ if "devai" in series:
 PY
 }
 
-main() {
-    case "${1:-}" in
-        --write-in) write_in; return;;
-        "") ;;
-        *) die "usage: build-vllm.sh [--write-in]";;
-    esac
-    preflight
-    mkdir -p "$BUILD_ROOT/ext"
-    fetch_record_sources
+# Bump when the compile steps change in a way compile_id's inputs do not show.
+COMPILE_SCHEMA=1
 
-    local src
-    say "unpacking a pristine source tree"
-    src="$(unpack_sdist)"
-    check_pins "$src"
-    check_runtime_in "$src"
-    fetch_wheels
+# A content hash of every input the compiled wheel depends on: the build
+# record (sdist sha256, torch pin, HyperQwen commit and skips, EXTERNALS),
+# devai's patch files, the arch list, the compilers, Python and
+# COMPILE_SCHEMA. NOT the runtime lock: only the wheelhouse and the image
+# read it, so a lock-only change (plan E8) reuses the wheel instead of
+# compiling for twenty minutes. Contents only, never paths, so a moved
+# checkout gets the same id.
+compile_id() {
+    {
+        echo "compile-schema=$COMPILE_SCHEMA"
+        echo "vllm=$VLLM_VERSION arch=$CUDA_ARCH_LIST"
+        "$CUDA_HOME/bin/nvcc" --version | tail -1
+        gcc --version | head -1
+        "$PYTHON" --version
+        sha256sum < "$VLLM_RECORD_DIR/$VLLM_VERSION.sh"
+        if [ -n "$DEVAI_PATCH_DIR" ]; then
+            local f
+            for f in $(cd "$DEVAI_PATCH_DIR" && ls | LC_ALL=C sort); do
+                printf '%s ' "$f"
+                sha256sum < "$DEVAI_PATCH_DIR/$f"
+            done
+        fi
+    } | sha256sum | cut -c1-16
+}
 
+# The wheel kept for compile id $1, or nothing.
+compiled_wheel() {
+    local f
+    for f in "$BUILD_ROOT/compiled/$1"/vllm-*.whl; do
+        [ -f "$f" ] && { echo "$f"; return 0; }
+    done
+    return 0
+}
+
+# Keep the wheel just compiled ($2, from source tree $3) under its compile
+# id $1, with the patch list it carries. Only the newest is kept (about 380
+# MiB); the swap goes through a temporary directory.
+keep_compiled() {
+    local id="$1" wheel="$2" src="$3" dir="$BUILD_ROOT/compiled"
+    rm -rf "$dir.tmp"
+    mkdir -p "$dir.tmp/$id"
+    cp "$wheel" "$src/PATCHES.applied" "$dir.tmp/$id/"
+    rm -rf "$dir"
+    mv "$dir.tmp" "$dir"
+}
+
+# Fetch the kernel repositories and Rust crates, apply the record's patch
+# series and compile the wheel; sets WHEEL to its path.
+compile_wheel() {
+    local src="$1"
     local row name var repo ref sub
     for row in "${EXTERNALS[@]}"; do
         IFS='|' read -r name var repo ref _ sub <<< "$row"
@@ -487,10 +530,39 @@ main() {
     ( cd "$src" && python -m build --wheel --no-isolation --skip-dependency-check \
           --outdir dist . )
 
-    local wheel
-    wheel="$(ls "$src"/dist/vllm-*.whl 2>/dev/null | head -1)"
-    [ -n "$wheel" ] || die "the build produced no wheel"
-    verify_wheel "$wheel" || die "the wheel failed verification"
+    WHEEL="$(ls "$src"/dist/vllm-*.whl 2>/dev/null | head -1)"
+    [ -n "$WHEEL" ] || die "the build produced no wheel"
+    verify_wheel "$WHEEL" || die "the wheel failed verification"
+}
+
+main() {
+    case "${1:-}" in
+        --write-in) write_in; return;;
+        "") ;;
+        *) die "usage: build-vllm.sh [--write-in]";;
+    esac
+    preflight
+    mkdir -p "$BUILD_ROOT/ext"
+    fetch_record_sources
+
+    local src
+    say "unpacking a pristine source tree"
+    src="$(unpack_sdist)"
+    check_pins "$src"
+    check_runtime_in "$src"
+    fetch_wheels
+
+    local id wheel
+    id="$(compile_id)"
+    wheel="$(compiled_wheel "$id")"
+    if [ -n "$wheel" ] && [ -z "${VLLM_REBUILD:-}" ] && verify_wheel "$wheel"; then
+        say "reusing the wheel compiled from the same inputs ($id; VLLM_REBUILD=1 compiles anew)"
+        cp "$(dirname "$wheel")/PATCHES.applied" "$src/PATCHES.applied"
+    else
+        compile_wheel "$src"
+        wheel="$WHEEL"
+        keep_compiled "$id" "$wheel" "$src"
+    fi
 
     say "publishing the wheelhouse"
     local dist="$BUILD_ROOT/dist" devai_applied

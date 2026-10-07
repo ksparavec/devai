@@ -1838,7 +1838,7 @@ VLLM_PYTHON ?= /usr/bin/python3
 
 build-vllm: build-vllm-dist build-vllm-image ## Compile vLLM VLLM_VERSION (default 0.30.0) from source on the host as its build record says, then build the devai-vllm image from it. VLLM_DEVAI_IMAGE=<tag> keeps :latest where it is.
 
-build-vllm-dist: ## Compile vLLM FROM SOURCE on the host for this GPU only (compute capability 12.0), from the build record deploy/vllm-builds/$(VLLM_VERSION).sh (its patch series applied --fuzz 0, its hash-locked runtime set). LONG. Needs the CUDA 13 dev packages, uv and a rustup toolchain; see scripts/build-vllm.sh.
+build-vllm-dist: ## Compile vLLM FROM SOURCE on the host for this GPU only (compute capability 12.0), from the build record deploy/vllm-builds/$(VLLM_VERSION).sh (its patch series applied --fuzz 0, its hash-locked runtime set). LONG. Skipped when the compile inputs are unchanged (the runtime lock is not one): the newest compiled wheel is reused; VLLM_REBUILD=1 compiles anew. Needs the CUDA 13 dev packages, uv and a rustup toolchain; see scripts/build-vllm.sh.
 	PATH="$(HOME)/.cargo/bin:$$PATH" VLLM_VERSION=$(VLLM_VERSION) VLLM_BUILD_ROOT=$(VLLM_BUILD_ROOT) \
 		bash scripts/build-vllm.sh
 
