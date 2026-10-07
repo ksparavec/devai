@@ -432,7 +432,7 @@ docs/backup-restore.md        -- devai-backup reference: what's backed up/exclud
 docs/security-ci.md           -- GitHub Actions security-CI reference: blocking vs advisory checks, branch protection, local pre-push commands.
 docs/mcp-model-status.md      -- devai-model-status MCP server reference: the 3 tools, image/catalog registration, verification.
 docs/gpu-vendors.md           -- GPU-vendor overlay reference (NVIDIA default, AMD/ROCm opt-in): the switch, every call site touched, verification status.
-docs/plans/                   -- 14 design plans + execution-order README (README.md holds the canonical status table; 3 plans are Frozen). See "Documentation" section above for the snapshot.
+docs/plans/                   -- one plan, platform-rebuild.md (23 phases), plus README.md (the status legend, and every removed plan with what happened to it) and TEMPLATE.md. All other plans were removed on 2026-10-05; git history keeps them. See "Documentation" section above.
 ```
 
 ## Documentation conventions
