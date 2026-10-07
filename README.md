@@ -424,7 +424,7 @@ make install-systemd            # stage compose + symlink caches into ~/.config/
 make uninstall-systemd          # reverse: disable unit + remove staged files
 ```
 
-`install-systemd` stages a systemd user service that brings the infrastructure containers up on login (`loginctl enable-linger` keeps them running after logout). It **copies** `docker-compose.yaml` into `~/.config/devai/` and **symlinks** nine of the paths the compose mounts (`registry-config.yaml`, `logging.sh`, `recovery-flags.json`, `vllm-plugins.json`, `models.yaml`, and the four `.X-reasoning-cache.json` files) back into the repo's `deploy/`. The symlinks keep the systemd-managed stack reading the same probe caches that `make probe` writes -- no duplication, no drift.
+`install-systemd` stages a systemd user service that brings the infrastructure containers up on login (`loginctl enable-linger` keeps them running after logout). It **copies** `docker-compose.yaml` into `~/.config/devai/` and **symlinks** eight of the paths the compose mounts (`registry-config.yaml`, `logging.sh`, `vllm-plugins.json`, `models.yaml`, and the four `.X-reasoning-cache.json` files) back into the repo's `deploy/`. The symlinks keep the systemd-managed stack reading the same probe caches that `make probe` writes -- no duplication, no drift. The two recovery-flag files are not staged: the router mounts the repository's `deploy/` directory (`${DEVAI_REPO}/deploy`), and the installed unit carries `DEVAI_REPO`, set to the repository path at install time.
 
 ## Updating
 
@@ -566,7 +566,8 @@ deploy/
 gpu-arbiter/
   main.go                         -- Router source (multi-port proxy, reasoning policy,
                                     write-endpoint guard; single-host only)
-  recovery_flags.go               -- Per-model engine flags/env from recovery-flags.json
+  recovery_flags.go               -- Per-model engine flags/env from recovery-flags.json and
+                                    recovery-flags.generated.json, re-read at each launch
   vllm_plugins.go                 -- vLLM parser-plugin registry (vllm-plugins.json)
   catalog_mtp.go                  -- MTP launch-param side-table read from models.yaml
   policy_test.go                  -- Unit tests for the reasoning policy

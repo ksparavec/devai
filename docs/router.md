@@ -979,6 +979,107 @@ probers launch with the same flags. Without this symmetry the probe
 would record `fits=false` at 128K, the picker would hide the cell,
 and the router would never get a chance to use the recovery flags.
 
+### The machine-made file, and the re-read at each launch
+
+Since platform-rebuild Phase 17a (decision I25) there is a second file,
+`deploy/recovery-flags.generated.json`, for flags a program added:
+recipe flags written by `make recipe-apply NAME=<row>` (docs/backends.md
+"vLLM launch recipes") and, from Phase 18, automatic fixes. The curated
+file is never written by a program, and its contract above does not
+change.
+
+```json
+{
+  "version": 1,
+  "models": {
+    "<model>": [
+      {"backends": ["vllm-devai"], "engine_flags": ["--enforce-eager"],
+       "engine_env": {}, "source": "recipe",
+       "reason": "vllm-project/recipes models/<org>/<repo>.yaml at <commit>",
+       "added": "2026-10-07T10:00:00Z"}
+    ]
+  }
+}
+```
+
+- Each model has a LIST of groups. `backends` is required (there is no
+  "every backend" group); `source` is `recipe` or `auto-fix`
+  (informational; the readers do not check it); a group has no `image`
+  (one is ignored with a warning).
+- For a launch on backend B, the router appends the curated entry's
+  flags (and merges its env) when it applies to B, then every generated
+  group whose `backends` names B or B's engine, in file order -- the
+  curated file's own matching rule, so a `["vllm"]` group reaches a
+  `vllm-devai` launch and a `["vllm-devai"]` group does not reach
+  `vllm`. Later env keys win, and the engine takes the last of a repeated
+  flag.
+- A missing file reads as empty. The repository ships
+  `{"version": 1, "models": {}}`, which adds nothing to any launch.
+  Removing a group, or the whole file, reverts exactly what it added.
+- Writers write the whole file to a temporary name and rename it.
+
+**Malformed input, in both files.** The router and the probers give the
+same verdict on every malformed input; the shared fixture in
+`tests/fixtures/recovery-flags/` (good files, `broken/` files and a
+hand-written `expected.json`) is loaded by both test suites.
+
+- Keys are exact and case-sensitive (`Backends` or `ENGINE_FLAGS` is an
+  unknown key, not a spelling of the real one; the Go reader decodes
+  objects into maps, never into tagged structs, whose matching ignores
+  case).
+- A top level that is not a JSON object (`null` included), a `models` that
+  is neither absent/null nor an object, invalid JSON (NaN included), and
+  in the generated file a `version` other than the integer 1, fail the
+  whole file: the previously loaded content is kept.
+- An entry or group with a malformed field is skipped WHOLE, never applied
+  in part: `engine_flags` must be absent, null or a list of strings (no
+  null or non-string element, not a string); `engine_env` absent, null or
+  an object of strings; a curated `image` absent, null or a string.
+- `backends`: a curated entry follows contract C2 above (a non-list is
+  treated as absent), except that a list with a non-string or null
+  element skips the entry; a generated group's must be a list of strings,
+  else the group is skipped.
+
+**Re-read at each launch.** The router used to read the curated file once,
+at boot. Now `containerRecreate` looks the model up through
+`recoveryFiles` (`gpu-arbiter/recovery_flags.go`), which stats both files
+first and reloads either one whose device, inode, mtime or size changed.
+A file that fails to parse (or carries another `version`) keeps the
+previously loaded content and logs `warning: ... keeping the previously
+loaded ...`; the next launch tries again. A curated file that disappears
+after a good load keeps its previous entries too (`warning: ... disappeared;
+keeping ...`): `git checkout` replaces a file by unlink and create, so a
+launch can land between the two. A curated file missing at boot reads as
+empty and logs with the `warning:` prefix. A removed generated file, by
+contrast, reverts what it added (I25). The probers do the same before each
+launch (`_refresh_recovery` in `scripts/_probe_hf_common.py`).
+
+Every launch that applies recovery flags logs one line naming them and
+their sources, e.g.
+
+```
+  vllm-devai recovery flags for <model>: flags=["--max-num-seqs" "8" ... "--async-scheduling"] env=["VLLM_X=1"] image="" (curated entry: true, generated groups: 1)
+```
+
+**The directory mount.** Compose mounts the repository's `deploy/`
+directory read-only at `/etc/devai/deploy` and points
+`RECOVERY_FLAGS_REGISTRY` and `RECOVERY_FLAGS_GENERATED` at the two files
+there. A single-file bind mount pins the old inode, so a file replaced with
+a new inode (the writers' rename, `git checkout`'s unlink and create) would
+stay invisible and the container would go on reading the old content. The mount source is `${DEVAI_REPO:?...}/deploy`:
+an unset `DEVAI_REPO` stops compose instead of mounting `/deploy`. The
+Makefile exports `DEVAI_REPO := $(CURDIR)`; `tests/test-router-idle.sh`
+and `tests/test-model-matrix.sh`, which run compose themselves, default it
+to the repository root; `make install-systemd` writes it into the unit as
+`Environment="DEVAI_REPO=<path>"`, escaped for a quoted value. **An
+existing systemd install must re-run `make install-systemd`**: the unit it
+installed before has no `DEVAI_REPO`, and compose refuses to start without
+it.
+`RECOVERY_FLAGS_REGISTRY` defaults to `/etc/devai/deploy/recovery-flags.json`
+and `RECOVERY_FLAGS_GENERATED` to `recovery-flags.generated.json` beside
+it. The other router mounts (probe caches,
+`models.yaml`, plugins) are unchanged until Phase 9.
+
 ---
 
 ## vLLM plugin registry

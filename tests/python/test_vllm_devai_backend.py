@@ -244,7 +244,11 @@ class ParserHintsByEngineTest(unittest.TestCase):
         import _probe_hf_common as hf
         src = inspect.getsource(hf.run_probe_pass)
         self.assertIn("curated_parsers(row, spec.name)", src)
-        self.assertIn("derive_parser_for(", src)
+        # The parser order (Phase 17a) lives in resolve_parsers, which
+        # run_probe_pass calls with the backend name.
+        self.assertIn("resolve_parsers(", src)
+        self.assertIn("name, models_dir, spec.name, curated_reasoning, curated_tool", src)
+        self.assertIn("derive_parser_for(", inspect.getsource(hf.resolve_parsers))
         self.assertNotIn('("parsers") or {}).get(spec.name)', src)
         self.assertNotIn("derive_parser(\n                    name, models_dir, spec.name", src)
 

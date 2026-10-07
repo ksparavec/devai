@@ -241,6 +241,9 @@ COPY scripts/_capability.py /usr/local/bin/_capability.py
 COPY scripts/_model_status.py /usr/local/bin/_model_status.py
 COPY scripts/vram-fit.py /usr/local/bin/vram-fit.py
 COPY deploy/models.yaml /etc/devai/models.yaml
+# vLLM launch-recipe seeds (make fetch-vllm-recipes): the picker's recipe badge.
+# bin/devai-agent overmounts it from ~/.devai/ like models.yaml.
+COPY deploy/recipe-seeds.yaml /etc/devai/recipe-seeds.yaml
 RUN chmod +x /usr/local/bin/aiagent-shell /usr/local/bin/dsh-web /usr/local/bin/agent-picker /usr/local/bin/model-picker /usr/local/bin/sky-setup.sh
 
 # Name the GPU 'render' group in /etc/group. On the host, /dev/dri/renderD* is

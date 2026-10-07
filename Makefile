@@ -84,6 +84,11 @@ export OLLAMA_IMAGE
 # an install without .env still resolves.
 DEVAI_GPU_DEVICE ?= nvidia.com/gpu=all
 export DEVAI_GPU_DEVICE
+# The repository root, by absolute path. Compose mounts $(DEVAI_REPO)/deploy
+# read-only into the router (the two recovery-flag files, re-read at each
+# launch), as a DIRECTORY so a file replaced with a new inode is seen (I25).
+# The compose file refuses to start without it (`${DEVAI_REPO:?}`).
+export DEVAI_REPO := $(CURDIR)
 CACHE_COMPOSE = $(CURDIR)/deploy/docker-compose.yaml
 
 # Services `make cache-up` brings up, in compose-declaration order. Listed
@@ -244,6 +249,7 @@ endif
 .PHONY: vllm-list vllm-rm vllm-status vllm-df
 .PHONY: clean clean-cpu clean-gpu clean-router prune
 .PHONY: fetch-cli pull-images install install-systemd uninstall test test-router test-ollama test-agents test-models test-probe-vllm test-probe-sglang test-probe-ollama-idempotent test-vllm test-sglang test-e2e test-full help
+.PHONY: fetch-vllm-recipes recipe-apply
 .PHONY: catalog-regen catalog-suggest catalog-discover catalog-discover-add probe probe-vllm probe-sglang probe-load-vllm probe-load-sglang probe-check probe-ornith-arch model-fit model-pull model-status model-sync vram-fit verify-backend-flags ollama-cleanup-ctx-variants
 .PHONY: bench bench-vllm bench-sglang bench-ollama bench-report bench-harvest test-bench-smoke
 .PHONY: test-python build-backup-tool build-devai-tools test-devai-tools
@@ -439,7 +445,9 @@ BASE_IMAGES = debian:trixie $(GPU_BASE_IMAGE)
 # devai-router) and `devai/` (docker.io/devai/vllm-devai, tagged with a
 # registry name but present only locally -- a pull would fail three times
 # and abort the target).
-CACHE_IMAGES = $(shell $(COMPOSE) -f $(CACHE_COMPOSE) config --images 2>/dev/null | grep -vE 'devai-|devai/')
+# DEVAI_REPO is passed explicitly: the compose file refuses to render without
+# it, and GNU Make before 4.4 does not hand exported variables to $(shell).
+CACHE_IMAGES = $(shell DEVAI_REPO=$(DEVAI_REPO) $(COMPOSE) -f $(CACHE_COMPOSE) config --images 2>/dev/null | grep -vE 'devai-|devai/')
 # Seconds between pull-images retry attempts (the attempt COUNT is fixed at 3).
 PULL_RETRY_DELAY ?= 5
 
@@ -831,6 +839,7 @@ help: ## Show this help message
 	@printf "  %-44s%s\n" "ollama-df        Disk usage" ""
 	@printf "  %s\n" "ollama-clean     Clean partials"
 	@printf "  %-44s%s\n" "card-hints       Derived parser report" "card-hints-fetch Stage metadata only"
+	@printf "  %-44s%s\n" "fetch-vllm-recipes  vLLM recipe seeds" "recipe-apply     NAME=<row> recipe flags"
 	@printf "\n"
 	@printf "  %s\n" "DEPLOY"
 	@printf "  %s\n" "install-systemd  Auto-start infrastructure at boot"
@@ -1160,6 +1169,12 @@ PROBE_CONTEXTS ?= 32K,64K,128K,256K
 # e.g. PROBE_FORCE_CTX=128K PROBE_KV_CACHE_TYPE=q8_0 PROBE_FLASH_ATTENTION=1.
 PROBE_KV_CACHE_TYPE   ?=
 PROBE_FLASH_ATTENTION ?=
+# HF probers: 1 = the card-derived parsers alone drive the launch (the curated
+# parsers: block, the recipe seed and the name heuristic are skipped; plan I24).
+# The prober refuses it unless scoped (PROBE_REPO) and pointed at a scratch
+# cache (--cache, which these targets do not pass yet), and then writes no
+# exclusion ledger: its cells must not replace the curated ones.
+PROBE_IGNORE_CURATED_PARSERS ?=
 # Seconds to wait for the recreated devai-ollama to answer `ollama list`
 # before `make probe` gives up. Bounded so a daemon that never comes up
 # fails loudly instead of hanging the probe run forever.
@@ -1291,7 +1306,13 @@ probe-vllm: ## Probe every downloaded vLLM/HF model per (VRAM, CONTEXT) cell.
 	@#   PROBE_KV_CACHE_TYPE=auto    KV dtype for this pass (default fp8);
 	@#                               cells are stamped so serve time
 	@#                               reproduces the measured dtype
+	@#   PROBE_IGNORE_CURATED_PARSERS=1  card-derived parsers only: skip the
+	@#                               curated block, recipe seed and name
+	@#                               heuristic (plan I24); the prober refuses
+	@#                               it without PROBE_REPO and a scratch
+	@#                               --cache (run the script directly)
 	PROBE_KV_CACHE_TYPE="$(PROBE_KV_CACHE_TYPE)" \
+	PROBE_IGNORE_CURATED_PARSERS="$(PROBE_IGNORE_CURATED_PARSERS)" \
 	python3 scripts/probe-vllm-reasoning.py \
 	    --host-vram-gb $(GPU_MEMORY_GB) \
 	    --models-dir $(VLLM_MODELS_DIR) \
@@ -1315,7 +1336,13 @@ probe-vllm-devai: ## Probe every downloaded HF model on the vllm-devai backend (
 	@#   PROBE_KV_CACHE_TYPE=auto    KV dtype for this pass (default fp8);
 	@#                               cells are stamped so serve time
 	@#                               reproduces the measured dtype
+	@#   PROBE_IGNORE_CURATED_PARSERS=1  card-derived parsers only: skip the
+	@#                               curated block, recipe seed and name
+	@#                               heuristic (plan I24); the prober refuses
+	@#                               it without PROBE_REPO and a scratch
+	@#                               --cache (run the script directly)
 	PROBE_KV_CACHE_TYPE="$(PROBE_KV_CACHE_TYPE)" \
+	PROBE_IGNORE_CURATED_PARSERS="$(PROBE_IGNORE_CURATED_PARSERS)" \
 	python3 scripts/probe-vllm-devai-reasoning.py \
 	    --host-vram-gb $(GPU_MEMORY_GB) \
 	    --models-dir $(VLLM_MODELS_DIR) \
@@ -1338,7 +1365,11 @@ probe-sglang: ## Probe every downloaded SGLang/HF model per (VRAM, CONTEXT) cell
 	@#                               (default: none = engine default);
 	@#                               cells are stamped so serve time
 	@#                               reproduces the measured dtype
+	@#   PROBE_IGNORE_CURATED_PARSERS=1  card-derived parsers only: skip the
+	@#                               curated block and name heuristic (plan I24);
+	@#                               refused without PROBE_REPO and a scratch --cache
 	PROBE_KV_CACHE_TYPE="$(PROBE_KV_CACHE_TYPE)" \
+	PROBE_IGNORE_CURATED_PARSERS="$(PROBE_IGNORE_CURATED_PARSERS)" \
 	python3 scripts/probe-sglang-reasoning.py \
 	    --host-vram-gb $(GPU_MEMORY_GB) \
 	    --models-dir $(SGLANG_MODELS_DIR) \
@@ -1490,6 +1521,19 @@ probe-check: ## Report backend image drift: compare running vLLM/SGLang image di
 	@CONTAINER_RUNTIME=$(CONTAINER_RUNTIME) \
 	  VLLM_IMAGE="$(VLLM_IMAGE)" SGLANG_IMAGE="$(SGLANG_IMAGE)" \
 	  python3 scripts/probe-check.py
+
+fetch-vllm-recipes: ## Fetch vLLM's official launch recipes (github.com/vllm-project/recipes) for the catalog's HF rows into deploy/recipe-seeds.yaml. Offline-first: cached 12 h, never fails. RECIPES_CACHE=<dir>, OFFLINE=1, REFRESH=1.
+	@#   Review `git diff deploy/recipe-seeds.yaml`; the probers use a seed's
+	@#   parsers after the curated and card-derived ones; nothing launches with
+	@#   its engine flags until `make recipe-apply NAME=<row>`.
+	python3 scripts/fetch-vllm-recipes.py \
+	    $(if $(RECIPES_CACHE),--cache-dir '$(RECIPES_CACHE)',) \
+	    $(if $(OFFLINE),--offline,) \
+	    $(if $(REFRESH),--refresh,)
+
+recipe-apply: ## Write one row's reviewed recipe flags into deploy/recovery-flags.generated.json (backend vllm-devai), only where min_vllm_version admits build-vllm.sh's vLLM; flags the launch builders emit are reported, not written. NAME=<row>, DRY_RUN=1.
+	@test -n "$(NAME)" || { echo "usage: make recipe-apply NAME=<catalog row> [DRY_RUN=1]"; exit 2; }
+	python3 scripts/recipe-apply.py --name '$(NAME)' $(if $(DRY_RUN),--dry-run,)
 
 card-hints: ## Read-only: predicted-vs-curated parser report derived from each checkpoint's own chat template. No GPU, no launch, changes nothing.
 	@VLLM_MODELS_DIR="$(VLLM_MODELS_DIR)" SGLANG_MODELS_DIR="$(SGLANG_MODELS_DIR)" \
@@ -1708,6 +1752,9 @@ install: ## Install bin/devai-agent to $(INSTALL_PREFIX)/bin and stage config in
 	@# picker sees rows and `mtp:` blocks added after the last image build.
 	@ln -sf "$(CURDIR)/deploy/models.yaml" $(DEVAI_HOME)/models.yaml
 	@echo "  linked: $(DEVAI_HOME)/models.yaml"
+	@# The vLLM recipe seeds, for the picker's recipe badge; mounted the same way.
+	@ln -sf "$(CURDIR)/deploy/recipe-seeds.yaml" $(DEVAI_HOME)/recipe-seeds.yaml
+	@echo "  linked: $(DEVAI_HOME)/recipe-seeds.yaml"
 	@# Symlink each backend's probe cache so it stays fresh as the prober
 	@# regenerates it. If users want a frozen snapshot they can replace the
 	@# link with a copy after install. Missing caches are warned but not
@@ -1756,6 +1803,7 @@ uninstall: ## Remove devai-agent launcher and the staged config dir
 	@rm -f $(DEVAI_HOME)/.vllm-devai-reasoning-cache.json
 	@rm -f $(DEVAI_HOME)/.bench-cache.json
 	@rm -f $(DEVAI_HOME)/models.yaml
+	@rm -f $(DEVAI_HOME)/recipe-seeds.yaml
 	@rm -f $(DEVAI_HOME)/model-picker.py
 	@rm -f $(DEVAI_HOME)/_capability.py
 	@rm -f $(DEVAI_HOME)/_model_status.py
@@ -1786,7 +1834,6 @@ install-systemd: ## Install and enable systemd service for infrastructure
 	@# (which the old recipe would leave behind on re-runs).
 	ln -sfn $(CURDIR)/deploy/registry-config.yaml          $(HOME)/.config/devai/registry-config.yaml
 	ln -sfn $(CURDIR)/deploy/logging.sh                    $(HOME)/.config/devai/logging.sh
-	ln -sfn $(CURDIR)/deploy/recovery-flags.json           $(HOME)/.config/devai/recovery-flags.json
 	ln -sfn $(CURDIR)/deploy/vllm-plugins.json             $(HOME)/.config/devai/vllm-plugins.json
 	@# models.yaml is mounted by the router service (MTP launch params).
 	@# Symlinked, not copied, so a `make catalog-regen` in the repo is
@@ -1797,7 +1844,12 @@ install-systemd: ## Install and enable systemd service for infrastructure
 	ln -sfn $(CURDIR)/deploy/.vllm-reasoning-cache.json    $(HOME)/.config/devai/.vllm-reasoning-cache.json
 	ln -sfn $(CURDIR)/deploy/.sglang-reasoning-cache.json  $(HOME)/.config/devai/.sglang-reasoning-cache.json
 	ln -sfn $(CURDIR)/deploy/.vllm-devai-reasoning-cache.json  $(HOME)/.config/devai/.vllm-devai-reasoning-cache.json
-	cp deploy/systemd/devai-infra.service $(HOME)/.config/systemd/user/
+	@# The router reads both recovery-flag files from $(DEVAI_REPO)/deploy (a
+	@# directory mount, plan I25), so the unit carries the repository path.
+	@# Read from the environment (exported above), never pasted into the
+	@# shell, and escaped for the unit's quoted Environment= value, so a path
+	@# with spaces, |, &, quotes or % is carried as it is; a newline is refused.
+	python3 -c 'import os, sys; repo = os.environ["DEVAI_REPO"]; "\n" in repo and sys.exit("install-systemd: the repository path contains a newline"); value = repo.replace("\\", "\\\\").replace("\"", "\\\"").replace("%", "%%"); open(sys.argv[2], "w").write(open(sys.argv[1]).read().replace("@DEVAI_REPO@", value))' deploy/systemd/devai-infra.service "$$HOME/.config/systemd/user/devai-infra.service"
 	systemctl --user daemon-reload
 	systemctl --user enable --now podman.socket
 	systemctl --user enable --now devai-infra.service

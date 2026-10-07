@@ -607,6 +607,82 @@ A wrong tool parser mis-parses live tool calls; NO parser merely means
 the router strips tools and plain chat still works. So the derivation is
 built to refuse rather than guess, and these names stay curated.
 
+#### The parser order
+
+The HF probers pick each parser (tool, reasoning) from the first of these
+that has one (`resolve_parsers` in `scripts/_probe_hf_common.py`;
+platform-rebuild Phase 17a):
+
+1. the curated `parsers:` block (`curated`);
+2. the value derived from the checkpoint's own chat template (`card`,
+   `scripts/_card_hints.py`, which refuses rather than guesses);
+3. the vLLM recipe seed (`recipe`, `deploy/recipe-seeds.yaml`, see "vLLM
+   launch recipes" below) -- vLLM engines only, and only when the
+   recipe's `min_vllm_version` admits the vLLM the backend runs: the
+   version in the launch image's tag (a curated `image` pin counts), else,
+   for `vllm-devai` (tagged `latest`), `scripts/build-vllm.sh`'s default
+   `VLLM_VERSION`; an image whose tag names no version gets no seed;
+4. a name heuristic (`heuristic`, printed as "guessed, not
+   probe-verified"): `NAME_PARSER_HEURISTICS`, an ordered table of name
+   patterns (DeepSeek-R1 first, then gpt-oss, Qwen3-Coder, Qwen3.5+, Qwen3,
+   Gemma-4). Each value is one this host's probe caches recorded for that
+   family on 2026-10-07: a tool parser verified in AUTO mode, a reasoning
+   parser with capability `structured`. Left out on that evidence: the
+   Llama-3.x tool parsers and SGLang's `qwen` for the Qwen3.5+ markup
+   (both passed only the forced call), SGLang `qwen3_coder` (never
+   verified there), and every plugin-backed parser;
+5. none: no parser flag, and the router strips tools.
+
+Steps 3 and 4 are guesses for a model nobody has curated: they run only
+when the row has no `parsers:` block for the backend's engine (or its own
+name). A kind such a block leaves out is a curated omission -- gemma4's
+"no reasoning parser" was measured and written down in
+`scripts/model-families.yaml` -- and only the card derivation (step 2)
+may fill it, as before. (A literal reading of the plan's order would let
+the Gemma-4 recipes' `gemma4` reasoning parser override that decision.)
+
+The probe stays the authority: it launches with the chosen value, and a
+parser the tool or reasoning round trip cannot verify is not recorded in
+the row's `tool_parser` / `reasoning_parser`. Two rules hold for GUESSED
+values (steps 3 and 4) only:
+
+- A guessed tool parser is recorded only when the auto-choice call (Probe
+  B1) verifies it. The forced call (B2, a named `tool_choice`) is
+  satisfied by constrained decoding without the parser -- vLLM 0.28 builds
+  the call from the constrained JSON, SGLang skips its detector for a named
+  or required choice in the common case -- so it cannot tell a working
+  parser from a wrong one, and a row recorded `tool_mode=forced` answers
+  every multi-tool request 400 at the router. The forced result is kept in
+  the cell's evidence (`auto_only`, with the reason). Curated and
+  card-derived parsers keep the old rule (either call verifies).
+- If the row's FIRST launch in a run fails -- at startup, in Probe A,
+  anywhere -- while it carries a guess, the same context is relaunched
+  once without the guesses. Only if that run fits is the guess blamed: it
+  is dropped for the rest of the run and recorded in `parser_fallback`,
+  and later runs skip that value for that kind (the order goes on to the
+  next step). If the run without it fails too, the failure is not the
+  guess's (an OOM, a recovery flag the engine rejects, ...): the guesses
+  stay and nothing is recorded. At most one extra launch per row.
+  vLLM's `invalid tool call parser` / `invalid reasoning parser` startup
+  errors are filed as `launch_args` (they used to be `infra`).
+
+The row records which step each value came from (provenance table below).
+
+`PROBE_IGNORE_CURATED_PARSERS=1` (plan I24; `make probe-vllm`,
+`probe-vllm-devai` and `probe-sglang` forward it, or `--ignore-curated-parsers`)
+skips steps 1, 3 and 4, so the card-derived parsers alone drive the launch.
+It exists for Phase 4's check of the card path on gpt-oss-20b, and its cells
+must not replace the curated ones, so the prober refuses it without
+`--repo` (`PROBE_REPO`) and a scratch `--cache <file>` other than the
+backend's own, refuses `--no-cache-write` (which makes a row that already
+fits look fully cached, so the run would probe nothing), and does not
+write the exclusion ledger under it. The `--load` pass refuses it: it
+relaunches with the parsers the fit pass recorded. On an exact-context miss
+(`PROBE_CTX_EXACT`) the provenance fields are restored with the band. The Makefile does not forward a cache path yet (Phase 4
+adds `PROBE_CACHE` and a scratch `--ledger`), so today run the prober
+directly, e.g. `python3 scripts/probe-vllm-devai-reasoning.py --repo gpt-oss
+--ignore-curated-parsers --cache /tmp/i24-cache.json`.
+
 #### Gemma-4's `<|think|>` is prompt text, not an output delimiter
 
 Gemma-4's template gates a `<|think|>` token on `enable_thinking` and
@@ -714,14 +790,18 @@ together re-probe the cell and re-derive the capability.
 
 #### Provenance fields in the HF probe caches
 
-Every model row the vLLM / vllm-devai / SGLang prober writes carries four
+Every model row the vLLM / vllm-devai / SGLang prober writes carries these
 additive fields beside `reasoning_parser` and `tool_parser` (no schema
-bump; written in `scripts/_probe_hf_common.py`, where the parsers are
-resolved, about lines 2405-2473). The Ollama cache has none of them.
+bump; written in `run_probe_pass` in `scripts/_probe_hf_common.py`, from
+what `resolve_parsers` returns). The parser fields are written only when
+the run actually probes the row, so they describe the parsers its cells
+were measured with; a row served from the cache keeps the provenance of
+the run that measured it. The Ollama cache has none of them.
 
 | Field | Values | Meaning |
 |---|---|---|
-| `tool_parser_source`, `reasoning_parser_source` | `"curated"`, `"card"` or `null` | where the row's parser came from: `curated` = the family's `parsers:` block in `deploy/models.yaml` (`curated_parsers`); `card` = derived from the checkpoint's own chat template (`derive_parser_for`, `scripts/_card_hints.py`), used only when no curated value exists; `null` = neither, so no parser flag is emitted |
+| `tool_parser_source`, `reasoning_parser_source` | `"curated"`, `"card"`, `"recipe"`, `"heuristic"` or `null` | which step of the parser order (above) chose the parser the probe launched with: `curated` = the family's `parsers:` block in `deploy/models.yaml` (`curated_parsers`); `card` = derived from the checkpoint's own chat template (`derive_parser_for`, `scripts/_card_hints.py`); `recipe` = the vLLM recipe seed (`deploy/recipe-seeds.yaml`); `heuristic` = the name heuristic, guessed, not probe-verified; `null` = none of them, so no parser flag is emitted. It records where the candidate came from, not that the probe verified it: the verified value is `tool_parser` / `reasoning_parser` |
+| `parser_fallback` | `{"tool" or "reasoning": {"parser": X, "source": "recipe" or "heuristic", "failure": <evidence kind>, "note": ...}}` | present only when the row's first launch with a guessed parser failed and the same context then fit without it (see "The parser order"); the source field of that kind is then `null`, and later runs skip that value. Kept while it still keeps the same guess out |
 | `parser_disagreement` | `{"tool" or "reasoning": {"curated": X, "derived": Y}}` | present only when the card derivation names a DIFFERENT parser than the curated block; the curated value is still served, and the prober also prints a WARNING. Removed again when a re-probe finds them in agreement |
 | `card_sampling` | a subset of `temperature`, `top_p`, `top_k`, `eos_token_id` | the checkpoint's own `generation_config.json` (`_card_hints.sampling_defaults`), read host-side at probe time; omitted when the file is absent or holds none of these keys |
 
@@ -732,10 +812,115 @@ the first real run of the card branch comes with the platform-rebuild
 re-probe (Phase 4, I24).
 
 Readers: only the prober itself, which prints the sources in its progress
-line (`R=<parser>(curated) T=<parser>(card)`). The router, the picker
+line (`R=<parser>(curated) T=<parser>(card)`; a heuristic value as
+`(heuristic: guessed, not probe-verified)`). The router, the picker
 and the bench do not read any of the four. In particular `card_sampling`
 was stamped so that the bench could read sampling defaults without a
 weights mount, but no bench code reads it (checked 2026-10-07).
+
+### vLLM launch recipes (`make fetch-vllm-recipes`, `make recipe-apply`)
+
+vLLM publishes a launch recipe per model at
+github.com/vllm-project/recipes (`models/<org>/<repo>.yaml`): base args and
+env, the tool-calling and reasoning parser args, per-precision variants
+with a VRAM minimum and extra flags, and `min_vllm_version`. Phase 17a of
+the platform rebuild (from odysseus CB-3) uses them in three places, none
+of which launches anything with an unreviewed recipe flag.
+
+**`make fetch-vllm-recipes`** (`scripts/fetch-vllm-recipes.py`) matches
+every HF / derived catalog row to a recipe and writes
+`deploy/recipe-seeds.yaml`, one entry per row that has one: the parsers,
+engine flags and env, `min_vllm_version`, the recipe's path and commit,
+how it matched, and the recipe's VRAM minimum for the row's precision.
+
+- Matching, recorded as `match`: `exact` (the row's repo is the recipe's
+  model), `variant` (the row's repo is one of the recipe's
+  `variants.*.model_id`), `base-name` (the repo name minus quantisation
+  and packaging suffixes -- `-NVFP4`, `-FP8`, `-MTP`, `-W4A16-AutoRound`,
+  `-devai`, ... -- equals one recipe's; two candidates match nothing). A
+  derived row matches through its source's repo. A row that matches no
+  recipe by name still gets a `variant` match when its repo is a variant
+  of a recipe loaded for another row.
+- Engine flags are the recipe's base args, plus the variant's extra args
+  only when the row IS that variant's checkpoint: a variant's extras
+  describe its own checkpoint (some recipes carry Ascend-NPU settings
+  there), not another publisher's quantisation of the same model.
+- A parser whose recipe also loads a parser plugin file is not seeded
+  (the seed records a note): vLLM does not ship that parser.
+- Offline-first, never a failure: the index (commit and file list) is
+  cached 12 h under `~/.cache/devai/vllm-recipes` (`RECIPES_CACHE=<dir>`
+  or `DEVAI_VLLM_RECIPES_CACHE`), each recipe file by commit. With the
+  network down a stale cache is used; with no cache at all nothing is
+  seeded, an existing seeds file is left as it is and a missing one is
+  written empty. A row whose own recipe file cannot be had keeps its
+  previous seed, which still names the commit it came from. `OFFLINE=1`
+  never touches the network, `REFRESH=1` re-fetches the index.
+- Each seed records, per vLLM backend, the vLLM a launch of that row runs
+  on this host (`vllm_version`: a curated `image` pin, judged by its own
+  tag; else the backend's image, `$VLLM_IMAGE` or the compose default for
+  `vllm`, `$VLLM_DEVAI_IMAGE` or `scripts/build-vllm.sh`'s default for
+  `vllm-devai`) and whether `min_vllm_version` admits it (`applies_to`).
+  Recomputed at every fetch: after an image change, run
+  `make fetch-vllm-recipes OFFLINE=1`.
+- `min_vllm_version` is read only as a string: an unquoted `0.10` is the
+  YAML float 0.1, so a non-string minimum is recorded as missing (with a
+  note), which admits no vLLM.
+
+Review `git diff deploy/recipe-seeds.yaml`. From then on the probers use a
+seed's parsers as step 3 of the parser order (above), checking
+`min_vllm_version` themselves against the image they launch, and the
+picker shows `rcp` in its RCP column (beside TOOLS) where the seed's
+`applies_to` admits the row's backend (never on SGLang or Ollama); the
+preview names the recipe, and says so when one exists but does not apply
+(e.g. a 0.25.0 minimum on stock vLLM 0.22.1). The file is baked into the lab image at
+`/etc/devai/recipe-seeds.yaml` and mounted over it by `devai-agent` from
+`~/.devai/` (`make install` stages it), like `models.yaml`.
+
+As fetched on 2026-10-07 (recipes commit 788f5f322c0f), 31 of the 36
+HF / derived rows have a recipe (Gemma-4-26B-A4B-NVFP4, whose name lacks
+`-it`, through the second pass: it is a variant of the gemma-4-26B-A4B-it
+recipe). The five without: Qwen3.6-27B-MTP-pi-tune-NVFP4 (a fine-tune;
+its name keeps `pi-tune`), Qwen3-Coder-30B-A3B-Instruct-FP4,
+Ornith-1.0-9B-NVFP4 and both DeepSeek-R1-Distill rows (no recipe). Every one of these rows has a curated `parsers:` block for vLLM,
+so today the seeds change no vLLM probe; they matter for a row added
+without one. Recipes and curation disagree on some tool parsers (the
+Qwen3.5 / 3.6 recipes name `qwen3_coder`, the probe-verified curated value
+is `qwen3_xml`), and the Gemma-4 recipes name a `gemma4` reasoning parser
+the gemma4 family deliberately does not curate (see "Gemma-4's
+`<|think|>`" above). That recipe line may be new evidence for that
+decision (the recipes target vLLM 0.19.1 and later); it is not acted on.
+
+**`make recipe-apply NAME=<row>`** (`scripts/recipe-apply.py`; `DRY_RUN=1`
+reports only) writes one group with `"source": "recipe"` into
+`deploy/recovery-flags.generated.json` (docs/router.md "The machine-made
+file"), scoped to `["vllm-devai"]`, the backend that runs the vLLM
+`scripts/build-vllm.sh` builds -- until Phase 4 step 4e renames it to
+`vllm` and rewrites these groups. It refuses unless `min_vllm_version`
+admits that build's default `VLLM_VERSION` (0.28.0 today; a `nightly`
+minimum admits nothing). It writes only flags the argument builders never
+emit and reports the rest, because the last flag wins and such a flag
+would pin every launch of the model (I18): the excluded set is every flag
+in `gpu-arbiter/testdata/argv-golden.txt` except those a golden case
+injects as RecoveryFlags (`--enforce-eager`, which stays writable), plus
+the speculative flags (`--speculative-config`; SGLang's
+`--speculative-algorithm`, `-num-steps`, `-num-draft-tokens`,
+`-eagle-topk`, `-draft-model-path`) and the sleep flags
+(`--enable-sleep-mode`, `--enable-memory-saver`). The recipe's env is
+written as it is, except a key the model's curated entry already sets.
+Re-applying a row replaces its recipe group in place (an identical one
+leaves the file untouched); other groups and models are kept; the file is
+written to a temporary name and renamed. The router and the probers pick
+it up at their next launch.
+
+A flag is compared by the name the engine resolves it to, so a spelling
+variant cannot slip past: `=value` and a `.subkey` suffix are stripped,
+`_` reads as `-`, known aliases map to their long flag (`-tp` is
+`--tensor-parallel-size`), and a flag that is a strict prefix of a
+protected long flag (argparse accepts abbreviations, e.g. `--max-model`)
+is reported too. A value that starts with `-` but is a number (`-1`) stays
+with its flag. Also reported, never written: `--hf-overrides` and
+`--rope-scaling` (models are used as delivered, CLAUDE.md), and any flag
+the model's curated entry already sets on that backend.
 
 ### Probe knobs
 
@@ -750,6 +935,7 @@ weights mount, but no bench code reads it (checked 2026-10-07).
 | `PROBE_FORCE=1` | Re-probe every cell even if cached |
 | `PROBE_FORCE_ARCH=1` | Re-probe top-level capability/arch fields |
 | `PROBE_NEEDLE_DEPTH=0.5` | Load probe: fractional depth (0.0 top, 1.0 bottom) of the recall needle |
+| `PROBE_IGNORE_CURATED_PARSERS=1` | HF fit probers only. The card-derived parsers alone drive the launch: the curated `parsers:` block, the recipe seed and the name heuristic are skipped (plan I24; see "The parser order"). Refused without `PROBE_REPO` and a scratch `--cache`, with `--no-cache-write`, and by the `--load` pass. |
 | `PROBE_CTX_EXACT=110K` | HF probers only. Probe exactly ONE context, no binary search, no 32K rounding. Requires `PROBE_REPO`. Implies `PROBE_FORCE` for the targeted rows. A hit replaces the cell (and runs the MTP pass at that ctx); a miss leaves the existing cell untouched, prints the engine's own estimate of what would have fit, and exits non-zero. See "Exact-context probing" below. |
 
 ### Exact-context probing (`PROBE_CTX_EXACT`)

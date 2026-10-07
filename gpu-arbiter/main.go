@@ -270,13 +270,13 @@ type launchConfig struct {
 	ToolParserPlugin      string
 	ReasoningParserPlugin string
 	// RecoveryFlags carries per-model CLI args pre-resolved by
-	// containerRecreate from the arbiter's recovery registry. Passing
-	// them through launchConfig instead of having the entrypoints reach
-	// up to a package global keeps the entrypoint functions pure (no
-	// hidden global dependency) and lets a future signal-driven reload
-	// of recovery-flags.json swap the registry atomically without
-	// racing in-flight requests. Empty slice = no flags, which is the
-	// path test fixtures already exercise.
+	// containerRecreate from the arbiter's recovery files (curated, then
+	// generated, I25). Passing them through launchConfig instead of having
+	// the entrypoints reach up to a package global keeps the entrypoint
+	// functions pure (no hidden global dependency); the files are
+	// re-read at each launch when they changed, outside the builders.
+	// Empty slice = no flags, which is the path test fixtures already
+	// exercise.
 	RecoveryFlags []string
 	// Speculative carries the resolved multi-token-prediction launch
 	// parameters for this request. nil = MTP off (entrypoints emit no
@@ -995,12 +995,12 @@ type arbiter struct {
 	// deploy/vllm-plugins.json). Always non-nil; entries map is empty
 	// when the registry file is missing or has no plugins.
 	pluginRegistry *vllmPluginRegistry
-	// recoveryRegistry holds per-model recovery flags (CLI args and env
-	// vars) from deploy/recovery-flags.json. Always non-nil; lookups
-	// for unknown models return (zero, false). Held on the struct (vs.
-	// a package-level var) so a future SIGHUP-style reload can swap
-	// the pointer atomically without racing in-flight requests.
-	recoveryRegistry *recoveryRegistry
+	// recoveryFiles holds per-model recovery flags (CLI args and env
+	// vars) from deploy/recovery-flags.json (curated) and
+	// deploy/recovery-flags.generated.json (machine-made, plan I25), and
+	// re-reads either file at each launch when it changed. Lookups for
+	// unknown models, and on a nil pointer, return (zero, false).
+	recoveryFiles *recoveryFiles
 	// healthClient is the short-timeout client used by backendIsServing
 	// to probe /health on each request that finds bs.running=true. A
 	// per-call &http.Client allocates a fresh transport (with its own
@@ -1444,7 +1444,8 @@ func vllmEntrypoint(modelName string, lc launchConfig) []string {
 	}
 	// Per-model recovery flags (e.g. --enforce-eager for checkpoints that
 	// OOM at vLLM model-load time on 24G). Pre-resolved by containerRecreate
-	// from a.recoveryRegistry. See deploy/recovery-flags.json.
+	// from a.recoveryFiles. See deploy/recovery-flags.json and
+	// deploy/recovery-flags.generated.json.
 	args = append(args, lc.RecoveryFlags...)
 	return args
 }
@@ -1940,8 +1941,14 @@ func buildArbiter() *arbiter {
 		env("VLLM_PLUGINS_REGISTRY", "/etc/devai/vllm-plugins.json"),
 		env("VLLM_PLUGINS_HOST_DIR", ""),
 	)
-	recoveryRegistry := loadRecoveryRegistry(
-		env("RECOVERY_FLAGS_REGISTRY", "/etc/devai/recovery-flags.json"),
+	// Both recovery files, re-read at each launch when either changed
+	// (recovery_flags.go). Compose points both into the read-only mount of
+	// the repository's deploy/ directory; the generated file defaults to
+	// the curated file's directory.
+	recoveryCurated := env("RECOVERY_FLAGS_REGISTRY", "/etc/devai/deploy/recovery-flags.json")
+	recoveryFiles := newRecoveryFiles(
+		recoveryCurated,
+		env("RECOVERY_FLAGS_GENERATED", generatedRecoveryPath(recoveryCurated)),
 	)
 
 	// Advertisement vetting inputs. Both are OPTIONAL, and a missing file
@@ -1993,7 +2000,7 @@ func buildArbiter() *arbiter {
 		totalVRAMGB:          totalVRAMGB,
 		maxContextLen:        maxCtx,
 		pluginRegistry:       pluginRegistry,
-		recoveryRegistry:     recoveryRegistry,
+		recoveryFiles:        recoveryFiles,
 		healthClient:         &http.Client{Timeout: 2 * time.Second},
 		holdCacheTTL:         jobHoldRetryAfter * time.Second,
 	}
@@ -3027,10 +3034,11 @@ func (a *arbiter) containerRecreate(bs *backendState, modelName string, desiredC
 	// via launchConfig and the spec envMap below. Single lookup keeps
 	// the two halves synced if the registry ever swaps mid-call.
 	var recoveryEnv map[string]string
-	if rec, ok := a.recoveryRegistry.Lookup(cfg.Name, modelName); ok {
+	if rec, ok := a.recoveryFiles.Lookup(cfg.Name, modelName); ok {
 		lc.RecoveryFlags = rec.Flags
 		recoveryEnv = rec.Env
 		lc.RecoveryImage = rec.Image
+		log.Printf("  %s recovery flags for %s: %s", cfg.Name, modelName, rec.describe())
 	}
 	// Speculative-decoding config (MTP). Set by the request handler when
 	// the model name carried `::mtp` AND the catalog declared an `mtp:`

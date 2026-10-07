@@ -925,7 +925,15 @@ def run_load_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
     PROBE_KV_CACHE_TYPE default -- see `_cell_kv_cache_dtype`.
 
     Backend-agnostic: identical for vLLM and SGLang via their BackendSpec.
+
+    PROBE_IGNORE_CURATED_PARSERS (plan I24) is refused here: this pass
+    relaunches with the parsers the fit pass recorded, so the switch would
+    mean nothing, and its scratch-cache contract is the fit pass's.
     """
+    if getattr(args, "ignore_curated_parsers", False):
+        sys.exit("error: PROBE_IGNORE_CURATED_PARSERS=1 / --ignore-curated-parsers "
+                 "applies to the fit pass only; the --load pass relaunches with "
+                 "the parsers the fit pass recorded (plan I24)")
     assert_no_active_backends(args.runtime)
     install_probe_cleanup()
 

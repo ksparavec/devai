@@ -133,6 +133,16 @@ _BENCH_CACHE_PATHS = [
     str(Path(__file__).resolve().parent.parent / "deploy" / ".bench-cache.json"),
 ]
 
+# vLLM launch-recipe seeds (scripts/fetch-vllm-recipes.py). Baked into the
+# image at /etc/devai/recipe-seeds.yaml and overmounted by bin/devai-agent
+# from ~/.devai/ (staged by `make install`), like the catalog. Read here
+# with yaml only: this file must not import _vllm_recipes (it runs
+# bind-mounted inside older images).
+_RECIPE_SEED_PATHS = [
+    "/etc/devai/recipe-seeds.yaml",
+    str(Path(__file__).resolve().parent.parent / "deploy" / "recipe-seeds.yaml"),
+]
+
 _ROUTER = os.environ.get("DEVAI_ROUTER_HOST", "devai-router")
 _VLLM_DIR = os.environ.get("VLLM_MODELS_DIR", "/var/cache/devai/vllm")
 _SGLANG_DIR = os.environ.get("SGLANG_MODELS_DIR", "/var/cache/devai/sglang")
@@ -1623,6 +1633,11 @@ def _format_model_row(m: dict, idx: int = 0) -> str:
     _ts = scores.get("tools")
     tools_col = (f"{_ts * 100:.0f}" if isinstance(_ts, (int, float))
                  else ("Yes" if _has_tools(m) else "No"))
+    # Recipe badge beside TOOLS: vLLM publishes a launch recipe for this
+    # model (deploy/recipe-seeds.yaml) and it applies to this backend's
+    # vLLM. The TOOLS value itself stays the probe-verified / benched one; a
+    # recipe only seeds a probe.
+    rcp_col = "rcp" if _recipe_applies(m) else "-"
 
     # Line number reflects position in the current sort order, so
     # ctrl-s renumbers the list. Caller passes 1-based ``idx``;
@@ -1639,6 +1654,7 @@ def _format_model_row(m: dict, idx: int = 0) -> str:
         f"{type_col:>6s}  "
         f"{fmt_col:>7s}  "
         f"{tools_col:>6s}  "
+        f"{rcp_col:>3s}  "
         f"{mtp_segment}"
         f"{tps_col:>7s}  "
         f"{code_col:>7s}  "
@@ -1676,6 +1692,69 @@ _REASONING_SCORE: dict[str, int] = {
     Capability.UNKNOWN:     0,
     Capability.ERROR:       0,
 }
+
+
+_RECIPE_SEEDS: dict | None = None
+
+
+def _recipe_seeds() -> dict:
+    """{catalog row name: seed} from the first readable recipe-seeds file,
+    loaded once. Fails open: a missing or malformed file means no badges."""
+    global _RECIPE_SEEDS
+    if _RECIPE_SEEDS is None:
+        _RECIPE_SEEDS = {}
+        for path in _RECIPE_SEED_PATHS:
+            try:
+                doc = yaml.safe_load(Path(path).read_text())
+            except (OSError, ValueError, yaml.YAMLError):
+                continue
+            if isinstance(doc, dict) and doc.get("version") == 1 \
+                    and isinstance(doc.get("seeds"), dict):
+                _RECIPE_SEEDS = {k: v for k, v in doc["seeds"].items()
+                                 if isinstance(v, dict)}
+            break
+    return _RECIPE_SEEDS
+
+
+def _recipe_for(m: dict) -> dict | None:
+    """The row's vLLM recipe seed, or None. A recipe is vLLM's launch
+    command, so only rows on a vLLM-engine backend have one."""
+    backend = str(m.get("backend") or "")
+    if _ENGINE_OF.get(backend, backend) != "vllm":
+        return None
+    return _recipe_seeds().get(str(m.get("name") or "")) or None
+
+
+def _recipe_applies(m: dict) -> bool:
+    """True when the seed applies to this row's backend: the fetcher's
+    `applies_to` (min_vllm_version against the vLLM that backend runs for
+    this model -- stock vLLM for `vllm`, build-vllm.sh's build for
+    `vllm-devai`, a curated image pin when there is one). The picker runs
+    inside the lab and cannot read those itself."""
+    seed = _recipe_for(m)
+    applies = (seed or {}).get("applies_to")
+    return isinstance(applies, dict) and applies.get(str(m.get("backend"))) is True
+
+
+def _recipe_line(m: dict) -> str:
+    """Preview line naming the row's vLLM recipe, or "" without one."""
+    seed = _recipe_for(m)
+    if not seed:
+        return ""
+    commit = str(seed.get("commit") or "")[:12] or "?"
+    head = (f"Recipe:    vllm-project/recipes {seed.get('recipe') or '?'} at "
+            f"{commit} ({seed.get('match') or '?'} match; min vLLM "
+            f"{seed.get('min_vllm_version') or '?'}")
+    if _recipe_applies(m):
+        return head + "; a seed, not probe-verified)\n"
+    backend = str(m.get("backend"))
+    have = ((seed.get("vllm_version") or {}).get(backend)
+            if isinstance(seed.get("vllm_version"), dict) else None)
+    why = (f"this backend runs vLLM {have}" if have else
+           "the vLLM this backend runs is not known")
+    if not isinstance(seed.get("applies_to"), dict):
+        why = "applicability not recorded; run make fetch-vllm-recipes"
+    return head + f") -- does NOT apply here: {why}\n"
 
 
 def _has_tools(m: dict) -> bool:
@@ -2451,6 +2530,7 @@ def _capability_summary_text(
         f"\n"
         f"Reasoning: {reason_label}\n"
         f"Tools:     {tools_label}    (parser: {parser})\n"
+        f"{_recipe_line(m)}"
         f"{mtp_line}"
     )
     parts = [head]
@@ -2898,6 +2978,7 @@ def _build_menu(
         f"{'TYPE':>6s}  "
         f"{'FORMAT':>7s}  "
         f"{_hdr('TOOLS', 'tools'):>6s}  "
+        f"{'RCP':>3s}  "
         f"{mtp_header_segment}"
         f"{_hdr('TPS', 'tps'):>7s}  "
         f"{_hdr('CODE%', 'code'):>7s}  "
@@ -2927,6 +3008,7 @@ def _build_menu(
     note = (
         "* = VRAM formula estimate.  "
         "TOOLS = agentic tool calling.  "
+        "RCP = vLLM recipe applies.  "
         "CODE = HumanEval pass@1.  "
         "CODE+ = HumanEval+ (hardened).  "
         "MMLU = MMLU-Pro.  "

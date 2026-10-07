@@ -86,6 +86,10 @@ MODEL_STATUS_CACHE = CONFIG_DIR / ".model-status.json"
 # was built come from it; the image's baked copy is whatever the last
 # `make build-gpu` saw (2026-07-27 here: no derived rows, no `mtp:` blocks).
 CATALOG = CONFIG_DIR / "models.yaml"
+# vLLM launch-recipe seeds (deploy/recipe-seeds.yaml, staged by `make
+# install`): the picker's recipe badge. Mounted over the image's baked copy
+# for the same reason as the catalog.
+RECIPE_SEEDS = CONFIG_DIR / "recipe-seeds.yaml"
 
 DEFAULTS: dict = {
     "vram": 24,
@@ -388,6 +392,14 @@ def build_run_cmd(
               "picker will read the copy baked into the image, which knows "
               "nothing added since the image was built (no MTP offer, no new "
               "rows). Run `make install`.", file=sys.stderr)
+    # Recipe seeds -- same treatment as the catalog.
+    if RECIPE_SEEDS.is_file():
+        cmd += ["-v", f"{RECIPE_SEEDS}:/etc/devai/recipe-seeds.yaml:ro"]
+    else:
+        print(f"devai-agent: WARNING: no recipe seeds (recipe-seeds.yaml) staged at "
+              f"{RECIPE_SEEDS}; the picker will read the copy baked into the image, "
+              "which knows no recipe fetched since the image was built. Run "
+              "`make install`.", file=sys.stderr)
 
     # Override the baked-in /usr/local/bin/model-picker with the host copy
     # so improvements made in the repo (and copied to ~/.devai/ by

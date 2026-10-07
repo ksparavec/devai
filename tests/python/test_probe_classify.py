@@ -20,6 +20,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -217,6 +218,11 @@ class TestRecoveryRegistryBackendFilter(unittest.TestCase):
 
     def setUp(self) -> None:
         self._saved = P._RECOVERY_REGISTRY
+        # recovery_overrides re-reads the real files when they change, which
+        # would replace this patch (and bring the generated groups in).
+        refresh = mock.patch.object(P, "_refresh_recovery", lambda: None)
+        refresh.start()
+        self.addCleanup(refresh.stop)
         P._RECOVERY_REGISTRY = {
             "AllBackends": {"engine_flags": ["--enforce-eager"],
                             "engine_env": {"A": "1"}},

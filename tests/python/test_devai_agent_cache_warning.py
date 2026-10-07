@@ -100,3 +100,44 @@ class CatalogMountTest(unittest.TestCase):
         uninstall = re.search(r"^uninstall:.*?(?=^\S)", mk, re.M | re.S).group(0)
         self.assertRegex(install, r'ln -sf "\$\(CURDIR\)/deploy/models\.yaml" \$\(DEVAI_HOME\)/models\.yaml')
         self.assertIn("rm -f $(DEVAI_HOME)/models.yaml", uninstall)
+
+
+class RecipeSeedsMountTest(unittest.TestCase):
+    """deploy/recipe-seeds.yaml (the picker's recipe badge, plan Phase 17a)
+    travels like the catalog: baked into the image at /etc/devai, staged by
+    `make install` into ~/.devai, and mounted over the baked copy by the
+    launcher, which says so when it is not staged."""
+
+    def _cmd(self, mod, td: str) -> tuple[str, str]:
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            cmd = mod.build_run_cmd(
+                runtime="podman", image="devai-lab-gpu", cpu_only=True,
+                work_dir=Path(td), prefs=dict(mod.DEFAULTS),
+                pref_model=None, pref_agent=None,
+            )
+        return " ".join(cmd), err.getvalue()
+
+    def test_staged_seeds_are_mounted_at_the_path_the_picker_reads(self) -> None:
+        mod = _load_launcher()
+        with tempfile.TemporaryDirectory() as td:
+            seeds = Path(td) / "recipe-seeds.yaml"
+            seeds.write_text("version: 1\nseeds: {}\n")
+            mod.PROBE_CACHES = {}
+            mod.RECIPE_SEEDS = seeds
+            joined, _ = self._cmd(mod, td)
+            self.assertIn(f"{seeds}:/etc/devai/recipe-seeds.yaml:ro", joined)
+            mod.RECIPE_SEEDS = Path(td) / "absent.yaml"
+            joined, err = self._cmd(mod, td)
+            self.assertNotIn("/etc/devai/recipe-seeds.yaml", joined)
+            self.assertIn("recipe-seeds.yaml", err)
+            self.assertIn("make install", err)
+
+    def test_install_stages_uninstall_removes_and_the_image_bakes_them(self) -> None:
+        mk = (REPO_ROOT / "Makefile").read_text()
+        install = re.search(r"^install:.*?(?=^\S)", mk, re.M | re.S).group(0)
+        uninstall = re.search(r"^uninstall:.*?(?=^\S)", mk, re.M | re.S).group(0)
+        self.assertRegex(install, r'ln -sf "\$\(CURDIR\)/deploy/recipe-seeds\.yaml" \$\(DEVAI_HOME\)/recipe-seeds\.yaml')
+        self.assertIn("rm -f $(DEVAI_HOME)/recipe-seeds.yaml", uninstall)
+        dockerfile = (REPO_ROOT / "deploy" / "Dockerfile.lab").read_text()
+        self.assertIn("COPY deploy/recipe-seeds.yaml /etc/devai/recipe-seeds.yaml", dockerfile)

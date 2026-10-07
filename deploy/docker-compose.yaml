@@ -226,11 +226,16 @@ services:
       # an actionable error rather than silently launching wrong.
       - VLLM_PLUGINS_REGISTRY=/etc/devai/vllm-plugins.json
       - VLLM_PLUGINS_HOST_DIR=${VLLM_PLUGINS_HOST_DIR:-}
-      # Per-model recovery flags + env (deploy/recovery-flags.json).
-      # Same JSON read by the vLLM/SGLang probers so probe and serve-time
-      # launches stay in sync. Missing file → no per-model overrides;
-      # behaviour identical to pre-registry builds.
-      - RECOVERY_FLAGS_REGISTRY=/etc/devai/recovery-flags.json
+      # Per-model recovery flags + env: the hand-curated
+      # deploy/recovery-flags.json, then the machine-made
+      # deploy/recovery-flags.generated.json (plan I25; scripts/recipe-apply.py
+      # writes it). Same two files the vLLM/SGLang probers read, so probe and
+      # serve-time launches stay in sync. Both are read from the deploy/
+      # DIRECTORY mount below and re-read at each launch when either changed
+      # (gpu-arbiter/recovery_flags.go). Missing file -> no per-model
+      # overrides from it.
+      - RECOVERY_FLAGS_REGISTRY=/etc/devai/deploy/recovery-flags.json
+      - RECOVERY_FLAGS_GENERATED=/etc/devai/deploy/recovery-flags.generated.json
       # Advertisement vetting (gpu-arbiter/advertise.go). The router lists
       # on /v1/models and /api/tags ONLY models that are probed AND
       # benched AND have weights in that backend's own store AND carry no
@@ -265,9 +270,16 @@ services:
       # the router only needs the host path string (passed via env) to
       # forward to libpod when recreating the vLLM container.
       - ./vllm-plugins.json:/etc/devai/vllm-plugins.json:ro
-      # Per-model recovery flags + env. See header comment in the JSON
-      # file for schema; loaded by gpu-arbiter/recovery_flags.go.
-      - ./recovery-flags.json:/etc/devai/recovery-flags.json:ro
+      # The repository's deploy/ directory, read-only, for the two recovery
+      # files (RECOVERY_FLAGS_REGISTRY / RECOVERY_FLAGS_GENERATED above).
+      # A DIRECTORY, not single files: a file replaced with a new inode (the
+      # writers' rename, git checkout's unlink and create) is invisible
+      # through a single-file bind mount, which pins the old inode and goes
+      # on serving the old content (plan I25). Absolute and
+      # required: an unset DEVAI_REPO stops compose instead of mounting
+      # /deploy. The Makefile exports DEVAI_REPO=$(CURDIR); scripts that run
+      # compose themselves default it to the repository root.
+      - ${DEVAI_REPO:?DEVAI_REPO must be set to the repository root (the Makefile exports it)}/deploy:/etc/devai/deploy:ro
       # Bench cache + exclusion ledger, read once at startup for
       # advertisement vetting (see BENCH_CACHE / MODEL_STATUS_LEDGER
       # above). Read-only: the router is a consumer of both, never a

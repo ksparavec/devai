@@ -7,6 +7,9 @@
 # Usage: ./tests/test-router-idle.sh
 
 RUNTIME="${CONTAINER_RUNTIME:-podman}"
+# Compose mounts ${DEVAI_REPO}/deploy and refuses to start without it (plan I25);
+# this script runs compose itself, outside make, so it defaults it here.
+: "${DEVAI_REPO:=$(cd "$(dirname "$0")/.." && pwd)}"; export DEVAI_REPO
 COMPOSE="$RUNTIME compose -f deploy/docker-compose.yaml"
 PASS=0
 FAIL=0

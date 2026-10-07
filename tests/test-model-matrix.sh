@@ -34,6 +34,9 @@ set -o pipefail
 # inside `local`. The PASS/FAIL tracking is robust against missing args.
 
 RUNTIME="${CONTAINER_RUNTIME:-podman}"
+# Compose mounts ${DEVAI_REPO}/deploy and refuses to start without it (plan I25);
+# this script runs compose itself, outside make, so it defaults it here.
+: "${DEVAI_REPO:=$(cd "$(dirname "$0")/.." && pwd)}"; export DEVAI_REPO
 ROUTER="${ROUTER:-devai-router:11434}"
 OLLAMA="${OLLAMA:-devai-ollama:11434}"
 PROBE_CACHE="${PROBE_CACHE:-deploy/.ollama-reasoning-cache.json}"
