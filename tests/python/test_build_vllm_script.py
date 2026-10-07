@@ -775,19 +775,9 @@ class VllmLockTargetTest(unittest.TestCase):
         self.assertIn("-o deploy/vllm-builds/0.30.0.lock", r.stdout)
 
 
-if __name__ == "__main__":
-    unittest.main()
 
-
-class CompiledWheelReuseTest(_ScriptCase):
-    """A build whose compile inputs are unchanged reuses the compiled wheel.
-
-    The compile takes about 21 minutes and depends only on the build record
-    (sdist, torch pin, HyperQwen commit and skips, EXTERNALS), devai's patch
-    files, the arch list and the toolchain -- not on the runtime lock, which
-    only the wheelhouse and the image read. Added 2026-10-07, after a
-    lock-only change (plan E8) recompiled everything.
-    """
+class _CompileInputsCase(_ScriptCase):
+    """A fake nvcc, a devai patch dir, a build record and its lock."""
 
     def setUp(self) -> None:
         super().setUp()
@@ -803,6 +793,18 @@ class CompiledWheelReuseTest(_ScriptCase):
         self._write_record("9.9.9", _record(devai="x"))
         self.lock = self.records / "9.9.9.lock"
         self.lock.write_text("pandas==3.0.5 --hash=sha256:00\n")
+
+
+class CompiledWheelReuseTest(_CompileInputsCase):
+    """A build whose compile inputs are unchanged reuses the compiled wheel.
+
+    The compile takes about 21 minutes and depends only on the build record
+    (sdist, torch pin, HyperQwen commit and skips, EXTERNALS), devai's patch
+    files, the arch list, the toolchain and the compile functions' own
+    source -- not on the runtime lock, which only the wheelhouse and the
+    image read. Added 2026-10-07, after a lock-only change (plan E8)
+    recompiled everything.
+    """
 
     def _id(self, **env: str) -> str:
         base = dict(VLLM_VERSION="9.9.9", VLLM_RECORD_DIR=str(self.records),
@@ -832,6 +834,22 @@ class CompiledWheelReuseTest(_ScriptCase):
         (self.cuda / "bin" / "nvcc").write_text("#!/bin/sh\necho 'Build cuda_13.2'\n")
         self.assertNotEqual(self._id(), first, "nvcc")
 
+    def test_the_id_covers_the_compile_functions_own_source(self) -> None:
+        first = self._id()
+        r = self._sh('apply_series() { :; }; compile_id', VLLM_VERSION="9.9.9",
+                     VLLM_RECORD_DIR=str(self.records), CUDA_HOME=str(self.cuda),
+                     DEVAI_PATCH_DIR=str(self.patches))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotEqual(r.stdout.strip(), first, "an edited compile step is a new id")
+
+    def test_an_input_that_fails_fails_the_id(self) -> None:
+        (self.cuda / "bin" / "nvcc").write_text("#!/bin/sh\nexit 3\n")
+        r = self._sh('id="$(compile_id)"; echo "id=$id"', VLLM_VERSION="9.9.9",
+                     VLLM_RECORD_DIR=str(self.records), CUDA_HOME=str(self.cuda),
+                     DEVAI_PATCH_DIR=str(self.patches))
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertNotIn("id=", r.stdout)
+
     def test_the_id_does_not_depend_on_where_the_repository_is(self) -> None:
         first = self._id()
         moved = self.tmp / "elsewhere"
@@ -856,3 +874,90 @@ class CompiledWheelReuseTest(_ScriptCase):
                          "devai/a.patch\n")
         r = self._sh("compiled_wheel aaaaaaaaaaaaaaaa", **env)
         self.assertEqual(r.stdout.strip(), "")
+
+
+# compile_wheel and verify_wheel stand-ins for build_wheel: a "compile" writes
+# a wheel holding $WHEEL_BODY and the patch list, and logs itself to $CALLS; a
+# wheel holding "corrupt" fails verification.
+_BUILD_STUBS = (
+    'compile_wheel() { mkdir -p "$1/dist"; w="$1/dist/vllm-9.9.9-cp313-linux_x86_64.whl"; '
+    'echo "${WHEEL_BODY:-good}" > "$w"; echo devai/a.patch > "$1/PATCHES.applied"; '
+    'WHEEL="$w"; echo compiled >> "$CALLS"; }; '
+    'verify_wheel() { ! grep -q corrupt "$1"; }; ')
+
+
+class BuildWheelTest(_CompileInputsCase):
+    """build_wheel, main's choice between the kept wheel and a compile."""
+
+    def _build(self, **extra: str) -> subprocess.CompletedProcess:
+        src = Path(tempfile.mkdtemp(dir=self.tmp))
+        env = dict(VLLM_VERSION="9.9.9", VLLM_RECORD_DIR=str(self.records),
+                   CUDA_HOME=str(self.cuda), DEVAI_PATCH_DIR=str(self.patches),
+                   VLLM_BUILD_ROOT=str(self.tmp / "root"))
+        env.update(extra)
+        r = self._sh(_BUILD_STUBS + f'build_wheel "{src}"; echo "WHEEL=$WHEEL"', **env)
+        r.src = src
+        return r
+
+    def _kept(self) -> list[Path]:
+        return sorted((self.tmp / "root" / "compiled").glob("*/*"))
+
+    def _compiles(self) -> int:
+        return self.calls.read_text().split().count("compiled")
+
+    def test_the_first_build_compiles_and_keeps_the_wheel(self) -> None:
+        r = self._build()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self._compiles(), 1)
+        self.assertEqual([k.name for k in self._kept()],
+                         ["PATCHES.applied", "vllm-9.9.9-cp313-linux_x86_64.whl"])
+        self.assertIn(f"WHEEL={r.src}/dist/", r.stdout)
+
+    def test_the_next_build_reuses_it_with_its_patch_list(self) -> None:
+        self._build()
+        r = self._build()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self._compiles(), 1, "no second compile")
+        self.assertIn("reusing the wheel compiled from the same inputs", r.stdout)
+        self.assertIn(f"WHEEL={self.tmp / 'root' / 'compiled'}/", r.stdout)
+        self.assertEqual((r.src / "PATCHES.applied").read_text(), "devai/a.patch\n")
+
+    def test_vllm_rebuild_1_compiles_anyway_and_0_does_not(self) -> None:
+        self._build()
+        self.assertEqual(self._build(VLLM_REBUILD="0").returncode, 0)
+        self.assertEqual(self._compiles(), 1)
+        self.assertEqual(self._build(VLLM_REBUILD="1").returncode, 0)
+        self.assertEqual(self._compiles(), 2)
+
+    def test_a_kept_wheel_that_fails_verification_is_compiled_anew(self) -> None:
+        self._build(WHEEL_BODY="corrupt")
+        r = self._build()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self._compiles(), 2)
+        self.assertIn("incomplete or failed verification", r.stdout)
+        self.assertEqual(self._kept()[1].read_text(), "good\n", "the fresh wheel replaces it")
+
+    def test_a_kept_wheel_without_its_patch_list_is_compiled_anew(self) -> None:
+        self._build()
+        (self._kept()[0]).unlink()
+        r = self._build()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self._compiles(), 2)
+
+    def test_a_changed_input_compiles_and_keeps_only_the_new_wheel(self) -> None:
+        self._build()
+        self._write_record("9.9.9", _record(devai="x", torch="2.14.0"))
+        self.assertEqual(self._build().returncode, 0)
+        self.assertEqual(self._compiles(), 2)
+        self.assertEqual(len(self._kept()), 2, "one id, two files")
+
+    def test_a_failing_compile_input_stops_before_any_compile(self) -> None:
+        (self.cuda / "bin" / "nvcc").write_text("#!/bin/sh\nexit 3\n")
+        r = self._build()
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(self._compiles(), 0)
+        self.assertNotIn("WHEEL=", r.stdout)
+
+
+if __name__ == "__main__":
+    unittest.main()
