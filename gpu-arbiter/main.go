@@ -278,6 +278,9 @@ type launchConfig struct {
 	// Empty slice = no flags, which is the path test fixtures already
 	// exercise.
 	RecoveryFlags []string
+	// EngineArgs carries the backend-wide engine argv (engineArgDefaults),
+	// emitted after the speculative flags and before RecoveryFlags.
+	EngineArgs []string
 	// Speculative carries the resolved multi-token-prediction launch
 	// parameters for this request. nil = MTP off (entrypoints emit no
 	// speculative-decoding flags); non-nil = the request body's model
@@ -1442,6 +1445,9 @@ func vllmEntrypoint(modelName string, lc launchConfig) []string {
 			args = append(args, "--speculative-config", cfg)
 		}
 	}
+	// Backend-wide engine args (engineArgDefaults), before the recovery
+	// flags so a per-model entry can still override them.
+	args = append(args, lc.EngineArgs...)
 	// Per-model recovery flags (e.g. --enforce-eager for checkpoints that
 	// OOM at vLLM model-load time on 24G). Pre-resolved by containerRecreate
 	// from a.recoveryFiles. See deploy/recovery-flags.json and
@@ -3028,6 +3034,7 @@ func (a *arbiter) containerRecreate(bs *backendState, modelName string, desiredC
 	// actually serve. Emitted before RecoveryFlags, so a per-model
 	// --max-num-seqs (VRAM rescue) still wins last.
 	lc.MaxNumSeqs = int(a.maxConcurrent)
+	lc.EngineArgs = engineArgDefaults(cfg.Name)
 	if parser := a.modelToolParser[cfg.Name][modelName]; parser != "" {
 		lc.ToolParser = parser
 	}

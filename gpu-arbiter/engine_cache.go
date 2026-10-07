@@ -100,3 +100,27 @@ func engineEnvDefaults(backend string) map[string]string {
 	}
 	return map[string]string{flashinferCubinsRepositoryEnv: noRuntimeCubinsRepository}
 }
+
+// prefixCacheRetentionArgs keeps vLLM's prefix-cache checkpoints dense.
+// vLLM 0.30.0 defaults --prefix-cache-retention-interval to 0, which under
+// MTP keeps less of each previous turn: on the teacher
+// (Qwen3.8-27B-MTP-devai-NVFP4::mtp@118784, 5-turn sessions with
+// 1,024-token replies, 8 sessions per setting) None cached 29,120 prompt
+// tokens per session against 24,128 and cut turn-2+ TTFT to 0.72x. Adopted
+// by plan 4v's retention rule on 2026-10-07, with both prepared rows
+// passing their exact-context and load probes with it (docs/backends.md
+// "vLLM 0.30.0"). Only the home-built vLLM has the flag: stock 0.22.1
+// refuses it. The probers emit the same constant
+// (scripts/probe-vllm-devai-reasoning.py); Phase 8 moves it into
+// pkg/engineargs.
+var prefixCacheRetentionArgs = []string{"--prefix-cache-retention-interval", "None"}
+
+// engineArgDefaults is the engine argv every launch on `backend` carries,
+// whatever the model. vllmEntrypoint emits it before the recovery flags,
+// so a model's recovery entry can still override a value (last flag wins).
+func engineArgDefaults(backend string) []string {
+	if backend != "vllm-devai" {
+		return nil
+	}
+	return append([]string(nil), prefixCacheRetentionArgs...)
+}

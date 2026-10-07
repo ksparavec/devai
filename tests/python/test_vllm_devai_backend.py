@@ -144,9 +144,24 @@ class ProberTest(unittest.TestCase):
         self.assertEqual(spec.cache_path.name, ".vllm-devai-reasoning-cache.json")
         self.assertEqual(spec.image, IMAGE_LATEST)
         vllm = _load(REPO_ROOT / "scripts" / "probe-vllm-reasoning.py", "probe_vllm_for_devai_test").SPEC
-        self.assertEqual(spec.build_args.__name__, vllm.build_args.__name__,
-                         "same launch argv builder as vllm")
+        # vLLM's builder, then the 0.30.0 backend's engine args (plan 4v,
+        # prefix-cache retention adopted 2026-10-07); recovery flags follow
+        # in _probe_hf_common, as in the router's vllmEntrypoint.
+        base = vllm.build_args("m", 32768, 0.9, reasoning_parser="qwen3",
+                               speculative_config='{"method": "mtp"}')
+        self.assertEqual(spec.build_args("m", 32768, 0.9, reasoning_parser="qwen3",
+                                         speculative_config='{"method": "mtp"}'),
+                         base + ["--prefix-cache-retention-interval", "None"])
+        self.assertNotIn("--prefix-cache-retention-interval", base,
+                         "stock vLLM 0.22.1 has no such flag")
         self.assertEqual(spec.allowed_kv_dtypes, vllm.allowed_kv_dtypes)
+
+    def test_retention_args_equal_the_routers(self) -> None:
+        mod = _load(REPO_ROOT / "scripts" / "probe-vllm-devai-reasoning.py", "probe_vllm_devai_parity")
+        go = (REPO_ROOT / "gpu-arbiter" / "engine_cache.go").read_text()
+        m = re.search(r'prefixCacheRetentionArgs = \[\]string\{([^}]*)\}', go)
+        self.assertIsNotNone(m, "gpu-arbiter/engine_cache.go lost prefixCacheRetentionArgs")
+        self.assertEqual(mod.PREFIX_CACHE_RETENTION_ARGS, re.findall(r'"([^"]*)"', m.group(1)))
 
     def test_engine_gates_mtp_pass_and_recovery_scoping(self) -> None:
         import _probe_hf_common as hf

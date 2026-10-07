@@ -37,9 +37,24 @@ _spec.loader.exec_module(_vllm)
 
 DEFAULT_IMAGE = os.environ.get("VLLM_DEVAI_IMAGE", "docker.io/devai/vllm-devai:latest")
 
+# The 0.30.0 backend's engine args: prefix-cache retention kept dense
+# (plan 4v's retention rule, adopted 2026-10-07; docs/backends.md "vLLM
+# 0.30.0"). Emitted after vLLM's own builder and before the recovery flags
+# _probe_hf_common appends -- the same constant in the same place as
+# gpu-arbiter's engineArgDefaults("vllm-devai"), pinned by
+# tests/python/test_vllm_devai_backend.py. Stock vLLM 0.22.1 has no such
+# flag, so probe-vllm-reasoning.py does not emit it.
+PREFIX_CACHE_RETENTION_ARGS = ["--prefix-cache-retention-interval", "None"]
+
+
+def vllm_devai_command_args(*args, **kwargs) -> list[str]:
+    return list(_vllm.SPEC.build_args(*args, **kwargs)) + PREFIX_CACHE_RETENTION_ARGS
+
+
 SPEC = replace(
     _vllm.SPEC,
     name="vllm-devai",
+    build_args=vllm_devai_command_args,
     image=DEFAULT_IMAGE,
     container_name="devai-vllm-devai-probe",
     cache_path=REPO_ROOT / "deploy" / ".vllm-devai-reasoning-cache.json",

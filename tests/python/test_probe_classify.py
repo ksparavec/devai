@@ -541,10 +541,23 @@ class TestVerifyBackendFlagsVllmDevai(unittest.TestCase):
                             "--gpu-memory-utilization", "--limit-mm-per-prompt"), self.ENTRIES)
         self.assertEqual(missing, ["model=--model"])
 
+    def test_the_devai_only_section_is_checked_on_the_devai_image(self) -> None:
+        cfg = {"vllm": {"model": "--model"},
+               "vllm-devai": {"retention": "--prefix-cache-retention-interval"}}
+        missing, _, n = self.mod.check_vllm_devai(cfg, self._help("--model"), [])
+        self.assertEqual(missing, ["retention=--prefix-cache-retention-interval"])
+        self.assertEqual(n, 2)
+        missing, _, _ = self.mod.check_vllm_devai(
+            cfg, self._help("--model", "--prefix-cache-retention-interval"), [])
+        self.assertEqual(missing, [])
+        # The stock vllm: check never sees the devai-only names.
+        self.assertEqual(self.mod._check_flags("vllm", cfg["vllm"], self._help("--model")), [])
+
     def test_main_checks_the_devai_image_with_help_all_and_fails_on_drift(self) -> None:
         import yaml
         cfg = yaml.safe_load((REPO_ROOT / "deploy" / "backend-flags.yaml").read_text())
-        everything = self._help(*cfg["vllm"].values(), *cfg["sglang"].values())
+        everything = self._help(*cfg["vllm"].values(), *cfg["sglang"].values(),
+                                *cfg["vllm-devai"].values())
         calls = []
 
         def fake_help(image, args, gpu, help_arg="--help"):

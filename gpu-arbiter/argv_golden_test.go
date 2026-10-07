@@ -103,6 +103,18 @@ func goldenCases() []goldenCase {
 			},
 		},
 		{
+			// The 0.30.0 backend's engine args (prefix-cache retention),
+			// after the parsers and before the recovery flags.
+			Name:  "vllm-devai-engine-args",
+			Model: "Qwen3.8-27B-MTP-devai-NVFP4",
+			LC: launchConfig{
+				MemFraction: 0.96, MaxContext: 118784, MaxNumSeqs: 32,
+				ReasoningParser: "qwen3", ToolParser: "qwen3_xml",
+				EngineArgs:    engineArgDefaults("vllm-devai"),
+				RecoveryFlags: []string{"--enforce-eager"},
+			},
+		},
+		{
 			Name:  "plugin-paths-vllm-only",
 			Model: "NVIDIA-Nemotron-Nano-9B-v2-NVFP4",
 			LC: launchConfig{

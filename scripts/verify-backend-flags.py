@@ -151,8 +151,10 @@ def check_vllm_devai(cfg: dict, help_text: str,
                      entries: list[tuple[str, str, list[str], str | None]]
                      ) -> tuple[list[str], list[str], int]:
     """(missing, skipped entries, number of flags checked) for the home-built
-    vLLM: the pinned vLLM flag names plus the vllm-devai recovery flags."""
+    vLLM: the pinned vLLM flag names, the vllm-devai-only names, and the
+    vllm-devai recovery flags."""
     flags = {k: v for k, v in (cfg.get("vllm") or {}).items() if isinstance(v, str)}
+    flags.update({k: v for k, v in (cfg.get("vllm-devai") or {}).items() if isinstance(v, str)})
     rec, skipped = recovery_flags(entries)
     pinned = set(flags.values())
     flags.update({k: v for k, v in rec.items() if v not in pinned})

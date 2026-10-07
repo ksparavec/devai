@@ -65,6 +65,14 @@ vllm:
   # method, optional drafter path, and num_speculative_tokens.
   speculative_config:   "--speculative-config"
 
+# Flags only the home-built vLLM (vllm-devai, VLLM_DEVAI_IMAGE) emits, on
+# top of the vllm: names above; stock vLLM 0.22.1 does not have them.
+# verify-backend-flags.py checks this section against VLLM_DEVAI_IMAGE only.
+vllm-devai:
+  # gpu-arbiter engineArgDefaults / probe-vllm-devai-reasoning.py
+  # PREFIX_CACHE_RETENTION_ARGS (plan 4v, adopted 2026-10-07).
+  prefix_cache_retention_interval: "--prefix-cache-retention-interval"
+
 sglang:
   model_path:           "--model-path"
   host:                 "--host"
