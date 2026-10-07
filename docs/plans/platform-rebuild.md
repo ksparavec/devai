@@ -426,7 +426,7 @@ The plan proposed each of these as the smallest choice that lets the code be wri
 ## Open questions
 
 1. Does SGLang 0.5.16 build and serve with nvcc 13.1 on sm120? -- Phase 4 step 4a answers it. The rule for a no is already decided: drop or upgrade (M2).
-2. Does slurmd run in an unprivileged container with `proctrack/linuxproc`, now that job scripts only send bus commands? -- Phase 5 step 1 answers it; the measured privileged setup is the fallback.
+2. Does slurmd run in an unprivileged container with `proctrack/linuxproc`, now that job scripts only send bus commands? -- Phase 5 step 1 answers it; the measured privileged setup is the fallback. *(Partly answered, 2026-10-07: all of devai-slurm runs unprivileged in podman's default user namespace, with `CgroupPlugin=disabled` in `cgroup.conf` -- without it slurmd stops at start, failing to set a systemd scope. Still open: the `--pid=host` part, which `tests/slurm/test-slurm.sh` checks.)*
 3. The sleep fast path: how long sleep and wake take, how much VRAM a sleeping vLLM or SGLang process keeps, and whether sleep support costs speed or memory while serving. -- Phase 8 step 1 measures it; `sleep_mode=false` by default is the fallback.
 
 4. ~~What are the SGLang keep thresholds (Phase 15)?~~ Decided: I16.
@@ -441,9 +441,6 @@ The fourth readiness review's fixes were checked one by one: 70 of 103 were comp
 
 | Phase | Item |
 |---|---|
-| 5 | `bin/devai-jobs`'s Phase 5 row names `submit`, `suspend` and `interrupt` for devai-operator from Phase 10, not `service` (I13 names all four). |
-| 5 | `test-slurm.sh` runs with the stack down: before Phase 9 that needs `make slurm-down` as well. |
-| 5, References | The References' slurm.conf key list lacks `JobRequeue` and `ReturnToService`, which C3 and Phase 5 set. |
 | 7 | `scripts/ops/operator-up.sh` must keep handing devai-operator the lab's host context that Phase 6 passes through Make (`DEVAI_HOST_IP` and the rest). |
 | 8 | **Phase 8 step 1 has no decision rule for `sleep_mode`'s default** (Open question 3): fix one before measuring; the fallback (sleep only for a launch a hold or a pending job names) stays. |
 | 8 | A test that an unstamped SGLang cell (empty `kv_cache_dtype`) passes C2's check. |
@@ -784,7 +781,7 @@ Two launches are the same when backend, model, ctx, `kv_cache_dtype` and `mtp` a
 
 ### C3 -- Jobs
 
-**Submission.** `POST /slurm/v0.0.42/job/submit`, with the headers `X-SLURM-USER-NAME: devai` and `X-SLURM-USER-TOKEN: <JWT>`. The JWT is HS256, `{"sun":"devai", "iat":<now>, "exp":<now+300>}`, signed with `jwt_hs256.key`. The key could sign a token for any user, root included, so slurmctld accepts a job only from the Slurm user `devai`: `deploy/slurm/job_submit.lua` (`JobSubmitPlugins=lua`, Phase 5) refuses every other submitter, and root has no association. The field names below are checked against 24.11's own spec in Phase 5, step 2.
+**Submission.** `POST /slurm/v0.0.42/job/submit`, with the headers `X-SLURM-USER-NAME: devai` and `X-SLURM-USER-TOKEN: <JWT>`. The JWT is HS256, `{"sun":"devai", "iat":<now>, "exp":<now+300>}`, signed with `jwt_hs256.key`. The key could sign a token for any user, root included, so slurmctld accepts a job only from the Slurm user `devai`: `deploy/slurm/job_submit.lua` (`JobSubmitPlugins=lua`, Phase 5) refuses every other submitter, and root has no association. The field names below are checked against 24.11's own spec in Phase 5, step 2. *(Checked 2026-10-07, against the spec dumped from this slurmrestd, `deploy/slurm/openapi-v0.0.42.json`, which `pkg/slurmrest` follows: the body wraps the job, `{"job": {...}}`, with `job.script`; `time_limit` and `kill_warning_delay` are objects `{set, infinite, number}`; `kill_warning_signal` is a signal name (`INT`, `USR2`) and `kill_warning_flags` is `["BATCH_JOB"]`; the list paths end in a slash (`/slurm/v0.0.42/jobs/`, `/slurmdb/v0.0.42/jobs/`); `job_state` is a list; slurmdbd returns `comment` as `{administrator, job, system}`; a hold that devai sends over REST reads `JobHeldAdmin`. The names below stay as written.)*
 
 Every job sets:
 
@@ -918,7 +915,7 @@ slurmctld/                       slurmctld's StateSaveLocation
 ```
 
 - Retention: `devai-jobs prune --older-than <days>` (default 90) deletes `results/<jobid>/`, `engines/<backend>/<jobid>.log`, `operator/<run>/` and `bus/<date>.jsonl` older than that. It never deletes `mariadb/`, `slurmctld/`, or anything that belongs to a job still in the queue. It runs daily inside `devai-slurm` (a supervisord program that sleeps a day between runs), and Phase 13's tests pin it.
-- `gpu.json`: `{"v":1, "job", "device", "interval_s":5, "started_at", "ended_at", "samples":[[t, used_mib, util_pct], ...], "peak_mib", "mean_mib", "mean_util_pct", "energy_j"}`. The epilog also puts `gpu peak=<MiB> mean=<MiB> util=<pct> energy=<J>` into the job's `AdminComment` (Phase 5 step 6 checks that 24.11 accepts this from an epilog).
+- `gpu.json`: `{"v":1, "job", "device", "interval_s":5, "started_at", "ended_at", "samples":[[t, used_mib, util_pct], ...], "peak_mib", "mean_mib", "mean_util_pct", "energy_j"}`. The epilog also puts `gpu peak=<MiB> mean=<MiB> util=<pct> energy=<J>` into the job's `AdminComment` (Phase 5 step 6 checks that 24.11 accepts this from an epilog). *(It does not: "Job has already finished", 2026-10-07. `gpu.json` is the record, and Phase 13 reads it there.)*
 - `result.json`: `{"v":1, "job", "kind", "status", "started_at", "ended_at", "summary", "outputs"}`.
   - `status` is one of `ok`, `failed`, `truncated`, `cancelled`.
   - `outputs` depends on the kind. Bench: `{model, backend, ctx, task, n_planned, n_scored, score, cache_key}`. Probe: `{model, backend, cells_written}`. Action: `{exit_code}`.
@@ -1697,8 +1694,8 @@ devai-tools/internal/control/     new    -- config, supervisord XML-RPC client (
                                             none, never overwriting one, C4)
 devai-tools/cmd/devai-jobs/       new    -- list, show, queue, cancel, node, submit; every command with --json
                                             (basic; Phase 13 completes it)
-bin/devai-jobs                    new    -- `podman exec devai-slurm devai-jobs "$@"` (I13; from Phase 10, `submit`, `suspend`
-                                            and `interrupt` run in devai-operator); installed by `make install`
+bin/devai-jobs                    new    -- `podman exec devai-slurm devai-jobs "$@"` (I13; from Phase 10, `submit`, `suspend`,
+                                            `interrupt` and `service` run in devai-operator); installed by `make install`
 tests/slurm/Dockerfile.control-test
                                   new    -- trixie-slim + supervisor + devai-control. test-slurm.sh runs it as two
                                             containers, so jobs use the production subjects, users and namespaces:
@@ -1713,7 +1710,7 @@ tests/slurm/test-slurm.sh         new    -- the live checks in the exit criteria
                                             devai-control runs (devai-engines or devai-operator), since both would
                                             answer the same subjects and match the guard's command-line lookup, and names
                                             the commands that stop them. It runs from the host with the stack down:
-                                            `make cache-down`, and once devai-operator exists also `podman stop
+                                            `make cache-down` (before Phase 9 also `make slurm-down`), and once devai-operator exists also `podman stop
                                             devai-operator` (stack-down leaves it running, Phase 6). It starts both
                                             test containers and removes them afterwards, and an EXIT trap brings
                                             devai-slurm back as compose defines it (`make cache-up`, with
@@ -4296,7 +4293,7 @@ Estimates, not measurements. Phases 5-7, 15-17, 20 and 21 run beside others, so 
 
 - [docs/slurm.md](../slurm.md) -- the architecture this plan builds.
 - Slurm documentation (slurm.schedmd.com):
-  - slurm.conf: `Licenses`, `PrologEpilogTimeout`, `BatchStartTimeout`, `KillWait`, `PrologFlags`, `HealthCheckProgram`, `SlurmdParameters`;
+  - slurm.conf: `Licenses`, `PrologEpilogTimeout`, `BatchStartTimeout`, `KillWait`, `PrologFlags`, `HealthCheckProgram`, `SlurmdParameters`, `JobRequeue`, `ReturnToService`;
   - cgroup.conf (`IgnoreSystemd`), for the fallback;
   - accounting;
   - slurmrestd, and rest_api (JWT).

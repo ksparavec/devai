@@ -147,8 +147,13 @@ and history tool (Sec. 9), runs only in `devai-slurm` and `devai-operator`
   "Controller memory is not enabled"). Here a job script is a short bash
   script that sends bus commands, so this layout proposes
   `ProctrackType=proctrack/linuxproc`, no cgroup plugins and an unprivileged
-  container. Whether slurmd runs that way is untested; the measured
-  privileged setup is the fallback.
+  container. It does (checked 2026-10-07, without `--pid=host` and without
+  the GPU): every daemon runs unprivileged in podman's default user
+  namespace, with `CgroupPlugin=disabled` in `cgroup.conf` -- without it
+  slurmd stops at start, failing to set a systemd scope for slurmstepd. The
+  `--pid=host` part (the process tree on the host, the guard's kills) is
+  checked by the plan's `tests/slurm/test-slurm.sh`, not yet run. The
+  measured privileged setup stays the fallback.
 
   The container stays in podman's default user namespace (plan I26), so its
   root is the host user. The guard can therefore see and kill GPU holders in
@@ -780,10 +785,11 @@ that adds it.
 4. ~~The laya trainer's internals~~ -- they move from its HTTP controller to
    trainer jobs; its API toward aiagent does not change. Agreed by the owner
    (D14).
-5. **Debian's Slurm 24.11.5 has not been run** here (D12); the spike ran
-   26.05.4. Only its packages' contents were read (`apt-get download`,
-   `dpkg -c`). The plan's Phase 5 starts it before anything else, and checks whether
-   slurmd runs in an unprivileged container with `proctrack/linuxproc`.
+5. ~~Debian's Slurm 24.11.5 has not been run~~ -- it runs (2026-10-07, plan
+   Phase 5): unprivileged, with `CgroupPlugin=disabled`; its REST API (v0.0.42,
+   spec dumped to `deploy/slurm/openapi-v0.0.42.json`) differs from the
+   plan's C3 names in shape, and the client follows the spec. Still open:
+   the `--pid=host` checks of `tests/slurm/test-slurm.sh`.
 6. **The bus path is untested:** load, unload, sleep, wake and lease through
    `devai-control`; the supervisor verbs; how long an Ollama unload takes to
    free the card.
@@ -792,10 +798,8 @@ that adds it.
    starting every model process with sleep support costs speed or memory while
    it serves. The plan's Phase 8 step 1 measures it, on the vLLM that will serve (Phase 4
    step 4v's build, before 4e retires `vllm-devai`).
-8. **Two guard details are untested on 24.11:**
-   - Whether the epilog may write a completing job's `AdminComment`. If not,
-     `gpu.json` is the record.
-   - Whether a node that a failed prolog drained keeps a reason the health
-     check can recognise. If not, the health check reads `guard.json`.
-
-   The plan's Phase 5 checks both.
+8. ~~Two guard details on 24.11~~ -- checked 2026-10-07: the epilog may NOT
+   write a completing job's `AdminComment` ("Job has already finished"), so
+   `gpu.json` is the record; a failed prolog drains the node with reason
+   "Prolog error" (a failed epilog, "Epilog error"), which the health check
+   recognises, and it leaves a drain with any other reason alone.
