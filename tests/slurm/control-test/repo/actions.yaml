@@ -1,0 +1,25 @@
+# The test registry of devai-control-test-operator (C8's format). Phase 6
+# brings the real one, deploy/operator/actions.yaml.
+version: 1
+actions:
+  - id: test-sleep
+    group: test
+    title: Sleep, then exit; on TERM wait stop_s, then exit
+    kind: job
+    script: bin/test-sleep.sh
+    params:
+      - {name: sleep_s, type: int, required: true, to: {env: SLEEP_S}}
+      - {name: stop_s, type: int, to: {env: STOP_S}}
+      - {name: exit_code, type: int, to: {env: EXIT_CODE}}
+    job_kind: action
+  - id: test-bench
+    group: bench
+    title: A bench task that scores its prefix on INT
+    kind: job
+    script: bin/test-bench.sh
+    params:
+      - {name: sleep_s, type: int, required: true, to: {env: SLEEP_S}}
+      - {name: stop_s, type: int, to: {env: STOP_S}}
+    job_kind: bench
+not_offered: []
+pending: []

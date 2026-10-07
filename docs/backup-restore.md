@@ -20,6 +20,7 @@ snapshots and restores exactly this set.
 | `deploy/*.sops.env` | encrypted secrets files, if any exist (none do since the sops/age scaffold moved to the attic; the glob stays) | skipped, snapshot continues |
 | `~/.devai/preferences.yaml` | last-used model/agent/vram/context | skipped, snapshot continues |
 | `~/.devai/sessions/` | per-(agent,model) session history | skipped, snapshot continues |
+| `~/.config/devai/slurm/` | devai-slurm's secrets, created once by `make slurm-init` (platform-rebuild C7): `slurm.key`, `jwt_hs256.key`, `mariadb.pass` and `nats/<user>.pass`, each 0600. Archived as `devai-config/slurm/...`; restore puts them back with their 0600 mode | skipped, snapshot continues |
 
 Everything else under `~/.devai/` (the picker script, the probe-cache
 symlinks `make install` stages there) is a symlink back into this
@@ -39,6 +40,17 @@ double-counted.
   (platform-rebuild Phase 1, M12). A key already on the host is left
   where it is; keep an offline copy yourself if anything encrypted with
   it still matters.
+
+## Archives are private
+
+An archive holds devai-slurm's keys and passwords (the
+`~/.config/devai/slurm/` row above): whoever has `jwt_hs256.key` can submit
+Slurm jobs as `devai`, and `slurm.key` authenticates Slurm's own daemons.
+`devai-backup` therefore writes every archive mode 0600 (opened with
+`O_EXCL`, so the umask cannot widen it and an existing file is never
+reused) into a destination directory it creates 0700. Keep archives on
+encrypted disk or offline media, and never commit them or upload them to
+unencrypted storage.
 
 ## Archives made before 2026-10-07
 

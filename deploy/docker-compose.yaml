@@ -141,6 +141,51 @@ services:
       - label=disable
     restart: "no"
 
+  # devai-slurm (docs/slurm.md Sec. 3.1; platform-rebuild Phase 5): Slurm
+  # (slurmctld, slurmdbd, slurmrestd, slurmd), MariaDB, nats-server and the
+  # bus log in ONE container, built here (`make build-slurm`), never pulled.
+  # Behind the `slurm` profile until Phase 9 makes the router its client:
+  # `make slurm-up` / `make slurm-down`; `make cache-up` leaves it alone.
+  #
+  # - pid: host -- the GPU guard and the sampler see and signal GPU holders,
+  #   whose PIDs NVML reports in the host namespace; tini -s (the image's
+  #   entrypoint) reaps, since it is not PID 1 here.
+  # - podman's default user namespace (no userns_mode; I26): its root is the
+  #   host user, so the guard can kill holders in rootless containers; jobs
+  #   run as devai, a subordinate uid, and cannot read the keys.
+  # - devai-net only, nothing published (C6, I13): slurmrestd :6820 and NATS
+  #   :4222 are reached by name on devai-net; no podman socket.
+  # - /run/devai is a tmpfs: the rendered nats-server.conf, the jobs bus
+  #   password copy, the sampler files.
+  # - The GPU for NVML only; no CUDA work runs here. Phase 11 makes it
+  #   optional (compose.gpu.yaml).
+  slurm:
+    image: ${SLURM_IMAGE:-localhost/devai-slurm:latest}
+    pull_policy: never
+    profiles: [slurm]
+    container_name: devai-slurm
+    hostname: devai-slurm
+    networks: [default]
+    pid: host
+    tmpfs:
+      - /run/devai
+    environment:
+      # For devai-jobs under `podman exec devai-slurm` (bin/devai-jobs; C7).
+      - SLURM_REST_URL=http://127.0.0.1:6820
+      - SLURM_JWT_KEY_FILE=/etc/slurm/jwt_hs256.key
+      - SLURM_USER=devai
+    volumes:
+      - /var/cache/devai/jobs:/var/cache/devai/jobs
+      # C7's files (make slurm-init), read-only: slurm.key, jwt_hs256.key,
+      # mariadb.pass and every bus user's nats/<user>.pass, which the
+      # entrypoint renders into nats-server.conf.
+      - ${DEVAI_SLURM_CONFIG_DIR:-${HOME}/.config/devai/slurm}:/etc/devai/slurm:ro
+    devices:
+      - ${DEVAI_GPU_DEVICE:-nvidia.com/gpu=all}
+    security_opt:
+      - label=disable
+    restart: unless-stopped
+
   router:
     build:
       context: ..

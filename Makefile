@@ -270,6 +270,7 @@ endif
 .PHONY: bench bench-vllm bench-sglang bench-ollama bench-report bench-harvest test-bench-smoke
 .PHONY: test-python build-backup-tool build-devai-tools test-devai-tools
 .PHONY: backup-create backup-list backup-verify backup-restore test-backup-restore
+.PHONY: slurm-tools build-slurm slurm-init setup-jobs slurm-up slurm-down test-slurm
 
 all: help
 
@@ -645,7 +646,9 @@ prune: ## Clean up dangling images only (keeps tagged images and volumes)
 	$(CONTAINER_RUNTIME) image prune -f
 
 # devai-tools (devai-tools/go.mod): first-party Go CLIs sibling to
-# gpu-arbiter -- devai-backup.
+# gpu-arbiter -- devai-backup, and since platform-rebuild Phase 5 devai-bus,
+# devai-control and devai-jobs (the images get static builds from
+# slurm-tools).
 # Built/tested with the host's own Go toolchain (consolidated to the
 # current stable release across both modules -- see gpu-arbiter/go.mod),
 # not a pinned container: needs Go >= the go.mod floor on PATH.
@@ -654,8 +657,9 @@ build-backup-tool: ## Build devai-tools/bin/devai-backup
 	cd devai-tools && mkdir -p bin && go build -o bin/devai-backup ./cmd/devai-backup
 
 build-devai-tools: build-backup-tool ## Build every devai-tools/ binary
+	cd devai-tools && for c in devai-bus devai-control devai-jobs; do go build -o bin/$$c ./cmd/$$c || exit 1; done
 
-test-devai-tools: ## Run Go unit tests for devai-tools/ (backup)
+test-devai-tools: ## Run Go unit tests for devai-tools/ (backup, devai-bus, devai-control, devai-jobs; an embedded nats-server from deploy/slurm/nats-server.conf.in)
 	cd devai-tools && go test -race -v -count=1 ./...
 
 # Backup/restore (devai-tools/cmd/devai-backup; see docs/backup-restore.md).
@@ -680,6 +684,71 @@ backup-restore: build-backup-tool ## Restore from an archive. ARCHIVE=<path> YES
 
 test-backup-restore: test-devai-tools ## devai-tools Go tests + tests/test-backup-restore.sh
 	./tests/test-backup-restore.sh
+
+# =============================================================================
+# devai-slurm: Slurm, MariaDB, NATS and the bus log in one container
+# (docs/slurm.md; platform-rebuild Phase 5). Behind the compose profile
+# `slurm` until Phase 9 makes the router its client. One-time setup, in
+# order: make setup-jobs slurm-init build-slurm slurm-up.
+# =============================================================================
+
+# The one Debian image devai pulls, pinned by digest (M1, M13). Phase 2 step 1
+# passes this same variable as BASE_IMAGE to every build; until then
+# build-slurm is its only user. Bumping it is a deliberate edit followed by
+# a rebuild of every image that uses it.
+DEBIAN_IMAGE = docker.io/library/debian:trixie-slim@sha256:277da9fa1353e0e06028a9ad1b744fd1e92201a396949ecad4034d1cce20c246
+SLURM_IMAGE ?= localhost/devai-slurm:latest
+# Static devai-tools binaries for the images (devai-bus, devai-jobs,
+# devai-control), built with the host's Go and bind-mounted into the build,
+# as build-ollama does with its host build. devai-tools/bin/ is gitignored.
+SLURM_TOOLS_DIST ?= $(CURDIR)/devai-tools/bin/static
+# C7's files, created once by slurm-init; devai-slurm mounts the directory
+# read-only. Compose reads the same path from DEVAI_SLURM_CONFIG_DIR.
+SLURM_CONFIG_DIR ?= $(HOME)/.config/devai/slurm
+export DEVAI_SLURM_CONFIG_DIR := $(SLURM_CONFIG_DIR)
+JOBS_DIR = $(CACHE_DIR)/jobs
+
+slurm-tools: ## Build devai-bus, devai-jobs and devai-control as static binaries into SLURM_TOOLS_DIST (for the devai-slurm and control-test images)
+	@mkdir -p $(SLURM_TOOLS_DIST)
+	cd devai-tools && for c in devai-bus devai-jobs devai-control; do \
+		CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o $(SLURM_TOOLS_DIST)/$$c ./cmd/$$c || exit 1; \
+	done
+
+build-slurm: slurm-tools ## Build the devai-slurm image (Debian trixie's Slurm 24.11.5, MariaDB, nats-server; devai-bus, devai-jobs, devai-gpu, the guard and the job scripts) on the pinned DEBIAN_IMAGE
+	$(CONTAINER_RUNTIME) build --network=host \
+		$(PROXY_BUILD_ARGS) \
+		$(APT_PROXY_ARG) \
+		--build-arg BASE_IMAGE=$(DEBIAN_IMAGE) \
+		--build-arg DIST_ID=$$(cat $(SLURM_TOOLS_DIST)/devai-bus $(SLURM_TOOLS_DIST)/devai-jobs | sha256sum | cut -c1-16) \
+		-v $(SLURM_TOOLS_DIST):/var/cache/devai-tools-dist:ro \
+		-f deploy/slurm/Dockerfile \
+		-t $(SLURM_IMAGE) deploy/slurm
+
+slurm-init: ## One-time: create devai-slurm's secrets in ~/.config/devai/slurm (slurm.key, jwt_hs256.key, mariadb.pass, nats/<user>.pass; 0600, never overwritten)
+	DEVAI_SLURM_CONFIG_DIR=$(SLURM_CONFIG_DIR) scripts/slurm-init.sh
+
+setup-jobs: ## One-time: create the 50G LV at /var/cache/devai/jobs (Slurm state, MariaDB, job results, the bus log; requires sudo)
+	@# The generic volume script (see setup-logs); it refuses to hide or wipe
+	@# data that is already there. devai-slurm must not hold the path open.
+	-@$(MAKE) --no-print-directory slurm-down
+	sudo LV=cache_jobs MOUNTPOINT=$(JOBS_DIR) SIZE=$${SIZE:-50G} VG=$${VG:-vgais} \
+	     POOL=$${POOL:-cachepool} RECREATE=$${RECREATE:-0} \
+	  deploy/setup-logs-volume.sh
+	@echo "Next: make slurm-init build-slurm slurm-up"
+
+slurm-up: ## Start devai-slurm (compose profile `slurm`; needs setup-jobs, slurm-init and build-slurm first)
+	@test -d $(SLURM_CONFIG_DIR) || { echo "error: no $(SLURM_CONFIG_DIR) -- run 'make slurm-init' first" >&2; exit 1; }
+	@mountpoint -q $(JOBS_DIR) || { echo "error: $(JOBS_DIR) is not a mounted volume -- run 'make setup-jobs' first" >&2; exit 1; }
+	@$(CONTAINER_RUNTIME) image exists $(SLURM_IMAGE) || { echo "error: no image $(SLURM_IMAGE) -- run 'make build-slurm' first" >&2; exit 1; }
+	@$(CONTAINER_RUNTIME) network exists $(DEVAI_NETWORK) 2>/dev/null || $(CONTAINER_RUNTIME) network create $(DEVAI_NETWORK)
+	$(COMPOSE) -f $(CACHE_COMPOSE) --profile slurm up -d --no-deps slurm
+
+slurm-down: ## Stop and remove devai-slurm (jobs running then end NODE_FAIL and never run again; JobRequeue=0)
+	-$(COMPOSE) -f $(CACHE_COMPOSE) --profile slurm stop -t 60 slurm
+	-$(COMPOSE) -f $(CACHE_COMPOSE) --profile slurm rm -f slurm
+
+test-slurm: slurm-tools ## Live Phase 5 checks: devai-slurm and two devai-control test containers on the GPU, with the stack down (tests/slurm/test-slurm.sh; refuses while a production devai-control runs)
+	tests/slurm/test-slurm.sh
 
 # pipelock egress proxy (per docs/pipelock.md). Always-on infra service (no
 # profile) brought up by `make cache-up`, which mounts the host CA key.
@@ -856,6 +925,11 @@ help: ## Show this help message
 	@printf "  %s\n" "ollama-clean     Clean partials"
 	@printf "  %-44s%s\n" "card-hints       Derived parser report" "card-hints-fetch Stage metadata only"
 	@printf "  %-44s%s\n" "fetch-vllm-recipes  vLLM recipe seeds" "recipe-apply     NAME=<row> recipe flags"
+	@printf "\n"
+	@printf "  %-44s%s\n" "SLURM (docs/slurm.md; profile slurm)" ""
+	@printf "  %-44s%s\n" "setup-jobs       LV for jobs/ (once, sudo)" "slurm-up         Start devai-slurm"
+	@printf "  %-44s%s\n" "slurm-init       Create its secrets (once)" "slurm-down       Stop devai-slurm"
+	@printf "  %-44s%s\n" "build-slurm      Build devai-slurm" "test-slurm       Live checks (GPU)"
 	@printf "\n"
 	@printf "  %s\n" "DEPLOY"
 	@printf "  %s\n" "install-systemd  Auto-start infrastructure at boot"
@@ -1801,6 +1875,10 @@ install: ## Install bin/devai-agent to $(INSTALL_PREFIX)/bin and stage config in
 	@# path in --help; that's honest and a non-issue in practice.
 	@ln -sf "$(CURDIR)/bin/devai-agent" $(INSTALL_PREFIX)/bin/devai-agent
 	@chmod +x "$(CURDIR)/bin/devai-agent"
+	@# devai-jobs runs inside devai-slurm, never on the host (platform-rebuild
+	@# I13); this wrapper runs it there through podman exec.
+	@ln -sf "$(CURDIR)/bin/devai-jobs" $(INSTALL_PREFIX)/bin/devai-jobs
+	@chmod +x "$(CURDIR)/bin/devai-jobs"
 	@# Symlink the picker so devai-agent can override the in-image copy via
 	@# bind-mount; re-running `make install` after picker edits picks up the
 	@# new code without a full image rebuild.
@@ -1852,6 +1930,7 @@ install: ## Install bin/devai-agent to $(INSTALL_PREFIX)/bin and stage config in
 	fi
 	@echo "  linked: $(DEVAI_HOME)/model-picker.py"
 	@echo "  installed: $(INSTALL_PREFIX)/bin/devai-agent"
+	@echo "  installed: $(INSTALL_PREFIX)/bin/devai-jobs"
 	@echo
 	@echo "Next steps:"
 	@echo "  1. Add $(INSTALL_PREFIX)/bin to PATH if not already."
@@ -1860,6 +1939,7 @@ install: ## Install bin/devai-agent to $(INSTALL_PREFIX)/bin and stage config in
 
 uninstall: ## Remove devai-agent launcher and the staged config dir
 	@rm -f $(INSTALL_PREFIX)/bin/devai-agent
+	@rm -f $(INSTALL_PREFIX)/bin/devai-jobs
 	@rm -f $(DEVAI_HOME)/.ollama-reasoning-cache.json
 	@rm -f $(DEVAI_HOME)/.vllm-reasoning-cache.json
 	@rm -f $(DEVAI_HOME)/.sglang-reasoning-cache.json
@@ -1871,7 +1951,7 @@ uninstall: ## Remove devai-agent launcher and the staged config dir
 	@rm -f $(DEVAI_HOME)/_capability.py
 	@rm -f $(DEVAI_HOME)/_model_status.py
 	@rm -f $(DEVAI_HOME)/.model-status.json
-	@echo "Removed $(INSTALL_PREFIX)/bin/devai-agent and the symlinks under $(DEVAI_HOME)/."
+	@echo "Removed $(INSTALL_PREFIX)/bin/devai-agent, $(INSTALL_PREFIX)/bin/devai-jobs and the symlinks under $(DEVAI_HOME)/."
 	@echo "preferences.yaml and sessions/ are kept; remove $(DEVAI_HOME)/ manually if you want a clean slate."
 
 install-systemd: ## Install and enable systemd service for infrastructure

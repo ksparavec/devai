@@ -1,0 +1,82 @@
+# slurm.conf for devai-slurm (docs/slurm.md Sec. 3.1; platform-rebuild
+# Phase 5). Rendered at every start by entrypoint.sh into
+# /etc/slurm/slurm.conf: @CPUS@ is `nproc --all` on the host and
+# @MEMORY_MB@ is MemTotal from /proc/meminfo in MiB (I4).
+#
+# One node, one partition, one cluster. The node declares no GPU: the
+# engine license, not a GPU resource, lets one engine, trainer, probe or
+# GPU-action job hold the card at a time, with or without a GPU (I5).
+
+ClusterName=devai
+SlurmctldHost=localhost
+SlurmUser=root
+SlurmdUser=root
+SlurmctldPort=6817
+SlurmdPort=6818
+
+# Authentication: auth/slurm with the shared slurm.key for the daemons and
+# the command-line tools; auth/jwt as the alternative type, for the HS256
+# tokens the router, devai-operator and devai-jobs sign (C3, C7).
+AuthType=auth/slurm
+CredType=cred/slurm
+AuthAltTypes=auth/jwt
+AuthAltParameters=jwt_key=/etc/slurm/jwt_hs256.key
+
+# Jobs from user devai only (job_submit.lua; I6).
+JobSubmitPlugins=lua
+
+StateSaveLocation=/var/cache/devai/jobs/slurmctld
+SlurmdSpoolDir=/var/spool/slurmd
+SlurmctldPidFile=/run/slurm/slurmctld.pid
+SlurmdPidFile=/run/slurm/slurmd.pid
+
+# Nothing is confined or pinned: a job script only sends bus commands.
+# proctrack/linuxproc tracks the job's processes by parentage, so slurmd
+# signals the whole process tree of the step (Open question 2).
+ProctrackType=proctrack/linuxproc
+TaskPlugin=task/none
+JobAcctGatherType=jobacct_gather/none
+MpiDefault=none
+
+# One CPU per job; a host runs as many jobs at once as it has CPUs (I4).
+SelectType=select/cons_tres
+SelectTypeParameters=CR_CPU
+SlurmdParameters=config_overrides
+
+# engine:1 -- one GPU model at a time; bench:1 -- one bench task at a time.
+Licenses=engine:1,bench:1
+
+AccountingStorageType=accounting_storage/slurmdbd
+AccountingStorageHost=localhost
+AccountingStoreFlags=job_comment,job_script
+
+# The guard (docs/slurm.md Sec. 6). Alloc: the prolog runs at allocation, so
+# it creates results/<jobid>/ before the job script opens its log.
+# ForceRequeueOnFail: a guard refusal still requeues and holds its job.
+Prolog=/usr/local/lib/devai/prolog.sh
+Epilog=/usr/local/lib/devai/epilog.sh
+PrologFlags=Alloc,ForceRequeueOnFail
+# A hung prolog or epilog drains the node instead of holding the license;
+# BatchStartTimeout above it, so a slow guard does not get its job requeued.
+PrologEpilogTimeout=180
+BatchStartTimeout=240
+KillWait=30
+HealthCheckProgram=/usr/local/lib/devai/healthcheck.sh
+HealthCheckInterval=30
+HealthCheckNodeState=ANY
+
+# A job lost with its node (a devai-slurm restart, a host reboot) ends
+# NODE_FAIL and never runs again (C3).
+JobRequeue=0
+# A node set DOWN for any reason ("Node unexpectedly rebooted" after a host
+# reboot included) returns when slurmd registers; a DRAIN set by the guard or
+# an epilog stays the health check's (I7).
+ReturnToService=2
+
+# No log files: the daemons run in the foreground under supervisord and log
+# to stderr, which podman logs (and the log follower) keep.
+SlurmctldDebug=info
+SlurmdDebug=info
+
+NodeName=devai NodeAddr=127.0.0.1 CPUs=@CPUS@ RealMemory=@MEMORY_MB@ State=UNKNOWN
+PartitionName=devai Nodes=devai Default=YES MaxTime=INFINITE State=UP

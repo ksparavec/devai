@@ -17,8 +17,9 @@ type Entry struct {
 // filesystem root it was written from, so Restore can invert Manifest.
 func ArchiveRoots(repoRoot, homeDir string) map[string]string {
 	return map[string]string{
-		"deploy":     filepath.Join(repoRoot, "deploy"),
-		"devai-home": filepath.Join(homeDir, ".devai"),
+		"deploy":       filepath.Join(repoRoot, "deploy"),
+		"devai-home":   filepath.Join(homeDir, ".devai"),
+		"devai-config": filepath.Join(homeDir, ".config", "devai"),
 	}
 }
 
@@ -39,6 +40,7 @@ var retiredArchiveRoots = map[string]string{
 func Manifest(repoRoot, homeDir string) []Entry {
 	deploy := filepath.Join(repoRoot, "deploy")
 	devaiHome := filepath.Join(homeDir, ".devai")
+	devaiConfig := filepath.Join(homeDir, ".config", "devai")
 
 	entries := []Entry{
 		{SourcePath: filepath.Join(deploy, ".bench-cache.json"), ArchivePath: "deploy/.bench-cache.json"},
@@ -52,6 +54,10 @@ func Manifest(repoRoot, homeDir string) []Entry {
 		{SourcePath: filepath.Join(deploy, ".model-status.json"), ArchivePath: "deploy/.model-status.json"},
 		{SourcePath: filepath.Join(devaiHome, "preferences.yaml"), ArchivePath: "devai-home/preferences.yaml"},
 		{SourcePath: filepath.Join(devaiHome, "sessions"), ArchivePath: "devai-home/sessions", Dir: true},
+		// devai-slurm's secrets (platform-rebuild C7, `make slurm-init`):
+		// slurm.key, jwt_hs256.key, mariadb.pass and nats/<user>.pass, all
+		// 0600. The archive is written 0600 for them (Snapshot).
+		{SourcePath: filepath.Join(devaiConfig, "slurm"), ArchivePath: "devai-config/slurm", Dir: true},
 	}
 
 	if matches, err := filepath.Glob(filepath.Join(deploy, "*.sops.env")); err == nil {

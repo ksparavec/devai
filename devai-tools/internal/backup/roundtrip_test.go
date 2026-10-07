@@ -32,6 +32,15 @@ func setupFixture(t *testing.T) (repoRoot, homeDir string) {
 	// An age key left on the host from the retired sops/age scaffold
 	// (attic/sops-age/). It is NOT a manifest source any more; the round
 	// trip below proves it is neither archived nor restored.
+	slurmDir := filepath.Join(homeDir, ".config", "devai", "slurm", "nats")
+	mustMkdirAll(t, slurmDir)
+	if err := os.WriteFile(filepath.Join(slurmDir, "jobs.pass"), []byte("0123abcd\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(homeDir, ".config", "devai", "slurm", "jwt_hs256.key"), []byte("k"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
 	ageDir := filepath.Join(homeDir, ".config", "sops", "age")
 	mustMkdirAll(t, ageDir)
 	mustWriteFile(t, filepath.Join(ageDir, "keys.txt"), "AGE-SECRET-KEY-1TESTTESTTEST\n")
@@ -63,6 +72,11 @@ func TestSnapshotListVerifyRestoreRoundTrip(t *testing.T) {
 		t.Fatalf("Snapshot: %v", err)
 	}
 
+	// The archive holds C7's 0600 secrets: written 0600 whatever the umask.
+	if info, err := os.Stat(archivePath); err != nil || info.Mode().Perm() != 0o600 {
+		t.Errorf("archive mode = %v (%v), want 0600", info.Mode().Perm(), err)
+	}
+
 	archives, err := List(destDir)
 	if err != nil {
 		t.Fatalf("List: %v", err)
@@ -84,6 +98,7 @@ func TestSnapshotListVerifyRestoreRoundTrip(t *testing.T) {
 	origPrefs := mustReadFile(t, filepath.Join(homeDir, ".devai", "preferences.yaml"))
 	origSession := mustReadFile(t, filepath.Join(homeDir, ".devai", "sessions", "claude.jsonl"))
 	origSops := mustReadFile(t, filepath.Join(repoRoot, "deploy", "prod.sops.env"))
+	origJobsPass := mustReadFile(t, filepath.Join(homeDir, ".config", "devai", "slurm", "nats", "jobs.pass"))
 
 	if err := os.RemoveAll(repoRoot); err != nil {
 		t.Fatal(err)
@@ -100,6 +115,11 @@ func TestSnapshotListVerifyRestoreRoundTrip(t *testing.T) {
 	assertFileEquals(t, filepath.Join(homeDir, ".devai", "preferences.yaml"), origPrefs)
 	assertFileEquals(t, filepath.Join(homeDir, ".devai", "sessions", "claude.jsonl"), origSession)
 	assertFileEquals(t, filepath.Join(repoRoot, "deploy", "prod.sops.env"), origSops)
+	restoredPass := filepath.Join(homeDir, ".config", "devai", "slurm", "nats", "jobs.pass")
+	assertFileEquals(t, restoredPass, origJobsPass)
+	if info, err := os.Stat(restoredPass); err != nil || info.Mode().Perm() != 0o600 {
+		t.Errorf("restored jobs.pass mode = %v (%v), want 0600", info.Mode().Perm(), err)
+	}
 
 	if _, err := os.Lstat(filepath.Join(homeDir, ".config", "sops")); !os.IsNotExist(err) {
 		t.Errorf("restore recreated ~/.config/sops (err=%v); the age key is no longer backed up", err)

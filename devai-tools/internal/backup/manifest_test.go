@@ -61,10 +61,26 @@ func TestArchiveRootsRoundTrip(t *testing.T) {
 	if roots["devai-home"] != filepath.Join("/home/u", ".devai") {
 		t.Errorf("devai-home root = %q", roots["devai-home"])
 	}
+	if roots["devai-config"] != filepath.Join("/home/u", ".config", "devai") {
+		t.Errorf("devai-config root = %q", roots["devai-config"])
+	}
 	if _, ok := roots["sops-age"]; ok {
 		t.Error("sops-age is a retired root; ArchiveRoots must not map it")
 	}
-	if len(roots) != 2 {
-		t.Errorf("ArchiveRoots = %v, want exactly deploy and devai-home", roots)
+	if len(roots) != 3 {
+		t.Errorf("ArchiveRoots = %v, want exactly deploy, devai-home and devai-config", roots)
 	}
+}
+
+// platform-rebuild C7: devai-backup includes ~/.config/devai/slurm/.
+func TestManifestCarriesTheSlurmSecrets(t *testing.T) {
+	for _, e := range Manifest("/repo", "/home/u") {
+		if e.ArchivePath == "devai-config/slurm" {
+			if !e.Dir || e.SourcePath != filepath.Join("/home/u", ".config", "devai", "slurm") {
+				t.Errorf("slurm entry = %+v", e)
+			}
+			return
+		}
+	}
+	t.Fatal("no devai-config/slurm entry")
 }
