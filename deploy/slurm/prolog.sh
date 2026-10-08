@@ -17,7 +17,7 @@ case "$J" in *[!0-9]*|'') echo "prolog: bad job id '$J'" >&2; exit 1 ;; esac
 R=/var/cache/devai/jobs/results/$J
 
 if ! install -d -o devai -g 0 -m 2775 "$R" "$R/artifacts"; then
-    echo "prolog: cannot create $R (is the jobs volume full? devai-jobs prune)" >&2
+    echo "prolog: cannot create $R (is /var/cache/devai full? devai-jobs prune)" >&2
     exit 1
 fi
 

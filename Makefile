@@ -270,7 +270,7 @@ endif
 .PHONY: bench bench-vllm bench-sglang bench-ollama bench-report bench-harvest test-bench-smoke
 .PHONY: test-python build-backup-tool build-devai-tools test-devai-tools
 .PHONY: backup-create backup-list backup-verify backup-restore test-backup-restore
-.PHONY: slurm-tools build-slurm slurm-init setup-jobs slurm-up slurm-down test-slurm
+.PHONY: slurm-tools build-slurm slurm-init slurm-up slurm-down test-slurm
 
 all: help
 
@@ -688,8 +688,9 @@ test-backup-restore: test-devai-tools ## devai-tools Go tests + tests/test-backu
 # =============================================================================
 # devai-slurm: Slurm, MariaDB, NATS and the bus log in one container
 # (docs/slurm.md; platform-rebuild Phase 5). Behind the compose profile
-# `slurm` until Phase 9 makes the router its client. One-time setup, in
-# order: make setup-jobs slurm-init build-slurm slurm-up.
+# `slurm` until Phase 9 makes the router its client. One-time setup: create
+# $(JOBS_DIR) as a plain directory (plan E9), then make slurm-init
+# build-slurm slurm-up.
 # =============================================================================
 
 # The one Debian image devai pulls, pinned by digest (M1, M13). Phase 2 step 1
@@ -727,18 +728,9 @@ build-slurm: slurm-tools ## Build the devai-slurm image (Debian trixie's Slurm 2
 slurm-init: ## One-time: create devai-slurm's secrets in ~/.config/devai/slurm (slurm.key, jwt_hs256.key, mariadb.pass, nats/<user>.pass; 0600, never overwritten)
 	DEVAI_SLURM_CONFIG_DIR=$(SLURM_CONFIG_DIR) scripts/slurm-init.sh
 
-setup-jobs: ## One-time: create the 50G LV at /var/cache/devai/jobs (Slurm state, MariaDB, job results, the bus log; requires sudo)
-	@# The generic volume script (see setup-logs); it refuses to hide or wipe
-	@# data that is already there. devai-slurm must not hold the path open.
-	-@$(MAKE) --no-print-directory slurm-down
-	sudo LV=cache_jobs MOUNTPOINT=$(JOBS_DIR) SIZE=$${SIZE:-50G} VG=$${VG:-vgais} \
-	     POOL=$${POOL:-cachepool} RECREATE=$${RECREATE:-0} \
-	  deploy/setup-logs-volume.sh
-	@echo "Next: make slurm-init build-slurm slurm-up"
-
-slurm-up: ## Start devai-slurm (compose profile `slurm`; needs setup-jobs, slurm-init and build-slurm first)
+slurm-up: ## Start devai-slurm (compose profile `slurm`; needs the $(JOBS_DIR) directory, slurm-init and build-slurm first)
 	@test -d $(SLURM_CONFIG_DIR) || { echo "error: no $(SLURM_CONFIG_DIR) -- run 'make slurm-init' first" >&2; exit 1; }
-	@mountpoint -q $(JOBS_DIR) || { echo "error: $(JOBS_DIR) is not a mounted volume -- run 'make setup-jobs' first" >&2; exit 1; }
+	@test -d $(JOBS_DIR) || { echo "error: no $(JOBS_DIR) -- create it first (a plain directory; plan E9)" >&2; exit 1; }
 	@$(CONTAINER_RUNTIME) image exists $(SLURM_IMAGE) || { echo "error: no image $(SLURM_IMAGE) -- run 'make build-slurm' first" >&2; exit 1; }
 	@$(CONTAINER_RUNTIME) network exists $(DEVAI_NETWORK) 2>/dev/null || $(CONTAINER_RUNTIME) network create $(DEVAI_NETWORK)
 	$(COMPOSE) -f $(CACHE_COMPOSE) --profile slurm up -d --no-deps slurm
@@ -927,9 +919,9 @@ help: ## Show this help message
 	@printf "  %-44s%s\n" "fetch-vllm-recipes  vLLM recipe seeds" "recipe-apply     NAME=<row> recipe flags"
 	@printf "\n"
 	@printf "  %-44s%s\n" "SLURM (docs/slurm.md; profile slurm)" ""
-	@printf "  %-44s%s\n" "setup-jobs       LV for jobs/ (once, sudo)" "slurm-up         Start devai-slurm"
-	@printf "  %-44s%s\n" "slurm-init       Create its secrets (once)" "slurm-down       Stop devai-slurm"
-	@printf "  %-44s%s\n" "build-slurm      Build devai-slurm" "test-slurm       Live checks (GPU)"
+	@printf "  %-44s%s\n" "slurm-init       Create its secrets (once)" "slurm-up         Start devai-slurm"
+	@printf "  %-44s%s\n" "build-slurm      Build devai-slurm" "slurm-down       Stop devai-slurm"
+	@printf "  %-44s%s\n" "test-slurm       Live checks (GPU)" ""
 	@printf "\n"
 	@printf "  %s\n" "DEPLOY"
 	@printf "  %s\n" "install-systemd  Auto-start infrastructure at boot"

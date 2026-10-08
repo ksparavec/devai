@@ -4,7 +4,7 @@
 #
 # It starts devai-slurm itself (as compose defines it: --pid=host, podman's
 # default user namespace, devai-net only, nothing published, the tmpfs, the
-# jobs volume and ~/.config/devai/slurm; first WITHOUT the GPU device, then
+# jobs directory and ~/.config/devai/slurm; first WITHOUT the GPU device, then
 # with it), and two devai-control test containers from
 # tests/slurm/Dockerfile.control-test, so jobs use the production subjects,
 # users and namespaces:
@@ -22,8 +22,9 @@
 #     the same subjects and match the guard's command-line lookup;
 #   - the stack is up: run `make cache-down slurm-down` first (and, once
 #     devai-operator exists, `podman stop devai-operator`);
-#   - the card is not idle, or an image, the secrets or the jobs volume are
-#     missing (`make build-slurm slurm-init setup-jobs`).
+#   - the card is not idle, or an image, the secrets or the jobs directory
+#     are missing (`make build-slurm slurm-init`; the directory is created
+#     by hand, plan E9).
 #
 # An EXIT trap removes the test containers and the epilog test switch, and
 # brings the stack back as compose defines it: `make cache-up slurm-up`
@@ -96,7 +97,7 @@ fi
 for f in slurm.key jwt_hs256.key mariadb.pass nats/jobs.pass nats/operator.pass nats/control-engines.pass nats/control-operator.pass; do
     [ -s "$SLURM_CONFIG_DIR/$f" ] || die "no $SLURM_CONFIG_DIR/$f -- make slurm-init"
 done
-mountpoint -q "$JOBS" || die "$JOBS is not a mounted volume -- make setup-jobs"
+[ -d "$JOBS" ] || die "no $JOBS -- create it (a plain directory; plan E9)"
 for b in devai-control devai-bus; do
     [ -x "$TOOLS/$b" ] || die "no $TOOLS/$b -- make slurm-tools"
 done

@@ -121,7 +121,7 @@ Quoted as recorded in the three plans this one replaces, except E1-E6, which the
   - when the interrupting job needs the same backend and model, the interruption must be fast (no engine restart).
   - devai application containers always go through the router and never use the GPU directly.
 - **D2 -- Slurm runs in containers**, so devai stays independent of the host's Linux distribution. The containers get the privileges they need.
-- **D3 -- Job results live in `/var/cache/devai/jobs`** (its own volume, per the mount-point convention in CLAUDE.md).
+- **D3 -- Job results live in `/var/cache/devai/jobs`** (a plain directory the operator creates, E9; it was to be its own volume).
 - **D4 -- Use a published image if one exists.** *(Superseded by D7 on 2026-09-30.)* Docker Hub has none that is maintained (2026-09-29: the `slurm/` namespace holds two repositories last updated in 2017 and 2018; the rest are personal images). SchedMD, Slurm's maintainer, publishes official images on GHCR (`ghcr.io/slinkyproject/{slurmctld,slurmd,slurmdbd,slurmrestd}:26.05-ubuntu26.04`, Slurm 26.05.4, recipe github.com/SlinkyProject/containers). Its `slurmd` was built without the `gpu_nvml` plugin.
 - **D5 -- Not a separate project.** One consumer, contracts that change together with the router and the workloads, no product without devai. A second repository would make every change a cross-repo release (the aiagent experience). It stays extractable: own directory, own tests, config under `deploy/slurm/`, a written job/result format.
 - **D6 -- No containers inside containers.** Ruled out after spike round 1, which ran engines as podman containers nested in the slurmd container. (It also meant, until D10, that an engine ran as the job's own process. D10 replaced that with `podman exec` into a sibling container, which is still not nesting. Since D15 no job starts a process in another container at all.)
@@ -251,6 +251,14 @@ The operator's answers after two research rounds on 2026-10-06: vLLM after 0.28,
   - Checked in the 0.30.0 image on 2026-10-07: FlashInfer JIT-compiled its kernels with `/usr/local/cuda` (13.1), and humming-kernels, the only other package that compiles with nvcc at run time, picks the system toolkit over pip's when both are present. Neither Qwen3.8 row uses humming (NVFP4 on FlashInfer CUTLASS, int8 layers on Marlin).
   - It amends step 4v's runtime-set rule ("without its `vllm`, `flashinfer-cubin` and extra-index lines"): `scripts/build-vllm.sh` drops these four packages and those extras when it writes `<version>.in`.
   - Done 2026-10-07: both locks regenerated (each lost exactly the four packages); the 0.30.0 image rebuilt without them (`5ab31d2b6ebc`) and re-probed with the FlashInfer cache emptied -- both prepared rows keep their contexts with MTP and pass the load probe, Qwen3.5-9B-NVFP4 keeps 262,144, every value equal to the first build's (docs/backends.md "vLLM 0.30.0"); `:latest` moved to it.
+
+### Storage (2026-10-08)
+
+- **E9 -- Plain directories under `/var/cache/devai`; no logical-volume steps.** The operator, 2026-10-08: "remove this logical volume creation step. regarding thin-pool: this is planned, but is part of another project. for now, we just use plain directories."
+  - `/var/cache/devai` is one volume (`vgais-cache`), and the folders under it are plain directories on it. A new one is a plain directory the operator creates. Per-folder thin volumes belong to that other project, not to this plan.
+  - `make setup-jobs` is removed. The operator created `/var/cache/devai/jobs` on 2026-10-08. `make slurm-up`, the `devai-slurm` entrypoint and `tests/slurm/test-slurm.sh` check that it exists, not that it is a mount point. Amends D3, C4 and Phase 5 step 8.
+  - The same holds for LS24's embedding store: `/var/cache/devai/embed` is a plain directory, and `make setup-embed` is not written (Phase 20.2).
+  - No step of this plan checks for a mount point under `/var/cache/devai`.
 
 ## Implementation decisions (2026-10-05)
 
@@ -643,7 +651,7 @@ These engines cannot share one Python environment. And FlashInfer compiles its k
 | 3 | One lab image on Debian | 2 | 5 |
 | 4 | `devai-engines` | 3 (its first step, 4v, needs nothing) | 5, 6, 7 |
 | 5 | `devai-slurm` and the bus | -- (it uses Phase 2's Debian pin once that exists) | 1-4, 6, 7 |
-| 6 | `devai-operator`: image, container, direct actions | 2, 3 (`scripts/host-gpu.sh`), and Phase 5's `make setup-jobs` (step 8, which can run on its own first: its runs write under `/var/cache/devai/jobs`) | 4, 5 |
+| 6 | `devai-operator`: image, container, direct actions | 2, 3 (`scripts/host-gpu.sh`), and Phase 5's jobs directory (`/var/cache/devai/jobs`, created by the operator, E9: its runs write under it) | 4, 5 |
 | 7 | Recipes into scripts | 6 | 4, 5, 8 |
 | 8 | Engines and trainer under `devai-control` | 4, 5, 17a (the generated recovery file and its readers, I25); its step 1 needs only 4v, and runs before 4e retires `vllm-devai` | 7 |
 | 9 | Router as Slurm client | 6 (`scripts/ops/probe-ollama.sh`; the log follower in devai-operator, I20), 8 | 7 |
@@ -660,7 +668,7 @@ These engines cannot share one Python environment. And FlashInfer compiles its k
 | 20 | Library service | 2, 3, 6, 7 (20.1's `scripts/ops/operator-up.sh`, the rewritten systemd unit and its registry entries; 12 for the lab action's mount) | 4, 5, 8-19 |
 | 21 | Loose ends | -- | any |
 | 22 | laya 0.3.28 | -- (aiagent's release first, E6) | any |
-| 23 | System One | 4, 8, 9 (step 1 needs only the `vllm-s1` build, with 4c's `Dockerfile.engines` and 4d's launcher written for it if 4a-4b are not done yet, and Phase 5's `make setup-jobs` (step 8, which can run on its own first: step 1 writes `attempts.jsonl` under `/var/cache/devai/jobs`); step 2 only the trainer image; step 5 only 4v; its registry entries Phase 7, its jobs, GPU action and holds Phase 10) | 10-22 |
+| 23 | System One | 4, 8, 9 (step 1 needs only the `vllm-s1` build, with 4c's `Dockerfile.engines` and 4d's launcher written for it if 4a-4b are not done yet, and Phase 5's jobs directory (`/var/cache/devai/jobs`, created by the operator, E9: step 1 writes `attempts.jsonl` under it); step 2 only the trainer image; step 5 only 4v; its registry entries Phase 7, its jobs, GPU action and holds Phase 10) | 10-22 |
 
 The critical path is 1 -> 2 -> 3 -> 4 -> 8 -> 9 -> 10 -> 13 -> 14. Phase 5 runs beside it and must be done before 8, Phase 6 before 9, and Phase 7 before 10. Phase 4's first step, 4v (vLLM 0.30.0, E1), needs nothing and comes before Phase 15, which runs beside 1-3 and must be done before 4a; 17a must be done before 8. Phases 15-22 are outside slurm.md's scope; Phase 23 adds a service to two containers and a router port, which slurm.md records.
 
@@ -902,7 +910,7 @@ How the router ends an engine job:
 
 ### C4 -- Files under `/var/cache/devai/jobs`
 
-This is its own volume (D3), created by `make setup-jobs`. A job's directory is shared through a setgid group (I26). The prolog creates `results/<jobid>/` and its `artifacts/` owned by devai, group 0 (the host user's group), mode 2775. `job.log` belongs to devai's subordinate uid and everything else to the host user; every file carries the host user's group.
+This is a plain directory the operator creates (D3, E9). A job's directory is shared through a setgid group (I26). The prolog creates `results/<jobid>/` and its `artifacts/` owned by devai, group 0 (the host user's group), mode 2775. `job.log` belongs to devai's subordinate uid and everything else to the host user; every file carries the host user's group.
 
 ```
 results/<jobid>/job.log          the job script's output (Slurm)
@@ -1735,7 +1743,7 @@ deploy/docker-compose.yaml        modify -- service `slurm` (container devai-slu
                                             the GPU when present, C6/C7 mounts, the environment of C7:
                                             SLURM_REST_URL, SLURM_JWT_KEY_FILE, SLURM_USER); profile `slurm`
                                             until Phase 9
-Makefile                          modify -- build-slurm, slurm-init, setup-jobs, slurm-up, slurm-down, test-slurm
+Makefile                          modify -- build-slurm, slurm-init, slurm-up, slurm-down, test-slurm
 scripts/slurm-init.sh             new    -- C7 (the Slurm part)
 devai-tools/internal/backup/manifest.go
                                   modify -- ~/.config/devai/slurm/
@@ -1780,11 +1788,11 @@ docs/backup-restore.md            modify -- archives are written 0600, because t
    - Check whether 24.11 accepts `scontrol update JobId=<id> AdminComment=...` from the epilog of a completing job. If it does not, the summary stays in `gpu.json`, and Phase 13 reads it from there.
    - Check whether a node drained by a failed prolog keeps a reason that the health check can recognise; otherwise the health check also reads `guard.json`.
 7. **The bus log.** `devai-bus log --dir /var/cache/devai/jobs/bus` writes one JSON line per event, with the receive time.
-8. **Compose, Makefile, init, backup.** `slurm-init`; `setup-jobs` (`sudo LV=cache_jobs MOUNTPOINT=/var/cache/devai/jobs SIZE=50G deploy/setup-logs-volume.sh`); the backup entry, and archives written 0600 (C7's secrets are in them).
+8. **Compose, Makefile, init, backup.** `slurm-init`; `slurm-up` refuses without `/var/cache/devai/jobs` (a plain directory the operator creates, E9; `setup-jobs` and its LV were removed); the backup entry, and archives written 0600 (C7's secrets are in them).
 
 ### Exit criteria
 
-- After `make setup-jobs slurm-init build-slurm slurm-up`, `sinfo` shows `devai` idle, `sacctmgr show cluster` lists `devai`, `sacctmgr -n show user devai format=adminlevel` prints `Operator` (also after `podman restart devai-slurm`), and `podman port devai-slurm` lists nothing.
+- After `make slurm-init build-slurm slurm-up` (with `/var/cache/devai/jobs` created), `sinfo` shows `devai` idle, `sacctmgr show cluster` lists `devai`, `sacctmgr -n show user devai format=adminlevel` prints `Operator` (also after `podman restart devai-slurm`), and `podman port devai-slurm` lists nothing.
 - A job submitted through slurmrestd from another container on `devai-net`, with a JWT signed by `pkg/slurmrest`, runs, and its JSON comment arrives intact in `sacct`. A second `-L engine` job waits as `PENDING (Licenses)`.
 - A job submitted through slurmrestd with a JWT signed for `sun: root`, or for any user other than devai, is refused at submission and never runs.
 - `bin/devai-jobs list --json` succeeds against the live devai-slurm, and a prolog's `devai.events.slurm.guard` event lands in the bus log (C7: devai-slurm's environment; the guard sets its own bus settings).
@@ -2006,7 +2014,7 @@ tests/python/test_makefile_ops.py new    -- every offered target's recipe is one
 
 1. Inventory the 124 documented targets by group.
    - Interactive targets (`lab`, `shell`) become job actions in the `lab` group (Phase 12; `job_kind: action`, no license, O2) or are not offered.
-   - Host-root targets (`setup-logs`, `setup-jobs`, the volume set-ups) become `host` actions (O3).
+   - Host-root targets (`setup-logs`, the volume set-ups) become `host` actions (O3).
    - Targets Phase 1 removed are gone already. `secrets-tmpfs` in O3 went to the attic with sops/age (M12).
    - `install-systemd` is already broken: its unit runs compose from a copy in `~/.config/devai`, which stages none of six current mounts. The unit now runs the same scripts as the Makefile, so each override file a later phase adds reaches it without anyone returning to `install-systemd`:
      - `WorkingDirectory=<repo>` and `Environment=DEVAI_REPO=<repo>` (I25);
@@ -2714,8 +2722,8 @@ scripts/ops/lab-start.sh, lab-stop.sh
                                             name; removes devai-lab-<name>. The read-only /library mount once Phase
                                             20.1 has landed
 deploy/operator/actions.yaml      modify -- lab-start, lab-stop (kind job, job_kind action, group lab; no license, no
-                                            gpu); the host items (kind host): setup-logs, setup-jobs, the model-store
-                                            volumes, install, and setup-embed once Phase 20.2 has landed (LS24)
+                                            gpu); the host items (kind host): setup-logs, the model-store
+                                            volumes, install, and the jobs and embed directories (E9)
 devai-operator/devai_operator/lab.py, host.py
                                   new    -- the lab page lists containers labelled devai.lab and shows
                                             http://<host>:<port>/lab?token=<devai.lab.token> and, when set, the dsh
@@ -2729,7 +2737,7 @@ tests (make test-operator)        new    -- lab-start's argv and labels from the
 ### Detailed steps
 
 1. **The lab page** lists running `devai-lab` containers by their label and shows their links. Start and stop are `job` actions (`job_kind: action`, no license, O2), so they are in the job history: they hold no GPU, so they never wait for `engine:1`. If this phase lands before Phase 10, they run direct until Phase 10 makes them jobs, as every non-lifecycle action. The script starts the `devai-lab` container detached and returns. The container is labelled `devai.lab`, not with the job's label, so the end of the job and its cleanup leave it running.
-2. **The host-setup page.** For each item it checks what the container can see. The mounts under `/var/cache/devai` are visible through the bind mount, so `setup-logs`, `setup-jobs` and the store volumes can be checked. The page then prints the command. `install` writes the host's `~/.local/bin`, which the container does not see, so it is shown with its command and "state not checked".
+2. **The host-setup page.** For each item it checks what the container can see. The mounts under `/var/cache/devai` are visible through the bind mount, so `setup-logs`, the jobs directory and the store volumes can be checked. The page then prints the command. `install` writes the host's `~/.local/bin`, which the container does not see, so it is shown with its command and "state not checked".
 
 ### Exit criteria
 
@@ -3273,7 +3281,7 @@ It needs Phase 2 (the pinned Debian image, pipelock and apt-cache built here), P
 - **Owner actions, each blocking the phase named:**
   - the dedicated contact address (LS21) on the company's own domain: blocks 20.1's live exit (no external request without it), and every key application below;
   - an OpenAlex API key: optional, raises the daily budget from $0.10 to $1 (20.2);
-  - the embedding store's LV (`make setup-embed`, root, LS24): blocks 20.2's index;
+  - the embedding store's directory, `/var/cache/devai/embed` (a plain directory the operator creates, LS24, E9): blocks 20.2's index;
   - a GitHub fine-grained token (20.4); a Hugging Face token (20.4); a Semantic Scholar key, requested only when 20.5 starts because unused keys are pruned after about 60 days; an OpenReview service account (20.5);
   - contacting arXiv before the library passes about 1,000 full-text downloads ("Politeness engine").
 - **pipelock** (`docs/pipelock.md`): the service's outbound traffic goes through it for DLP.
@@ -3487,7 +3495,7 @@ Each key the library uses is a plain file the owner writes once into `~/.config/
 - The OpenAlex adapter: discovery (structural filters where they fit, text matching priced as search), open-access locations, `cited_by_count` and citing works, advisory author metrics with provenance (source, as-of date, match method), the dollar budget; `POST /v1/enrichments` and `GET /v1/candidates/{id}`.
 - Unpaywall by DOI. Fetchable link records for open-access PDFs on allowed hosts (each host added to `library-sources.yaml` with its own robots and limits); "known, not held" link records otherwise, SSRN included (LS8).
 - The key, if an OpenAlex key exists: `~/.config/devai/library/openalex.key` (LS30), mounted into `devai-library` only. First check whether `api.openalex.org` accepts the key in a request header (one keyed request; it must show the $1/day budget in the response's rate-limit or budget headers). If it does, send it in that header and add no DLP exemption: no pipelock pattern matches an OpenAlex key. If it does not, send it as the `api_key` query parameter that OpenAlex documents, to `api.openalex.org` only: add `api.openalex.org` to the `exempt_domains` of pipelock's `Credential in URL` pattern (deploy/pipelock.yaml), strip `api_key` from every URL the service logs or stores, and record the exception in `docs/library.md`. Without a key, 20.2-20.3 run keyless at $0.10/day, and the acceptance test is sized to that.
-- The keyword and vector indexes, library search; the embedding model's store (LS24: `/var/cache/devai/embed` on its own LV, set up by `make setup-embed` (`sudo LV=cache_embed MOUNTPOINT=/var/cache/devai/embed SIZE=<n>G deploy/setup-logs-volume.sh`, like `setup-jobs`; a C8 `host` action like the other volume set-ups), written out in `scripts/select-models.py`'s storage layout and pinned by `StorageLayoutTest`, mounted read-only into `devai-library` at `/embed`; the service refuses to start search when the pinned model file is absent there), its catalog row in `deploy/embed-models.yaml` and its pull through `scripts/select-models.py`.
+- The keyword and vector indexes, library search; the embedding model's store (LS24: `/var/cache/devai/embed`, a plain directory the operator creates (E9; LS24 had its own LV and `make setup-embed`), written out in `scripts/select-models.py`'s storage layout and pinned by `StorageLayoutTest`, mounted read-only into `devai-library` at `/embed`; the service refuses to start search when the pinned model file is absent there), its catalog row in `deploy/embed-models.yaml` and its pull through `scripts/select-models.py`.
 - The rebuild command: delete `index/` and rebuild it from the plain files, reusing `cache/embeddings/` (a unit whose key is cached is not re-embedded); `--reembed` also deletes `cache/embeddings/`. Every listing is in a total order: the requested sort key, then `item_id` ascending. A cursor encodes the last row's (sort value, `item_id`), not an offset or a row id, so a page does not depend on insertion order.
 
 **Exit criteria:** candidates from OpenAlex merge with arXiv records by identifier; a non-arXiv open-access PDF is fetched from an allowed host; an SSRN work comes back as a link with its reason; after a rebuild from the plain files the topic listing is byte-identical and every alias resolves as before (aiagent's check 6), tested on a fixture with tied relevance scores, whose items are written in a different order than they are read back, and compared across at least two pages, the second reached through `next_cursor`; a second rebuild with an unchanged library embeds zero units (counted in the rebuild's report); with an OpenAlex key, a keyed request reports the $1/day budget.
@@ -3788,7 +3796,7 @@ Implements E2-E5 with I27-I30. New work, from the two research rounds of 2026-10
 ### Needs
 
 - **Phase 4:** the engines image (`deploy/Dockerfile.engines`, the `devai-engine` launcher) and 4v's version parameter in `scripts/build-vllm.sh` (I29).
-  - Step 1 needs only the `vllm-s1` build and Phase 5's `make setup-jobs` (step 8, which can run on its own first), because it writes `/var/cache/devai/jobs/systemone-gate/attempts.jsonl`. The build: 4v's parameter and its `make vllm-lock`, the 0.31.0 record (`deploy/vllm-builds/0.31.0.sh`), the engines image's `vllm-s1` stage, which builds on its own (`--target vllm-s1-run`), and the `devai-engine` launcher (4d). If 4c and 4d have not been done, step 1 writes `Dockerfile.engines` and the launcher for `vllm-s1` alone, and 4c and 4d add the other engines later.
+  - Step 1 needs only the `vllm-s1` build and Phase 5's jobs directory (created by the operator, E9), because it writes `/var/cache/devai/jobs/systemone-gate/attempts.jsonl`. The build: 4v's parameter and its `make vllm-lock`, the 0.31.0 record (`deploy/vllm-builds/0.31.0.sh`), the engines image's `vllm-s1` stage, which builds on its own (`--target vllm-s1-run`), and the `devai-engine` launcher (4d). If 4c and 4d have not been done, step 1 writes `Dockerfile.engines` and the launcher for `vllm-s1` alone, and 4c and 4d add the other engines later.
   - Step 5 needs only 4v: it reads from the teacher on the `vllm` backend (on `vllm-devai`, port 11437, until 4e).
 - **Phase 8:** `devai-control`, for step 3 (`vllm-s1` as a service) and for the student service as a supervisord program of `devai-laya-trainer`. Step 2 needs only the trainer image.
 - **Phase 9:** the router's Slurm launcher, for step 4: the System One port reaches DiffusionGemma through an engine job, and a switch into `vllm-s1` is a rule of that launcher.
@@ -3971,14 +3979,14 @@ scripts/systemone/gate.py             new    -- step 1, the DiffusionGemma gate 
                                                 GPU-device test reads here as well as in systemone-gate.sh; reads
                                                 deploy/systemone-gate-flags.json and appends to
                                                 /var/cache/devai/jobs/systemone-gate/attempts.jsonl (step 1); refuses
-                                                to start, naming `make setup-jobs`, when /var/cache/devai/jobs is not
-                                                a mount point; builds each launch's argv as production will (step 1)
+                                                to start when /var/cache/devai/jobs does not exist
+                                                (E9); builds each launch's argv as production will (step 1)
 deploy/systemone-gate-flags.json      new    -- the gate's flag set (step 1), seeded from the launch list; tests pin
                                                 that gate.py refuses a file without `--kv-cache-dtype`, refuses
                                                 `counted` on a sha256 with a pass or deferral line, refuses it after
                                                 a "limit reached" line without `--after-limit`, and accepts it with
                                                 `--after-limit` naming that line; and that it refuses to start when
-                                                /var/cache/devai/jobs is not a mount point
+                                                /var/cache/devai/jobs does not exist
 scripts/systemone/score.py            new    -- one scorer for any /v1/systemone backend against a stored dataset's
                                                 held-out gold labels, and `--golden` (steps 2 and 5)
 scripts/systemone/teacher_reads.py    new    -- step 5 (E5): a /v1/systemone-shaped reader over the teacher's chat
@@ -4098,7 +4106,7 @@ The server is `examples/features/structured_diffusion/structured_server.py` at v
    - **Model:** add `backends: [vllm-s1]` to the diffusiongemma family, run `make catalog-regen`, then `make model-pull NAME=diffusiongemma-26B-A4B-it-NVFP4` (the row in `deploy/models.yaml`; 17.53 GB into the vLLM store). The `select-models.py` deliverable lands first.
    - **Where it runs:**
      - before Phase 10: `make systemone-gate`, with the stack down. The target first checks that nothing holds the card, with C8's card check (no compute process, `memory.used` at most 512 MiB);
-     - from Phase 10 on: the GPU action `systemone-gate` (`job_kind: action`, `gpu: true`, `time_limit_min: 240`, C8; an engineering margin, not measured: read latency on `vllm-s1` is not yet known, and the 10 counted launches alone take about 17 min of startup at the old image's 90-115 s each; the report records each job's wall time). Its parameter `mode` (`shakedown` | `counted`; before Phase 10 the target's `MODE=`, gate.py's `--mode`) selects the run. The flags come from one tracked file, `deploy/systemone-gate-flags.json` (the engine's arguments after `--model`, and its environment), which gate.py reads at start and copies, with its sha256, into the report. The file must name `--kv-cache-dtype` explicitly; gate.py refuses one that does not. gate.py builds each launch's argv as production will build it for backend `vllm-s1` at `DEVAI_SYSTEMONE_CTX`: the vllm-s1 prober's `vllm_command_args`, which mirrors the router's builder (I1; from Phase 8 the same argv as `gpu-arbiter -print-load` through `pkg/engineargs`), so `--trust-remote-code`, `--max-num-seqs` = `MAX_CONCURRENT_REQUESTS`, the computed utilisation and the family's curated parsers (`--reasoning-parser gemma4 --enable-auto-tool-choice --tool-call-parser gemma4`), and then the file's flags and environment last, as the recovery entry will be appended (the last flag wins). The report records the full argv and environment of every launch. A shakedown job runs launches on that file and counts nothing; the operator edits and commits it between shakedowns. A counted job runs both soaks and the 10 launches on it. Every counted run appends one line (the flags' sha256, the flags, the job id or `host`, start, outcome: pass, deferral or limit reached) to `/var/cache/devai/jobs/systemone-gate/attempts.jsonl`; gate.py lists every line in its report and refuses `counted` when the current flags' sha256 already has a pass or deferral line. When the sha256's only lines are "limit reached", it refuses `counted` unless it is given `--after-limit <job id or host>` naming the latest such line (the target's `AFTER_LIMIT=`, the action's parameter `after_limit`); the new line records that id, and the report lists both attempts. gate.py refuses to start, naming `make setup-jobs`, when `/var/cache/devai/jobs` is not a mount point (`os.path.ismount`), so the ledger never lands on the root filesystem; a test pins the refusal. Its job holds the `engine` license, so the guard and the license keep every other model off the card, and its container carries the job's `devai.job` label and `DEVAI_JOB_ID`, as Phase 22's `laya-recipe-eval` does. No target runs the card check then, and Phase 10 converts the pre-Phase-10 form if this phase lands first;
+     - from Phase 10 on: the GPU action `systemone-gate` (`job_kind: action`, `gpu: true`, `time_limit_min: 240`, C8; an engineering margin, not measured: read latency on `vllm-s1` is not yet known, and the 10 counted launches alone take about 17 min of startup at the old image's 90-115 s each; the report records each job's wall time). Its parameter `mode` (`shakedown` | `counted`; before Phase 10 the target's `MODE=`, gate.py's `--mode`) selects the run. The flags come from one tracked file, `deploy/systemone-gate-flags.json` (the engine's arguments after `--model`, and its environment), which gate.py reads at start and copies, with its sha256, into the report. The file must name `--kv-cache-dtype` explicitly; gate.py refuses one that does not. gate.py builds each launch's argv as production will build it for backend `vllm-s1` at `DEVAI_SYSTEMONE_CTX`: the vllm-s1 prober's `vllm_command_args`, which mirrors the router's builder (I1; from Phase 8 the same argv as `gpu-arbiter -print-load` through `pkg/engineargs`), so `--trust-remote-code`, `--max-num-seqs` = `MAX_CONCURRENT_REQUESTS`, the computed utilisation and the family's curated parsers (`--reasoning-parser gemma4 --enable-auto-tool-choice --tool-call-parser gemma4`), and then the file's flags and environment last, as the recovery entry will be appended (the last flag wins). The report records the full argv and environment of every launch. A shakedown job runs launches on that file and counts nothing; the operator edits and commits it between shakedowns. A counted job runs both soaks and the 10 launches on it. Every counted run appends one line (the flags' sha256, the flags, the job id or `host`, start, outcome: pass, deferral or limit reached) to `/var/cache/devai/jobs/systemone-gate/attempts.jsonl`; gate.py lists every line in its report and refuses `counted` when the current flags' sha256 already has a pass or deferral line. When the sha256's only lines are "limit reached", it refuses `counted` unless it is given `--after-limit <job id or host>` naming the latest such line (the target's `AFTER_LIMIT=`, the action's parameter `after_limit`); the new line records that id, and the report lists both attempts. gate.py refuses to start when `/var/cache/devai/jobs` does not exist (a plain directory on the cache volume, E9); a test pins the refusal. Its job holds the `engine` license, so the guard and the license keep every other model off the card, and its container carries the job's `devai.job` label and `DEVAI_JOB_ID`, as Phase 22's `laya-recipe-eval` does. No target runs the card check then, and Phase 10 converts the pre-Phase-10 form if this phase lands first;
      - either way, `gate.py` starts the container from `--target vllm-s1-run` under the fixed name `devai-systemone-gate`, on `devai-net`, with 11441 and 11442 published on 127.0.0.1 only, and removes it on every exit path. It reaches it at 127.0.0.1 from the host and by name from `devai-operator`.
    - **Launch**, with the engine and the server started as `devai-control` will start them:
      - `--served-model-name diffusiongemma-26B-A4B-it-NVFP4`, the name the server is given with `--model` (the table above);
@@ -4260,7 +4268,7 @@ The server is `examples/features/structured_diffusion/structured_server.py` at v
 - **Phase 23:** the System One port is off while `DEVAI_SYSTEMONE_PORT` is unset, and the router is then byte-identical to before (I27). The student service is one supervisord program; stopping it, or reverting it, leaves the trainer as it was. `vllm-s1` leaves by reverting its stage, its service, its prober and its catalog and recovery changes; nothing else in `devai-engines` depends on it.
 - **Existing hosts:**
   - delete the registry mirror stanza from `~/.config/containers/registries.conf` (Phase 2);
-  - run `make setup-jobs` once, as root (Phase 5);
+  - create `/var/cache/devai/jobs`, a plain directory (Phase 5, E9);
   - run `make slurm-init` (Phase 5) and `make operator-init` (Phase 6);
   - rebuild.
 

@@ -36,8 +36,8 @@ install -d -m 0755 /etc/slurm
 install -m 0600 -o root -g root "$SECRETS/slurm.key" /etc/slurm/slurm.key
 install -m 0600 -o root -g root "$SECRETS/jwt_hs256.key" /etc/slurm/jwt_hs256.key
 
-# --- the jobs volume (C4) -------------------------------------------------
-[ -d "$JOBS" ] || die "$JOBS is not mounted -- run 'make setup-jobs' on the host"
+# --- the jobs directory (C4) ----------------------------------------------
+[ -d "$JOBS" ] || die "$JOBS is missing -- create it on the host (a plain directory; plan E9)"
 install -d -m 0755 "$JOBS/results" "$JOBS/bus" "$JOBS/slurmctld" "$JOBS/engines" "$JOBS/operator"
 install -d -m 0750 "$JOBS/mariadb"
 if [ "$(stat -c %U "$JOBS/mariadb")" != mysql ]; then

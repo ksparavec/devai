@@ -299,9 +299,23 @@ class Image(unittest.TestCase):
 
     def test_documented_targets(self):
         mk = (REPO / "Makefile").read_text()
-        for target in ("build-slurm", "slurm-init", "setup-jobs", "slurm-up", "slurm-down", "test-slurm"):
+        for target in ("build-slurm", "slurm-init", "slurm-up", "slurm-down", "test-slurm"):
             self.assertRegex(mk, rf"(?m)^{target}:.*## ", target)
-        self.assertIn("LV=cache_jobs MOUNTPOINT=$(JOBS_DIR) SIZE=$${SIZE:-50G}", mk)
+
+    def test_the_jobs_directory_is_plain_and_made_by_hand(self):
+        # Plan E9 (operator, 2026-10-08): plain directories under
+        # /var/cache/devai until the separate thin-pool project lands, so no
+        # target creates a logical volume for jobs/ and nothing requires a
+        # mount point there.
+        mk = (REPO / "Makefile").read_text()
+        self.assertNotRegex(mk, r"(?m)^setup-jobs:")
+        self.assertNotIn("cache_jobs", mk)
+        self.assertNotIn("mountpoint -q $(JOBS_DIR)", mk)
+        self.assertIn("@test -d $(JOBS_DIR) ||", mk)
+        test_slurm = (REPO / "tests" / "slurm" / "test-slurm.sh").read_text()
+        self.assertNotIn('mountpoint -q "$JOBS"', test_slurm)
+        for path in ("Makefile", "deploy/slurm/entrypoint.sh", "tests/slurm/test-slurm.sh"):
+            self.assertNotIn("setup-jobs", (REPO / path).read_text(), path)
 
 
 class SlurmInit(unittest.TestCase):
