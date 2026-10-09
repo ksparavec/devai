@@ -150,6 +150,32 @@ func TestLeaseClockCountsFromTheAnswer(t *testing.T) {
 	})
 }
 
+// A load is answered by its reply, not by its serving event: the reply goes
+// out first, so the event is only the fallback for a lost reply and the
+// response permission (C1's allow_responses, 15 minutes) is what carries the
+// answer. Before 2026-10-09 the event went out first and devai-bus took it
+// in 7 of 7 live loads, so the reply path was never used.
+func TestALoadIsAnsweredByItsReplyBeforeItsEvent(t *testing.T) {
+	srv := bustest.Start(t)
+	r := startRig(t, srv, engineConfig(t, srv, 0.3), nil, nil)
+	for job := int64(30); job < 36; job++ {
+		var out, errb syncBuffer
+		code := buscli.Request(context.Background(), buscli.RequestOptions{
+			Bus: srv.Config("jobs"), Subject: fakeSubject + ".load", Body: loadBody(60), Job: job,
+			Timeout: 30 * time.Second, Stdout: &out, Stderr: &errb,
+		})
+		if code != 0 {
+			t.Fatalf("job %d: load exit %d: %s", job, code, errb.String())
+		}
+		if strings.Contains(errb.String(), "as the reply") {
+			t.Errorf("job %d: the load was answered by its event, not its reply: %s", job, errb.String())
+		}
+		if c, rep := r.requestAsJob(fakeSubject+".unload", `{}`, job, 10*time.Second); c != 0 || !rep.OK {
+			t.Fatalf("job %d: unload exit %d %+v", job, c, rep)
+		}
+	}
+}
+
 // Phase 5 step 5, adoption: devai-control killed during a load; the
 // restarted one publishes serving for the same job, the job's request
 // returns ok from that event, and the hold starts.

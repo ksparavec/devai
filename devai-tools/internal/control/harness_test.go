@@ -21,11 +21,13 @@ import (
 	"github.com/sparavec/gpu-arbiter/pkg/bus/bustest"
 )
 
-// The test lease (Phase 5 step 5: "a 2 s lease").
+// The test lease (Phase 5 step 5: "a 2 s lease"), and a reply grace scaled
+// down with it (production: 2 s against a 60 s lease).
 const (
-	testLease     = 2 * time.Second
-	testHeartbeat = time.Second
-	leaseEvery    = 400 * time.Millisecond
+	testLease      = 2 * time.Second
+	testHeartbeat  = time.Second
+	leaseEvery     = 400 * time.Millisecond
+	testReplyGrace = 200 * time.Millisecond
 )
 
 type syncBuffer struct {
@@ -183,7 +185,7 @@ func (r *rig) requestAsJob(subject, body string, job int64, timeout time.Duratio
 	var out, errb syncBuffer
 	code := buscli.Request(context.Background(), buscli.RequestOptions{
 		Bus: r.srv.Config("jobs"), Subject: subject, Body: body, Job: job, Timeout: timeout,
-		Stdout: &out, Stderr: &errb,
+		ReplyGrace: testReplyGrace, Stdout: &out, Stderr: &errb,
 	})
 	var rep bus.Reply
 	_ = json.Unmarshal(bytes.TrimSpace([]byte(out.String())), &rep)

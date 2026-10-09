@@ -826,7 +826,7 @@ These time limits are defaults; a C8 registry entry's `time_limit_min`, when set
 - It sends `<json>` with `v: 1` and `job: N` added, and prints the reply on stdout. `--job` is required; the operator's tools, which act for no job, pass `--job 0`.
 - A body that already carries `job` or `v` is refused (exit 1), so the two never disagree.
 - `--timeout` is the client's wait for the reply, separate from a verb's `timeout_s`; a request that times out exits 1.
-- For `load` (a wake included), it subscribes to `devai.events.<container>.<service>` before it sends. A `serving` event for its job counts as an ok reply, and a `failed` event for its job as `load_failed` (exit 1). So a reply lost with a restarted `devai-control` (C1, "Adoption after a restart") or with a bus restart does not leave the job waiting out its `--timeout`.
+- For `load` (a wake included), it subscribes to `devai.events.<container>.<service>` before it sends. A `serving` event for its job counts as an ok reply, and a `failed` event for its job as `load_failed` (exit 1), once no reply has followed it within 2 s (`ReplyGrace`). So a reply lost with a restarted `devai-control` (C1, "Adoption after a restart") or with a bus restart does not leave the job waiting out its `--timeout`, while a reply that arrives is what answers: `devai-control` publishes the event as the load ends, and without the grace the event answered every load of the first live run (2026-10-09), so the 15-minute response permission was never used.
 
 `devai-bus hold <subject> --job $J --parent $$` holds a model, a trainer run or an action run:
 - It subscribes to the service's events first and then asks for its state, so a run that ended before it started is not missed.

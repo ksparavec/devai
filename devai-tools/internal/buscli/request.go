@@ -26,6 +26,15 @@ type RequestOptions struct {
 	// RetryWait is the pause before a `load` is sent again after "no
 	// responders" (devai-control restarting); 1 s by default.
 	RetryWait time.Duration
+	// ReplyGrace is how long a `load` still waits for its reply once its
+	// job's serving or failed event has arrived; 2 s by default. The two
+	// race (devai-control publishes the event as the load ends, and the
+	// heartbeat repeats it), so without the grace the event answered 7 of
+	// 7 live loads and the reply path was never used: the event is the
+	// fallback for a lost reply, not a race with it (C1). A lost reply
+	// thus answers 2 s late, well inside the 60 s lease that starts with
+	// the answer.
+	ReplyGrace time.Duration
 }
 
 // BuildRequest adds v and job to body, a JSON object that must carry
@@ -77,6 +86,9 @@ func Request(ctx context.Context, o RequestOptions) int {
 	}
 	if o.RetryWait <= 0 {
 		o.RetryWait = time.Second
+	}
+	if o.ReplyGrace <= 0 {
+		o.ReplyGrace = 2 * time.Second
 	}
 	fail := func(code int, format string, a ...any) int {
 		fmt.Fprintf(o.Stderr, "devai-bus request: "+format+"\n", a...)
@@ -160,16 +172,32 @@ func Request(ctx context.Context, o RequestOptions) int {
 
 	replies := send()
 	var stateReplies <-chan result
+	// A final event held for ReplyGrace while the reply may still come.
+	var held *bus.Reply
+	var heldStatus string
+	var grace <-chan time.Time
+	takeHeld := func(why string) int {
+		fmt.Fprintf(o.Stderr, "devai-bus request: %s; took job %d's %s event as the reply\n", why, o.Job, heldStatus)
+		printReply(o.Stdout, *held)
+		return exitFor(*held)
+	}
 	for {
 		select {
 		case <-ctx.Done():
+			if held != nil {
+				return takeHeld(fmt.Sprintf("no reply within %s", o.Timeout))
+			}
 			return fail(ExitFailed, "no reply from %s within %s", o.Subject, o.Timeout)
 		case s := <-events:
-			if r, done := loadOutcome(s); done {
-				fmt.Fprintf(o.Stderr, "devai-bus request: no reply yet; took job %d's %s event as the reply\n", o.Job, s.Status)
-				printReply(o.Stdout, r)
-				return exitFor(r)
+			if held != nil {
+				break
 			}
+			if r, done := loadOutcome(s); done {
+				held, heldStatus = &r, s.Status
+				grace = time.After(o.ReplyGrace)
+			}
+		case <-grace:
+			return takeHeld(fmt.Sprintf("no reply within %s of the event", o.ReplyGrace))
 		case <-reconnected:
 			if isLoad {
 				stateReplies = askState()
@@ -189,6 +217,9 @@ func Request(ctx context.Context, o RequestOptions) int {
 			case res.err == nil:
 				printReply(o.Stdout, res.reply)
 				return exitFor(res.reply)
+			case held != nil && (errors.Is(res.err, nats.ErrNoResponders) ||
+				errors.Is(res.err, context.DeadlineExceeded) || errors.Is(res.err, nats.ErrTimeout)):
+				return takeHeld(fmt.Sprintf("the reply failed (%v)", res.err))
 			case errors.Is(res.err, nats.ErrNoResponders) && isLoad:
 				// devai-control is restarting: nobody received it, so it is
 				// safe to send again.
