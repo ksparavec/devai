@@ -152,8 +152,18 @@ and history tool (Sec. 9), runs only in `devai-slurm` and `devai-operator`
   namespace, with `CgroupPlugin=disabled` in `cgroup.conf` -- without it
   slurmd stops at start, failing to set a systemd scope for slurmstepd. The
   `--pid=host` part (the process tree on the host, the guard's kills) is
-  checked by the plan's `tests/slurm/test-slurm.sh`, not yet run. The
-  measured privileged setup stays the fallback.
+  checked by the plan's `tests/slurm/test-slurm.sh`, run on this host's card
+  on 2026-10-09 (measured): 75 checks passed, among them the guard killing
+  foreign GPU holders (uid root and uid 2000) in plain rootless containers,
+  and one was skipped -- the unkillable-holder check needs passwordless sudo
+  and is still to be run by hand and recorded here. The first run of the
+  same day failed 6 checks: two were real defects, fixed the same day (a
+  load answered by its event rather than its reply, so the 15-minute
+  response permission was never used -- `devai-bus request` now waits 2 s
+  for the reply; and jobs left RUNNING by a `devai-slurm` restart --
+  `node-recover`, Sec. 3.1), and four were the test's own timing. Logs:
+  `/var/cache/devai/bench/phase5/`. The measured privileged setup stays the
+  fallback.
 
   The container stays in podman's default user namespace (plan I26), so its
   root is the host user. The guard can therefore see and kill GPU holders in
@@ -169,9 +179,17 @@ and history tool (Sec. 9), runs only in `devai-slurm` and `devai-operator`
   setgid group: owned by `devai`, group 0 (the host user's group), mode 2775.
   Job scripts run with umask 0002.
 - **Processes:** supervisord runs MariaDB, slurmdbd, slurmctld, slurmrestd,
-  slurmd, nats-server and the bus log (Sec. 9), and at every start the
-  one-shot `accounting-init`, which waits for slurmdbd and then creates the
-  cluster, the account and the user `devai` idempotently (`sacctmgr`).
+  slurmd, nats-server and the bus log (Sec. 9), and at every start two
+  one-shots: `accounting-init`, which waits for slurmdbd and then creates the
+  cluster, the account and the user `devai` idempotently (`sacctmgr`), and
+  `node-recover`, which starts slurmd. Before it does, it sets the node DOWN
+  when slurmctld still lists jobs on it as running: they died with the
+  previous container, and the DOWN ends them NODE_FAIL at once. Slurm alone
+  ends such a job only at a node registration more than `BatchStartTimeout`
+  after the job was last seen, and slurmd registers on its own only every
+  few tens of minutes (measured 2026-10-09: two jobs stayed RUNNING through
+  260 s, a re-creation and a reconfigure, one holding the `engine`
+  license).
 - **Slurm configuration:**
   - One node, `devai`, with no GPU resource declared.
   - Its `CPUs=` and `RealMemory=` are written at start from the host, with
@@ -619,7 +637,8 @@ measured.
   waiting requests died with it, and holds return with their clients' next
   renewal (at most 30 s). If `devai-slurm` restarts, running job
   scripts and the bus go with it, and Slurm ends those jobs as NODE_FAIL
-  without requeueing them (`JobRequeue=0`, plan C3); engines keep serving until their lease runs
+  as soon as it is back (`node-recover`, Sec. 3.1) without requeueing them
+  (`JobRequeue=0`, plan C3); engines keep serving until their lease runs
   out (60 s) and then unload, because Slurm no longer has a job for them; the
   router submits new engine jobs on demand. If `devai-control` restarts,
   supervisord starts it again and it takes over its running model process from
@@ -691,7 +710,7 @@ creates the operator's htpasswd entry and its TLS certificate under
 | the host rebooted | the node registers with a new boot time and would be set DOWN | `ReturnToService=2` returns it to service when slurmd registers |
 | a model process crashes, also after it reached serving | `devai-control`'s liveness check (every heartbeat and on supervisord's process events) publishes `failed`; the job ends non-zero | the next request loads again (breaker) |
 | a job script killed before its trap ran | the model stays loaded, or the action keeps running | the epilog's `unload`; the lease as a backstop, which also stops an action |
-| `devai-slurm` restarts | job scripts and the bus gone | the lost jobs end NODE_FAIL without being requeued (`JobRequeue=0`); leases run out after 60 s and the engines unload |
+| `devai-slurm` restarts | job scripts and the bus gone | the lost jobs end NODE_FAIL as soon as it is back (`node-recover` sets the node DOWN before slurmd starts), without being requeued (`JobRequeue=0`); leases run out after 60 s and the engines unload |
 | the bus is down longer than a lease | engines unload, and runs stop, although their jobs still run | once reconnected, the jobs' holds ask for the state again, see their engine no longer serving them or their run stopped, and end; the router resubmits |
 | `devai-control` restarts | its model process keeps running | it takes it over again from supervisord's status |
 | `devai-control` restarts during a load | the load's reply is lost | it adopts the loading program from its state file and publishes `serving` or `failed`; the job's `devai-bus request` takes that event as its reply once no reply has followed within 2 s (plan C1, C3) |

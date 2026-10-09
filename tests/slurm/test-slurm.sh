@@ -147,7 +147,11 @@ opbus() {
     sx env DEVAI_BUS_URL=nats://127.0.0.1:4222 DEVAI_BUS_USER=operator \
         DEVAI_BUS_PASSWORD_FILE=/etc/devai/slurm/nats/operator.pass devai-bus "$@"
 }
-jget() { python3 -c 'import json,sys; d=json.load(sys.stdin)
+jget() { python3 -c 'import json,sys
+try:
+    d = json.load(sys.stdin)
+except ValueError:  # no answer (a request that timed out while polling)
+    d = None
 for k in sys.argv[1].split("."):
     d = d.get(k) if isinstance(d, dict) else None
 print("" if d is None else d)' "$1"; }
@@ -326,10 +330,16 @@ done
 say "two engine jobs, the license, the guard event, devai-jobs on the host"
 a=$(submit_engine); b=$(submit_engine)
 check "the first engine job loads the fake engine (2 GiB held)" wait_for 60 card_holds
-check "the second -L engine job waits PENDING (Licenses)" pending_on "$b" Licenses
+# Right after a submission squeue shows reason None until the scheduler has
+# looked at the job; the license is the reason it then gives.
+check "the second -L engine job waits PENDING (Licenses)" wait_for 10 pending_on "$b" Licenses
 host_list_json() { "$REPO/bin/devai-jobs" list --json | python3 -c 'import json,sys; json.load(sys.stdin)'; }
 check "bin/devai-jobs list --json succeeds" host_list_json
 check "the prolog's devai.events.slurm.guard event is in the bus log" buslog_has "devai.events.slurm.guard.*\"job\": ?${a}[,}]"
+# Hold the first job's model through one devai-gpu sampling interval (5 s):
+# a job cancelled within a second of its load has only the sampler's first
+# sample, taken before the model was there (2026-10-09: peak 480 MiB).
+sleep 6
 djobs cancel "$a" >/dev/null
 check "scancel unloads the fake engine; the card is back at its baseline" wait_for 90 card_at_base
 gpu_summary_ok() { python3 -c 'import json,sys; g=json.load(open(sys.argv[1])); sys.exit(not g["samples"] or g["peak_mib"] < int(sys.argv[2]))' "$JOBS/results/$1/gpu.json" $((BASE + 1800)); }
@@ -438,7 +448,7 @@ say "bench jobs and the bench license"
 k=$(submit_bench '{"sleep_s":600,"stop_s":15}')
 wait_for 30 state_is "$k" RUNNING; sleep 3
 l=$(submit_bench '{"sleep_s":5}' mmlu)
-check "a second -L bench job waits PENDING (Licenses)" pending_on "$l" Licenses
+check "a second -L bench job waits PENDING (Licenses)" wait_for 10 pending_on "$l" Licenses
 djobs cancel "$k" >/dev/null
 sleep 8
 check "while the first bench run stops (15 s), the second still waits" state_is "$l" PENDING
@@ -453,7 +463,7 @@ check "sacct: the second bench job started at or after the first ended ($k_end <
 k2=$(submit_bench '{"sleep_s":600,"stop_s":15}' gsm8k --time-limit-min 3)
 wait_for 30 state_is "$k2" RUNNING; sleep 2
 l2=$(submit_bench '{"sleep_s":5}' mmlu)
-check "the next bench job waits for the license" pending_on "$l2" Licenses
+check "the next bench job waits for the license" wait_for 10 pending_on "$l2" Licenses
 check "the warning ends the first one's run (prefix scored)" wait_for 150 state_is "$k2" 'COMPLETED|CANCELLED|FAILED|TIMEOUT'
 check "its run wrote result.json, truncated" grep -q '"status":"truncated"' "$JOBS/results/$k2/result.json"
 check "the next bench job then starts" wait_for 90 state_is "$l2" 'RUNNING|COMPLETED'
@@ -534,13 +544,19 @@ check "once the bus is back the engine job's hold sees it and the job ends 0" wa
 djobs cancel "$r" >/dev/null 2>&1; wait_for 90 state_is "$r" 'CANCELLED|COMPLETED|FAILED|LOST'
 
 say "devai-slurm restarted while jobs run: NODE_FAIL, never run again"
+# The jobs die with the container; node-recover sets the node DOWN before
+# slurmd starts, so Slurm ends them NODE_FAIL at once, and slurmd's
+# registration returns the node to service. (Slurm alone ends them only at a
+# registration more than BatchStartTimeout after they were last seen, tens
+# of minutes later: on 2026-10-09 both were still RUNNING 260 s after the
+# restart, the engine job holding the engine license.)
 s=$(submit_engine); u=$(submit_action '{"sleep_s":900}')
 wait_for 60 fake_is serving; wait_for 30 state_is "$u" RUNNING
 "$RUNTIME" restart -t 60 devai-slurm >/dev/null
 wait_for 180 slurm_ready
-sleep 260   # BatchStartTimeout=240
-check "the engine job ended NODE_FAIL" state_is "$s" NODE_FAIL
-check "the action job ended NODE_FAIL" state_is "$u" NODE_FAIL
+check "the engine job ended NODE_FAIL" wait_for 60 state_is "$s" NODE_FAIL
+check "the action job ended NODE_FAIL" wait_for 60 state_is "$u" NODE_FAIL
+check "the node is back in service" wait_for 60 node_is idle
 check "neither ran a second time" [ "$(sx sacct -n -P -X -j "$s,$u" -o restarts 2>/dev/null | sort -u)" = 0 ]
 check "the lease unloaded the fake engine" wait_for 90 card_at_base
 

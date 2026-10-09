@@ -68,7 +68,7 @@ RUN set -eu; \
 COPY slurm.conf.in slurmdbd.conf.in nats-server.conf.in /usr/local/share/devai/slurm/
 COPY job_submit.lua cgroup.conf /etc/slurm/
 COPY supervisord.conf /etc/devai/supervisord.conf
-COPY entrypoint.sh accounting-init.sh prolog.sh epilog.sh healthcheck.sh devai-gpu /usr/local/lib/devai/
+COPY entrypoint.sh accounting-init.sh node-recover.sh prolog.sh epilog.sh healthcheck.sh devai-gpu /usr/local/lib/devai/
 COPY jobs/ /usr/local/lib/devai/jobs/
 
 RUN set -eu; \

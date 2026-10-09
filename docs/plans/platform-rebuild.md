@@ -4,7 +4,7 @@ _Pull exactly one image from upstream; compile every engine here into one contai
 
 ## Status
 
-Draft (2026-10-05; engines and System One added 2026-10-06). Nothing is built or tested.
+Draft (2026-10-05; engines and System One added 2026-10-06). Built since, on branch feat/platform-rebuild: Phases 1, 5 and 21, steps 4v, 16a, 16e and 17a (2026-10-07). Phase 5's live checks (`make test-slurm`) passed on the card on 2026-10-09, 75 of 76; the unkillable-holder check, which needs passwordless sudo, is still to be run by hand.
 
 Plan-level review ends here (operator, 2026-10-06). After four readiness reviews, the last fix round was checked finding by finding and left the small items listed under "Left for implementation" (below Open questions). They are settled in the phase named, and each phase's tests and exit criteria are the check, not a further review of this plan.
 
@@ -14,7 +14,7 @@ Plan-level review ends here (operator, 2026-10-06). After four readiness reviews
 - **The architecture is [docs/slurm.md](../slurm.md).** This plan follows it section by section (see Approach).
   - Where the code needs more detail than the architecture gives, the detail is fixed under Contracts (C1-C8).
   - Where that detail adds to or differs from slurm.md, it is recorded as an implementation decision (I1-I33), taken by the operator on 2026-10-05 and 2026-10-06 (I27-I32 with E1-E6, I33 after the fourth readiness review); those that shape the architecture are folded into slurm.md.
-- **Engines and System One (2026-10-06).** The operator's E1-E6: vLLM moves to 0.30.0 (E1); one version per backend gets recorded exceptions (E2), the first bringing DiffusionGemma's System One back on stock vLLM 0.31.0, taking turns on the GPU (E3); devai serves laya students on the CPU (E4); System One reads on the teacher are measured before anything is planned for them (E5); laya moves to 0.3.28 (E6). On 2026-10-07 the operator dropped the 0.28.0 arm of step 4v: 0.30.0 is accepted on its own context and load probes (E7); and the runtime sets take no CUDA compiler from PyPI (E8).
+- **Engines and System One (2026-10-06).** The operator's E1-E6: vLLM moves to 0.30.0 (E1); one version per backend gets recorded exceptions (E2), the first bringing DiffusionGemma's System One back on stock vLLM 0.31.0, taking turns on the GPU (E3); devai serves laya students on the CPU (E4); System One reads on the teacher are measured before anything is planned for them (E5); laya moves to 0.3.28 (E6). On 2026-10-07 the operator dropped the 0.28.0 arm of step 4v: 0.30.0 is accepted on its own context and load probes (E7); and the runtime sets take no CUDA compiler from PyPI (E8). On 2026-10-08: plain directories under `/var/cache/devai`, no logical-volume steps (E9).
 - **23 phases.** Phases 1-14 build the new architecture; Phases 15-21 are the independent work folded in from earlier plans; Phases 22-23 are the laya sync and System One (E3-E6). Each has its files, steps, tests and exit criteria; the order table under Approach says what can run beside what.
 
 ## Dependencies
@@ -1641,8 +1641,16 @@ deploy/slurm/slurmdbd.conf.in     new    -- MariaDB on localhost, the password f
 deploy/slurm/nats-server.conf.in  new    -- C1 users and permissions (the control users' `allow_responses` with
                                             `expires: "15m"`); passwords filled in at start into /run/devai (0600)
 deploy/slurm/supervisord.conf     new    -- mariadb, slurmdbd, slurmctld, slurmrestd (user slurmrest, -a rest_auth/jwt,
-                                            :6820), slurmd (-N devai), nats-server, the bus log, and accounting-init
+                                            :6820), slurmd (-N devai; autostart=false, node-recover starts it),
+                                            nats-server, the bus log, node-recover (one-shot) and accounting-init
                                             (one-shot: autorestart=unexpected, startsecs=0, exitcodes=0)
+deploy/slurm/node-recover.sh      new    -- on every container start, before slurmd (added 2026-10-09): waits for
+                                            slurmctld; when it lists jobs on the node as running (they died with the
+                                            previous container), sets the node DOWN, so Slurm ends them NODE_FAIL at
+                                            once; then starts slurmd, whose registration returns the node
+                                            (ReturnToService=2). Slurm alone ended them only at a registration more
+                                            than BatchStartTimeout after they were last seen: tens of minutes, with
+                                            the engine license held (measured 2026-10-09)
 deploy/slurm/entrypoint.sh        new    -- render the configs (the node's CPUs and memory from the host, I4); copy the jobs bus
                                             password to /run/devai/bus/jobs.pass (devai, 0400; I26); run directories for slurm, slurmrest, mysql; initialise
                                             MariaDB on an empty data directory (--innodb-snapshot-isolation=OFF);
@@ -1796,7 +1804,7 @@ docs/backup-restore.md            modify -- archives are written 0600, because t
 - A job submitted through slurmrestd from another container on `devai-net`, with a JWT signed by `pkg/slurmrest`, runs, and its JSON comment arrives intact in `sacct`. A second `-L engine` job waits as `PENDING (Licenses)`.
 - A job submitted through slurmrestd with a JWT signed for `sun: root`, or for any user other than devai, is refused at submission and never runs.
 - `bin/devai-jobs list --json` succeeds against the live devai-slurm, and a prolog's `devai.events.slurm.guard` event lands in the bus log (C7: devai-slurm's environment; the guard sets its own bus settings).
-- `podman restart devai-slurm` while a fake-engine job and an action job are RUNNING leaves both NODE_FAIL in `sacct` once `BatchStartTimeout` has passed, and neither runs a second time.
+- `podman restart devai-slurm` while a fake-engine job and an action job are RUNNING leaves both NODE_FAIL in `sacct` as soon as `devai-slurm` is back (`node-recover`; not "once `BatchStartTimeout` has passed": Slurm alone took tens of minutes, measured 2026-10-09), the node returns to service, and neither runs a second time.
 - After `scontrol update NodeName=devai State=DOWN Reason=test` and a restart of the slurmd program in devai-slurm, `sinfo -h -o %T -n devai` prints `idle` within 60 s without a manual resume. A node drained by the guard stays drained until the health check resumes it.
 - Against the test containers:
   - an engine job loads the fake engine (2 GiB held), and `sacct` or `gpu.json` shows the GPU summary;

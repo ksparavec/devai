@@ -192,7 +192,7 @@ class SlurmConf(unittest.TestCase):
         cp = configparser.RawConfigParser()
         cp.read(SLURM / "supervisord.conf")
         progs = {s.split(":", 1)[1]: dict(cp[s]) for s in cp.sections() if s.startswith("program:")}
-        self.assertEqual(sorted(progs), ["accounting-init", "buslog", "mariadb", "nats-server",
+        self.assertEqual(sorted(progs), ["accounting-init", "buslog", "mariadb", "nats-server", "node-recover",
                                          "slurmctld", "slurmd", "slurmdbd", "slurmrestd"])
         self.assertIn("--innodb-snapshot-isolation=OFF", progs["mariadb"]["command"])
         rest = progs["slurmrestd"]
@@ -203,6 +203,32 @@ class SlurmConf(unittest.TestCase):
         acct = progs["accounting-init"]
         self.assertEqual((acct["autorestart"], acct["startsecs"], acct["exitcodes"]), ("unexpected", "0", "0"))
         self.assertIn("devai-bus log --dir /var/cache/devai/jobs/bus", progs["buslog"]["command"])
+
+    def test_node_recover_starts_slurmd(self):
+        # Jobs recovered as running died with the previous container; Slurm
+        # alone ends them only tens of minutes later (measured 2026-10-09),
+        # holding their licenses. node-recover sets the node DOWN first and
+        # then starts slurmd, which supervisord no longer starts by itself.
+        cp = configparser.RawConfigParser()
+        cp.read(SLURM / "supervisord.conf")
+        nr, sd = cp["program:node-recover"], cp["program:slurmd"]
+        self.assertEqual(nr["command"], "/usr/local/lib/devai/node-recover.sh")
+        self.assertEqual(nr["autorestart"], "false")
+        self.assertEqual(sd["autostart"], "false")
+        self.assertEqual(sd["autorestart"], "true")
+        self.assertLess(int(cp["program:slurmctld"]["priority"]), int(nr["priority"]))
+        script = (SLURM / "node-recover.sh").read_text()
+        self.assertLess(script.index("State=DOWN"), script.rindex("start_slurmd\n"),
+                        "the DOWN comes before slurmd starts")
+        self.assertEqual(script.count("    start_slurmd\n") + script.count("\nstart_slurmd\n"), 3,
+                         "slurmd is started on every path")
+        self.assertIn("node-recover.sh", (SLURM / "Dockerfile").read_text())
+        self.assertTrue((SLURM / "node-recover.sh").stat().st_mode & 0o111)
+        # A drained node keeps its reason, so the health check still resumes
+        # a guard drain (review 2026-10-09).
+        self.assertIn("*drain*)", script)
+        self.assertIn("-o %E", script)
+        self.assertIn('Reason="$reason"', script)
 
 
 class Compose(unittest.TestCase):
