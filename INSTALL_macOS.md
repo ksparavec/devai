@@ -552,7 +552,7 @@ which the macOS procedure never does.
 
 ---
 
-## 9. Phase 8 -- Build CPU lab + router images
+## 9. Phase 8 -- Build the lab + router images
 
 ### 9.1 Apple Silicon `arm64` build caveat
 
@@ -589,18 +589,26 @@ The agent must apply exactly one workaround. Default to A.
 $ cd ${REPO_DIR}
 $ make pull-images       # populates podman machine VM image store
 $ make fetch-cli         # downloads CLI tarballs to /var/cache/devai/pip/bin (VM-side)
-$ make build-cpu build-router
+$ make build-lab build-router
 ```
 
-**Do NOT run `make build-gpu` or `make build`.** Both target
-`devai-lab-gpu` and `devai-base-gpu`, which pull
-`docker.io/nvidia/cuda:*` -- that image has no arm64 manifest and is
-useless without an NVIDIA GPU anyway.
+There is one lab image since platform-rebuild Phase 3 (M14): `devai-lab`
+on `devai-base`, both on the pinned `debian:trixie-slim`, built natively
+for arm64 in the podman machine VM. It carries the CUDA torch and runs on
+the CPU here: the VM has no NVIDIA GPU, so the host check
+(`scripts/host-gpu.sh`) prints nothing and no device is attached.
+
+**Not yet verified on a Mac.** The arm64 build of the one image has not
+been run (2026-10-10). Known obstacles besides section 9.1's uv fetch: the
+aiagent and dstui installers that `make fetch-cli` pre-fetches are
+x86_64-only, and the Python hash locks (`make lab-lock`,
+`make laya-trainer-lock`) are resolved for `x86_64-manylinux_2_28`; regenerate
+them for aarch64 if the build reports missing hashes.
 
 ### 9.3 Verification
 
 ```bash
-[verify] $ podman images --format '{{.Repository}}:{{.Tag}}' | grep -E '^(devai-(base-cpu|lab-cpu)|localhost/devai-router):latest$'
+[verify] $ podman images --format '{{.Repository}}:{{.Tag}}' | grep -E '^localhost/devai-(base|lab|router):latest$'
 ```
 
 Expected: three entries.
@@ -714,7 +722,7 @@ before invoking `devai-agent`.
 ```
 
 `--show` prints the resolved `podman run` invocation without launching
-anything. It must reference `devai-lab-cpu` (NOT `-gpu`).
+anything. It must reference `devai-lab` and carry no `--device`.
 
 ---
 

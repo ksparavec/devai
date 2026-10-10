@@ -90,18 +90,15 @@ operator pipeline does not traverse the router -- `select-models.py` uses
 
 Use `make help` to list supported targets. Common commands:
 
-- `make build-cpu`: build the CPU lab image.
-- `make build-gpu`: build the GPU/CUDA lab image.
+- `make build-lab`: build the lab image (one image; GPU when the host has one, CPU otherwise).
 - `make build-router`: build the router image (a host-built static binary in FROM scratch).
 - `make build-apt-cache`, `make build-pipelock`: build the apt-cache and pipelock images (platform-rebuild Phase 2).
-- `make build`: build CPU, GPU, router, apt-cache and pipelock images.
+- `make build`: build the lab, router, apt-cache and pipelock images.
 - `make cache-up`: start active infrastructure services.
 - `make cache-down`: stop infrastructure services.
 - `make cache-status`: show service and model-cache status.
-- `make lab-gpu`: run JupyterLab with GPU support.
-- `make lab-cpu`: run JupyterLab without GPU support.
-- `make shell-gpu`: start the GPU shell and open the model picker.
-- `make shell-cpu`: start the CPU shell.
+- `make lab`: run JupyterLab (with the GPU when the host check finds one; `DEVAI_GPU_DEVICE=` forces the CPU).
+- `make shell`: start the shell and open the model picker.
 - `make catalog-regen`: refresh `deploy/models.yaml` from the upstream HF
   and Ollama registries (input is `scripts/model-families.yaml`).
 - `make probe`: probe every downloaded Ollama digest at every
@@ -236,7 +233,7 @@ Important runtime knobs:
 - `GPU_MEMORY_GB`: total GPU VRAM, default `24`.
 - `MAX_CONTEXT_LEN`: default per-request context cap in tokens, default `131072`.
 - `CONTEXT`: per-run picker/model selection override, for example
-  `CONTEXT=32768 make shell-gpu`.
+  `CONTEXT=32768 make shell`.
 - `VRAM`: per-run VRAM override, for example `VRAM=16 make model-fit`.
 - `PROBE_VRAMS`, `PROBE_CONTEXTS`: comma-separated lists driving
   `make probe`. Defaults `16G,24G` and `32K,64K,128K,256K`.

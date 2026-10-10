@@ -22,7 +22,7 @@ keeping the adversarial-evasion scanners in warn-only to avoid false positives.
 ## Architecture
 
 ```
-lab container (devai-lab-gpu/cpu)              devai-net (has internet)
+lab container (devai-lab)                      devai-net (has internet)
   joined ONLY to devai-lab-egress                ^
   - no internet route, no host-gateway           | internet leg
   - HTTPS_PROXY=http://devai-pipelock:8888        |
@@ -75,7 +75,7 @@ lives on the host and is never committed. Bootstrap is three commands:
 ```
 make pipelock-ca-init   # CA cert -> deploy/pipelock-ca.crt (local build input, gitignored)
                         # CA key  -> ~/.config/devai/pipelock-ca-key.pem (0600, host-only)
-make build-gpu          # or build-cpu -- bakes the CA cert into the lab trust store
+make build-lab          # bakes the CA cert into the lab trust store
 make cache-up           # mounts the host key into devai-pipelock automatically
 ```
 
@@ -102,7 +102,7 @@ make cache-up         # starts devai-pipelock (+ creates devai-lab-egress --inte
 make pipelock-logs    # tail decisions (also at /var/cache/devai/logs/devai-pipelock.log)
 ```
 
-`bin/devai-agent` and `make lab-gpu/shell-gpu` launch the lab on
+`bin/devai-agent` and `make lab` / `make shell` launch the lab on
 `devai-lab-egress` with the proxy + CA env forced. To bypass the lock for
 debugging (UNSAFE -- no egress control), set `DEVAI_NO_EGRESS_LOCK=1` (launcher
 only); this restores the open `devai-net` path.

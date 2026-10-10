@@ -41,7 +41,7 @@ compression method is not supported` on them, so run the log readers
 (`bench_extract_logs.py`, `bench_stats.py`, `kvquant_*`, ...) inside the
 lab image (Python 3.14.7) once logs from the re-bench are in the
 directory, e.g. `podman run --rm --network=none --entrypoint python3
--v $PWD:/repo:ro -v $L:$L:ro -v $O:$O localhost/devai-lab-gpu:latest
+-v $PWD:/repo:ro -v $L:$L:ro -v $O:$O localhost/devai-lab:latest
 /repo/scripts/stats/bench_extract_logs.py $L $O/logs_extracted.json`.
 
 ```bash
@@ -67,7 +67,7 @@ python3 scripts/stats/bench_timeouts.py $L $O/timeouts.tsv
   port-11435 vs 11437 AutoRound pair (docs/router.md). It EXECUTES model
   code and imports inspect_ai, so run it inside the lab image:
   `podman run --rm --network=none --entrypoint python3 -v $PWD:/repo:ro
-  -v $L:/logs:ro -v $O:/o localhost/devai-lab-gpu:latest
+  -v $L:/logs:ro -v $O:/o localhost/devai-lab:latest
   /repo/scripts/stats/bench_rescore_humaneval.py /o/logs_extracted.json
   /logs /o/humaneval_rescore.json`.
 - `bench_engine_facts.py`: the sampler defaults and KV dtype each engine
@@ -99,7 +99,7 @@ python3 scripts/stats/vllm_upgrade_accept.py retention \
 ```bash
 L=/var/cache/devai/bench/inspect-logs; O=~/.cache/devai/stats/usecase; mkdir -p $O
 podman run --rm --network=none --entrypoint python3 -v $PWD:/repo:ro -v $L:$L:ro -v $O:$O \
-    localhost/devai-lab-gpu:latest /repo/scripts/stats/bench_extract_logs.py $L $O/logs_extracted.json
+    localhost/devai-lab:latest /repo/scripts/stats/bench_extract_logs.py $L $O/logs_extracted.json
 python3 scripts/stats/usecase_scores.py $O/logs_extracted.json deploy/.bench-cache.json $O
 ```
 

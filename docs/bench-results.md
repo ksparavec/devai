@@ -1084,7 +1084,7 @@ python3 scripts/stats/bench_stats.py $O/logs_extracted.json $L deploy/.bench-cac
 python3 scripts/stats/bench_scorer_scan.py $O/logs_extracted.json $L $O/scorer_artifact_scan.json   # D3, parse-only
 # D3, executed with the fixed extractor -- runs model code, so inside the lab image:
 podman run --rm --network=none --entrypoint python3 -v $PWD:/repo:ro -v $L:/logs:ro -v $O:/o \
-    localhost/devai-lab-gpu:latest /repo/scripts/stats/bench_rescore_humaneval.py \
+    localhost/devai-lab:latest /repo/scripts/stats/bench_rescore_humaneval.py \
     /o/logs_extracted.json /logs /o/humaneval_rescore.json
 python3 scripts/stats/bench_engine_facts.py /var/cache/devai/logs $O/engine_log_facts.json          # D1 samplers, KV dtype
 python3 scripts/stats/bench_timeouts.py $L $O/timeouts.tsv                                          # D2

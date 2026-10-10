@@ -1150,15 +1150,13 @@ Section 9 is offline.
 
 ```bash
 [vm] $ cd ${REPO_DIR}
-[vm] $ make build           # base-cpu, lab-cpu, base-gpu, lab-gpu, router, apt-cache, pipelock
+[vm] $ make build           # base, lab, router, apt-cache, pipelock
 ```
 
 | Target | Image |
 |---|---|
-| `build-base-cpu` | `devai-base-cpu` |
-| `build-cpu`      | `devai-lab-cpu`  |
-| `build-base-gpu` | `devai-base-gpu` |
-| `build-gpu`      | `devai-lab-gpu`  |
+| `build-base`     | `devai-base` (the pinned trixie-slim) |
+| `build-lab`      | `devai-lab` (CUDA torch; runs with or without a GPU) |
 | `build-router`   | `localhost/devai-router` (host Go, FROM scratch) |
 | `build-apt-cache` | `localhost/devai-apt-cache` |
 | `build-pipelock` | `localhost/devai-pipelock` (host Go build of pipelock v3.0.0) |
@@ -1176,11 +1174,11 @@ hit only if section 8 missed something.
 
 ```bash
 [vm] [verify] $ podman images --format '{{.Repository}}:{{.Tag}}' \
-                | grep -E '^(devai-(base-cpu|base-gpu|lab-cpu|lab-gpu)|localhost/devai-(router|apt-cache|pipelock)):latest$' \
+                | grep -E '^localhost/devai-(base|lab|router|apt-cache|pipelock):latest$' \
                 | sort
 ```
 
-Expected: seven entries.
+Expected: five entries.
 
 ### 9.2 Recovery
 
@@ -1391,8 +1389,8 @@ Then write a 250-400 word factual summary of the project covering:
   2. The three inference backends (Ollama, vLLM, SGLang), how they
      are reached via the router's host ports, and the GPU mutual-
      exclusion invariant the router enforces.
-  3. The lab images (devai-lab-cpu / devai-lab-gpu) and the two-
-     layer base+lab build pattern.
+  3. The lab image (devai-lab, one image with or without a GPU) and
+     the two-layer base+lab build pattern.
   4. The on-disk cache layout under /var/cache/devai/ and the
      thin-pool / LV scheme.
   5. The role of model-picker.py and the devai-agent launcher.
@@ -1675,7 +1673,7 @@ The VM lives on `192.168.122.0/24` (libvirt `default` NAT) at
 host[clients] -- NAT -- vm[${VM_IP}]:11434 -> devai-router:11434 -> devai-ollama:11434
                                        :11435 -> devai-router:11435 -> devai-vllm:11434
                                        :11436 -> devai-router:11436 -> devai-sglang:11434
-                                       :8888  -> devai-lab-gpu:8888
+                                       :8888  -> devai-lab:8888
 ```
 
 Only those VM ports are exposed; backends are reachable only from

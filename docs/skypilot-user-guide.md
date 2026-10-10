@@ -165,7 +165,7 @@ into its own venv, `/opt/skypilot`, with only `sky` linked onto PATH.
 It is kept out of the lab's own Python because SkyPilot's version caps
 (click, websocket-client, protobuf, ...) would otherwise downgrade lab
 packages. To upgrade: edit the version in `requirements-skypilot.in`, run
-`make lab-lock`, then `make build-gpu` (or `make build-cpu`). Do not
+`make lab-lock`, then `make build-lab`. Do not
 `uv pip install --system skypilot` inside the lab: that puts the caps
 back into the lab's environment.
 

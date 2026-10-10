@@ -11,7 +11,8 @@ caveats under "Quality of the installed student" kept as known limits
 reference for what is built.
 
 - Image: `localhost/devai-laya-trainer:latest` (`make build-laya-trainer`), on the
-  lab's GPU base image (`devai-base-gpu`, Python 3.14.7), hash-locked Python
+  lab's base image (`devai-base`, Debian trixie-slim, Python 3.14.7; it was the
+  CUDA-based `devai-base-gpu` until platform-rebuild Phase 3), hash-locked Python
   packages (`laya-trainer/requirements.lock`, `torch==2.14.0` = the lab's cu130
   build).
 - Container: `devai-laya-trainer`. Compose starts it as a `sleep infinity`
@@ -416,7 +417,7 @@ Logs: `make logs SERVICE=devai-laya-trainer`.
 
 ```bash
 make model-pull NAME=laya-multilingual   # base checkpoint (default student); laya-english likewise
-make build-laya-trainer                  # the image (needs devai-base-gpu; builds it via build-base-gpu)
+make build-laya-trainer                  # the image (needs devai-base; builds it via build-base)
 make test-laya-trainer [VERBOSE=1]       # unit tests in the image, CPU, no network
 make laya-trainer-lock                   # regenerate the hash lock from laya-trainer/requirements.in
 make laya-check [TEACHER=...] [KEEP_RUN=1]  # GPU, evicts the teacher ~3 min: the reference check below

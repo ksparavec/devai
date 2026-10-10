@@ -21,7 +21,7 @@ For tasks where cloud AI is appropriate, the JupyterLab environment also include
 
 ## Features
 
-- **Two-step interactive picker** -- pick a model (+ backend for HF repos), then an agent. Arrow-key navigation via fzf in the shell (`make shell-gpu`); same flow from JupyterLab launcher cards. Renders per-backend discovery with FORMAT, PARSER, and reasoning-off variants. Inline-reasoning models produce two rows (default + "Reasoning off").
+- **Two-step interactive picker** -- pick a model (+ backend for HF repos), then an agent. Arrow-key navigation via fzf in the shell (`make shell`); same flow from JupyterLab launcher cards. Renders per-backend discovery with FORMAT, PARSER, and reasoning-off variants. Inline-reasoning models produce two rows (default + "Reasoning off").
 - **Probe-verified model facts** -- every downloaded model is probed against the live runtime (Ollama or vLLM; SGLang is frozen, see below). Reasoning behavior (Structured / Inline / Unsupported / Error) plus actual VRAM use at every (VRAM band, context tier) cell, full on-GPU confirmation, and tool-parser verification are measured, not guessed. Cells are probed independently; no interpolation.
 - **Per-context bench leaderboard** -- bench cache schema v3 keys rows by `(model, backend, ctx)` so the picker shows TOOLS / TPS / CODE% / CODE+% / MMLU% / GPQA% / LEAK% values at the user's chosen ctx exactly (the saturated `REAS%` / `TOTAL%` composites were retired for those sharper discriminators). Same model benched at 32K and 128K lands in distinct rows instead of silently overwriting (under MTP a single model can differ by 17+ tok/s between ctx tiers). See `docs/bench-results.md`.
 - **Single-host by design** -- one workstation, one GPU, one router. Multi-host cluster mode and the SkyPilot cloud-burst fleet provisioner were built, never ran end to end, and are frozen (not deleted) under `attic/cluster-mode/`. `gpu-arbiter` still accepts `--mode`, but any value other than `single` exits with a pointer to [`attic/README.md`](attic/README.md). See "Frozen work" below.
@@ -105,9 +105,9 @@ make model-fit VRAM=16 CONTEXT=32768          # query a different (VRAM, ctx)
 ### 5. Run
 
 ```bash
-make lab-gpu         # Start JupyterLab with GPU (or make lab-cpu)
+make lab             # Start JupyterLab (GPU when the host has one; DEVAI_GPU_DEVICE= forces the CPU)
 # OR
-make shell-gpu       # Drop straight into the model picker (cwd = repo)
+make shell           # Drop straight into the model picker (cwd = repo)
 # OR (standalone host launcher -- see "devai-agent" below)
 make install                  # one-time: stage launcher + config in ~/.local/bin and ~/.devai/
 devai-agent --init            # one-time: write default ~/.devai/preferences.yaml
@@ -120,7 +120,7 @@ Access:
 
 ### `devai-agent` -- standalone host launcher
 
-`bin/devai-agent` is the same lab container as `make shell-gpu`,
+`bin/devai-agent` is the same lab container as `make shell`,
 runnable from anywhere on the host without invoking Make or being inside the repo directory. State lives
 under `~/.devai/`; the repo is only consulted once at `make install` time.
 
@@ -149,7 +149,7 @@ want to work on first.
 
 ```bash
 cd ~/projects/my-app && devai-agent # GPU; my-app/ becomes /home/devai/work
-devai-agent --cpu                   # CPU lab
+DEVAI_GPU_DEVICE= devai-agent       # the lab on the CPU
 devai-agent -C ~/other              # mount ~/other instead of $PWD this run
 devai-agent --model qwen3.5:9b-q8_0 --agent claude
 devai-agent --show                  # print resolved prefs + container cmd, no run
@@ -189,7 +189,7 @@ missing.
          |         devai-net
          |       (internal)
          v
-  devai-lab-gpu
+  devai-lab
   (JupyterLab + AI CLIs)
          |
          +----------+
@@ -301,7 +301,7 @@ The interactive model picker reads the probe caches directly. It shows one row p
 | `HOME_VOLUME` | `$HOME/devai-home` | Persistent home directory |
 | `JUPYTER_TOKEN` | -- | Fixed access token (set in .env) |
 | `APT_PROXY` | -- | APT cache URL (e.g. `http://localhost:3142`; the cache is published on 127.0.0.1 only) |
-| `GPU_MEMORY_GB` | 24 | Total GPU VRAM in GB. Picker filter ceiling. Override per-call: `VRAM=48 make shell-gpu` |
+| `GPU_MEMORY_GB` | 24 | Total GPU VRAM in GB. Picker filter ceiling. Override per-call: `VRAM=48 make shell` |
 | `MAX_CONTEXT_LEN` | 131072 | Operator-side cap on per-model context, in tokens (128K). The router reads `min(model.max_context, MAX_CONTEXT_LEN)` from the probe cache at startup. `make probe` is independent and probes the full `PROBE_CONTEXTS` tier set. |
 | `PROBE_VRAMS` | `16G,24G` | Comma-separated VRAM bands `make probe` cycles through. Each band recreates `devai-ollama` with `OLLAMA_GPU_OVERHEAD` set so the daemon behaves like a card of that size. |
 | `PROBE_CONTEXTS` | `32K,64K,128K,256K` | Comma-separated context tiers probed inside each VRAM band. Tiers above a model's `max_context` are silently capped. |
@@ -340,7 +340,7 @@ Create `requirements.txt` in the repo root and rebuild:
 
 ```bash
 echo "langchain" > requirements.txt
-make build-gpu
+make build-lab
 ```
 
 ## Make Targets
@@ -349,10 +349,10 @@ Run `make help` for the full list. Highlights:
 
 ```
 BUILD                                     INFRASTRUCTURE                            RUN
-build-cpu        Build image (CPU)        cache-up        Start services            lab-cpu        JupyterLab (CPU)
-build-gpu        Build image (GPU)        cache-down      Stop services             lab-gpu        JupyterLab (GPU)
-build-router     Build router image       cache-status    Show status               shell-cpu      Shell + picker (CPU)
-build            Build all                cache-clean     Remove cached data        shell-gpu      Shell + picker (GPU)
+build-lab        Build the lab image      cache-up        Start services            lab            JupyterLab
+build-router     Build router image       cache-down      Stop services             shell          Shell + picker
+build            Build all                cache-status    Show status
+                                          cache-clean     Remove cached data
 fetch-cli        Update CLI binaries      logs            Tail SERVICE=devai-X
 pull-images      Pull base images         setup-logs      One-time: 100G LV at /var/cache/devai/logs
 
@@ -392,9 +392,9 @@ Two more subtrees joined the attic on 2026-10-07 (platform-rebuild Phase 1): the
 - NVIDIA Container Toolkit
 - For NVFP4 models: Blackwell architecture
 
-### GPU images
+### One lab image
 
-The GPU lab image (`devai-lab-gpu`) includes PyTorch with CUDA. The base image uses `nvidia/cuda:12.9.1-cudnn-runtime-ubuntu24.04`. Python is installed via uv (not system apt) to ensure a single Python version across CPU and GPU images.
+The lab image (`devai-lab`) includes PyTorch with CUDA, on `devai-base`, which is built on the pinned `debian:trixie-slim`; torch brings its CUDA runtime as pip packages and the driver comes from the host through CDI. The same image runs with the GPU when the host has one and on the CPU otherwise (`scripts/host-gpu.sh` decides; `DEVAI_GPU_DEVICE=` forces the CPU). Python is installed via uv (not system apt). Until platform-rebuild Phase 3 there were two lab images, a CPU one on `debian:trixie` and a GPU one on `nvidia/cuda:12.9.1-cudnn-runtime-ubuntu24.04`.
 
 ## SSL / HTTPS
 
