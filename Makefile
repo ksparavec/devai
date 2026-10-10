@@ -892,7 +892,7 @@ help: ## Show this help message
 	@printf "  %-44s%s\n" "" "prune            Prune dangling images"
 	@printf "  %-44s%s\n" "" "test             Run integration tests"
 	@printf "\n"
-	@printf "  %-44s%s\n" "MODELS" "vLLM / SGLang (lifecycle: docs/backends.md)"
+	@printf "  %-44s%s\n" "MODELS" "vLLM / vllm-devai (lifecycle: docs/backends.md)"
 	@printf "  %-44s%s\n" "probe            Populate cache for every (VRAM, ctx) tier" "vllm-list        List on-disk vLLM weights"
 	@printf "  %-44s%s\n" "model-fit        Print fitting models at VRAM/CONTEXT" "vllm-rm          Remove model"
 	@printf "  %-44s%s\n" "model-pull       Download best-fit candidates" "vllm-status      Show status"
@@ -983,7 +983,7 @@ cache-up: ## Start all infrastructure (caches + Ollama + router; vLLM/SGLang as 
 	@echo "  Registry mirror:   http://localhost:5000"
 	@echo "  Router:            devai-router:11434 (unified endpoint)"
 	@echo "  Ollama:            devai-ollama:11434 (GGUF models)"
-	@echo "  vLLM/SGLang:       devai-router:11435 / 11436 (recreated on first request — see docs/backends.md)"
+	@echo "  vLLM/vllm-devai:   devai-router:11435 / 11437 (recreated on first request — see docs/backends.md)"
 	@echo "  laya trainer:      devai-router:11438 (job runner, recreated on the first job -- see docs/laya-trainer.md)"
 	@echo "  Logger:            $(CACHE_DIR)/logs/<container>.log (per-service stdout)"
 	@echo ""
@@ -2112,7 +2112,7 @@ bench-harvest: ## (used by bench-sync) Score a task stopped at its deadline from
 		$(IMAGE_NAME_GPU) \
 		/scripts/bench/harvest_truncated.py $(HARVEST_ARGS)
 
-bench-concurrency: ## Sweep concurrency x prefix-sharing for ONE model (MODEL=, PORT=11435|11436|11437); MODE=multiturn takes SALT=, MIN_TOKENS=, METRICS_URL=, SESSIONS= (with ENGINE=). The JSON report goes to stdout alone.
+bench-concurrency: ## Sweep concurrency x prefix-sharing for ONE model (MODEL=, PORT=11435|11437); MODE=multiturn takes SALT=, MIN_TOKENS=, METRICS_URL=, SESSIONS= (with ENGINE=). The JSON report goes to stdout alone.
 	@# Deliberately NOT part of `make bench`: this answers a backend
 	@# selection question (does prefix caching pay off here?), not a
 	@# per-model leaderboard question, and it is GPU-exclusive.
@@ -2129,8 +2129,8 @@ bench-concurrency: ## Sweep concurrency x prefix-sharing for ONE model (MODEL=, 
 	@# The command is not echoed, so `> session.json` captures the report alone
 	@# (progress goes to stderr).
 	@if [ -z "$(MODEL)" ]; then \
-	  echo "usage: make bench-concurrency MODEL=<served-name> [PORT=11436] [MODE=sweep|multiturn] [LEVELS=1,2,4,8,16,32] [TURNS=8] [SALT=..] [MIN_TOKENS=..] [METRICS_URL=..] [SESSIONS=..] [ENGINE=..]"; \
-	  echo "  e.g. make bench-concurrency MODEL=gpt-oss-20b@131072 PORT=11436"; exit 2; fi
+	  echo "usage: make bench-concurrency MODEL=<served-name> [PORT=11435] [MODE=sweep|multiturn] [LEVELS=1,2,4,8,16,32] [TURNS=8] [SALT=..] [MIN_TOKENS=..] [METRICS_URL=..] [SESSIONS=..] [ENGINE=..]"; \
+	  echo "  e.g. make bench-concurrency MODEL=gpt-oss-20b@131072 PORT=11435"; exit 2; fi
 	@$(CONTAINER_RUNTIME) run --rm \
 		--network $(DEVAI_NETWORK) \
 		-v $(CURDIR)/scripts:/scripts:ro \
@@ -2138,7 +2138,7 @@ bench-concurrency: ## Sweep concurrency x prefix-sharing for ONE model (MODEL=, 
 		$(IMAGE_NAME_GPU) \
 		/scripts/bench/bench_concurrency.py \
 			--model '$(MODEL)' \
-			--router-url http://devai-router:$(or $(PORT),11436) \
+			--router-url http://devai-router:$(or $(PORT),11435) \
 			--mode $(or $(MODE),sweep) \
 			$(if $(LEVELS),--levels $(LEVELS),) \
 			$(if $(TURNS),--turns $(TURNS),) \

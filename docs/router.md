@@ -69,7 +69,7 @@ This document covers single mode, which is all of it.
 | (Claude Code,|                         |                              |
 |  OpenCode,   |  POST /v1/...           |  port 11434  -->  ollama     |
 |  Codex, Pi,  | ------------------>     |  port 11435  -->  vllm       |
-|  dsh,        |                         |  port 11436  -->  sglang     |
+|  dsh,        |                         |  port 11436  (sglang, frozen)|
 |  curl, ...)  |                         |                              |
 +--------------+                         |  GPU mutex * request rewrite |
                                          |  container lifecycle         |
@@ -79,12 +79,13 @@ This document covers single mode, which is all of it.
                                          +------------------------------+
                                          |  devai-ollama (always on)    |
                                          |  devai-vllm   (sleep > live) |
-                                         |  devai-sglang (sleep > live) |
+                                         |  devai-sglang (frozen, M16)  |
                                          +------------------------------+
 ```
 
-The vLLM and SGLang containers start as `sleep infinity` placeholders
-(see `deploy/docker-compose.yaml`). The router replaces them with a
+The vLLM containers (and SGLang's, until it was frozen) start as
+`sleep infinity` placeholders (see `deploy/docker-compose.yaml`). The
+router replaces them with a
 live engine on the first request to their port via the Podman libpod
 API, with the right `--model`, `--max-model-len`, parser flags, and
 plugin mounts derived from the probe cache.
@@ -96,6 +97,21 @@ the code are preserved under `attic/cluster-mode/` and described in
 `attic/README.md`; do not treat them as available behaviour. If they are
 ever thawed, `attic/cluster-mode/RESTORE.md` lists what was still broken
 when they were parked.
+
+### SGLang (frozen)
+
+SGLang was frozen on 2026-10-10 by platform-rebuild Phase 15 (decision
+M16 in docs/plans/platform-rebuild.md): on Qwen3.5-9B-NVFP4 its turn-2+
+TTFT was 0.806 of vLLM 0.30.0's (95% CI 0.802-0.812), and I16 required at
+most 0.75. Its entry left the router's backend table together with
+`SGLANG_URL`, the SGLang probe-cache load and its drift-map entry, so
+port 11436 is not served and compose has no `sglang` service.
+`sglangEntrypoint` (now emitting `--enable-metrics`) and the SGLang
+branches of the reasoning policy, the Anthropic `/v1/messages` and
+Responses rewrites, engine-cache volumes and recovery-flag scoping stay in
+the code, tested, but unreachable. Where this document describes SGLang
+behaviour, it describes that code. `attic/sglang/RESTORE.md` says how to
+re-wire it.
 
 ### What the router IS
 
@@ -125,7 +141,7 @@ when they were parked.
 |-------|---------|----------|---------------------------------|
 | 11434 | Ollama  | always live  | GGUF only                   |
 | 11435 | vLLM    | recreated on demand | NVFP4, FP8, AWQ, BF16 safetensors |
-| 11436 | SGLang  | recreated on demand | NVFP4 (arch-dependent), BF16 safetensors |
+| 11436 | SGLang  | FROZEN (M16): not served | was NVFP4 (arch-dependent), BF16 safetensors |
 | 11437 | vllm-devai | recreated on demand | the home-built, HyperQwen-patched vLLM (same store as vLLM) |
 | 11438 | laya-trainer | recreated on the first job | a job runner, not an engine: laya fine-tuning jobs (see [Job runners](#job-runners-the-laya-trainer)) |
 
@@ -144,7 +160,10 @@ the router is dual-homed) or from your own container with
 1. Read three probe caches:
    - `/etc/devai/.ollama-reasoning-cache.json` (digest-keyed v3)
    - `/etc/devai/.vllm-reasoning-cache.json` (repo+sha-keyed v2)
-   - `/etc/devai/.sglang-reasoning-cache.json` (repo+sha-keyed v2)
+   - `/etc/devai/.vllm-devai-reasoning-cache.json` (repo+sha-keyed v2)
+
+   (The SGLang cache was read here too until the freeze, M16; it stays
+   on disk, unread.)
 2. Read `/etc/devai/vllm-plugins.json` (parser plugin registry).
 3. Synthesise one `configModel` per cache entry whose host-VRAM band
    has a `fits=true` (HF) / `fully_on_gpu=true` (Ollama) cell.
@@ -156,7 +175,7 @@ the router is dual-homed) or from your own container with
 ### First request to vLLM/SGLang (cold start)
 
 ```
-agent --> router (port 11435 or 11436)
+agent --> router (port 11435 or 11437; 11436 until the SGLang freeze)
               |
               +- parse `<model>@<ctx>` and `<model>::<reasoning>` overrides
               +- identify other backends holding the GPU
@@ -637,7 +656,8 @@ router ones:
   'none']`. A normal function tool therefore fails with a pydantic
   `ValidationError` surfaced as an unhandled **500**. Codex uses function
   tools, so Codex cannot work against SGLang's Responses endpoint
-  regardless of configuration.
+  regardless of configuration. The picker never offers Codex on SGLang
+  (`_AGENT_BACKEND_FAILS` in scripts/model-picker.py, Phase 15 step 6).
 - **Non-Harmony models appear broken on the endpoint.**
   `Qwen3.5-9B-NVFP4` returns `400 "input_ids should be a list of lists
   for batch processing"` on *every* `/v1/responses` request, including a
@@ -686,6 +706,9 @@ backend's protocol path:
 | SGLang `/v1/messages`               | structured | auto REMOVES the client's `output_config.effort` (model default, as on SGLang's other surfaces); low/medium/high set it; off removes it and replaces `thinking` with `{type: disabled}` |
 | Any                                 | inline + policy=off | log `reasoningDisable` (explicit user opt-out) |
 | Any                                 | none / unsupported  | noop |
+
+The SGLang rows describe code that stays, unreachable since the
+2026-10-10 freeze (M16; see [SGLang (frozen)](#sglang-frozen)).
 
 Models with `disable_verified=False` can't reliably suppress
 reasoning -- the directive is sent, but the model may emit reasoning
@@ -1131,7 +1154,8 @@ The router reads only -- never writes. Keep the writers single-source.
 |--------------------------------------------|--------|------------------------------|-------------------|
 | `deploy/.ollama-reasoning-cache.json`      | v3     | `probe-ollama-reasoning.py`  | digest            |
 | `deploy/.vllm-reasoning-cache.json`        | v2     | `probe-vllm-reasoning.py`    | `<repo>@<sha>`    |
-| `deploy/.sglang-reasoning-cache.json`      | v2     | `probe-sglang-reasoning.py`  | `<repo>@<sha>`    |
+| `deploy/.vllm-devai-reasoning-cache.json`  | v2     | `probe-vllm-devai-reasoning.py` | `<repo>@<sha>` |
+| `deploy/.sglang-reasoning-cache.json` (not read since the SGLang freeze, M16) | v2 | `probe-sglang-reasoning.py` (now in `attic/sglang/scripts/`) | `<repo>@<sha>` |
 | `deploy/vllm-plugins.json`                 | v1     | hand-edited                  | parser name       |
 
 Top-level fields used by the router:
@@ -1160,7 +1184,7 @@ family that already had probed cells).
 
 A missing probe cache is non-fatal: the corresponding backend exposes
 zero models. Run `make probe` (Ollama) or `make probe-vllm` /
-`make probe-sglang` (HF) to populate.
+`make probe-vllm-devai` (HF) to populate.
 
 **`_meta` image-digest block (vLLM/SGLang).** Each HF cache carries a
 top-level `_meta` key (NOT a model row) written by the prober:
@@ -1200,11 +1224,6 @@ the shell when invoking compose.
 | `VLLM_CONTAINER`     | `devai-vllm`                                               | name to recreate              |
 | `VLLM_IMAGE`         | `docker.io/vllm/vllm-openai:v0.22.1-x86_64-cu129-ubuntu2404`       | image to launch               |
 | `VLLM_MODELS_DIR`    | `/var/cache/devai/vllm`                                    | host path bound to `/models`  |
-| `SGLANG_URL`         | `http://devai-sglang:11434`                                | upstream                      |
-| `SGLANG_PORT`        | `11436`                                                    | router listen                 |
-| `SGLANG_CONTAINER`   | `devai-sglang`                                             | name to recreate              |
-| `SGLANG_IMAGE`       | `docker.io/lmsysorg/sglang:v0.5.10.post1-cu130`            | image to launch               |
-| `SGLANG_MODELS_DIR`  | `/var/cache/devai/sglang`                                  | host path bound to `/models`  |
 | `LAYA_TRAINER_URL`   | `http://laya-trainer:11434`                                | upstream (job runner)         |
 | `LAYA_TRAINER_PORT`  | `11438`                                                    | router listen                 |
 | `LAYA_TRAINER_CONTAINER` | `devai-laya-trainer`                                   | name to recreate              |
@@ -1213,6 +1232,11 @@ the shell when invoking compose.
 | `LAYA_CATALOG_FILE`  | `/etc/devai/laya-models.yaml`                              | the trainer's model allowlist |
 | `NETWORK`            | `devai-net`                                                | podman network name           |
 | `PODMAN_SOCKET`      | `/run/podman/podman.sock`                                  | libpod socket inside router   |
+
+The `SGLANG_*` variables (`SGLANG_URL`, `SGLANG_PORT`, `SGLANG_CONTAINER`,
+`SGLANG_IMAGE`, `SGLANG_MODELS_DIR`) are not read since the SGLang freeze
+(M16): the backend entry that read them left the router
+(`attic/sglang/frozen-branches.txt` keeps it).
 
 ### Lifecycle
 
@@ -1301,7 +1325,9 @@ Implementation and rationale: `gpu-arbiter/sse_keepalive.go`.
 |------------------------|---------------------------------------------------|-----------------|
 | `PROBE_CACHE`          | `/etc/devai/.ollama-reasoning-cache.json`         | Ollama cache    |
 | `VLLM_PROBE_CACHE`     | `/etc/devai/.vllm-reasoning-cache.json`           | vLLM cache      |
-| `SGLANG_PROBE_CACHE`   | `/etc/devai/.sglang-reasoning-cache.json`         | SGLang cache    |
+| `VLLM_DEVAI_PROBE_CACHE` | `/etc/devai/.vllm-devai-reasoning-cache.json`   | vllm-devai cache |
+
+`SGLANG_PROBE_CACHE` is not read since the SGLang freeze (M16).
 
 ### Plugin registry
 
@@ -1441,7 +1467,7 @@ cache is not stamped and never flagged.
 
 Fix: refresh the cache against the running image --
 `make cache-down && make probe-vllm && make probe-load-vllm` (or the
-`sglang` equivalents). Preview which backends are stale without
+`vllm-devai` equivalents). Preview which backends are stale without
 restarting anything: `make probe-check`.
 
 ### Recreate race on concurrent requests
@@ -1696,7 +1722,7 @@ exact subset name (e.g. `gsm8k_subset_100`) already exists.
 ```
 make bench           # all backends
 make bench-vllm      # only vLLM models
-make bench-sglang    # only SGLang models
+make bench-vllm-devai # only vllm-devai models (bench-sglang went with the SGLang freeze, M16)
 make bench-ollama    # only Ollama models
 make bench-report    # Markdown leaderboard from .bench-cache.json
 make test-bench-smoke # 1-model tiny-subset sanity check

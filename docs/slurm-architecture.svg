@@ -59,7 +59,7 @@
 <text x="50" y="302.5" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">podman socket (scripts, log follower); GPU when present (probes)</text>
 <rect x="620" y="240" width="640" height="90" rx="8" fill="#FFF3DC" stroke="#D98A1C" stroke-width="2.2"/>
 <text x="630" y="259" font-family="Helvetica, Arial, sans-serif" font-size="12.5" font-weight="bold" fill="#222" text-anchor="start">devai-router  (own unprivileged container, small image)</text>
-<text x="630" y="273.5" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">:11434 ollama  :11435 vllm  :11436 sglang  :11438 laya-trainer  :11440 System One</text>
+<text x="630" y="273.5" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">:11434 ollama  :11435 vllm  :11438 laya-trainer  :11440 System One</text>
 <text x="630" y="288.0" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">request path unchanged; launch layer = Slurm client (REST + self-signed JWT)</text>
 <text x="630" y="302.5" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">engine state from the bus; blocks engine control routes; no podman socket</text>
 <rect x="40" y="360" width="460" height="470" rx="12" fill="#F5F0FB" stroke="#7A52B3" stroke-width="1.4"/>
@@ -98,8 +98,8 @@
 <text x="610" y="467.5" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">one model process while loaded; sleep = fast path</text>
 <text x="610" y="482.0" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">vllm-s1: stock vLLM 0.31, DiffusionGemma System One :11441/:11442</text>
 <rect x="600" y="494" width="400" height="40" rx="8" fill="#E0F1E0" stroke="#4F9A5A" stroke-width="1.4"/>
-<text x="610" y="513" font-family="Helvetica, Arial, sans-serif" font-size="12.5" font-weight="bold" fill="#222" text-anchor="start">SGLang 0.5.16  :11436</text>
-<text x="610" y="527.5" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">one model process while loaded; sleep = fast path</text>
+<text x="610" y="513" font-family="Helvetica, Arial, sans-serif" font-size="12.5" font-weight="bold" fill="#222" text-anchor="start">SGLang  -- frozen (Phase 15, M16)</text>
+<text x="610" y="527.5" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">not built; attic/sglang/RESTORE.md</text>
 <rect x="600" y="540" width="400" height="48" rx="8" fill="#E3F3F3" stroke="#178A8A" stroke-width="1.4"/>
 <text x="610" y="559" font-family="Helvetica, Arial, sans-serif" font-size="12.5" font-weight="bold" fill="#222" text-anchor="start">supervisord + devai-control</text>
 <text x="610" y="573.5" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">keeps the engines running; takes commands from the bus</text>
@@ -141,12 +141,12 @@
 <path d="M580 1025 v-6 a2 2 0 0 1 2 -2 h70 l8 8 z" fill="#FFFFFF" stroke="#777" stroke-width="1.4"/>
 <rect x="580" y="1025" width="240" height="72" rx="8" fill="#FFFFFF" stroke="#777" stroke-width="1.4"/>
 <text x="590" y="1044" font-family="Helvetica, Arial, sans-serif" font-size="12.5" font-weight="bold" fill="#222" text-anchor="start">model stores</text>
-<text x="590" y="1058.5" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">ollama/ vllm/ sglang/ laya/</text>
+<text x="590" y="1058.5" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">ollama/ vllm/ laya/</text>
 <text x="590" y="1073.0" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">+ vLLM parser plugins</text>
 <path d="M840 1025 v-6 a2 2 0 0 1 2 -2 h60 l8 8 z" fill="#FFFFFF" stroke="#777" stroke-width="1.4"/>
 <rect x="840" y="1025" width="180" height="72" rx="8" fill="#FFFFFF" stroke="#777" stroke-width="1.4"/>
 <text x="850" y="1044" font-family="Helvetica, Arial, sans-serif" font-size="12.5" font-weight="bold" fill="#222" text-anchor="start">engine caches</text>
-<text x="850" y="1058.5" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">FlashInfer, SGLang</text>
+<text x="850" y="1058.5" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">FlashInfer</text>
 <text x="850" y="1073.0" font-family="Helvetica, Arial, sans-serif" font-size="10.8" font-weight="normal" fill="#333" text-anchor="start">(named volumes)</text>
 <path d="M1100 178 L1100 240" fill="none" stroke="#2F6FD1" stroke-width="1.8" marker-end="url(#e-data)"/>
 <circle cx="1100" cy="207" r="9.5" fill="#FFFFFF" stroke="#2F6FD1" stroke-width="1.6"/>

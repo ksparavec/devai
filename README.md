@@ -22,14 +22,14 @@ For tasks where cloud AI is appropriate, the JupyterLab environment also include
 ## Features
 
 - **Two-step interactive picker** -- pick a model (+ backend for HF repos), then an agent. Arrow-key navigation via fzf in the shell (`make shell-gpu`); same flow from JupyterLab launcher cards. Renders per-backend discovery with FORMAT, PARSER, and reasoning-off variants. Inline-reasoning models produce two rows (default + "Reasoning off").
-- **Probe-verified model facts** -- every downloaded model is probed against the live runtime (Ollama, vLLM, or SGLang). Reasoning behavior (Structured / Inline / Unsupported / Error) plus actual VRAM use at every (VRAM band, context tier) cell, full on-GPU confirmation, and tool-parser verification are measured, not guessed. Cells are probed independently; no interpolation.
+- **Probe-verified model facts** -- every downloaded model is probed against the live runtime (Ollama or vLLM; SGLang is frozen, see below). Reasoning behavior (Structured / Inline / Unsupported / Error) plus actual VRAM use at every (VRAM band, context tier) cell, full on-GPU confirmation, and tool-parser verification are measured, not guessed. Cells are probed independently; no interpolation.
 - **Per-context bench leaderboard** -- bench cache schema v3 keys rows by `(model, backend, ctx)` so the picker shows TOOLS / TPS / CODE% / CODE+% / MMLU% / GPQA% / LEAK% values at the user's chosen ctx exactly (the saturated `REAS%` / `TOTAL%` composites were retired for those sharper discriminators). Same model benched at 32K and 128K lands in distinct rows instead of silently overwriting (under MTP a single model can differ by 17+ tok/s between ctx tiers). See `docs/bench-results.md`.
 - **Single-host by design** -- one workstation, one GPU, one router. Multi-host cluster mode and the SkyPilot cloud-burst fleet provisioner were built, never ran end to end, and are frozen (not deleted) under `attic/cluster-mode/`. `gpu-arbiter` still accepts `--mode`, but any value other than `single` exits with a pointer to [`attic/README.md`](attic/README.md). See "Frozen work" below.
 - **MoE / dense awareness** -- Ollama probe captures `expert_count` / `expert_used_count` from `/api/show`, surfaced in the picker as `MoE 8/128` or `dense`. Same fit rules apply (full weights must be GPU-resident), but you can see at a glance which models give big-model-quality at small-model speed.
 - **Multiple AI CLIs pre-installed** -- Claude Code, OpenAI Codex, Google Gemini CLI, OpenCode, Pi, DeepSeek Harness (web UI in JupyterLab, dstui in any terminal), aiagent, Ollama. All wired through the local router by default.
 - **SkyPilot CLI in the lab** -- the lab image installs the `sky` CLI (offline, from pre-fetched wheels) plus the `sky-setup.sh` first-launch helper, so a user can drive her own cloud accounts from inside the container. This is user-driven and entirely separate from the frozen system-side fleet provisioner. See `docs/skypilot-user-guide.md`.
 - **VS Code in the browser** -- code-server provides a full Visual Studio Code experience accessible from any browser.
-- **Automatic GPU-arbitrated model serving** -- Ollama for GGUF models, vLLM/SGLang for NVFP4 models. The gpu-arbiter router transparently switches backends and exposes a single endpoint per protocol (`/api/chat`, `/v1/chat/completions`, `/v1/messages`).
+- **Automatic GPU-arbitrated model serving** -- Ollama for GGUF models, vLLM (stock and the home-built vllm-devai) for NVFP4 models. SGLang was frozen on 2026-10-10 by platform-rebuild Phase 15 (M16; `attic/sglang/RESTORE.md`). The gpu-arbiter router transparently switches backends and exposes a single endpoint per protocol (`/api/chat`, `/v1/chat/completions`, `/v1/messages`).
 - **Reasoning policy at the router** -- set `DEVAI_REASONING=auto|off|low|medium|high` to control thinking mode globally; override per-request via `X-DevAI-Reasoning` header or per-session via `<model>::<reasoning>` suffix (e.g., `qwen3.5:9b::nothink` forces thinking off even for structured-capable models). The router maps your policy to the right native protocol field (Ollama's `think:`, vLLM/SGLang's `enable_thinking`) based on each model's verified capability.
 - **Fast iteration** -- two-layer container build separates rarely-changing system packages from frequently-updated tools.
 - **Aggressive caching** -- CLI binaries via ETags, APT proxy, Docker Hub mirror.
@@ -70,13 +70,13 @@ make build           # Build all images (CPU + GPU + router)
 ### 3. Start Infrastructure
 
 ```bash
-make cache-up        # Start all services. vLLM/SGLang start as `sleep` placeholders;
+make cache-up        # Start all services. vLLM/vllm-devai start as `sleep` placeholders;
                      # router recreates them on demand. See docs/backends.md.
 ```
 
 ### 4. Pull, Probe & Select
 
-Three orthogonal commands. `make probe` (Ollama) + `make probe-vllm` / `make probe-sglang` populate the probe caches; `make model-fit` queries them; `make model-pull` downloads best-fit candidates across a (family, backend, context) matrix.
+Three orthogonal commands. `make probe` (Ollama) + `make probe-vllm` / `make probe-vllm-devai` populate the probe caches; `make model-fit` queries them; `make model-pull` downloads best-fit candidates across a (family, backend, context) matrix.
 
 ```bash
 # Ollama probing (Make-orchestrated per PROBE_VRAMS bands)
@@ -84,10 +84,10 @@ make probe                                    # probe every (VRAM, ctx) cell
 make probe PROBE_VRAMS=24G PROBE_CONTEXTS=128K # one band, one tier
 make probe PROBE_FORCE=1                      # re-probe everything, ignore cache
 
-# vLLM/SGLang probing (requires `make cache-down` first for exclusive GPU access)
+# vLLM probing (requires `make cache-down` first for exclusive GPU access)
 make cache-down
 make probe-vllm                               # probe vLLM across all (VRAM, ctx)
-make probe-sglang                             # probe SGLang across all (VRAM, ctx)
+# (probe-sglang went to attic/sglang/ with the SGLang freeze, M16)
 make cache-up
 
 # Matrix-mode downloading (iterates all context tiers per family/backend)
@@ -198,15 +198,14 @@ missing.
          |  devai-router       |  ports per backend:
          |  (gpu-arbiter)      |    :11434 -> ollama
          |                     |    :11435 -> vllm
-         |  reasoning policy   |    :11436 -> sglang
+         |  reasoning policy   |    :11436 -> sglang (FROZEN, M16)
          +----------+----------+
                     |
          +----------+----------+
          v          v          v
    devai-ollama  devai-vllm  devai-sglang
-   (GGUF, RAM-   (NVFP4,     (NVFP4 +
-    resident)    on-demand)  RadixAttn,
-                              on-demand)
+   (GGUF, RAM-   (NVFP4,     (FROZEN,
+    resident)    on-demand)  not served)
 
   devai-apt-cache    devai-registry-cache
   (APT cache)        (Docker Hub mirror)
@@ -214,20 +213,20 @@ missing.
 
 **External access** (host ports): JupyterLab `:8888`, and the DeepSeek Harness web UI `:3080` (`DSH_PORT`) while a lab runs
 **Loopback only** (`127.0.0.1`): APT cache `:3142`, registry mirror `:5000`. Reaching either from another machine means an SSH tunnel or an authenticating proxy, not a wider bind.
-**Internal only** (devai-net): router, Ollama, vLLM, SGLang, caches.
+**Internal only** (devai-net): router, Ollama, vLLM, caches.
 
 ### GPU Arbitration
 
 The router (`devai-router`) is a small Go reverse proxy (~9 MB distroless) that:
 
-- Routes by **port -> backend** (no message inspection): `:11434` -> ollama, `:11435` -> vllm, `:11436` -> sglang.
+- Routes by **port -> backend** (no message inspection): `:11434` -> ollama, `:11435` -> vllm, `:11437` -> vllm-devai (`:11436` was SGLang's, frozen on 2026-10-10, M16).
 - Manages **GPU exclusion**: only one backend uses the GPU at a time. Switches by stopping the current backend (with graceful drain for in-flight requests) and starting the next via the Podman API.
-- Sizes vLLM/SGLang launches dynamically (`--gpu-memory-utilization`, `--mem-fraction-static`, `--max-model-len`) from per-model VRAM budgets.
+- Sizes vLLM launches dynamically (`--gpu-memory-utilization`, `--max-model-len`) from per-model VRAM budgets.
 - Keeps a loaded backend warm by default (`IDLE_TIMEOUT=0`): it is unloaded when a *different* model is requested, not on a timer. Set `IDLE_TIMEOUT` to a positive number of seconds to restore time-based auto-stop.
 - Applies the **reasoning policy** to each request (see below).
 - Refuses the Ollama **write endpoints** (`/api/pull`, `/api/create`, `/api/push`, `/api/copy`, `/api/delete`, `/api/blobs/...`) with 403 on every backend listener, also when a slash in the path is percent-encoded, so an agent in the lab cannot pull an unprobed model and then serve it around the probe-cache fit gate. The sanctioned path is still `make model-pull`; `scripts/select-models.py` reaches Ollama via `podman exec`, never through the router, so it is unaffected.
 
-> **Status:** all three backends are wired. vLLM and SGLang start as `sleep infinity` placeholders (compose can't know which model the user will pick); the router replaces them on demand via libpod when a request arrives on port 11435 / 11436. The picker shows HF rows once they have a fitting probe entry.
+> **Status:** Ollama, vLLM and vllm-devai are wired; SGLang was frozen on 2026-10-10 by platform-rebuild Phase 15 (M16; `attic/sglang/RESTORE.md`). The vLLM backends start as `sleep infinity` placeholders (compose can't know which model the user will pick); the router replaces them on demand via libpod when a request arrives on port 11435 / 11437. The picker shows HF rows once they have a fitting probe entry.
 >
 > Two reference docs:
 > - [`docs/router.md`](docs/router.md) -- router architecture, ports, lifecycle, the full request rewrite chain (override parsing, reasoning policy, tool-choice promotion, tool stripping, ctx injection), config env, caches, and failure modes. Start here when reasoning about routing.
@@ -284,11 +283,11 @@ deploy/.ollama-reasoning-cache.json   per-digest, per-(VRAM, ctx) cells
 
 Day-to-day after pulling a new model: `make probe && podman rm -f devai-router && make cache-up`.
 
-The interactive model picker reads the probe caches directly. It shows one row per `(model_dir, backend)` for HF repos (both vLLM and SGLang rows appear) and per Ollama family/quantization. Each row is filtered to the picker's VRAM band (env `VRAM` or `GPU_MEMORY_GB`). Inline-reasoning models produce two rows: default mode + "Reasoning off" variant with `::nothink` suffix appended.
+The interactive model picker reads the probe caches directly. It shows one row per `(model_dir, backend)` for HF repos (vLLM and vllm-devai rows; no SGLang rows since the freeze, M16) and per Ollama family/quantization. Each row is filtered to the picker's VRAM band (env `VRAM` or `GPU_MEMORY_GB`). Inline-reasoning models produce two rows: default mode + "Reasoning off" variant with `::nothink` suffix appended.
 
 **Per-session context binding & reasoning overrides:**
 - **Ollama**: the picker emits the parent name (or `<name>::nothink` to force reasoning off). KV cache allocation is dynamic per request from the global `OLLAMA_CONTEXT_LENGTH` (default 256K). The `/api/chat` and `/api/generate` endpoints honour `options.num_ctx` injected by the router; OpenAI- and Anthropic-compat endpoints get the global ceiling.
-- **vLLM / SGLang**: the picker emits `<name>@<ctx>` (e.g., `Llama-3.1-8B@32768`) or `<name>::<reasoning>@<ctx>` (e.g., `Llama-3.1-8B::low@32768`) to bind both context and reasoning policy per session. The router's `parseCtxOverride` and `parseReasoningOverride` strip these suffixes, rewrite the request body's `model` field to the clean name, and trigger a container recreate if the context or reasoning setting differs from the previous run.
+- **vLLM / vllm-devai**: the picker emits `<name>@<ctx>` (e.g., `Llama-3.1-8B@32768`) or `<name>::<reasoning>@<ctx>` (e.g., `Llama-3.1-8B::low@32768`) to bind both context and reasoning policy per session. The router's `parseCtxOverride` and `parseReasoningOverride` strip these suffixes, rewrite the request body's `model` field to the clean name, and trigger a container recreate if the context or reasoning setting differs from the previous run.
 
 ## Configuration
 
@@ -324,7 +323,7 @@ Hand-maintained source of model lineages. Each family declares its `ollama_repos
 Source kinds:
 
 - **`ollama_repos:`** -- list of library names under `ollama.com/library/<name>`. Every published tag for each library becomes a catalog row served by the Ollama backend (`ollama pull` on download).
-- **`hf_repos:`** -- list of HuggingFace repositories (transformers safetensors / FP8 / NVFP4 / AWQ / GPTQ). Each becomes one catalog row served by vLLM/SGLang (currently dormant).
+- **`hf_repos:`** -- list of HuggingFace repositories (transformers safetensors / FP8 / NVFP4 / AWQ / GPTQ). Each becomes one catalog row served by vLLM / vllm-devai (SGLang is frozen, M16).
 - **`gguf_repos:`** -- list of HuggingFace GGUF-only repositories with one entry per file inside the repo. Each entry takes a `repo:`, optional `tag_prefix:` (anchors the local Ollama tag), and optional `include:` allowlist of quantization tokens substring-matched against the filename (e.g. `UD-Q3_K_XL`, `Q3_K_M`). `make model-pull` downloads the `.gguf` blob, writes a Modelfile that emits `FROM <file>` plus `RENDERER <family>` and `PARSER <family>` directives, and runs `ollama create` to register the imported tag. The renderer/parser pair is what makes imported GGUFs accept tool calls -- without them Ollama returns "does not support tools".
 
 ### `deploy/models.yaml` -- Generated catalog
@@ -557,7 +556,7 @@ deploy/
   .ollama-reasoning-cache.json    -- Probe cache (schema v3, digest-keyed,
                                     probes nested by VRAM x CONTEXT)
   .bench-cache.json               -- Bench cache (schema v3, per (model, backend, ctx))
-  docker-compose.yaml             -- Infrastructure services (router/ollama/vllm/sglang/
+  docker-compose.yaml             -- Infrastructure services (router/ollama/vllm/vllm-devai/
                                     caches/logger/pipelock)
   Dockerfile.base                 -- Base image (system packages, Python, Node)
   Dockerfile.lab                  -- Lab image (CLI tools incl. the sky CLI, JupyterLab)

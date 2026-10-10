@@ -4,10 +4,12 @@
 
 DevAI is a containerized local AI development environment. It provides
 JupyterLab, multiple AI CLIs, an interactive model picker, and a
-GPU-aware inference router. All three inference backends (Ollama, vLLM, SGLang)
-are wired and covered by router tests. vLLM and SGLang start as `sleep infinity`
-placeholders so `make cache-up` is hermetic; the router replaces them via libpod
-on demand when a request arrives on the backend's port. See
+GPU-aware inference router. The inference backends (Ollama, vLLM, vllm-devai)
+are wired and covered by router tests; SGLang was frozen on 2026-10-10 by
+platform-rebuild Phase 15 (M16, `attic/sglang/RESTORE.md`). The vLLM backends
+start as `sleep infinity` placeholders so `make cache-up` is hermetic; the
+router replaces them via libpod on demand when a request arrives on the
+backend's port. See
 `docs/backends.md` for the lifecycle, probing procedure, and failure-mode
 taxonomy before changing backend behavior.
 
@@ -65,7 +67,7 @@ The inference stack is fronted by `devai-router`, implemented in
 
 - `11434`: Ollama, active
 - `11435`: vLLM, dormant
-- `11436`: SGLang, dormant
+- `11436`: SGLang, frozen on 2026-10-10 (M16) -- not served
 
 The router manages backend lifecycle, GPU exclusion, idle shutdown, drain
 behavior, and request forwarding. Request path and port determine protocol and
@@ -125,19 +127,21 @@ Use `make help` to list supported targets. Common commands:
   protocol (`/api/chat`, `/v1/chat/completions`, `/v1/messages`) x
   scenario (basic, tools, reasoning auto/off, ctx). Reads the probe
   cache to enumerate cells (slow -- minutes-to-tens-of-minutes).
-- `make test-vllm` / `make test-sglang`: live HF-backend integration
+- `make test-vllm`: live HF-backend integration
   tests through the router (cold-start chat, ctx switch, model switch
   when >=2 models cached, GPU exclusion, parameter forwarding).
   Skip cleanly when no fitting model is in the corresponding cache.
 - `make test-e2e`: bridges picker discovery, agent-command construction,
   and a live router round-trip -- proves the full picker->agent->router
   chain serves a real chat completion.
-- `make test-probe-vllm` / `make test-probe-sglang`: single-cell probe
-  smoke tests with cache-schema assertion (require `cache-down` first).
+- `make test-probe-vllm`: single-cell probe
+  smoke test with cache-schema assertion (requires `cache-down` first).
+  (`test-sglang` and `test-probe-sglang` went to `attic/sglang/` with the
+  SGLang freeze, M16.)
 - `make test-probe-ollama-idempotent`: byte-identical regression check
   on the refactored Ollama prober.
 - `make test`: runs **every** available test in sequence -- Go unit +
-  Python unit + Ollama integration + matrix + vLLM/SGLang integration +
+  Python unit + Ollama integration + matrix + vLLM integration +
   E2E + probe smoke. Wall time 30-60+ min. Each layer skips cleanly
   when its prerequisites aren't met.
 - `make test-python`: stdlib-unittest cases covering bench v3 schema
@@ -169,7 +173,7 @@ the host. Use the documented container build flow from `CLAUDE.md` or
 declares `ollama_repos`, `hf_repos`, and/or `gguf_repos`, plus an
 `arch_ref` HF repo for architecture metadata. Backend is implicit:
 `ollama_repos` and `gguf_repos` rows run on Ollama; `hf_repos` rows run
-on vLLM/SGLang (currently dormant).
+on vLLM / vllm-devai (SGLang was frozen on 2026-10-10, M16).
 
 `deploy/models.yaml` is the generated full model catalog. It is
 refreshed by `make catalog-regen`, not hand-edited.

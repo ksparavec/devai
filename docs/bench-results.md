@@ -1021,7 +1021,11 @@ applied to a noisy score misclassifies near the cut-off).
    vLLM is in [backends.md](backends.md) "vLLM vs SGLang -- measured,
    2026-07-29": confounded by context, KV dtype, run date, tool_choice
    protocol and time-outs, and no difference is distinguishable after a
-   Holm correction over 18 tests.
+   Holm correction over 18 tests. SGLang was frozen on 2026-10-10 by
+   platform-rebuild Phase 15 (M16; turn-2+ TTFT 0.806 of vLLM 0.30.0's,
+   I16 needed at most 0.75), so `bench-sglang` is gone (kept in
+   `attic/sglang/Makefile.frozen-targets`) and `bench-sync` plans no
+   SGLang rows.
 9. ~~**Run `bench-ollama`**~~ **Partly done** from 2026-07-17 (gemma4,
    qwen3.5, qwen3.6 and qwen3.8 rows). Rows benched before 2026-09-19
    ran with 10 samples queued on Ollama's single slot; their time-outs
@@ -1106,7 +1110,8 @@ counts) come from `perf_coldstart.py`, `perf_ceiling.py`,
   `tool_choice_pinning_required` rule that the bench surfaced as Issue
   #2, and the benchmark harness reference.
 - [backends.md](backends.md) -- backend lifecycle, parser plugins, the
-  vLLM-vs-SGLang comparison, and "Per-tier KV-cache dtype".
+  vLLM-vs-SGLang comparison and the keep-or-freeze measurement (M16),
+  and "Per-tier KV-cache dtype".
 - [nvfp4-coldstart.md](nvfp4-coldstart.md) -- NVFP4 cold-start phases;
   `ttft_ms_first` includes that timeline only when the first request
   triggered the launch.

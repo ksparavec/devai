@@ -10,6 +10,14 @@
   shape the design;
 - the interfaces the code is written against (its contracts C1-C8).
 
+**SGLang is frozen** (the plan's Phase 15, decision M16, 2026-10-10): its
+turn-2+ TTFT on Qwen3.5-9B-NVFP4 was 0.806 of vLLM 0.30.0's, and I16 required
+at most 0.75. Phase 4 therefore skips SGLang's build (steps 4a-4b and its stage
+in `Dockerfile.engines`), so `devai-engines` carries no SGLang and the router
+serves no SGLang port. Where SGLang still appears below (its model process,
+sleep, memory fraction, admin routes, metrics), it is frozen design, kept for a
+thaw and built by no phase (`attic/sglang/RESTORE.md`).
+
 **(measured)** marks a fact measured on this host in an
 earlier spike (2026-09-29) or read in an engine's source; that spike tested two
 layouts since discarded and is obsolete, so only facts that do not depend on the
@@ -41,8 +49,9 @@ Proposed:
   daemon, a single-node cluster. One cluster license lets one engine, trainer
   or probe job hold the GPU at a time, with or without a GPU; Slurm also queues
   work and records every job.
-- **Engines run all the time and carry no Slurm.** `devai-engines` (Ollama,
-  vLLM, SGLang; built in
+- **Engines run all the time and carry no Slurm.** `devai-engines` (Ollama and
+  vLLM; SGLang was frozen by the plan's Phase 15, M16, so Phase 4 skips its
+  build; built in
   [the plan](plans/platform-rebuild.md)'s Phase 4) and
   `devai-laya-trainer` run supervisord, which keeps their services running.
   Nothing in `devai-slurm` starts or stops them. A job tells an engine to load
@@ -103,7 +112,7 @@ Source: [`scripts/diagrams/slurm_architecture.py`](../scripts/diagrams/slurm_arc
 | Container | Image | Holds | Privileges |
 |---|---|---|---|
 | `devai-slurm` | `devai-slurm` (new, built here on the pinned `debian:trixie-slim`) | slurmctld, slurmdbd, slurmrestd, MariaDB, slurmd, nats-server, the GPU guard, the GPU sampler, the bus log, `devai-bus`, `devai-jobs` | `--pid=host`; podman's default user namespace, so its root is the host user (plan I26); the GPU via CDI, for NVML only, when the host has one; `--privileged --cgroupns=private` only if slurmd turns out to need them (Sec. 3.1) |
-| `devai-engines` | `devai-engines` (the plan's Phase 4) | supervisord, `devai-control`, Ollama, vLLM 0.30 + HyperQwen, SGLang 0.5.16, each in its own env and on its own port (11434, 11435, 11436); from the plan's Phase 23, `vllm-s1`, stock vLLM 0.31.0 for DiffusionGemma's System One (plan E3, I29), in its own env: the engine on 11441 and the vendored System One server on 11442, one service that one load starts and one unload stops | GPU via CDI when present |
+| `devai-engines` | `devai-engines` (the plan's Phase 4) | supervisord, `devai-control`, Ollama and vLLM 0.30 + HyperQwen, each in its own env and on its own port (11434, 11435; SGLang 0.5.16 on 11436 was dropped when Phase 15 froze it, M16, and Phase 4 skips its build); from the plan's Phase 23, `vllm-s1`, stock vLLM 0.31.0 for DiffusionGemma's System One (plan E3, I29), in its own env: the engine on 11441 and the vendored System One server on 11442, one service that one load starts and one unload stops | GPU via CDI when present |
 | `devai-laya-trainer` | `devai-laya-trainer` (its own image, as today, on `devai-base`; the plan's Phase 3) | supervisord, `devai-control`, the laya trainer; from the plan's Phase 23, the student service `systemone` on 11443, which serves trained laya students on the CPU only (plan I28) | GPU via CDI when present |
 | `devai-operator` | `devai-operator` ([the plan](plans/platform-rebuild.md), Phase 6) | supervisord, Apache + mod_wsgi, `devai-control`, `devai-bus`, `devai-jobs`, devai's scripts and the tools they call, the log follower (plan I20) | runs as `devai` with `--userns=keep-id` (plan I19); the host's podman socket read-write; the GPU when present (probes); HTTPS published on the LAN (O6) |
 | `devai-router` | its own small image | the router, with a bus client that follows engine state and unloads a sleeper no job needs (I9) | none, but it holds the JWT key: it can submit jobs as `devai` (`job_submit.lua` refuses every other user, Sec. 3.1) |
@@ -278,7 +287,7 @@ What load and unload mean for each engine:
   a mismatch with the loaded context makes Ollama load the model again. Ollama also loads a model by itself for any request that names one;
   the router forwards only requests for the loaded model, and nothing else
   reaches `devai-engines` (Sec. 12).
-- **vLLM and SGLang** serve one model per process, with the model, context,
+- **vLLM and SGLang** (SGLang frozen, M16) serve one model per process, with the model, context,
   KV type, parsers and MTP fixed when the process starts (for vLLM 0.30, the
   version devai serves (plan E1): read in the 0.28 and 0.31 sources, and
   re-read in 0.30's in the plan's Phase 4 step 4v; measured in the SGLang

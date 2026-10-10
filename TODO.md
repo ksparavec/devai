@@ -33,6 +33,7 @@
 - [x] `none` capability bucket distinguishes correct-by-design non-reasoning from broken parser pairings
 
 ### vLLM / SGLang parity
+- [x] SGLang FROZEN on 2026-10-10 by platform-rebuild Phase 15 (M16): turn-2+ TTFT 0.806 of vLLM 0.30.0's, short of I16's 0.75. Port 11436, its compose service, picker rows, make targets and prober are out of service (the prober moved to `attic/sglang/`); the items below are history. `attic/sglang/RESTORE.md` says how to bring it back.
 - [x] Probe runners (`probe-vllm-reasoning.py`, `probe-sglang-reasoning.py`) on shared `_probe_hf_common`
 - [x] Schema-v2 caches (repo+sha-keyed, per-cell `fits` + evidence)
 - [x] vLLM / SGLang start as `sleep infinity` placeholders; router recreates on demand
@@ -73,7 +74,7 @@
 - [ ] Family-level `engine_flags` field (e.g. `--enforce-eager`) so OOM-prone NVFP4 MoE variants like `Nemotron-3-Nano-30B-A3B-NVFP4` can free the CUDA-graph budget and re-enter `hf_repos`.
 - [x] Re-evaluated SGLang NVFP4: the blocker was the piecewise CUDA-graph default (Dynamo tracing flashinfer's FP4 JIT at `modelopt_quant.py:1482`), not `fp4_quantize` itself. Fixed with `--disable-piecewise-cuda-graph` (always-on); no upstream fix needed. Drop the flag when a future SGLang image can trace the FP4 path.
 - [ ] Probe context tiers above the model's native rope: 128K/256K cells of R1-Distill-Qwen-7B failed `kind=infra` because Qwen-2 base has 32K positional encodings without rope_scaling. Either skip those tiers in the prober when `max_position_embeddings < requested_ctx`, or extend implied-spill to `infra` failures of the right shape. Today they leave noisy red entries in the cache.
-- [ ] Optional: SGLang `deepseek_string` analogue. SGLang's tool-parser plugin model is Python-import based (a registered class, not a file path); requires a separate implementation against SGLang's detector framework. No longer gated on NVFP4 (now unblocked) -- still optional.
+- [ ] Optional (moot while SGLang is frozen, M16): SGLang `deepseek_string` analogue. SGLang's tool-parser plugin model is Python-import based (a registered class, not a file path); requires a separate implementation against SGLang's detector framework. No longer gated on NVFP4 (now unblocked) -- still optional.
 
 ### pipelock egress lockdown (network fail-closed)
 - [ ] **Web search for all agents.** opencode has Exa web search (`OPENCODE_ENABLE_EXA=1`); the other agents' built-in search is cloud-provider-coupled and doesn't work against the local router. Give them all search uniformly (e.g. self-hosted SearXNG). Provider-agnostic, works on local models. The earlier route, the MCP gateway's `duckduckgo` server, went with the gateway on 2026-10-07 (platform-rebuild Phase 1, M10). (Decision: opencode-only for now, 2026-06-16.)

@@ -7,11 +7,25 @@ the per-request context cap, applies the reasoning policy, and emits the
 correct backend startup flags (`--reasoning-parser`, `--tool-call-parser`)
 when the probe cache has confirmed values for the model.
 
+> **SGLang is FROZEN** since 2026-10-10 (platform-rebuild Phase 15,
+> decision M16 in docs/plans/platform-rebuild.md). On Qwen3.5-9B-NVFP4 its
+> turn-2+ TTFT was 0.806 of vLLM 0.30.0's (95% CI 0.802-0.812), and I16
+> required at most 0.75. Port 11436 is not served, compose has no `sglang`
+> service, the picker shows no SGLang rows, and `probe-sglang`,
+> `probe-load-sglang`, `bench-sglang`, `test-sglang` and
+> `test-probe-sglang` are gone (kept in
+> `attic/sglang/Makefile.frozen-targets`); the SGLang prober moved to
+> `attic/sglang/scripts/`. The router's SGLang code (`sglangEntrypoint`,
+> the policy branches) stays, unreachable, and
+> `deploy/.sglang-reasoning-cache.json` and `/var/cache/devai/sglang` stay
+> on disk. The SGLang text below describes it as it served until then;
+> `attic/sglang/RESTORE.md` says how to bring it back.
+
 | Backend | Port | Image | Models |
 |---|---|---|---|
 | Ollama  | 11434 | `ollama/ollama:latest` | GGUF (Q3/Q4/Q5/Q8/etc.) |
 | vLLM    | 11435 | `vllm/vllm-openai:v0.22.1-x86_64-cu129-ubuntu2404` | NVFP4, FP8, BF16/FP16 safetensors |
-| SGLang  | 11436 | `lmsysorg/sglang:v0.5.10.post1-cu130` | NVFP4, FP8, BF16/FP16 safetensors (RadixAttention multi-turn) |
+| SGLang (FROZEN, M16) | 11436, not served | `lmsysorg/sglang:v0.5.16-cu130` | NVFP4, FP8, BF16/FP16 safetensors (RadixAttention multi-turn) |
 
 Backend launch-flag *names* are pinned in `deploy/backend-flags.yaml`.
 Run `make verify-backend-flags` after bumping either image -- it dumps
@@ -27,8 +41,9 @@ abbreviation. See the cross-unit note in the router/prober spelling
 discussion: both emitters should move to `--tp-size` before upstream
 adds a second `--tp*` option.
 
-All three are reachable via the router from inside the `devai-net` Podman
-network. Agents (Claude Code, Codex, OpenCode, Pi, DeepSeek Harness) talk to the
+All except the frozen SGLang are reachable via the router from inside the
+`devai-net` Podman network. Agents (Claude Code, Codex, OpenCode, Pi,
+DeepSeek Harness) talk to the
 router on the appropriate port; the picker emits the right port based on
 the chosen model's backend.
 
@@ -38,12 +53,13 @@ the chosen model's backend.
 
 - **Always running**: `devai-ollama`, `devai-router`, `devai-apt-cache`,
   `devai-registry-cache`, `devai-logger`.
-- **Idle placeholders**: `devai-vllm` and `devai-sglang` start with
+- **Idle placeholders**: `devai-vllm` (and `devai-sglang` until the
+  2026-10-10 freeze, M16) start with
   `entrypoint: ["sleep", "infinity"]`. They hold the service definition
   (image, mounts, GPU device, network) but consume no GPU resources.
 
-When the first request hits port 11435 (vLLM) or 11436 (SGLang), the
-router:
+When the first request hits port 11435 (vLLM) or, until the freeze,
+11436 (SGLang), the router:
 
 1. Stops the other GPU-using backends -- `devai-ollama` is unloaded via
    `/api/generate` with `keep_alive=0`; vLLM/SGLang containers are
@@ -96,6 +112,8 @@ Each backend has its own probe cache:
 - `deploy/.ollama-reasoning-cache.json` -- schema v3, digest-keyed.
 - `deploy/.vllm-reasoning-cache.json` -- schema v2, repo+sha-keyed.
 - `deploy/.sglang-reasoning-cache.json` -- schema v2, repo+sha-keyed.
+  Kept on disk since the SGLang freeze (M16); nothing writes it, and the
+  router no longer loads it.
 
 Schema v2 (vLLM/SGLang) added three top-level fields per entry:
 
@@ -143,8 +161,10 @@ backends -- asking a 65K-ceiling model for 256K just asks it for 65K.
 
 Both backends serve the same NVFP4 checkpoints, so "which one" is an
 empirical question. It was measured on the reference 24 GiB RTX PRO 4000
-Blackwell after the SGLang v0.5.10.post1 -> v0.5.16 bump. SGLang is
-KEPT. This section records what the numbers do and do not show. The
+Blackwell after the SGLang v0.5.10.post1 -> v0.5.16 bump. SGLang was
+KEPT then; it was frozen on 2026-10-10 on a different measurement (M16,
+at the end of this section). This section records what the numbers do
+and do not show. The
 statistical terms are defined in
 [statistics-primer.md](statistics-primer.md); the numbers are recomputed
 by `scripts/stats/bench_stats.py` (see `scripts/stats/README.md`).
@@ -262,6 +282,22 @@ estimate (as bench_latency_leak already did), but was not re-run. The
 1-4 requests per cell. Those numbers are dominated by prefill and are not
 a decode-throughput measure.
 
+**The keep-or-freeze measurement, 2026-10-10 (M16; SGLang frozen).**
+Platform-rebuild Phase 15 measured SGLang 0.5.16 against vLLM 0.30.0
+(vllm-devai) on Qwen3.5-9B-NVFP4, both at 196,608 tokens, MTP and
+reasoning off, against I16's thresholds fixed before the run:
+
+| I16 condition | measured | needed |
+|---|---|---|
+| (a) steady TTFT, SGLang / vLLM | 1.27 | at most 3.0 |
+| (b) turn-2+ TTFT, SGLang / vLLM | **0.806** (95% CI 0.802-0.812) | **at most 0.75** |
+| (c) turn-2+ TTFT, radix on / off | 0.322 | CI below 1 |
+| (d) pooled radix-on hit rate, turns 2-5 | 0.709 | above 0 |
+
+SGLang failed (b), so it was frozen. vLLM's own prefix cache served 0.640
+of the same turns' prompt tokens. Details: M16 in
+docs/plans/platform-rebuild.md and `attic/sglang/RESTORE.md`.
+
 ### Per-row engine-image stamps
 
 Every HF probe row carries `backend_image_digest`: the engine image its
@@ -357,7 +393,7 @@ make probe                                          # host band x all contexts
 make probe PROBE_VRAMS=24G PROBE_CONTEXTS=32K      # one band, one tier
 make probe PROBE_FORCE=1                           # re-probe everything
 
-# 2. HF probing (vLLM/SGLang) -- requires exclusive GPU access
+# 2. HF probing (vLLM) -- requires exclusive GPU access
 #    Stop the live router and ollama first.
 make cache-down
 
@@ -369,23 +405,21 @@ make cache-down
 #                                verifies suppression of `reasoning_content`
 #    Each cell takes 1-3 minutes; extra probes add a few seconds each.
 make probe-vllm                                     # all vLLM models, all cells
-make probe-sglang                                   # all SGLang models, all cells
 make probe-vllm PROBE_REPO=Llama                   # filter to matching models
-make probe-sglang PROBE_CONTEXTS=128K              # single context tier
-#    `make probe-sglang` can only probe weights that exist in
-#    SGLANG_MODELS_DIR (/var/cache/devai/sglang). `make model-pull`
-#    always downloads into the vLLM store, so SGLang weights are a
-#    separate, explicit copy:
-python3 scripts/select-models.py --name <n> --download --hf-store sglang
-#    An SGLang cell marked fits=true with no weights in that store is
-#    an advertised model the router cannot launch, so select-models.py
-#    flags it -- see "SGLang store gaps" below.
+make probe-vllm PROBE_CONTEXTS=128K                # single context tier
+#    (`make probe-sglang` went to attic/sglang/ with the SGLang freeze,
+#    M16.)
 
-# 4. Restart the stack -- router reloads all three caches at boot.
+# 4. Restart the stack -- router reloads its probe caches at boot.
 make cache-up
 ```
 
 ### SGLang store gaps (`--hf-store`, `--ignore-store-gaps`)
+
+Skipped since the SGLang freeze (M16): `enforce_sglang_store_gaps` now
+returns after its unrecorded-retirements report, and a thaw removes that
+early `return` (`attic/sglang/RESTORE.md`). The rest of this section
+describes the check as it ran until then.
 
 `devai-sglang` mounts `SGLANG_MODELS_DIR` (`/var/cache/devai/sglang`),
 a different directory from `devai-vllm`'s `VLLM_MODELS_DIR`. `make
@@ -487,6 +521,11 @@ and refuses:
 
 ### SGLang bench candidacy is gated on vLLM (enforced in code)
 
+Frozen with SGLang (M16): `make bench-sglang` is gone and neither
+`bench-sync` nor `bench_runner`'s `--backend` choices name `sglang`; the
+gate (`gate_reason`) stays in `bench_runner.py`, and its test went to
+`attic/sglang/`.
+
 A `(model, ctx)` becomes an SGLang **bench** target only when vLLM has
 already benched that model at a context **at least as large**, with no
 bench verdict recorded against it. Enforced in
@@ -522,6 +561,9 @@ which is the failure mode this whole area keeps producing.
 
 ### Cross-backend VRAM verdicts (vLLM -> SGLang, one way)
 
+Moot while SGLang is frozen (M16); the mechanism stays in
+`_model_status`.
+
 SGLang does not re-probe a model whose VRAM verdict vLLM already
 measured, because on this fleet SGLang needs **strictly more** VRAM for
 the same `(model, ctx)`:
@@ -548,7 +590,7 @@ Two reasons are deliberately excluded from the mechanism:
 - **`manual`** -- an operator verdict with no recorded physics.
   Propagating it would be actively wrong here: `Qwen3-8B-NVFP4` and
   `Qwen3-14B-NVFP4` both carry a vLLM `manual` exclusion **and** fit on
-  SGLang, where they are currently served. A blanket "anything vLLM
+  SGLang, where they were served until the freeze. A blanket "anything vLLM
   rejected" rule would delete both.
 
 An implied exclusion is never more durable than the verdict it derives
@@ -668,8 +710,9 @@ values (steps 3 and 4) only:
 
 The row records which step each value came from (provenance table below).
 
-`PROBE_IGNORE_CURATED_PARSERS=1` (plan I24; `make probe-vllm`,
-`probe-vllm-devai` and `probe-sglang` forward it, or `--ignore-curated-parsers`)
+`PROBE_IGNORE_CURATED_PARSERS=1` (plan I24; `make probe-vllm` and
+`probe-vllm-devai` forward it, as `probe-sglang` did until the freeze; or
+`--ignore-curated-parsers`)
 skips steps 1, 3 and 4, so the card-derived parsers alone drive the launch.
 It exists for Phase 4's check of the card path on gpt-oss-20b, and its cells
 must not replace the curated ones, so the prober refuses it without
@@ -740,7 +783,7 @@ work:**
 # 2. Propagate it into the generated catalog the probers actually read.
 make catalog-regen
 # 3. Re-probe. PROBE_FORCE=1 is required, not just PROBE_FORCE_ARCH=1.
-PROBE_REPO=<org>/<Model> PROBE_FORCE=1 PROBE_FORCE_ARCH=1 make probe-sglang
+PROBE_REPO=<org>/<Model> PROBE_FORCE=1 PROBE_FORCE_ARCH=1 make probe-vllm
 ```
 
 Step 2 is easy to miss because the file you edited is not the file the
@@ -928,7 +971,7 @@ the model's curated entry already sets on that backend.
 |---|---|
 | `PROBE_VRAMS=$(GPU_MEMORY_GB)G` | Ollama target bands. Defaults to the host card ONLY (24G here). Pass e.g. `PROBE_VRAMS=16G,24G` to also measure a smaller card, which `make probe` then simulates physically with `scripts/vram-ballast.py` |
 | `PROBE_VRAMS_VLLM=24G` | vLLM target bands |
-| `PROBE_VRAMS_SGLANG=24G` | SGLang target bands |
+| `PROBE_VRAMS_SGLANG=24G` | SGLang target bands (went with `probe-sglang`, M16) |
 | `PROBE_CONTEXTS=32K,64K,128K,256K` | Context tiers. For vLLM/SGLang this **caps the binary-search ceiling** (`max()` of the listed tiers) in BOTH the fit pass and the `--load` pass; the 32K-multiple grid below that ceiling is still searched, and any listed non-grid tier is unioned in. `PROBE_CONTEXTS=32K` therefore probes exactly one tier. For Ollama it is the literal list of tiers probed. **On the load pass the cap is not just a filter -- it can MOVE the winning cell down**: the load probe keeps exactly one cell at the largest ctx that actually serves within the cap, so re-running with a narrower `--ctx` shrinks that model's advertised `max_context`. Re-run at the full ceiling to restore it. |
 | `PROBE_READY_TIMEOUT=180` | Seconds `make probe` waits for the recreated `devai-ollama` to answer `ollama list` before giving up. The whole `probe` recipe is one `set -e` shell, so this `exit 1` aborts the **entire probe run**, not just the current VRAM band -- the remaining bands are not attempted. The EXIT trap still restores `OLLAMA_GPU_OVERHEAD`. |
 | `PROBE_REPO=Llama-3.1-8B` | Regex filter on catalog rows (HF probers only) |
@@ -1226,7 +1269,6 @@ it:
 make cache-down                 # same exclusive-GPU precondition as fit probing
 make probe-vllm                 # fit cache must exist first
 make probe-load-vllm            # then layer serving-time data on top
-make probe-load-sglang          # likewise for SGLang
 make probe-load-vllm PROBE_REPO=Gemma PROBE_CONTEXTS=32K,64K,128K
 make cache-up
 ```
@@ -1571,7 +1613,8 @@ without the plugin file accessible.
 SGLang has no equivalent: SGLang's plugin model is Python-import based
 (register a class via SGLang's detector framework), not file-path
 based, so a separate plugin would be needed per model. SGLang traffic
-for plugin-only families runs without tool support until that lands.
+for plugin-only families ran without tool support (moot while SGLang is
+frozen, M16).
 
 #### Operational notes -- R1-Distill family
 
@@ -1609,7 +1652,7 @@ The HF probe cache is keyed on `<repo>@<sha>` where `sha` is the first
 
 1. `make catalog-regen` produces a new sha.
 2. The old cache entry is now an orphan (different key) and ignored.
-3. Run `make probe-vllm` / `make probe-sglang` to populate the new key.
+3. Run `make probe-vllm` / `make probe-vllm-devai` to populate the new key.
 
 Old entries persist until manually pruned. The router synthesizes only
 from the latest catalog sha -- old entries don't affect serving.
@@ -1634,7 +1677,7 @@ NVFP4 model start crashing at load, which is why the image is now
   "Backend image drift").
 - Refresh after an intentional image bump:
   `make cache-down && make probe-vllm && make probe-load-vllm`
-  (or the `sglang` equivalents). Then re-run `make verify-backend-flags`
+  (or the `vllm-devai` equivalents). Then re-run `make verify-backend-flags`
   if the engine version changed.
 
 ### Ollama -- re-probe when digest changes
@@ -1776,7 +1819,7 @@ probe driver refuses to run if `devai-router`, `devai-vllm`, or
 When the picker selects a model + context tier (+ reasoning override), each backend handles the binding differently:
 
 - **Ollama**: the picker emits the parent name (e.g., `qwen3.5:9b-q8_0`), or with a reasoning override suffix (e.g., `qwen3.5:9b-q8_0::nothink` to suppress thinking even if the model supports it). KV cache is allocated dynamically per request from the `OLLAMA_CONTEXT_LENGTH` global ceiling (default 256K). The `/api/chat` and `/api/generate` endpoints honour `options.num_ctx` injected by the router; the OpenAI- and Anthropic-compat layers ignore it and use the global ceiling. A bare `<name>` is served from whatever tier is currently loaded -- only an explicit `<name>@<ctx>` pin (which the picker emits for mixed-KV models) can force a tier switch and the container recreate that goes with it.
-- **vLLM / SGLang**: the picker emits `<name>@<ctx>` (e.g., `Llama-3.1-8B-Instruct-NVFP4@32768`), or with a reasoning override suffix (e.g., `Llama-3.1-8B-Instruct-NVFP4::low@32768` to set reasoning effort to `low`). The router's `peelControlSuffixes` strips `@<ctx>`, `::<mtp>` and `::<reasoning>` in whatever order they trail, rewrites the body's `model` field to the clean name, applies the reasoning policy, and triggers a recreate when `currentContext` (or the MTP spec) differs. A reasoning change alone never recreates the container. No client-side tag materialization needed.
+- **vLLM / vllm-devai** (and SGLang until the freeze, M16): the picker emits `<name>@<ctx>` (e.g., `Llama-3.1-8B-Instruct-NVFP4@32768`), or with a reasoning override suffix (e.g., `Llama-3.1-8B-Instruct-NVFP4::low@32768` to set reasoning effort to `low`). The router's `peelControlSuffixes` strips `@<ctx>`, `::<mtp>` and `::<reasoning>` in whatever order they trail, rewrites the body's `model` field to the clean name, applies the reasoning policy, and triggers a recreate when `currentContext` (or the MTP spec) differs. A reasoning change alone never recreates the container. No client-side tag materialization needed.
 
 Valid reasoning suffixes: `::off`, `::auto`, `::low`, `::medium`, `::high`, `::nothink` (Ollama only; suppresses thinking).
 

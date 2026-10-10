@@ -85,6 +85,15 @@
 # To add a family: add a block below, then run `make catalog-regen`.
 #
 # ── SGLang NVFP4 status (updated 2026-07-29, image v0.5.16-cu130) ────────
+# FROZEN on 2026-10-10 by platform-rebuild Phase 15 (M16): on
+# Qwen3.5-9B-NVFP4, SGLang 0.5.16's turn-2+ TTFT was 0.806 of vLLM
+# 0.30.0's (vllm-devai), and I16 needed at most 0.75. Since then the
+# router serves no SGLang port (11436), the picker shows no SGLang rows,
+# and the SGLang make targets and prober are in attic/sglang/. The
+# `sglang:` parser blocks below are kept for a thaw
+# (attic/sglang/RESTORE.md). The rest of this block is the state as of
+# 2026-07-29.
+#
 # NVFP4 serves on SGLang with NO workaround flag. History, because the
 # reasoning changed twice:
 #   1. "every NVFP4 cell fails at modelopt_quant.py:1482 in fp4_quantize"

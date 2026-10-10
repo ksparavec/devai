@@ -135,7 +135,7 @@ def draw() -> str:
         "podman socket (scripts, log follower); GPU when present (probes)"],
         fill="#FDF6EC", stroke=ORANGE, width=2.2)
     box(620, 240, 640, 90, "devai-router  (own unprivileged container, small image)", [
-        ":11434 ollama  :11435 vllm  :11436 sglang  :11438 laya-trainer  :11440 System One",
+        ":11434 ollama  :11435 vllm  :11438 laya-trainer  :11440 System One",
         "request path unchanged; launch layer = Slurm client (REST + self-signed JWT)",
         "engine state from the bus; blocks engine control routes; no podman socket"],
         fill="#FFF3DC", stroke=ORANGE, width=2.2)
@@ -164,7 +164,7 @@ def draw() -> str:
     box(600, 390, 400, 40, "ollama serve  :11434", ["always running; loads and unloads on a job's command"], **eng)
     box(600, 434, 400, 56, "vLLM 0.30 + HyperQwen  :11435", ["one model process while loaded; sleep = fast path",
         "vllm-s1: stock vLLM 0.31, DiffusionGemma System One :11441/:11442"], **eng)
-    box(600, 494, 400, 40, "SGLang 0.5.16  :11436", ["one model process while loaded; sleep = fast path"], **eng)
+    box(600, 494, 400, 40, "SGLang  -- frozen (Phase 15, M16)", ["not built; attic/sglang/RESTORE.md"], **eng)
     box(600, 540, 400, 48, "supervisord + devai-control", ["keeps the engines running; takes commands from the bus"], **bus)
     zone(1040, 360, 410, 240, "devai-laya-trainer  (own image; no Slurm)", "#EEF7EE", "#4F9A5A")
     box(1060, 400, 370, 64, "trainer runs", ["one fine-tuning run per trainer job", "started and stopped by devai-control"], **eng)
@@ -189,8 +189,8 @@ def draw() -> str:
     folder(40, 1017, 480, 80, "jobs/   (new volume)", [
         "results/<jobid>/  result.json, gpu.json, logs",
         "mariadb/  history    slurmctld/  state    bus/  bus log"], width=2.2)
-    folder(580, 1017, 240, 80, "model stores", ["ollama/ vllm/ sglang/ laya/", "+ vLLM parser plugins"])
-    folder(840, 1017, 180, 80, "engine caches", ["FlashInfer, SGLang", "(named volumes)"])
+    folder(580, 1017, 240, 80, "model stores", ["ollama/ vllm/ laya/", "+ vLLM parser plugins"])
+    folder(840, 1017, 180, 80, "engine caches", ["FlashInfer", "(named volumes)"])
 
     # ----------------------------------------------------------------- arrows
     arrow([(1100, 178), (1100, 240)], "data", 1, (1100, 207), "inference API; fine-tuning jobs on :11438; System One on :11440", (1116, 211))
