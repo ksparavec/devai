@@ -11,7 +11,7 @@ deploy/docker-compose.yaml, every Dockerfile* under deploy/ and tests/
   - scratch             in a FROM (the router's base)
 
 Anything else fails with the file and line. `*_IMAGE_NAME` variables are not
-image references but the tags builds write (-t devai-lab-cpu), and a
+image references but the tags builds write (-t devai-lab), and a
 `$(VAR)` reference is checked where VAR is defined.
 
 TRANSITIONAL names what later phases replace. Each phase removes its
@@ -32,8 +32,6 @@ REPO = Path(__file__).resolve().parent.parent.parent
 # variable (a compose `${VAR:-default}` counts as VAR), "<path> <ARG>" for a
 # Dockerfile ARG default, "compose <service>" for a literal compose image.
 TRANSITIONAL = {
-    "Makefile GPU_BASE_IMAGE": "Phase 3 (the lab on Debian)",
-    "deploy/Dockerfile.lab BASE_IMAGE": "Phase 3 (the lab on Debian)",
     "Makefile VLLM_IMAGE": "Phase 4 (devai-engines)",
     "Makefile VLLM_DEVAI_IMAGE": "Phase 4 (devai-engines)",
     "Makefile VLLM_DEVAI_IMAGE_TAG": "Phase 4 (devai-engines)",
@@ -138,9 +136,12 @@ class UpstreamImagesTest(unittest.TestCase):
             self.assertIsNotNone(target, df)
             self.assertIn("--build-arg BASE_IMAGE=$(DEBIAN_IMAGE)", target.group(0), target.group(1))
 
-    def test_pull_images_pulls_debian_and_the_cuda_base_only(self):
+    def test_pull_images_pulls_only_debian_as_a_base(self):
+        # The CUDA base left with Phase 3; compose's transitional images
+        # come in through CACHE_IMAGES.
         mk = (REPO / "Makefile").read_text()
-        self.assertRegex(mk, r"(?m)^BASE_IMAGES = \$\(DEBIAN_IMAGE\) \$\(GPU_BASE_IMAGE\)$")
+        self.assertRegex(mk, r"(?m)^BASE_IMAGES = \$\(DEBIAN_IMAGE\)$")
+        self.assertNotIn("GPU_BASE_IMAGE", mk)
 
     def test_the_guard_sees_every_source(self):
         # A parser that silently matches nothing would pass everything.

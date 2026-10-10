@@ -12,7 +12,7 @@ What these pin, each learned against dsh 0.1.5-rc.2:
 - The default model goes into settings.yaml's `agent-default-model`.
 - The shipped overlay disables both upload paths and binds 0.0.0.0:3080
   (the CLI refuses `--host 0.0.0.0`; the config schema accepts it).
-- Only `make lab-cpu|lab-gpu` publish DSH_PORT; the menu hides the agent
+- Only `make lab` publishes DSH_PORT; the menu hides the agent
   elsewhere and the launcher refuses without it.
 - Node >= 22.19: dsh's entry point runs only `if (import.meta.main)`, which
   22.16 lacks, so it exited 0 having done nothing.
@@ -226,7 +226,7 @@ class TestShippedFiles(unittest.TestCase):
         r = subprocess.run(["bash", str(REPO_ROOT / "scripts" / "dsh-web-launcher.sh")],
                            env=env, capture_output=True, text=True, check=False)
         self.assertEqual(r.returncode, 1)
-        self.assertIn("lab-gpu", r.stderr)
+        self.assertIn("'make lab'", r.stderr)
 
     def test_launcher_command(self) -> None:
         env = {**os.environ, "DSH_PORT": "3099", "HOST_IP": "192.0.2.7",
@@ -261,7 +261,7 @@ class TestShippedFiles(unittest.TestCase):
 
     def test_lab_targets_publish_the_dsh_port(self) -> None:
         mk = (REPO_ROOT / "Makefile").read_text()
-        for target in ("lab-cpu", "lab-gpu"):
+        for target in ("lab",):
             body = mk.split(f"\n{target}:", 1)[1].split("\n\n", 1)[0]
             self.assertIn("-p 0.0.0.0:$(DSH_PORT):3080", body, target)
             self.assertIn("-e DSH_PORT=$(DSH_PORT)", body, target)

@@ -4,7 +4,7 @@
 # Defaults (override via .env)
 CONTAINER_RUNTIME ?= podman
 LAB_PORT ?= 8888
-# DeepSeek Harness web UI, published by lab-cpu/lab-gpu only (docs: CLAUDE.md "dsh").
+# DeepSeek Harness web UI, published by `make lab` only (docs: CLAUDE.md "dsh").
 DSH_PORT ?= 3080
 # Pinned -- see the DeepSeek Harness block in fetch-cli.
 DSH_VERSION ?= 0.1.5-rc.2
@@ -18,10 +18,11 @@ NO_PROXY ?=
 
 # Derived (not configurable)
 COMPOSE = $(CONTAINER_RUNTIME) compose
-IMAGE_NAME = devai-lab-cpu
-IMAGE_NAME_GPU = devai-lab-gpu
-BASE_IMAGE_NAME = devai-base-cpu
-BASE_IMAGE_NAME_GPU = devai-base-gpu
+# One base and one lab image, on the pinned Debian with the CUDA torch; they
+# run with the GPU when the host check finds one and on the CPU otherwise
+# (platform-rebuild Phase 3, M14/M15). They were devai-{base,lab}-{cpu,gpu}.
+IMAGE_NAME = devai-lab
+BASE_IMAGE_NAME = devai-base
 CONTAINER_USER = devai
 # EXACT pin (not "latest patch of 3.x"): the base image and the SkyPilot wheel
 # pre-fetch must agree. Bump deliberately; tests/python/test_lab_python_and_torch.py.
@@ -93,11 +94,19 @@ export SGLANG_IMAGE
 # recreates that container for pinned KV tiers -- both must name one image.
 OLLAMA_IMAGE ?= localhost/devai-ollama:latest
 export OLLAMA_IMAGE
-# Exported for the same reason: the probers launch their own containers
-# on the host and must use the same CDI device string the compose
-# services do (NVIDIA's CDI string unless .env overrides it). Defaulted so
-# an install without .env still resolves.
-DEVAI_GPU_DEVICE ?= nvidia.com/gpu=all
+# The CDI device string GPU containers get. The host check
+# (scripts/host-gpu.sh; platform-rebuild Phase 3, M15) prints it when an
+# NVIDIA GPU is usable and nothing otherwise; empty means the CPU. Set in
+# the environment or on the command line it wins, empty included (`make lab
+# DEVAI_GPU_DEVICE=` forces the CPU); a line in .env does not count.
+# Exported for the same reason as OLLAMA_IMAGE: the probers launch their own
+# containers on the host, and compose reads it. Empty means the CPU for the
+# lab, `make shell`, the probers and the bench (GPU_FLAGS); compose and the
+# router still read an empty value as nvidia.com/gpu=all until Phase 11
+# moves the devices into compose.gpu.yaml.
+ifeq ($(filter environment command line,$(origin DEVAI_GPU_DEVICE)),)
+DEVAI_GPU_DEVICE := $(shell $(CURDIR)/scripts/host-gpu.sh)
+endif
 export DEVAI_GPU_DEVICE
 # The repository root, by absolute path. Compose mounts $(DEVAI_REPO)/deploy
 # read-only into the router (the two recovery-flag files, re-read at each
@@ -185,11 +194,6 @@ EGRESS_PROXY_ENV = \
 	-e no_proxy=$(PIPELOCK_NO_PROXY)
 
 
-# GPU build settings. An explicit GPU_BASE_IMAGE in .env or the shell wins
-# (?= only assigns when unset). NVIDIA only: the AMD/ROCm branch moved to
-# attic/amd-rocm/ on 2026-10-07 (platform-rebuild Phase 1, M11).
-GPU_BASE_IMAGE ?= docker.io/nvidia/cuda:12.9.1-cudnn-runtime-ubuntu24.04
-
 # The one Debian image devai pulls, pinned by digest (M1, M13), passed as
 # BASE_IMAGE to every build of an image on Debian (platform-rebuild Phase 2);
 # each Dockerfile's default is the same reference, and
@@ -258,27 +262,26 @@ ifeq ($(findstring podman,$(CONTAINER_RUNTIME)),podman)
 	DEVAI_USER_FLAGS = --userns=keep-id --user devai
 endif
 
-# GPU runtime flags
-# DEVAI_GPU_DEVICE (the CDI device string) may come from .env (via -include
-# .env above); it defaults to NVIDIA's when unset.
+# GPU runtime flags: the device when DEVAI_GPU_DEVICE names one, nothing on a
+# CPU host -- the same image then runs on the CPU.
 GPU_FLAGS =
 ifeq ($(findstring podman,$(CONTAINER_RUNTIME)),podman)
-	GPU_FLAGS += --device $(or $(DEVAI_GPU_DEVICE),nvidia.com/gpu=all) --security-opt=label=disable
+	GPU_FLAGS += $(if $(DEVAI_GPU_DEVICE),--device $(DEVAI_GPU_DEVICE) --security-opt=label=disable,)
 else
-	GPU_FLAGS += --gpus all
+	GPU_FLAGS += $(if $(DEVAI_GPU_DEVICE),--gpus all,)
 endif
 
 # Compose settings
 
-.PHONY: all build build-cpu build-gpu build-base-cpu build-base-gpu build-router
+.PHONY: all build build-lab build-base build-router
 .PHONY: build-apt-cache build-pipelock build-pipelock-dist build-pipelock-image pipelock-ca-init
 .PHONY: build-laya-trainer test-laya-trainer laya-trainer-lock lab-lock laya-check
 .PHONY: vllm-lock
-.PHONY: lab-cpu lab-gpu shell-cpu shell-gpu
+.PHONY: lab shell
 .PHONY: cache-up cache-down cache-status cache-clean logs setup-logs
 .PHONY: ollama-rm ollama-list ollama-status ollama-clean ollama-df
 .PHONY: vllm-list vllm-rm vllm-status vllm-df
-.PHONY: clean clean-cpu clean-gpu clean-router prune
+.PHONY: clean clean-lab clean-router prune
 .PHONY: fetch-cli pull-images install install-systemd uninstall test test-router test-ollama test-agents test-models test-probe-vllm test-probe-ollama-idempotent test-vllm test-e2e test-full help
 .PHONY: fetch-vllm-recipes recipe-apply
 .PHONY: catalog-regen catalog-suggest catalog-discover catalog-discover-add probe probe-vllm probe-load-vllm probe-load-vllm-devai probe-check probe-ornith-arch model-fit model-pull model-status model-sync vram-fit verify-backend-flags ollama-cleanup-ctx-variants
@@ -368,7 +371,7 @@ fetch-cli: ## Download all external binaries and packages to local cache (uses E
 	fi
 	@# DeepSeek Harness (deepseek-ai/deepseek-harness): an npm app with ~500
 	@# transitive packages, so it needs a real `npm install` -- run inside the
-	@# base image (built just before this by build-cpu/build-gpu), not with a
+	@# base image (built just before this by build-lab), not with a
 	@# host npm. PINNED, unlike the other CLIs: upstream is a developer preview
 	@# that announces compatibility-breaking changes, and devai's integration
 	@# names its internal config entries (webserver, llm-pi-ai, the telemetry
@@ -377,8 +380,8 @@ fetch-cli: ## Download all external binaries and packages to local cache (uses E
 	@if [ "$$(cat $(ETAG_DIR)/dsh.version 2>/dev/null)" = "$(DSH_VERSION)" ] && [ -d $(CACHE_DIR)/pip/bin/dsh/node_modules ]; then \
 		echo "DeepSeek Harness: up to date ($(DSH_VERSION))"; \
 	else \
-		IMG=$(BASE_IMAGE_NAME); $(CONTAINER_RUNTIME) image inspect $$IMG >/dev/null 2>&1 || IMG=$(BASE_IMAGE_NAME_GPU); \
-		$(CONTAINER_RUNTIME) image inspect $$IMG >/dev/null 2>&1 || { echo "ERROR: no base image -- run 'make build-base-cpu' or 'make build-base-gpu' first (DeepSeek Harness installs with its npm)." >&2; exit 1; }; \
+		IMG=$(BASE_IMAGE_NAME); \
+		$(CONTAINER_RUNTIME) image inspect $$IMG >/dev/null 2>&1 || { echo "ERROR: no base image -- run 'make build-base' first (DeepSeek Harness installs with its npm)." >&2; exit 1; }; \
 		rm -rf $(CACHE_DIR)/pip/bin/dsh.tmp && mkdir -p $(CACHE_DIR)/pip/bin/dsh.tmp \
 		&& $(CONTAINER_RUNTIME) run --rm --network=host $(subst --build-arg,-e,$(PROXY_BUILD_ARGS)) \
 			-e HOME=/tmp -e NPM_CONFIG_UPDATE_NOTIFIER=false -v $(CACHE_DIR)/pip/bin/dsh.tmp:/out:z $$IMG \
@@ -471,12 +474,12 @@ fetch-cli: ## Download all external binaries and packages to local cache (uses E
 			&& chmod +x $(CACHE_DIR)/pip/bin/dstui-install.sh && STATE="updated"; fi \
 		&& echo "dstui: $$STATE ($$DSTUI_VERSION)"
 
-# The images devai pulls: the pinned Debian image, and the upstream images
-# later phases replace (tests/python/test_upstream_images.py, the
-# transitional allowlist): the CUDA base until Phase 3, here and through
-# compose the stock vLLM image (Phase 4) and the logger's podman image
-# (Phase 6). Everything else is built here.
-BASE_IMAGES = $(DEBIAN_IMAGE) $(GPU_BASE_IMAGE)
+# The images devai pulls: the pinned Debian image, and through compose the
+# upstream images later phases replace (tests/python/test_upstream_images.py,
+# the transitional allowlist): the stock vLLM image (Phase 4) and the
+# logger's podman image (Phase 6). Everything else is built here; the CUDA
+# base the GPU lab was built on went in Phase 3.
+BASE_IMAGES = $(DEBIAN_IMAGE)
 # Home-built images are excluded from pulls: `devai-` (localhost/devai-ollama,
 # devai-router) and `devai/` (docker.io/devai/vllm-devai, tagged with a
 # registry name but present only locally -- a pull would fail three times
@@ -507,7 +510,7 @@ pull-images: ## Pull the pinned Debian image and the upstream images not yet bui
 		done; \
 	 done
 
-build-base-cpu: ## Build base image with system packages and runtimes (CPU) on the pinned DEBIAN_IMAGE
+build-base: ## Build the base image (system packages, Python, Node) on the pinned DEBIAN_IMAGE
 	$(CONTAINER_RUNTIME) build --network=host \
 		$(PROXY_BUILD_ARGS) \
 		$(APT_PROXY_ARG) \
@@ -516,18 +519,9 @@ build-base-cpu: ## Build base image with system packages and runtimes (CPU) on t
 		-f deploy/Dockerfile.base \
 		-t $(BASE_IMAGE_NAME) .
 
-build-base-gpu: ## Build base image with system packages and runtimes (GPU)
-	$(CONTAINER_RUNTIME) build --network=host \
-		$(PROXY_BUILD_ARGS) \
-		$(APT_PROXY_ARG) \
-		$(PYTHON_VERSION_ARG) \
-		--build-arg BASE_IMAGE=$(GPU_BASE_IMAGE) \
-		-f deploy/Dockerfile.base \
-		-t $(BASE_IMAGE_NAME_GPU) .
+build: build-lab build-router build-apt-cache build-pipelock ## Build all images (lab + router + apt-cache + pipelock)
 
-build: build-cpu build-gpu build-router build-apt-cache build-pipelock ## Build all images (CPU + GPU + router + apt-cache + pipelock)
-
-build-cpu: build-base-cpu fetch-cli ## Build the container image (CPU)
+build-lab: build-base fetch-cli ## Build the lab image (CUDA torch; runs with the GPU when the host has one, on the CPU otherwise)
 	@[ -f deploy/pipelock-ca.crt ] || { echo "ERROR: deploy/pipelock-ca.crt missing -- run 'make pipelock-ca-init' first (the lab image bakes the pipelock CA into its trust store)."; exit 1; }
 	$(CONTAINER_RUNTIME) build --network=host \
 		$(PROXY_BUILD_ARGS) \
@@ -538,27 +532,16 @@ build-cpu: build-base-cpu fetch-cli ## Build the container image (CPU)
 		-f deploy/Dockerfile.lab \
 		-t $(IMAGE_NAME) .
 
-build-gpu: build-base-gpu fetch-cli ## Build the container image (GPU/CUDA)
-	@[ -f deploy/pipelock-ca.crt ] || { echo "ERROR: deploy/pipelock-ca.crt missing -- run 'make pipelock-ca-init' first (the lab image bakes the pipelock CA into its trust store)."; exit 1; }
-	$(CONTAINER_RUNTIME) build --network=host \
-		$(PROXY_BUILD_ARGS) \
-		$(CACHE_BUILD_ARGS) \
-		--build-arg BASE_IMAGE=$(BASE_IMAGE_NAME_GPU) \
-		--build-arg GPU_BUILD=true \
-		--build-arg OLLAMA_HOST=$(OLLAMA_HOST) \
-		--build-arg OLLAMA_DEFAULT_MODEL=$(OLLAMA_DEFAULT_MODEL) \
-		-f deploy/Dockerfile.lab \
-		-t $(IMAGE_NAME_GPU) .
 
-
-lab-cpu: ## Run the container (CPU)
+lab: ## Run JupyterLab in the lab image, with the GPU when the host check finds one (DEVAI_GPU_DEVICE= forces the CPU)
 	@if [ -n "$(HOST_HOME_DIR)" ]; then mkdir -p "$(HOST_HOME_DIR)"; fi
-	@echo "Starting $(IMAGE_NAME)..."
+	@echo "Starting $(IMAGE_NAME) $(if $(DEVAI_GPU_DEVICE),with GPU $(DEVAI_GPU_DEVICE),on the CPU)..."
 	@echo "Access JupyterLab at http://$(HOST_IP):$(LAB_PORT)/lab?token=..."
 	$(CONTAINER_RUNTIME) run -it --rm \
 		--name $(IMAGE_NAME) \
 		$(RUN_FLAGS) \
 		$(DEVAI_USER_FLAGS) \
+		$(GPU_FLAGS) \
 		--network $(DEVAI_EGRESS_NETWORK) \
 		$(EGRESS_PROXY_ENV) \
 		-e OLLAMA_HOST=$(OLLAMA_HOST) \
@@ -579,40 +562,12 @@ lab-cpu: ## Run the container (CPU)
 		-v "$$(readlink -f $(HOST_WORK_DIR))":/home/$(CONTAINER_USER)/work \
 		$(IMAGE_NAME)
 
-lab-gpu: ## Run the container (GPU/CUDA)
-	@if [ -n "$(HOST_HOME_DIR)" ]; then mkdir -p "$(HOST_HOME_DIR)"; fi
-	@echo "Starting $(IMAGE_NAME_GPU) with GPU support..."
-	@echo "Access JupyterLab at http://$(HOST_IP):$(LAB_PORT)/lab?token=..."
-	$(CONTAINER_RUNTIME) run -it --rm \
-		--name $(IMAGE_NAME_GPU) \
-		$(RUN_FLAGS) \
-		$(DEVAI_USER_FLAGS) \
-		$(GPU_FLAGS) \
-		--network $(DEVAI_EGRESS_NETWORK) \
-		$(EGRESS_PROXY_ENV) \
-		-e OLLAMA_HOST=$(OLLAMA_HOST) \
-		-e OLLAMA_DEFAULT_MODEL=$(OLLAMA_DEFAULT_MODEL) \
-		-e CONTEXT=$${CONTEXT:-$(MAX_CONTEXT_LEN)} \
-		-e VRAM=$${VRAM:-$(GPU_MEMORY_GB)} \
-		$(USER_ENV) \
-		-e CONTAINER_USER=$(CONTAINER_USER) \
-		-e HOST_IP=$(HOST_IP) \
-		-e PORT=$(LAB_PORT) \
-		-p 0.0.0.0:$(LAB_PORT):8888 \
-		-e DSH_PORT=$(DSH_PORT) \
-		-p 0.0.0.0:$(DSH_PORT):3080 \
-		-v $(HOME_VOLUME):/home/$(CONTAINER_USER) \
-		$(HOME_MOUNT_ARG) \
-		$(MODEL_CACHE_MOUNT) \
-		$(PROBE_CACHE_MOUNT) \
-		-v "$$(readlink -f $(HOST_WORK_DIR))":/home/$(CONTAINER_USER)/work \
-		$(IMAGE_NAME_GPU)
-
-shell-cpu: ## Start an interactive shell (CPU)
+shell: ## Start an interactive shell (the agent picker) in the lab image, with the GPU when the host check finds one
 	$(CONTAINER_RUNTIME) run -it --rm \
 		--name $(IMAGE_NAME)-shell \
 		$(RUN_FLAGS) \
 		$(DEVAI_USER_FLAGS) \
+		$(GPU_FLAGS) \
 		--network $(DEVAI_EGRESS_NETWORK) \
 		$(EGRESS_PROXY_ENV) \
 		-e OLLAMA_HOST=$(OLLAMA_HOST) \
@@ -628,36 +583,11 @@ shell-cpu: ## Start an interactive shell (CPU)
 		-v "$$(readlink -f $(HOST_WORK_DIR))":/home/$(CONTAINER_USER)/work \
 		$(IMAGE_NAME) agent-picker
 
-shell-gpu: ## Start an interactive shell (GPU)
-	$(CONTAINER_RUNTIME) run -it --rm \
-		--name $(IMAGE_NAME_GPU)-shell \
-		$(RUN_FLAGS) \
-		$(DEVAI_USER_FLAGS) \
-		$(GPU_FLAGS) \
-		--network $(DEVAI_EGRESS_NETWORK) \
-		$(EGRESS_PROXY_ENV) \
-		-e OLLAMA_HOST=$(OLLAMA_HOST) \
-		-e OLLAMA_DEFAULT_MODEL=$(OLLAMA_DEFAULT_MODEL) \
-		-e CONTEXT=$${CONTEXT:-$(MAX_CONTEXT_LEN)} \
-		-e VRAM=$${VRAM:-$(GPU_MEMORY_GB)} \
-		$(USER_ENV) \
-		-e CONTAINER_USER=$(CONTAINER_USER) \
-		-v $(HOME_VOLUME):/home/$(CONTAINER_USER) \
-		$(HOME_MOUNT_ARG) \
-		$(MODEL_CACHE_MOUNT) \
-		$(PROBE_CACHE_MOUNT) \
-		-v "$$(readlink -f $(HOST_WORK_DIR))":/home/$(CONTAINER_USER)/work \
-		$(IMAGE_NAME_GPU) agent-picker
+clean: clean-lab clean-router ## Remove the lab, base and router images
 
-clean: clean-cpu clean-gpu clean-router ## Remove all images (CPU + GPU + router)
-
-clean-cpu: ## Remove the CPU container + base images
+clean-lab: ## Remove the lab and base images
 	$(CONTAINER_RUNTIME) rmi $(IMAGE_NAME) 2>/dev/null || true
 	$(CONTAINER_RUNTIME) rmi $(BASE_IMAGE_NAME) 2>/dev/null || true
-
-clean-gpu: ## Remove the GPU container + base images
-	$(CONTAINER_RUNTIME) rmi $(IMAGE_NAME_GPU) 2>/dev/null || true
-	$(CONTAINER_RUNTIME) rmi $(BASE_IMAGE_NAME_GPU) 2>/dev/null || true
 
 clean-router: ## Remove the router image
 	$(CONTAINER_RUNTIME) rmi devai-router 2>/dev/null || true
@@ -777,7 +707,7 @@ pipelock-ca-init: ## One-time: generate the pipelock MITM CA. Cert -> deploy/ (c
 	echo ""; \
 	echo "CA cert -> deploy/pipelock-ca.crt        (local build input; gitignored)"; \
 	echo "CA key  -> $(PIPELOCK_CA_KEY)  (0600, host-only, never committed)"; \
-	echo "Next: make build-gpu && make cache-up"
+	echo "Next: make build-lab && make cache-up"
 
 test-router: ## Run Go unit tests for gpu-arbiter router
 	cd gpu-arbiter && go test -race -v -count=1 ./...
@@ -861,7 +791,7 @@ test-agents: ## Smoke-test every (agent × backend) cell against the live router
 		-e PROMPT="$${PROMPT:-reply with the single word PONG}" \
 		-e ROUTER=devai-router \
 		-e LOG_DIR=/var/log/agent-matrix \
-		$(IMAGE_NAME_GPU) /usr/local/bin/agent-matrix
+		$(IMAGE_NAME) /usr/local/bin/agent-matrix
 	@echo "  logs preserved at $(CURDIR)/tests/.matrix-logs/"
 
 test: test-router test-devai-tools test-python test-backup-restore test-probe-ollama-idempotent test-ollama test-e2e test-vllm test-models ## Run every available test in sequence (Go unit + Python unit + Ollama + E2E + vLLM integration + matrix + probes; ~30-60 min)
@@ -892,16 +822,15 @@ test: test-router test-devai-tools test-python test-backup-restore test-probe-ol
 help: ## Show this help message
 	@printf "\nDevAI Lab — Containerized AI Development Environment\n\n"
 	@printf "  %-44s%s\n" "BUILD" "RUN"
-	@printf "  %-44s%s\n" "fetch-cli        Update CLI binaries" "lab-cpu          JupyterLab (CPU)"
-	@printf "  %-44s%s\n" "pull-images      Pull base images" "lab-gpu          JupyterLab (GPU)"
-	@printf "  %-44s%s\n" "build-cpu        Build image (CPU)" "shell-cpu        Shell (CPU)"
-	@printf "  %-44s%s\n" "build-gpu        Build image (GPU)" "shell-gpu        Shell (GPU)"
+	@printf "  %-44s%s\n" "fetch-cli        Update CLI binaries" "lab              JupyterLab (GPU if the host has one)"
+	@printf "  %-44s%s\n" "pull-images      Pull base images" "shell            Shell (GPU if the host has one)"
+	@printf "  %s\n" "build-lab        Build the lab image"
 	@printf "  %s\n" "build-router     Build router image"
-	@printf "  %s\n" "build            Build all (CPU+GPU+router)"
+	@printf "  %s\n" "build            Build all (lab+router+apt-cache+pipelock)"
 	@printf "\n"
 	@printf "  %-44s%s\n" "INFRASTRUCTURE" "MAINTENANCE"
-	@printf "  %-44s%s\n" "cache-up         Start services" "clean-cpu        Remove image (CPU)"
-	@printf "  %-44s%s\n" "cache-down       Stop services" "clean-gpu        Remove image (GPU)"
+	@printf "  %-44s%s\n" "cache-up         Start services" "clean-lab        Remove lab + base images"
+	@printf "  %-44s%s\n" "cache-down       Stop services" ""
 	@printf "  %-44s%s\n" "cache-status     Show status" "clean-router     Remove router image"
 	@printf "  %-44s%s\n" "cache-clean      Remove cached data" "clean            Remove all images"
 	@printf "  %-44s%s\n" "" "prune            Prune dangling images"
@@ -1705,16 +1634,17 @@ vllm-df: ## Show vLLM models disk usage
 
 
 # laya trainer backend (docs/plans/laya-trainer.md). A separate image on the
-# lab's GPU base, NOT an extension of the lab image. Its Python packages come
+# lab's base, NOT an extension of the lab image. Its Python packages come
 # from a hash lock (laya-trainer/requirements.lock), installed with
 # --require-hashes; SOURCE_ID is recorded in every artifact manifest.
 LAYA_TRAINER_IMAGE ?= localhost/devai-laya-trainer:latest
 
-build-laya-trainer: build-base-gpu ## Build the laya trainer image (devai-laya-trainer) on the lab's GPU base image
+build-laya-trainer: build-base ## Build the laya trainer image (devai-laya-trainer) on the lab's base image
 	$(CONTAINER_RUNTIME) build --network=host \
 		$(PROXY_BUILD_ARGS) \
+		$(APT_PROXY_ARG) \
 		-v $(CACHE_DIR)/pip:/root/.cache/uv \
-		--build-arg BASE_IMAGE=$(BASE_IMAGE_NAME_GPU) \
+		--build-arg BASE_IMAGE=$(BASE_IMAGE_NAME) \
 		--build-arg SOURCE_ID=$$(cat laya-trainer/requirements.lock deploy/laya-models.yaml laya-trainer/laya_trainer/*.py | sha256sum | cut -c1-16) \
 		-f deploy/Dockerfile.laya-trainer \
 		-t $(LAYA_TRAINER_IMAGE) .
@@ -1727,20 +1657,20 @@ test-laya-trainer: ## Run the laya trainer's unit tests inside its image, on CPU
 		$(LAYA_TRAINER_IMAGE) \
 		python -m unittest discover -s /opt/laya-trainer/laya_trainer/tests -t /opt/laya-trainer $(if $(VERBOSE),-v,)
 
-laya-trainer-lock: ## Regenerate laya-trainer/requirements.lock (hash-locked) from requirements.in, inside the GPU base image
+laya-trainer-lock: ## Regenerate laya-trainer/requirements.lock (hash-locked) from requirements.in, inside the base image
 	$(CONTAINER_RUNTIME) run --rm --network=host \
 		-v $(CURDIR)/laya-trainer:/src \
 		-v $(CACHE_DIR)/pip:/root/.cache/uv \
-		$(BASE_IMAGE_NAME_GPU) \
+		$(BASE_IMAGE_NAME) \
 		uv pip compile /src/requirements.in --generate-hashes \
 			--python-version $(PYTHON_VERSION) --python-platform x86_64-manylinux_2_28 \
 			--custom-compile-command "make laya-trainer-lock" -o /src/requirements.lock
 
-lab-lock: ## Regenerate the lab image's hash locks inside the GPU base image: requirements-lab.lock from requirements-base.txt (against the torch pins in requirements-torch.txt) and requirements-skypilot.lock from requirements-skypilot.in. Keeps every locked version the inputs still allow (uv treats the existing lock as preferences); UPGRADE=1 re-resolves to the newest releases. Review the diff, rebuild, re-bench.
+lab-lock: ## Regenerate the lab image's hash locks inside the base image: requirements-lab.lock from requirements-base.txt (against the torch pins in requirements-torch.txt) and requirements-skypilot.lock from requirements-skypilot.in. Keeps every locked version the inputs still allow (uv treats the existing lock as preferences); UPGRADE=1 re-resolves to the newest releases. Review the diff, rebuild, re-bench.
 	$(CONTAINER_RUNTIME) run --rm --network=host --entrypoint uv \
 		-v $(CURDIR):/src -w /src \
 		-v $(CACHE_DIR)/pip:/root/.cache/uv \
-		$(BASE_IMAGE_NAME_GPU) \
+		$(BASE_IMAGE_NAME) \
 		pip compile requirements-base.txt -c requirements-torch.txt --torch-backend cpu \
 			--no-emit-package torch --no-emit-package torchvision --no-emit-package torchaudio \
 			--generate-hashes $(if $(UPGRADE),--upgrade,) --python-version $(PYTHON_VERSION) --python-platform x86_64-manylinux_2_28 \
@@ -1748,13 +1678,13 @@ lab-lock: ## Regenerate the lab image's hash locks inside the GPU base image: re
 	$(CONTAINER_RUNTIME) run --rm --network=host --entrypoint uv \
 		-v $(CURDIR):/src -w /src \
 		-v $(CACHE_DIR)/pip:/root/.cache/uv \
-		$(BASE_IMAGE_NAME_GPU) \
+		$(BASE_IMAGE_NAME) \
 		pip compile requirements-skypilot.in \
 			--generate-hashes $(if $(UPGRADE),--upgrade,) --python-version $(PYTHON_VERSION) --python-platform x86_64-manylinux_2_28 \
 			--custom-compile-command "make lab-lock" -o requirements-skypilot.lock
 
 laya-check: ## GPU-exclusive, evicts the teacher ~3 min: run the reference laya job (ds-a6c9c8248242) through :11438 and check the teacher/trainer hand-off (swap, 503 hold, job, parity, aiagent verify + golden, teacher restored). TEACHER=<model string> (default: what TEACHER_PORT has loaded), TEACHER_PORT=11437, KEEP_RUN=1.
-	python3 scripts/laya-check.py --lab-image $(IMAGE_NAME_GPU) --trainer-image $(LAYA_TRAINER_IMAGE) \
+	python3 scripts/laya-check.py --lab-image $(IMAGE_NAME) --trainer-image $(LAYA_TRAINER_IMAGE) \
 	  $(if $(TEACHER),--teacher '$(TEACHER)',) \
 	  $(if $(TEACHER_PORT),--teacher-port $(TEACHER_PORT),) \
 	  $(if $(KEEP_RUN),--keep-run,)
@@ -1881,6 +1811,9 @@ install: ## Install bin/devai-agent to $(INSTALL_PREFIX)/bin and stage config in
 	@# in-image one without bind-mounting the constants module too.
 	@ln -sf "$(CURDIR)/scripts/_capability.py" $(DEVAI_HOME)/_capability.py
 	@ln -sf "$(CURDIR)/scripts/_model_status.py" $(DEVAI_HOME)/_model_status.py
+	@# The host check: devai-agent runs it to decide whether the lab gets the
+	@# GPU (platform-rebuild Phase 3, M15).
+	@ln -sf "$(CURDIR)/scripts/host-gpu.sh" $(DEVAI_HOME)/host-gpu.sh
 	@# The catalog. devai-agent mounts it over the image's baked copy so the
 	@# picker sees rows and `mtp:` blocks added after the last image build.
 	@ln -sf "$(CURDIR)/deploy/models.yaml" $(DEVAI_HOME)/models.yaml
@@ -1942,6 +1875,7 @@ uninstall: ## Remove devai-agent launcher and the staged config dir
 	@rm -f $(DEVAI_HOME)/model-picker.py
 	@rm -f $(DEVAI_HOME)/_capability.py
 	@rm -f $(DEVAI_HOME)/_model_status.py
+	@rm -f $(DEVAI_HOME)/host-gpu.sh
 	@rm -f $(DEVAI_HOME)/.model-status.json
 	@echo "Removed $(INSTALL_PREFIX)/bin/devai-agent, $(INSTALL_PREFIX)/bin/devai-jobs and the symlinks under $(DEVAI_HOME)/."
 	@echo "preferences.yaml and sessions/ are kept; remove $(DEVAI_HOME)/ manually if you want a clean slate."
@@ -2103,7 +2037,7 @@ bench-vllm: ## Bench every loaded vLLM/HF model via devai-router:11435
 		-e GPU_MEMORY_GB=$(GPU_MEMORY_GB) \
 		-e HF_TOKEN -e HUGGING_FACE_HUB_TOKEN \
 		--entrypoint python3 \
-		$(IMAGE_NAME_GPU) \
+		$(IMAGE_NAME) \
 		/scripts/bench/bench_runner.py --backend vllm \
 			$(BENCH_RUN_FLAGS)
 
@@ -2119,7 +2053,7 @@ bench-vllm-devai: ## Bench every loaded vLLM/HF model via devai-router:11437 (vl
 		-e GPU_MEMORY_GB=$(GPU_MEMORY_GB) \
 		-e HF_TOKEN -e HUGGING_FACE_HUB_TOKEN \
 		--entrypoint python3 \
-		$(IMAGE_NAME_GPU) \
+		$(IMAGE_NAME) \
 		/scripts/bench/bench_runner.py --backend vllm-devai \
 			$(BENCH_RUN_FLAGS)
 
@@ -2132,7 +2066,7 @@ bench-ollama: ## Bench every loaded Ollama model via devai-router:11434
 		-e GPU_MEMORY_GB=$(GPU_MEMORY_GB) \
 		-e HF_TOKEN -e HUGGING_FACE_HUB_TOKEN \
 		--entrypoint python3 \
-		$(IMAGE_NAME_GPU) \
+		$(IMAGE_NAME) \
 		/scripts/bench/bench_runner.py --backend ollama \
 			$(BENCH_RUN_FLAGS)
 
@@ -2163,7 +2097,7 @@ bench-harvest: ## (used by bench-sync) Score a task stopped at its deadline from
 	$(CONTAINER_RUNTIME) run --rm --network=none \
 		$(BENCH_CACHE_MOUNTS) \
 		--entrypoint python3 \
-		$(IMAGE_NAME_GPU) \
+		$(IMAGE_NAME) \
 		/scripts/bench/harvest_truncated.py $(HARVEST_ARGS)
 
 bench-concurrency: ## Sweep concurrency x prefix-sharing for ONE model (MODEL=, PORT=11435|11437); MODE=multiturn takes SALT=, MIN_TOKENS=, METRICS_URL=, SESSIONS= (with ENGINE=). The JSON report goes to stdout alone.
@@ -2189,7 +2123,7 @@ bench-concurrency: ## Sweep concurrency x prefix-sharing for ONE model (MODEL=, 
 		--network $(DEVAI_NETWORK) \
 		-v $(CURDIR)/scripts:/scripts:ro \
 		--entrypoint python3 \
-		$(IMAGE_NAME_GPU) \
+		$(IMAGE_NAME) \
 		/scripts/bench/bench_concurrency.py \
 			--model '$(MODEL)' \
 			--router-url http://devai-router:$(or $(PORT),11435) \
@@ -2228,7 +2162,7 @@ test-bench-smoke: ## 1-model tiny-subset smoke test (CI / sanity)
 		-e GPU_MEMORY_GB=$(GPU_MEMORY_GB) \
 		-e HF_TOKEN -e HUGGING_FACE_HUB_TOKEN \
 		--entrypoint python3 \
-		$(IMAGE_NAME_GPU) \
+		$(IMAGE_NAME) \
 		/scripts/bench/bench_runner.py --backend vllm \
 			--repo "Qwen3-8B-NVFP4" \
 			--n-gsm8k 5 --n-humaneval 5 --n-tools 4 --n-leak-prompts 10 \

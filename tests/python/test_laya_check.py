@@ -574,7 +574,7 @@ class MainTest(unittest.TestCase):
         self.assertTrue((self.store / "runs" / JOB).is_dir())
 
     def test_a_missing_image_stops_before_anything_runs(self):
-        p = FakePodman(self.store, missing_image="devai-lab-gpu")
+        p = FakePodman(self.store, missing_image="devai-lab")
         self.assertEqual(self.run_main(p), 2)
         self.assertNotIn("drive", p.kinds())
 
@@ -652,7 +652,7 @@ class MainTest(unittest.TestCase):
 class ContainerTest(unittest.TestCase):
 
     def test_aiagent_runs_without_network_or_gpu_and_reads_laya_only(self):
-        argv = lc.lab_argv("devai-lab-gpu", Path("/s"), ["x"], write_inbox=False)
+        argv = lc.lab_argv("devai-lab", Path("/s"), ["x"], write_inbox=False)
         self.assertEqual(argv[argv.index("--network") + 1], "none")
         self.assertIn("--userns=keep-id", argv)
         self.assertNotIn("--device", argv)
@@ -660,7 +660,7 @@ class ContainerTest(unittest.TestCase):
         self.assertEqual(mounts, ["/s:/laya:ro"])
 
     def test_only_the_writer_gets_the_inbox(self):
-        argv = lc.lab_argv("devai-lab-gpu", Path("/s"), ["/laya"], write_inbox=True)
+        argv = lc.lab_argv("devai-lab", Path("/s"), ["/laya"], write_inbox=True)
         mounts = [argv[i + 1] for i, a in enumerate(argv) if a == "-v"]
         self.assertEqual(mounts, ["/s:/laya:ro", "/s/inbox:/laya/inbox"])
 
@@ -686,7 +686,7 @@ class MakefileTest(unittest.TestCase):
         self.assertIn("laya-check", MAKEFILE.split(".PHONY: build-laya-trainer")[1].split("\n")[0])
         recipe = MAKEFILE.split("\nlaya-check:")[1].split("\n\n")[0]
         self.assertIn("evicts the teacher", recipe.splitlines()[0])
-        for piece in ("scripts/laya-check.py", "--lab-image $(IMAGE_NAME_GPU)",
+        for piece in ("scripts/laya-check.py", "--lab-image $(IMAGE_NAME)",
                       "--trainer-image $(LAYA_TRAINER_IMAGE)", "--teacher '$(TEACHER)'",
                       "--teacher-port $(TEACHER_PORT)", "--keep-run"):
             self.assertIn(piece, recipe)

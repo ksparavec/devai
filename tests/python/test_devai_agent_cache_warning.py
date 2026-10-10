@@ -41,7 +41,7 @@ class MissingCacheWarningTest(unittest.TestCase):
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
                 cmd = mod.build_run_cmd(
-                    runtime="podman", image="devai-lab-gpu", cpu_only=True,
+                    runtime="podman", image="devai-lab", device="",
                     work_dir=Path(td), prefs=dict(mod.DEFAULTS),
                     pref_model=None, pref_agent=None,
                 )
@@ -77,7 +77,7 @@ class CatalogMountTest(unittest.TestCase):
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
                 cmd = mod.build_run_cmd(
-                    runtime="podman", image="devai-lab-gpu", cpu_only=True,
+                    runtime="podman", image="devai-lab", device="",
                     work_dir=Path(td), prefs=dict(mod.DEFAULTS),
                     pref_model=None, pref_agent=None,
                 )
@@ -86,7 +86,7 @@ class CatalogMountTest(unittest.TestCase):
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
                 cmd = mod.build_run_cmd(
-                    runtime="podman", image="devai-lab-gpu", cpu_only=True,
+                    runtime="podman", image="devai-lab", device="",
                     work_dir=Path(td), prefs=dict(mod.DEFAULTS),
                     pref_model=None, pref_agent=None,
                 )
@@ -112,7 +112,7 @@ class RecipeSeedsMountTest(unittest.TestCase):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             cmd = mod.build_run_cmd(
-                runtime="podman", image="devai-lab-gpu", cpu_only=True,
+                runtime="podman", image="devai-lab", device="",
                 work_dir=Path(td), prefs=dict(mod.DEFAULTS),
                 pref_model=None, pref_agent=None,
             )

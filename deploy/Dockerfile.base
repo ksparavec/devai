@@ -1,9 +1,10 @@
 # Layer 1: System packages + runtimes (build once)
-# CPU:  make build-base-cpu  (BASE_IMAGE = the Makefile's DEBIAN_IMAGE, the
-#       pinned trixie-slim below; it was the unpinned debian:trixie until
-#       platform-rebuild Phase 2, M13)
-# GPU:  make build-base-gpu  (BASE_IMAGE = GPU_BASE_IMAGE, the CUDA image,
-#       until Phase 3 puts the lab on Debian too)
+# make build-base: BASE_IMAGE = the Makefile's DEBIAN_IMAGE, the pinned
+# trixie-slim below. One base for every host (platform-rebuild Phase 3, M14):
+# it replaced devai-base-cpu (unpinned debian:trixie) and devai-base-gpu
+# (nvidia/cuda:12.9.1-cudnn-runtime-ubuntu24.04). No system CUDA: the lab's
+# and the laya trainer's torch bring their CUDA runtime as pip packages, and
+# the driver comes from the host through CDI.
 
 ARG BASE_IMAGE=docker.io/library/debian:trixie-slim@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd
 FROM ${BASE_IMAGE}

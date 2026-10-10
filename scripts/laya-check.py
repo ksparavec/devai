@@ -318,7 +318,7 @@ def main(argv: list[str] | None = None, *, runner: Runner | None = None,
     ap.add_argument("--teacher", default="",
                     help="teacher model string (default: what the teacher port has loaded)")
     ap.add_argument("--teacher-port", type=int, default=DEFAULT_TEACHER_PORT)
-    ap.add_argument("--lab-image", default="devai-lab-gpu")
+    ap.add_argument("--lab-image", default="devai-lab")
     ap.add_argument("--trainer-image", default="localhost/devai-laya-trainer:latest")
     ap.add_argument("--job-timeout", type=int, default=1800, help="seconds (default 1800)")
     ap.add_argument("--keep-run", action="store_true",

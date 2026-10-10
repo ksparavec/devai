@@ -12,7 +12,7 @@ just `cd` to the project you want to work on first.
 
     cd ~/myapp && devai-agent             # launch with myapp/ as work dir
     devai-agent --init                    # reset preferences to defaults
-    devai-agent --cpu                     # use the CPU lab image
+    DEVAI_GPU_DEVICE= devai-agent         # run the lab on the CPU
     devai-agent -C ~/other                # override work dir for this run
     devai-agent --model qwen3.5:9b-q8_0 --agent claude  # pre-set picks
     devai-agent --model NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4@131072 \
@@ -28,6 +28,11 @@ Preferences (in ~/.devai/preferences.yaml):
                                   launcher ran from (informational —
                                   the work dir is always $PWD)
     agent_session_file  str|null  per-(agent,model) session, if supported
+
+The lab image (devai-lab) is the same with and without a GPU: the host
+check (~/.devai/host-gpu.sh, scripts/host-gpu.sh staged by `make install`)
+decides whether the container gets the GPU, and DEVAI_GPU_DEVICE in the
+environment overrides it, empty forcing the CPU (platform-rebuild Phase 3).
 
 The script does NOT read the repo's .env, NOT modify the parent shell,
 NOT write to the repo. Everything it touches at runtime lives under
@@ -58,6 +63,9 @@ CAPABILITY_SRC = CONFIG_DIR / "_capability.py"
 # rows carrying an operator-recorded bench verdict. Optional in the
 # picker, so an image predating it still starts.
 MODEL_STATUS_SRC = CONFIG_DIR / "_model_status.py"
+# The host check: prints the CDI device string, or nothing for the CPU.
+HOST_GPU_SRC = CONFIG_DIR / "host-gpu.sh"
+LAB_IMAGE = "devai-lab"
 SESSIONS_DIR = CONFIG_DIR / "sessions"
 PICK_BACK_CHANNEL = CONFIG_DIR / ".last-pick.json"
 
@@ -84,7 +92,7 @@ MODEL_STATUS_CACHE = CONFIG_DIR / ".model-status.json"
 # The catalog (deploy/models.yaml, staged by `make install`). The picker's
 # MTP offer, PARAMS/TYPE/FORMAT columns and every row added after the image
 # was built come from it; the image's baked copy is whatever the last
-# `make build-gpu` saw (2026-07-27 here: no derived rows, no `mtp:` blocks).
+# `make build-lab` (before Phase 3: `make build-gpu`) saw (2026-07-27 here: no derived rows, no `mtp:` blocks).
 CATALOG = CONFIG_DIR / "models.yaml"
 # vLLM launch-recipe seeds (deploy/recipe-seeds.yaml, staged by `make
 # install`): the picker's recipe badge. Mounted over the image's baked copy
@@ -192,9 +200,8 @@ def preflight(runtime: str, image: str) -> None:
         sys.exit(f"error: container runtime {runtime!r} not on PATH "
                  f"(set CONTAINER_RUNTIME=docker if you don't use podman)")
     if not runtime_check(runtime, "image", image):
-        which = "cpu" if image.endswith("-cpu") else "gpu"
         sys.exit(f"error: image {image!r} not found.\n"
-                 f"       Build it from the devai repo: `make build-{which}`.")
+                 f"       Build it from the devai repo: `make build-lab`.")
     net = DEVAI_NETWORK if _egress_locked() else DEVAI_OPEN_NETWORK
     if not runtime_check(runtime, "network", net):
         sys.exit(f"error: network {net!r} not found.\n"
@@ -218,11 +225,26 @@ def preflight(runtime: str, image: str) -> None:
 
 # ── Container command construction ──────────────────────────────────────────
 
-def gpu_flags(runtime: str, cpu_only: bool) -> list[str]:
-    if cpu_only:
+def host_gpu_device() -> str:
+    """The host check's answer: the CDI device string, or "" for the CPU.
+
+    Refuses to guess when the check is not staged: falling back to the CPU
+    would silently take the GPU away, and to the GPU would break a CPU host.
+    """
+    if not HOST_GPU_SRC.exists():
+        sys.exit(f"error: the host check is not staged at {HOST_GPU_SRC}.\n"
+                 f"       Run `make install` in the devai repo.")
+    cp = subprocess.run([str(HOST_GPU_SRC)], capture_output=True, text=True, check=False)
+    if cp.returncode != 0:
+        sys.exit(f"error: {HOST_GPU_SRC} failed (rc {cp.returncode}): {cp.stderr.strip()}")
+    return cp.stdout.strip()
+
+
+def gpu_flags(runtime: str, device: str) -> list[str]:
+    if not device:
         return []
     if "podman" in runtime:
-        return ["--device", "nvidia.com/gpu=all", "--security-opt=label=disable"]
+        return ["--device", device, "--security-opt=label=disable"]
     return ["--gpus", "all"]
 
 
@@ -300,7 +322,7 @@ def optional_mounts() -> list[str]:
 
 
 def build_run_cmd(
-    *, runtime: str, image: str, cpu_only: bool,
+    *, runtime: str, image: str, device: str,
     work_dir: Path, prefs: dict,
     pref_model: str | None, pref_agent: str | None,
     prompt: str | None = None,
@@ -319,7 +341,7 @@ def build_run_cmd(
     cmd += devai_user_flags(runtime)
 
     cmd += [
-        *gpu_flags(runtime, cpu_only),
+        *gpu_flags(runtime, device),
         *network_flags(),
         *proxy_env(),
         "-e", f"OLLAMA_HOST={OLLAMA_HOST}",
@@ -432,8 +454,6 @@ def make_parser() -> argparse.ArgumentParser:
     )
     ap.add_argument("--init", action="store_true",
                     help="reset ~/.devai/preferences.yaml to defaults and exit")
-    ap.add_argument("--cpu", action="store_true",
-                    help="use the CPU lab image instead of GPU")
     ap.add_argument("-C", "--workdir",
                     help="mount this directory as /home/devai/work "
                          "instead of the current $PWD "
@@ -471,7 +491,7 @@ def main() -> int:
     prefs = read_prefs()
 
     runtime = os.environ.get("CONTAINER_RUNTIME", "podman")
-    image = "devai-lab-cpu" if args.cpu else "devai-lab-gpu"
+    image = LAB_IMAGE
 
     # Work dir defaults to the current shell's $PWD, NOT to prefs.last_work_dir.
     # `last_work_dir` is a record of where the user last ran from (kept for
@@ -486,9 +506,10 @@ def main() -> int:
     pref_agent = args.agent or prefs.get("last_agent")
 
     preflight(runtime, image)
+    device = host_gpu_device()
 
     cmd = build_run_cmd(
-        runtime=runtime, image=image, cpu_only=args.cpu,
+        runtime=runtime, image=image, device=device,
         work_dir=work_dir, prefs=prefs,
         pref_model=pref_model, pref_agent=pref_agent,
         prompt=args.prompt,

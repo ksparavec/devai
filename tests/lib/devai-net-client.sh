@@ -14,9 +14,8 @@
 #   TEST_EXEC_HOST     an existing container on devai-net to use instead;
 #                      nothing is started or removed then
 #   TEST_CLIENT_IMAGE  image for the throwaway client. Default: the lab
-#                      image, localhost/devai-lab-gpu:latest, falling back to
-#                      localhost/devai-lab-cpu:latest (both carry curl and
-#                      bake in no proxy)
+#                      image, localhost/devai-lab:latest (it carries curl
+#                      and bakes in no proxy)
 #
 # The throwaway client runs `sleep infinity` as PID 1, which ignores SIGTERM,
 # so it is killed (SIGKILL) rather than stopped.
@@ -51,15 +50,9 @@ devai_net_client_start() {
         echo "devai-net-client: TEST_EXEC_HOST=$TEST_EXEC_HOST is not a container; starting a client instead" >&2
     fi
 
-    local image="${TEST_CLIENT_IMAGE:-}"
-    if [ -z "$image" ]; then
-        for image in localhost/devai-lab-gpu:latest localhost/devai-lab-cpu:latest ""; do
-            [ -n "$image" ] || break
-            "$runtime" image inspect "$image" >/dev/null 2>&1 && break
-        done
-    fi
-    if [ -z "$image" ]; then
-        echo "devai-net-client: no client image: neither localhost/devai-lab-gpu:latest nor localhost/devai-lab-cpu:latest exists (make build-gpu), and TEST_CLIENT_IMAGE is unset" >&2
+    local image="${TEST_CLIENT_IMAGE:-localhost/devai-lab:latest}"
+    if ! "$runtime" image inspect "$image" >/dev/null 2>&1; then
+        echo "devai-net-client: no client image $image (make build-lab, or set TEST_CLIENT_IMAGE)" >&2
         return 1
     fi
 

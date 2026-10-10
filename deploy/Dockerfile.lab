@@ -1,12 +1,13 @@
 # Layer 2: All packages + configuration (rebuild when packages change)
 
-ARG BASE_IMAGE=devai-base-cpu
+# One lab image (platform-rebuild Phase 3, M14): CUDA torch on the Debian base,
+# run with the GPU when the host has one and on the CPU otherwise (M15).
+ARG BASE_IMAGE=localhost/devai-base:latest
 FROM ${BASE_IMAGE}
 
 ARG HTTP_PROXY
 ARG HTTPS_PROXY
 ARG NO_PROXY
-ARG GPU_BUILD=false
 ARG OLLAMA_HOST=http://devai-router:11434
 ARG OLLAMA_DEFAULT_MODEL=qwen3.5:9b
 
@@ -119,8 +120,9 @@ RUN cp -a /var/cache/bin/gemini/lib/node_modules/@google /usr/local/lib/node_mod
     && ln -sf ../lib/node_modules/@google/gemini-cli/bundle/gemini.js /usr/local/bin/gemini
 
 # --- Package installs (change more often, cached after binaries) ---
-# Torch first, from the index that carries the right build, then the rest from
-# PyPI alone. NOT one resolve with PyTorch's index added: uv's default index
+# Torch first, from PyPI, whose torch is the CUDA build (one lab image for
+# every host, M14; the CPU index branch went in Phase 3), then the rest.
+# Both from PyPI alone. NOT one resolve with PyTorch's index added: uv's default index
 # strategy then takes every package that index carries (numpy, jinja2, certifi,
 # idna, fsspec, ...) from it ONLY, and the resolver backtracked the whole lab to
 # old releases -- the 3.13 CPU image shipped JupyterLab 4.1.6 (2024) and
@@ -139,12 +141,7 @@ RUN cp -a /var/cache/bin/gemini/lib/node_modules/@google /usr/local/lib/node_mod
 # 2026-10-07 (platform-rebuild Phase 1, M11).
 
 COPY requirements-torch.txt requirements-lab.lock /tmp/
-RUN if [ "$GPU_BUILD" = "true" ]; then \
-        TORCH_INDEX=""; \
-    else \
-        TORCH_INDEX="--index-url https://download.pytorch.org/whl/cpu"; \
-    fi \
-    && uv pip install --system -r /tmp/requirements-torch.txt $TORCH_INDEX \
+RUN uv pip install --system -r /tmp/requirements-torch.txt \
     && uv pip install --system --no-deps --require-hashes -r /tmp/requirements-lab.lock \
     && uv pip check --system
 
@@ -260,26 +257,12 @@ RUN getent group "$RENDER_GID" >/dev/null 2>&1 \
     || groupadd -g "$RENDER_GID" render 2>/dev/null \
     || echo "render:x:${RENDER_GID}:" >> /etc/group
 
-# Create the devai user/group at uid/gid 1000 with home /home/devai. The GPU base
-# (nvidia/cuda:...-ubuntu2404) already ships an `ubuntu` user/group at 1000, so a
-# plain `useradd devai` is skipped there and uid 1000 stays `ubuntu` -- which
-# breaks `--user devai` (non-root mode) and is inconsistent with the CPU (debian)
-# image. Instead, RENAME whatever occupies 1000 to `devai` (mirroring what the
-# docker-path entrypoint does at runtime), so uid 1000 == devai on both bases.
+# Create the devai user/group at uid/gid 1000 with home /home/devai. (The
+# Ubuntu-based CUDA base this replaced had an `ubuntu` user at 1000, which a
+# step here renamed; Debian has nothing there.)
 RUN set -eu; \
-    if getent group 1000 >/dev/null 2>&1; then \
-        g="$(getent group 1000 | cut -d: -f1)"; \
-        [ "$g" = devai ] || groupmod -n devai "$g"; \
-    else \
-        groupadd -g 1000 devai; \
-    fi; \
-    if getent passwd 1000 >/dev/null 2>&1; then \
-        u="$(getent passwd 1000 | cut -d: -f1)"; \
-        [ "$u" = devai ] || usermod -l devai "$u"; \
-        usermod -g 1000 -d /home/devai -s /bin/bash -c '' devai; \
-    else \
-        useradd -u 1000 -g 1000 -d /home/devai -s /bin/bash devai; \
-    fi; \
+    groupadd -g 1000 devai; \
+    useradd -u 1000 -g 1000 -d /home/devai -s /bin/bash devai; \
     mkdir -p /home/devai/work /home/devai/.local/bin; \
     chown -R 1000:1000 /home/devai
 

@@ -8,7 +8,7 @@ bench scorer's own subprocess sandbox, and imports inspect_ai):
 
   podman run --rm --network=none --entrypoint python3 \\
     -v $PWD:/repo:ro -v /var/cache/devai/bench/inspect-logs:/logs:ro \\
-    -v $O:/o localhost/devai-lab-gpu:latest \\
+    -v $O:/o localhost/devai-lab:latest \\
     /repo/scripts/stats/bench_rescore_humaneval.py /o/logs_extracted.json /logs /o/humaneval_rescore.json
 
 Only answers whose extraction CHANGES are executed; every other item keeps

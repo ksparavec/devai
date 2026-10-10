@@ -83,11 +83,13 @@ class TorchStepTest(unittest.TestCase):
     def test_no_extra_index_anywhere_in_the_step(self) -> None:
         self.assertNotIn("--extra-index-url", _requirements_step())
 
-    def test_cpu_torch_comes_from_its_own_index(self) -> None:
-        # The ROCm branch (whl/rocm6.4) moved to attic/amd-rocm/ on
-        # 2026-10-07 (platform-rebuild Phase 1, M11); CUDA torch is PyPI's.
+    def test_one_torch_the_cuda_build_from_pypi(self) -> None:
+        # One lab image for every host (platform-rebuild Phase 3, M14): the
+        # CPU index branch is gone (the ROCm one went in Phase 1, M11), and
+        # PyPI's torch is the CUDA build, which also runs on the CPU.
         step = _requirements_step()
-        self.assertIn("--index-url https://download.pytorch.org/whl/cpu", step)
+        self.assertNotIn("index-url", step)
+        self.assertNotIn("GPU_BUILD", LAB)
 
     def test_torch_stack_is_pinned_exactly(self) -> None:
         for name in TORCH_STACK:

@@ -292,7 +292,7 @@ _RESET = "\033[0m"
 # `~/.devai/` to `/devai-host`, the picker drops a one-shot JSON file the
 # launcher reads after exit so it can persist (model, agent, context) into
 # `preferences.yaml`. Silent no-op when the path is absent — this is what
-# happens for `make shell-gpu` and any other invocation that doesn't go
+# happens for `make shell` and any other invocation that doesn't go
 # through the launcher.
 _PICK_BACK_CHANNEL = Path("/devai-host/.last-pick.json")
 
@@ -1207,8 +1207,8 @@ def _check_cache_visible() -> None:
             f"error: model cache not visible inside the container.\n"
             f"  Looked for: {_OLLAMA_MANIFESTS}\n"
             f"          and {_VLLM_DIR}\n"
-            f"  Re-run via `make shell-gpu` / `make lab-gpu` (or equivalent CPU "
-            f"target) so the host cache dir is mounted read-only."
+            f"  Re-run via `make shell` / `make lab` "
+            f"so the host cache dir is mounted read-only."
         )
 
 
@@ -3663,7 +3663,7 @@ def _build(agent_id: str, model_name: str, backend: str) -> list[str]:
 
     if agent_id == "dsh":
         # DeepSeek Harness has no terminal UI: the launcher serves its web
-        # UI on the port lab-cpu/lab-gpu publish (DSH_PORT) and prints the
+        # UI on the port `make lab` publishes (DSH_PORT) and prints the
         # URL. The providers and default model are written first; see
         # _write_dsh_config for where each goes and why.
         ctx = os.environ.get("CONTEXT", "")
@@ -3808,7 +3808,7 @@ def _models_for_agent(models: list[dict], agent: str | None) -> list[dict]:
 
 def _offered_agents(backend: str | None = None) -> list[tuple[str, str, str]]:
     """The agent menu for a row on ``backend``. DeepSeek Harness serves a
-    browser UI on the port that only `make lab-cpu|lab-gpu` publish
+    browser UI on the port that only `make lab` publishes
     (DSH_PORT), so it is left out of the menu anywhere else; an explicit
     `--agent dsh` still reaches its launcher, which says why it cannot
     start. An agent known to fail on the backend is left out too."""
