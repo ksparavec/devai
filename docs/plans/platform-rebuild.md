@@ -4,7 +4,7 @@ _Pull exactly one image from upstream; compile every engine here into one contai
 
 ## Status
 
-Draft (2026-10-05; engines and System One added 2026-10-06). Built since, on branch feat/platform-rebuild: Phases 1, 5 and 21, steps 4v, 16a, 16e and 17a (2026-10-07). Phase 5's live checks (`make test-slurm`) passed on the card: 75 of 76 on 2026-10-09, and the unkillable-holder check, which needs sudo, alone on 2026-10-10 (`make test-slurm ONLY=holders`, 10 of 10).
+Draft (2026-10-05; engines and System One added 2026-10-06). Built since, on branch feat/platform-rebuild: Phases 1, 5 and 21, steps 4v, 16a, 16e and 17a (2026-10-07). Phase 5's live checks (`make test-slurm`) passed on the card: 75 of 76 on 2026-10-09, and the unkillable-holder check, which needs sudo, alone on 2026-10-10 (`make test-slurm ONLY=holders`, 10 of 10). Phase 15 measured SGLang against vLLM 0.30.0 on 2026-10-10: frozen (M16).
 
 Plan-level review ends here (operator, 2026-10-06). After four readiness reviews, the last fix round was checked finding by finding and left the small items listed under "Left for implementation" (below Open questions). They are settled in the phase named, and each phase's tests and exit criteria are the check, not a further review of this plan.
 
@@ -111,6 +111,14 @@ Quoted as recorded in the three plans this one replaces, except E1-E6, which the
   - none -> the same images run on the CPU, which works reasonably on unified-memory hosts.
 
   What runs on the CPU follows from the builds: Ollama (its build includes llama.cpp's CPU backend, preset `cpu` in `scripts/build-ollama.sh`) and the laya trainer (torch runs on the CPU). vLLM and SGLang are compiled for CUDA only and are not offered without a GPU. On macOS nothing changes in kind: Ollama runs natively on the host with Metal (INSTALL_macOS.md), and the lab runs in `podman machine`, now from the one lab image built for arm64.
+
+- **M16 -- SGLang is frozen** (Phase 15, 2026-10-10; I16's outcome, confirmed by the operator the same day). Measured by `make sglang-keep-check` (commit d507d6b; report `/var/cache/devai/bench/phase15/keep-check.json`, salt `8c8e7590f962`) on Qwen3.5-9B-NVFP4 (I15), with the stack down: SGLang 0.5.16 (`lmsysorg/sglang:v0.5.16-cu130`, digest `sha256:34e52c64636e...`, KV engine default) and vLLM 0.30.0 (vllm-devai, `sha256:6c2ad8b6282f...`, KV fp8), both at 196,608 tokens (SGLang's probed maximum; vLLM's is 262,144), MTP off, reasoning off, temperature 0, no tools. The dry run (2 sessions, uncounted) showed a 0.709 hit rate, so the instrument was sound. The measured run completed with no failed request and no failed counter read:
+  - (a) steady TTFT, SGLang over vLLM: 1.27 (45.2 against 35.7 ms, medians over prompts 1-30) -- passes (at most 3.0);
+  - (b) turn-2+ TTFT, SGLang over vLLM: **0.806** (272.8 against 338.4 ms, medians of 20 session medians each; 95% percentile bootstrap 0.802-0.812) -- **fails** (at most 0.75 required);
+  - (c) turn-2+ TTFT, radix on over off: 0.322 (272.8 against 846.2 ms; 0.321-0.325) -- passes;
+  - (d) the pooled radix-on hit rate over turns 2-5: 0.709 -- passes.
+
+  So SGLang's radix cache works and makes it about 19% faster than vLLM on later agent turns, short of the 25% I16 requires; vLLM's own prefix cache served 0.640 of the same turns' prompt tokens (its counters, read the same way). The sessions were smaller than their nominal sizes: the prefix builder's 3.5 characters per token overestimates, so the engines counted about 2,360 prompt tokens per 4,096 nominal (turn 1) and about 11,800 by turn 5; the same for every arm. Phase 4 therefore skips steps 4a-4b and SGLang's stage in `Dockerfile.engines`, and SGLang leaves the router's backend table, the picker, the agent seeds and the make targets; its prober and its SGLang-only tests move to `attic/sglang/` (Phase 15 step 4). Not explained, and not re-measured: Qwen3.5-9B-NVFP4's HumanEval of 0.86 on SGLang against 0.68 on vLLM in the July runs (same checkpoint; those rows are no longer in the bench cache, and they predate the bench's 2026-09-27 sampling and scorer fixes).
 
 ### Slurm (2026-09-29)
 

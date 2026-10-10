@@ -2217,15 +2217,6 @@ bench-concurrency: ## Sweep concurrency x prefix-sharing for ONE model (MODEL=, 
 			$(if $(SESSIONS),--sessions $(SESSIONS),) \
 			$(if $(ENGINE),--engine '$(ENGINE)',)
 
-KEEP_CHECK_OUT ?= /var/cache/devai/bench/phase15/keep-check-$(shell date -u +%Y%m%dT%H%M%SZ).json
-
-sglang-keep-check: ## Phase 15's one-time SGLang keep-or-freeze measurement (I16): SGLang radix on/off and vllm-devai on Qwen3.5-9B-NVFP4, launched by the check itself. GPU-exclusive: run `make cache-down slurm-down` first. KEEP_CHECK_OUT=<file>, SALT=<nonce>.
-	@# scripts/bench/sglang_keep_check.py; removed again once M16 is
-	@# recorded (platform-rebuild Phase 15, step 4).
-	VLLM_MODELS_DIR=$(VLLM_MODELS_DIR) SGLANG_MODELS_DIR=$(SGLANG_MODELS_DIR) \
-	python3 scripts/bench/sglang_keep_check.py --out '$(KEEP_CHECK_OUT)' \
-	    --host-vram-gb $(GPU_MEMORY_GB) $(if $(SALT),--salt '$(SALT)',)
-
 bench-report: ## Print a Markdown leaderboard from .bench-cache.json
 	@$(CONTAINER_RUNTIME) run --rm \
 		-v $(CURDIR)/scripts:/scripts:ro \
