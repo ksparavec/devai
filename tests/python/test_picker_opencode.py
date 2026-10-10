@@ -68,7 +68,7 @@ class _ConfigHome:
 VETTED = {
     "ollama": ["qwen3.6:27b-q4_K_M"],
     "vllm": ["Qwen3-8B-NVFP4@32768", "gpt-oss-20b@131072"],
-    "sglang": ["gpt-oss-20b@131072"],
+    "vllm-devai": ["gpt-oss-20b@131072"],   # SGLang left with Phase 15 (M16)
 }
 
 
@@ -79,12 +79,12 @@ class TestWriteOpencodeProviders(unittest.TestCase):
             cfg = json.loads(cfg_path.read_text())
         self.assertEqual(
             sorted(p for p in cfg["provider"] if p.startswith("router-")),
-            ["router-ollama", "router-sglang", "router-vllm", "router-vllm-devai"])
+            ["router-ollama", "router-vllm", "router-vllm-devai"])
         self.assertEqual(
             sorted(cfg["provider"]["router-vllm"]["models"]),
             ["Qwen3-8B-NVFP4@32768", "gpt-oss-20b@131072"])
         self.assertEqual(
-            sorted(cfg["provider"]["router-sglang"]["models"]),
+            sorted(cfg["provider"]["router-vllm-devai"]["models"]),
             ["gpt-oss-20b@131072"])
 
     def test_each_provider_points_at_its_own_router_port(self) -> None:
@@ -96,7 +96,7 @@ class TestWriteOpencodeProviders(unittest.TestCase):
             for pid, prov in cfg["provider"].items()
         }
         # One port per backend -- the port IS the backend selector.
-        self.assertEqual(len(set(ports.values())), 4, ports)
+        self.assertEqual(len(set(ports.values())), 3, ports)
         self.assertEqual(ports["router-vllm-devai"], "11437")
 
     def test_replaces_rather_than_accumulates(self) -> None:
@@ -153,7 +153,7 @@ class TestWriteOpencodeProviders(unittest.TestCase):
     def test_empty_backend_declares_no_models_not_a_broken_provider(self) -> None:
         with _ConfigHome() as cfg_path:
             PICKER._write_opencode_providers(
-                {"ollama": [], "vllm": ["a@1"], "sglang": []}, "vllm", "a@1")
+                {"ollama": [], "vllm": ["a@1"], "vllm-devai": []}, "vllm", "a@1")
             cfg = json.loads(cfg_path.read_text())
         self.assertEqual(cfg["provider"]["router-ollama"]["models"], {})
         self.assertIn("baseURL", cfg["provider"]["router-ollama"]["options"])
@@ -176,7 +176,7 @@ class TestVettedIdShape(unittest.TestCase):
              "_picker_context": 131072},
             {"name": "Qwen3-8B-NVFP4", "backend": "vllm",
              "_picker_context": 32768},
-            {"name": "gpt-oss-20b", "backend": "sglang",
+            {"name": "gpt-oss-20b", "backend": "vllm-devai",
              "_picker_context": 131072},
         ]
         out = PICKER._vetted_ids_by_backend(rows)
@@ -184,7 +184,7 @@ class TestVettedIdShape(unittest.TestCase):
         # Ollama tier for a bare name, so per-ctx ids would invite thrash.
         self.assertEqual(out["ollama"], ["qwen3.6:27b-q4_K_M"])
         self.assertEqual(out["vllm"], ["Qwen3-8B-NVFP4@32768"])
-        self.assertEqual(out["sglang"], ["gpt-oss-20b@131072"])
+        self.assertEqual(out["vllm-devai"], ["gpt-oss-20b@131072"])
 
     def test_ids_carry_the_launch_suffixes(self) -> None:
         """An in-session switch must launch the row as the picker would.
@@ -211,14 +211,14 @@ class TestVettedIdShape(unittest.TestCase):
                          ["Qwen3-Next-MTP::mtp@65536", "Qwen3-8B-NVFP4@32768"])
 
     def test_same_name_on_two_backends_is_kept_on_both(self) -> None:
-        """The menu dedups vLLM/SGLang; the provider list must not."""
+        """The menu dedups across HF backends; the provider list must not."""
         rows = [
             {"name": "gpt-oss-20b", "backend": "vllm", "_picker_context": 131072},
-            {"name": "gpt-oss-20b", "backend": "sglang", "_picker_context": 131072},
+            {"name": "gpt-oss-20b", "backend": "vllm-devai", "_picker_context": 131072},
         ]
         out = PICKER._vetted_ids_by_backend(rows)
         self.assertEqual(out["vllm"], ["gpt-oss-20b@131072"])
-        self.assertEqual(out["sglang"], ["gpt-oss-20b@131072"])
+        self.assertEqual(out["vllm-devai"], ["gpt-oss-20b@131072"])
 
 
 if __name__ == "__main__":

@@ -71,8 +71,7 @@ class _PiHome:
 VETTED = {
     "ollama": ["qwen3.6:27b-q4_K_M"],
     "vllm": ["Qwen3-8B-NVFP4@32768", "gpt-oss-20b@131072"],
-    "sglang": ["gpt-oss-20b@131072"],
-}
+}  # its "sglang" entry left with SGLang (platform-rebuild Phase 15, M16)
 
 
 def _ids(cfg: dict, provider: str) -> list[str]:
@@ -90,10 +89,9 @@ class TestWritePiModels(unittest.TestCase):
             cfg = json.loads(path.read_text())
         self.assertEqual(
             sorted(p for p in cfg["providers"] if p.startswith("router-")),
-            ["router-ollama", "router-sglang", "router-vllm", "router-vllm-devai"])
+            ["router-ollama", "router-vllm", "router-vllm-devai"])
         self.assertEqual(sorted(_ids(cfg, "router-vllm")),
                          ["Qwen3-8B-NVFP4@32768", "gpt-oss-20b@131072"])
-        self.assertEqual(_ids(cfg, "router-sglang"), ["gpt-oss-20b@131072"])
         for prov in cfg["providers"].values():
             self.assertEqual(prov["api"], "openai-completions")
             self.assertEqual(prov["apiKey"], "local")

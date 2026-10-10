@@ -222,7 +222,6 @@ _VRAM_BUDGET = float(os.environ.get("VRAM", os.environ.get("GPU_MEMORY_GB", "24"
 _BACKENDS: dict[str, tuple[str, str, int]] = {
     "ollama": ("Ollama", "GGUF quantized — wide compatibility, CPU+GPU",              11434),
     "vllm":   ("vLLM",   "NVFP4 tensor cores — high throughput, paged attention",     11435),
-    "sglang": ("SGLang", "NVFP4 tensor cores — RadixAttention, multi-turn optimized", 11436),
     "vllm-devai": ("vLLM devai", "home-built vLLM 0.28 + HyperQwen patches — MTP on 24G, prepared checkpoints", 11437),
 }
 
@@ -252,7 +251,12 @@ _BACKENDS: dict[str, tuple[str, str, int]] = {
 # Ordering matters: _dedup_hf_rows keeps one row per (model, backend)
 # and ranks vllm above sglang, so a model probed on both still leads
 # with its vLLM row while the SGLang row stays selectable.
-_PICKER_BACKENDS: tuple[str, ...] = ("ollama", "vllm", "vllm-devai", "sglang")
+#
+# Frozen 2026-10-10 by platform-rebuild Phase 15 (M16): on the same
+# checkpoint SGLang's turn-2+ TTFT was 0.81x vLLM 0.30.0's, short of the
+# 0.75 I16 requires, so SGLang left the router's backend table, this list
+# and _BACKENDS above. attic/sglang/RESTORE.md says how to bring it back.
+_PICKER_BACKENDS: tuple[str, ...] = ("ollama", "vllm", "vllm-devai")
 _PICKER_HF_BACKENDS: tuple[str, ...] = tuple(
     b for b in _PICKER_BACKENDS if b != "ollama"
 )

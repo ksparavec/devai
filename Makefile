@@ -110,16 +110,17 @@ CACHE_COMPOSE = $(CURDIR)/deploy/docker-compose.yaml
 # explicitly because cache-up must name them one by one -- see the
 # router-managed-container note in that target. Keep in sync with
 # deploy/docker-compose.yaml; `make cache-services-check` asserts it.
-CACHE_SERVICES = apt-cache registry-cache ollama vllm vllm-devai laya-trainer sglang router \
+CACHE_SERVICES = apt-cache registry-cache ollama vllm vllm-devai laya-trainer router \
                  logger pipelock
 
-# The five the router recreates on demand. cache-up skips any of these
+# The four the router recreates on demand (SGLang, the fifth, was frozen
+# by platform-rebuild Phase 15, M16). cache-up skips any of these
 # that already exist rather than colliding with the router's container.
 # vllm-devai was missing here from its introduction (449270a) until
 # 2026-09-22: with a vllm-devai model loaded, every `make cache-up` died on
 # the name collision before it reached the router. laya-trainer is the job
 # runner (docs/plans/laya-trainer.md).
-CACHE_BACKEND_SERVICES = ollama vllm vllm-devai laya-trainer sglang
+CACHE_BACKEND_SERVICES = ollama vllm vllm-devai laya-trainer
 INFERENCE_CONFIG = deploy/models.yaml
 HF_CLI = hf
 # vLLM and SGLang safetensors live on their OWN external volumes
@@ -264,10 +265,10 @@ endif
 .PHONY: ollama-rm ollama-list ollama-status ollama-clean ollama-df
 .PHONY: vllm-list vllm-rm vllm-status vllm-df
 .PHONY: clean clean-cpu clean-gpu clean-router prune
-.PHONY: fetch-cli pull-images install install-systemd uninstall test test-router test-ollama test-agents test-models test-probe-vllm test-probe-sglang test-probe-ollama-idempotent test-vllm test-sglang test-e2e test-full help
+.PHONY: fetch-cli pull-images install install-systemd uninstall test test-router test-ollama test-agents test-models test-probe-vllm test-probe-ollama-idempotent test-vllm test-e2e test-full help
 .PHONY: fetch-vllm-recipes recipe-apply
-.PHONY: catalog-regen catalog-suggest catalog-discover catalog-discover-add probe probe-vllm probe-sglang probe-load-vllm probe-load-vllm-devai probe-load-sglang probe-check probe-ornith-arch model-fit model-pull model-status model-sync vram-fit verify-backend-flags ollama-cleanup-ctx-variants
-.PHONY: bench bench-vllm bench-sglang bench-ollama bench-report bench-harvest test-bench-smoke
+.PHONY: catalog-regen catalog-suggest catalog-discover catalog-discover-add probe probe-vllm probe-load-vllm probe-load-vllm-devai probe-check probe-ornith-arch model-fit model-pull model-status model-sync vram-fit verify-backend-flags ollama-cleanup-ctx-variants
+.PHONY: bench bench-vllm bench-ollama bench-report bench-harvest test-bench-smoke
 .PHONY: test-python build-backup-tool build-devai-tools test-devai-tools
 .PHONY: backup-create backup-list backup-verify backup-restore test-backup-restore
 .PHONY: slurm-tools build-slurm slurm-init slurm-up slurm-down test-slurm
@@ -787,13 +788,6 @@ test-probe-vllm: ## Smoke test: probe one HF model via vLLM, assert cache schema
 	@# containers and aborts otherwise.
 	./tests/test-probe-vllm.sh
 
-test-probe-sglang: ## Smoke test: probe one HF model via SGLang, assert cache schema
-	@# Wall time ~60-120s. Same precondition as test-probe-vllm.
-	@# Notes that the schema is correct even when the model can't load
-	@# (e.g. SGLang+FP4 on this image — the cache records `fits: false`
-	@# with `evidence.kind: "infra"`).
-	./tests/test-probe-sglang.sh
-
 test-probe-ollama-idempotent: cache-up ## Verify the refactored Ollama prober is byte-idempotent on a populated cache
 	@# Phase 1 byte-identical regression check. Runs `make probe` against
 	@# the existing cache (which skips already-cached cells) and diffs
@@ -806,11 +800,6 @@ test-vllm: cache-up ## Live integration tests for the vLLM backend (chat, ctx sw
 	@# pick models — skips cleanly when nothing's cached. See
 	@# tests/test-router-vllm.sh for the test surface.
 	./tests/test-router-vllm.sh
-
-test-sglang: cache-up ## Live integration tests for the SGLang backend (mirror of test-vllm)
-	@# Skips entirely when the SGLang cache has no fitting entries
-	@# (e.g. when SGLang+FP4 fails on this image — see docs/backends.md).
-	./tests/test-router-sglang.sh
 
 test-e2e: cache-up ## End-to-end: picker discovery → agent command → live router chat
 	@# Bridges Phase 7 picker tests and Phase 5 router tests. Imports
@@ -860,7 +849,7 @@ test-agents: ## Smoke-test every (agent × backend) cell against the live router
 		$(IMAGE_NAME_GPU) /usr/local/bin/agent-matrix
 	@echo "  logs preserved at $(CURDIR)/tests/.matrix-logs/"
 
-test: test-router test-devai-tools test-python test-backup-restore test-probe-ollama-idempotent test-ollama test-e2e test-vllm test-sglang test-models ## Run every available test in sequence (Go unit + Python unit + Ollama + E2E + vLLM/SGLang integration + matrix + probes; ~30-60 min)
+test: test-router test-devai-tools test-python test-backup-restore test-probe-ollama-idempotent test-ollama test-e2e test-vllm test-models ## Run every available test in sequence (Go unit + Python unit + Ollama + E2E + vLLM integration + matrix + probes; ~30-60 min)
 	@# The cache-up suite runs as prerequisites above. Probe smoke tests
 	@# require the live backends to be DOWN (the prober self-checks for
 	@# router/vllm/sglang containers and aborts otherwise) — they run
@@ -869,22 +858,20 @@ test: test-router test-devai-tools test-python test-backup-restore test-probe-ol
 	@# captured and re-emitted after `cache-up` so we never leave the
 	@# stack down.
 	@#
-	@# rc=77 is the repo-wide "skipped, precondition absent" convention. Both probe
-	@# smoke tests exit 77 when the model they would probe has no weights on
+	@# rc=77 is the repo-wide "skipped, precondition absent" convention. The probe
+	@# smoke test exits 77 when the model it would probe has no weights on
 	@# disk -- a host data condition, not a failure. Anything else is real.
+	@# (SGLang's smoke test went to attic/sglang/ with its backend, M16.)
 	@set -u; \
 	echo ""; echo "=== Running cache-down probe tests (final phase) ==="; \
 	$(MAKE) cache-down >/dev/null 2>&1 || true; \
-	./tests/test-probe-vllm.sh;   vrc=$$?; \
-	./tests/test-probe-sglang.sh; src=$$?; \
+	./tests/test-probe-vllm.sh; vrc=$$?; \
 	$(MAKE) cache-up >/dev/null 2>&1 || true; \
-	for rc in "$$vrc" "$$src"; do \
-	    if [ "$$rc" -ne 0 ] && [ "$$rc" -ne 77 ]; then \
-	        echo "probe-vllm rc=$$vrc, probe-sglang rc=$$src"; exit 1; \
-	    fi; \
-	done; \
-	if [ "$$vrc" -eq 77 ] || [ "$$src" -eq 77 ]; then \
-	    echo "probe smoke tests: vllm rc=$$vrc, sglang rc=$$src (77 = skipped, no weights on disk)"; \
+	if [ "$$vrc" -ne 0 ] && [ "$$vrc" -ne 77 ]; then \
+	    echo "probe-vllm rc=$$vrc"; exit 1; \
+	fi; \
+	if [ "$$vrc" -eq 77 ]; then \
+	    echo "probe smoke test: vllm rc=$$vrc (77 = skipped, no weights on disk)"; \
 	fi
 
 help: ## Show this help message
@@ -1442,34 +1429,6 @@ probe-vllm-devai: ## Probe every downloaded HF model on the vllm-devai backend (
 	    $(if $(PROBE_CTX_EXACT),--ctx-exact $(PROBE_CTX_EXACT),) \
 	    $(if $(PROBE_LEDGER),--ledger '$(PROBE_LEDGER)',)
 
-probe-sglang: ## Probe every downloaded SGLang/HF model per (VRAM, CONTEXT) cell.
-	@# Pre-condition: same as probe-vllm — all GPU-owning backends down.
-	@# Knobs:
-	@#   PROBE_VRAMS_SGLANG=16G,24G  target VRAM bands
-	@#   PROBE_CONTEXTS=32K,...      ctx tiers
-	@#   PROBE_REPO=<regex>          filter catalog rows by repo
-	@#   PROBE_FORCE=1               re-probe every cell
-	@#   PROBE_FORCE_ARCH=1          re-probe top-level capability/arch
-	@#   PROBE_KV_CACHE_TYPE=fp8_e5m2  enforce a KV dtype for this pass
-	@#                               (default: none = engine default);
-	@#                               cells are stamped so serve time
-	@#                               reproduces the measured dtype
-	@#   PROBE_IGNORE_CURATED_PARSERS=1  card-derived parsers only: skip the
-	@#                               curated block and name heuristic (plan I24);
-	@#                               refused without PROBE_REPO, a scratch --cache
-	@#                               and a scratch --ledger
-	PROBE_KV_CACHE_TYPE="$(PROBE_KV_CACHE_TYPE)" \
-	PROBE_IGNORE_CURATED_PARSERS="$(PROBE_IGNORE_CURATED_PARSERS)" \
-	python3 scripts/probe-sglang-reasoning.py \
-	    --host-vram-gb $(GPU_MEMORY_GB) \
-	    --models-dir $(SGLANG_MODELS_DIR) \
-	    $(if $(PROBE_VRAMS_SGLANG),--vram $(PROBE_VRAMS_SGLANG),) \
-	    $(if $(PROBE_CONTEXTS),--ctx $(PROBE_CONTEXTS),) \
-	    $(if $(PROBE_REPO),--repo '$(PROBE_REPO)',) \
-	    $(if $(PROBE_FORCE),--force,) \
-	    $(if $(PROBE_FORCE_ARCH),--force-arch,) \
-	    $(if $(PROBE_CTX_EXACT),--ctx-exact $(PROBE_CTX_EXACT),)
-
 probe-load-vllm: ## Serving-time LOAD probe for vLLM: augment fit cache with serving_ok/transient/needle, ascending ctx, stop at OOM.
 	@# Layers onto deploy/.vllm-reasoning-cache.json — run `make probe-vllm`
 	@# first so the fit cells exist. Same GPU-exclusivity precondition as
@@ -1512,18 +1471,6 @@ probe-load-vllm-devai: ## Serving-time LOAD probe on the vllm-devai backend (VLL
 	    $(if $(PROBE_MTP),--mtp,) \
 	    $(if $(PROBE_CACHE),--cache '$(PROBE_CACHE)',) \
 	    $(if $(PROBE_LEDGER),--ledger '$(PROBE_LEDGER)',) \
-	    $(if $(PROBE_NEEDLE_DEPTH),--needle-depth $(PROBE_NEEDLE_DEPTH),)
-
-probe-load-sglang: ## Serving-time LOAD probe for SGLang: same as probe-load-vllm against the SGLang cache.
-	@# Layers onto deploy/.sglang-reasoning-cache.json -- run `make probe-sglang`
-	@# first. Same precondition + knobs as probe-load-vllm.
-	PROBE_KV_CACHE_TYPE="$(PROBE_KV_CACHE_TYPE)" \
-	python3 scripts/probe-sglang-reasoning.py --load \
-	    --host-vram-gb $(GPU_MEMORY_GB) \
-	    --models-dir $(SGLANG_MODELS_DIR) \
-	    $(if $(PROBE_CONTEXTS),--ctx $(PROBE_CONTEXTS),) \
-	    $(if $(PROBE_REPO),--repo '$(PROBE_REPO)',) \
-	    $(if $(PROBE_FORCE),--force,) \
 	    $(if $(PROBE_NEEDLE_DEPTH),--needle-depth $(PROBE_NEEDLE_DEPTH),)
 
 model-fit: ## Print which models fit at the chosen (VRAM, CONTEXT) — diagnostic, no writes.
@@ -1628,9 +1575,9 @@ model-sync: ## Closed loop: diff catalog vs probed+excluded, auto download+probe
 	  $(if $(SYNC_MAX_DOWNLOADS),--max-downloads $(SYNC_MAX_DOWNLOADS),) \
 	  $(if $(FAMILY),--family $(FAMILY),)
 
-probe-check: ## Report backend image drift: compare running vLLM/SGLang image digest vs each probe cache's _meta baseline. Exit 1 on drift.
+probe-check: ## Report backend image drift: compare the vLLM and vllm-devai images against each probe cache's _meta baseline. Exit 1 on drift.
 	@CONTAINER_RUNTIME=$(CONTAINER_RUNTIME) \
-	  VLLM_IMAGE="$(VLLM_IMAGE)" SGLANG_IMAGE="$(SGLANG_IMAGE)" \
+	  VLLM_IMAGE="$(VLLM_IMAGE)" \
 	  python3 scripts/probe-check.py
 
 fetch-vllm-recipes: ## Fetch vLLM's official launch recipes (github.com/vllm-project/recipes) for the catalog's HF rows into deploy/recipe-seeds.yaml. Offline-first: cached 12 h, never fails. RECIPES_CACHE=<dir>, OFFLINE=1, REFRESH=1.
@@ -2086,7 +2033,7 @@ BENCH_RUN_FLAGS = \
 	$(if $(BENCH_MTP),--mtp,) \
 	$(if $(BENCH_MAX_CONNECTIONS),--max-connections $(BENCH_MAX_CONNECTIONS),)
 
-bench: bench-vllm bench-sglang bench-ollama ## Bench every probed model on every backend
+bench: bench-vllm bench-ollama ## Bench every probed model on every backend
 	@echo
 	@echo ">>> bench complete; run 'make bench-report' for the leaderboard"
 
@@ -2120,19 +2067,6 @@ bench-vllm-devai: ## Bench every loaded vLLM/HF model via devai-router:11437 (vl
 		--entrypoint python3 \
 		$(IMAGE_NAME_GPU) \
 		/scripts/bench/bench_runner.py --backend vllm-devai \
-			$(BENCH_RUN_FLAGS)
-
-bench-sglang: ## Bench every loaded SGLang model via devai-router:11436
-	@mkdir -p $(CACHE_DIR)/bench/inspect-logs
-	$(CONTAINER_RUNTIME) run --rm \
-		--network $(DEVAI_NETWORK) \
-		$(BENCH_CACHE_MOUNTS) \
-		$(GPU_FLAGS) \
-		-e GPU_MEMORY_GB=$(GPU_MEMORY_GB) \
-		-e HF_TOKEN -e HUGGING_FACE_HUB_TOKEN \
-		--entrypoint python3 \
-		$(IMAGE_NAME_GPU) \
-		/scripts/bench/bench_runner.py --backend sglang \
 			$(BENCH_RUN_FLAGS)
 
 bench-ollama: ## Bench every loaded Ollama model via devai-router:11434

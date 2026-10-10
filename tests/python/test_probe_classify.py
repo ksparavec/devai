@@ -707,8 +707,8 @@ class TestKvCacheDtypeThreading(unittest.TestCase):
     def setUp(self) -> None:
         self.vllm = _load_script("_probe_vllm_under_test",
                                  "probe-vllm-reasoning.py")
-        self.sglang = _load_script("_probe_sglang_under_test",
-                                   "probe-sglang-reasoning.py")
+        # The SGLang prober and its cases went to attic/sglang/ with its
+        # backend (platform-rebuild Phase 15, M16).
 
     def _kv(self, args: list[str]) -> str | None:
         for i, a in enumerate(args):
@@ -724,14 +724,6 @@ class TestKvCacheDtypeThreading(unittest.TestCase):
         args = self.vllm.vllm_command_args("m", 32768, 0.9)
         self.assertEqual(self._kv(args), self.vllm.KV_CACHE_DTYPE)
 
-    def test_sglang_empty_dtype_emits_no_flag(self) -> None:
-        args = self.sglang.sglang_command_args("m", 32768, 0.9, kv_cache_dtype="")
-        self.assertIsNone(self._kv(args))
-
-    def test_sglang_explicit_dtype_emits_flag(self) -> None:
-        args = self.sglang.sglang_command_args(
-            "m", 32768, 0.9, kv_cache_dtype="fp8_e5m2")
-        self.assertEqual(self._kv(args), "fp8_e5m2")
 
 
 if __name__ == "__main__":

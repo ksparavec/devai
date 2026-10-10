@@ -1,0 +1,186 @@
+# Live-file branches cut by platform-rebuild Phase 15 (M16, 2026-10-10).
+# Verbatim where shown; see RESTORE.md for the order to put them back.
+
+=== deploy/docker-compose.yaml: the sglang service, the router's SGLANG_* environment, and the router's two SGLang mounts
+  sglang:
+    image: ${SGLANG_IMAGE:-docker.io/lmsysorg/sglang:v0.5.16-cu130}
+    container_name: devai-sglang
+    hostname: sglang
+    volumes:
+      - /var/cache/devai/sglang:/models:ro
+    entrypoint: ["sleep", "infinity"]
+    devices:
+      - ${DEVAI_GPU_DEVICE:-nvidia.com/gpu=all}
+    security_opt:
+      - label=disable
+    restart: "no"
+
+
+      - SGLANG_URL=http://sglang:11434
+      - SGLANG_PORT=11436
+      - SGLANG_CONTAINER=devai-sglang
+      - SGLANG_IMAGE=${SGLANG_IMAGE:-docker.io/lmsysorg/sglang:v0.5.16-cu130}
+      - SGLANG_MODELS_DIR=/var/cache/devai/sglang
+
+      - ./.sglang-reasoning-cache.json:/etc/devai/.sglang-reasoning-cache.json:ro
+
+      - ${SGLANG_MODELS_DIR:-/var/cache/devai/sglang}:${SGLANG_MODELS_DIR:-/var/cache/devai/sglang}:ro
+
+=== gpu-arbiter/main.go: SGLANG_URL, the probe-cache load, the backend entry, the drift-map entry, the env docs
+	sglangURL, _ := url.Parse(env("SGLANG_URL", "http://devai-sglang:11434"))
+	sglangCachePath := env("SGLANG_PROBE_CACHE", "/etc/devai/.sglang-reasoning-cache.json")
+	cfg.Models = append(cfg.Models,
+		loadHFCache(sglangCachePath, "sglang", hostVRAMGB, operatorMaxCtx, catalogMTP)...)
+
+		{
+			Name:          "sglang",
+			ListenPort:    envInt("SGLANG_PORT", 11436),
+			BackendURL:    sglangURL,
+			ContainerName: env("SGLANG_CONTAINER", "devai-sglang"),
+			Image:         env("SGLANG_IMAGE", "docker.io/lmsysorg/sglang:v0.5.16-cu130"),
+			ModelsDir:     env("SGLANG_MODELS_DIR", "/var/cache/devai/sglang"),
+			Network:       network,
+			HealthPath:    "/health",
+			Entrypoint:    sglangEntrypoint,
+		},
+
+	// probeCachePathByBackend took a third argument and had the entry:
+		"sglang":     sglang,
+//	SGLANG_URL        SGLang backend URL (default http://devai-sglang:11434)
+//	SGLANG_PORT       SGLang listen port (default 11436)
+//	SGLANG_CONTAINER  SGLang container name (default devai-sglang)
+//	SGLANG_IMAGE      SGLang container image
+//	SGLANG_MODELS_DIR host path to SGLang models
+
+=== scripts/model-picker.py: the _BACKENDS entry, and _PICKER_BACKENDS
+    "sglang": ("SGLang", "NVFP4 tensor cores — RadixAttention, multi-turn optimized", 11436),
+_PICKER_BACKENDS: tuple[str, ...] = ("ollama", "vllm", "vllm-devai", "sglang")
+
+=== config/: the router-sglang provider in each agent seed
+--- config/codex/config.toml
+[model_providers.router-sglang]
+name = "SGLang via DevAI router"
+base_url = "http://devai-router:11436/v1"
+
+
+--- config/codex/config.toml
+# define custom providers (`router-ollama`, `router-vllm`, `router-sglang`,
+# `router-vllm-devai`) pointing at the DevAI router on the appropriate port.
+--- config/opencode/opencode.json
+    "router-sglang": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "SGLang via DevAI router",
+      "options": {
+        "baseURL": "http://devai-router:11436/v1",
+        "apiKey": "local"
+      }
+    },
+
+--- config/pi/models.json
+    "router-sglang": {
+      "name": "SGLang via DevAI router",
+      "baseUrl": "http://devai-router:11436/v1",
+      "api": "openai-completions",
+      "apiKey": "local",
+      "models": []
+    },
+
+=== tests/test-router.sh: sglang_curl and Tests 3 and 6
+sglang_curl() {
+    $RUNTIME exec "$EXEC_HOST" curl -sf --max-time "${2:-10}" \
+        -H "Content-Type: application/json" \
+        "http://router:11436$1" ${3:+-d "$3"} 2>&1
+}
+
+# ============================================================================
+info "=== Test 3: SGLang health check (port 11436) ==="
+# ============================================================================
+
+health=$(sglang_curl /health)
+if echo "$health" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['status']=='ok'; assert d['backend']=='sglang'" 2>/dev/null; then
+    pass "SGLang health endpoint returns ok"
+else
+    fail "SGLang health" "$health"
+fi
+
+# ============================================================================
+info "=== Test 6: SGLang /v1/models returns OpenAI list shape ==="
+# ============================================================================
+# The router synthesizes SGLang rows from .sglang-reasoning-cache.json.
+# When the cache has no fitting entries (e.g. SGLang+FP4 fails on this
+# image), `data` is null — which is a VALID empty state, not a router
+# bug. Test passes when the response shape is correct (object: "list");
+# entry count is informational.
+
+models=$(sglang_curl /v1/models)
+if echo "$models" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+assert d.get('object') == 'list', f\"object={d.get('object')!r}\"
+data = d.get('data')
+assert data is None or isinstance(data, list), f'data not list/null: {type(data).__name__}'
+" 2>/dev/null; then
+    count=$(echo "$models" | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('data') or []))")
+    pass "SGLang /v1/models returns $count models (valid OpenAI list shape)"
+else
+    fail "SGLang /v1/models" "$models"
+fi
+
+=== tests: the SGLang prober cases cut from the shared test files
+--- tests/python/test_needle_warning.py (class with setUp loading both probers)
+    def setUp(self):
+        self.v = _load("probe_vllm", "scripts/probe-vllm-reasoning.py")
+        self.s = _load("probe_sglang", "scripts/probe-sglang-reasoning.py")
+
+    def test_vllm_prober_emits_max_num_seqs(self):
+        args = self.v.vllm_command_args("M", 131072, 0.88)
+        self.assertIn("--max-num-seqs", args)
+
+    def test_sglang_prober_emits_max_running_requests(self):
+        args = self.s.sglang_command_args("M", 131072, 0.88)
+        self.assertIn("--max-running-requests", args)
+
+    def test_both_default_to_the_router_admission_limit(self):
+        """MAX_CONCURRENT_REQUESTS defaults to 32 in gpu-arbiter."""
+        self.assertEqual(self.v.MAX_NUM_SEQS, 32)
+        self.assertEqual(self.s.MAX_RUNNING_REQUESTS, 32)
+
+--- tests/python/test_probe_classify.py TestKvCacheDtypeThreading (setUp, SGLang cases)
+        self.vllm = _load_script("_probe_vllm_under_test",
+                                 "probe-vllm-reasoning.py")
+        self.sglang = _load_script("_probe_sglang_under_test",
+                                   "probe-sglang-reasoning.py")
+
+    def test_sglang_empty_dtype_emits_no_flag(self) -> None:
+        args = self.sglang.sglang_command_args("m", 32768, 0.9, kv_cache_dtype="")
+        self.assertIsNone(self._kv(args))
+
+    def test_sglang_explicit_dtype_emits_flag(self) -> None:
+        args = self.sglang.sglang_command_args(
+            "m", 32768, 0.9, kv_cache_dtype="fp8_e5m2")
+        self.assertEqual(self._kv(args), "fp8_e5m2")
+
+--- tests/python/test_probe_scratch_ledger.py LedgerFlagTest
+"probe-sglang-reasoning.py" in the prober loop
+--- gpu-arbiter/flags_allowlist_test.go
+filepath.Join("..", "scripts", "probe-sglang-reasoning.py") in the .4f check
+
+=== scripts/model-sync.py
+_row_backends accepted "sglang"; execute() ran ["make", "probe-sglang"] after probe-vllm.
+
+=== scripts/bench-sync.py
+BACKENDS = ("vllm", "vllm-devai", "sglang", "ollama")
+
+=== scripts/bench/bench_runner.py
+--backend choices=["ollama", "vllm", "sglang", "vllm-devai"]
+
+=== scripts/probe-check.py
+BACKENDS had ("sglang", "deploy/.sglang-reasoning-cache.json", "SGLANG_IMAGE", "docker.io/lmsysorg/sglang:v0.5.16-cu130"),
+and the drift hint printed "make cache-down && make probe-sglang && make probe-load-sglang".
+
+=== scripts/select-models.py
+enforce_sglang_store_gaps now returns before the SGLang gap check (the `return` after the retirements report); remove it.
+
+=== Makefile (outside the frozen targets)
+CACHE_SERVICES and CACHE_BACKEND_SERVICES listed sglang; `bench:` depended on bench-sglang and `test:` on test-sglang; the final probe phase of `test:` also ran ./tests/test-probe-sglang.sh; probe-check passed SGLANG_IMAGE.
+

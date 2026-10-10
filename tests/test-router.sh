@@ -40,12 +40,6 @@ vllm_curl() {
         "http://router:11435$1" ${3:+-d "$3"} 2>&1
 }
 
-sglang_curl() {
-    $RUNTIME exec "$EXEC_HOST" curl -sf --max-time "${2:-10}" \
-        -H "Content-Type: application/json" \
-        "http://router:11436$1" ${3:+-d "$3"} 2>&1
-}
-
 # ============================================================================
 info "=== Test 1: Ollama health check (port 11434) ==="
 # ============================================================================
@@ -68,16 +62,8 @@ else
     fail "vLLM health" "$health"
 fi
 
-# ============================================================================
-info "=== Test 3: SGLang health check (port 11436) ==="
-# ============================================================================
-
-health=$(sglang_curl /health)
-if echo "$health" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['status']=='ok'; assert d['backend']=='sglang'" 2>/dev/null; then
-    pass "SGLang health endpoint returns ok"
-else
-    fail "SGLang health" "$health"
-fi
+# (Test 3, SGLang's health check on port 11436, went to attic/sglang/
+# with its backend: platform-rebuild Phase 15, M16.)
 
 # ============================================================================
 info "=== Test 4: Ollama /v1/models returns only Ollama models ==="
@@ -118,28 +104,7 @@ else
     fail "vLLM /v1/models" "$models"
 fi
 
-# ============================================================================
-info "=== Test 6: SGLang /v1/models returns OpenAI list shape ==="
-# ============================================================================
-# The router synthesizes SGLang rows from .sglang-reasoning-cache.json.
-# When the cache has no fitting entries (e.g. SGLang+FP4 fails on this
-# image), `data` is null — which is a VALID empty state, not a router
-# bug. Test passes when the response shape is correct (object: "list");
-# entry count is informational.
-
-models=$(sglang_curl /v1/models)
-if echo "$models" | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-assert d.get('object') == 'list', f\"object={d.get('object')!r}\"
-data = d.get('data')
-assert data is None or isinstance(data, list), f'data not list/null: {type(data).__name__}'
-" 2>/dev/null; then
-    count=$(echo "$models" | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('data') or []))")
-    pass "SGLang /v1/models returns $count models (valid OpenAI list shape)"
-else
-    fail "SGLang /v1/models" "$models"
-fi
+# (Test 6, SGLang's /v1/models on port 11436, went to attic/sglang/ too.)
 
 # ============================================================================
 info "=== Test 7: Ollama /api/tags ==="

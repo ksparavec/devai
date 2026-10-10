@@ -128,20 +128,16 @@ class ProbeServeConcurrencyParityTest(unittest.TestCase):
 
     def setUp(self):
         self.v = _load("probe_vllm", "scripts/probe-vllm-reasoning.py")
-        self.s = _load("probe_sglang", "scripts/probe-sglang-reasoning.py")
+        # The SGLang prober and its two cases went to attic/sglang/ with its
+        # backend (platform-rebuild Phase 15, M16).
 
     def test_vllm_prober_emits_max_num_seqs(self):
         args = self.v.vllm_command_args("M", 131072, 0.88)
         self.assertIn("--max-num-seqs", args)
 
-    def test_sglang_prober_emits_max_running_requests(self):
-        args = self.s.sglang_command_args("M", 131072, 0.88)
-        self.assertIn("--max-running-requests", args)
-
-    def test_both_default_to_the_router_admission_limit(self):
+    def test_vllm_defaults_to_the_router_admission_limit(self):
         """MAX_CONCURRENT_REQUESTS defaults to 32 in gpu-arbiter."""
         self.assertEqual(self.v.MAX_NUM_SEQS, 32)
-        self.assertEqual(self.s.MAX_RUNNING_REQUESTS, 32)
 
     def test_flag_precedes_parser_flags(self):
         """Recovery flags are appended after, so a per-model override must

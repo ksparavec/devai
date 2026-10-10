@@ -94,7 +94,7 @@ class ArgparserTest(unittest.TestCase):
 
 class WiringTest(unittest.TestCase):
     def test_make_probe_targets_forward_the_knob(self) -> None:
-        for target in ("probe-vllm", "probe-sglang"):
+        for target in ("probe-vllm", "probe-vllm-devai"):   # probe-sglang left with M16
             recipe = MAKEFILE.split(f"\n{target}:", 1)[1].split("\n\n", 1)[0]
             self.assertIn("$(if $(PROBE_CTX_EXACT),--ctx-exact $(PROBE_CTX_EXACT),)", recipe, target)
 

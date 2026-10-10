@@ -284,7 +284,7 @@ class ToolingTest(unittest.TestCase):
 
     def test_picker_lists_it_after_vllm(self) -> None:
         src = (REPO_ROOT / "scripts" / "model-picker.py").read_text()
-        self.assertIn('_PICKER_BACKENDS: tuple[str, ...] = ("ollama", "vllm", "vllm-devai", "sglang")', src)
+        self.assertIn('_PICKER_BACKENDS: tuple[str, ...] = ("ollama", "vllm", "vllm-devai")', src)
         self.assertIn('"vllm-devai": ("vLLM devai"', src)
         self.assertIn("11437", src)
         self.assertRegex(src, r'hf_priority = \{"vllm": 3, "vllm-devai": 2, "sglang": 1\}')
@@ -294,9 +294,13 @@ class ToolingTest(unittest.TestCase):
         self.assertEqual(gc.HF_BACKENDS, ["vllm", "vllm-devai", "sglang"])
 
     def test_makefile_mounts_and_links_the_cache_wherever_the_other_three_are(self) -> None:
-        # bench container mount, `install` placeholder + symlink, `uninstall`
-        self.assertEqual(MAKEFILE.count(".vllm-devai-reasoning-cache.json"),
-                         MAKEFILE.count(".sglang-reasoning-cache.json"),
+        # bench container mount, `install` placeholder + symlink, `uninstall`.
+        # Recipe lines only: SGLang's targets left with Phase 15 (M16) and
+        # took their comments with them, while the sites below stay paired.
+        code = [l for l in MAKEFILE.splitlines() if not l.lstrip().startswith(("#", "@#"))]
+        count = lambda c: sum(l.count(c) for l in code)  # noqa: E731
+        self.assertEqual(count(".vllm-devai-reasoning-cache.json"),
+                         count(".sglang-reasoning-cache.json"),
                          "every Makefile site that names the sglang cache must name this one")
 
     def test_launcher_mounts_its_cache(self) -> None:

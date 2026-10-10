@@ -693,7 +693,7 @@ class ParserOrderTest(unittest.TestCase):
         self.assertIn("ignore_curated = check_ignore_curated(spec, args)", src)
         self.assertIn("recipe_parsers=recipe_parsers, ignore_curated=ignore_curated", src)
         mk = (REPO_ROOT / "Makefile").read_text()
-        for target in ("probe-vllm", "probe-vllm-devai", "probe-sglang"):
+        for target in ("probe-vllm", "probe-vllm-devai"):   # probe-sglang left with M16
             body = re.search(rf"^{re.escape(target)}:.*?(?=^\S)", mk, re.M | re.S).group(0)
             with self.subTest(target=target):
                 self.assertIn('PROBE_IGNORE_CURATED_PARSERS="$(PROBE_IGNORE_CURATED_PARSERS)"', body)

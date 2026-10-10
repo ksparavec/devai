@@ -19,11 +19,8 @@
 //	VLLM_CONTAINER    vLLM container name (default devai-vllm)
 //	VLLM_IMAGE        vLLM container image
 //	VLLM_MODELS_DIR   host path to vLLM models
-//	SGLANG_URL        SGLang backend URL (default http://devai-sglang:11434)
-//	SGLANG_PORT       SGLang listen port (default 11436)
-//	SGLANG_CONTAINER  SGLang container name (default devai-sglang)
-//	SGLANG_IMAGE      SGLang container image
-//	SGLANG_MODELS_DIR host path to SGLang models
+//	(SGLang, port 11436, was frozen by platform-rebuild Phase 15 (M16): its
+//	code below stays, unreachable, and its SGLANG_* variables are not read.)
 //	IDLE_TIMEOUT      seconds before an idle backend is auto-unloaded; 0 = never (default 0, keep-warm)
 //	DRAIN_TIMEOUT     seconds to wait for in-flight requests before stopping (default 30)
 //	HEALTH_TIMEOUT_SECONDS  seconds to wait for a backend to become healthy after launch (default 600)
@@ -1673,7 +1670,6 @@ func buildArbiter() *arbiter {
 	ollamaURL, _ := url.Parse(env("OLLAMA_URL", "http://devai-ollama:11434"))
 	vllmURL, _ := url.Parse(env("VLLM_URL", "http://devai-vllm:11434"))
 	vllmDevaiURL, _ := url.Parse(env("VLLM_DEVAI_URL", "http://devai-vllm-devai:11434"))
-	sglangURL, _ := url.Parse(env("SGLANG_URL", "http://devai-sglang:11434"))
 	socketPath := env("PODMAN_SOCKET", "/run/podman/podman.sock")
 	network := env("NETWORK", "devai-net")
 
@@ -1737,9 +1733,6 @@ func buildArbiter() *arbiter {
 	vllmCachePath := env("VLLM_PROBE_CACHE", "/etc/devai/.vllm-reasoning-cache.json")
 	cfg.Models = append(cfg.Models,
 		loadHFCache(vllmCachePath, "vllm", hostVRAMGB, operatorMaxCtx, catalogMTP)...)
-	sglangCachePath := env("SGLANG_PROBE_CACHE", "/etc/devai/.sglang-reasoning-cache.json")
-	cfg.Models = append(cfg.Models,
-		loadHFCache(sglangCachePath, "sglang", hostVRAMGB, operatorMaxCtx, catalogMTP)...)
 	// The custom vLLM build has its own cache: cells are stamped with the
 	// image they were measured on, and this backend's image is not vllm's.
 	vllmDevaiCachePath := env("VLLM_DEVAI_PROBE_CACHE", "/etc/devai/.vllm-devai-reasoning-cache.json")
@@ -1803,17 +1796,11 @@ func buildArbiter() *arbiter {
 			Entrypoint:    vllmEntrypoint,
 			EnvVars:       map[string]string{"VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1"},
 		},
-		{
-			Name:          "sglang",
-			ListenPort:    envInt("SGLANG_PORT", 11436),
-			BackendURL:    sglangURL,
-			ContainerName: env("SGLANG_CONTAINER", "devai-sglang"),
-			Image:         env("SGLANG_IMAGE", "docker.io/lmsysorg/sglang:v0.5.16-cu130"),
-			ModelsDir:     env("SGLANG_MODELS_DIR", "/var/cache/devai/sglang"),
-			Network:       network,
-			HealthPath:    "/health",
-			Entrypoint:    sglangEntrypoint,
-		},
+		// SGLang (port 11436) was here until platform-rebuild Phase 15
+		// froze it (M16, 2026-10-10: its turn-2+ TTFT on Qwen3.5-9B-NVFP4
+		// was 0.81x vLLM's, short of I16's 0.75). sglangEntrypoint and its
+		// policies stay, unreachable; attic/sglang/RESTORE.md says how to
+		// bring the entry back.
 		// The laya trainer: a job runner, not an inference engine. See
 		// job_runner.go and docs/plans/laya-trainer.md.
 		layaTrainerBackend(network),
@@ -2039,7 +2026,7 @@ func buildArbiter() *arbiter {
 	// moved tag silently invalidates fit/serving/parser data; we serve
 	// anyway but warn (loud log here + X-DevAI-Warning per response + a
 	// /health flag). Ollama (empty Image, no _meta stamp) never goes stale.
-	backendCachePath := probeCachePathByBackend(vllmCachePath, sglangCachePath, vllmDevaiCachePath)
+	backendCachePath := probeCachePathByBackend(vllmCachePath, vllmDevaiCachePath)
 	for _, bc := range backends {
 		probed := readProbedImageDigest(backendCachePath[bc.Name])
 		running := a.imageDigestFromLibpod(bc.Image)
@@ -2430,11 +2417,11 @@ func normalizeImageDigest(digest string, repoDigests []string) string {
 // HF backend's probe cache through. Every backend that has a probe cache
 // must be here: a name that is missing reads back "" and can never be
 // reported stale -- which is how vllm-devai spent its first day with the
-// drift safety net silently off (2026-09-22).
-func probeCachePathByBackend(vllm, sglang, vllmDevai string) map[string]string {
+// drift safety net silently off (2026-09-22). SGLang left it with its
+// backend entry (platform-rebuild Phase 15, M16).
+func probeCachePathByBackend(vllm, vllmDevai string) map[string]string {
 	return map[string]string{
 		"vllm":       vllm,
-		"sglang":     sglang,
 		"vllm-devai": vllmDevai,
 	}
 }

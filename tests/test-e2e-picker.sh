@@ -114,7 +114,7 @@ PY
 if [ -z "$picked_row" ]; then
     info ""
     skip "picker E2E" "no selectable HF rows — the picker would only show Ollama"
-    info "  Run \`make probe-vllm\` or \`make probe-sglang\` against a"
+    info "  Run \`make probe-vllm\` or \`make probe-vllm-devai\` against a"
     info "  downloaded HF model to populate the relevant cache, then rerun."
     echo ""
     echo "========================================"

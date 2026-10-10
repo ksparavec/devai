@@ -1535,7 +1535,9 @@ def _check_router(router_url: str) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--backend", required=True, choices=["ollama", "vllm", "sglang", "vllm-devai"])
+    # SGLang was frozen by platform-rebuild Phase 15 (M16); its tables below
+    # stay, unreachable, for attic/sglang/RESTORE.md.
+    ap.add_argument("--backend", required=True, choices=["ollama", "vllm", "vllm-devai"])
     ap.add_argument(
         "--tasks",
         default=DEFAULT_TASKS,

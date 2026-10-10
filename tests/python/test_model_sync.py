@@ -139,9 +139,9 @@ class TestExecuteAlwaysRestoresTheStack(unittest.TestCase):
     def test_happy_path_order(self) -> None:
         calls, spy = self._spy(lambda cmd: 0)
         self.assertEqual(self._execute(spy), 0)
+        # probe-sglang left with SGLang (platform-rebuild Phase 15, M16).
         self.assertEqual(calls[1:], [["make", "cache-down"],
                                      ["make", "probe-vllm"],
-                                     ["make", "probe-sglang"],
                                      ["make", "cache-up"],
                                      ["make", "probe"]])
 
@@ -150,12 +150,11 @@ class TestExecuteAlwaysRestoresTheStack(unittest.TestCase):
             lambda cmd: 2 if cmd == ["make", "probe-vllm"] else 0)
         self.assertEqual(self._execute(spy), 2)       # original rc preserved
         self.assertIn(["make", "cache-up"], calls)
-        self.assertNotIn(["make", "probe-sglang"], calls)  # aborted at failure
-        self.assertNotIn(["make", "probe"], calls)
+        self.assertNotIn(["make", "probe"], calls)        # aborted at failure
 
     def test_cache_up_runs_when_a_probe_raises(self) -> None:
         def boom(cmd):
-            if cmd == ["make", "probe-sglang"]:
+            if cmd == ["make", "probe-vllm"]:
                 raise RuntimeError("podman vanished")
             return 0
 

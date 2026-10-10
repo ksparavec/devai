@@ -1139,6 +1139,9 @@ def report_sglang_weight_gaps(gaps: list[str], fatal: bool,
 def enforce_sglang_store_gaps(models: list[dict], args) -> None:
     """Report advertised-but-absent SGLang weights; abort when it matters.
 
+    Since platform-rebuild Phase 15 froze SGLang (M16) only the unrecorded-
+    retirements report runs; the SGLang gap check after it is skipped.
+
     The rule, in one sentence: **warn on every run that could be misled by a
     gap, and fail only when the run is about to act on a model that IS in the
     gap.** Concretely:
@@ -1182,6 +1185,11 @@ def enforce_sglang_store_gaps(models: list[dict], args) -> None:
         except Exception:
             pass  # bookkeeping must never break a download run
 
+    # SGLang was frozen by platform-rebuild Phase 15 (M16): no SGLang row is
+    # served or offered any more, so a gap in its store advertises nothing,
+    # and the check below stops here. sglang_weight_gaps and its report stay
+    # for attic/sglang/RESTORE.md.
+    return
     if args.hf_store == "sglang" or args.ignore_store_gaps:
         return
     gaps = sglang_weight_gaps(models, load_hf_probe_caches())

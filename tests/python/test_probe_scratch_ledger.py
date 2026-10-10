@@ -245,8 +245,8 @@ class ScratchLedgerTest(unittest.TestCase):
 class LedgerFlagTest(unittest.TestCase):
     def test_every_prober_accepts_ledger_and_mtp(self) -> None:
         import importlib.util
-        for script in ("probe-vllm-reasoning.py", "probe-vllm-devai-reasoning.py",
-                       "probe-sglang-reasoning.py"):
+        # probe-sglang-reasoning.py went to attic/sglang/ (Phase 15, M16).
+        for script in ("probe-vllm-reasoning.py", "probe-vllm-devai-reasoning.py"):
             with self.subTest(script=script):
                 spec = importlib.util.spec_from_file_location(
                     f"ledger_flag_{script.replace('-', '_')}", REPO_ROOT / "scripts" / script)

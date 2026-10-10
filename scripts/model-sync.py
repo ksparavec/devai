@@ -20,7 +20,7 @@ Execution (composition of existing targets; needs a GPU + podman):
   make model-pull DOWNLOAD_LIMIT=<budget>   # pulls new best-fit, records
                                             # too_big/too_small to the ledger
   make cache-down                           # GPU exclusivity for HF probes
-  make probe-vllm / probe-sglang / probe    # probes new, records
+  make probe-vllm / probe                   # probes new, records
                                             # unsupported_arch, skips excluded
   make cache-up                             # restore serving backends
 
@@ -92,8 +92,9 @@ def is_probed(row: dict, ollama_cache: dict, vllm_cache: dict,
 
 
 def _row_backends(row: dict) -> list[str]:
+    # SGLang left the served backends with platform-rebuild Phase 15 (M16).
     return [b for b in (row.get("backend") or [])
-            if b in ("ollama", "vllm", "vllm-devai", "sglang")]
+            if b in ("ollama", "vllm", "vllm-devai")]
 
 
 def plan_sync(catalog_rows: list[dict], ollama_cache: dict, vllm_cache: dict,
@@ -216,8 +217,7 @@ def execute(plan: dict, *, max_downloads: int) -> int:
     # returns nor raises on the success path.
     rc = 0
     try:
-        for cmd in (["make", "cache-down"], ["make", "probe-vllm"],
-                    ["make", "probe-sglang"]):
+        for cmd in (["make", "cache-down"], ["make", "probe-vllm"]):
             rc = _run(cmd)
             if rc != 0:
                 print(f"\nstep failed (rc={rc}): {' '.join(cmd)}",
