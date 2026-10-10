@@ -4,7 +4,7 @@ _Pull exactly one image from upstream; compile every engine here into one contai
 
 ## Status
 
-Draft (2026-10-05; engines and System One added 2026-10-06). Built since, on branch feat/platform-rebuild: Phases 1, 5 and 21, steps 4v, 16a, 16e and 17a (2026-10-07). Phase 5's live checks (`make test-slurm`) passed on the card on 2026-10-09, 75 of 76; the unkillable-holder check, which needs sudo, is still to be run (`sudo -v`, then `make test-slurm ONLY=holders`).
+Draft (2026-10-05; engines and System One added 2026-10-06). Built since, on branch feat/platform-rebuild: Phases 1, 5 and 21, steps 4v, 16a, 16e and 17a (2026-10-07). Phase 5's live checks (`make test-slurm`) passed on the card: 75 of 76 on 2026-10-09, and the unkillable-holder check, which needs sudo, alone on 2026-10-10 (`make test-slurm ONLY=holders`, 10 of 10).
 
 Plan-level review ends here (operator, 2026-10-06). After four readiness reviews, the last fix round was checked finding by finding and left the small items listed under "Left for implementation" (below Open questions). They are settled in the phase named, and each phase's tests and exit criteria are the check, not a further review of this plan.
 
