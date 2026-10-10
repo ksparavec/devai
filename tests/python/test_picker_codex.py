@@ -277,5 +277,30 @@ class TestSeedsDeclareEveryBackend(unittest.TestCase):
             self.assertEqual(_port(url), str(port), f"{bname}: {url}")
 
 
+
+class TestCodexNotOfferedOnSGLang(unittest.TestCase):
+    """Codex speaks only /v1/responses, which takes no function tools on
+    SGLang, so every Codex turn fails there: the picker never offers the
+    pair (platform-rebuild Phase 15)."""
+
+    def test_agent_menu_of_an_sglang_row_has_no_codex(self) -> None:
+        sglang = [a[0] for a in PICKER._offered_agents("sglang")]
+        self.assertNotIn("codex", sglang)
+        self.assertIn("claude", sglang)
+        for backend in ("ollama", "vllm", "vllm-devai"):
+            self.assertIn("codex", [a[0] for a in PICKER._offered_agents(backend)], backend)
+
+    def test_the_codex_card_lists_no_sglang_row(self) -> None:
+        rows = [{"name": "a", "backend": "sglang"}, {"name": "a", "backend": "vllm"},
+                {"name": "b", "backend": "ollama"}]
+        self.assertEqual([m["backend"] for m in PICKER._models_for_agent(rows, "codex")],
+                         ["vllm", "ollama"])
+        self.assertEqual(PICKER._models_for_agent(rows, "claude"), rows)
+        self.assertEqual(PICKER._models_for_agent(rows, None), rows)
+
+    def test_an_explicit_codex_on_an_sglang_row_goes_back_to_the_list(self) -> None:
+        model = {"name": "a", "backend": "sglang", "capability": ""}
+        self.assertIsNone(PICKER._resolve_agent("codex", model))
+
 if __name__ == "__main__":
     unittest.main()

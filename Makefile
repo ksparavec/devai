@@ -2178,7 +2178,7 @@ bench-harvest: ## (used by bench-sync) Score a task stopped at its deadline from
 		$(IMAGE_NAME_GPU) \
 		/scripts/bench/harvest_truncated.py $(HARVEST_ARGS)
 
-bench-concurrency: ## Sweep concurrency x prefix-sharing for ONE model (MODEL=, PORT=11435|11436|11437); MODE=multiturn takes SALT=, MIN_TOKENS=, METRICS_URL=. The JSON report goes to stdout alone.
+bench-concurrency: ## Sweep concurrency x prefix-sharing for ONE model (MODEL=, PORT=11435|11436|11437); MODE=multiturn takes SALT=, MIN_TOKENS=, METRICS_URL=, SESSIONS= (with ENGINE=). The JSON report goes to stdout alone.
 	@# Deliberately NOT part of `make bench`: this answers a backend
 	@# selection question (does prefix caching pay off here?), not a
 	@# per-model leaderboard question, and it is GPU-exclusive.
@@ -2190,10 +2190,12 @@ bench-concurrency: ## Sweep concurrency x prefix-sharing for ONE model (MODEL=, 
 	@# level of every turn; METRICS_URL=<engine /metrics> records the
 	@# engine's prefix-cache and speculative-decoding counters before and
 	@# after each turn (e.g. http://devai-vllm-devai:11434/metrics).
+	@# SESSIONS=<n> runs n sessions salted <salt>-<ENGINE>-<i> and reports
+	@# each one's turn-2+ median TTFT (Phase 15, I16; 5 turns unless TURNS=).
 	@# The command is not echoed, so `> session.json` captures the report alone
 	@# (progress goes to stderr).
 	@if [ -z "$(MODEL)" ]; then \
-	  echo "usage: make bench-concurrency MODEL=<served-name> [PORT=11436] [MODE=sweep|multiturn] [LEVELS=1,2,4,8,16,32] [TURNS=8] [SALT=..] [MIN_TOKENS=..] [METRICS_URL=..]"; \
+	  echo "usage: make bench-concurrency MODEL=<served-name> [PORT=11436] [MODE=sweep|multiturn] [LEVELS=1,2,4,8,16,32] [TURNS=8] [SALT=..] [MIN_TOKENS=..] [METRICS_URL=..] [SESSIONS=..] [ENGINE=..]"; \
 	  echo "  e.g. make bench-concurrency MODEL=gpt-oss-20b@131072 PORT=11436"; exit 2; fi
 	@$(CONTAINER_RUNTIME) run --rm \
 		--network $(DEVAI_NETWORK) \
@@ -2211,7 +2213,18 @@ bench-concurrency: ## Sweep concurrency x prefix-sharing for ONE model (MODEL=, 
 			$(if $(MAX_TOKENS),--max-tokens $(MAX_TOKENS),) \
 			$(if $(SALT),--salt '$(SALT)',) \
 			$(if $(MIN_TOKENS),--min-tokens $(MIN_TOKENS),) \
-			$(if $(METRICS_URL),--metrics-url '$(METRICS_URL)',)
+			$(if $(METRICS_URL),--metrics-url '$(METRICS_URL)',) \
+			$(if $(SESSIONS),--sessions $(SESSIONS),) \
+			$(if $(ENGINE),--engine '$(ENGINE)',)
+
+KEEP_CHECK_OUT ?= /var/cache/devai/bench/phase15/keep-check-$(shell date -u +%Y%m%dT%H%M%SZ).json
+
+sglang-keep-check: ## Phase 15's one-time SGLang keep-or-freeze measurement (I16): SGLang radix on/off and vllm-devai on Qwen3.5-9B-NVFP4, launched by the check itself. GPU-exclusive: run `make cache-down slurm-down` first. KEEP_CHECK_OUT=<file>, SALT=<nonce>.
+	@# scripts/bench/sglang_keep_check.py; removed again once M16 is
+	@# recorded (platform-rebuild Phase 15, step 4).
+	VLLM_MODELS_DIR=$(VLLM_MODELS_DIR) SGLANG_MODELS_DIR=$(SGLANG_MODELS_DIR) \
+	python3 scripts/bench/sglang_keep_check.py --out '$(KEEP_CHECK_OUT)' \
+	    --host-vram-gb $(GPU_MEMORY_GB) $(if $(SALT),--salt '$(SALT)',)
 
 bench-report: ## Print a Markdown leaderboard from .bench-cache.json
 	@$(CONTAINER_RUNTIME) run --rm \

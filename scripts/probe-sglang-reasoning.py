@@ -59,8 +59,12 @@ def sglang_command_args(
     tool_parser_plugin: str | None = None,
     speculative_config: str | None = None,
     kv_cache_dtype: str | None = None,
+    disable_radix_cache: bool = False,
 ) -> list[str]:
     """Build SGLang launch arguments. Mirrors gpu-arbiter sglangEntrypoint.
+
+    ``disable_radix_cache`` adds ``--disable-radix-cache``: platform-rebuild
+    Phase 15's radix-off arm. The router never emits it.
 
     Parser flags are appended only when the catalog row's
     `parsers.sglang` block supplied a value. Omitting them keeps the
@@ -112,7 +116,12 @@ def sglang_command_args(
         # measured on this fleet. Dropped from BOTH so probe-time and
         # serve-time launches stay identical -- a divergence here silently
         # invalidates every fit verdict.
+        # /metrics is served only with it; Phase 15 reads the cache
+        # counters there. As gpu-arbiter sglangEntrypoint.
+        "--enable-metrics",
     ]
+    if disable_radix_cache:
+        args.append("--disable-radix-cache")
     # KV-cache dtype for THIS launch. SGLang's default is auto (no flag,
     # unquantized); a PROBE_KV_CACHE_TYPE=fp8_e5m2/fp8_e4m3 pass measures
     # quantized-KV fit and stamps the cell so serve time reproduces it.

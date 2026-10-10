@@ -1566,6 +1566,12 @@ func sglangEntrypoint(modelName string, lc launchConfig) []string {
 		// image, so re-adding it is a one-line change if a future bump
 		// regresses -- but carrying a workaround for a fixed bug costs
 		// every launch the graph capture it disables.
+		//
+		// --enable-metrics: SGLang serves /metrics only with it, and
+		// platform-rebuild Phase 15 reads its cache counters
+		// (sglang:cached_tokens_total, sglang:prompt_tokens_total) there.
+		// Must match sglang_command_args in scripts/probe-sglang-reasoning.py.
+		"--enable-metrics",
 	}
 	// Per-model KV dtype from the probe cache. SGLang's legacy cells ran
 	// the engine default (no flag), decoded as "" — emit nothing so those

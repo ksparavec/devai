@@ -3781,14 +3781,37 @@ def _resolve_kv_tier(model: dict) -> tuple[int, bool] | None:
     return (tiers[idx], True)
 
 
-def _offered_agents() -> list[tuple[str, str, str]]:
-    """The agent menu. DeepSeek Harness serves a browser UI on the port that
-    only `make lab-cpu|lab-gpu` publish (DSH_PORT), so it is left out of the
-    menu anywhere else; an explicit `--agent dsh` still reaches its launcher,
-    which says why it cannot start."""
+# (agent, backend) pairs known to fail, with why. Codex speaks only
+# /v1/responses, and SGLang's takes no function tools (`tools[].type` is
+# web_search_preview or code_interpreter), so every Codex turn fails there
+# (platform-rebuild Phase 15).
+_AGENT_BACKEND_FAILS: dict[tuple[str, str], str] = {
+    ("codex", "sglang"): "SGLang's /v1/responses takes no function tools",
+}
+
+
+def _agent_works_on(agent: str, backend: str | None) -> bool:
+    """False for an (agent, backend) pair known to fail."""
+    return (agent, backend or "") not in _AGENT_BACKEND_FAILS
+
+
+def _models_for_agent(models: list[dict], agent: str | None) -> list[dict]:
+    """The model rows a picker run for ``agent`` (``--agent``) may offer."""
+    if not agent:
+        return models
+    return [m for m in models if _agent_works_on(agent, m.get("backend"))]
+
+
+def _offered_agents(backend: str | None = None) -> list[tuple[str, str, str]]:
+    """The agent menu for a row on ``backend``. DeepSeek Harness serves a
+    browser UI on the port that only `make lab-cpu|lab-gpu` publish
+    (DSH_PORT), so it is left out of the menu anywhere else; an explicit
+    `--agent dsh` still reaches its launcher, which says why it cannot
+    start. An agent known to fail on the backend is left out too."""
+    agents = [a for a in _AGENTS if _agent_works_on(a[0], backend)]
     if os.environ.get("DSH_PORT"):
-        return list(_AGENTS)
-    return [a for a in _AGENTS if a[0] != "dsh"]
+        return agents
+    return [a for a in agents if a[0] != "dsh"]
 
 
 def _resolve_agent(agent_filter: str | None, model: dict) -> tuple[str, str, str] | None:
@@ -3837,11 +3860,14 @@ def _resolve_agent(agent_filter: str | None, model: dict) -> tuple[str, str, str
                 f"error: unknown agent '{agent_filter}' "
                 f"(known: {', '.join(a[0] for a in _AGENTS)})"
             )
+        if not _agent_works_on(agent[0], model.get("backend")):
+            # main() already leaves such rows out of the list.
+            return None
         if not _apply_aiagent_gpu(agent[0]):
             return None
         return (agent[0], reasoning_mode, mtp_mode)
 
-    offered = _offered_agents()
+    offered = _offered_agents(model.get("backend"))
     alines = [_format_agent_row(a) for a in offered]
     mode_notes = []
     if reasoning_mode == "nothink":
@@ -4048,7 +4074,7 @@ def main() -> None:
         os.execvp("gemini", ["gemini"])
 
     _check_cache_visible()
-    models = _discover_models()
+    models = _models_for_agent(_discover_models(), agent_filter)
     if not models:
         sys.exit(
             "error: no downloaded models found on disk.\n"

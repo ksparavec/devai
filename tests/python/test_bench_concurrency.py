@@ -513,5 +513,118 @@ class TestMultiturnSaltMinTokensCounters(unittest.TestCase):
         self.assertNotEqual(cm.exception.code, 0)
 
 
+class TestPhase15Sessions(unittest.TestCase):
+    """Phase 15 (I16): body_fields at the top level, salted independent
+    sessions, per-session turn-2+ medians, failed sessions, and SGLang's
+    pooled hit rate over turns 2..N from settled counter reads."""
+
+    _SGLANG = ('sglang:prompt_tokens_total{{model_name="m"}} {prompt}\n'
+               'sglang:cached_tokens_total{{model_name="m",cache_source="device"}} {cached}\n')
+
+    def setUp(self) -> None:
+        self._orig = (B._one_request, B.stream_chat_completion, B._fetch_text, B.SETTLE_PAUSE_S)
+        B.SETTLE_PAUSE_S = 0.0
+        self.warmup_bodies: list[dict] = []
+        self.bodies: list[dict] = []
+        self.fail_turn: set[int] = set()
+        self.tokenless_turn: set[int] = set()
+
+        def fake_one(u, m, p, mt, ts, body_fields=None):
+            self.warmup_bodies.append(body_fields)
+            return {"ok": True, "capped": False, "ttft_ms": 1.0, "tokens": 1, "wall_s": 0.01}
+        B._one_request = fake_one
+
+        def fake_stream(url, body, timeout=600.0):
+            self.bodies.append(body)
+            n = len(self.bodies)                 # 1-based call index
+            if n in self.fail_turn:
+                raise OSError("engine gone")
+            first = None if n in self.tokenless_turn else 0.1 * n
+            return {"content": "ok", "t_open": 0.0, "t_first_token": first, "t_done": 1.0,
+                    "effective_tokens": 0 if first is None else 64,
+                    "completion_tokens": 0 if first is None else 64, "token_source": "usage"}
+        B.stream_chat_completion = fake_stream
+
+        # Counters follow the turns already answered: each turn prompts
+        # 1000 tokens and every turn after a session's first finds 800 cached.
+        def fetch(url, timeout_s):
+            n = len(self.bodies)
+            per_session = 5
+            done_in_session = (n - 1) % per_session + 1 if n else 0
+            sessions_before = (n - 1) // per_session if n else 0
+            cached = 800 * (sessions_before * (per_session - 1) + max(0, done_in_session - 1))
+            return self._SGLANG.format(prompt=1000 * n, cached=cached)
+        B._fetch_text = fetch
+
+    def tearDown(self) -> None:
+        B._one_request, B.stream_chat_completion, B._fetch_text, B.SETTLE_PAUSE_S = self._orig
+
+    def test_body_fields_go_top_level_into_the_warm_up_and_every_turn(self) -> None:
+        fields = {"chat_template_kwargs": {"enable_thinking": False}, "top_p": 1.0}
+        B.run_multiturn("m", "u", turns=3, prefix_tokens=64, growth_tokens=64, body_fields=fields)
+        self.assertEqual(self.warmup_bodies, [fields])
+        self.assertEqual(len(self.bodies), 3)
+        for b in self.bodies:
+            self.assertEqual(b["chat_template_kwargs"], {"enable_thinking": False})
+            self.assertEqual(b["top_p"], 1.0)
+            self.assertNotIn("extra_body", b)
+
+    def test_without_body_fields_the_warm_up_call_is_unchanged(self) -> None:
+        B.run_multiturn("m", "u", turns=1, prefix_tokens=64)
+        self.assertEqual(self.warmup_bodies, [None])
+        self.assertNotIn("chat_template_kwargs", self.bodies[0])
+
+    def test_body_fields_may_not_replace_the_request_itself(self) -> None:
+        with self.assertRaises(ValueError):
+            B._merge_body({"model": "m"}, {"messages": []})
+
+    def test_sessions_are_salted_and_summarised(self) -> None:
+        out = B.run_multiturn_sessions("m", "u", sessions=2, engine="sglang", salt="n0nce",
+                                       prefix_tokens=64, growth_tokens=64,
+                                       metrics_url="http://e/metrics")
+        self.assertEqual([x["salt"] for x in out["sessions"]], ["n0nce-sglang-0", "n0nce-sglang-1"])
+        self.assertTrue(self.bodies[0]["messages"][0]["content"].startswith("# session n0nce-sglang-0\n"))
+        s0, s1 = out["sessions"]
+        # TTFT 100..500 ms on session 0's turns, 600..1000 on session 1's.
+        self.assertEqual(s0["turn_ttft_ms"], [100.0, 200.0, 300.0, 400.0, 500.0])
+        self.assertEqual(s0["turn2plus_median_ms"], 350.0)
+        self.assertEqual(s1["turn2plus_median_ms"], 850.0)
+        self.assertEqual(out["turn2plus_median_ms"], 600.0)
+        # Turns 2-5: 4 x 1000 prompted, 4 x 800 cached, in each session.
+        self.assertEqual(s0["sglang_hit_rate_turn2plus"], 0.8)
+        self.assertEqual(out["sglang_hit_rate_pooled"], 0.8)
+        self.assertEqual(out["n_failed"], 0)
+
+    def test_a_dry_run_has_its_own_salts(self) -> None:
+        out = B.run_multiturn_sessions("m", "u", sessions=2, engine="sglang", salt="n0nce",
+                                       dry=True, prefix_tokens=64, growth_tokens=64)
+        self.assertEqual([x["salt"] for x in out["sessions"]],
+                         ["n0nce-dry-sglang-0", "n0nce-dry-sglang-1"])
+
+    def test_a_failed_turn_fails_its_session_without_a_shorter_median(self) -> None:
+        self.fail_turn = {4}
+        out = B.run_multiturn_sessions("m", "u", sessions=1, engine="vllm", salt="x",
+                                       prefix_tokens=64, growth_tokens=64)
+        s = out["sessions"][0]
+        self.assertTrue(s["failed"])
+        self.assertIsNone(s["turn2plus_median_ms"])
+        self.assertEqual(out["n_failed"], 1)
+        self.assertIsNone(out["turn2plus_median_ms"])
+
+    def test_a_tokenless_turn_fails_its_session(self) -> None:
+        self.tokenless_turn = {2}
+        out = B.run_multiturn_sessions("m", "u", sessions=1, engine="vllm", salt="x",
+                                       prefix_tokens=64, growth_tokens=64)
+        self.assertTrue(out["sessions"][0]["failed"])
+        self.assertIn("turn 2: no token streamed", out["sessions"][0]["problems"])
+
+    def test_settled_reads_wait_until_two_reads_agree(self) -> None:
+        seq = iter([10, 20, 30, 30])
+        B._fetch_text = lambda url, t: self._SGLANG.format(prompt=next(seq), cached=0)
+        counters, err = B._read_counters_settled("http://e/metrics")
+        self.assertIsNone(err)
+        self.assertEqual(counters["sglang:prompt_tokens_total"], 30.0)
+
+
 if __name__ == "__main__":
     unittest.main()

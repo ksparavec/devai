@@ -99,6 +99,13 @@ sglang:
   # fails the gate instead of silently dropping quantized-KV support.
   kv_cache_dtype:       "--kv-cache-dtype"
   trust_remote_code:    "--trust-remote-code"
+  # /metrics (sglang:cached_tokens_total, sglang:prompt_tokens_total) is
+  # served only with it; the router and the prober emit it on every launch
+  # (platform-rebuild Phase 15).
+  enable_metrics:       "--enable-metrics"
+  # Phase 15's radix-off arm only (sglang_command_args disable_radix_cache);
+  # the router never emits it.
+  disable_radix_cache:  "--disable-radix-cache"
   tool_call_parser:     "--tool-call-parser"
   reasoning_parser:     "--reasoning-parser"
   # disable_piecewise_cuda_graph was pinned here while the router and

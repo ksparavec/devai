@@ -372,7 +372,8 @@
   "0.9000",
   "--context-length",
   "32768",
-  "--trust-remote-code"
+  "--trust-remote-code",
+  "--enable-metrics"
 ]
 
 == sglang / typical-nvfp4-128k
@@ -395,6 +396,7 @@
   "--context-length",
   "131072",
   "--trust-remote-code",
+  "--enable-metrics",
   "--max-running-requests",
   "32",
   "--reasoning-parser",
@@ -423,6 +425,7 @@
   "--context-length",
   "262144",
   "--trust-remote-code",
+  "--enable-metrics",
   "--max-running-requests",
   "32",
   "--tool-call-parser",
@@ -449,6 +452,7 @@
   "--context-length",
   "131072",
   "--trust-remote-code",
+  "--enable-metrics",
   "--kv-cache-dtype",
   "fp8",
   "--max-running-requests",
@@ -476,7 +480,8 @@
   "0.9000",
   "--context-length",
   "65536",
-  "--trust-remote-code"
+  "--trust-remote-code",
+  "--enable-metrics"
 ]
 
 == sglang / ollama-q8-kv
@@ -499,6 +504,7 @@
   "--context-length",
   "131072",
   "--trust-remote-code",
+  "--enable-metrics",
   "--kv-cache-dtype",
   "q8_0"
 ]
@@ -522,7 +528,8 @@
   "0.9000",
   "--context-length",
   "32768",
-  "--trust-remote-code"
+  "--trust-remote-code",
+  "--enable-metrics"
 ]
 
 == sglang / recovery-flags-last
@@ -545,6 +552,7 @@
   "--context-length",
   "32768",
   "--trust-remote-code",
+  "--enable-metrics",
   "--max-running-requests",
   "32",
   "--reasoning-parser",
@@ -572,6 +580,7 @@
   "--context-length",
   "118784",
   "--trust-remote-code",
+  "--enable-metrics",
   "--max-running-requests",
   "32",
   "--reasoning-parser",
@@ -601,6 +610,7 @@
   "--context-length",
   "131072",
   "--trust-remote-code",
+  "--enable-metrics",
   "--max-running-requests",
   "32",
   "--reasoning-parser",
