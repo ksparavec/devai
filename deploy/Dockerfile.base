@@ -1,8 +1,11 @@
 # Layer 1: System packages + runtimes (build once)
-# CPU:  podman build -f Dockerfile.base -t devai-base .
-# GPU:  podman build -f Dockerfile.base --build-arg BASE_IMAGE=docker.io/nvidia/cuda:12.9.1-cudnn-runtime-ubuntu24.04 -t devai-base-gpu .
+# CPU:  make build-base-cpu  (BASE_IMAGE = the Makefile's DEBIAN_IMAGE, the
+#       pinned trixie-slim below; it was the unpinned debian:trixie until
+#       platform-rebuild Phase 2, M13)
+# GPU:  make build-base-gpu  (BASE_IMAGE = GPU_BASE_IMAGE, the CUDA image,
+#       until Phase 3 puts the lab on Debian too)
 
-ARG BASE_IMAGE=debian:trixie
+ARG BASE_IMAGE=docker.io/library/debian:trixie-slim@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd
 FROM ${BASE_IMAGE}
 
 ARG HTTP_PROXY

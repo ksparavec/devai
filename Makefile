@@ -110,7 +110,7 @@ CACHE_COMPOSE = $(CURDIR)/deploy/docker-compose.yaml
 # explicitly because cache-up must name them one by one -- see the
 # router-managed-container note in that target. Keep in sync with
 # deploy/docker-compose.yaml; `make cache-services-check` asserts it.
-CACHE_SERVICES = apt-cache registry-cache ollama vllm vllm-devai laya-trainer router \
+CACHE_SERVICES = apt-cache ollama vllm vllm-devai laya-trainer router \
                  logger pipelock
 
 # The four the router recreates on demand (SGLang, the fifth, was frozen
@@ -175,7 +175,7 @@ PROXY_RUN_ENV = \
 # Egress-lock env for the interactive lab/shell targets: force ALL egress
 # through the pipelock MITM proxy; internal hosts (router, caches) bypass it.
 PIPELOCK_PROXY = http://devai-pipelock:8888
-PIPELOCK_NO_PROXY = devai-router,router,apt-cache,registry-cache,ollama,localhost,127.0.0.1,::1
+PIPELOCK_NO_PROXY = devai-router,router,ollama,localhost,127.0.0.1,::1
 EGRESS_PROXY_ENV = \
 	-e HTTP_PROXY=$(PIPELOCK_PROXY) \
 	-e HTTPS_PROXY=$(PIPELOCK_PROXY) \
@@ -189,6 +189,19 @@ EGRESS_PROXY_ENV = \
 # (?= only assigns when unset). NVIDIA only: the AMD/ROCm branch moved to
 # attic/amd-rocm/ on 2026-10-07 (platform-rebuild Phase 1, M11).
 GPU_BASE_IMAGE ?= docker.io/nvidia/cuda:12.9.1-cudnn-runtime-ubuntu24.04
+
+# The one Debian image devai pulls, pinned by digest (M1, M13), passed as
+# BASE_IMAGE to every build of an image on Debian (platform-rebuild Phase 2);
+# each Dockerfile's default is the same reference, and
+# tests/python/test_upstream_images.py holds them together. Bumping it is a
+# deliberate edit of all of them, followed by a rebuild of every image.
+# The digest is Docker Hub's index digest of one of Debian's dated tags
+# (here trixie-20260713-slim; those tags stay published), read from the
+# registry, NOT from `podman images --digests`: the image pulled on
+# 2026-07-13 through the old registry mirror carries a manifest digest
+# Docker Hub never served (same image, config 2a96bd19), and the pin made
+# from it could not be pulled anywhere else.
+DEBIAN_IMAGE = docker.io/library/debian:trixie-slim@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd
 
 # Mount host config files (gitconfig, ssh) to staging dir for entrypoint to copy
 HOME_MOUNT_ARG =
@@ -258,6 +271,7 @@ endif
 # Compose settings
 
 .PHONY: all build build-cpu build-gpu build-base-cpu build-base-gpu build-router
+.PHONY: build-apt-cache build-pipelock build-pipelock-dist build-pipelock-image pipelock-ca-init
 .PHONY: build-laya-trainer test-laya-trainer laya-trainer-lock lab-lock laya-check
 .PHONY: vllm-lock
 .PHONY: lab-cpu lab-gpu shell-cpu shell-gpu
@@ -457,8 +471,12 @@ fetch-cli: ## Download all external binaries and packages to local cache (uses E
 			&& chmod +x $(CACHE_DIR)/pip/bin/dstui-install.sh && STATE="updated"; fi \
 		&& echo "dstui: $$STATE ($$DSTUI_VERSION)"
 
-# Base images used by build and infrastructure
-BASE_IMAGES = debian:trixie $(GPU_BASE_IMAGE)
+# The images devai pulls: the pinned Debian image, and the upstream images
+# later phases replace (tests/python/test_upstream_images.py, the
+# transitional allowlist): the CUDA base until Phase 3, here and through
+# compose the stock vLLM image (Phase 4) and the logger's podman image
+# (Phase 6). Everything else is built here.
+BASE_IMAGES = $(DEBIAN_IMAGE) $(GPU_BASE_IMAGE)
 # Home-built images are excluded from pulls: `devai-` (localhost/devai-ollama,
 # devai-router) and `devai/` (docker.io/devai/vllm-devai, tagged with a
 # registry name but present only locally -- a pull would fail three times
@@ -469,7 +487,7 @@ CACHE_IMAGES = $(shell DEVAI_REPO=$(DEVAI_REPO) $(COMPOSE) -f $(CACHE_COMPOSE) c
 # Seconds between pull-images retry attempts (the attempt COUNT is fixed at 3).
 PULL_RETRY_DELAY ?= 5
 
-pull-images: ## Pull latest versions of all base and infrastructure images. IMAGES="a b" limits the run. Each pull is tried 3 times; an image that still fails aborts with a non-zero exit.
+pull-images: ## Pull the pinned Debian image and the upstream images not yet built here (the transitional allowlist). IMAGES="a b" limits the run. Each pull is tried 3 times; an image that still fails aborts with a non-zero exit.
 	@# Failures are ERRORS. This used to end in `|| true`, so a pull that never
 	@# happened was indistinguishable from one that did and make exited 0.
 	@# Bail out at the first image that fails all 3 attempts -- never carry on
@@ -489,11 +507,12 @@ pull-images: ## Pull latest versions of all base and infrastructure images. IMAG
 		done; \
 	 done
 
-build-base-cpu: ## Build base image with system packages and runtimes (CPU)
+build-base-cpu: ## Build base image with system packages and runtimes (CPU) on the pinned DEBIAN_IMAGE
 	$(CONTAINER_RUNTIME) build --network=host \
 		$(PROXY_BUILD_ARGS) \
 		$(APT_PROXY_ARG) \
 		$(PYTHON_VERSION_ARG) \
+		--build-arg BASE_IMAGE=$(DEBIAN_IMAGE) \
 		-f deploy/Dockerfile.base \
 		-t $(BASE_IMAGE_NAME) .
 
@@ -506,7 +525,7 @@ build-base-gpu: ## Build base image with system packages and runtimes (GPU)
 		-f deploy/Dockerfile.base \
 		-t $(BASE_IMAGE_NAME_GPU) .
 
-build: build-cpu build-gpu build-router ## Build all images (CPU + GPU + router)
+build: build-cpu build-gpu build-router build-apt-cache build-pipelock ## Build all images (CPU + GPU + router + apt-cache + pipelock)
 
 build-cpu: build-base-cpu fetch-cli ## Build the container image (CPU)
 	@[ -f deploy/pipelock-ca.crt ] || { echo "ERROR: deploy/pipelock-ca.crt missing -- run 'make pipelock-ca-init' first (the lab image bakes the pipelock CA into its trust store)."; exit 1; }
@@ -694,11 +713,6 @@ test-backup-restore: test-devai-tools ## devai-tools Go tests + tests/test-backu
 # build-slurm slurm-up.
 # =============================================================================
 
-# The one Debian image devai pulls, pinned by digest (M1, M13). Phase 2 step 1
-# passes this same variable as BASE_IMAGE to every build; until then
-# build-slurm is its only user. Bumping it is a deliberate edit followed by
-# a rebuild of every image that uses it.
-DEBIAN_IMAGE = docker.io/library/debian:trixie-slim@sha256:277da9fa1353e0e06028a9ad1b744fd1e92201a396949ecad4034d1cce20c246
 SLURM_IMAGE ?= localhost/devai-slurm:latest
 # Static devai-tools binaries for the images (devai-bus, devai-jobs,
 # devai-control), built with the host's Go and bind-mounted into the build,
@@ -748,10 +762,11 @@ test-slurm: slurm-tools ## Live Phase 5 checks: devai-slurm and two devai-contro
 pipelock-logs: ## Tail the pipelock egress-proxy log
 	$(CONTAINER_RUNTIME) logs -f devai-pipelock
 
-pipelock-ca-init: ## One-time: generate the pipelock MITM CA. Cert -> deploy/ (commit); key -> host (0600).
+pipelock-ca-init: ## One-time: generate the pipelock MITM CA. Cert -> deploy/ (commit); key -> host (0600). Needs make build-pipelock.
+	@$(CONTAINER_RUNTIME) image exists localhost/devai-pipelock:latest || { echo "error: no image localhost/devai-pipelock:latest -- run 'make build-pipelock' first" >&2; exit 1; }
 	@mkdir -p "$$(dirname $(PIPELOCK_CA_KEY))"; \
 	tmp=$$(mktemp -d); \
-	$(CONTAINER_RUNTIME) run --rm -v "$$tmp:/out:z" ghcr.io/luckypipewrench/pipelock:latest \
+	$(CONTAINER_RUNTIME) run --rm -v "$$tmp:/out:z" localhost/devai-pipelock:latest \
 	    tls init --out /out --org "devai-pipelock" >/dev/null; \
 	if [ ! -f "$$tmp/ca.pem" ] || [ ! -f "$$tmp/ca-key.pem" ]; then \
 	    echo "ERROR: pipelock tls init did not produce a CA." >&2; rm -rf "$$tmp"; exit 1; \
@@ -961,6 +976,13 @@ cache-up: ## Start all infrastructure (caches + Ollama + router; vLLM/SGLang as 
 	@# names every non-profile service, so nothing needed goes unstarted --
 	@# and `make cache-services-check`'s test asserts that list stays in
 	@# sync with the compose file.
+	@# The always-on images are built here (platform-rebuild Phase 2); compose
+	@# would try to PULL a missing localhost/ image and fail obscurely.
+	@for i in localhost/devai-apt-cache:latest=build-apt-cache localhost/devai-pipelock:latest=build-pipelock \
+	          localhost/devai-router:latest=build-router $(OLLAMA_IMAGE)=build-ollama; do \
+	  $(CONTAINER_RUNTIME) image exists $${i%=*} \
+	    || { echo "error: no image $${i%=*} -- run 'make $${i##*=}' first" >&2; exit 1; }; \
+	done
 	@key=$(PIPELOCK_CA_KEY); [ -f "$$key" ] || key=/dev/null; \
 	  if [ "$$key" = /dev/null ]; then echo "NOTE: pipelock CA key not found ($(PIPELOCK_CA_KEY)); devai-pipelock stays unhealthy until 'make pipelock-ca-init'."; fi; \
 	  svcs=""; \
@@ -980,7 +1002,6 @@ cache-up: ## Start all infrastructure (caches + Ollama + router; vLLM/SGLang as 
 	  PIPELOCK_CA_KEY_FILE=$$key $(COMPOSE) -f $(CACHE_COMPOSE) up -d --no-deps $$svcs
 	@echo "Infrastructure services started:"
 	@echo "  apt-cacher-ng:     http://localhost:3142"
-	@echo "  Registry mirror:   http://localhost:5000"
 	@echo "  Router:            devai-router:11434 (unified endpoint)"
 	@echo "  Ollama:            devai-ollama:11434 (GGUF models)"
 	@echo "  vLLM/vllm-devai:   devai-router:11435 / 11437 (recreated on first request — see docs/backends.md)"
@@ -1098,10 +1119,11 @@ cache-status: ## Show infrastructure service status and disk usage
 cache-clean: ## Remove all cached data (keeps volumes mounted, preserves podman graphroot)
 	$(COMPOSE) -f $(CACHE_COMPOSE) down
 	@echo "Cleaning cache directories..."
-	@# $(CACHE_DIR)/registry co-hosts podman's graphroot AND the registry:2 pull-through cache
-	@# (see README "Storage Layout"). Wiping registry/* would destroy podman image storage,
-	@# so we target only the registry:2 subtree (registry/docker) and guard every path
-	@# against overlap with the container runtime's graphroot.
+	@# $(CACHE_DIR)/registry co-hosts podman's graphroot AND what is left of the registry:2
+	@# pull-through cache (removed by platform-rebuild Phase 2; see README "Storage Layout").
+	@# Wiping registry/* would destroy podman image storage, so we target only the
+	@# registry:2 subtree (registry/docker) and guard every path against overlap with the
+	@# container runtime's graphroot.
 	@# Container-managed caches (apt-cacher-ng, registry:2) contain files owned by
 	@# subuids, so the cleanup runs under `podman unshare` to access them.
 	@graphroot=$$($(CONTAINER_RUNTIME) info --format '{{.Store.GraphRoot}}' 2>/dev/null \
@@ -1737,10 +1759,39 @@ laya-check: ## GPU-exclusive, evicts the teacher ~3 min: run the reference laya 
 	  $(if $(TEACHER_PORT),--teacher-port $(TEACHER_PORT),) \
 	  $(if $(KEEP_RUN),--keep-run,)
 
-build-router: ## Build the gpu-arbiter router image
+build-router: ## Build the gpu-arbiter router image: a static binary from the host's Go, in FROM scratch
+	cd gpu-arbiter && CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o gpu-arbiter .
 	$(CONTAINER_RUNTIME) build --network=host \
 		-f deploy/Dockerfile.router \
 		-t devai-router .
+
+build-apt-cache: ## Build the devai-apt-cache image (Debian's apt-cacher-ng on the pinned DEBIAN_IMAGE)
+	$(CONTAINER_RUNTIME) build --network=host \
+		$(PROXY_BUILD_ARGS) \
+		$(APT_PROXY_ARG) \
+		--build-arg BASE_IMAGE=$(DEBIAN_IMAGE) \
+		-f deploy/Dockerfile.apt-cache \
+		-t devai-apt-cache .
+
+# Where scripts/build-pipelock.sh leaves the binary. NOT under $(CACHE_DIR),
+# for the same reason as OLLAMA_DIST.
+PIPELOCK_DIST ?= $(HOME)/.cache/devai/pipelock-build/dist
+
+build-pipelock: build-pipelock-dist build-pipelock-image ## Compile pipelock from source on the host, then build the devai-pipelock image from it
+
+build-pipelock-dist: ## Compile pipelock v3.0.0 (commit 9d2e37d) FROM SOURCE with the host's Go; see scripts/build-pipelock.sh
+	bash scripts/build-pipelock.sh
+
+build-pipelock-image: ## Build the devai-pipelock image (the pinned DEBIAN_IMAGE + its CA bundle + the host-built pipelock)
+	@test -x $(PIPELOCK_DIST)/pipelock || { echo "error: no build at $(PIPELOCK_DIST) -- run 'make build-pipelock-dist' first" >&2; exit 1; }
+	$(CONTAINER_RUNTIME) build --network=host \
+		$(PROXY_BUILD_ARGS) \
+		$(APT_PROXY_ARG) \
+		--build-arg BASE_IMAGE=$(DEBIAN_IMAGE) \
+		--build-arg DIST_ID=$$(sha256sum $(PIPELOCK_DIST)/pipelock | cut -c1-16) \
+		-v $(PIPELOCK_DIST):/var/cache/pipelock-dist:ro \
+		-f deploy/Dockerfile.pipelock \
+		-t devai-pipelock .
 
 # Where scripts/build-ollama.sh leaves the compiled tree. NOT under
 # $(CACHE_DIR): a new top-level directory there is not volume-backed.
@@ -1756,6 +1807,7 @@ build-ollama-image: ## Build the devai-ollama image (debian:trixie-slim + the ho
 	$(CONTAINER_RUNTIME) build --network=host \
 		$(PROXY_BUILD_ARGS) \
 		$(APT_PROXY_ARG) \
+		--build-arg BASE_IMAGE=$(DEBIAN_IMAGE) \
 		--build-arg DIST_ID=$$(cat $(OLLAMA_DIST)/bin/ollama $(OLLAMA_DIST)/lib/ollama/cuda_v13/libggml-cuda.so | sha256sum | cut -c1-16) \
 		-v $(OLLAMA_DIST):/var/cache/ollama-dist:ro \
 		-f deploy/Dockerfile.ollama \
@@ -1798,6 +1850,7 @@ build-vllm-image: ## Build the devai-vllm image (debian:trixie-slim + the host-c
 	$(CONTAINER_RUNTIME) build --network=host \
 		$(PROXY_BUILD_ARGS) \
 		$(APT_PROXY_ARG) \
+		--build-arg BASE_IMAGE=$(DEBIAN_IMAGE) \
 		--build-arg DIST_ID=$$(cat $(VLLM_DIST)/wheels/vllm-*.whl $(VLLM_DIST)/PATCHES.applied $(VLLM_DIST)/requirements.txt | sha256sum | cut -c1-16) \
 		-v $(VLLM_DIST):/var/cache/vllm-dist:ro \
 		-v $(VLLM_CUDA_HOME):/var/cache/cuda-toolkit:ro \
@@ -1914,7 +1967,8 @@ install-systemd: ## Install and enable systemd service for infrastructure
 	@# Symlink mutable / shared assets from the repo. ln -sfn updates a
 	@# pre-existing symlink in place and refuses to clobber a real file
 	@# (which the old recipe would leave behind on re-runs).
-	ln -sfn $(CURDIR)/deploy/registry-config.yaml          $(HOME)/.config/devai/registry-config.yaml
+	@# The registry mirror's config, staged by installs before platform-rebuild Phase 2.
+	rm -f $(HOME)/.config/devai/registry-config.yaml
 	ln -sfn $(CURDIR)/deploy/logging.sh                    $(HOME)/.config/devai/logging.sh
 	ln -sfn $(CURDIR)/deploy/vllm-plugins.json             $(HOME)/.config/devai/vllm-plugins.json
 	@# models.yaml is mounted by the router service (MTP launch params).

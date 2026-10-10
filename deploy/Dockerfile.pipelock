@@ -1,0 +1,39 @@
+# devai-pipelock: the lab's egress proxy (docs/pipelock.md), a pipelock
+# COMPILED ON THE HOST by scripts/build-pipelock.sh, on debian:trixie-slim
+# (platform-rebuild Phase 2). Replaces ghcr.io/luckypipewrench/pipelock:latest.
+#
+# Build: make build-pipelock (= build-pipelock-dist + build-pipelock-image).
+# The host build is bind-mounted read-only at /var/cache/pipelock-dist.
+#
+# Same contract as upstream's image (FROM scratch + the CA bundle + /pipelock),
+# so compose changes only the image name: entrypoint /pipelock, default
+# command `run --listen 0.0.0.0:8888`, port 8888, root (no USER; compose
+# drops every capability), config under /config from compose. The CA bundle
+# comes from Debian's ca-certificates at the same path upstream copies it to,
+# /etc/ssl/certs/ca-certificates.crt. The healthcheck is compose's
+# (`/pipelock healthcheck`); podman's OCI image format drops HEALTHCHECK.
+
+ARG BASE_IMAGE=docker.io/library/debian:trixie-slim@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd
+FROM ${BASE_IMAGE}
+
+ARG APT_PROXY
+RUN if [ -n "$APT_PROXY" ]; then echo "Acquire::http::Proxy \"$APT_PROXY\";" > /etc/apt/apt.conf.d/00cache; fi && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/* /etc/apt/apt.conf.d/00cache
+
+# DIST_ID (a hash of the binary, passed by the Makefile) is what invalidates
+# this layer: podman caches a RUN layer on its instruction text and never
+# looks inside a bind mount.
+ARG DIST_ID=unset
+RUN set -eu; \
+    echo "pipelock build $DIST_ID"; \
+    test -x /var/cache/pipelock-dist/pipelock \
+        || { echo "error: no pipelock in the mounted build -- run 'make build-pipelock-dist' first" >&2; exit 1; }; \
+    install -m 0755 /var/cache/pipelock-dist/pipelock /pipelock; \
+    test -s /etc/ssl/certs/ca-certificates.crt; \
+    /pipelock version
+
+EXPOSE 8888
+ENTRYPOINT ["/pipelock"]
+CMD ["run", "--listen", "0.0.0.0:8888"]

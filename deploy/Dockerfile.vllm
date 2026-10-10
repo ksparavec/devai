@@ -32,7 +32,7 @@
 # one vLLM was compiled with -- is bind-mounted read-only at
 # /var/cache/cuda-toolkit and only nvcc, nvvm, the headers and libcudart are
 # copied in (~300 MB; the full toolkit with its static libraries is ~1.9 GB).
-ARG BASE_IMAGE=docker.io/library/debian:trixie-slim
+ARG BASE_IMAGE=docker.io/library/debian:trixie-slim@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd
 FROM ${BASE_IMAGE}
 
 ARG APT_PROXY

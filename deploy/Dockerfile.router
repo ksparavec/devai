@@ -1,14 +1,16 @@
-# gpu-arbiter router — routes LLM requests between Ollama and vLLM
-# with GPU exclusion management.
+# devai-router: the gpu-arbiter in an empty image (platform-rebuild Phase 2).
 #
-# Build: podman build -f deploy/Dockerfile.router -t devai-router .
+# Build: make build-router. It compiles gpu-arbiter/gpu-arbiter with the
+# HOST's Go (CGO_ENABLED=0, so static) and then builds this file from the
+# repository root. No Go image and no distroless image are pulled.
+#
+# Nothing else is needed at run time: the router makes no HTTPS calls (no CA
+# bundle), loads no time zone, sets no USER, reads its configuration from
+# compose's bind mounts under /etc/devai, and gets /etc/hosts and
+# /etc/resolv.conf from podman. Its one write, the opt-in raw request capture
+# (DEVAI_REQUEST_FINGERPRINT_RAW), creates /tmp/devai-fingerprints itself.
 
-FROM docker.io/library/golang:1.27-bookworm AS build
-WORKDIR /src
-COPY gpu-arbiter/ .
-RUN go mod tidy && CGO_ENABLED=0 go build -ldflags="-s -w" -o /gpu-arbiter .
-
-FROM gcr.io/distroless/static-debian12
-COPY --from=build /gpu-arbiter /gpu-arbiter
-EXPOSE 11434 11435 11436
+FROM scratch
+COPY gpu-arbiter/gpu-arbiter /gpu-arbiter
+EXPOSE 11434 11435 11437 11438
 ENTRYPOINT ["/gpu-arbiter"]

@@ -1,36 +1,35 @@
 services:
   # Loopback-only publish: apt-cacher-ng is an unauthenticated open HTTP
-  # proxy. Its only consumers reach it over loopback or over devai-net --
-  # image builds run `podman build --network=host` with
-  # APT_PROXY=http://localhost:3142 (host netns -> host loopback), and the
-  # egress-locked lab reaches it by service name on devai-lab-egress, which
-  # is unaffected by port publishing. Nothing documented reaches it from
-  # another host.
+  # proxy. Its only consumers are image builds, which run `podman build
+  # --network=host` with APT_PROXY=http://localhost:3142 (host netns -> host
+  # loopback). Nothing documented reaches it from another host.
+  #
+  # NOT on devai-lab-egress (platform-rebuild Phase 2): it proxies any host,
+  # over CONNECT and over plain http, so from the egress-locked lab it was a
+  # way out around pipelock (tested 2026-10-10: example.com 200 both ways).
+  # The lab's apt never used it -- the lab configures no apt proxy -- and
+  # goes through pipelock like everything else.
+  #
+  # Built here (`make build-apt-cache`, deploy/Dockerfile.apt-cache): Debian's
+  # apt-cacher-ng as uid 101, the owner of the files already in the cache.
   apt-cache:
-    image: sameersbn/apt-cacher-ng:latest
+    image: localhost/devai-apt-cache:latest
     container_name: devai-apt-cache
     hostname: apt-cache
     ports:
       - "127.0.0.1:3142:3142"
     volumes:
       - /var/cache/devai/apt:/var/cache/apt-cacher-ng
-    networks: [default, devai-lab-egress]   # also reachable by the egress-locked lab
-    restart: unless-stopped
-
-  # Loopback-only publish, same reasoning as apt-cache above: the mirror
-  # is an unauthenticated pull-through registry, and its only consumer is
-  # the host's own podman via deploy/registries.conf, which hardcodes
-  # `location = "localhost:5000"`.
-  registry-cache:
-    image: registry:2
-    container_name: devai-registry-cache
-    hostname: registry-cache
-    ports:
-      - "127.0.0.1:5000:5000"
-    volumes:
-      - /var/cache/devai/registry:/var/lib/registry
-      - ./registry-config.yaml:/etc/docker/registry/config.yml:ro
-    networks: [default, devai-lab-egress]   # also reachable by the egress-locked lab
+    networks: [default]
+    # deploy/apt-cache-healthcheck.sh, baked into the image: one GET of the
+    # report page. No argument here may contain a space: podman-compose
+    # splits them, and `bash -c "<script>"` became `bash -c exec`, which
+    # passed whatever the daemon did.
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/apt-cache-healthcheck"]
+      interval: 10s
+      timeout: 2s
+      retries: 3
     restart: unless-stopped
 
   ollama:
@@ -176,13 +175,10 @@ services:
     restart: unless-stopped
 
   router:
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile.router
     # Fully-qualified to bypass unqualified-search-registries (docker.io)
-    # in registries.conf — otherwise the local mirror at localhost:5000
-    # can shadow the locally-built image with a stale `docker.io/library/...`
-    # copy. `make build-router` tags as `localhost/devai-router:latest`.
+    # in registries.conf. Built by `make build-router` (the host's Go, then
+    # deploy/Dockerfile.router), which tags `localhost/devai-router:latest`;
+    # compose has no build stanza because the binary is compiled outside it.
     image: localhost/devai-router:latest
     container_name: devai-router
     hostname: router
@@ -361,8 +357,12 @@ services:
   # on it. Requires an operator-bootstrapped CA (`make pipelock-ca-init`);
   # without the host key it fails its healthcheck and the launcher refuses to
   # start the lab (fail-closed, not fail-open).
+  #
+  # Built here (`make build-pipelock`): scripts/build-pipelock.sh compiles
+  # the version that ran from ghcr.io until platform-rebuild Phase 2, and
+  # deploy/Dockerfile.pipelock keeps that image's paths.
   pipelock:
-    image: ghcr.io/luckypipewrench/pipelock:latest
+    image: localhost/devai-pipelock:latest
     container_name: devai-pipelock
     hostname: pipelock
     command: ["run", "--listen", "0.0.0.0:8888", "--config", "/config/pipelock.yaml"]
