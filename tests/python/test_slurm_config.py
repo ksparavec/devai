@@ -328,6 +328,22 @@ class Image(unittest.TestCase):
         for target in ("build-slurm", "slurm-init", "slurm-up", "slurm-down", "test-slurm"):
             self.assertRegex(mk, rf"(?m)^{target}:.*## ", target)
 
+    def test_test_slurm_runs_the_holder_checks_alone(self):
+        # make test-slurm ONLY=holders: the unkillable-holder check needs
+        # sudo, and a full run reaches it after sudo's 15-minute default.
+        mk = (REPO / "Makefile").read_text()
+        self.assertIn("tests/slurm/test-slurm.sh $(if $(ONLY),--only $(ONLY))", mk)
+        script = (REPO / "tests" / "slurm" / "test-slurm.sh").read_text()
+        self.assertIn("section_holders() {", script)
+        self.assertEqual(script.count("\n    section_holders\n") + script.count("\nsection_holders\n"), 2,
+                         "called once in the full run and once alone")
+        self.assertIn("--only holders runs the unkillable-holder check, which needs sudo", script)
+        # A wrong or missing value is refused before anything is touched.
+        for args in (["--only", "bogus"], ["--only"], ["--bogus"]):
+            r = subprocess.run(["bash", str(REPO / "tests" / "slurm" / "test-slurm.sh"), *args],
+                               capture_output=True, text=True, timeout=30)
+            self.assertEqual(r.returncode, 2, (args, r.stderr))
+
     def test_the_jobs_directory_is_plain_and_made_by_hand(self):
         # Plan E9 (operator, 2026-10-08): plain directories under
         # /var/cache/devai until the separate thin-pool project lands, so no

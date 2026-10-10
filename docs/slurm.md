@@ -155,8 +155,9 @@ and history tool (Sec. 9), runs only in `devai-slurm` and `devai-operator`
   checked by the plan's `tests/slurm/test-slurm.sh`, run on this host's card
   on 2026-10-09 (measured): 75 checks passed, among them the guard killing
   foreign GPU holders (uid root and uid 2000) in plain rootless containers,
-  and one was skipped -- the unkillable-holder check needs passwordless sudo
-  and is still to be run by hand and recorded here. The first run of the
+  and one was skipped -- the unkillable-holder check needs sudo and is
+  still to be run (`sudo -v`, then `make test-slurm ONLY=holders`, which
+  runs the guard's holder checks alone) and recorded here. The first run of the
   same day failed 6 checks: two were real defects, fixed the same day (a
   load answered by its event rather than its reply, so the 15-minute
   response permission was never used -- `devai-bus request` now waits 2 s

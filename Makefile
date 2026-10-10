@@ -739,8 +739,8 @@ slurm-down: ## Stop and remove devai-slurm (jobs running then end NODE_FAIL and 
 	-$(COMPOSE) -f $(CACHE_COMPOSE) --profile slurm stop -t 60 slurm
 	-$(COMPOSE) -f $(CACHE_COMPOSE) --profile slurm rm -f slurm
 
-test-slurm: slurm-tools ## Live Phase 5 checks: devai-slurm and two devai-control test containers on the GPU, with the stack down (tests/slurm/test-slurm.sh; refuses while a production devai-control runs)
-	tests/slurm/test-slurm.sh
+test-slurm: slurm-tools ## Live Phase 5 checks: devai-slurm and two devai-control test containers on the GPU, with the stack down (tests/slurm/test-slurm.sh; refuses while a production devai-control runs). ONLY=holders runs only the guard's foreign-holder checks, the unkillable one included: run `sudo -v` first.
+	tests/slurm/test-slurm.sh $(if $(ONLY),--only $(ONLY))
 
 # pipelock egress proxy (per docs/pipelock.md). Always-on infra service (no
 # profile) brought up by `make cache-up`, which mounts the host CA key.

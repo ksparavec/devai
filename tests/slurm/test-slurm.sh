@@ -36,6 +36,14 @@
 # everything else passed: the operator runs that check by hand and records
 # the result in docs/slurm.md.
 #
+# --only holders (make test-slurm ONLY=holders) runs that section alone:
+# the same refusals, the test image, devai-slurm with the GPU and the two
+# test containers, then "the guard and foreign holders" -- the killable
+# holders and the unkillable one -- and the cleanup. It reaches the sudo
+# steps within a few minutes, so a `sudo -v` just before is enough (a full
+# run reaches them after about 17, past sudo's 15-minute default), and it
+# refuses at once without sudo.
+#
 # Exit: 0 every check passed; 1 a check failed or a refusal; 77 all ran
 # checks passed but one was skipped.
 #
@@ -44,6 +52,19 @@
 # SLURM_IMAGE (localhost/devai-slurm:latest), SLURM_TOOLS_DIST
 # (devai-tools/bin/static, from `make slurm-tools`), APT_PROXY.
 set -uo pipefail
+
+ONLY=
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --only) [ $# -ge 2 ] || { echo "usage: test-slurm.sh [--only holders]" >&2; exit 2; }
+                ONLY=$2; shift 2 ;;
+        *) echo "usage: test-slurm.sh [--only holders]" >&2; exit 2 ;;
+    esac
+done
+case "$ONLY" in
+    "" | holders) ;;
+    *) echo "test-slurm: --only takes holders, not '$ONLY'" >&2; exit 2 ;;
+esac
 
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 RUNTIME=${CONTAINER_RUNTIME:-podman}
@@ -109,6 +130,9 @@ BASE=$(gpu_used)
 [ "$BASE" -le 512 ] || die "the card shows $BASE MiB used with no process; the checks need it idle"
 SUDO_OK=0
 sudo -n true 2>/dev/null && SUDO_OK=1
+if [ "$ONLY" = holders ] && [ "$SUDO_OK" != 1 ]; then
+    die "--only holders runs the unkillable-holder check, which needs sudo: run 'sudo -v' in this terminal first"
+fi
 
 # --- cleanup ----------------------------------------------------------------
 
@@ -263,6 +287,44 @@ buslog_has() {  # pattern
     grep -qE "$1" "$JOBS"/bus/*.jsonl 2>/dev/null
 }
 
+# The guard and foreign holders (also run alone: --only holders).
+section_holders() {
+    say "the guard and foreign holders"
+    guard_verdict_is() { grep -q "\"verdict\": \"$2\"" "$JOBS/results/$1/guard.json" 2>/dev/null; }
+    for who in root 2000; do
+        "$RUNTIME" rm -f -t 0 "$HOLDER" >/dev/null 2>&1
+        "$RUNTIME" run -d --rm --name "$HOLDER" --device "$GPU_DEVICE" --security-opt label=disable --user "$who" \
+            "$TEST_IMAGE" python3 /usr/local/lib/devai/vram-ballast.py 2048 >/dev/null
+        wait_for 30 card_holds
+        n=$(submit_engine)
+        check "the prolog kills a foreign GPU holder (uid $who) in a plain rootless container" wait_for 90 guard_verdict_is "$n" killed
+        check "and the engine job loads" wait_for 90 fake_is serving
+        djobs cancel "$n" >/dev/null; wait_for 90 card_at_base
+    done
+    "$RUNTIME" rm -f -t 0 "$HOLDER" >/dev/null 2>&1
+
+    if [ "$SUDO_OK" = 1 ]; then
+        sudo -n python3 "$REPO/scripts/vram-ballast.py" 2048 >/dev/null 2>&1 &
+        wait_for 30 card_holds
+        SUDO_BALLAST_PID=$(sudo -n pgrep -f 'vram-ballast.py 2048' | head -1)
+        o=$(submit_engine)
+        check "a holder the guard cannot kill drains the node" wait_for 120 node_is 'drained|draining'
+        job_held() { sx squeue -h -j "$1" -o %r | grep -qi held; }
+        check "and its job is held" wait_for 60 job_held "$o"
+        p=$(submit_action '{"sleep_s":5}')
+        sleep 5
+        check "a license-free action job waits PENDING while drained" state_is "$p" PENDING
+        djobs queue | grep -E "^$p " || true
+        sudo -n kill "$SUDO_BALLAST_PID"; SUDO_BALLAST_PID=
+        wait_for 30 card_at_base
+        check "the health check resumes the node within 60 s of the holder exiting" wait_for 60 node_is 'idle|mixed|allocated' 
+        check "and the action job starts within 60 s of that" wait_for 60 state_is "$p" 'RUNNING|COMPLETED'
+        djobs cancel "$o" >/dev/null 2>&1
+    else
+        skip "the unkillable-holder check needs passwordless sudo: run it by hand and record it in docs/slurm.md"
+    fi
+}
+
 # --- build the test image ---------------------------------------------------
 
 say "build $TEST_IMAGE"
@@ -271,6 +333,15 @@ say "build $TEST_IMAGE"
     -v "$TOOLS:/var/cache/devai-tools-dist:ro" -f "$REPO/tests/slurm/Dockerfile.control-test" \
     -t "$TEST_IMAGE" "$REPO" >"$TMP/build.log" 2>&1 || die "build failed: $(tail -20 "$TMP/build.log")"
 pass "built $TEST_IMAGE"
+
+if [ "$ONLY" = holders ]; then
+    say "devai-slurm with the GPU and the test containers"
+    start_slurm gpu
+    start_engines 0
+    start_operator
+    section_holders
+    exit 0
+fi
 
 # --- without the GPU device -------------------------------------------------
 
@@ -488,40 +559,7 @@ devai_signals() { "$RUNTIME" exec -u devai devai-slurm kill -0 "$1" 2>/dev/null;
 check "a job (user devai in devai-slurm) cannot signal a host user's process" not devai_signals "$hostpid"
 kill "$hostpid" 2>/dev/null
 
-say "the guard and foreign holders"
-guard_verdict_is() { grep -q "\"verdict\": \"$2\"" "$JOBS/results/$1/guard.json" 2>/dev/null; }
-for who in root 2000; do
-    "$RUNTIME" rm -f -t 0 "$HOLDER" >/dev/null 2>&1
-    "$RUNTIME" run -d --rm --name "$HOLDER" --device "$GPU_DEVICE" --security-opt label=disable --user "$who" \
-        "$TEST_IMAGE" python3 /usr/local/lib/devai/vram-ballast.py 2048 >/dev/null
-    wait_for 30 card_holds
-    n=$(submit_engine)
-    check "the prolog kills a foreign GPU holder (uid $who) in a plain rootless container" wait_for 90 guard_verdict_is "$n" killed
-    check "and the engine job loads" wait_for 90 fake_is serving
-    djobs cancel "$n" >/dev/null; wait_for 90 card_at_base
-done
-"$RUNTIME" rm -f -t 0 "$HOLDER" >/dev/null 2>&1
-
-if [ "$SUDO_OK" = 1 ]; then
-    sudo -n python3 "$REPO/scripts/vram-ballast.py" 2048 >/dev/null 2>&1 &
-    wait_for 30 card_holds
-    SUDO_BALLAST_PID=$(sudo -n pgrep -f 'vram-ballast.py 2048' | head -1)
-    o=$(submit_engine)
-    check "a holder the guard cannot kill drains the node" wait_for 120 node_is 'drained|draining'
-    job_held() { sx squeue -h -j "$1" -o %r | grep -qi held; }
-    check "and its job is held" wait_for 60 job_held "$o"
-    p=$(submit_action '{"sleep_s":5}')
-    sleep 5
-    check "a license-free action job waits PENDING while drained" state_is "$p" PENDING
-    djobs queue | grep -E "^$p " || true
-    sudo -n kill "$SUDO_BALLAST_PID"; SUDO_BALLAST_PID=
-    wait_for 30 card_at_base
-    check "the health check resumes the node within 60 s of the holder exiting" wait_for 60 node_is 'idle|mixed|allocated' 
-    check "and the action job starts within 60 s of that" wait_for 60 state_is "$p" 'RUNNING|COMPLETED'
-    djobs cancel "$o" >/dev/null 2>&1
-else
-    skip "the unkillable-holder check needs passwordless sudo: run it by hand and record it in docs/slurm.md"
-fi
+section_holders
 
 say "node state and ReturnToService"
 sx scontrol update NodeName=devai State=DOWN Reason=test
