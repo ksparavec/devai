@@ -52,7 +52,7 @@ the chosen model's backend.
 `make cache-up` brings up:
 
 - **Always running**: `devai-ollama`, `devai-router`, `devai-apt-cache`,
-  `devai-registry-cache`, `devai-logger`.
+  `devai-logger`, `devai-pipelock`.
 - **Idle placeholders**: `devai-vllm` (and `devai-sglang` until the
   2026-10-10 freeze, M16) start with
   `entrypoint: ["sleep", "infinity"]`. They hold the service definition

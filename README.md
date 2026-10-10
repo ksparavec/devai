@@ -207,17 +207,17 @@ missing.
    (GGUF, RAM-   (NVFP4,     (FROZEN,
     resident)    on-demand)  not served)
 
-  devai-apt-cache    devai-registry-cache
-  (APT cache)        (Docker Hub mirror)
+  devai-apt-cache    devai-pipelock
+  (APT cache)        (the lab's egress proxy)
 ```
 
 **External access** (host ports): JupyterLab `:8888`, and the DeepSeek Harness web UI `:3080` (`DSH_PORT`) while a lab runs
-**Loopback only** (`127.0.0.1`): APT cache `:3142`, registry mirror `:5000`. Reaching either from another machine means an SSH tunnel or an authenticating proxy, not a wider bind.
+**Loopback only** (`127.0.0.1`): APT cache `:3142`. Reaching it from another machine means an SSH tunnel or an authenticating proxy, not a wider bind.
 **Internal only** (devai-net): router, Ollama, vLLM, caches.
 
 ### GPU Arbitration
 
-The router (`devai-router`) is a small Go reverse proxy (~9 MB distroless) that:
+The router (`devai-router`) is a small Go reverse proxy (~8 MB, a static binary in `FROM scratch`) that:
 
 - Routes by **port -> backend** (no message inspection): `:11434` -> ollama, `:11435` -> vllm, `:11437` -> vllm-devai (`:11436` was SGLang's, frozen on 2026-10-10, M16).
 - Manages **GPU exclusion**: only one backend uses the GPU at a time. Switches by stopping the current backend (with graceful drain for in-flight requests) and starting the next via the Podman API.
@@ -406,15 +406,13 @@ mkcert <HOST_IP>
 # Copy <HOST_IP>.pem and <HOST_IP>-key.pem to the container host
 ```
 
-## Podman Registry Mirror
-
-To route Docker Hub pulls through the local cache:
+## Podman Registry Configuration
 
 ```bash
 cp deploy/registries.conf ~/.config/containers/registries.conf
 ```
 
-This tells Podman to try `localhost:5000` (the registry mirror started by `make cache-up`) before going to Docker Hub directly. The mirror is published on `127.0.0.1` only, and the config marks it `insecure = true` (plaintext HTTP, no image-signature check) -- which is safe only because it is this host's own loopback cache. Read the security note at the top of `deploy/registries.conf` before pointing it anywhere else.
+The file only resolves unqualified image names against Docker Hub. Until platform-rebuild Phase 2 (2026-10-10) it also routed every docker.io pull through a local `registry:2` mirror on `localhost:5000`; that mirror is gone, and devai now pulls one image, Debian pinned by digest (`DEBIAN_IMAGE`), building the rest. A host that installed the old file deletes its `[[registry.mirror]]` stanza (INSTALL.md section 5.4).
 
 ## Auto-Start at Boot
 
@@ -429,7 +427,7 @@ make uninstall-systemd          # reverse: disable unit + remove staged files
 
 ```bash
 make fetch-cli                 # Update CLI binaries (Claude, Codex, Ollama, Gemini) via ETags
-make pull-images               # Pull latest base and infrastructure images
+make pull-images               # Pull the pinned Debian image (and the upstream images not yet built here)
 make catalog-regen             # Refresh deploy/models.yaml from HF + Ollama upstream
 make model-pull && make probe  # Pull any new fitting variants, then probe them
 make build                     # Rebuild all images with updated binaries/packages
@@ -447,7 +445,7 @@ Reference implementation (volume group `vgais`):
 | Volume | Mount | Size | Purpose |
 |--------|-------|------|---------|
 | `cache_ollama` | `/var/cache/devai/ollama` | 200G | Ollama GGUF models + vLLM NVFP4 models |
-| `cache_registry` | `/var/cache/devai/registry` | 200G | Podman container image storage + Docker Hub mirror |
+| `cache_registry` | `/var/cache/devai/registry` | 200G | Podman container image storage (and the blobs of the Docker Hub mirror removed in platform-rebuild Phase 2) |
 | `cache_logs` | `/var/cache/devai/logs` | 100G | Persisted container stdout (one `<service>.log` per devai-* container, written by the `logger` sidecar) |
 | `cache_pip` | `/var/cache/devai/pip` | 30G | Python package cache (uv) + CLI binaries |
 | `cache_apt` | `/var/cache/devai/apt` | 10G | APT package cache (apt-cacher-ng) |
@@ -460,16 +458,16 @@ it is left for the operator to remove.
 
 Podman's rootless graphroot is `/var/cache/devai/registry/podman` (set in
 `~/.config/containers/storage.conf`), a subdirectory of the `cache_registry`
-volume that it shares with the registry:2 mirror's blob tree at
-`/var/cache/devai/registry/docker/`. The store uses NATIVE overlay (kernel
+volume that it shares with the blob tree of the registry:2 mirror removed
+in platform-rebuild Phase 2, `/var/cache/devai/registry/docker/`. The store uses NATIVE overlay (kernel
 overlayfs with `userxattr`), not fuse-overlayfs: with a mount program podman
 cannot use the native overlay diff, so every layer commit walks the whole
 image tree -- measured 2026-09-22 at ~12 s per single-file COPY on the lab
 image against 0.2 s native. If `podman info` ever reports
 `Native Overlay Diff: false`, the store has been initialised with
 fuse-overlayfs (sticky `.has-mount-program` flag) and must be recreated; the
-flag is never re-evaluated. Never wipe `registry/*` wholesale: it holds both
-the store and the mirror cache.
+flag is never re-evaluated. Never wipe `registry/*` wholesale: it holds the
+store as well as the old mirror's blobs.
 
 `cache_logs` is the only volume that can be created entirely from the
 repo: `make setup-logs` carves the LV in the existing `vgais/cachepool`,
@@ -560,7 +558,9 @@ deploy/
                                     caches/logger/pipelock)
   Dockerfile.base                 -- Base image (system packages, Python, Node)
   Dockerfile.lab                  -- Lab image (CLI tools incl. the sky CLI, JupyterLab)
-  Dockerfile.router               -- Router image (distroless, 9 MB)
+  Dockerfile.router               -- Router image (FROM scratch + a host-built static binary, 8 MB)
+  Dockerfile.apt-cache            -- apt-cacher-ng on the pinned Debian image
+  Dockerfile.pipelock             -- The lab's egress proxy (pipelock built on the host)
   systemd/                        -- Auto-start service
 gpu-arbiter/
   main.go                         -- Router source (multi-port proxy, reasoning policy,

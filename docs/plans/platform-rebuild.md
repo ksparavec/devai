@@ -4,7 +4,7 @@ _Pull exactly one image from upstream; compile every engine here into one contai
 
 ## Status
 
-Draft (2026-10-05; engines and System One added 2026-10-06). Built since, on branch feat/platform-rebuild: Phases 1, 5 and 21, steps 4v, 16a, 16e and 17a (2026-10-07). Phase 5's live checks (`make test-slurm`) passed on the card: 75 of 76 on 2026-10-09, and the unkillable-holder check, which needs sudo, alone on 2026-10-10 (`make test-slurm ONLY=holders`, 10 of 10). Phase 15 measured SGLang against vLLM 0.30.0 on 2026-10-10: frozen (M16).
+Draft (2026-10-05; engines and System One added 2026-10-06). Built since, on branch feat/platform-rebuild: Phases 1, 5 and 21, steps 4v, 16a, 16e and 17a (2026-10-07), Phase 15 (2026-10-10) and Phase 2 (2026-10-10). Phase 5's live checks (`make test-slurm`) passed on the card: 75 of 76 on 2026-10-09, and the unkillable-holder check, which needs sudo, alone on 2026-10-10 (`make test-slurm ONLY=holders`, 10 of 10). Phase 15 measured SGLang against vLLM 0.30.0 on 2026-10-10: frozen (M16). Phase 2's exit criteria were met on 2026-10-10; the Debian pin made in Phase 5 could not be pulled (its digest was the one podman recorded for an image fetched through the old registry mirror, which Docker Hub never served), so it was re-pinned to Docker Hub's index digest of `trixie-20260713-slim`, the same image (config `2a96bd19`), and nothing was rebuilt for it.
 
 Plan-level review ends here (operator, 2026-10-06). After four readiness reviews, the last fix round was checked finding by finding and left the small items listed under "Left for implementation" (below Open questions). They are settled in the phase named, and each phase's tests and exit criteria are the check, not a further review of this plan.
 
@@ -478,8 +478,6 @@ The fourth readiness review's fixes were checked one by one: 70 of 103 were comp
 | 12, slurm.md | slurm.md Sec. 12 still names one fixed lab port pair; each lab has its own. |
 | 13 | `devai-jobs prune` (C4 retention) is missing from Phase 13's devai-jobs deliverable. |
 | 14 | docs/laya-trainer.md should name `runs/<job>/run.log`. |
-| 15 | The freeze list misses the router's `probeCachePathByBackend` SGLang entry and the `bench-sglang`, `test-sglang` and `test-probe-sglang` targets. |
-| 15 | I16's "any other outcome is a freeze" must exempt the new void outcome (a vLLM-side failure). |
 | 20 | The `index/` "derived only" lines contradict the candidate cache kept there; the library can reach the router on devai-lab-egress, which one line denies. |
 | 23 | The compose row mounts the `vllm-s1` probe cache as a single file; Phase 9 mounts `deploy/` as a directory. |
 | 23 | Step 1's launch list has no KV-cache dtype. |

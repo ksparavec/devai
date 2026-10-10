@@ -876,10 +876,7 @@ EOF
 Verification is deferred to section 6.8 because `/var/cache/devai/registry`
 does not exist until section 6 mounts it.
 
-### 5.4 Registry mirror routing (optional)
-
-The infra stack runs a `registry:2` pull-through cache on `:5000`.
-Routing podman through it speeds up rebuilds.
+### 5.4 Container registry
 
 ```bash
 [vm] $ mkdir -p ~/.config/containers
@@ -888,9 +885,16 @@ Routing podman through it speeds up rebuilds.
             ~/.config/containers/registries.conf
 ```
 
-The shipped file adds `localhost:5000` as an insecure mirror for
-`docker.io` and falls back to `docker.io` directly if the mirror is
-down. Safe to install before section 10 (when the mirror starts).
+The shipped file only resolves unqualified image names against
+`docker.io`. Until platform-rebuild Phase 2 (2026-10-10) the infra stack
+also ran a `registry:2` pull-through cache on `:5000`, and this file routed
+every `docker.io` pull through it as an insecure mirror. The mirror is
+gone, so **an existing host deletes the `[[registry.mirror]]` stanza**
+(`location = "localhost:5000"`, `insecure = true`) from
+`~/.config/containers/registries.conf`; with it left in, every `docker.io`
+pull first tries `localhost:5000`, is refused, and falls back. The mirror's
+blobs stay under `/var/cache/devai/registry/docker/` until removed (section
+15.4); `registry/podman/` is podman's graphroot.
 
 ### 5.5 Verification
 
@@ -1099,14 +1103,15 @@ into `.env` before section 10).
 [vm] $ make pull-images
 ```
 
-Targets (see `deploy/docker-compose.yaml` for the source of truth):
-`debian:trixie`, `docker.io/nvidia/cuda:12.9.1-cudnn-runtime-
-ubuntu24.04`, `docker.io/library/golang:1.23-bookworm`,
-`gcr.io/distroless/static-debian12`, `sameersbn/apt-cacher-ng:latest`,
-`registry:2`, `ollama/ollama:latest`,
-`docker.io/vllm/vllm-openai:latest-cu130-ubuntu2404`,
-`docker.io/lmsysorg/sglang:v0.5.10.post1-cu130`,
-`quay.io/podman/stable`.
+Targets: the Debian image pinned by digest in the Makefile's
+`DEBIAN_IMAGE` (every Debian image is built on it), and the upstream
+images later platform-rebuild phases replace:
+`docker.io/nvidia/cuda:12.9.1-cudnn-runtime-ubuntu24.04` (Phase 3),
+`docker.io/vllm/vllm-openai:v0.22.1-x86_64-cu129-ubuntu2404` (Phase 4) and
+`quay.io/podman/stable` (the logger, Phase 6).
+`tests/python/test_upstream_images.py` holds that list. Everything else
+(router, apt-cache, pipelock, Ollama, vllm-devai, devai-slurm) is built
+here in section 9.
 
 If any pull fails, the agent halts. Re-running `make pull-images` is
 idempotent (digest match -> no-op).
@@ -1133,7 +1138,7 @@ Section 9 is offline.
 
 ```bash
 [vm] [verify] $ podman images --format '{{.Repository}}:{{.Tag}}' \
-                | grep -E '(debian|nvidia/cuda|golang|distroless|apt-cacher|registry|ollama|vllm|sglang|podman/stable)' \
+                | grep -E '(debian|nvidia/cuda|vllm-openai|podman/stable)' \
                 | sort -u
 [vm] [verify] $ ls -1 /var/cache/devai/pip/bin/ \
                 | grep -E '^(claude|codex|ollama|code-server|uv|uvx|gemini)$'
@@ -1145,7 +1150,7 @@ Section 9 is offline.
 
 ```bash
 [vm] $ cd ${REPO_DIR}
-[vm] $ make build           # base-cpu, lab-cpu, base-gpu, lab-gpu, router
+[vm] $ make build           # base-cpu, lab-cpu, base-gpu, lab-gpu, router, apt-cache, pipelock
 ```
 
 | Target | Image |
@@ -1154,7 +1159,13 @@ Section 9 is offline.
 | `build-cpu`      | `devai-lab-cpu`  |
 | `build-base-gpu` | `devai-base-gpu` |
 | `build-gpu`      | `devai-lab-gpu`  |
-| `build-router`   | `localhost/devai-router` |
+| `build-router`   | `localhost/devai-router` (host Go, FROM scratch) |
+| `build-apt-cache` | `localhost/devai-apt-cache` |
+| `build-pipelock` | `localhost/devai-pipelock` (host Go build of pipelock v3.0.0) |
+
+`build-router` and `build-pipelock` compile with the host's Go, which
+`build-ollama` needs too. `make cache-up` refuses to start without the
+router, apt-cache, pipelock and Ollama images.
 
 The VM always has a GPU (D9), so the GPU variants always build. The
 Makefile bind-mounts `/var/cache/devai/pip`, `/var/cache/devai/npm`,
@@ -1165,11 +1176,11 @@ hit only if section 8 missed something.
 
 ```bash
 [vm] [verify] $ podman images --format '{{.Repository}}:{{.Tag}}' \
-                | grep -E '^(devai-(base-cpu|base-gpu|lab-cpu|lab-gpu)|localhost/devai-router):latest$' \
+                | grep -E '^(devai-(base-cpu|base-gpu|lab-cpu|lab-gpu)|localhost/devai-(router|apt-cache|pipelock)):latest$' \
                 | sort
 ```
 
-Expected: five entries.
+Expected: seven entries.
 
 ### 9.2 Recovery
 
@@ -1194,12 +1205,14 @@ This:
 - Creates the `devai-net` network if missing.
 - Runs `podman compose -f deploy/docker-compose.yaml up -d` (via
   `docker-compose` v2 -- D13), starting `devai-apt-cache`,
-  `devai-registry-cache`, `devai-ollama`, `devai-vllm` (placeholder),
-  `devai-sglang` (placeholder), `devai-router`, `devai-logger`.
+  `devai-ollama`, `devai-vllm`, `devai-vllm-devai` and
+  `devai-laya-trainer` (placeholders), `devai-router`, `devai-logger`,
+  `devai-pipelock`.
 
-`devai-vllm` and `devai-sglang` launch with `entrypoint: ["sleep",
-"infinity"]` and do not serve traffic; the router replaces each
-container on demand when a request first hits ports 11435/11436.
+`devai-vllm`, `devai-vllm-devai` and `devai-laya-trainer` launch with
+`entrypoint: ["sleep", "infinity"]` and do not serve traffic; the router
+replaces each container on demand when a request first hits ports
+11435, 11437 or 11438 (SGLang's 11436 is frozen, M16).
 
 ### 10.2 Verification
 
@@ -1564,8 +1577,8 @@ credentials file into a shared VM.
 [vm] $ make install-systemd
 ```
 
-This stages `deploy/docker-compose.yaml` and `deploy/registry-config.yaml`
-to `~/.config/devai/`, installs `deploy/systemd/devai-infra.service`
+This stages `deploy/docker-compose.yaml` to `~/.config/devai/` (and
+removes the `registry-config.yaml` link earlier installs left there), installs `deploy/systemd/devai-infra.service`
 as a `--user` unit, enables `podman.socket` and
 `devai-infra.service`, and calls `loginctl enable-linger devai` (a
 no-op if section 4.6 already ran).
@@ -1623,7 +1636,7 @@ validation.
 +-- apt/             <- cache_apt
 +-- npm/             <- cache_npm
 +-- pip/             <- cache_pip (uv cache + CLI binaries in pip/bin/)
-+-- registry/        <- cache_registry (podman graphroot + registry:2 mirror)
++-- registry/        <- cache_registry (podman graphroot; docker/ = the removed mirror's blobs)
 +-- ollama/          <- cache_ollama
 |   +-- models/
 |       +-- blobs/         (Ollama GGUF + manifests)
@@ -1641,7 +1654,6 @@ ${REPO_DIR}/
 |   +-- docker-compose.yaml
 |   +-- models.yaml
 |   +-- registries.conf
-|   +-- registry-config.yaml
 +-- scripts/
 
 ${HOME}/                                (= /home/devai)
@@ -1682,7 +1694,7 @@ only the router ports (`11434/11435/11436`).
 
 | Path | Class | Safe to delete? |
 |---|---|---|
-| `/var/cache/devai/registry/docker/` | regenerable mirror cache | yes |
+| `/var/cache/devai/registry/docker/` | blobs of the registry mirror removed in platform-rebuild Phase 2 | yes |
 | `/var/cache/devai/apt/` / `pip/` / `npm/` | regenerable build caches | yes (forces full rebuild) |
 | `/var/cache/devai/ollama/models/blobs/` | downloaded GGUFs | costly to re-pull |
 | `/var/cache/devai/vllm/` and `/var/cache/devai/sglang/` | downloaded NVFP4 weights | costly to re-pull |

@@ -92,8 +92,9 @@ Use `make help` to list supported targets. Common commands:
 
 - `make build-cpu`: build the CPU lab image.
 - `make build-gpu`: build the GPU/CUDA lab image.
-- `make build-router`: build the router image.
-- `make build`: build CPU, GPU, and router images.
+- `make build-router`: build the router image (a host-built static binary in FROM scratch).
+- `make build-apt-cache`, `make build-pipelock`: build the apt-cache and pipelock images (platform-rebuild Phase 2).
+- `make build`: build CPU, GPU, router, apt-cache and pipelock images.
 - `make cache-up`: start active infrastructure services.
 - `make cache-down`: stop infrastructure services.
 - `make cache-status`: show service and model-cache status.

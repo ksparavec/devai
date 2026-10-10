@@ -621,7 +621,7 @@ $ podman compose \
 
 This brings up:
 
-- `devai-apt-cache`, `devai-registry-cache` -- build accelerators (kept).
+- `devai-apt-cache` -- build accelerator (kept).
 - `devai-router` -- protocol bridge + reasoning policy + tool stripping.
   Pointed at host Ollama.
 - `devai-logger` -- per-container stdout sink.
@@ -852,7 +852,7 @@ podman machine VM (${VM_NAME})
 |   +-- apt/, npm/, pip/, registry/, logs/
 |   +-- (NO ollama/ -- host-side instead)
 +-- containers:
-    devai-apt-cache, devai-registry-cache,
+    devai-apt-cache,
     devai-router (-> host Ollama),
     devai-logger
 ```
