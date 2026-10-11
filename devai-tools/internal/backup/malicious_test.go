@@ -70,14 +70,17 @@ func TestRestoreRejectsMaliciousArchiveWithNoWrites(t *testing.T) {
 		{"relative-traversal", &tar.Header{Name: "../../evil", Typeflag: tar.TypeReg, Mode: 0o644, Size: 7}},
 		{"absolute-path", &tar.Header{Name: "/etc/passwd", Typeflag: tar.TypeReg, Mode: 0o644, Size: 7}},
 		{"symlink-escape", &tar.Header{Name: "deploy/link", Typeflag: tar.TypeSymlink, Linkname: "/etc/passwd"}},
-		// "sops-age" is one archive-name segment but maps to a real root
-		// three directories deep (homeDir/.config/sops/age): a single ".."
-		// cancels cleanly in the archive-name's own coordinate space (so
-		// ValidateName sees plain "evil" and accepts it) while still
-		// escaping the real "sops-age" root into a sibling directory
-		// (homeDir/.config/sops/evil) once joined. Only resolveTarget's
-		// containment check on the resolved path catches this.
-		{"root-depth-mismatch-escape", &tar.Header{Name: "sops-age/../evil", Typeflag: tar.TypeReg, Mode: 0o644, Size: 7}},
+		// The "root-depth-mismatch-escape" case lived here: an archive root
+		// that maps to a directory several levels deep ("sops-age" ->
+		// homeDir/.config/sops/age) lets "<root>/../evil" cancel cleanly
+		// in the archive name while escaping the real root once joined.
+		// No multi-segment root remains since the sops-age root was
+		// retired on 2026-10-07; bring the case back with Phase 5's
+		// ~/.config/devai/slurm root (platform-rebuild), using that root.
+		//
+		// A retired root is skipped on restore, but only AFTER the ".."
+		// guard: a traversal under it must still be rejected, not skipped.
+		{"retired-root-traversal", &tar.Header{Name: "sops-age/../evil", Typeflag: tar.TypeReg, Mode: 0o644, Size: 7}},
 		// A bare root name resolves to the root DIRECTORY. Honouring it
 		// would rename the whole deploy/ tree aside -- every probe and
 		// bench cache with it -- and write a single file in its place.
@@ -96,7 +99,6 @@ func TestRestoreRejectsMaliciousArchiveWithNoWrites(t *testing.T) {
 			homeDir := filepath.Join(parent, "home")
 			mustMkdirAll(t, filepath.Join(repoRoot, "deploy"))
 			mustMkdirAll(t, filepath.Join(homeDir, ".devai"))
-			mustMkdirAll(t, filepath.Join(homeDir, ".config", "sops", "age"))
 
 			archiveDir := t.TempDir()
 			archivePath := filepath.Join(archiveDir, "evil.tar.gz")

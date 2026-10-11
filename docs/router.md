@@ -1,7 +1,7 @@
 # DevAI Router (`gpu-arbiter`)
 
 The router is the central component of the DevAI stack. Every model
-request from agents (Claude Code, Codex, OpenCode, Pi, DeepSeek Harness, Open WebUI, raw curl)
+request from agents (Claude Code, Codex, OpenCode, Pi, DeepSeek Harness, raw curl)
 goes through it. The router is responsible for: which backend serves a
 model, which model is currently loaded in that backend, what context
 length and parser flags the backend was launched with, and how every
@@ -18,6 +18,7 @@ caches consumed, and failure modes.
 - [Architecture](#architecture)
 - [Port layout](#port-layout)
 - [What the router advertises](#what-the-router-advertises)
+- [Model-store mutation guard](#model-store-mutation-guard)
 - [Backend lifecycle](#backend-lifecycle)
   - [Job runners (the laya trainer)](#job-runners-the-laya-trainer)
 - [Request rewrite chain](#request-rewrite-chain)
@@ -34,6 +35,7 @@ caches consumed, and failure modes.
 - [Configuration (env vars)](#configuration-env-vars)
 - [Failure modes](#failure-modes)
 - [Operator tasks](#operator-tasks)
+  - [Request fingerprints](#request-fingerprints-find-claude-codes-throwaway-requests)
 - [Benchmark harness](#benchmark-harness)
 
 ---
@@ -67,7 +69,7 @@ This document covers single mode, which is all of it.
 | (Claude Code,|                         |                              |
 |  OpenCode,   |  POST /v1/...           |  port 11434  -->  ollama     |
 |  Codex, Pi,  | ------------------>     |  port 11435  -->  vllm       |
-|  Open WebUI, |                         |  port 11436  -->  sglang     |
+|  dsh,        |                         |  port 11436  (sglang, frozen)|
 |  curl, ...)  |                         |                              |
 +--------------+                         |  GPU mutex * request rewrite |
                                          |  container lifecycle         |
@@ -77,12 +79,13 @@ This document covers single mode, which is all of it.
                                          +------------------------------+
                                          |  devai-ollama (always on)    |
                                          |  devai-vllm   (sleep > live) |
-                                         |  devai-sglang (sleep > live) |
+                                         |  devai-sglang (frozen, M16)  |
                                          +------------------------------+
 ```
 
-The vLLM and SGLang containers start as `sleep infinity` placeholders
-(see `deploy/docker-compose.yaml`). The router replaces them with a
+The vLLM containers (and SGLang's, until it was frozen) start as
+`sleep infinity` placeholders (see `deploy/docker-compose.yaml`). The
+router replaces them with a
 live engine on the first request to their port via the Podman libpod
 API, with the right `--model`, `--max-model-len`, parser flags, and
 plugin mounts derived from the probe cache.
@@ -94,6 +97,21 @@ the code are preserved under `attic/cluster-mode/` and described in
 `attic/README.md`; do not treat them as available behaviour. If they are
 ever thawed, `attic/cluster-mode/RESTORE.md` lists what was still broken
 when they were parked.
+
+### SGLang (frozen)
+
+SGLang was frozen on 2026-10-10 by platform-rebuild Phase 15 (decision
+M16 in docs/plans/platform-rebuild.md): on Qwen3.5-9B-NVFP4 its turn-2+
+TTFT was 0.806 of vLLM 0.30.0's (95% CI 0.802-0.812), and I16 required at
+most 0.75. Its entry left the router's backend table together with
+`SGLANG_URL`, the SGLang probe-cache load and its drift-map entry, so
+port 11436 is not served and compose has no `sglang` service.
+`sglangEntrypoint` (now emitting `--enable-metrics`) and the SGLang
+branches of the reasoning policy, the Anthropic `/v1/messages` and
+Responses rewrites, engine-cache volumes and recovery-flag scoping stay in
+the code, tested, but unreachable. Where this document describes SGLang
+behaviour, it describes that code. `attic/sglang/RESTORE.md` says how to
+re-wire it.
 
 ### What the router IS
 
@@ -123,13 +141,15 @@ when they were parked.
 |-------|---------|----------|---------------------------------|
 | 11434 | Ollama  | always live  | GGUF only                   |
 | 11435 | vLLM    | recreated on demand | NVFP4, FP8, AWQ, BF16 safetensors |
-| 11436 | SGLang  | recreated on demand | NVFP4 (arch-dependent), BF16 safetensors |
+| 11436 | SGLang  | FROZEN (M16): not served | was NVFP4 (arch-dependent), BF16 safetensors |
 | 11437 | vllm-devai | recreated on demand | the home-built, HyperQwen-patched vLLM (same store as vLLM) |
 | 11438 | laya-trainer | recreated on the first job | a job runner, not an engine: laya fine-tuning jobs (see [Job runners](#job-runners-the-laya-trainer)) |
 
 The router is internal to `devai-net`. It is **not** published to the
-host. Reach it from sibling containers (`devai-open-webui`,
-`devai-lab-*`) or from your own container with `--network devai-net`.
+host. Reach it from the lab (`devai-lab-*`, on `devai-lab-egress`, where
+the router is dual-homed) or from your own container with
+`--network devai-net` -- the live test scripts start a throwaway one
+(`tests/lib/devai-net-client.sh`).
 
 ---
 
@@ -140,7 +160,10 @@ host. Reach it from sibling containers (`devai-open-webui`,
 1. Read three probe caches:
    - `/etc/devai/.ollama-reasoning-cache.json` (digest-keyed v3)
    - `/etc/devai/.vllm-reasoning-cache.json` (repo+sha-keyed v2)
-   - `/etc/devai/.sglang-reasoning-cache.json` (repo+sha-keyed v2)
+   - `/etc/devai/.vllm-devai-reasoning-cache.json` (repo+sha-keyed v2)
+
+   (The SGLang cache was read here too until the freeze, M16; it stays
+   on disk, unread.)
 2. Read `/etc/devai/vllm-plugins.json` (parser plugin registry).
 3. Synthesise one `configModel` per cache entry whose host-VRAM band
    has a `fits=true` (HF) / `fully_on_gpu=true` (Ollama) cell.
@@ -152,7 +175,7 @@ host. Reach it from sibling containers (`devai-open-webui`,
 ### First request to vLLM/SGLang (cold start)
 
 ```
-agent --> router (port 11435 or 11436)
+agent --> router (port 11435 or 11437; 11436 until the SGLang freeze)
               |
               +- parse `<model>@<ctx>` and `<model>::<reasoning>` overrides
               +- identify other backends holding the GPU
@@ -404,6 +427,50 @@ applies everywhere.
 
 See `gpu-arbiter/advertise.go`.
 
+## Model-store mutation guard
+
+The probe caches are the fit gate: nothing should serve unless a probe
+measured that it fits and serves at the requested context. For vLLM and
+SGLang the router enforces that directly (the allowlist in
+`makeRequestHandler`). For Ollama it relies on upstream serving only the
+locally pulled tags, which holds only while nothing but the probe
+pipeline changes that set. So the router refuses Ollama's store-changing
+routes on EVERY backend listener, for every HTTP method, before the
+catch-all proxy sees them (`ollamaMutationPaths`, `makeMutationGuard`,
+registered by `newBackendMux` in `gpu-arbiter/main.go`):
+
+| Route | Why |
+|---|---|
+| `/api/pull` | adds an unprobed model, which would then serve with no fit data |
+| `/api/create` | the same, from a Modelfile |
+| `/api/push`, `/api/copy` | change or publish the store |
+| `/api/delete` | removes a model the probe cache still advertises |
+| `/api/blobs/<digest>` (a subtree) | the blob upload (POST) and existence check (HEAD) that precede an `ollama create` from a local file; added 2026-10-07 (platform-rebuild 16e) |
+
+ServeMux matches routes on the ESCAPED path, so `/api%2Fdelete` is a
+single segment that misses the `/api/delete` pattern and lands on the
+catch-all, which proxies the raw path -- and Ollama decodes it and runs
+the delete. The catch-all therefore checks the decoded, cleaned path as
+well (`isMutationPath`, `refuseMutation`), which also covers `/api//pull`
+and `/api/delete/`. Until 2026-10-07 it did not: a review verified
+`DELETE /api%2Fdelete` reaching Ollama's delete handler and
+`POST /api/blobs%2Fsha256:...` writing a blob, against devai-ollama 0.34.2.
+
+A refused request gets `403` with `Content-Type: application/json` and a
+JSON body naming the route and the sanctioned path (`make model-pull` on
+the host, then `make probe`), and the router logs
+`[<backend>] REFUSED <method> "<path>" from <addr> -- model-store mutation
+via router` (the path quoted, since it is the client's). The other
+`/api/*` routes (`/api/chat`, `/api/generate`, `/api/show`, `/api/embed`,
+`/api/tags`) are untouched, and near misses such as `/api/pullxyz` and
+`/api/blobsx` fall through to the proxy. `/api/blobs` without a trailing
+slash gets ServeMux's redirect to `/api/blobs/`, which is refused.
+
+devai's own pipeline never goes through the router for these:
+`scripts/select-models.py` runs `ollama pull` / `ollama create` with
+`podman exec` in the Ollama container, and the Ollama prober talks to that
+container directly. Tests: `gpu-arbiter/mutation_guard_test.go`.
+
 ## Request rewrite chain
 
 Every non-trivial request goes through this chain in order. Each step
@@ -509,8 +576,9 @@ So folding alone is sufficient and **no field filtering is needed** --
 are not the blocker and pass through the normalisation untouched
 (`output_config.effort` is then rewritten by the reasoning policy, see
 3c -- a policy decision, not a shim requirement). SGLang was verified
-independently and behaves identically (see
-`docs/plans/sglang-backend-remediation.md` Phase 0, finding 11).
+independently and behaves identically (see the
+sglang-backend-remediation plan's Phase 0, finding 11; removed 2026-10-05, in git
+history).
 
 This is a client/server API-version mismatch rather than a devai defect:
 Claude Code emits a newer Anthropic beta wire format (note the
@@ -588,7 +656,8 @@ router ones:
   'none']`. A normal function tool therefore fails with a pydantic
   `ValidationError` surfaced as an unhandled **500**. Codex uses function
   tools, so Codex cannot work against SGLang's Responses endpoint
-  regardless of configuration.
+  regardless of configuration. The picker never offers Codex on SGLang
+  (`_AGENT_BACKEND_FAILS` in scripts/model-picker.py, Phase 15 step 6).
 - **Non-Harmony models appear broken on the endpoint.**
   `Qwen3.5-9B-NVFP4` returns `400 "input_ids should be a list of lists
   for batch processing"` on *every* `/v1/responses` request, including a
@@ -637,6 +706,9 @@ backend's protocol path:
 | SGLang `/v1/messages`               | structured | auto REMOVES the client's `output_config.effort` (model default, as on SGLang's other surfaces); low/medium/high set it; off removes it and replaces `thinking` with `{type: disabled}` |
 | Any                                 | inline + policy=off | log `reasoningDisable` (explicit user opt-out) |
 | Any                                 | none / unsupported  | noop |
+
+The SGLang rows describe code that stays, unreachable since the
+2026-10-10 freeze (M16; see [SGLang (frozen)](#sglang-frozen)).
 
 Models with `disable_verified=False` can't reliably suppress
 reasoning -- the directive is sent, but the model may emit reasoning
@@ -930,6 +1002,107 @@ probers launch with the same flags. Without this symmetry the probe
 would record `fits=false` at 128K, the picker would hide the cell,
 and the router would never get a chance to use the recovery flags.
 
+### The machine-made file, and the re-read at each launch
+
+Since platform-rebuild Phase 17a (decision I25) there is a second file,
+`deploy/recovery-flags.generated.json`, for flags a program added:
+recipe flags written by `make recipe-apply NAME=<row>` (docs/backends.md
+"vLLM launch recipes") and, from Phase 18, automatic fixes. The curated
+file is never written by a program, and its contract above does not
+change.
+
+```json
+{
+  "version": 1,
+  "models": {
+    "<model>": [
+      {"backends": ["vllm-devai"], "engine_flags": ["--enforce-eager"],
+       "engine_env": {}, "source": "recipe",
+       "reason": "vllm-project/recipes models/<org>/<repo>.yaml at <commit>",
+       "added": "2026-10-07T10:00:00Z"}
+    ]
+  }
+}
+```
+
+- Each model has a LIST of groups. `backends` is required (there is no
+  "every backend" group); `source` is `recipe` or `auto-fix`
+  (informational; the readers do not check it); a group has no `image`
+  (one is ignored with a warning).
+- For a launch on backend B, the router appends the curated entry's
+  flags (and merges its env) when it applies to B, then every generated
+  group whose `backends` names B or B's engine, in file order -- the
+  curated file's own matching rule, so a `["vllm"]` group reaches a
+  `vllm-devai` launch and a `["vllm-devai"]` group does not reach
+  `vllm`. Later env keys win, and the engine takes the last of a repeated
+  flag.
+- A missing file reads as empty. The repository ships
+  `{"version": 1, "models": {}}`, which adds nothing to any launch.
+  Removing a group, or the whole file, reverts exactly what it added.
+- Writers write the whole file to a temporary name and rename it.
+
+**Malformed input, in both files.** The router and the probers give the
+same verdict on every malformed input; the shared fixture in
+`tests/fixtures/recovery-flags/` (good files, `broken/` files and a
+hand-written `expected.json`) is loaded by both test suites.
+
+- Keys are exact and case-sensitive (`Backends` or `ENGINE_FLAGS` is an
+  unknown key, not a spelling of the real one; the Go reader decodes
+  objects into maps, never into tagged structs, whose matching ignores
+  case).
+- A top level that is not a JSON object (`null` included), a `models` that
+  is neither absent/null nor an object, invalid JSON (NaN included), and
+  in the generated file a `version` other than the integer 1, fail the
+  whole file: the previously loaded content is kept.
+- An entry or group with a malformed field is skipped WHOLE, never applied
+  in part: `engine_flags` must be absent, null or a list of strings (no
+  null or non-string element, not a string); `engine_env` absent, null or
+  an object of strings; a curated `image` absent, null or a string.
+- `backends`: a curated entry follows contract C2 above (a non-list is
+  treated as absent), except that a list with a non-string or null
+  element skips the entry; a generated group's must be a list of strings,
+  else the group is skipped.
+
+**Re-read at each launch.** The router used to read the curated file once,
+at boot. Now `containerRecreate` looks the model up through
+`recoveryFiles` (`gpu-arbiter/recovery_flags.go`), which stats both files
+first and reloads either one whose device, inode, mtime or size changed.
+A file that fails to parse (or carries another `version`) keeps the
+previously loaded content and logs `warning: ... keeping the previously
+loaded ...`; the next launch tries again. A curated file that disappears
+after a good load keeps its previous entries too (`warning: ... disappeared;
+keeping ...`): `git checkout` replaces a file by unlink and create, so a
+launch can land between the two. A curated file missing at boot reads as
+empty and logs with the `warning:` prefix. A removed generated file, by
+contrast, reverts what it added (I25). The probers do the same before each
+launch (`_refresh_recovery` in `scripts/_probe_hf_common.py`).
+
+Every launch that applies recovery flags logs one line naming them and
+their sources, e.g.
+
+```
+  vllm-devai recovery flags for <model>: flags=["--max-num-seqs" "8" ... "--async-scheduling"] env=["VLLM_X=1"] image="" (curated entry: true, generated groups: 1)
+```
+
+**The directory mount.** Compose mounts the repository's `deploy/`
+directory read-only at `/etc/devai/deploy` and points
+`RECOVERY_FLAGS_REGISTRY` and `RECOVERY_FLAGS_GENERATED` at the two files
+there. A single-file bind mount pins the old inode, so a file replaced with
+a new inode (the writers' rename, `git checkout`'s unlink and create) would
+stay invisible and the container would go on reading the old content. The mount source is `${DEVAI_REPO:?...}/deploy`:
+an unset `DEVAI_REPO` stops compose instead of mounting `/deploy`. The
+Makefile exports `DEVAI_REPO := $(CURDIR)`; `tests/test-router-idle.sh`
+and `tests/test-model-matrix.sh`, which run compose themselves, default it
+to the repository root; `make install-systemd` writes it into the unit as
+`Environment="DEVAI_REPO=<path>"`, escaped for a quoted value. **An
+existing systemd install must re-run `make install-systemd`**: the unit it
+installed before has no `DEVAI_REPO`, and compose refuses to start without
+it.
+`RECOVERY_FLAGS_REGISTRY` defaults to `/etc/devai/deploy/recovery-flags.json`
+and `RECOVERY_FLAGS_GENERATED` to `recovery-flags.generated.json` beside
+it. The other router mounts (probe caches,
+`models.yaml`, plugins) are unchanged until Phase 9.
+
 ---
 
 ## vLLM plugin registry
@@ -981,7 +1154,8 @@ The router reads only -- never writes. Keep the writers single-source.
 |--------------------------------------------|--------|------------------------------|-------------------|
 | `deploy/.ollama-reasoning-cache.json`      | v3     | `probe-ollama-reasoning.py`  | digest            |
 | `deploy/.vllm-reasoning-cache.json`        | v2     | `probe-vllm-reasoning.py`    | `<repo>@<sha>`    |
-| `deploy/.sglang-reasoning-cache.json`      | v2     | `probe-sglang-reasoning.py`  | `<repo>@<sha>`    |
+| `deploy/.vllm-devai-reasoning-cache.json`  | v2     | `probe-vllm-devai-reasoning.py` | `<repo>@<sha>` |
+| `deploy/.sglang-reasoning-cache.json` (not read since the SGLang freeze, M16) | v2 | `probe-sglang-reasoning.py` (now in `attic/sglang/scripts/`) | `<repo>@<sha>` |
 | `deploy/vllm-plugins.json`                 | v1     | hand-edited                  | parser name       |
 
 Top-level fields used by the router:
@@ -1010,7 +1184,7 @@ family that already had probed cells).
 
 A missing probe cache is non-fatal: the corresponding backend exposes
 zero models. Run `make probe` (Ollama) or `make probe-vllm` /
-`make probe-sglang` (HF) to populate.
+`make probe-vllm-devai` (HF) to populate.
 
 **`_meta` image-digest block (vLLM/SGLang).** Each HF cache carries a
 top-level `_meta` key (NOT a model row) written by the prober:
@@ -1050,11 +1224,6 @@ the shell when invoking compose.
 | `VLLM_CONTAINER`     | `devai-vllm`                                               | name to recreate              |
 | `VLLM_IMAGE`         | `docker.io/vllm/vllm-openai:v0.22.1-x86_64-cu129-ubuntu2404`       | image to launch               |
 | `VLLM_MODELS_DIR`    | `/var/cache/devai/vllm`                                    | host path bound to `/models`  |
-| `SGLANG_URL`         | `http://devai-sglang:11434`                                | upstream                      |
-| `SGLANG_PORT`        | `11436`                                                    | router listen                 |
-| `SGLANG_CONTAINER`   | `devai-sglang`                                             | name to recreate              |
-| `SGLANG_IMAGE`       | `docker.io/lmsysorg/sglang:v0.5.10.post1-cu130`            | image to launch               |
-| `SGLANG_MODELS_DIR`  | `/var/cache/devai/sglang`                                  | host path bound to `/models`  |
 | `LAYA_TRAINER_URL`   | `http://laya-trainer:11434`                                | upstream (job runner)         |
 | `LAYA_TRAINER_PORT`  | `11438`                                                    | router listen                 |
 | `LAYA_TRAINER_CONTAINER` | `devai-laya-trainer`                                   | name to recreate              |
@@ -1063,6 +1232,11 @@ the shell when invoking compose.
 | `LAYA_CATALOG_FILE`  | `/etc/devai/laya-models.yaml`                              | the trainer's model allowlist |
 | `NETWORK`            | `devai-net`                                                | podman network name           |
 | `PODMAN_SOCKET`      | `/run/podman/podman.sock`                                  | libpod socket inside router   |
+
+The `SGLANG_*` variables (`SGLANG_URL`, `SGLANG_PORT`, `SGLANG_CONTAINER`,
+`SGLANG_IMAGE`, `SGLANG_MODELS_DIR`) are not read since the SGLang freeze
+(M16): the backend entry that read them left the router
+(`attic/sglang/frozen-branches.txt` keeps it).
 
 ### Lifecycle
 
@@ -1076,6 +1250,8 @@ the shell when invoking compose.
 | `DEVAI_SSE_KEEPALIVE_GRACE_SECONDS` | `5` | how long a launch may take before the first frame is sent (and the response is committed as SSE) |
 | `LAYA_MAX_HOLD_S`         | `900`   | longest a busy job runner may refuse other backends, counted from its job's `started_at`; `0` = no cap. An engineering margin set by the owner, not an estimate: the three measured campaign jobs held 123.3 / 135.2 / 140.4 s (1,448-1,789 training rows x 4 epochs, single runs, 2026-09-25; docs/laya-trainer.md "Measurements"). A straight line through two job sizes puts 900 s at roughly 10x that dataset at the same short texts, 4 epochs and lean mode -- an extrapolation the two points cannot test. A job past it fails as `trainer_stopped`. |
 | `LAYA_JOB_TIMEOUT_S`      | `0`     | forwarded to the trainer: per-job wall-clock limit (exit 124); `0` = none |
+| `DEVAI_REQUEST_FINGERPRINT` | `off` | `on` logs one content-free `fingerprint:` line per POST; see [Request fingerprints](#request-fingerprints-find-claude-codes-throwaway-requests) |
+| `DEVAI_REQUEST_FINGERPRINT_RAW` | `off` | `on` turns fingerprints on AND writes every POST body, verbatim, to a file inside the router container (`raw_file` in the line): content-revealing, for capturing a fixture only. Any value other than `on`/`off` counts as off, with a startup warning |
 | `DEVAI_MAX_FAILED_LAUNCHES` | `3` | consecutive launches of the same `(model, ctx)` that may fail to produce a real engine response before the router refuses; `0` disables the breaker. See [Launch circuit breaker](#launch-circuit-breaker-engine-dies-after-passing-health). |
 
 ### SSE keepalive during cold start
@@ -1149,7 +1325,9 @@ Implementation and rationale: `gpu-arbiter/sse_keepalive.go`.
 |------------------------|---------------------------------------------------|-----------------|
 | `PROBE_CACHE`          | `/etc/devai/.ollama-reasoning-cache.json`         | Ollama cache    |
 | `VLLM_PROBE_CACHE`     | `/etc/devai/.vllm-reasoning-cache.json`           | vLLM cache      |
-| `SGLANG_PROBE_CACHE`   | `/etc/devai/.sglang-reasoning-cache.json`         | SGLang cache    |
+| `VLLM_DEVAI_PROBE_CACHE` | `/etc/devai/.vllm-devai-reasoning-cache.json`   | vllm-devai cache |
+
+`SGLANG_PROBE_CACHE` is not read since the SGLang freeze (M16).
 
 ### Plugin registry
 
@@ -1289,7 +1467,7 @@ cache is not stamped and never flagged.
 
 Fix: refresh the cache against the running image --
 `make cache-down && make probe-vllm && make probe-load-vllm` (or the
-`sglang` equivalents). Preview which backends are stale without
+`vllm-devai` equivalents). Preview which backends are stale without
 restarting anything: `make probe-check`.
 
 ### Recreate race on concurrent requests
@@ -1343,6 +1521,81 @@ Useful log lines:
 | `ERROR: <cache> failed to parse: ... -- ZERO <backend> models registered` | probe cache unreadable; the router will 404 every request for that backend and the picker lists none. Replaces the older `warning: probe cache parse failed`. |
 | `error: unloadOllama: keep_alive=0 for <model> failed/returned <status> -- GPU may still be held by ollama` | the Ollama unload that precedes a backend switch did not take; VRAM may still be held |
 | `recovery registry: entry for <model> is scoped to [vllm] -- not applied to sglang` | a per-model recovery entry was skipped because of its `backends` allow-list |
+
+### Request fingerprints (find Claude Code's throwaway requests)
+
+Claude Code sends requests whose answers it throws away -- a quota check,
+title generation, suggestion mode, command-prefix detection, file-path
+extraction -- and each can trigger a cold start. Before any of them is
+answered in the router (platform-rebuild Phase 16b-16c, not built), they
+are found by their shape on real traffic. The fingerprint is observe only:
+the request is neither changed nor answered differently, and with both
+switches off (the default) the request path is unchanged
+(`gpu-arbiter/fingerprint.go`, `fingerprint_test.go`).
+
+With `DEVAI_REQUEST_FINGERPRINT=on` the router logs, for every POST whose
+body it reads (one refused by `MAX_CONCURRENT_REQUESTS` or too large is
+not read), one line:
+
+```
+[vllm] fingerprint: {"path":"/v1/messages","model":"claude-haiku-4-5","max_tokens":1,"n_messages":1,"has_system":false,"system_sha256_12":"","has_tools":false,"stream":false,"body_bytes":213}
+```
+
+- The system text is the top-level `system` (a string or text blocks)
+  plus every `role:"system"` message, as the client sent them (before the
+  router's own normalisation). It appears only as the first 12 hex digits
+  of its SHA-256 -- unsalted, so it can confirm a GUESSED short system
+  prompt, but it does not reveal one. No message, system or tool text is
+  logged; `model` is the client's string, cut at 256 bytes.
+- A body that is not JSON, or a field of an unexpected type, gives zero
+  values for what could not be read (all nine keys are always present).
+- Only `messages`, `system`, `tools`, `max_tokens` / `max_completion_tokens`
+  and `stream` are read: a Responses API body (`input`, `instructions`,
+  `max_output_tokens`), a `developer` role and Ollama's
+  `options.num_predict` are not, so such a line shows `n_messages: 0`.
+  That is enough for Claude Code, whose calls go to `/v1/messages`.
+
+`DEVAI_REQUEST_FINGERPRINT_RAW=on` (fingerprints on, whatever
+`DEVAI_REQUEST_FINGERPRINT` says) also writes each body, byte for byte, to
+its own file under `/tmp/devai-fingerprints/` INSIDE the router container,
+named `<unix-ns>-<backend>-<system_sha256_12 or nosystem>.json` (mode
+0600), and adds `"raw_file":"<name>"` to the line. Capture stops after 256
+MiB per router run (logged once). Bodies never go to the log: conmon
+splits long lines into 8 KiB chunks and the logger's
+`podman logs --timestamps` puts a stamp into every chunk, which corrupts
+a body taken from the log; and the log is persisted. Raw mode captures
+EVERY client's requests, prompts and file contents included. The files
+live only in the container's own filesystem: recreating the container
+removes them, and the router also deletes the directory at start whenever
+raw mode is off.
+
+The runbook (the stack runs under your own, rootless podman):
+
+1. Set `DEVAI_REQUEST_FINGERPRINT=on` in `.env` and run `make cache-up`
+   (compose recreates the router for the changed environment); the
+   startup log says `request fingerprints ON`.
+2. Run a real Claude Code session against the router.
+3. Bucket the lines by `(path, has_system, system_sha256_12, max_tokens,
+   has_tools)`, from the persisted log (`make logs` follows forever):
+
+   ```bash
+   sed -n 's/^[^ ]* [^ ]* [^ ]* \[[a-z0-9-]*\] fingerprint: //p' \
+       /var/cache/devai/logs/devai-router.log \
+     | jq -cR 'fromjson? // empty | [.path, .has_system, .system_sha256_12, .max_tokens, .has_tools]' \
+     | sort | uniq -c | sort -rn
+   ```
+
+4. For each frequent bucket whose answer is a constant or a pure function
+   of the request, capture ONE body as a fixture under
+   `tests/fixtures/claude-code-probes/`: set
+   `DEVAI_REQUEST_FINGERPRINT_RAW=on`, `make cache-up`, trigger the
+   request, then
+   `podman cp devai-router:/tmp/devai-fingerprints ./fingerprints`
+   and pick the file the bucket's line names in `raw_file`. Check a
+   fixture for anything private before committing it.
+5. Set both back to `off` and run `make cache-up`; the recreated router
+   no longer holds any captured body. Delete the local `./fingerprints`
+   copy.
 
 ### Verify a single request end-to-end
 
@@ -1469,7 +1722,7 @@ exact subset name (e.g. `gsm8k_subset_100`) already exists.
 ```
 make bench           # all backends
 make bench-vllm      # only vLLM models
-make bench-sglang    # only SGLang models
+make bench-vllm-devai # only vllm-devai models (bench-sglang went with the SGLang freeze, M16)
 make bench-ollama    # only Ollama models
 make bench-report    # Markdown leaderboard from .bench-cache.json
 make test-bench-smoke # 1-model tiny-subset sanity check

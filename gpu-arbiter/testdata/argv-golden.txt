@@ -49,6 +49,12 @@
   "serve"
 ]
 
+== ollama / vllm-devai-engine-args
+[
+  "/bin/ollama",
+  "serve"
+]
+
 == ollama / plugin-paths-vllm-only
 [
   "/bin/ollama",
@@ -276,6 +282,41 @@
   "--enforce-eager"
 ]
 
+== vllm / vllm-devai-engine-args
+[
+  "python3",
+  "-m",
+  "vllm.entrypoints.openai.api_server",
+  "--model",
+  "/models/Qwen3.8-27B-MTP-devai-NVFP4",
+  "--host",
+  "0.0.0.0",
+  "--port",
+  "11434",
+  "--tensor-parallel-size",
+  "1",
+  "--max-model-len",
+  "118784",
+  "--kv-cache-dtype",
+  "fp8",
+  "--gpu-memory-utilization",
+  "0.9600",
+  "--enable-prefix-caching",
+  "--trust-remote-code",
+  "--served-model-name",
+  "Qwen3.8-27B-MTP-devai-NVFP4",
+  "--max-num-seqs",
+  "32",
+  "--reasoning-parser",
+  "qwen3",
+  "--enable-auto-tool-choice",
+  "--tool-call-parser",
+  "qwen3_xml",
+  "--prefix-cache-retention-interval",
+  "None",
+  "--enforce-eager"
+]
+
 == vllm / plugin-paths-vllm-only
 [
   "python3",
@@ -331,7 +372,8 @@
   "0.9000",
   "--context-length",
   "32768",
-  "--trust-remote-code"
+  "--trust-remote-code",
+  "--enable-metrics"
 ]
 
 == sglang / typical-nvfp4-128k
@@ -354,6 +396,7 @@
   "--context-length",
   "131072",
   "--trust-remote-code",
+  "--enable-metrics",
   "--max-running-requests",
   "32",
   "--reasoning-parser",
@@ -382,6 +425,7 @@
   "--context-length",
   "262144",
   "--trust-remote-code",
+  "--enable-metrics",
   "--max-running-requests",
   "32",
   "--tool-call-parser",
@@ -408,6 +452,7 @@
   "--context-length",
   "131072",
   "--trust-remote-code",
+  "--enable-metrics",
   "--kv-cache-dtype",
   "fp8",
   "--max-running-requests",
@@ -435,7 +480,8 @@
   "0.9000",
   "--context-length",
   "65536",
-  "--trust-remote-code"
+  "--trust-remote-code",
+  "--enable-metrics"
 ]
 
 == sglang / ollama-q8-kv
@@ -458,6 +504,7 @@
   "--context-length",
   "131072",
   "--trust-remote-code",
+  "--enable-metrics",
   "--kv-cache-dtype",
   "q8_0"
 ]
@@ -481,7 +528,8 @@
   "0.9000",
   "--context-length",
   "32768",
-  "--trust-remote-code"
+  "--trust-remote-code",
+  "--enable-metrics"
 ]
 
 == sglang / recovery-flags-last
@@ -504,10 +552,41 @@
   "--context-length",
   "32768",
   "--trust-remote-code",
+  "--enable-metrics",
   "--max-running-requests",
   "32",
   "--reasoning-parser",
   "qwen3",
+  "--enforce-eager"
+]
+
+== sglang / vllm-devai-engine-args
+[
+  "python3",
+  "-m",
+  "sglang.launch_server",
+  "--model-path",
+  "/models/Qwen3.8-27B-MTP-devai-NVFP4",
+  "--served-model-name",
+  "Qwen3.8-27B-MTP-devai-NVFP4",
+  "--host",
+  "0.0.0.0",
+  "--port",
+  "11434",
+  "--tp-size",
+  "1",
+  "--mem-fraction-static",
+  "0.9600",
+  "--context-length",
+  "118784",
+  "--trust-remote-code",
+  "--enable-metrics",
+  "--max-running-requests",
+  "32",
+  "--reasoning-parser",
+  "qwen3",
+  "--tool-call-parser",
+  "qwen3_xml",
   "--enforce-eager"
 ]
 
@@ -531,6 +610,7 @@
   "--context-length",
   "131072",
   "--trust-remote-code",
+  "--enable-metrics",
   "--max-running-requests",
   "32",
   "--reasoning-parser",

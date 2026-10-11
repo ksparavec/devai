@@ -3,11 +3,13 @@
 ## Project Overview
 
 DevAI is a containerized local AI development environment. It provides
-JupyterLab, multiple AI CLIs, an interactive model picker, Open WebUI, and a
-GPU-aware inference router. All three inference backends (Ollama, vLLM, SGLang)
-are wired and covered by router tests. vLLM and SGLang start as `sleep infinity`
-placeholders so `make cache-up` is hermetic; the router replaces them via libpod
-on demand when a request arrives on the backend's port. See
+JupyterLab, multiple AI CLIs, an interactive model picker, and a
+GPU-aware inference router. The inference backends (Ollama, vLLM, vllm-devai)
+are wired and covered by router tests; SGLang was frozen on 2026-10-10 by
+platform-rebuild Phase 15 (M16, `attic/sglang/RESTORE.md`). The vLLM backends
+start as `sleep infinity` placeholders so `make cache-up` is hermetic; the
+router replaces them via libpod on demand when a request arrives on the
+backend's port. See
 `docs/backends.md` for the lifecycle, probing procedure, and failure-mode
 taxonomy before changing backend behavior.
 
@@ -18,19 +20,12 @@ to return. `gpu-arbiter` still accepts `--mode`, but any value other than
 `single` exits with a pointer to `attic/README.md`. Read that README before
 touching anything cluster- or fleet-shaped.
 
-Optional opt-in surfaces (gated behind compose profiles, default behaviour
-unchanged):
-
-- **MCP gateway** (profile=`mcp`) -- Docker MCP Gateway peer service on port
-  8088, endpoint path `/mcp`, bearer token minted at startup. Third-party
-  servers come from Docker's official catalog; `deploy/mcp-catalog-devai.yaml`
-  adds the one server this repo authors. 15 servers enabled, 134 tools
-  verified live on 2026-07-25. See `docs/mcp.md`.
-- **sops + age secret store** -- shared encrypted-at-rest scaffold. Two of its
-  three intended consumers are now frozen, so the only remaining one is the
-  MCP gateway's `github-official` / `firecrawl` secrets, and that path is
-  unverified. Operators run `make age-keygen-host` once and append their
-  public key to `.sops.yaml`. See `docs/secrets.md`.
+Removed on 2026-10-07 by platform-rebuild Phase 1: Open WebUI and its nginx
+TLS proxy (decision M9; browser chat is the DeepSeek Harness web UI) and the
+MCP gateway with devai's own `devai-model-status` server (M10), both deleted;
+the AMD/ROCm GPU-vendor overlay (M11) and the sops/age secret-store scaffold
+(M12), both moved to `attic/` (`attic/amd-rocm/`, `attic/sops-age/`, each
+with a `RESTORE.md`). devai is NVIDIA-only.
 
 The lab image bundles the `sky` CLI and `/usr/local/bin/sky-setup.sh` for the
 user-facing cloud flow (`docs/skypilot-user-guide.md`). That is a separate
@@ -45,8 +40,7 @@ flags, mounted paths, or runtime environment variables.
 - `gpu-arbiter/`: Go module for the GPU-aware multi-port reverse proxy. Tests
   live beside the source as `*_test.go`.
 - `deploy/`: container and runtime assets, including Dockerfiles,
-  `docker-compose.yaml`, generated model catalogs, systemd units, and WebUI
-  proxy configuration.
+  `docker-compose.yaml`, generated model catalogs, and systemd units.
 - `scripts/`: operational Python and shell tooling. Important scripts include
   `generate-catalog.py`, `probe-ollama-reasoning.py`, `select-models.py`, and
   `model-picker.py`.
@@ -73,7 +67,7 @@ The inference stack is fronted by `devai-router`, implemented in
 
 - `11434`: Ollama, active
 - `11435`: vLLM, dormant
-- `11436`: SGLang, dormant
+- `11436`: SGLang, frozen on 2026-10-10 (M16) -- not served
 
 The router manages backend lifecycle, GPU exclusion, idle shutdown, drain
 behavior, and request forwarding. Request path and port determine protocol and
@@ -82,8 +76,9 @@ protocol fields, not by prompt hacks in agents. The current reasoning semantics
 are documented in `docs/ollama_models.md`.
 
 The router also refuses model-store mutations. `/api/pull`, `/api/create`,
-`/api/push`, `/api/copy` and `/api/delete` return 403 on every backend
-listener, for every HTTP method, before the catch-all proxy sees them
+`/api/push`, `/api/copy`, `/api/delete` and `/api/blobs/...` return 403 on
+every backend listener, for every HTTP method, before the catch-all proxy
+sees them, also when a slash in the path is percent-encoded
 (`ollamaMutationPaths` / `makeMutationGuard` / `newBackendMux` in
 `gpu-arbiter/main.go`). Without that guard anything in the lab could pull an
 unprobed model and then serve it, bypassing the probe-cache fit gate. The
@@ -95,17 +90,15 @@ operator pipeline does not traverse the router -- `select-models.py` uses
 
 Use `make help` to list supported targets. Common commands:
 
-- `make build-cpu`: build the CPU lab image.
-- `make build-gpu`: build the GPU/CUDA lab image.
-- `make build-router`: build the router image.
-- `make build`: build CPU, GPU, and router images.
+- `make build-lab`: build the lab image (one image; GPU when the host has one, CPU otherwise).
+- `make build-router`: build the router image (a host-built static binary in FROM scratch).
+- `make build-apt-cache`, `make build-pipelock`: build the apt-cache and pipelock images (platform-rebuild Phase 2).
+- `make build`: build the lab, router, apt-cache and pipelock images.
 - `make cache-up`: start active infrastructure services.
 - `make cache-down`: stop infrastructure services.
 - `make cache-status`: show service and model-cache status.
-- `make lab-gpu`: run JupyterLab with GPU support.
-- `make lab-cpu`: run JupyterLab without GPU support.
-- `make shell-gpu`: start the GPU shell and open the model picker.
-- `make shell-cpu`: start the CPU shell.
+- `make lab`: run JupyterLab (with the GPU when the host check finds one; `DEVAI_GPU_DEVICE=` forces the CPU).
+- `make shell`: start the shell and open the model picker.
 - `make catalog-regen`: refresh `deploy/models.yaml` from the upstream HF
   and Ollama registries (input is `scripts/model-families.yaml`).
 - `make probe`: probe every downloaded Ollama digest at every
@@ -132,41 +125,34 @@ Use `make help` to list supported targets. Common commands:
   protocol (`/api/chat`, `/v1/chat/completions`, `/v1/messages`) x
   scenario (basic, tools, reasoning auto/off, ctx). Reads the probe
   cache to enumerate cells (slow -- minutes-to-tens-of-minutes).
-- `make test-vllm` / `make test-sglang`: live HF-backend integration
+- `make test-vllm`: live HF-backend integration
   tests through the router (cold-start chat, ctx switch, model switch
   when >=2 models cached, GPU exclusion, parameter forwarding).
   Skip cleanly when no fitting model is in the corresponding cache.
 - `make test-e2e`: bridges picker discovery, agent-command construction,
   and a live router round-trip -- proves the full picker->agent->router
   chain serves a real chat completion.
-- `make test-probe-vllm` / `make test-probe-sglang`: single-cell probe
-  smoke tests with cache-schema assertion (require `cache-down` first).
+- `make test-probe-vllm`: single-cell probe
+  smoke test with cache-schema assertion (requires `cache-down` first).
+  (`test-sglang` and `test-probe-sglang` went to `attic/sglang/` with the
+  SGLang freeze, M16.)
 - `make test-probe-ollama-idempotent`: byte-identical regression check
   on the refactored Ollama prober.
 - `make test`: runs **every** available test in sequence -- Go unit +
-  Python unit + Ollama integration + matrix + vLLM/SGLang integration +
+  Python unit + Ollama integration + matrix + vLLM integration +
   E2E + probe smoke. Wall time 30-60+ min. Each layer skips cleanly
   when its prerequisites aren't met.
-- `make test-python`: stdlib-unittest cases (612 collected as of
-  2026-07-27) covering bench v3 schema migration + runner ctx flags
-  + picker keying + report rendering, sops/age scaffold script
-  gates, MCP gateway catalog/compose/Makefile shape, SkyPilot
-  agent-skill, catalog-discover, and the model-lifecycle ledger.
+- `make test-python`: stdlib-unittest cases covering bench v3 schema
+  migration + runner ctx flags + picker keying + report rendering,
+  SkyPilot agent-skill, catalog-discover, and the model-lifecycle
+  ledger.
 
-MCP / secrets targets (opt-in):
-
-- `make mcp-up` / `make mcp-down` / `make mcp-logs` / `make mcp-test` /
-  `make mcp-secrets-render`: MCP gateway (profile=`mcp`).
-  `make mcp-test` does a real handshake, asserts a tool-count floor,
-  and invokes a tool; it skips (77) only when the gateway container
-  is absent. `make mcp-health` is liveness only -- do not read it as
-  a functional check.
-- `make build-mcp-modelstatus-image` / `make test-mcp-modelstatus`:
-  the one MCP server this repo authors. The gateway runs servers with
-  `--pull never`, so build the image before starting the gateway.
-- `make age-keygen-host` / `make secrets-tmpfs` /
-  `make secrets-edit SOPS_FILE=...` / `make secrets-rotate`:
-  shared sops/age scaffold.
+The MCP targets (`mcp-*`, `build-mcp-modelstatus-image`,
+`test-mcp-modelstatus`) were deleted on 2026-10-07 with the gateway.
+The sops/age targets (`secrets-*`, `age-keygen-host`) and the AMD
+overlay's (`gpu-vendor`, `test-gpu-vendor`) are preserved verbatim in
+`attic/sops-age/Makefile.frozen-targets` and
+`attic/amd-rocm/Makefile.frozen-targets`.
 
 The cluster-mode and SkyPilot targets are gone. All 9 of them
 (`cluster-head-up`, `cluster-head-down`, `cluster-status`,
@@ -185,7 +171,7 @@ the host. Use the documented container build flow from `CLAUDE.md` or
 declares `ollama_repos`, `hf_repos`, and/or `gguf_repos`, plus an
 `arch_ref` HF repo for architecture metadata. Backend is implicit:
 `ollama_repos` and `gguf_repos` rows run on Ollama; `hf_repos` rows run
-on vLLM/SGLang (currently dormant).
+on vLLM / vllm-devai (SGLang was frozen on 2026-10-10, M16).
 
 `deploy/models.yaml` is the generated full model catalog. It is
 refreshed by `make catalog-regen`, not hand-edited.
@@ -247,21 +233,13 @@ Important runtime knobs:
 - `GPU_MEMORY_GB`: total GPU VRAM, default `24`.
 - `MAX_CONTEXT_LEN`: default per-request context cap in tokens, default `131072`.
 - `CONTEXT`: per-run picker/model selection override, for example
-  `CONTEXT=32768 make shell-gpu`.
+  `CONTEXT=32768 make shell`.
 - `VRAM`: per-run VRAM override, for example `VRAM=16 make model-fit`.
 - `PROBE_VRAMS`, `PROBE_CONTEXTS`: comma-separated lists driving
   `make probe`. Defaults `16G,24G` and `32K,64K,128K,256K`.
 - `PROBE_FORCE`, `PROBE_FORCE_CTX`: re-probe the current VRAM band /
   the named tier, ignoring existing cache cells.
 - `DEVAI_REASONING`: `auto|off|low|medium|high`.
-
-MCP env knobs:
-
-- `MCP_PORT`: gateway host port, default 8088, bound to 127.0.0.1.
-  The endpoint is `http://127.0.0.1:${MCP_PORT}/mcp` -- the `/mcp`
-  path is required and a bearer token is mandatory.
-- `MCP_SECRETS_FILE`: host path of the rendered secrets file, mounted
-  at the fixed container path `/secrets/.env`; default `/dev/null`.
 
 `DEVAI_MODE` and the whole `DEVAI_HEAD_*` / `DEVAI_WORKER_*` /
 `SKYPILOT_*` env surface went with the freeze. Their contract table is
@@ -340,14 +318,9 @@ or generated logs. `.env` is local configuration; keep `.env.example` generic.
 Proxy variables and runtime settings should be documented without embedding
 private infrastructure details.
 
-Encrypted credentials live in `deploy/*.sops.env` (committed) and are rendered
-to `/run/devai/*.env` (tmpfs, gitignored) by `make *-secrets-render`. Plaintext
-templates are shipped as `*.sops.env.example` so operators see the expected
-variable names without decrypting anything. `.gitignore` blocks `*.env.plain`
-and `/run/devai`; the `!deploy/*.sops.env` exception ensures encrypted files
-stay tracked even under broader rules. Run the sops/age scaffold's pre-commit
-checklist (per `docs/secrets.md`) before any commit that touches `.sops.yaml`
-or a `.sops.env` file -- it catches the literal `age1xxx...` placeholder.
+The repo has no live encrypted-secret store: the sops/age scaffold moved to
+`attic/sops-age/` on 2026-10-07 (platform-rebuild Phase 1, M12). Read its
+`RESTORE.md` before reintroducing encrypted files under `deploy/`.
 
 Prefer Make targets over raw container commands. They preserve expected mounts,
 network names, user settings, and environment variables. If a workflow truly

@@ -696,3 +696,192 @@ class ServingSearchStepsDownTest(unittest.TestCase):
         self.assertIsNone(
             self.cx.binary_search_max_ctx(works, grid=(262144,)))
         self.assertEqual(probed, [262144])
+
+
+class TestLoadProbeMTP(unittest.TestCase):
+    """`--mtp` (Make PROBE_MTP, plan 4v): the load probe serves a row the way
+    the picker does. A row whose fit cell records `mtp_fits: true` is
+    relaunched with its catalog drafter -- the speculative config the fit
+    pass builds (row_speculative_config, one builder for both passes) -- and
+    the cell is stamped `serving_mtp: true`. Every other row, and every row
+    without --mtp, is relaunched without a drafter exactly as before, and a
+    rewritten cell never keeps a stale stamp.
+    """
+
+    MTP = {"method": "mtp", "num_speculative_tokens": 3}
+
+    def _run(self, *, cell: dict, mtp: bool, row_mtp: dict | None = None,
+             force: bool = False, backend: str = "vllm-devai",
+             serving: dict | None = None, ctx_key: str = "131072",
+             ctx_arg: str = "128K", serves=None) -> tuple[dict, list]:
+        import argparse
+        import contextlib
+        import io
+        import types
+
+        calls: list[tuple[int, str | None]] = []
+        row = {"name": "m", "repo": "vendor/m", "sha": "sha1", "parsers": {}}
+        if row_mtp is not None:
+            row["mtp"] = row_mtp
+        cache = {"vendor/m@sha1": {"schema_version": 2, "repo": "vendor/m", "sha": "sha1",
+                                   "aliases": ["m"], "capability": "structured",
+                                   "probes": {"24": {ctx_key: dict(cell)}}}}
+        names = ("assert_no_active_backends", "install_probe_cleanup",
+                 "load_catalog_hf_rows", "load_corpus", "is_downloaded",
+                 "model_size_gb_from_row", "load_cache", "save_cache",
+                 "image_digest_via_cli", "load_probe_one_cell", "_load_ledger",
+                 "_save_ledger", "_ledger_reason", "_ledger_record", "_ledger_clear",
+                 "effective_position_limit")
+        saved = {n: getattr(L, n) for n in names}
+        L.assert_no_active_backends = lambda runtime: None
+        L.install_probe_cleanup = lambda: None
+        L.load_catalog_hf_rows = lambda catalog, name: [row]
+        L.load_corpus = lambda: "filler text. " * 100
+        L.is_downloaded = lambda name, models_dir: True
+        L.model_size_gb_from_row = lambda r: 16.0
+        L.load_cache = lambda path: cache
+        L.save_cache = lambda path, c: None
+        L.image_digest_via_cli = lambda runtime, image: "sha256:deadbeef"
+        L._load_ledger = lambda: {}
+        L._save_ledger = lambda ledger, host_vram_gb=None: None
+        L._ledger_reason = lambda ledger, name, backend: None
+        L._ledger_record = lambda ledger, name, backend, reason, **kw: None
+        L._ledger_clear = lambda ledger, name, backend: None
+        L.effective_position_limit = lambda name, models_dir: None
+
+        def fake_probe(spec, *, requested_ctx, speculative_config=None, **kw):
+            calls.append((requested_ctx, speculative_config))
+            if serves is not None:
+                return {"serving_ok": serves(requested_ctx), "serving_peak_gb": 22.0,
+                        "needle_score": 1.0}
+            return dict(serving or {"serving_ok": True, "serving_peak_gb": 22.0,
+                                    "needle_score": 1.0})
+        L.load_probe_one_cell = fake_probe
+        with tempfile.TemporaryDirectory() as td:
+            args = argparse.Namespace(
+                runtime="podman", repo="", catalog=Path(td) / "models.yaml",
+                cache=Path(td) / "cache.json", models_dir=td, host_vram_gb=24, ctx=ctx_arg,
+                image="img", container_name="c", probe_port=18000, force=force,
+                no_cache_write=False, needle_depth=0.5, mtp=mtp)
+            try:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    L.run_load_probe_pass(types.SimpleNamespace(name=backend), args)
+            finally:
+                for k, v in saved.items():
+                    setattr(L, k, v)
+        return cache["vendor/m@sha1"]["probes"]["24"], calls
+
+    _FIT = {"ctx": 131072, "fits": True, "capability": "structured", "mtp_fits": True}
+
+    def test_an_mtp_fits_row_is_served_with_the_fit_pass_drafter(self) -> None:
+        import _probe_hf_common as hf
+        band, calls = self._run(cell=self._FIT, mtp=True, row_mtp=self.MTP)
+        want = hf.speculative_config_json("mtp", None, 3)
+        self.assertEqual(calls, [(131072, want)])
+        self.assertEqual(json.loads(want), {"method": "mtp", "num_speculative_tokens": 3})
+        self.assertIs(band["131072"]["serving_mtp"], True)
+        self.assertTrue(band["131072"]["serving_ok"])
+
+    def test_a_row_without_mtp_fits_is_served_without_a_drafter(self) -> None:
+        for cell in ({**self._FIT, "mtp_fits": False}, {k: v for k, v in self._FIT.items()
+                                                         if k != "mtp_fits"}):
+            with self.subTest(cell=cell):
+                band, calls = self._run(cell=cell, mtp=True, row_mtp=self.MTP)
+                self.assertEqual(calls, [(131072, None)])
+                self.assertNotIn("serving_mtp", band["131072"])
+
+    def test_without_the_flag_the_load_probe_is_stock(self) -> None:
+        band, calls = self._run(cell=self._FIT, mtp=False, row_mtp=self.MTP)
+        self.assertEqual(calls, [(131072, None)])
+        self.assertNotIn("serving_mtp", band["131072"])
+
+    def test_an_exact_context_cell_is_served_at_its_own_context(self) -> None:
+        # 4v confirms Qwen3.8-27B-MTP-devai-NVFP4 at 118,784 (PROBE_CTX_EXACT),
+        # no 32K multiple, and its load probe runs with the Makefile's
+        # default PROBE_CONTEXTS. The first launch is at the cell's context,
+        # and the cell stays there.
+        cell = {**self._FIT, "ctx": 118784}
+        band, calls = self._run(cell=cell, mtp=True, row_mtp=self.MTP, ctx_key="118784",
+                                ctx_arg="32K,64K,128K,256K")
+        self.assertEqual([c for c, _ in calls], [118784])
+        self.assertEqual(list(band), ["118784"])
+        self.assertTrue(band["118784"]["serving_ok"])
+        self.assertIs(band["118784"]["serving_mtp"], True)
+
+    def test_an_exact_context_cell_that_does_not_serve_moves_down_as_before(self) -> None:
+        cell = {**self._FIT, "ctx": 118784}
+        band, calls = self._run(cell=cell, mtp=True, row_mtp=self.MTP, ctx_key="118784",
+                                ctx_arg="32K,64K,128K,256K", serves=lambda ctx: ctx <= 98304)
+        self.assertEqual(calls[0][0], 118784)
+        self.assertEqual(list(band), ["98304"])
+        self.assertTrue(band["98304"]["serving_ok"])
+
+    def test_a_cell_above_the_requested_ceiling_keeps_the_cap(self) -> None:
+        # --ctx 64K with a 131,072 cell: nothing above 64K is launched.
+        band, calls = self._run(cell=self._FIT, mtp=False, ctx_arg="64K")
+        self.assertTrue(calls)
+        self.assertLessEqual(max(c for c, _ in calls), 65536)
+
+    def test_a_reprobe_without_the_drafter_drops_a_stale_stamp(self) -> None:
+        stale = {**self._FIT, "serving_ok": True, "serving_mtp": True}
+        band, calls = self._run(cell=stale, mtp=False, row_mtp=self.MTP, force=True)
+        self.assertEqual(calls, [(131072, None)])
+        self.assertNotIn("serving_mtp", band["131072"])
+
+    def test_under_mtp_a_verdict_measured_without_the_drafter_is_not_cached(self) -> None:
+        plain = {**self._FIT, "serving_ok": True}
+        _, calls = self._run(cell=plain, mtp=True, row_mtp=self.MTP)
+        self.assertEqual(len(calls), 1)
+        _, calls = self._run(cell={**plain, "serving_mtp": True}, mtp=True, row_mtp=self.MTP)
+        self.assertEqual(calls, [], "a verdict measured with the drafter is cached")
+        _, calls = self._run(cell=plain, mtp=False, row_mtp=self.MTP)
+        self.assertEqual(calls, [], "without --mtp the cache rule is today's")
+
+    def test_a_failed_mtp_serve_still_records_what_was_launched(self) -> None:
+        band, calls = self._run(cell=self._FIT, mtp=True, row_mtp=self.MTP,
+                                serving={"serving_ok": False,
+                                         "serving_error": "oom_marker: CUDA out of memory"})
+        self.assertTrue(all(sc is not None for _, sc in calls))
+        cell = next(iter(band.values()))
+        self.assertFalse(cell["serving_ok"])
+        self.assertIs(cell["serving_mtp"], True)
+
+    def test_sglang_never_gets_a_drafter_stamp(self) -> None:
+        band, calls = self._run(cell=self._FIT, mtp=True, row_mtp=self.MTP, backend="sglang")
+        self.assertEqual(calls, [(131072, None)])
+        self.assertNotIn("serving_mtp", band["131072"])
+
+    def test_load_probe_one_cell_hands_the_config_to_the_launch_argv(self) -> None:
+        # The argv builder, not just the pass, must see the drafter.
+        import types
+        seen: dict = {}
+
+        def build_args(model, ctx, frac, **kw):
+            seen.update(kw)
+            return ["--model", f"/models/{model}"]
+
+        def refuse(*a, **kw):
+            raise RuntimeError("no container in tests")
+        names = ("container_remove", "_wait_for_vram_settle", "container_run_detached",
+                 "recovery_overrides", "recovery_image")
+        saved = {n: getattr(L, n) for n in names}
+        L.container_remove = lambda runtime, name: None
+        L._wait_for_vram_settle = lambda *a, **kw: None
+        L.container_run_detached = refuse
+        L.recovery_overrides = lambda name, backend: ([], {})
+        L.recovery_image = lambda name, backend: None
+        spec = types.SimpleNamespace(name="vllm-devai", reserve_gb=1.0, supports_plugins=False,
+                                     build_args=build_args, entrypoint="python3")
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                rec = L.load_probe_one_cell(
+                    spec, runtime="podman", image="img", container_name="c",
+                    probe_port=18000, models_dir=td, model_name="m", requested_ctx=131072,
+                    band_gb=24, host_vram_gb=24, model_size_gb=16.0, reasoning_parser=None,
+                    tool_parser=None, corpus="x", needle_depth=0.5, kv_cache_dtype="fp8",
+                    speculative_config='{"method":"mtp","num_speculative_tokens":3}')
+        finally:
+            for k, v in saved.items():
+                setattr(L, k, v)
+        self.assertEqual(seen["speculative_config"], '{"method":"mtp","num_speculative_tokens":3}')
+        self.assertIn("launch_failed", rec["serving_error"])

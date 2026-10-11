@@ -21,19 +21,16 @@ For tasks where cloud AI is appropriate, the JupyterLab environment also include
 
 ## Features
 
-- **Two-step interactive picker** -- pick a model (+ backend for HF repos), then an agent. Arrow-key navigation via fzf in the shell (`make shell-gpu`); same flow from JupyterLab launcher cards. Renders per-backend discovery with FORMAT, PARSER, and reasoning-off variants. Inline-reasoning models produce two rows (default + "Reasoning off").
-- **Probe-verified model facts** -- every downloaded model is probed against the live runtime (Ollama, vLLM, or SGLang). Reasoning behavior (Structured / Inline / Unsupported / Error) plus actual VRAM use at every (VRAM band, context tier) cell, full on-GPU confirmation, and tool-parser verification are measured, not guessed. Cells are probed independently; no interpolation.
+- **Two-step interactive picker** -- pick a model (+ backend for HF repos), then an agent. Arrow-key navigation via fzf in the shell (`make shell`); same flow from JupyterLab launcher cards. Renders per-backend discovery with FORMAT, PARSER, and reasoning-off variants. Inline-reasoning models produce two rows (default + "Reasoning off").
+- **Probe-verified model facts** -- every downloaded model is probed against the live runtime (Ollama or vLLM; SGLang is frozen, see below). Reasoning behavior (Structured / Inline / Unsupported / Error) plus actual VRAM use at every (VRAM band, context tier) cell, full on-GPU confirmation, and tool-parser verification are measured, not guessed. Cells are probed independently; no interpolation.
 - **Per-context bench leaderboard** -- bench cache schema v3 keys rows by `(model, backend, ctx)` so the picker shows TOOLS / TPS / CODE% / CODE+% / MMLU% / GPQA% / LEAK% values at the user's chosen ctx exactly (the saturated `REAS%` / `TOTAL%` composites were retired for those sharper discriminators). Same model benched at 32K and 128K lands in distinct rows instead of silently overwriting (under MTP a single model can differ by 17+ tok/s between ctx tiers). See `docs/bench-results.md`.
 - **Single-host by design** -- one workstation, one GPU, one router. Multi-host cluster mode and the SkyPilot cloud-burst fleet provisioner were built, never ran end to end, and are frozen (not deleted) under `attic/cluster-mode/`. `gpu-arbiter` still accepts `--mode`, but any value other than `single` exits with a pointer to [`attic/README.md`](attic/README.md). See "Frozen work" below.
-- **MCP gateway** (opt-in, profile=`mcp`) -- the Docker MCP Gateway as a peer service on port 8088, published on `127.0.0.1` only. 15 servers enabled: 14 resolved from Docker's official catalog, which upstream digest-pins and maintains (filesystem / git / SQLite / fetch / memory / time / sequentialthinking / duckduckgo / arxiv-mcp-server / wikipedia-mcp / github-official / firecrawl / hugging-face / context7), plus the project's own `devai-model-status`. Single endpoint any MCP-aware agent can target; the gateway is dual-homed on `devai-net` and `devai-lab-egress` so lab containers can reach it. See "MCP Gateway" below and `docs/mcp.md`.
-- **sops + age secret store** -- shared encrypted-at-rest scaffold for the credentials the project needs (today: the MCP gateway's `github-official` / `firecrawl` secrets). Per-host age key custody, tmpfs-only render targets, idempotent rotation, extra-recipient onboarding via `sops updatekeys`. See `docs/secrets.md`.
 - **MoE / dense awareness** -- Ollama probe captures `expert_count` / `expert_used_count` from `/api/show`, surfaced in the picker as `MoE 8/128` or `dense`. Same fit rules apply (full weights must be GPU-resident), but you can see at a glance which models give big-model-quality at small-model speed.
 - **Multiple AI CLIs pre-installed** -- Claude Code, OpenAI Codex, Google Gemini CLI, OpenCode, Pi, DeepSeek Harness (web UI in JupyterLab, dstui in any terminal), aiagent, Ollama. All wired through the local router by default.
 - **SkyPilot CLI in the lab** -- the lab image installs the `sky` CLI (offline, from pre-fetched wheels) plus the `sky-setup.sh` first-launch helper, so a user can drive her own cloud accounts from inside the container. This is user-driven and entirely separate from the frozen system-side fleet provisioner. See `docs/skypilot-user-guide.md`.
 - **VS Code in the browser** -- code-server provides a full Visual Studio Code experience accessible from any browser.
-- **Automatic GPU-arbitrated model serving** -- Ollama for GGUF models, vLLM/SGLang for NVFP4 models. The gpu-arbiter router transparently switches backends and exposes a single endpoint per protocol (`/api/chat`, `/v1/chat/completions`, `/v1/messages`).
+- **Automatic GPU-arbitrated model serving** -- Ollama for GGUF models, vLLM (stock and the home-built vllm-devai) for NVFP4 models. SGLang was frozen on 2026-10-10 by platform-rebuild Phase 15 (M16; `attic/sglang/RESTORE.md`). The gpu-arbiter router transparently switches backends and exposes a single endpoint per protocol (`/api/chat`, `/v1/chat/completions`, `/v1/messages`).
 - **Reasoning policy at the router** -- set `DEVAI_REASONING=auto|off|low|medium|high` to control thinking mode globally; override per-request via `X-DevAI-Reasoning` header or per-session via `<model>::<reasoning>` suffix (e.g., `qwen3.5:9b::nothink` forces thinking off even for structured-capable models). The router maps your policy to the right native protocol field (Ollama's `think:`, vLLM/SGLang's `enable_thinking`) based on each model's verified capability.
-- **Open WebUI chat interface** -- web-based chat UI over HTTPS that sees all available models.
 - **Fast iteration** -- two-layer container build separates rarely-changing system packages from frequently-updated tools.
 - **Aggressive caching** -- CLI binaries via ETags, APT proxy, Docker Hub mirror.
 - **Works with Podman and Docker** -- rootless Podman is the default.
@@ -73,13 +70,13 @@ make build           # Build all images (CPU + GPU + router)
 ### 3. Start Infrastructure
 
 ```bash
-make cache-up        # Start all services. vLLM/SGLang start as `sleep` placeholders;
+make cache-up        # Start all services. vLLM/vllm-devai start as `sleep` placeholders;
                      # router recreates them on demand. See docs/backends.md.
 ```
 
 ### 4. Pull, Probe & Select
 
-Three orthogonal commands. `make probe` (Ollama) + `make probe-vllm` / `make probe-sglang` populate the probe caches; `make model-fit` queries them; `make model-pull` downloads best-fit candidates across a (family, backend, context) matrix.
+Three orthogonal commands. `make probe` (Ollama) + `make probe-vllm` / `make probe-vllm-devai` populate the probe caches; `make model-fit` queries them; `make model-pull` downloads best-fit candidates across a (family, backend, context) matrix.
 
 ```bash
 # Ollama probing (Make-orchestrated per PROBE_VRAMS bands)
@@ -87,10 +84,10 @@ make probe                                    # probe every (VRAM, ctx) cell
 make probe PROBE_VRAMS=24G PROBE_CONTEXTS=128K # one band, one tier
 make probe PROBE_FORCE=1                      # re-probe everything, ignore cache
 
-# vLLM/SGLang probing (requires `make cache-down` first for exclusive GPU access)
+# vLLM probing (requires `make cache-down` first for exclusive GPU access)
 make cache-down
 make probe-vllm                               # probe vLLM across all (VRAM, ctx)
-make probe-sglang                             # probe SGLang across all (VRAM, ctx)
+# (probe-sglang went to attic/sglang/ with the SGLang freeze, M16)
 make cache-up
 
 # Matrix-mode downloading (iterates all context tiers per family/backend)
@@ -108,9 +105,9 @@ make model-fit VRAM=16 CONTEXT=32768          # query a different (VRAM, ctx)
 ### 5. Run
 
 ```bash
-make lab-gpu         # Start JupyterLab with GPU (or make lab-cpu)
+make lab             # Start JupyterLab (GPU when the host has one; DEVAI_GPU_DEVICE= forces the CPU)
 # OR
-make shell-gpu       # Drop straight into the model picker (cwd = repo)
+make shell           # Drop straight into the model picker (cwd = repo)
 # OR (standalone host launcher -- see "devai-agent" below)
 make install                  # one-time: stage launcher + config in ~/.local/bin and ~/.devai/
 devai-agent --init            # one-time: write default ~/.devai/preferences.yaml
@@ -119,11 +116,11 @@ cd ~/myproject && devai-agent # launch with myproject/ mounted as work dir
 
 Access:
 - **JupyterLab**: `https://<HOST_IP>:8888`
-- **Open WebUI**: `https://<HOST_IP>:8443`
+- **DeepSeek Harness web UI** (browser chat with every backend): started from its JupyterLab card on `DSH_PORT` (default 3080)
 
 ### `devai-agent` -- standalone host launcher
 
-`bin/devai-agent` is the same lab container as `make shell-gpu`,
+`bin/devai-agent` is the same lab container as `make shell`,
 runnable from anywhere on the host without invoking Make or being inside the repo directory. State lives
 under `~/.devai/`; the repo is only consulted once at `make install` time.
 
@@ -152,7 +149,7 @@ want to work on first.
 
 ```bash
 cd ~/projects/my-app && devai-agent # GPU; my-app/ becomes /home/devai/work
-devai-agent --cpu                   # CPU lab
+DEVAI_GPU_DEVICE= devai-agent       # the lab on the CPU
 devai-agent -C ~/other              # mount ~/other instead of $PWD this run
 devai-agent --model qwen3.5:9b-q8_0 --agent claude
 devai-agent --show                  # print resolved prefs + container cmd, no run
@@ -186,55 +183,50 @@ missing.
 ```
   Browser / API clients
   ---------------------------------------------------------
-  https://<HOST_IP>:8888        https://<HOST_IP>:8443
-         |                              |
-  -------+------------------------------+------------------
-         |         devai-net            |
-         |       (internal)             |
-         v                              v
-  devai-lab-gpu              devai-webui-proxy
-  (JupyterLab + AI CLIs)    (nginx TLS termination)
-         |                              |
-         |                              v
-         |                      devai-open-webui
-         |                       (chat UI)
-         |                              |
-         +----------+-------------------+
+  https://<HOST_IP>:8888
+         |
+  -------+-------------------------------------------------
+         |         devai-net
+         |       (internal)
+         v
+  devai-lab
+  (JupyterLab + AI CLIs)
+         |
+         +----------+
                     |
          +----------+----------+
          |  devai-router       |  ports per backend:
          |  (gpu-arbiter)      |    :11434 -> ollama
          |                     |    :11435 -> vllm
-         |  reasoning policy   |    :11436 -> sglang
+         |  reasoning policy   |    :11436 -> sglang (FROZEN, M16)
          +----------+----------+
                     |
          +----------+----------+
          v          v          v
    devai-ollama  devai-vllm  devai-sglang
-   (GGUF, RAM-   (NVFP4,     (NVFP4 +
-    resident)    on-demand)  RadixAttn,
-                              on-demand)
+   (GGUF, RAM-   (NVFP4,     (FROZEN,
+    resident)    on-demand)  not served)
 
-  devai-apt-cache    devai-registry-cache
-  (APT cache)        (Docker Hub mirror)
+  devai-apt-cache    devai-pipelock
+  (APT cache)        (the lab's egress proxy)
 ```
 
-**External access** (host ports): JupyterLab `:8888`, Open WebUI `:8443`
-**Loopback only** (`127.0.0.1`): APT cache `:3142`, registry mirror `:5000`, and -- when the `mcp` profile is up -- the MCP gateway `:8088`. Reaching any of those from another machine means an SSH tunnel or an authenticating proxy, not a wider bind.
-**Internal only** (devai-net): router, Ollama, vLLM, SGLang, caches.
+**External access** (host ports): JupyterLab `:8888`, and the DeepSeek Harness web UI `:3080` (`DSH_PORT`) while a lab runs
+**Loopback only** (`127.0.0.1`): APT cache `:3142`. Reaching it from another machine means an SSH tunnel or an authenticating proxy, not a wider bind.
+**Internal only** (devai-net): router, Ollama, vLLM, caches.
 
 ### GPU Arbitration
 
-The router (`devai-router`) is a small Go reverse proxy (~9 MB distroless) that:
+The router (`devai-router`) is a small Go reverse proxy (~8 MB, a static binary in `FROM scratch`) that:
 
-- Routes by **port -> backend** (no message inspection): `:11434` -> ollama, `:11435` -> vllm, `:11436` -> sglang.
+- Routes by **port -> backend** (no message inspection): `:11434` -> ollama, `:11435` -> vllm, `:11437` -> vllm-devai (`:11436` was SGLang's, frozen on 2026-10-10, M16).
 - Manages **GPU exclusion**: only one backend uses the GPU at a time. Switches by stopping the current backend (with graceful drain for in-flight requests) and starting the next via the Podman API.
-- Sizes vLLM/SGLang launches dynamically (`--gpu-memory-utilization`, `--mem-fraction-static`, `--max-model-len`) from per-model VRAM budgets.
+- Sizes vLLM launches dynamically (`--gpu-memory-utilization`, `--max-model-len`) from per-model VRAM budgets.
 - Keeps a loaded backend warm by default (`IDLE_TIMEOUT=0`): it is unloaded when a *different* model is requested, not on a timer. Set `IDLE_TIMEOUT` to a positive number of seconds to restore time-based auto-stop.
 - Applies the **reasoning policy** to each request (see below).
-- Refuses the Ollama **write endpoints** (`/api/pull`, `/api/create`, `/api/push`, `/api/copy`, `/api/delete`) with 403 on every backend listener, so an agent in the lab or an Open WebUI user cannot pull an unprobed model and then serve it around the probe-cache fit gate. The sanctioned path is still `make model-pull`; `scripts/select-models.py` reaches Ollama via `podman exec`, never through the router, so it is unaffected.
+- Refuses the Ollama **write endpoints** (`/api/pull`, `/api/create`, `/api/push`, `/api/copy`, `/api/delete`, `/api/blobs/...`) with 403 on every backend listener, also when a slash in the path is percent-encoded, so an agent in the lab cannot pull an unprobed model and then serve it around the probe-cache fit gate. The sanctioned path is still `make model-pull`; `scripts/select-models.py` reaches Ollama via `podman exec`, never through the router, so it is unaffected.
 
-> **Status:** all three backends are wired. vLLM and SGLang start as `sleep infinity` placeholders (compose can't know which model the user will pick); the router replaces them on demand via libpod when a request arrives on port 11435 / 11436. The picker shows HF rows once they have a fitting probe entry.
+> **Status:** Ollama, vLLM and vllm-devai are wired; SGLang was frozen on 2026-10-10 by platform-rebuild Phase 15 (M16; `attic/sglang/RESTORE.md`). The vLLM backends start as `sleep infinity` placeholders (compose can't know which model the user will pick); the router replaces them on demand via libpod when a request arrives on port 11435 / 11437. The picker shows HF rows once they have a fitting probe entry.
 >
 > Two reference docs:
 > - [`docs/router.md`](docs/router.md) -- router architecture, ports, lifecycle, the full request rewrite chain (override parsing, reasoning policy, tool-choice promotion, tool stripping, ctx injection), config env, caches, and failure modes. Start here when reasoning about routing.
@@ -291,11 +283,11 @@ deploy/.ollama-reasoning-cache.json   per-digest, per-(VRAM, ctx) cells
 
 Day-to-day after pulling a new model: `make probe && podman rm -f devai-router && make cache-up`.
 
-The interactive model picker reads the probe caches directly. It shows one row per `(model_dir, backend)` for HF repos (both vLLM and SGLang rows appear) and per Ollama family/quantization. Each row is filtered to the picker's VRAM band (env `VRAM` or `GPU_MEMORY_GB`). Inline-reasoning models produce two rows: default mode + "Reasoning off" variant with `::nothink` suffix appended.
+The interactive model picker reads the probe caches directly. It shows one row per `(model_dir, backend)` for HF repos (vLLM and vllm-devai rows; no SGLang rows since the freeze, M16) and per Ollama family/quantization. Each row is filtered to the picker's VRAM band (env `VRAM` or `GPU_MEMORY_GB`). Inline-reasoning models produce two rows: default mode + "Reasoning off" variant with `::nothink` suffix appended.
 
 **Per-session context binding & reasoning overrides:**
 - **Ollama**: the picker emits the parent name (or `<name>::nothink` to force reasoning off). KV cache allocation is dynamic per request from the global `OLLAMA_CONTEXT_LENGTH` (default 256K). The `/api/chat` and `/api/generate` endpoints honour `options.num_ctx` injected by the router; OpenAI- and Anthropic-compat endpoints get the global ceiling.
-- **vLLM / SGLang**: the picker emits `<name>@<ctx>` (e.g., `Llama-3.1-8B@32768`) or `<name>::<reasoning>@<ctx>` (e.g., `Llama-3.1-8B::low@32768`) to bind both context and reasoning policy per session. The router's `parseCtxOverride` and `parseReasoningOverride` strip these suffixes, rewrite the request body's `model` field to the clean name, and trigger a container recreate if the context or reasoning setting differs from the previous run.
+- **vLLM / vllm-devai**: the picker emits `<name>@<ctx>` (e.g., `Llama-3.1-8B@32768`) or `<name>::<reasoning>@<ctx>` (e.g., `Llama-3.1-8B::low@32768`) to bind both context and reasoning policy per session. The router's `parseCtxOverride` and `parseReasoningOverride` strip these suffixes, rewrite the request body's `model` field to the clean name, and trigger a container recreate if the context or reasoning setting differs from the previous run.
 
 ## Configuration
 
@@ -304,13 +296,12 @@ The interactive model picker reads the probe caches directly. It shows one row p
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `LAB_PORT` | 8888 | JupyterLab port |
-| `WEBUI_PORT` | 8443 | Open WebUI HTTPS port |
 | `CONTAINER_RUNTIME` | podman | `podman` or `docker` |
 | `HOST_HOME_DIR` | `$HOME` | Enables .gitconfig/.ssh in container |
 | `HOME_VOLUME` | `$HOME/devai-home` | Persistent home directory |
 | `JUPYTER_TOKEN` | -- | Fixed access token (set in .env) |
 | `APT_PROXY` | -- | APT cache URL (e.g. `http://localhost:3142`; the cache is published on 127.0.0.1 only) |
-| `GPU_MEMORY_GB` | 24 | Total GPU VRAM in GB. Picker filter ceiling. Override per-call: `VRAM=48 make shell-gpu` |
+| `GPU_MEMORY_GB` | 24 | Total GPU VRAM in GB. Picker filter ceiling. Override per-call: `VRAM=48 make shell` |
 | `MAX_CONTEXT_LEN` | 131072 | Operator-side cap on per-model context, in tokens (128K). The router reads `min(model.max_context, MAX_CONTEXT_LEN)` from the probe cache at startup. `make probe` is independent and probes the full `PROBE_CONTEXTS` tier set. |
 | `PROBE_VRAMS` | `16G,24G` | Comma-separated VRAM bands `make probe` cycles through. Each band recreates `devai-ollama` with `OLLAMA_GPU_OVERHEAD` set so the daemon behaves like a card of that size. |
 | `PROBE_CONTEXTS` | `32K,64K,128K,256K` | Comma-separated context tiers probed inside each VRAM band. Tiers above a model's `max_context` are silently capped. |
@@ -332,7 +323,7 @@ Hand-maintained source of model lineages. Each family declares its `ollama_repos
 Source kinds:
 
 - **`ollama_repos:`** -- list of library names under `ollama.com/library/<name>`. Every published tag for each library becomes a catalog row served by the Ollama backend (`ollama pull` on download).
-- **`hf_repos:`** -- list of HuggingFace repositories (transformers safetensors / FP8 / NVFP4 / AWQ / GPTQ). Each becomes one catalog row served by vLLM/SGLang (currently dormant).
+- **`hf_repos:`** -- list of HuggingFace repositories (transformers safetensors / FP8 / NVFP4 / AWQ / GPTQ). Each becomes one catalog row served by vLLM / vllm-devai (SGLang is frozen, M16).
 - **`gguf_repos:`** -- list of HuggingFace GGUF-only repositories with one entry per file inside the repo. Each entry takes a `repo:`, optional `tag_prefix:` (anchors the local Ollama tag), and optional `include:` allowlist of quantization tokens substring-matched against the filename (e.g. `UD-Q3_K_XL`, `Q3_K_M`). `make model-pull` downloads the `.gguf` blob, writes a Modelfile that emits `FROM <file>` plus `RENDERER <family>` and `PARSER <family>` directives, and runs `ollama create` to register the imported tag. The renderer/parser pair is what makes imported GGUFs accept tool calls -- without them Ollama returns "does not support tools".
 
 ### `deploy/models.yaml` -- Generated catalog
@@ -349,7 +340,7 @@ Create `requirements.txt` in the repo root and rebuild:
 
 ```bash
 echo "langchain" > requirements.txt
-make build-gpu
+make build-lab
 ```
 
 ## Make Targets
@@ -358,10 +349,10 @@ Run `make help` for the full list. Highlights:
 
 ```
 BUILD                                     INFRASTRUCTURE                            RUN
-build-cpu        Build image (CPU)        cache-up        Start services            lab-cpu        JupyterLab (CPU)
-build-gpu        Build image (GPU)        cache-down      Stop services             lab-gpu        JupyterLab (GPU)
-build-router     Build router image       cache-status    Show status               shell-cpu      Shell + picker (CPU)
-build            Build all                cache-clean     Remove cached data        shell-gpu      Shell + picker (GPU)
+build-lab        Build the lab image      cache-up        Start services            lab            JupyterLab
+build-router     Build router image       cache-down      Stop services             shell          Shell + picker
+build            Build all                cache-status    Show status
+                                          cache-clean     Remove cached data
 fetch-cli        Update CLI binaries      logs            Tail SERVICE=devai-X
 pull-images      Pull base images         setup-logs      One-time: 100G LV at /var/cache/devai/logs
 
@@ -375,49 +366,11 @@ ollama-clean     Clean partials                                                 
 MAINTENANCE                                                                         TESTING
 clean            Remove all images        prune           Prune dangling images     test              Run all tests (router + python + ollama + matrix)
                                                                                     test-router       Go unit tests for arbiter (single-host)
-                                                                                    test-python       Python stdlib unittests (bench v3, picker, sops/age, MCP)
+                                                                                    test-python       Python stdlib unittests (bench v3, picker, catalog, probes)
                                                                                     test-ollama       Ollama integration tests
                                                                                     test-models       Matrix: every probed digest x wire x scenario
                                                                                     test-agents       Smoke-test all agents against ollama
 ```
-
-### MCP gateway + secrets scaffold (opt-in)
-
-```
-MCP GATEWAY (mcp-gateway plan, profile=mcp)             SECRETS SCAFFOLD (sops-age plan, shared)
-mcp-up               Start the MCP gateway              age-keygen-host      One-time per host: gen keypair
-mcp-down             Stop it                            secrets-tmpfs        Mount /run/devai tmpfs
-mcp-logs             Tail the gateway log               secrets-edit         Edit *.sops.env in place
-mcp-test             Real MCP handshake + tools/call    secrets-rotate       Re-key after .sops.yaml change
-mcp-secrets-render   Render Tier 2 secrets to tmpfs
-```
-
-## MCP Gateway (opt-in)
-
-`make mcp-up` starts the [Docker MCP Gateway](https://github.com/docker/mcp-gateway) (`docker/mcp-gateway:v0.43.3`) as a peer service to the router, on the `mcp` compose profile. It is one HTTP endpoint that any MCP-aware agent can target; the gateway spawns each MCP server in its own short-lived container through the host's Podman socket.
-
-Third-party servers are **not** defined in this repo. The gateway loads Docker's official catalog by default -- upstream digest-pins and maintains it -- and `deploy/mcp-catalog-devai.yaml` is merged on top via `--additional-catalog` carrying exactly one entry, the project's own `devai-model-status` server. The enabled set is the explicit `--servers=` list in `deploy/docker-compose.yaml`; those names are upstream catalog keys and are **case-sensitive** (`SQLite`, not `sqlite`).
-
-```bash
-make mcp-up          # start (compose profile 'mcp')
-make mcp-test        # real handshake: initialize -> tools/list -> tools/call
-make mcp-logs        # tail; the bearer token is printed here once at startup
-make mcp-down        # stop
-```
-
-**Reaching it.** The endpoint is `http://127.0.0.1:8088/mcp` -- the `/mcp` path is required -- over streamable HTTP, and every request needs an `Authorization: Bearer <token>` header. The gateway mints that token at startup and prints it once to its own log (`Use Bearer token: ...`), so `make mcp-logs` is how you retrieve it. Responses come back SSE-framed (`event: message` / `data: {...}`). From inside `devai-net` or `devai-lab-egress` the host is `devai-mcp-gateway` (also `mcp-gateway`) on port 8088; both names are in the `NO_PROXY` lists the Makefile and `bin/devai-agent` set.
-
-**What `make mcp-test` asserts.** `tests/test-mcp.sh` performs a real MCP handshake (`initialize` -> `notifications/initialized` -> `tools/list`), requires the tool count to clear a floor (`MCP_MIN_TOOLS`, default 40), asserts the three first-party tools by name, and then performs a real `tools/call`. It skips (exit 77) only when the gateway container is absent.
-
-**Measured on 2026-07-25:** the gateway comes up in ~13s and `tools/list` returns 134 tools; a `tools/call` of `list_fitting_models` returned 27 models.
-
-**Known limitations** -- open, not worked around:
-
-- 2 of the 15 servers fail to start: `filesystem` (`Error accessing directory : ENOENT, stat ''`) and `arxiv-mcp-server` (`invalid docker volume ':/app/papers': source and target are required`). Both want a host path supplied through gateway config that is not set yet. The 134 tools above are what the other 13 provide.
-- `get_router_status` enumerates but returns unreachable when called: the gateway spawns each server container without attaching it to `devai-net`, so the spawned container cannot resolve `devai-router`. The catalog schema has no field for a custom network (only `disableNetwork` / `extraHosts`). The other two first-party tools (`list_fitting_models`, `get_model_bench`) read caches baked into the image at build time and work. Unresolved; needs an operator decision.
-- `github-official` and `firecrawl` enumerate their tools but need secrets before any call can succeed, and that secrets path is unverified. The upstream secret names are `github.personal_access_token` and `firecrawl.api_key` -- not the `GITHUB_TOKEN`-style keys. `hugging-face` and `context7` are `type: remote` upstream and connect anonymously, so they need no secret.
-
-See [`docs/mcp.md`](docs/mcp.md) for the operator reference and client configs.
 
 ## Frozen work
 
@@ -427,7 +380,9 @@ What moved: 22 Go files (11 source + 11 test, each now carrying a `//go:build de
 
 `gpu-arbiter` still accepts `--mode`, but any value other than `single` now exits with a pointer to the attic. Read [`attic/README.md`](attic/README.md) for why it was frozen, and `attic/cluster-mode/RESTORE.md` for the defects that were open at freeze time before attempting a thaw -- a naive thaw restores broken code.
 
-The design plans stay in `docs/plans/` with a frozen status; they are still the design record.
+The design plans were removed from `docs/plans/` on 2026-10-05; they are in git history.
+
+Two more subtrees joined the attic on 2026-10-07 (platform-rebuild Phase 1): the AMD/ROCm GPU-vendor overlay (`attic/amd-rocm/`, decision M11 -- it never ran on ROCm hardware, so devai is NVIDIA-only until it is restored) and the sops/age secret-store scaffold (`attic/sops-age/`, M12 -- its last consumer was the MCP gateway). Each has a `RESTORE.md`. The same phase removed Open WebUI and its nginx TLS proxy (M9; browser chat is the DeepSeek Harness web UI) and the MCP gateway with devai's own `devai-model-status` server (M10); those were deleted, not moved, and git history keeps them.
 
 ## GPU Support
 
@@ -437,16 +392,13 @@ The design plans stay in `docs/plans/` with a frozen status; they are still the 
 - NVIDIA Container Toolkit
 - For NVFP4 models: Blackwell architecture
 
-### GPU images
+### One lab image
 
-The GPU lab image (`devai-lab-gpu`) includes PyTorch with CUDA. The base image uses `nvidia/cuda:12.9.1-cudnn-runtime-ubuntu24.04`. Python is installed via uv (not system apt) to ensure a single Python version across CPU and GPU images.
+The lab image (`devai-lab`) includes PyTorch with CUDA, on `devai-base`, which is built on the pinned `debian:trixie-slim`; torch brings its CUDA runtime as pip packages and the driver comes from the host through CDI. The same image runs with the GPU when the host has one and on the CPU otherwise (`scripts/host-gpu.sh` decides; `DEVAI_GPU_DEVICE=` forces the CPU). Python is installed via uv (not system apt). Until platform-rebuild Phase 3 there were two lab images, a CPU one on `debian:trixie` and a GPU one on `nvidia/cuda:12.9.1-cudnn-runtime-ubuntu24.04`.
 
 ## SSL / HTTPS
 
-Both JupyterLab and Open WebUI support HTTPS:
-
-- **JupyterLab**: Auto-detects mkcert certificates in `~/.jupyter/ssl/`
-- **Open WebUI**: nginx proxy with mkcert certs or self-signed fallback
+JupyterLab supports HTTPS: it auto-detects mkcert certificates in `~/.jupyter/ssl/`.
 
 Generate certificates on the browser workstation:
 ```bash
@@ -454,15 +406,13 @@ mkcert <HOST_IP>
 # Copy <HOST_IP>.pem and <HOST_IP>-key.pem to the container host
 ```
 
-## Podman Registry Mirror
-
-To route Docker Hub pulls through the local cache:
+## Podman Registry Configuration
 
 ```bash
 cp deploy/registries.conf ~/.config/containers/registries.conf
 ```
 
-This tells Podman to try `localhost:5000` (the registry mirror started by `make cache-up`) before going to Docker Hub directly. The mirror is published on `127.0.0.1` only, and the config marks it `insecure = true` (plaintext HTTP, no image-signature check) -- which is safe only because it is this host's own loopback cache. Read the security note at the top of `deploy/registries.conf` before pointing it anywhere else.
+The file only resolves unqualified image names against Docker Hub. Until platform-rebuild Phase 2 (2026-10-10) it also routed every docker.io pull through a local `registry:2` mirror on `localhost:5000`; that mirror is gone, and devai now pulls one image, Debian pinned by digest (`DEBIAN_IMAGE`), building the rest. A host that installed the old file deletes its `[[registry.mirror]]` stanza (INSTALL.md section 5.4).
 
 ## Auto-Start at Boot
 
@@ -471,13 +421,13 @@ make install-systemd            # stage compose + symlink caches into ~/.config/
 make uninstall-systemd          # reverse: disable unit + remove staged files
 ```
 
-`install-systemd` stages a systemd user service that brings the infrastructure containers up on login (`loginctl enable-linger` keeps them running after logout). It **copies** `docker-compose.yaml` into `~/.config/devai/` and **symlinks** the eight other paths the compose mounts (`registry-config.yaml`, `logging.sh`, `recovery-flags.json`, `vllm-plugins.json`, the three `.X-reasoning-cache.json` files, and the `webui-proxy/` directory) back into the repo's `deploy/`. The symlinks keep the systemd-managed stack reading the same probe caches that `make probe` writes -- no duplication, no drift.
+`install-systemd` stages a systemd user service that brings the infrastructure containers up on login (`loginctl enable-linger` keeps them running after logout). It **copies** `docker-compose.yaml` into `~/.config/devai/` and **symlinks** eight of the paths the compose mounts (`registry-config.yaml`, `logging.sh`, `vllm-plugins.json`, `models.yaml`, and the four `.X-reasoning-cache.json` files) back into the repo's `deploy/`. The symlinks keep the systemd-managed stack reading the same probe caches that `make probe` writes -- no duplication, no drift. The two recovery-flag files are not staged: the router mounts the repository's `deploy/` directory (`${DEVAI_REPO}/deploy`), and the installed unit carries `DEVAI_REPO`, set to the repository path at install time.
 
 ## Updating
 
 ```bash
 make fetch-cli                 # Update CLI binaries (Claude, Codex, Ollama, Gemini) via ETags
-make pull-images               # Pull latest base and infrastructure images
+make pull-images               # Pull the pinned Debian image (and the upstream images not yet built here)
 make catalog-regen             # Refresh deploy/models.yaml from HF + Ollama upstream
 make model-pull && make probe  # Pull any new fitting variants, then probe them
 make build                     # Rebuild all images with updated binaries/packages
@@ -495,25 +445,29 @@ Reference implementation (volume group `vgais`):
 | Volume | Mount | Size | Purpose |
 |--------|-------|------|---------|
 | `cache_ollama` | `/var/cache/devai/ollama` | 200G | Ollama GGUF models + vLLM NVFP4 models |
-| `cache_registry` | `/var/cache/devai/registry` | 200G | Podman container image storage + Docker Hub mirror |
+| `cache_registry` | `/var/cache/devai/registry` | 200G | Podman container image storage (and the blobs of the Docker Hub mirror removed in platform-rebuild Phase 2) |
 | `cache_logs` | `/var/cache/devai/logs` | 100G | Persisted container stdout (one `<service>.log` per devai-* container, written by the `logger` sidecar) |
 | `cache_pip` | `/var/cache/devai/pip` | 30G | Python package cache (uv) + CLI binaries |
 | `cache_apt` | `/var/cache/devai/apt` | 10G | APT package cache (apt-cacher-ng) |
 | `cache_npm` | `/var/cache/devai/npm` | 10G | npm package cache |
-| `cache_open_webui` | `/var/cache/devai/open-webui` | 5G | Open WebUI application data |
+
+Hosts set up before 2026-10-07 may also have a `cache_open_webui` LV at
+`/var/cache/devai/open-webui`, holding Open WebUI's data. Open WebUI was
+dropped then (platform-rebuild Phase 1, M9) and nothing reads the volume;
+it is left for the operator to remove.
 
 Podman's rootless graphroot is `/var/cache/devai/registry/podman` (set in
 `~/.config/containers/storage.conf`), a subdirectory of the `cache_registry`
-volume that it shares with the registry:2 mirror's blob tree at
-`/var/cache/devai/registry/docker/`. The store uses NATIVE overlay (kernel
+volume that it shares with the blob tree of the registry:2 mirror removed
+in platform-rebuild Phase 2, `/var/cache/devai/registry/docker/`. The store uses NATIVE overlay (kernel
 overlayfs with `userxattr`), not fuse-overlayfs: with a mount program podman
 cannot use the native overlay diff, so every layer commit walks the whole
 image tree -- measured 2026-09-22 at ~12 s per single-file COPY on the lab
 image against 0.2 s native. If `podman info` ever reports
 `Native Overlay Diff: false`, the store has been initialised with
 fuse-overlayfs (sticky `.has-mount-program` flag) and must be recreated; the
-flag is never re-evaluated. Never wipe `registry/*` wholesale: it holds both
-the store and the mirror cache.
+flag is never re-evaluated. Never wipe `registry/*` wholesale: it holds the
+store as well as the old mirror's blobs.
 
 `cache_logs` is the only volume that can be created entirely from the
 repo: `make setup-logs` carves the LV in the existing `vgais/cachepool`,
@@ -556,10 +510,9 @@ sudo lvcreate -V 200G -T vgais/cachepool -n cache_registry
 sudo lvcreate -V 30G  -T vgais/cachepool -n cache_pip
 sudo lvcreate -V 10G  -T vgais/cachepool -n cache_apt
 sudo lvcreate -V 10G  -T vgais/cachepool -n cache_npm
-sudo lvcreate -V 5G   -T vgais/cachepool -n cache_open_webui
 
 # Format and mount
-for vol in cache_ollama cache_registry cache_pip cache_apt cache_npm cache_open_webui; do
+for vol in cache_ollama cache_registry cache_pip cache_apt cache_npm; do
     sudo mkfs.xfs /dev/vgais/$vol
 done
 
@@ -570,10 +523,9 @@ cat <<'EOF' | sudo tee -a /etc/fstab
 /dev/vgais/cache_pip        /var/cache/devai/pip         xfs defaults 0 0
 /dev/vgais/cache_apt        /var/cache/devai/apt         xfs defaults 0 0
 /dev/vgais/cache_npm        /var/cache/devai/npm         xfs defaults 0 0
-/dev/vgais/cache_open_webui /var/cache/devai/open-webui  xfs defaults 0 0
 EOF
 
-sudo mkdir -p /var/cache/devai/{ollama,registry,pip,apt,npm,open-webui}
+sudo mkdir -p /var/cache/devai/{ollama,registry,pip,apt,npm}
 sudo mount -a
 sudo chown -R $USER:$USER /var/cache/devai
 
@@ -596,31 +548,25 @@ sudo xfs_growfs /var/cache/devai/ollama
 ```
 .env                              -- Host/runtime configuration
 .env.example                      -- Configuration template
-.sops.yaml                        -- sops/age recipient list (host public keys)
 bin/devai-agent                   -- Standalone shell-agent launcher (no Make required)
 deploy/
   models.yaml                     -- Generated catalog (ollama + hf + gguf rows)
   .ollama-reasoning-cache.json    -- Probe cache (schema v3, digest-keyed,
                                     probes nested by VRAM x CONTEXT)
   .bench-cache.json               -- Bench cache (schema v3, per (model, backend, ctx))
-  docker-compose.yaml             -- Infrastructure services (router/ollama/vllm/sglang/
-                                    webui + opt-in mcp-gateway)
-  mcp-catalog-devai.yaml          -- First-party MCP catalog (devai-model-status only;
-                                    every third-party server comes from Docker's
-                                    official catalog via --additional-catalog)
-  mcp-secrets.sops.env.example    -- Operator template for Tier 2 secrets
+  docker-compose.yaml             -- Infrastructure services (router/ollama/vllm/vllm-devai/
+                                    caches/logger/pipelock)
   Dockerfile.base                 -- Base image (system packages, Python, Node)
   Dockerfile.lab                  -- Lab image (CLI tools incl. the sky CLI, JupyterLab)
-  Dockerfile.router               -- Router image (distroless, 9 MB)
-  Dockerfile.mcp-modelstatus      -- devai-model-status MCP server image (distroless;
-                                    bakes the catalog + probe/bench caches at build time)
-  setup-secrets-tmpfs.sh          -- Idempotent /run/devai tmpfs mount
-  webui-proxy/                    -- nginx TLS proxy for Open WebUI
+  Dockerfile.router               -- Router image (FROM scratch + a host-built static binary, 8 MB)
+  Dockerfile.apt-cache            -- apt-cacher-ng on the pinned Debian image
+  Dockerfile.pipelock             -- The lab's egress proxy (pipelock built on the host)
   systemd/                        -- Auto-start service
 gpu-arbiter/
   main.go                         -- Router source (multi-port proxy, reasoning policy,
                                     write-endpoint guard; single-host only)
-  recovery_flags.go               -- Per-model engine flags/env from recovery-flags.json
+  recovery_flags.go               -- Per-model engine flags/env from recovery-flags.json and
+                                    recovery-flags.generated.json, re-read at each launch
   vllm_plugins.go                 -- vLLM parser-plugin registry (vllm-plugins.json)
   catalog_mtp.go                  -- MTP launch-param side-table read from models.yaml
   policy_test.go                  -- Unit tests for the reasoning policy
@@ -631,8 +577,6 @@ scripts/
   probe-ollama-reasoning.py       -- Per-(VRAM, ctx) probe per digest (schema v3)
   select-models.py                -- Print fitting models / pull catalog candidates
   model-picker.py                 -- Two-step interactive picker (model -> agent)
-  age-keygen-host.sh              -- Per-host age keypair generator (idempotent)
-  render-secret.sh                -- Generic single-file decrypt to tmpfs (refuses non-tmpfs)
   sky-setup.sh                    -- SkyPilot first-launch helper inside the lab
                                     (installed to /usr/local/bin/sky-setup.sh)
   bench/_bench_core.py            -- Bench harness shared helpers (schema v3 keys + migrator)
@@ -642,26 +586,23 @@ docs/
   ollama_models.md                -- Reasoning detection design doc
   router.md                       -- Router architecture + request rewrite chain
   backends.md                     -- Backend lifecycle, probing, cache hygiene
-  secrets.md                      -- sops/age scaffold reference (canonical)
-  mcp.md                          -- MCP gateway operator reference
-  mcp-model-status.md             -- devai-model-status MCP server reference
   skypilot-user-guide.md          -- User-facing SkyPilot CLI guide (lab-side `sky`)
-  plans/                          -- 14 design plans + execution-order README
+  plans/                          -- one plan, platform-rebuild.md, + README and TEMPLATE
                                     (README.md holds the canonical status table)
 attic/
-  README.md                       -- Why cluster mode + SkyPilot fleet were frozen
+  README.md                       -- Index of frozen work and why each was frozen
   cluster-mode/                   -- The frozen tree (Go behind a build tag, compose
                                     fragment, tests, docs, Makefile.frozen-targets,
                                     RESTORE.md)
+  amd-rocm/                       -- The AMD/ROCm GPU-vendor overlay (2026-10-07)
+  sops-age/                       -- The sops/age secret-store scaffold (2026-10-07)
 tests/
   agent-matrix.sh                 -- Smoke-test all agents against ollama
   test-router*.sh                 -- Router integration tests
-  test-mcp.sh                     -- MCP gateway end-to-end (real handshake, tool-count
-                                    floor, first-party tools by name, real tools/call)
-  test-mcp-modelstatus.sh         -- devai-model-status against the live gateway
-  python/                         -- 508 Python stdlib unittests covering bench v3,
-                                    picker, sops/age scaffold, MCP gateway,
-                                    catalog-discover, model lifecycle
+  lib/devai-net-client.sh         -- Throwaway curl client on devai-net for the live
+                                    router tests (the router publishes no host ports)
+  python/                         -- Python stdlib unittests covering bench v3,
+                                    picker, catalog-discover, model lifecycle
 requirements-base.txt             -- Base Python packages (always installed)
 requirements.txt                  -- Optional project-specific packages
 packages/jupyter-ai-launchers     -- JupyterLab launcher extension

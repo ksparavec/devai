@@ -41,7 +41,6 @@ jobs:
           - deploy/Dockerfile.base
           - deploy/Dockerfile.lab
           - deploy/Dockerfile.router
-          - deploy/Dockerfile.mcp-modelstatus
           - deploy/Dockerfile.ollama
           - deploy/Dockerfile.vllm
     steps:

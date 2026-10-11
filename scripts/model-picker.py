@@ -133,6 +133,16 @@ _BENCH_CACHE_PATHS = [
     str(Path(__file__).resolve().parent.parent / "deploy" / ".bench-cache.json"),
 ]
 
+# vLLM launch-recipe seeds (scripts/fetch-vllm-recipes.py). Baked into the
+# image at /etc/devai/recipe-seeds.yaml and overmounted by bin/devai-agent
+# from ~/.devai/ (staged by `make install`), like the catalog. Read here
+# with yaml only: this file must not import _vllm_recipes (it runs
+# bind-mounted inside older images).
+_RECIPE_SEED_PATHS = [
+    "/etc/devai/recipe-seeds.yaml",
+    str(Path(__file__).resolve().parent.parent / "deploy" / "recipe-seeds.yaml"),
+]
+
 _ROUTER = os.environ.get("DEVAI_ROUTER_HOST", "devai-router")
 _VLLM_DIR = os.environ.get("VLLM_MODELS_DIR", "/var/cache/devai/vllm")
 _SGLANG_DIR = os.environ.get("SGLANG_MODELS_DIR", "/var/cache/devai/sglang")
@@ -212,7 +222,6 @@ _VRAM_BUDGET = float(os.environ.get("VRAM", os.environ.get("GPU_MEMORY_GB", "24"
 _BACKENDS: dict[str, tuple[str, str, int]] = {
     "ollama": ("Ollama", "GGUF quantized — wide compatibility, CPU+GPU",              11434),
     "vllm":   ("vLLM",   "NVFP4 tensor cores — high throughput, paged attention",     11435),
-    "sglang": ("SGLang", "NVFP4 tensor cores — RadixAttention, multi-turn optimized", 11436),
     "vllm-devai": ("vLLM devai", "home-built vLLM 0.28 + HyperQwen patches — MTP on 24G, prepared checkpoints", 11437),
 }
 
@@ -242,7 +251,12 @@ _BACKENDS: dict[str, tuple[str, str, int]] = {
 # Ordering matters: _dedup_hf_rows keeps one row per (model, backend)
 # and ranks vllm above sglang, so a model probed on both still leads
 # with its vLLM row while the SGLang row stays selectable.
-_PICKER_BACKENDS: tuple[str, ...] = ("ollama", "vllm", "vllm-devai", "sglang")
+#
+# Frozen 2026-10-10 by platform-rebuild Phase 15 (M16): on the same
+# checkpoint SGLang's turn-2+ TTFT was 0.81x vLLM 0.30.0's, short of the
+# 0.75 I16 requires, so SGLang left the router's backend table, this list
+# and _BACKENDS above. attic/sglang/RESTORE.md says how to bring it back.
+_PICKER_BACKENDS: tuple[str, ...] = ("ollama", "vllm", "vllm-devai")
 _PICKER_HF_BACKENDS: tuple[str, ...] = tuple(
     b for b in _PICKER_BACKENDS if b != "ollama"
 )
@@ -278,7 +292,7 @@ _RESET = "\033[0m"
 # `~/.devai/` to `/devai-host`, the picker drops a one-shot JSON file the
 # launcher reads after exit so it can persist (model, agent, context) into
 # `preferences.yaml`. Silent no-op when the path is absent — this is what
-# happens for `make shell-gpu` and any other invocation that doesn't go
+# happens for `make shell` and any other invocation that doesn't go
 # through the launcher.
 _PICK_BACK_CHANNEL = Path("/devai-host/.last-pick.json")
 
@@ -1193,8 +1207,8 @@ def _check_cache_visible() -> None:
             f"error: model cache not visible inside the container.\n"
             f"  Looked for: {_OLLAMA_MANIFESTS}\n"
             f"          and {_VLLM_DIR}\n"
-            f"  Re-run via `make shell-gpu` / `make lab-gpu` (or equivalent CPU "
-            f"target) so the host cache dir is mounted read-only."
+            f"  Re-run via `make shell` / `make lab` "
+            f"so the host cache dir is mounted read-only."
         )
 
 
@@ -1623,6 +1637,11 @@ def _format_model_row(m: dict, idx: int = 0) -> str:
     _ts = scores.get("tools")
     tools_col = (f"{_ts * 100:.0f}" if isinstance(_ts, (int, float))
                  else ("Yes" if _has_tools(m) else "No"))
+    # Recipe badge beside TOOLS: vLLM publishes a launch recipe for this
+    # model (deploy/recipe-seeds.yaml) and it applies to this backend's
+    # vLLM. The TOOLS value itself stays the probe-verified / benched one; a
+    # recipe only seeds a probe.
+    rcp_col = "rcp" if _recipe_applies(m) else "-"
 
     # Line number reflects position in the current sort order, so
     # ctrl-s renumbers the list. Caller passes 1-based ``idx``;
@@ -1639,6 +1658,7 @@ def _format_model_row(m: dict, idx: int = 0) -> str:
         f"{type_col:>6s}  "
         f"{fmt_col:>7s}  "
         f"{tools_col:>6s}  "
+        f"{rcp_col:>3s}  "
         f"{mtp_segment}"
         f"{tps_col:>7s}  "
         f"{code_col:>7s}  "
@@ -1676,6 +1696,69 @@ _REASONING_SCORE: dict[str, int] = {
     Capability.UNKNOWN:     0,
     Capability.ERROR:       0,
 }
+
+
+_RECIPE_SEEDS: dict | None = None
+
+
+def _recipe_seeds() -> dict:
+    """{catalog row name: seed} from the first readable recipe-seeds file,
+    loaded once. Fails open: a missing or malformed file means no badges."""
+    global _RECIPE_SEEDS
+    if _RECIPE_SEEDS is None:
+        _RECIPE_SEEDS = {}
+        for path in _RECIPE_SEED_PATHS:
+            try:
+                doc = yaml.safe_load(Path(path).read_text())
+            except (OSError, ValueError, yaml.YAMLError):
+                continue
+            if isinstance(doc, dict) and doc.get("version") == 1 \
+                    and isinstance(doc.get("seeds"), dict):
+                _RECIPE_SEEDS = {k: v for k, v in doc["seeds"].items()
+                                 if isinstance(v, dict)}
+            break
+    return _RECIPE_SEEDS
+
+
+def _recipe_for(m: dict) -> dict | None:
+    """The row's vLLM recipe seed, or None. A recipe is vLLM's launch
+    command, so only rows on a vLLM-engine backend have one."""
+    backend = str(m.get("backend") or "")
+    if _ENGINE_OF.get(backend, backend) != "vllm":
+        return None
+    return _recipe_seeds().get(str(m.get("name") or "")) or None
+
+
+def _recipe_applies(m: dict) -> bool:
+    """True when the seed applies to this row's backend: the fetcher's
+    `applies_to` (min_vllm_version against the vLLM that backend runs for
+    this model -- stock vLLM for `vllm`, build-vllm.sh's build for
+    `vllm-devai`, a curated image pin when there is one). The picker runs
+    inside the lab and cannot read those itself."""
+    seed = _recipe_for(m)
+    applies = (seed or {}).get("applies_to")
+    return isinstance(applies, dict) and applies.get(str(m.get("backend"))) is True
+
+
+def _recipe_line(m: dict) -> str:
+    """Preview line naming the row's vLLM recipe, or "" without one."""
+    seed = _recipe_for(m)
+    if not seed:
+        return ""
+    commit = str(seed.get("commit") or "")[:12] or "?"
+    head = (f"Recipe:    vllm-project/recipes {seed.get('recipe') or '?'} at "
+            f"{commit} ({seed.get('match') or '?'} match; min vLLM "
+            f"{seed.get('min_vllm_version') or '?'}")
+    if _recipe_applies(m):
+        return head + "; a seed, not probe-verified)\n"
+    backend = str(m.get("backend"))
+    have = ((seed.get("vllm_version") or {}).get(backend)
+            if isinstance(seed.get("vllm_version"), dict) else None)
+    why = (f"this backend runs vLLM {have}" if have else
+           "the vLLM this backend runs is not known")
+    if not isinstance(seed.get("applies_to"), dict):
+        why = "applicability not recorded; run make fetch-vllm-recipes"
+    return head + f") -- does NOT apply here: {why}\n"
 
 
 def _has_tools(m: dict) -> bool:
@@ -2451,6 +2534,7 @@ def _capability_summary_text(
         f"\n"
         f"Reasoning: {reason_label}\n"
         f"Tools:     {tools_label}    (parser: {parser})\n"
+        f"{_recipe_line(m)}"
         f"{mtp_line}"
     )
     parts = [head]
@@ -2898,6 +2982,7 @@ def _build_menu(
         f"{'TYPE':>6s}  "
         f"{'FORMAT':>7s}  "
         f"{_hdr('TOOLS', 'tools'):>6s}  "
+        f"{'RCP':>3s}  "
         f"{mtp_header_segment}"
         f"{_hdr('TPS', 'tps'):>7s}  "
         f"{_hdr('CODE%', 'code'):>7s}  "
@@ -2927,6 +3012,7 @@ def _build_menu(
     note = (
         "* = VRAM formula estimate.  "
         "TOOLS = agentic tool calling.  "
+        "RCP = vLLM recipe applies.  "
         "CODE = HumanEval pass@1.  "
         "CODE+ = HumanEval+ (hardened).  "
         "MMLU = MMLU-Pro.  "
@@ -3577,7 +3663,7 @@ def _build(agent_id: str, model_name: str, backend: str) -> list[str]:
 
     if agent_id == "dsh":
         # DeepSeek Harness has no terminal UI: the launcher serves its web
-        # UI on the port lab-cpu/lab-gpu publish (DSH_PORT) and prints the
+        # UI on the port `make lab` publishes (DSH_PORT) and prints the
         # URL. The providers and default model are written first; see
         # _write_dsh_config for where each goes and why.
         ctx = os.environ.get("CONTEXT", "")
@@ -3699,14 +3785,37 @@ def _resolve_kv_tier(model: dict) -> tuple[int, bool] | None:
     return (tiers[idx], True)
 
 
-def _offered_agents() -> list[tuple[str, str, str]]:
-    """The agent menu. DeepSeek Harness serves a browser UI on the port that
-    only `make lab-cpu|lab-gpu` publish (DSH_PORT), so it is left out of the
-    menu anywhere else; an explicit `--agent dsh` still reaches its launcher,
-    which says why it cannot start."""
+# (agent, backend) pairs known to fail, with why. Codex speaks only
+# /v1/responses, and SGLang's takes no function tools (`tools[].type` is
+# web_search_preview or code_interpreter), so every Codex turn fails there
+# (platform-rebuild Phase 15).
+_AGENT_BACKEND_FAILS: dict[tuple[str, str], str] = {
+    ("codex", "sglang"): "SGLang's /v1/responses takes no function tools",
+}
+
+
+def _agent_works_on(agent: str, backend: str | None) -> bool:
+    """False for an (agent, backend) pair known to fail."""
+    return (agent, backend or "") not in _AGENT_BACKEND_FAILS
+
+
+def _models_for_agent(models: list[dict], agent: str | None) -> list[dict]:
+    """The model rows a picker run for ``agent`` (``--agent``) may offer."""
+    if not agent:
+        return models
+    return [m for m in models if _agent_works_on(agent, m.get("backend"))]
+
+
+def _offered_agents(backend: str | None = None) -> list[tuple[str, str, str]]:
+    """The agent menu for a row on ``backend``. DeepSeek Harness serves a
+    browser UI on the port that only `make lab` publishes
+    (DSH_PORT), so it is left out of the menu anywhere else; an explicit
+    `--agent dsh` still reaches its launcher, which says why it cannot
+    start. An agent known to fail on the backend is left out too."""
+    agents = [a for a in _AGENTS if _agent_works_on(a[0], backend)]
     if os.environ.get("DSH_PORT"):
-        return list(_AGENTS)
-    return [a for a in _AGENTS if a[0] != "dsh"]
+        return agents
+    return [a for a in agents if a[0] != "dsh"]
 
 
 def _resolve_agent(agent_filter: str | None, model: dict) -> tuple[str, str, str] | None:
@@ -3755,11 +3864,14 @@ def _resolve_agent(agent_filter: str | None, model: dict) -> tuple[str, str, str
                 f"error: unknown agent '{agent_filter}' "
                 f"(known: {', '.join(a[0] for a in _AGENTS)})"
             )
+        if not _agent_works_on(agent[0], model.get("backend")):
+            # main() already leaves such rows out of the list.
+            return None
         if not _apply_aiagent_gpu(agent[0]):
             return None
         return (agent[0], reasoning_mode, mtp_mode)
 
-    offered = _offered_agents()
+    offered = _offered_agents(model.get("backend"))
     alines = [_format_agent_row(a) for a in offered]
     mode_notes = []
     if reasoning_mode == "nothink":
@@ -3966,7 +4078,7 @@ def main() -> None:
         os.execvp("gemini", ["gemini"])
 
     _check_cache_visible()
-    models = _discover_models()
+    models = _models_for_agent(_discover_models(), agent_filter)
     if not models:
         sys.exit(
             "error: no downloaded models found on disk.\n"

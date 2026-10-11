@@ -4,11 +4,12 @@
 # Defaults (override via .env)
 CONTAINER_RUNTIME ?= podman
 LAB_PORT ?= 8888
-# DeepSeek Harness web UI, published by lab-cpu/lab-gpu only (docs: CLAUDE.md "dsh").
+# DeepSeek Harness web UI, published by `make lab` only (docs: CLAUDE.md "dsh").
 DSH_PORT ?= 3080
 # Pinned -- see the DeepSeek Harness block in fetch-cli.
 DSH_VERSION ?= 0.1.5-rc.2
-WEBUI_PORT ?= 8443
+# Pinned -- see the Pi block in fetch-cli.
+PI_VERSION ?= 0.87.1
 HOST_WORK_DIR ?= .
 HOST_HOME_DIR ?= $(HOME)
 HOME_VOLUME ?= $(HOME)/devai-home
@@ -17,10 +18,11 @@ NO_PROXY ?=
 
 # Derived (not configurable)
 COMPOSE = $(CONTAINER_RUNTIME) compose
-IMAGE_NAME = devai-lab-cpu
-IMAGE_NAME_GPU = devai-lab-gpu
-BASE_IMAGE_NAME = devai-base-cpu
-BASE_IMAGE_NAME_GPU = devai-base-gpu
+# One base and one lab image, on the pinned Debian with the CUDA torch; they
+# run with the GPU when the host check finds one and on the CPU otherwise
+# (platform-rebuild Phase 3, M14/M15). They were devai-{base,lab}-{cpu,gpu}.
+IMAGE_NAME = devai-lab
+BASE_IMAGE_NAME = devai-base
 CONTAINER_USER = devai
 # EXACT pin (not "latest patch of 3.x"): the base image and the SkyPilot wheel
 # pre-fetch must agree. Bump deliberately; tests/python/test_lab_python_and_torch.py.
@@ -64,11 +66,26 @@ export GPU_MEMORY_GB MAX_CONTEXT_LEN
 VLLM_IMAGE ?= docker.io/vllm/vllm-openai:latest-x86_64-cu129-ubuntu2404
 export VLLM_IMAGE
 SGLANG_IMAGE ?= docker.io/lmsysorg/sglang:v0.5.16-cu130
-# The home-built, HyperQwen-patched vLLM 0.28.0 (make build-vllm). A docker.io
+# The home-built, HyperQwen-patched vLLM (make build-vllm). A docker.io
 # name so it can be pushed one day; today it exists only in the local image
 # store (never pulled: pull-images filters on `devai-`).
+#
+# Exported for the reason VLLM_IMAGE is: a value from .env or the command
+# line must reach the probers and compose. Without the export they fell back
+# to `:latest`, so `make probe-vllm-devai VLLM_DEVAI_IMAGE=<tag>` probed
+# whatever `:latest` was -- both arms of a version comparison could silently
+# run one build (platform-rebuild 4v). Every 4v target runs as
+# `make <target> VLLM_DEVAI_IMAGE=<tag>`.
 VLLM_DEVAI_IMAGE ?= docker.io/devai/vllm-devai:latest
-VLLM_DEVAI_IMAGE_TAG ?= docker.io/devai/vllm-devai:v0.28.0-cu131-debian13-hq.c0c81bb
+export VLLM_DEVAI_IMAGE
+# The vLLM build record scripts/build-vllm.sh builds (deploy/vllm-builds/
+# <version>.sh; E1 moved the default to 0.30.0). The image tag, the build root
+# and the wheelhouse follow it: v<version>-cu131-debian13-hq.<HyperQwen
+# commit, 7 hex>, or -stock for a record without HyperQwen.
+VLLM_VERSION ?= 0.30.0
+VLLM_BUILD_RECORD = deploy/vllm-builds/$(VLLM_VERSION).sh
+VLLM_HYPERQWEN_SHORT = $(shell sed -n 's/^HYPERQWEN_COMMIT=\([0-9a-f]\{7\}\)[0-9a-f]\{33\}$$/\1/p' $(VLLM_BUILD_RECORD) 2>/dev/null)
+VLLM_DEVAI_IMAGE_TAG ?= docker.io/devai/vllm-devai:v$(VLLM_VERSION)-cu131-debian13-$(if $(VLLM_HYPERQWEN_SHORT),hq.$(VLLM_HYPERQWEN_SHORT),stock)
 export SGLANG_IMAGE
 # The Ollama image is BUILT HERE (`make build-ollama`), not pulled: Ollama
 # compiled from source on the host, on debian:trixie-slim, CUDA 13 for this
@@ -77,29 +94,42 @@ export SGLANG_IMAGE
 # recreates that container for pinned KV tiers -- both must name one image.
 OLLAMA_IMAGE ?= localhost/devai-ollama:latest
 export OLLAMA_IMAGE
-# Exported for the same reason: the probers launch their own containers
-# on the host and must use the same CDI device string the compose
-# services do (written into .env by `make gpu-vendor`). Defaulted so an
-# install without .env still resolves.
-DEVAI_GPU_DEVICE ?= nvidia.com/gpu=all
+# The CDI device string GPU containers get. The host check
+# (scripts/host-gpu.sh; platform-rebuild Phase 3, M15) prints it when an
+# NVIDIA GPU is usable and nothing otherwise; empty means the CPU. Set in
+# the environment or on the command line it wins, empty included (`make lab
+# DEVAI_GPU_DEVICE=` forces the CPU); a line in .env does not count.
+# Exported for the same reason as OLLAMA_IMAGE: the probers launch their own
+# containers on the host, and compose reads it. Empty means the CPU for the
+# lab, `make shell`, the probers and the bench (GPU_FLAGS); compose and the
+# router still read an empty value as nvidia.com/gpu=all until Phase 11
+# moves the devices into compose.gpu.yaml.
+ifeq ($(filter environment command line,$(origin DEVAI_GPU_DEVICE)),)
+DEVAI_GPU_DEVICE := $(shell $(CURDIR)/scripts/host-gpu.sh)
+endif
 export DEVAI_GPU_DEVICE
+# The repository root, by absolute path. Compose mounts $(DEVAI_REPO)/deploy
+# read-only into the router (the two recovery-flag files, re-read at each
+# launch), as a DIRECTORY so a file replaced with a new inode is seen (I25).
+# The compose file refuses to start without it (`${DEVAI_REPO:?}`).
+export DEVAI_REPO := $(CURDIR)
 CACHE_COMPOSE = $(CURDIR)/deploy/docker-compose.yaml
 
 # Services `make cache-up` brings up, in compose-declaration order. Listed
 # explicitly because cache-up must name them one by one -- see the
 # router-managed-container note in that target. Keep in sync with
 # deploy/docker-compose.yaml; `make cache-services-check` asserts it.
-# mcp-gateway is deliberately absent: it sits behind the `mcp` profile.
-CACHE_SERVICES = apt-cache registry-cache ollama vllm vllm-devai laya-trainer sglang router \
-                 open-webui webui-proxy logger pipelock
+CACHE_SERVICES = apt-cache ollama vllm vllm-devai laya-trainer router \
+                 logger pipelock
 
-# The five the router recreates on demand. cache-up skips any of these
+# The four the router recreates on demand (SGLang, the fifth, was frozen
+# by platform-rebuild Phase 15, M16). cache-up skips any of these
 # that already exist rather than colliding with the router's container.
 # vllm-devai was missing here from its introduction (449270a) until
 # 2026-09-22: with a vllm-devai model loaded, every `make cache-up` died on
 # the name collision before it reached the router. laya-trainer is the job
 # runner (docs/plans/laya-trainer.md).
-CACHE_BACKEND_SERVICES = ollama vllm vllm-devai laya-trainer sglang
+CACHE_BACKEND_SERVICES = ollama vllm vllm-devai laya-trainer
 INFERENCE_CONFIG = deploy/models.yaml
 HF_CLI = hf
 # vLLM and SGLang safetensors live on their OWN external volumes
@@ -154,7 +184,7 @@ PROXY_RUN_ENV = \
 # Egress-lock env for the interactive lab/shell targets: force ALL egress
 # through the pipelock MITM proxy; internal hosts (router, caches) bypass it.
 PIPELOCK_PROXY = http://devai-pipelock:8888
-PIPELOCK_NO_PROXY = devai-router,router,apt-cache,registry-cache,ollama,devai-mcp-gateway,mcp-gateway,localhost,127.0.0.1,::1
+PIPELOCK_NO_PROXY = devai-router,router,ollama,localhost,127.0.0.1,::1
 EGRESS_PROXY_ENV = \
 	-e HTTP_PROXY=$(PIPELOCK_PROXY) \
 	-e HTTPS_PROXY=$(PIPELOCK_PROXY) \
@@ -164,15 +194,18 @@ EGRESS_PROXY_ENV = \
 	-e no_proxy=$(PIPELOCK_NO_PROXY)
 
 
-# GPU build settings. Base image defaults on DEVAI_GPU_VENDOR (from .env,
-# via -include .env above; set by `make gpu-vendor VENDOR=amd`) -- an
-# explicit GPU_BASE_IMAGE in .env or the shell still wins either way
-# (?= only assigns when unset). See docs/gpu-vendors.md.
-ifeq ($(DEVAI_GPU_VENDOR),amd)
-GPU_BASE_IMAGE ?= docker.io/rocm/dev-ubuntu-24.04:6.4.3-complete
-else
-GPU_BASE_IMAGE ?= docker.io/nvidia/cuda:12.9.1-cudnn-runtime-ubuntu24.04
-endif
+# The one Debian image devai pulls, pinned by digest (M1, M13), passed as
+# BASE_IMAGE to every build of an image on Debian (platform-rebuild Phase 2);
+# each Dockerfile's default is the same reference, and
+# tests/python/test_upstream_images.py holds them together. Bumping it is a
+# deliberate edit of all of them, followed by a rebuild of every image.
+# The digest is Docker Hub's index digest of one of Debian's dated tags
+# (here trixie-20260713-slim; those tags stay published), read from the
+# registry, NOT from `podman images --digests`: the image pulled on
+# 2026-07-13 through the old registry mirror carries a manifest digest
+# Docker Hub never served (same image, config 2a96bd19), and the pin made
+# from it could not be pulled anywhere else.
+DEBIAN_IMAGE = docker.io/library/debian:trixie-slim@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd
 
 # Mount host config files (gitconfig, ssh) to staging dir for entrypoint to copy
 HOME_MOUNT_ARG =
@@ -229,34 +262,33 @@ ifeq ($(findstring podman,$(CONTAINER_RUNTIME)),podman)
 	DEVAI_USER_FLAGS = --userns=keep-id --user devai
 endif
 
-# GPU runtime flags
-# DEVAI_GPU_DEVICE comes from .env (via -include .env above), written by
-# `make gpu-vendor VENDOR=amd` (devai-tools/cmd/devai-gpu-vendor). Defaults
-# to NVIDIA's CDI device string when unset -- see docs/gpu-vendors.md.
+# GPU runtime flags: the device when DEVAI_GPU_DEVICE names one, nothing on a
+# CPU host -- the same image then runs on the CPU.
 GPU_FLAGS =
 ifeq ($(findstring podman,$(CONTAINER_RUNTIME)),podman)
-	GPU_FLAGS += --device $(or $(DEVAI_GPU_DEVICE),nvidia.com/gpu=all) --security-opt=label=disable
+	GPU_FLAGS += $(if $(DEVAI_GPU_DEVICE),--device $(DEVAI_GPU_DEVICE) --security-opt=label=disable,)
 else
-	GPU_FLAGS += --gpus all
+	GPU_FLAGS += $(if $(DEVAI_GPU_DEVICE),--gpus all,)
 endif
 
 # Compose settings
 
-.PHONY: all build build-cpu build-gpu build-base-cpu build-base-gpu build-router
+.PHONY: all build build-lab build-base build-router
+.PHONY: build-apt-cache build-pipelock build-pipelock-dist build-pipelock-image pipelock-ca-init
 .PHONY: build-laya-trainer test-laya-trainer laya-trainer-lock lab-lock laya-check
-.PHONY: lab-cpu lab-gpu shell-cpu shell-gpu
+.PHONY: vllm-lock
+.PHONY: lab shell
 .PHONY: cache-up cache-down cache-status cache-clean logs setup-logs
 .PHONY: ollama-rm ollama-list ollama-status ollama-clean ollama-df
 .PHONY: vllm-list vllm-rm vllm-status vllm-df
-.PHONY: clean clean-cpu clean-gpu clean-router prune
-.PHONY: fetch-cli pull-images install install-systemd uninstall test test-router test-ollama test-agents test-models test-probe-vllm test-probe-sglang test-probe-ollama-idempotent test-vllm test-sglang test-e2e test-full help
-.PHONY: catalog-regen catalog-suggest catalog-discover catalog-discover-add probe probe-vllm probe-sglang probe-load-vllm probe-load-sglang probe-check probe-ornith-arch model-fit model-pull model-status model-sync vram-fit verify-backend-flags ollama-cleanup-ctx-variants
-.PHONY: bench bench-vllm bench-sglang bench-ollama bench-report bench-harvest test-bench-smoke
-.PHONY: secrets-tmpfs secrets-edit secrets-render secrets-rotate age-keygen-host test-python
-.PHONY: build-backup-tool build-gpu-vendor-tool build-mcp-modelstatus build-mcp-modelstatus-image build-devai-tools test-devai-tools
-.PHONY: gpu-vendor test-gpu-vendor
+.PHONY: clean clean-lab clean-router prune
+.PHONY: fetch-cli pull-images install install-systemd uninstall test test-router test-ollama test-agents test-models test-probe-vllm test-probe-ollama-idempotent test-vllm test-e2e test-full help
+.PHONY: fetch-vllm-recipes recipe-apply
+.PHONY: catalog-regen catalog-suggest catalog-discover catalog-discover-add probe probe-vllm probe-load-vllm probe-load-vllm-devai probe-check probe-ornith-arch model-fit model-pull model-status model-sync vram-fit verify-backend-flags ollama-cleanup-ctx-variants
+.PHONY: bench bench-vllm bench-ollama bench-report bench-harvest test-bench-smoke
+.PHONY: test-python build-backup-tool build-devai-tools test-devai-tools
 .PHONY: backup-create backup-list backup-verify backup-restore test-backup-restore
-.PHONY: mcp-up mcp-down mcp-logs mcp-test mcp-health mcp-secrets-render test-mcp-modelstatus
+.PHONY: slurm-tools build-slurm slurm-init slurm-up slurm-down test-slurm
 
 all: help
 
@@ -314,24 +346,32 @@ fetch-cli: ## Download all external binaries and packages to local cache (uses E
 	@# Pi (earendil-works/pi, pi.dev): Bun-compiled binary that loads sidecar
 	@# assets (wasm, themes, export-html) from its own directory, so the whole
 	@# `pi/` tree is kept together and only the binary is symlinked onto PATH
-	@# (Dockerfile.lab). The asset name carries no version: latest/download works.
-	@ARCH=$$(dpkg --print-architecture) \
+	@# (Dockerfile.lab). PINNED, like DeepSeek Harness: the picker writes Pi's
+	@# models.json and relies on how Pi matches --model (test_picker_pi.py,
+	@# verified on 0.87.1). Bump PI_VERSION deliberately and re-test. Fetched to
+	@# a temp dir and checked against PI_VERSION, so a failed download or a
+	@# binary of another version leaves the previous tree in place.
+	@if [ "$$(cat $(ETAG_DIR)/pi.version 2>/dev/null)" = "$(PI_VERSION)" ] && [ -x $(CACHE_DIR)/pip/bin/pi/pi ]; then \
+		echo "Pi: up to date ($(PI_VERSION))"; \
+	else \
+		ARCH=$$(dpkg --print-architecture) \
 		&& case "$$ARCH" in amd64) PI_ARCH=x64;; arm64) PI_ARCH=arm64;; esac \
-		&& HTTP_CODE=$$(curl -fsSL -w '%{http_code}' -o $(CACHE_DIR)/pip/bin/pi.tar.gz \
-			--etag-compare $(ETAG_DIR)/pi.etag --etag-save $(ETAG_DIR)/pi.etag \
-			"https://github.com/earendil-works/pi/releases/latest/download/pi-linux-$${PI_ARCH}.tar.gz") \
-		&& if [ "$$HTTP_CODE" = "304" ] || [ ! -s $(CACHE_DIR)/pip/bin/pi.tar.gz ]; then \
-			rm -f $(CACHE_DIR)/pip/bin/pi.tar.gz; STATE="up to date"; \
-		else \
-			rm -rf $(CACHE_DIR)/pip/bin/pi \
-			&& tar -xzf $(CACHE_DIR)/pip/bin/pi.tar.gz -C $(CACHE_DIR)/pip/bin pi \
-			&& chmod +x $(CACHE_DIR)/pip/bin/pi/pi \
-			&& rm -f $(CACHE_DIR)/pip/bin/pi.tar.gz && STATE="updated"; fi \
-		&& VERSION=$$(PI_OFFLINE=1 $(CACHE_DIR)/pip/bin/pi/pi --version </dev/null 2>&1 | awk '{print $$1; exit}') \
-		&& echo "Pi: $$STATE ($$VERSION)"
+		&& rm -rf $(CACHE_DIR)/pip/bin/pi.tmp && mkdir -p $(CACHE_DIR)/pip/bin/pi.tmp \
+		&& curl -fsSL -o $(CACHE_DIR)/pip/bin/pi.tmp/pi.tar.gz \
+			"https://github.com/earendil-works/pi/releases/download/v$(PI_VERSION)/pi-linux-$${PI_ARCH}.tar.gz" \
+		&& tar -xzf $(CACHE_DIR)/pip/bin/pi.tmp/pi.tar.gz -C $(CACHE_DIR)/pip/bin/pi.tmp pi \
+		&& chmod +x $(CACHE_DIR)/pip/bin/pi.tmp/pi/pi \
+		&& VERSION=$$(PI_OFFLINE=1 $(CACHE_DIR)/pip/bin/pi.tmp/pi/pi --version </dev/null 2>&1 | awk '{print $$1; exit}') \
+		&& [ "$$VERSION" = "$(PI_VERSION)" ] \
+		&& rm -rf $(CACHE_DIR)/pip/bin/pi && mv $(CACHE_DIR)/pip/bin/pi.tmp/pi $(CACHE_DIR)/pip/bin/pi \
+		&& rm -rf $(CACHE_DIR)/pip/bin/pi.tmp \
+		&& echo "$(PI_VERSION)" > $(ETAG_DIR)/pi.version \
+		&& echo "Pi: updated ($(PI_VERSION))" \
+		|| { rm -rf $(CACHE_DIR)/pip/bin/pi.tmp; echo "ERROR: Pi $(PI_VERSION) download failed, or the binary is not $(PI_VERSION)" >&2; exit 1; }; \
+	fi
 	@# DeepSeek Harness (deepseek-ai/deepseek-harness): an npm app with ~500
 	@# transitive packages, so it needs a real `npm install` -- run inside the
-	@# base image (built just before this by build-cpu/build-gpu), not with a
+	@# base image (built just before this by build-lab), not with a
 	@# host npm. PINNED, unlike the other CLIs: upstream is a developer preview
 	@# that announces compatibility-breaking changes, and devai's integration
 	@# names its internal config entries (webserver, llm-pi-ai, the telemetry
@@ -340,8 +380,8 @@ fetch-cli: ## Download all external binaries and packages to local cache (uses E
 	@if [ "$$(cat $(ETAG_DIR)/dsh.version 2>/dev/null)" = "$(DSH_VERSION)" ] && [ -d $(CACHE_DIR)/pip/bin/dsh/node_modules ]; then \
 		echo "DeepSeek Harness: up to date ($(DSH_VERSION))"; \
 	else \
-		IMG=$(BASE_IMAGE_NAME); $(CONTAINER_RUNTIME) image inspect $$IMG >/dev/null 2>&1 || IMG=$(BASE_IMAGE_NAME_GPU); \
-		$(CONTAINER_RUNTIME) image inspect $$IMG >/dev/null 2>&1 || { echo "ERROR: no base image -- run 'make build-base-cpu' or 'make build-base-gpu' first (DeepSeek Harness installs with its npm)." >&2; exit 1; }; \
+		IMG=$(BASE_IMAGE_NAME); \
+		$(CONTAINER_RUNTIME) image inspect $$IMG >/dev/null 2>&1 || { echo "ERROR: no base image -- run 'make build-base' first (DeepSeek Harness installs with its npm)." >&2; exit 1; }; \
 		rm -rf $(CACHE_DIR)/pip/bin/dsh.tmp && mkdir -p $(CACHE_DIR)/pip/bin/dsh.tmp \
 		&& $(CONTAINER_RUNTIME) run --rm --network=host $(subst --build-arg,-e,$(PROXY_BUILD_ARGS)) \
 			-e HOME=/tmp -e NPM_CONFIG_UPDATE_NOTIFIER=false -v $(CACHE_DIR)/pip/bin/dsh.tmp:/out:z $$IMG \
@@ -401,39 +441,6 @@ fetch-cli: ## Download all external binaries and packages to local cache (uses E
 			&& ln -sf ../lib/node_modules/@google/gemini-cli/bundle/gemini.js $(CACHE_DIR)/pip/bin/gemini/bin/gemini \
 			&& echo "$$LATEST" > $(ETAG_DIR)/gemini.version \
 			&& echo "Gemini CLI: updated to $$LATEST"; fi
-	@# sops + age (sops-age-secrets plan): static Go binaries from GitHub
-	@# releases. ETag-stamped per the existing CLI pattern. Both projects
-	@# publish single-arch binaries with a -linux-${arch}.tar.gz naming
-	@# convention; we curl the asset, verify it's non-empty, and unpack
-	@# into /var/cache/devai/pip/bin/.
-	@ARCH=$$(dpkg --print-architecture) \
-		&& case "$$ARCH" in amd64) SOPS_ARCH=amd64;; arm64) SOPS_ARCH=arm64;; esac \
-		&& SOPS_VERSION=$$(curl -fsSL https://api.github.com/repos/getsops/sops/releases/latest | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])") \
-		&& HTTP_CODE=$$(curl -fsSL -w '%{http_code}' -o $(CACHE_DIR)/pip/bin/sops.tmp \
-			--etag-compare $(ETAG_DIR)/sops.etag --etag-save $(ETAG_DIR)/sops.etag \
-			"https://github.com/getsops/sops/releases/latest/download/sops-$${SOPS_VERSION}.linux.$${SOPS_ARCH}") \
-		&& if [ "$$HTTP_CODE" = "304" ] || [ ! -s $(CACHE_DIR)/pip/bin/sops.tmp ]; then \
-			rm -f $(CACHE_DIR)/pip/bin/sops.tmp; STATE="up to date"; \
-		else \
-			mv $(CACHE_DIR)/pip/bin/sops.tmp $(CACHE_DIR)/pip/bin/sops \
-			&& chmod +x $(CACHE_DIR)/pip/bin/sops && STATE="updated"; fi \
-		&& VERSION=$$($(CACHE_DIR)/pip/bin/sops --version 2>&1 | awk '{print $$2; exit}' || echo "?") \
-		&& echo "sops: $$STATE ($$VERSION)"
-	@# age + age-keygen ship in one tarball.
-	@ARCH=$$(dpkg --print-architecture) \
-		&& case "$$ARCH" in amd64) AGE_ARCH=amd64;; arm64) AGE_ARCH=arm64;; esac \
-		&& AGE_VERSION=$$(curl -fsSL https://api.github.com/repos/FiloSottile/age/releases/latest | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])") \
-		&& HTTP_CODE=$$(curl -fsSL -w '%{http_code}' -o $(CACHE_DIR)/pip/bin/age.tar.gz \
-			--etag-compare $(ETAG_DIR)/age.etag --etag-save $(ETAG_DIR)/age.etag \
-			"https://github.com/FiloSottile/age/releases/latest/download/age-$${AGE_VERSION}-linux-$${AGE_ARCH}.tar.gz") \
-		&& if [ "$$HTTP_CODE" = "304" ] || [ ! -s $(CACHE_DIR)/pip/bin/age.tar.gz ]; then \
-			rm -f $(CACHE_DIR)/pip/bin/age.tar.gz; STATE="up to date"; \
-		else \
-			tar -xzf $(CACHE_DIR)/pip/bin/age.tar.gz -C $(CACHE_DIR)/pip/bin --strip-components=1 age/age age/age-keygen \
-			&& chmod +x $(CACHE_DIR)/pip/bin/age $(CACHE_DIR)/pip/bin/age-keygen \
-			&& rm -f $(CACHE_DIR)/pip/bin/age.tar.gz && STATE="updated"; fi \
-		&& VERSION=$$($(CACHE_DIR)/pip/bin/age --version 2>&1 | head -n1 || echo "?") \
-		&& echo "age: $$STATE ($$VERSION)"
 	@# aiagent (devitops-com/aiagent): a self-extracting makeself bundle (~63 MB)
 	@# that carries its own CPython 3.13, so the lab image needs no extra Python
 	@# or zstd to run it. ETag-stamped like the other CLIs, which keeps the lab
@@ -467,17 +474,23 @@ fetch-cli: ## Download all external binaries and packages to local cache (uses E
 			&& chmod +x $(CACHE_DIR)/pip/bin/dstui-install.sh && STATE="updated"; fi \
 		&& echo "dstui: $$STATE ($$DSTUI_VERSION)"
 
-# Base images used by build and infrastructure
-BASE_IMAGES = debian:trixie $(GPU_BASE_IMAGE)
+# The images devai pulls: the pinned Debian image, and through compose the
+# upstream images later phases replace (tests/python/test_upstream_images.py,
+# the transitional allowlist): the stock vLLM image (Phase 4) and the
+# logger's podman image (Phase 6). Everything else is built here; the CUDA
+# base the GPU lab was built on went in Phase 3.
+BASE_IMAGES = $(DEBIAN_IMAGE)
 # Home-built images are excluded from pulls: `devai-` (localhost/devai-ollama,
 # devai-router) and `devai/` (docker.io/devai/vllm-devai, tagged with a
 # registry name but present only locally -- a pull would fail three times
 # and abort the target).
-CACHE_IMAGES = $(shell $(COMPOSE) -f $(CACHE_COMPOSE) config --images 2>/dev/null | grep -vE 'devai-|devai/')
+# DEVAI_REPO is passed explicitly: the compose file refuses to render without
+# it, and GNU Make before 4.4 does not hand exported variables to $(shell).
+CACHE_IMAGES = $(shell DEVAI_REPO=$(DEVAI_REPO) $(COMPOSE) -f $(CACHE_COMPOSE) config --images 2>/dev/null | grep -vE 'devai-|devai/')
 # Seconds between pull-images retry attempts (the attempt COUNT is fixed at 3).
 PULL_RETRY_DELAY ?= 5
 
-pull-images: ## Pull latest versions of all base and infrastructure images. IMAGES="a b" limits the run. Each pull is tried 3 times; an image that still fails aborts with a non-zero exit.
+pull-images: ## Pull the pinned Debian image and the upstream images not yet built here (the transitional allowlist). IMAGES="a b" limits the run. Each pull is tried 3 times; an image that still fails aborts with a non-zero exit.
 	@# Failures are ERRORS. This used to end in `|| true`, so a pull that never
 	@# happened was indistinguishable from one that did and make exited 0.
 	@# Bail out at the first image that fails all 3 attempts -- never carry on
@@ -497,26 +510,18 @@ pull-images: ## Pull latest versions of all base and infrastructure images. IMAG
 		done; \
 	 done
 
-build-base-cpu: ## Build base image with system packages and runtimes (CPU)
+build-base: ## Build the base image (system packages, Python, Node) on the pinned DEBIAN_IMAGE
 	$(CONTAINER_RUNTIME) build --network=host \
 		$(PROXY_BUILD_ARGS) \
 		$(APT_PROXY_ARG) \
 		$(PYTHON_VERSION_ARG) \
+		--build-arg BASE_IMAGE=$(DEBIAN_IMAGE) \
 		-f deploy/Dockerfile.base \
 		-t $(BASE_IMAGE_NAME) .
 
-build-base-gpu: ## Build base image with system packages and runtimes (GPU)
-	$(CONTAINER_RUNTIME) build --network=host \
-		$(PROXY_BUILD_ARGS) \
-		$(APT_PROXY_ARG) \
-		$(PYTHON_VERSION_ARG) \
-		--build-arg BASE_IMAGE=$(GPU_BASE_IMAGE) \
-		-f deploy/Dockerfile.base \
-		-t $(BASE_IMAGE_NAME_GPU) .
+build: build-lab build-router build-apt-cache build-pipelock ## Build all images (lab + router + apt-cache + pipelock)
 
-build: build-cpu build-gpu build-router ## Build all images (CPU + GPU + router)
-
-build-cpu: build-base-cpu fetch-cli ## Build the container image (CPU)
+build-lab: build-base fetch-cli ## Build the lab image (CUDA torch; runs with the GPU when the host has one, on the CPU otherwise)
 	@[ -f deploy/pipelock-ca.crt ] || { echo "ERROR: deploy/pipelock-ca.crt missing -- run 'make pipelock-ca-init' first (the lab image bakes the pipelock CA into its trust store)."; exit 1; }
 	$(CONTAINER_RUNTIME) build --network=host \
 		$(PROXY_BUILD_ARGS) \
@@ -527,28 +532,16 @@ build-cpu: build-base-cpu fetch-cli ## Build the container image (CPU)
 		-f deploy/Dockerfile.lab \
 		-t $(IMAGE_NAME) .
 
-build-gpu: build-base-gpu fetch-cli ## Build the container image (GPU/CUDA)
-	@[ -f deploy/pipelock-ca.crt ] || { echo "ERROR: deploy/pipelock-ca.crt missing -- run 'make pipelock-ca-init' first (the lab image bakes the pipelock CA into its trust store)."; exit 1; }
-	$(CONTAINER_RUNTIME) build --network=host \
-		$(PROXY_BUILD_ARGS) \
-		$(CACHE_BUILD_ARGS) \
-		--build-arg BASE_IMAGE=$(BASE_IMAGE_NAME_GPU) \
-		--build-arg GPU_BUILD=true \
-		--build-arg GPU_VENDOR=$(or $(DEVAI_GPU_VENDOR),nvidia) \
-		--build-arg OLLAMA_HOST=$(OLLAMA_HOST) \
-		--build-arg OLLAMA_DEFAULT_MODEL=$(OLLAMA_DEFAULT_MODEL) \
-		-f deploy/Dockerfile.lab \
-		-t $(IMAGE_NAME_GPU) .
 
-
-lab-cpu: ## Run the container (CPU)
+lab: ## Run JupyterLab in the lab image, with the GPU when the host check finds one (DEVAI_GPU_DEVICE= forces the CPU)
 	@if [ -n "$(HOST_HOME_DIR)" ]; then mkdir -p "$(HOST_HOME_DIR)"; fi
-	@echo "Starting $(IMAGE_NAME)..."
+	@echo "Starting $(IMAGE_NAME) $(if $(DEVAI_GPU_DEVICE),with GPU $(DEVAI_GPU_DEVICE),on the CPU)..."
 	@echo "Access JupyterLab at http://$(HOST_IP):$(LAB_PORT)/lab?token=..."
 	$(CONTAINER_RUNTIME) run -it --rm \
 		--name $(IMAGE_NAME) \
 		$(RUN_FLAGS) \
 		$(DEVAI_USER_FLAGS) \
+		$(GPU_FLAGS) \
 		--network $(DEVAI_EGRESS_NETWORK) \
 		$(EGRESS_PROXY_ENV) \
 		-e OLLAMA_HOST=$(OLLAMA_HOST) \
@@ -569,40 +562,12 @@ lab-cpu: ## Run the container (CPU)
 		-v "$$(readlink -f $(HOST_WORK_DIR))":/home/$(CONTAINER_USER)/work \
 		$(IMAGE_NAME)
 
-lab-gpu: ## Run the container (GPU/CUDA)
-	@if [ -n "$(HOST_HOME_DIR)" ]; then mkdir -p "$(HOST_HOME_DIR)"; fi
-	@echo "Starting $(IMAGE_NAME_GPU) with GPU support..."
-	@echo "Access JupyterLab at http://$(HOST_IP):$(LAB_PORT)/lab?token=..."
-	$(CONTAINER_RUNTIME) run -it --rm \
-		--name $(IMAGE_NAME_GPU) \
-		$(RUN_FLAGS) \
-		$(DEVAI_USER_FLAGS) \
-		$(GPU_FLAGS) \
-		--network $(DEVAI_EGRESS_NETWORK) \
-		$(EGRESS_PROXY_ENV) \
-		-e OLLAMA_HOST=$(OLLAMA_HOST) \
-		-e OLLAMA_DEFAULT_MODEL=$(OLLAMA_DEFAULT_MODEL) \
-		-e CONTEXT=$${CONTEXT:-$(MAX_CONTEXT_LEN)} \
-		-e VRAM=$${VRAM:-$(GPU_MEMORY_GB)} \
-		$(USER_ENV) \
-		-e CONTAINER_USER=$(CONTAINER_USER) \
-		-e HOST_IP=$(HOST_IP) \
-		-e PORT=$(LAB_PORT) \
-		-p 0.0.0.0:$(LAB_PORT):8888 \
-		-e DSH_PORT=$(DSH_PORT) \
-		-p 0.0.0.0:$(DSH_PORT):3080 \
-		-v $(HOME_VOLUME):/home/$(CONTAINER_USER) \
-		$(HOME_MOUNT_ARG) \
-		$(MODEL_CACHE_MOUNT) \
-		$(PROBE_CACHE_MOUNT) \
-		-v "$$(readlink -f $(HOST_WORK_DIR))":/home/$(CONTAINER_USER)/work \
-		$(IMAGE_NAME_GPU)
-
-shell-cpu: ## Start an interactive shell (CPU)
+shell: ## Start an interactive shell (the agent picker) in the lab image, with the GPU when the host check finds one
 	$(CONTAINER_RUNTIME) run -it --rm \
 		--name $(IMAGE_NAME)-shell \
 		$(RUN_FLAGS) \
 		$(DEVAI_USER_FLAGS) \
+		$(GPU_FLAGS) \
 		--network $(DEVAI_EGRESS_NETWORK) \
 		$(EGRESS_PROXY_ENV) \
 		-e OLLAMA_HOST=$(OLLAMA_HOST) \
@@ -618,36 +583,11 @@ shell-cpu: ## Start an interactive shell (CPU)
 		-v "$$(readlink -f $(HOST_WORK_DIR))":/home/$(CONTAINER_USER)/work \
 		$(IMAGE_NAME) agent-picker
 
-shell-gpu: ## Start an interactive shell (GPU)
-	$(CONTAINER_RUNTIME) run -it --rm \
-		--name $(IMAGE_NAME_GPU)-shell \
-		$(RUN_FLAGS) \
-		$(DEVAI_USER_FLAGS) \
-		$(GPU_FLAGS) \
-		--network $(DEVAI_EGRESS_NETWORK) \
-		$(EGRESS_PROXY_ENV) \
-		-e OLLAMA_HOST=$(OLLAMA_HOST) \
-		-e OLLAMA_DEFAULT_MODEL=$(OLLAMA_DEFAULT_MODEL) \
-		-e CONTEXT=$${CONTEXT:-$(MAX_CONTEXT_LEN)} \
-		-e VRAM=$${VRAM:-$(GPU_MEMORY_GB)} \
-		$(USER_ENV) \
-		-e CONTAINER_USER=$(CONTAINER_USER) \
-		-v $(HOME_VOLUME):/home/$(CONTAINER_USER) \
-		$(HOME_MOUNT_ARG) \
-		$(MODEL_CACHE_MOUNT) \
-		$(PROBE_CACHE_MOUNT) \
-		-v "$$(readlink -f $(HOST_WORK_DIR))":/home/$(CONTAINER_USER)/work \
-		$(IMAGE_NAME_GPU) agent-picker
+clean: clean-lab clean-router ## Remove the lab, base and router images
 
-clean: clean-cpu clean-gpu clean-router ## Remove all images (CPU + GPU + router)
-
-clean-cpu: ## Remove the CPU container + base images
+clean-lab: ## Remove the lab and base images
 	$(CONTAINER_RUNTIME) rmi $(IMAGE_NAME) 2>/dev/null || true
 	$(CONTAINER_RUNTIME) rmi $(BASE_IMAGE_NAME) 2>/dev/null || true
-
-clean-gpu: ## Remove the GPU container + base images
-	$(CONTAINER_RUNTIME) rmi $(IMAGE_NAME_GPU) 2>/dev/null || true
-	$(CONTAINER_RUNTIME) rmi $(BASE_IMAGE_NAME_GPU) 2>/dev/null || true
 
 clean-router: ## Remove the router image
 	$(CONTAINER_RUNTIME) rmi devai-router 2>/dev/null || true
@@ -655,44 +595,10 @@ clean-router: ## Remove the router image
 prune: ## Clean up dangling images only (keeps tagged images and volumes)
 	$(CONTAINER_RUNTIME) image prune -f
 
-# sops/age secret-store scaffold (per docs/plans/sops-age-secrets.md).
-# A consumer wraps secrets-render with its own (input, output) pair and
-# gates cache-up on the result. mcp-gateway Tier 2 is the only live
-# consumer; the cluster-mode and SkyPilot-fleet consumers were frozen on
-# 2026-07-25 (see attic/README.md).
-SOPS_FILE ?=
-
-secrets-tmpfs: ## Mount /run/devai as a 4 MiB tmpfs (one-time per boot)
-	@# Idempotent. Sudo because tmpfs requires CAP_SYS_ADMIN.
-	sudo bash deploy/setup-secrets-tmpfs.sh
-
-secrets-edit: ## Edit a sops-encrypted file in place. Pass SOPS_FILE=deploy/<name>.sops.env
-	@if [ -z "$(SOPS_FILE)" ]; then \
-		echo "ERROR: pass SOPS_FILE=deploy/<name>.sops.env" >&2; exit 2; \
-	fi
-	sops "$(SOPS_FILE)"
-
-secrets-render: ## Generic single-file render: pass SOPS_FILE and DEST. Consumer plans wrap this with concrete pairs.
-	@if [ -z "$(SOPS_FILE)" ] || [ -z "$(DEST)" ]; then \
-		echo "ERROR: pass SOPS_FILE=deploy/<name>.sops.env DEST=/run/devai/<name>.env" >&2; \
-		echo "       Or use a consumer-plan target (e.g. 'make mcp-secrets-render')." >&2; \
-		exit 2; \
-	fi
-	bash scripts/render-secret.sh "$(SOPS_FILE)" "$(DEST)"
-
-secrets-rotate: ## Re-key every deploy/*.sops.env file against the current .sops.yaml recipient list
-	@for f in deploy/*.sops.env; do \
-		if [ -f "$$f" ]; then \
-			echo ">>> updating keys for $$f"; \
-			sops updatekeys -y "$$f"; \
-		fi; \
-	done
-
-age-keygen-host: ## Generate a per-host age keypair under ~/.config/sops/age/ and print the public key
-	bash scripts/age-keygen-host.sh
-
 # devai-tools (devai-tools/go.mod): first-party Go CLIs sibling to
-# gpu-arbiter -- devai-backup, devai-mcp-modelstatus, devai-gpu-vendor.
+# gpu-arbiter -- devai-backup, and since platform-rebuild Phase 5 devai-bus,
+# devai-control and devai-jobs (the images get static builds from
+# slurm-tools).
 # Built/tested with the host's own Go toolchain (consolidated to the
 # current stable release across both modules -- see gpu-arbiter/go.mod),
 # not a pinned container: needs Go >= the go.mod floor on PATH.
@@ -700,35 +606,16 @@ age-keygen-host: ## Generate a per-host age keypair under ~/.config/sops/age/ an
 build-backup-tool: ## Build devai-tools/bin/devai-backup
 	cd devai-tools && mkdir -p bin && go build -o bin/devai-backup ./cmd/devai-backup
 
-build-mcp-modelstatus: ## Build devai-tools/bin/devai-mcp-modelstatus
-	cd devai-tools && mkdir -p bin && go build -o bin/devai-mcp-modelstatus ./cmd/devai-mcp-modelstatus
+build-devai-tools: build-backup-tool ## Build every devai-tools/ binary
+	cd devai-tools && for c in devai-bus devai-control devai-jobs; do go build -o bin/$$c ./cmd/$$c || exit 1; done
 
-build-mcp-modelstatus-image: ## Build the devai-mcp-modelstatus container image (for the MCP gateway catalog)
-	$(CONTAINER_RUNTIME) build --network=host \
-		-f deploy/Dockerfile.mcp-modelstatus \
-		-t devai-mcp-modelstatus .
-
-build-gpu-vendor-tool: ## Build devai-tools/bin/devai-gpu-vendor
-	cd devai-tools && mkdir -p bin && go build -o bin/devai-gpu-vendor ./cmd/devai-gpu-vendor
-
-gpu-vendor: build-gpu-vendor-tool ## Switch GPU vendor in .env. VENDOR=nvidia|amd (required)
-	@if [ "$(VENDOR)" != "nvidia" ] && [ "$(VENDOR)" != "amd" ]; then \
-		echo "ERROR: pass VENDOR=nvidia or VENDOR=amd" >&2; exit 2; \
-	fi
-	devai-tools/bin/devai-gpu-vendor --env-file .env --vendor $(VENDOR)
-
-test-gpu-vendor: ## Verify the GPU-vendor overlay renders correctly both directions
-	bash tests/test-gpu-vendor.sh
-
-build-devai-tools: build-backup-tool build-mcp-modelstatus build-gpu-vendor-tool ## Build every devai-tools/ binary
-
-test-devai-tools: ## Run Go unit tests for devai-tools/ (backup, modelcache, routerclient, gpu-vendor)
+test-devai-tools: ## Run Go unit tests for devai-tools/ (backup, devai-bus, devai-control, devai-jobs; an embedded nats-server from deploy/slurm/nats-server.conf.in)
 	cd devai-tools && go test -race -v -count=1 ./...
 
 # Backup/restore (devai-tools/cmd/devai-backup; see docs/backup-restore.md).
-# Snapshots probe/bench caches, ~/.devai/ preferences+sessions, and the
-# sops/age key. YES=1 mirrors the confirm-flag convention catalog-discover-add
-# already uses for a destructive default-off operation.
+# Snapshots probe/bench caches and ~/.devai/ preferences+sessions. YES=1
+# mirrors the confirm-flag convention catalog-discover-add already uses for
+# a destructive default-off operation.
 
 backup-create: build-backup-tool ## Snapshot host-local state. DEST=<dir> to override.
 	devai-tools/bin/devai-backup snapshot $(if $(DEST),--dest $(DEST))
@@ -748,60 +635,68 @@ backup-restore: build-backup-tool ## Restore from an archive. ARCHIVE=<path> YES
 test-backup-restore: test-devai-tools ## devai-tools Go tests + tests/test-backup-restore.sh
 	./tests/test-backup-restore.sh
 
-# MCP gateway (see docs/mcp.md, the source of truth). Third-party
-# servers resolve from Docker's official catalog; deploy/mcp-catalog-devai.yaml
-# adds only the first-party devai-model-status. Opt-in via the 'mcp'
-# compose profile -- cache-up does NOT start it. Two of the 15 enabled
-# servers (filesystem, arxiv-mcp-server) currently fail to start pending
-# config; the other 13 served 134 tools when last verified.
-mcp-up: ## Start the MCP gateway (15 servers; secrets optional)
-	$(COMPOSE) -f $(CACHE_COMPOSE) --profile mcp up -d mcp-gateway
+# =============================================================================
+# devai-slurm: Slurm, MariaDB, NATS and the bus log in one container
+# (docs/slurm.md; platform-rebuild Phase 5). Behind the compose profile
+# `slurm` until Phase 9 makes the router its client. One-time setup: create
+# $(JOBS_DIR) as a plain directory (plan E9), then make slurm-init
+# build-slurm slurm-up.
+# =============================================================================
 
-mcp-down: ## Stop the MCP gateway
-	$(COMPOSE) -f $(CACHE_COMPOSE) stop mcp-gateway || true
-	$(COMPOSE) -f $(CACHE_COMPOSE) rm -f mcp-gateway || true
+SLURM_IMAGE ?= localhost/devai-slurm:latest
+# Static devai-tools binaries for the images (devai-bus, devai-jobs,
+# devai-control), built with the host's Go and bind-mounted into the build,
+# as build-ollama does with its host build. devai-tools/bin/ is gitignored.
+SLURM_TOOLS_DIST ?= $(CURDIR)/devai-tools/bin/static
+# C7's files, created once by slurm-init; devai-slurm mounts the directory
+# read-only. Compose reads the same path from DEVAI_SLURM_CONFIG_DIR.
+SLURM_CONFIG_DIR ?= $(HOME)/.config/devai/slurm
+export DEVAI_SLURM_CONFIG_DIR := $(SLURM_CONFIG_DIR)
+JOBS_DIR = $(CACHE_DIR)/jobs
 
-mcp-logs: ## Tail the MCP gateway log
-	$(CONTAINER_RUNTIME) logs -f devai-mcp-gateway
+slurm-tools: ## Build devai-bus, devai-jobs and devai-control as static binaries into SLURM_TOOLS_DIST (for the devai-slurm and control-test images)
+	@mkdir -p $(SLURM_TOOLS_DIST)
+	cd devai-tools && for c in devai-bus devai-jobs devai-control; do \
+		CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o $(SLURM_TOOLS_DIST)/$$c ./cmd/$$c || exit 1; \
+	done
 
-mcp-test: ## Smoke-test the running MCP gateway (requires `make mcp-up`)
-	bash tests/test-mcp.sh
+build-slurm: slurm-tools ## Build the devai-slurm image (Debian trixie's Slurm 24.11.5, MariaDB, nats-server; devai-bus, devai-jobs, devai-gpu, the guard and the job scripts) on the pinned DEBIAN_IMAGE
+	$(CONTAINER_RUNTIME) build --network=host \
+		$(PROXY_BUILD_ARGS) \
+		$(APT_PROXY_ARG) \
+		--build-arg BASE_IMAGE=$(DEBIAN_IMAGE) \
+		--build-arg DIST_ID=$$(cat $(SLURM_TOOLS_DIST)/devai-bus $(SLURM_TOOLS_DIST)/devai-jobs | sha256sum | cut -c1-16) \
+		-v $(SLURM_TOOLS_DIST):/var/cache/devai-tools-dist:ro \
+		-f deploy/slurm/Dockerfile \
+		-t $(SLURM_IMAGE) deploy/slurm
 
-test-mcp-modelstatus: ## End-to-end test of the devai-model-status MCP server against the live gateway
-	bash tests/test-mcp-modelstatus.sh
+slurm-init: ## One-time: create devai-slurm's secrets in ~/.config/devai/slurm (slurm.key, jwt_hs256.key, mariadb.pass, nats/<user>.pass; 0600, never overwritten)
+	DEVAI_SLURM_CONFIG_DIR=$(SLURM_CONFIG_DIR) scripts/slurm-init.sh
 
-mcp-health: ## Lightweight /health probe against the running MCP gateway
-	bash scripts/mcp-health.sh
+slurm-up: ## Start devai-slurm (compose profile `slurm`; needs the $(JOBS_DIR) directory, slurm-init and build-slurm first)
+	@test -d $(SLURM_CONFIG_DIR) || { echo "error: no $(SLURM_CONFIG_DIR) -- run 'make slurm-init' first" >&2; exit 1; }
+	@test -d $(JOBS_DIR) || { echo "error: no $(JOBS_DIR) -- create it first (a plain directory; plan E9)" >&2; exit 1; }
+	@$(CONTAINER_RUNTIME) image exists $(SLURM_IMAGE) || { echo "error: no image $(SLURM_IMAGE) -- run 'make build-slurm' first" >&2; exit 1; }
+	@$(CONTAINER_RUNTIME) network exists $(DEVAI_NETWORK) 2>/dev/null || $(CONTAINER_RUNTIME) network create $(DEVAI_NETWORK)
+	$(COMPOSE) -f $(CACHE_COMPOSE) --profile slurm up -d --no-deps slurm
 
-mcp-secrets-render: secrets-tmpfs ## Render deploy/mcp-secrets.sops.env to /run/devai/mcp-secrets.env
-	@# Phase 2 wrapper around the shared scripts/render-secret.sh.
-	@# Operator must have:
-	@#   1. ran `make age-keygen-host` once (ships under sops-age plan)
-	@#   2. added the printed public key to .sops.yaml
-	@#   3. encrypted real values into deploy/mcp-secrets.sops.env via
-	@#      `cp .../mcp-secrets.sops.env.example /tmp/mcp.env`,
-	@#      `sops --encrypt /tmp/mcp.env > deploy/mcp-secrets.sops.env`,
-	@#      `shred -u /tmp/mcp.env`
-	@if [ ! -f deploy/mcp-secrets.sops.env ]; then \
-		echo "ERROR: deploy/mcp-secrets.sops.env not present." >&2; \
-		echo "       See deploy/mcp-secrets.sops.env.example for the" >&2; \
-		echo "       expected variable names. Encrypt your file with" >&2; \
-		echo "       sops, then re-run this target." >&2; \
-		exit 1; \
-	fi
-	bash scripts/render-secret.sh \
-	     deploy/mcp-secrets.sops.env \
-	     /run/devai/mcp-secrets.env
+slurm-down: ## Stop and remove devai-slurm (jobs running then end NODE_FAIL and never run again; JobRequeue=0)
+	-$(COMPOSE) -f $(CACHE_COMPOSE) --profile slurm stop -t 60 slurm
+	-$(COMPOSE) -f $(CACHE_COMPOSE) --profile slurm rm -f slurm
+
+test-slurm: slurm-tools ## Live Phase 5 checks: devai-slurm and two devai-control test containers on the GPU, with the stack down (tests/slurm/test-slurm.sh; refuses while a production devai-control runs). ONLY=holders runs only the guard's foreign-holder checks, the unkillable one included: run `sudo -v` first.
+	tests/slurm/test-slurm.sh $(if $(ONLY),--only $(ONLY))
 
 # pipelock egress proxy (per docs/pipelock.md). Always-on infra service (no
 # profile) brought up by `make cache-up`, which mounts the host CA key.
 pipelock-logs: ## Tail the pipelock egress-proxy log
 	$(CONTAINER_RUNTIME) logs -f devai-pipelock
 
-pipelock-ca-init: ## One-time: generate the pipelock MITM CA. Cert -> deploy/ (commit); key -> host (0600).
+pipelock-ca-init: ## One-time: generate the pipelock MITM CA. Cert -> deploy/ (commit); key -> host (0600). Needs make build-pipelock.
+	@$(CONTAINER_RUNTIME) image exists localhost/devai-pipelock:latest || { echo "error: no image localhost/devai-pipelock:latest -- run 'make build-pipelock' first" >&2; exit 1; }
 	@mkdir -p "$$(dirname $(PIPELOCK_CA_KEY))"; \
 	tmp=$$(mktemp -d); \
-	$(CONTAINER_RUNTIME) run --rm -v "$$tmp:/out:z" ghcr.io/luckypipewrench/pipelock:latest \
+	$(CONTAINER_RUNTIME) run --rm -v "$$tmp:/out:z" localhost/devai-pipelock:latest \
 	    tls init --out /out --org "devai-pipelock" >/dev/null; \
 	if [ ! -f "$$tmp/ca.pem" ] || [ ! -f "$$tmp/ca-key.pem" ]; then \
 	    echo "ERROR: pipelock tls init did not produce a CA." >&2; rm -rf "$$tmp"; exit 1; \
@@ -812,7 +707,7 @@ pipelock-ca-init: ## One-time: generate the pipelock MITM CA. Cert -> deploy/ (c
 	echo ""; \
 	echo "CA cert -> deploy/pipelock-ca.crt        (local build input; gitignored)"; \
 	echo "CA key  -> $(PIPELOCK_CA_KEY)  (0600, host-only, never committed)"; \
-	echo "Next: make build-gpu && make cache-up"
+	echo "Next: make build-lab && make cache-up"
 
 test-router: ## Run Go unit tests for gpu-arbiter router
 	cd gpu-arbiter && go test -race -v -count=1 ./...
@@ -838,13 +733,6 @@ test-probe-vllm: ## Smoke test: probe one HF model via vLLM, assert cache schema
 	@# containers and aborts otherwise.
 	./tests/test-probe-vllm.sh
 
-test-probe-sglang: ## Smoke test: probe one HF model via SGLang, assert cache schema
-	@# Wall time ~60-120s. Same precondition as test-probe-vllm.
-	@# Notes that the schema is correct even when the model can't load
-	@# (e.g. SGLang+FP4 on this image — the cache records `fits: false`
-	@# with `evidence.kind: "infra"`).
-	./tests/test-probe-sglang.sh
-
 test-probe-ollama-idempotent: cache-up ## Verify the refactored Ollama prober is byte-idempotent on a populated cache
 	@# Phase 1 byte-identical regression check. Runs `make probe` against
 	@# the existing cache (which skips already-cached cells) and diffs
@@ -857,11 +745,6 @@ test-vllm: cache-up ## Live integration tests for the vLLM backend (chat, ctx sw
 	@# pick models — skips cleanly when nothing's cached. See
 	@# tests/test-router-vllm.sh for the test surface.
 	./tests/test-router-vllm.sh
-
-test-sglang: cache-up ## Live integration tests for the SGLang backend (mirror of test-vllm)
-	@# Skips entirely when the SGLang cache has no fitting entries
-	@# (e.g. when SGLang+FP4 fails on this image — see docs/backends.md).
-	./tests/test-router-sglang.sh
 
 test-e2e: cache-up ## End-to-end: picker discovery → agent command → live router chat
 	@# Bridges Phase 7 picker tests and Phase 5 router tests. Imports
@@ -908,10 +791,10 @@ test-agents: ## Smoke-test every (agent × backend) cell against the live router
 		-e PROMPT="$${PROMPT:-reply with the single word PONG}" \
 		-e ROUTER=devai-router \
 		-e LOG_DIR=/var/log/agent-matrix \
-		$(IMAGE_NAME_GPU) /usr/local/bin/agent-matrix
+		$(IMAGE_NAME) /usr/local/bin/agent-matrix
 	@echo "  logs preserved at $(CURDIR)/tests/.matrix-logs/"
 
-test: test-router test-devai-tools test-python test-backup-restore test-gpu-vendor test-probe-ollama-idempotent test-ollama test-e2e test-vllm test-sglang test-models ## Run every available test in sequence (Go unit + Python unit + Ollama + E2E + vLLM/SGLang integration + matrix + probes; ~30-60 min)
+test: test-router test-devai-tools test-python test-backup-restore test-probe-ollama-idempotent test-ollama test-e2e test-vllm test-models ## Run every available test in sequence (Go unit + Python unit + Ollama + E2E + vLLM integration + matrix + probes; ~30-60 min)
 	@# The cache-up suite runs as prerequisites above. Probe smoke tests
 	@# require the live backends to be DOWN (the prober self-checks for
 	@# router/vllm/sglang containers and aborts otherwise) — they run
@@ -920,44 +803,40 @@ test: test-router test-devai-tools test-python test-backup-restore test-gpu-vend
 	@# captured and re-emitted after `cache-up` so we never leave the
 	@# stack down.
 	@#
-	@# rc=77 is the repo-wide "skipped, precondition absent" convention, the
-	@# same one tests/test-mcp.sh and tests/test-gpu-vendor.sh use. Both probe
-	@# smoke tests exit 77 when the model they would probe has no weights on
+	@# rc=77 is the repo-wide "skipped, precondition absent" convention. The probe
+	@# smoke test exits 77 when the model it would probe has no weights on
 	@# disk -- a host data condition, not a failure. Anything else is real.
+	@# (SGLang's smoke test went to attic/sglang/ with its backend, M16.)
 	@set -u; \
 	echo ""; echo "=== Running cache-down probe tests (final phase) ==="; \
 	$(MAKE) cache-down >/dev/null 2>&1 || true; \
-	./tests/test-probe-vllm.sh;   vrc=$$?; \
-	./tests/test-probe-sglang.sh; src=$$?; \
+	./tests/test-probe-vllm.sh; vrc=$$?; \
 	$(MAKE) cache-up >/dev/null 2>&1 || true; \
-	for rc in "$$vrc" "$$src"; do \
-	    if [ "$$rc" -ne 0 ] && [ "$$rc" -ne 77 ]; then \
-	        echo "probe-vllm rc=$$vrc, probe-sglang rc=$$src"; exit 1; \
-	    fi; \
-	done; \
-	if [ "$$vrc" -eq 77 ] || [ "$$src" -eq 77 ]; then \
-	    echo "probe smoke tests: vllm rc=$$vrc, sglang rc=$$src (77 = skipped, no weights on disk)"; \
+	if [ "$$vrc" -ne 0 ] && [ "$$vrc" -ne 77 ]; then \
+	    echo "probe-vllm rc=$$vrc"; exit 1; \
+	fi; \
+	if [ "$$vrc" -eq 77 ]; then \
+	    echo "probe smoke test: vllm rc=$$vrc (77 = skipped, no weights on disk)"; \
 	fi
 
 help: ## Show this help message
 	@printf "\nDevAI Lab — Containerized AI Development Environment\n\n"
 	@printf "  %-44s%s\n" "BUILD" "RUN"
-	@printf "  %-44s%s\n" "fetch-cli        Update CLI binaries" "lab-cpu          JupyterLab (CPU)"
-	@printf "  %-44s%s\n" "pull-images      Pull base images" "lab-gpu          JupyterLab (GPU)"
-	@printf "  %-44s%s\n" "build-cpu        Build image (CPU)" "shell-cpu        Shell (CPU)"
-	@printf "  %-44s%s\n" "build-gpu        Build image (GPU)" "shell-gpu        Shell (GPU)"
+	@printf "  %-44s%s\n" "fetch-cli        Update CLI binaries" "lab              JupyterLab (GPU if the host has one)"
+	@printf "  %-44s%s\n" "pull-images      Pull base images" "shell            Shell (GPU if the host has one)"
+	@printf "  %s\n" "build-lab        Build the lab image"
 	@printf "  %s\n" "build-router     Build router image"
-	@printf "  %s\n" "build            Build all (CPU+GPU+router)"
+	@printf "  %s\n" "build            Build all (lab+router+apt-cache+pipelock)"
 	@printf "\n"
 	@printf "  %-44s%s\n" "INFRASTRUCTURE" "MAINTENANCE"
-	@printf "  %-44s%s\n" "cache-up         Start services" "clean-cpu        Remove image (CPU)"
-	@printf "  %-44s%s\n" "cache-down       Stop services" "clean-gpu        Remove image (GPU)"
+	@printf "  %-44s%s\n" "cache-up         Start services" "clean-lab        Remove lab + base images"
+	@printf "  %-44s%s\n" "cache-down       Stop services" ""
 	@printf "  %-44s%s\n" "cache-status     Show status" "clean-router     Remove router image"
 	@printf "  %-44s%s\n" "cache-clean      Remove cached data" "clean            Remove all images"
 	@printf "  %-44s%s\n" "" "prune            Prune dangling images"
 	@printf "  %-44s%s\n" "" "test             Run integration tests"
 	@printf "\n"
-	@printf "  %-44s%s\n" "MODELS" "vLLM / SGLang (lifecycle: docs/backends.md)"
+	@printf "  %-44s%s\n" "MODELS" "vLLM / vllm-devai (lifecycle: docs/backends.md)"
 	@printf "  %-44s%s\n" "probe            Populate cache for every (VRAM, ctx) tier" "vllm-list        List on-disk vLLM weights"
 	@printf "  %-44s%s\n" "model-fit        Print fitting models at VRAM/CONTEXT" "vllm-rm          Remove model"
 	@printf "  %-44s%s\n" "model-pull       Download best-fit candidates" "vllm-status      Show status"
@@ -968,16 +847,22 @@ help: ## Show this help message
 	@printf "  %-44s%s\n" "ollama-df        Disk usage" ""
 	@printf "  %s\n" "ollama-clean     Clean partials"
 	@printf "  %-44s%s\n" "card-hints       Derived parser report" "card-hints-fetch Stage metadata only"
+	@printf "  %-44s%s\n" "fetch-vllm-recipes  vLLM recipe seeds" "recipe-apply     NAME=<row> recipe flags"
+	@printf "\n"
+	@printf "  %-44s%s\n" "SLURM (docs/slurm.md; profile slurm)" ""
+	@printf "  %-44s%s\n" "slurm-init       Create its secrets (once)" "slurm-up         Start devai-slurm"
+	@printf "  %-44s%s\n" "build-slurm      Build devai-slurm" "slurm-down       Stop devai-slurm"
+	@printf "  %-44s%s\n" "test-slurm       Live checks (GPU)" ""
 	@printf "\n"
 	@printf "  %s\n" "DEPLOY"
 	@printf "  %s\n" "install-systemd  Auto-start infrastructure at boot"
 	@printf "\n"
 
 # =============================================================================
-# Infrastructure services (caches + Ollama + vLLM + Open WebUI)
+# Infrastructure services (caches + Ollama + vLLM + router)
 # =============================================================================
 
-cache-up: ## Start all infrastructure (caches + Ollama + router + Open WebUI; vLLM/SGLang as `sleep` placeholders, recreated on demand)
+cache-up: ## Start all infrastructure (caches + Ollama + router; vLLM/SGLang as `sleep` placeholders, recreated on demand)
 	@# nvidia_uvm and nvidia_uvm_tools are not pulled in by the display
 	@# stack at boot — only by the first CUDA process. The CDI spec
 	@# references /dev/nvidia-uvm and /dev/nvidia-uvm-tools, so without
@@ -1020,6 +905,13 @@ cache-up: ## Start all infrastructure (caches + Ollama + router + Open WebUI; vL
 	@# names every non-profile service, so nothing needed goes unstarted --
 	@# and `make cache-services-check`'s test asserts that list stays in
 	@# sync with the compose file.
+	@# The always-on images are built here (platform-rebuild Phase 2); compose
+	@# would try to PULL a missing localhost/ image and fail obscurely.
+	@for i in localhost/devai-apt-cache:latest=build-apt-cache localhost/devai-pipelock:latest=build-pipelock \
+	          localhost/devai-router:latest=build-router $(OLLAMA_IMAGE)=build-ollama; do \
+	  $(CONTAINER_RUNTIME) image exists $${i%=*} \
+	    || { echo "error: no image $${i%=*} -- run 'make $${i##*=}' first" >&2; exit 1; }; \
+	done
 	@key=$(PIPELOCK_CA_KEY); [ -f "$$key" ] || key=/dev/null; \
 	  if [ "$$key" = /dev/null ]; then echo "NOTE: pipelock CA key not found ($(PIPELOCK_CA_KEY)); devai-pipelock stays unhealthy until 'make pipelock-ca-init'."; fi; \
 	  svcs=""; \
@@ -1039,12 +931,10 @@ cache-up: ## Start all infrastructure (caches + Ollama + router + Open WebUI; vL
 	  PIPELOCK_CA_KEY_FILE=$$key $(COMPOSE) -f $(CACHE_COMPOSE) up -d --no-deps $$svcs
 	@echo "Infrastructure services started:"
 	@echo "  apt-cacher-ng:     http://localhost:3142"
-	@echo "  Registry mirror:   http://localhost:5000"
 	@echo "  Router:            devai-router:11434 (unified endpoint)"
 	@echo "  Ollama:            devai-ollama:11434 (GGUF models)"
-	@echo "  vLLM/SGLang:       devai-router:11435 / 11436 (recreated on first request — see docs/backends.md)"
+	@echo "  vLLM/vllm-devai:   devai-router:11435 / 11437 (recreated on first request — see docs/backends.md)"
 	@echo "  laya trainer:      devai-router:11438 (job runner, recreated on the first job -- see docs/laya-trainer.md)"
-	@echo "  Open WebUI:        https://localhost:$(WEBUI_PORT)"
 	@echo "  Logger:            $(CACHE_DIR)/logs/<container>.log (per-service stdout)"
 	@echo ""
 	@echo "To pull and probe models:  make model-pull [FAMILY=qwen3.5] && make probe"
@@ -1158,10 +1048,11 @@ cache-status: ## Show infrastructure service status and disk usage
 cache-clean: ## Remove all cached data (keeps volumes mounted, preserves podman graphroot)
 	$(COMPOSE) -f $(CACHE_COMPOSE) down
 	@echo "Cleaning cache directories..."
-	@# $(CACHE_DIR)/registry co-hosts podman's graphroot AND the registry:2 pull-through cache
-	@# (see README "Storage Layout"). Wiping registry/* would destroy podman image storage,
-	@# so we target only the registry:2 subtree (registry/docker) and guard every path
-	@# against overlap with the container runtime's graphroot.
+	@# $(CACHE_DIR)/registry co-hosts podman's graphroot AND what is left of the registry:2
+	@# pull-through cache (removed by platform-rebuild Phase 2; see README "Storage Layout").
+	@# Wiping registry/* would destroy podman image storage, so we target only the
+	@# registry:2 subtree (registry/docker) and guard every path against overlap with the
+	@# container runtime's graphroot.
 	@# Container-managed caches (apt-cacher-ng, registry:2) contain files owned by
 	@# subuids, so the cleanup runs under `podman unshare` to access them.
 	@graphroot=$$($(CONTAINER_RUNTIME) info --format '{{.Store.GraphRoot}}' 2>/dev/null \
@@ -1298,6 +1189,12 @@ PROBE_CONTEXTS ?= 32K,64K,128K,256K
 # e.g. PROBE_FORCE_CTX=128K PROBE_KV_CACHE_TYPE=q8_0 PROBE_FLASH_ATTENTION=1.
 PROBE_KV_CACHE_TYPE   ?=
 PROBE_FLASH_ATTENTION ?=
+# HF probers: 1 = the card-derived parsers alone drive the launch (the curated
+# parsers: block, the recipe seed and the name heuristic are skipped; plan I24).
+# The prober refuses it unless scoped (PROBE_REPO) and pointed at a scratch
+# cache (--cache, which these targets do not pass yet), and then writes no
+# exclusion ledger: its cells must not replace the curated ones.
+PROBE_IGNORE_CURATED_PARSERS ?=
 # Seconds to wait for the recreated devai-ollama to answer `ollama list`
 # before `make probe` gives up. Bounded so a daemon that never comes up
 # fails loudly instead of hanging the probe run forever.
@@ -1429,7 +1326,14 @@ probe-vllm: ## Probe every downloaded vLLM/HF model per (VRAM, CONTEXT) cell.
 	@#   PROBE_KV_CACHE_TYPE=auto    KV dtype for this pass (default fp8);
 	@#                               cells are stamped so serve time
 	@#                               reproduces the measured dtype
+	@#   PROBE_IGNORE_CURATED_PARSERS=1  card-derived parsers only: skip the
+	@#                               curated block, recipe seed and name
+	@#                               heuristic (plan I24); the prober refuses
+	@#                               it without PROBE_REPO, a scratch --cache
+	@#                               and a scratch --ledger (run the script
+	@#                               directly)
 	PROBE_KV_CACHE_TYPE="$(PROBE_KV_CACHE_TYPE)" \
+	PROBE_IGNORE_CURATED_PARSERS="$(PROBE_IGNORE_CURATED_PARSERS)" \
 	python3 scripts/probe-vllm-reasoning.py \
 	    --host-vram-gb $(GPU_MEMORY_GB) \
 	    --models-dir $(VLLM_MODELS_DIR) \
@@ -1440,7 +1344,7 @@ probe-vllm: ## Probe every downloaded vLLM/HF model per (VRAM, CONTEXT) cell.
 	    $(if $(PROBE_FORCE_ARCH),--force-arch,) \
 	    $(if $(PROBE_CTX_EXACT),--ctx-exact $(PROBE_CTX_EXACT),)
 
-probe-vllm-devai: ## Probe every downloaded HF model on the vllm-devai backend (home-built vLLM 0.28 + patches; own cache) per (VRAM, CONTEXT) cell.
+probe-vllm-devai: ## Probe every downloaded HF model on the vllm-devai backend (home-built, patched vLLM; VLLM_DEVAI_IMAGE; own cache) per (VRAM, CONTEXT) cell. PROBE_LEDGER=<file> keeps verdicts out of deploy/.model-status.json.
 	@# Pre-condition: devai-router, devai-vllm, and devai-sglang must
 	@# be stopped — the prober launches devai-vllm-probe with explicit
 	@# GPU exclusivity. The script self-checks and aborts otherwise.
@@ -1453,7 +1357,18 @@ probe-vllm-devai: ## Probe every downloaded HF model on the vllm-devai backend (
 	@#   PROBE_KV_CACHE_TYPE=auto    KV dtype for this pass (default fp8);
 	@#                               cells are stamped so serve time
 	@#                               reproduces the measured dtype
+	@#   PROBE_IGNORE_CURATED_PARSERS=1  card-derived parsers only: skip the
+	@#                               curated block, recipe seed and name
+	@#                               heuristic (plan I24); the prober refuses
+	@#                               it without PROBE_REPO, a scratch --cache
+	@#                               and a scratch --ledger (run the script
+	@#                               directly for the cache)
+	@#   PROBE_LEDGER=<file>         read and write this exclusion ledger
+	@#                               instead of deploy/.model-status.json
+	@#                               (a scratch ledger: 4v's probes, I24)
+	@#   VLLM_DEVAI_IMAGE=<tag>      the build to probe (exported; default :latest)
 	PROBE_KV_CACHE_TYPE="$(PROBE_KV_CACHE_TYPE)" \
+	PROBE_IGNORE_CURATED_PARSERS="$(PROBE_IGNORE_CURATED_PARSERS)" \
 	python3 scripts/probe-vllm-devai-reasoning.py \
 	    --host-vram-gb $(GPU_MEMORY_GB) \
 	    --models-dir $(VLLM_MODELS_DIR) \
@@ -1462,30 +1377,8 @@ probe-vllm-devai: ## Probe every downloaded HF model on the vllm-devai backend (
 	    $(if $(PROBE_REPO),--repo '$(PROBE_REPO)',) \
 	    $(if $(PROBE_FORCE),--force,) \
 	    $(if $(PROBE_FORCE_ARCH),--force-arch,) \
-	    $(if $(PROBE_CTX_EXACT),--ctx-exact $(PROBE_CTX_EXACT),)
-
-probe-sglang: ## Probe every downloaded SGLang/HF model per (VRAM, CONTEXT) cell.
-	@# Pre-condition: same as probe-vllm — all GPU-owning backends down.
-	@# Knobs:
-	@#   PROBE_VRAMS_SGLANG=16G,24G  target VRAM bands
-	@#   PROBE_CONTEXTS=32K,...      ctx tiers
-	@#   PROBE_REPO=<regex>          filter catalog rows by repo
-	@#   PROBE_FORCE=1               re-probe every cell
-	@#   PROBE_FORCE_ARCH=1          re-probe top-level capability/arch
-	@#   PROBE_KV_CACHE_TYPE=fp8_e5m2  enforce a KV dtype for this pass
-	@#                               (default: none = engine default);
-	@#                               cells are stamped so serve time
-	@#                               reproduces the measured dtype
-	PROBE_KV_CACHE_TYPE="$(PROBE_KV_CACHE_TYPE)" \
-	python3 scripts/probe-sglang-reasoning.py \
-	    --host-vram-gb $(GPU_MEMORY_GB) \
-	    --models-dir $(SGLANG_MODELS_DIR) \
-	    $(if $(PROBE_VRAMS_SGLANG),--vram $(PROBE_VRAMS_SGLANG),) \
-	    $(if $(PROBE_CONTEXTS),--ctx $(PROBE_CONTEXTS),) \
-	    $(if $(PROBE_REPO),--repo '$(PROBE_REPO)',) \
-	    $(if $(PROBE_FORCE),--force,) \
-	    $(if $(PROBE_FORCE_ARCH),--force-arch,) \
-	    $(if $(PROBE_CTX_EXACT),--ctx-exact $(PROBE_CTX_EXACT),)
+	    $(if $(PROBE_CTX_EXACT),--ctx-exact $(PROBE_CTX_EXACT),) \
+	    $(if $(PROBE_LEDGER),--ledger '$(PROBE_LEDGER)',)
 
 probe-load-vllm: ## Serving-time LOAD probe for vLLM: augment fit cache with serving_ok/transient/needle, ascending ctx, stop at OOM.
 	@# Layers onto deploy/.vllm-reasoning-cache.json — run `make probe-vllm`
@@ -1500,6 +1393,9 @@ probe-load-vllm: ## Serving-time LOAD probe for vLLM: augment fit cache with ser
 	@#                               the dtype the target cells were fit-probed
 	@#                               with (default fp8), or serving numbers are
 	@#                               measured under the wrong dtype
+	@#   PROBE_MTP=1                 relaunch a row whose cell records
+	@#                               mtp_fits: true with its drafter, as the
+	@#                               picker serves it (stamps serving_mtp)
 	PROBE_KV_CACHE_TYPE="$(PROBE_KV_CACHE_TYPE)" \
 	python3 scripts/probe-vllm-reasoning.py --load \
 	    --host-vram-gb $(GPU_MEMORY_GB) \
@@ -1507,19 +1403,25 @@ probe-load-vllm: ## Serving-time LOAD probe for vLLM: augment fit cache with ser
 	    $(if $(PROBE_CONTEXTS),--ctx $(PROBE_CONTEXTS),) \
 	    $(if $(PROBE_REPO),--repo '$(PROBE_REPO)',) \
 	    $(if $(PROBE_FORCE),--force,) \
+	    $(if $(PROBE_MTP),--mtp,) \
 	    $(if $(PROBE_NEEDLE_DEPTH),--needle-depth $(PROBE_NEEDLE_DEPTH),)
 
-probe-load-sglang: ## Serving-time LOAD probe for SGLang: same as probe-load-vllm against the SGLang cache.
-	@# Layers onto deploy/.sglang-reasoning-cache.json (the vllm-devai backend
-	@# has no load probe target yet; deploy/.vllm-devai-reasoning-cache.json) -- run `make probe-sglang`
-	@# first. Same precondition + knobs as probe-load-vllm.
+probe-load-vllm-devai: ## Serving-time LOAD probe on the vllm-devai backend (VLLM_DEVAI_IMAGE): as probe-load-vllm, plus PROBE_MTP=1 (with the drafter), PROBE_CACHE=<file> (a copy of the vllm-devai cache) and PROBE_LEDGER=<file> (a scratch ledger).
+	@# Layers onto deploy/.vllm-devai-reasoning-cache.json, or onto
+	@# PROBE_CACHE -- run `make probe-vllm-devai` first so the fit cells exist.
+	@# A cell that already carries serving_ok is skipped (PROBE_FORCE=1
+	@# re-runs it), so a per-tag comparison takes a NEW copy of the cache
+	@# per tag (plan 4v). Same precondition + knobs as probe-load-vllm.
 	PROBE_KV_CACHE_TYPE="$(PROBE_KV_CACHE_TYPE)" \
-	python3 scripts/probe-sglang-reasoning.py --load \
+	python3 scripts/probe-vllm-devai-reasoning.py --load \
 	    --host-vram-gb $(GPU_MEMORY_GB) \
-	    --models-dir $(SGLANG_MODELS_DIR) \
+	    --models-dir $(VLLM_MODELS_DIR) \
 	    $(if $(PROBE_CONTEXTS),--ctx $(PROBE_CONTEXTS),) \
 	    $(if $(PROBE_REPO),--repo '$(PROBE_REPO)',) \
 	    $(if $(PROBE_FORCE),--force,) \
+	    $(if $(PROBE_MTP),--mtp,) \
+	    $(if $(PROBE_CACHE),--cache '$(PROBE_CACHE)',) \
+	    $(if $(PROBE_LEDGER),--ledger '$(PROBE_LEDGER)',) \
 	    $(if $(PROBE_NEEDLE_DEPTH),--needle-depth $(PROBE_NEEDLE_DEPTH),)
 
 model-fit: ## Print which models fit at the chosen (VRAM, CONTEXT) — diagnostic, no writes.
@@ -1624,10 +1526,23 @@ model-sync: ## Closed loop: diff catalog vs probed+excluded, auto download+probe
 	  $(if $(SYNC_MAX_DOWNLOADS),--max-downloads $(SYNC_MAX_DOWNLOADS),) \
 	  $(if $(FAMILY),--family $(FAMILY),)
 
-probe-check: ## Report backend image drift: compare running vLLM/SGLang image digest vs each probe cache's _meta baseline. Exit 1 on drift.
+probe-check: ## Report backend image drift: compare the vLLM and vllm-devai images against each probe cache's _meta baseline. Exit 1 on drift.
 	@CONTAINER_RUNTIME=$(CONTAINER_RUNTIME) \
-	  VLLM_IMAGE="$(VLLM_IMAGE)" SGLANG_IMAGE="$(SGLANG_IMAGE)" \
+	  VLLM_IMAGE="$(VLLM_IMAGE)" \
 	  python3 scripts/probe-check.py
+
+fetch-vllm-recipes: ## Fetch vLLM's official launch recipes (github.com/vllm-project/recipes) for the catalog's HF rows into deploy/recipe-seeds.yaml. Offline-first: cached 12 h, never fails. RECIPES_CACHE=<dir>, OFFLINE=1, REFRESH=1.
+	@#   Review `git diff deploy/recipe-seeds.yaml`; the probers use a seed's
+	@#   parsers after the curated and card-derived ones; nothing launches with
+	@#   its engine flags until `make recipe-apply NAME=<row>`.
+	python3 scripts/fetch-vllm-recipes.py \
+	    $(if $(RECIPES_CACHE),--cache-dir '$(RECIPES_CACHE)',) \
+	    $(if $(OFFLINE),--offline,) \
+	    $(if $(REFRESH),--refresh,)
+
+recipe-apply: ## Write one row's reviewed recipe flags into deploy/recovery-flags.generated.json (backend vllm-devai), only where min_vllm_version admits build-vllm.sh's vLLM; flags the launch builders emit are reported, not written. NAME=<row>, DRY_RUN=1.
+	@test -n "$(NAME)" || { echo "usage: make recipe-apply NAME=<catalog row> [DRY_RUN=1]"; exit 2; }
+	python3 scripts/recipe-apply.py --name '$(NAME)' $(if $(DRY_RUN),--dry-run,)
 
 card-hints: ## Read-only: predicted-vs-curated parser report derived from each checkpoint's own chat template. No GPU, no launch, changes nothing.
 	@VLLM_MODELS_DIR="$(VLLM_MODELS_DIR)" SGLANG_MODELS_DIR="$(SGLANG_MODELS_DIR)" \
@@ -1719,16 +1634,17 @@ vllm-df: ## Show vLLM models disk usage
 
 
 # laya trainer backend (docs/plans/laya-trainer.md). A separate image on the
-# lab's GPU base, NOT an extension of the lab image. Its Python packages come
+# lab's base, NOT an extension of the lab image. Its Python packages come
 # from a hash lock (laya-trainer/requirements.lock), installed with
 # --require-hashes; SOURCE_ID is recorded in every artifact manifest.
 LAYA_TRAINER_IMAGE ?= localhost/devai-laya-trainer:latest
 
-build-laya-trainer: build-base-gpu ## Build the laya trainer image (devai-laya-trainer) on the lab's GPU base image
+build-laya-trainer: build-base ## Build the laya trainer image (devai-laya-trainer) on the lab's base image
 	$(CONTAINER_RUNTIME) build --network=host \
 		$(PROXY_BUILD_ARGS) \
+		$(APT_PROXY_ARG) \
 		-v $(CACHE_DIR)/pip:/root/.cache/uv \
-		--build-arg BASE_IMAGE=$(BASE_IMAGE_NAME_GPU) \
+		--build-arg BASE_IMAGE=$(BASE_IMAGE_NAME) \
 		--build-arg SOURCE_ID=$$(cat laya-trainer/requirements.lock deploy/laya-models.yaml laya-trainer/laya_trainer/*.py | sha256sum | cut -c1-16) \
 		-f deploy/Dockerfile.laya-trainer \
 		-t $(LAYA_TRAINER_IMAGE) .
@@ -1741,20 +1657,20 @@ test-laya-trainer: ## Run the laya trainer's unit tests inside its image, on CPU
 		$(LAYA_TRAINER_IMAGE) \
 		python -m unittest discover -s /opt/laya-trainer/laya_trainer/tests -t /opt/laya-trainer $(if $(VERBOSE),-v,)
 
-laya-trainer-lock: ## Regenerate laya-trainer/requirements.lock (hash-locked) from requirements.in, inside the GPU base image
+laya-trainer-lock: ## Regenerate laya-trainer/requirements.lock (hash-locked) from requirements.in, inside the base image
 	$(CONTAINER_RUNTIME) run --rm --network=host \
 		-v $(CURDIR)/laya-trainer:/src \
 		-v $(CACHE_DIR)/pip:/root/.cache/uv \
-		$(BASE_IMAGE_NAME_GPU) \
+		$(BASE_IMAGE_NAME) \
 		uv pip compile /src/requirements.in --generate-hashes \
 			--python-version $(PYTHON_VERSION) --python-platform x86_64-manylinux_2_28 \
 			--custom-compile-command "make laya-trainer-lock" -o /src/requirements.lock
 
-lab-lock: ## Regenerate the lab image's hash locks inside the GPU base image: requirements-lab.lock from requirements-base.txt (against the torch pins in requirements-torch.txt) and requirements-skypilot.lock from requirements-skypilot.in. Keeps every locked version the inputs still allow (uv treats the existing lock as preferences); UPGRADE=1 re-resolves to the newest releases. Review the diff, rebuild, re-bench.
+lab-lock: ## Regenerate the lab image's hash locks inside the base image: requirements-lab.lock from requirements-base.txt (against the torch pins in requirements-torch.txt) and requirements-skypilot.lock from requirements-skypilot.in. Keeps every locked version the inputs still allow (uv treats the existing lock as preferences); UPGRADE=1 re-resolves to the newest releases. Review the diff, rebuild, re-bench.
 	$(CONTAINER_RUNTIME) run --rm --network=host --entrypoint uv \
 		-v $(CURDIR):/src -w /src \
 		-v $(CACHE_DIR)/pip:/root/.cache/uv \
-		$(BASE_IMAGE_NAME_GPU) \
+		$(BASE_IMAGE_NAME) \
 		pip compile requirements-base.txt -c requirements-torch.txt --torch-backend cpu \
 			--no-emit-package torch --no-emit-package torchvision --no-emit-package torchaudio \
 			--generate-hashes $(if $(UPGRADE),--upgrade,) --python-version $(PYTHON_VERSION) --python-platform x86_64-manylinux_2_28 \
@@ -1762,21 +1678,50 @@ lab-lock: ## Regenerate the lab image's hash locks inside the GPU base image: re
 	$(CONTAINER_RUNTIME) run --rm --network=host --entrypoint uv \
 		-v $(CURDIR):/src -w /src \
 		-v $(CACHE_DIR)/pip:/root/.cache/uv \
-		$(BASE_IMAGE_NAME_GPU) \
+		$(BASE_IMAGE_NAME) \
 		pip compile requirements-skypilot.in \
 			--generate-hashes $(if $(UPGRADE),--upgrade,) --python-version $(PYTHON_VERSION) --python-platform x86_64-manylinux_2_28 \
 			--custom-compile-command "make lab-lock" -o requirements-skypilot.lock
 
 laya-check: ## GPU-exclusive, evicts the teacher ~3 min: run the reference laya job (ds-a6c9c8248242) through :11438 and check the teacher/trainer hand-off (swap, 503 hold, job, parity, aiagent verify + golden, teacher restored). TEACHER=<model string> (default: what TEACHER_PORT has loaded), TEACHER_PORT=11437, KEEP_RUN=1.
-	python3 scripts/laya-check.py --lab-image $(IMAGE_NAME_GPU) --trainer-image $(LAYA_TRAINER_IMAGE) \
+	python3 scripts/laya-check.py --lab-image $(IMAGE_NAME) --trainer-image $(LAYA_TRAINER_IMAGE) \
 	  $(if $(TEACHER),--teacher '$(TEACHER)',) \
 	  $(if $(TEACHER_PORT),--teacher-port $(TEACHER_PORT),) \
 	  $(if $(KEEP_RUN),--keep-run,)
 
-build-router: ## Build the gpu-arbiter router image
+build-router: ## Build the gpu-arbiter router image: a static binary from the host's Go, in FROM scratch
+	cd gpu-arbiter && CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o gpu-arbiter .
 	$(CONTAINER_RUNTIME) build --network=host \
 		-f deploy/Dockerfile.router \
 		-t devai-router .
+
+build-apt-cache: ## Build the devai-apt-cache image (Debian's apt-cacher-ng on the pinned DEBIAN_IMAGE)
+	$(CONTAINER_RUNTIME) build --network=host \
+		$(PROXY_BUILD_ARGS) \
+		$(APT_PROXY_ARG) \
+		--build-arg BASE_IMAGE=$(DEBIAN_IMAGE) \
+		-f deploy/Dockerfile.apt-cache \
+		-t devai-apt-cache .
+
+# Where scripts/build-pipelock.sh leaves the binary. NOT under $(CACHE_DIR),
+# for the same reason as OLLAMA_DIST.
+PIPELOCK_DIST ?= $(HOME)/.cache/devai/pipelock-build/dist
+
+build-pipelock: build-pipelock-dist build-pipelock-image ## Compile pipelock from source on the host, then build the devai-pipelock image from it
+
+build-pipelock-dist: ## Compile pipelock v3.0.0 (commit 9d2e37d) FROM SOURCE with the host's Go; see scripts/build-pipelock.sh
+	bash scripts/build-pipelock.sh
+
+build-pipelock-image: ## Build the devai-pipelock image (the pinned DEBIAN_IMAGE + its CA bundle + the host-built pipelock)
+	@test -x $(PIPELOCK_DIST)/pipelock || { echo "error: no build at $(PIPELOCK_DIST) -- run 'make build-pipelock-dist' first" >&2; exit 1; }
+	$(CONTAINER_RUNTIME) build --network=host \
+		$(PROXY_BUILD_ARGS) \
+		$(APT_PROXY_ARG) \
+		--build-arg BASE_IMAGE=$(DEBIAN_IMAGE) \
+		--build-arg DIST_ID=$$(sha256sum $(PIPELOCK_DIST)/pipelock | cut -c1-16) \
+		-v $(PIPELOCK_DIST):/var/cache/pipelock-dist:ro \
+		-f deploy/Dockerfile.pipelock \
+		-t devai-pipelock .
 
 # Where scripts/build-ollama.sh leaves the compiled tree. NOT under
 # $(CACHE_DIR): a new top-level directory there is not volume-backed.
@@ -1792,31 +1737,51 @@ build-ollama-image: ## Build the devai-ollama image (debian:trixie-slim + the ho
 	$(CONTAINER_RUNTIME) build --network=host \
 		$(PROXY_BUILD_ARGS) \
 		$(APT_PROXY_ARG) \
+		--build-arg BASE_IMAGE=$(DEBIAN_IMAGE) \
 		--build-arg DIST_ID=$$(cat $(OLLAMA_DIST)/bin/ollama $(OLLAMA_DIST)/lib/ollama/cuda_v13/libggml-cuda.so | sha256sum | cut -c1-16) \
 		-v $(OLLAMA_DIST):/var/cache/ollama-dist:ro \
 		-f deploy/Dockerfile.ollama \
 		-t devai-ollama .
 
-# Where scripts/build-vllm.sh leaves the wheelhouse. NOT under $(CACHE_DIR),
-# for the same reason as OLLAMA_DIST.
-VLLM_DIST ?= $(HOME)/.cache/devai/vllm-build/dist
+# Where scripts/build-vllm.sh builds VLLM_VERSION and leaves its wheelhouse:
+# one root per version, so a build never touches another version's wheelhouse
+# (the rollback). NOT under $(CACHE_DIR), for the same reason as OLLAMA_DIST.
+VLLM_BUILD_ROOT ?= $(HOME)/.cache/devai/vllm-build/$(VLLM_VERSION)
+VLLM_DIST ?= $(VLLM_BUILD_ROOT)/dist
 # The host CUDA toolkit vLLM was compiled with. Its nvcc, nvvm, headers and
 # libcudart are copied into the image: FlashInfer JIT-compiles attention
 # kernels at first use, so the RUNTIME image needs a CUDA compiler too.
 VLLM_CUDA_HOME ?= /usr/local/cuda-13.1
+# The interpreter build-vllm.sh builds with (its PYTHON: Debian's python3,
+# the same Python the image installs from debian:trixie-slim). vllm-lock
+# resolves for it.
+VLLM_PYTHON ?= /usr/bin/python3
 
-build-vllm: build-vllm-dist build-vllm-image ## Compile vLLM from source on the host (HyperQwen patches applied), then build the devai-vllm image from it.
+build-vllm: build-vllm-dist build-vllm-image ## Compile vLLM VLLM_VERSION (default 0.30.0) from source on the host as its build record says, then build the devai-vllm image from it. VLLM_DEVAI_IMAGE=<tag> keeps :latest where it is.
 
-build-vllm-dist: ## Compile vLLM FROM SOURCE on the host for this GPU only (compute capability 12.0) with the HyperQwen patch series applied --fuzz 0. LONG. Needs the CUDA 13 dev packages, uv and a rustup toolchain; see scripts/build-vllm.sh.
-	PATH="$(HOME)/.cargo/bin:$$PATH" bash scripts/build-vllm.sh
+build-vllm-dist: ## Compile vLLM FROM SOURCE on the host for this GPU only (compute capability 12.0), from the build record deploy/vllm-builds/$(VLLM_VERSION).sh (its patch series applied --fuzz 0, its hash-locked runtime set). LONG. Skipped when the compile inputs are unchanged (the runtime lock is not one): the newest compiled wheel is reused; VLLM_REBUILD=1 compiles anew. Needs the CUDA 13 dev packages, uv and a rustup toolchain; see scripts/build-vllm.sh.
+	PATH="$(HOME)/.cargo/bin:$$PATH" VLLM_VERSION=$(VLLM_VERSION) VLLM_BUILD_ROOT=$(VLLM_BUILD_ROOT) \
+		bash scripts/build-vllm.sh
 
-build-vllm-image: ## Build the devai-vllm image (debian:trixie-slim + the host-compiled, patched vLLM, installed offline). No upstream vLLM image is used, not even as a build input.
+vllm-lock: ## Write deploy/vllm-builds/$(VLLM_VERSION).in from the build record's sources (scripts/build-vllm.sh --write-in) and hash-lock it as $(VLLM_VERSION).lock: PyPI alone, binary wheels, for VLLM_PYTHON. Keeps every locked version the input still allows; UPGRADE=1 re-resolves. Review the diff of both.
+	@test -f $(VLLM_BUILD_RECORD) || { echo "error: no build record $(VLLM_BUILD_RECORD)" >&2; exit 1; }
+	VLLM_VERSION=$(VLLM_VERSION) VLLM_BUILD_ROOT=$(VLLM_BUILD_ROOT) PYTHON=$(VLLM_PYTHON) \
+		bash scripts/build-vllm.sh --write-in
+	env -u UV_INDEX -u UV_INDEX_URL -u UV_DEFAULT_INDEX -u UV_EXTRA_INDEX_URL -u UV_FIND_LINKS \
+		uv pip compile deploy/vllm-builds/$(VLLM_VERSION).in --no-config \
+			--default-index https://pypi.org/simple --only-binary :all: \
+			--python $(VLLM_PYTHON) --generate-hashes $(if $(UPGRADE),--upgrade,) \
+			--custom-compile-command "make vllm-lock VLLM_VERSION=$(VLLM_VERSION)" \
+			-o deploy/vllm-builds/$(VLLM_VERSION).lock
+
+build-vllm-image: ## Build the devai-vllm image (debian:trixie-slim + the host-compiled, patched vLLM and its hash-locked runtime set, installed offline) as VLLM_DEVAI_IMAGE_TAG and VLLM_DEVAI_IMAGE. No upstream vLLM image is used, not even as a build input.
 	@test -f $(VLLM_DIST)/PATCHES.applied || { echo "error: no build at $(VLLM_DIST) -- run 'make build-vllm-dist' first" >&2; exit 1; }
 	@test -x $(VLLM_CUDA_HOME)/bin/nvcc || { echo "error: no nvcc under $(VLLM_CUDA_HOME) (set VLLM_CUDA_HOME)" >&2; exit 1; }
 	$(CONTAINER_RUNTIME) build --network=host \
 		$(PROXY_BUILD_ARGS) \
 		$(APT_PROXY_ARG) \
-		--build-arg DIST_ID=$$(cat $(VLLM_DIST)/wheels/vllm-*.whl $(VLLM_DIST)/PATCHES.applied | sha256sum | cut -c1-16) \
+		--build-arg BASE_IMAGE=$(DEBIAN_IMAGE) \
+		--build-arg DIST_ID=$$(cat $(VLLM_DIST)/wheels/vllm-*.whl $(VLLM_DIST)/PATCHES.applied $(VLLM_DIST)/requirements.txt | sha256sum | cut -c1-16) \
 		-v $(VLLM_DIST):/var/cache/vllm-dist:ro \
 		-v $(VLLM_CUDA_HOME):/var/cache/cuda-toolkit:ro \
 		-f deploy/Dockerfile.vllm \
@@ -1832,6 +1797,10 @@ install: ## Install bin/devai-agent to $(INSTALL_PREFIX)/bin and stage config in
 	@# path in --help; that's honest and a non-issue in practice.
 	@ln -sf "$(CURDIR)/bin/devai-agent" $(INSTALL_PREFIX)/bin/devai-agent
 	@chmod +x "$(CURDIR)/bin/devai-agent"
+	@# devai-jobs runs inside devai-slurm, never on the host (platform-rebuild
+	@# I13); this wrapper runs it there through podman exec.
+	@ln -sf "$(CURDIR)/bin/devai-jobs" $(INSTALL_PREFIX)/bin/devai-jobs
+	@chmod +x "$(CURDIR)/bin/devai-jobs"
 	@# Symlink the picker so devai-agent can override the in-image copy via
 	@# bind-mount; re-running `make install` after picker edits picks up the
 	@# new code without a full image rebuild.
@@ -1842,10 +1811,16 @@ install: ## Install bin/devai-agent to $(INSTALL_PREFIX)/bin and stage config in
 	@# in-image one without bind-mounting the constants module too.
 	@ln -sf "$(CURDIR)/scripts/_capability.py" $(DEVAI_HOME)/_capability.py
 	@ln -sf "$(CURDIR)/scripts/_model_status.py" $(DEVAI_HOME)/_model_status.py
+	@# The host check: devai-agent runs it to decide whether the lab gets the
+	@# GPU (platform-rebuild Phase 3, M15).
+	@ln -sf "$(CURDIR)/scripts/host-gpu.sh" $(DEVAI_HOME)/host-gpu.sh
 	@# The catalog. devai-agent mounts it over the image's baked copy so the
 	@# picker sees rows and `mtp:` blocks added after the last image build.
 	@ln -sf "$(CURDIR)/deploy/models.yaml" $(DEVAI_HOME)/models.yaml
 	@echo "  linked: $(DEVAI_HOME)/models.yaml"
+	@# The vLLM recipe seeds, for the picker's recipe badge; mounted the same way.
+	@ln -sf "$(CURDIR)/deploy/recipe-seeds.yaml" $(DEVAI_HOME)/recipe-seeds.yaml
+	@echo "  linked: $(DEVAI_HOME)/recipe-seeds.yaml"
 	@# Symlink each backend's probe cache so it stays fresh as the prober
 	@# regenerates it. If users want a frozen snapshot they can replace the
 	@# link with a copy after install. Missing caches are warned but not
@@ -1880,6 +1855,7 @@ install: ## Install bin/devai-agent to $(INSTALL_PREFIX)/bin and stage config in
 	fi
 	@echo "  linked: $(DEVAI_HOME)/model-picker.py"
 	@echo "  installed: $(INSTALL_PREFIX)/bin/devai-agent"
+	@echo "  installed: $(INSTALL_PREFIX)/bin/devai-jobs"
 	@echo
 	@echo "Next steps:"
 	@echo "  1. Add $(INSTALL_PREFIX)/bin to PATH if not already."
@@ -1888,17 +1864,20 @@ install: ## Install bin/devai-agent to $(INSTALL_PREFIX)/bin and stage config in
 
 uninstall: ## Remove devai-agent launcher and the staged config dir
 	@rm -f $(INSTALL_PREFIX)/bin/devai-agent
+	@rm -f $(INSTALL_PREFIX)/bin/devai-jobs
 	@rm -f $(DEVAI_HOME)/.ollama-reasoning-cache.json
 	@rm -f $(DEVAI_HOME)/.vllm-reasoning-cache.json
 	@rm -f $(DEVAI_HOME)/.sglang-reasoning-cache.json
 	@rm -f $(DEVAI_HOME)/.vllm-devai-reasoning-cache.json
 	@rm -f $(DEVAI_HOME)/.bench-cache.json
 	@rm -f $(DEVAI_HOME)/models.yaml
+	@rm -f $(DEVAI_HOME)/recipe-seeds.yaml
 	@rm -f $(DEVAI_HOME)/model-picker.py
 	@rm -f $(DEVAI_HOME)/_capability.py
 	@rm -f $(DEVAI_HOME)/_model_status.py
+	@rm -f $(DEVAI_HOME)/host-gpu.sh
 	@rm -f $(DEVAI_HOME)/.model-status.json
-	@echo "Removed $(INSTALL_PREFIX)/bin/devai-agent and the symlinks under $(DEVAI_HOME)/."
+	@echo "Removed $(INSTALL_PREFIX)/bin/devai-agent, $(INSTALL_PREFIX)/bin/devai-jobs and the symlinks under $(DEVAI_HOME)/."
 	@echo "preferences.yaml and sessions/ are kept; remove $(DEVAI_HOME)/ manually if you want a clean slate."
 
 install-systemd: ## Install and enable systemd service for infrastructure
@@ -1922,9 +1901,9 @@ install-systemd: ## Install and enable systemd service for infrastructure
 	@# Symlink mutable / shared assets from the repo. ln -sfn updates a
 	@# pre-existing symlink in place and refuses to clobber a real file
 	@# (which the old recipe would leave behind on re-runs).
-	ln -sfn $(CURDIR)/deploy/registry-config.yaml          $(HOME)/.config/devai/registry-config.yaml
+	@# The registry mirror's config, staged by installs before platform-rebuild Phase 2.
+	rm -f $(HOME)/.config/devai/registry-config.yaml
 	ln -sfn $(CURDIR)/deploy/logging.sh                    $(HOME)/.config/devai/logging.sh
-	ln -sfn $(CURDIR)/deploy/recovery-flags.json           $(HOME)/.config/devai/recovery-flags.json
 	ln -sfn $(CURDIR)/deploy/vllm-plugins.json             $(HOME)/.config/devai/vllm-plugins.json
 	@# models.yaml is mounted by the router service (MTP launch params).
 	@# Symlinked, not copied, so a `make catalog-regen` in the repo is
@@ -1935,8 +1914,12 @@ install-systemd: ## Install and enable systemd service for infrastructure
 	ln -sfn $(CURDIR)/deploy/.vllm-reasoning-cache.json    $(HOME)/.config/devai/.vllm-reasoning-cache.json
 	ln -sfn $(CURDIR)/deploy/.sglang-reasoning-cache.json  $(HOME)/.config/devai/.sglang-reasoning-cache.json
 	ln -sfn $(CURDIR)/deploy/.vllm-devai-reasoning-cache.json  $(HOME)/.config/devai/.vllm-devai-reasoning-cache.json
-	ln -sfn $(CURDIR)/deploy/webui-proxy                   $(HOME)/.config/devai/webui-proxy
-	cp deploy/systemd/devai-infra.service $(HOME)/.config/systemd/user/
+	@# The router reads both recovery-flag files from $(DEVAI_REPO)/deploy (a
+	@# directory mount, plan I25), so the unit carries the repository path.
+	@# Read from the environment (exported above), never pasted into the
+	@# shell, and escaped for the unit's quoted Environment= value, so a path
+	@# with spaces, |, &, quotes or % is carried as it is; a newline is refused.
+	python3 -c 'import os, sys; repo = os.environ["DEVAI_REPO"]; "\n" in repo and sys.exit("install-systemd: the repository path contains a newline"); value = repo.replace("\\", "\\\\").replace("\"", "\\\"").replace("%", "%%"); open(sys.argv[2], "w").write(open(sys.argv[1]).read().replace("@DEVAI_REPO@", value))' deploy/systemd/devai-infra.service "$$HOME/.config/systemd/user/devai-infra.service"
 	systemctl --user daemon-reload
 	systemctl --user enable --now podman.socket
 	systemctl --user enable --now devai-infra.service
@@ -1956,7 +1939,6 @@ uninstall-systemd: ## Stop, disable and remove the systemd infrastructure unit
 	rm -f $(HOME)/.config/devai/.vllm-reasoning-cache.json
 	rm -f $(HOME)/.config/devai/.sglang-reasoning-cache.json
 	rm -f $(HOME)/.config/devai/.vllm-devai-reasoning-cache.json
-	rm -f $(HOME)/.config/devai/webui-proxy
 	rmdir $(HOME)/.config/devai 2>/dev/null || true
 	systemctl --user daemon-reload
 	@echo "Removed devai-infra.service and $(HOME)/.config/devai/"
@@ -2000,6 +1982,24 @@ HF_TOKEN_FILE ?= $(HOME)/.cache/huggingface/token
 # n-knobs surface to the runner as both env (for inspect_ai's task
 # constructors that read defaults) and CLI flags (the runner reads them
 # either way; CLI takes precedence).
+#
+# BENCH_CACHE / BENCH_LOG_DIR point a run at a scratch cache and log
+# directory (plan 4v: neither arm may write deploy/.bench-cache.json). They
+# must lie under $(CACHE_DIR)/bench, the bench container's only read-write
+# mount besides deploy/, or the container writes them into its own layer and
+# they vanish with it. BENCH_MTP=1 serves every row as `<name>::mtp@<ctx>`
+# (refused for a row whose cell does not record mtp_fits: true);
+# BENCH_MAX_CONNECTIONS=N overrides the per-backend concurrency (recorded).
+ifneq ($(BENCH_CACHE),)
+ifeq ($(filter $(CACHE_DIR)/bench/%,$(BENCH_CACHE)),)
+$(error BENCH_CACHE=$(BENCH_CACHE) must lie under $(CACHE_DIR)/bench/, the bench container's read-write mount)
+endif
+endif
+ifneq ($(BENCH_LOG_DIR),)
+ifeq ($(filter $(CACHE_DIR)/bench/%,$(BENCH_LOG_DIR)),)
+$(error BENCH_LOG_DIR=$(BENCH_LOG_DIR) must lie under $(CACHE_DIR)/bench/, the bench container's read-write mount)
+endif
+endif
 BENCH_RUN_FLAGS = \
 	$(if $(BENCH_TASKS),--tasks '$(BENCH_TASKS)',) \
 	$(if $(BENCH_REPO),--repo '$(BENCH_REPO)',) \
@@ -2015,9 +2015,13 @@ BENCH_RUN_FLAGS = \
 	$(if $(BENCH_NO_EARLY_DROP),--no-early-drop,) \
 	$(if $(BENCH_N_LEAK_PROMPTS),--n-leak-prompts $(BENCH_N_LEAK_PROMPTS),) \
 	$(if $(BENCH_N_LONGCTX_FRACTION),--n-longctx-fraction $(BENCH_N_LONGCTX_FRACTION),) \
-	$(if $(BENCH_N_LONGCTX_MAX_TOKENS),--n-longctx-max-tokens $(BENCH_N_LONGCTX_MAX_TOKENS),)
+	$(if $(BENCH_N_LONGCTX_MAX_TOKENS),--n-longctx-max-tokens $(BENCH_N_LONGCTX_MAX_TOKENS),) \
+	$(if $(BENCH_CACHE),--cache '$(BENCH_CACHE)',) \
+	$(if $(BENCH_LOG_DIR),--log-dir '$(BENCH_LOG_DIR)',) \
+	$(if $(BENCH_MTP),--mtp,) \
+	$(if $(BENCH_MAX_CONNECTIONS),--max-connections $(BENCH_MAX_CONNECTIONS),)
 
-bench: bench-vllm bench-sglang bench-ollama ## Bench every probed model on every backend
+bench: bench-vllm bench-ollama ## Bench every probed model on every backend
 	@echo
 	@echo ">>> bench complete; run 'make bench-report' for the leaderboard"
 
@@ -2033,7 +2037,7 @@ bench-vllm: ## Bench every loaded vLLM/HF model via devai-router:11435
 		-e GPU_MEMORY_GB=$(GPU_MEMORY_GB) \
 		-e HF_TOKEN -e HUGGING_FACE_HUB_TOKEN \
 		--entrypoint python3 \
-		$(IMAGE_NAME_GPU) \
+		$(IMAGE_NAME) \
 		/scripts/bench/bench_runner.py --backend vllm \
 			$(BENCH_RUN_FLAGS)
 
@@ -2049,21 +2053,8 @@ bench-vllm-devai: ## Bench every loaded vLLM/HF model via devai-router:11437 (vl
 		-e GPU_MEMORY_GB=$(GPU_MEMORY_GB) \
 		-e HF_TOKEN -e HUGGING_FACE_HUB_TOKEN \
 		--entrypoint python3 \
-		$(IMAGE_NAME_GPU) \
+		$(IMAGE_NAME) \
 		/scripts/bench/bench_runner.py --backend vllm-devai \
-			$(BENCH_RUN_FLAGS)
-
-bench-sglang: ## Bench every loaded SGLang model via devai-router:11436
-	@mkdir -p $(CACHE_DIR)/bench/inspect-logs
-	$(CONTAINER_RUNTIME) run --rm \
-		--network $(DEVAI_NETWORK) \
-		$(BENCH_CACHE_MOUNTS) \
-		$(GPU_FLAGS) \
-		-e GPU_MEMORY_GB=$(GPU_MEMORY_GB) \
-		-e HF_TOKEN -e HUGGING_FACE_HUB_TOKEN \
-		--entrypoint python3 \
-		$(IMAGE_NAME_GPU) \
-		/scripts/bench/bench_runner.py --backend sglang \
 			$(BENCH_RUN_FLAGS)
 
 bench-ollama: ## Bench every loaded Ollama model via devai-router:11434
@@ -2075,7 +2066,7 @@ bench-ollama: ## Bench every loaded Ollama model via devai-router:11434
 		-e GPU_MEMORY_GB=$(GPU_MEMORY_GB) \
 		-e HF_TOKEN -e HUGGING_FACE_HUB_TOKEN \
 		--entrypoint python3 \
-		$(IMAGE_NAME_GPU) \
+		$(IMAGE_NAME) \
 		/scripts/bench/bench_runner.py --backend ollama \
 			$(BENCH_RUN_FLAGS)
 
@@ -2106,32 +2097,47 @@ bench-harvest: ## (used by bench-sync) Score a task stopped at its deadline from
 	$(CONTAINER_RUNTIME) run --rm --network=none \
 		$(BENCH_CACHE_MOUNTS) \
 		--entrypoint python3 \
-		$(IMAGE_NAME_GPU) \
+		$(IMAGE_NAME) \
 		/scripts/bench/harvest_truncated.py $(HARVEST_ARGS)
 
-bench-concurrency: ## Sweep concurrency x prefix-sharing for ONE model (MODEL=, PORT=11435|11436)
+bench-concurrency: ## Sweep concurrency x prefix-sharing for ONE model (MODEL=, PORT=11435|11437); MODE=multiturn takes SALT=, MIN_TOKENS=, METRICS_URL=, SESSIONS= (with ENGINE=). The JSON report goes to stdout alone.
 	@# Deliberately NOT part of `make bench`: this answers a backend
 	@# selection question (does prefix caching pay off here?), not a
 	@# per-model leaderboard question, and it is GPU-exclusive.
 	@# Requires the model to be the one already resident, or it pays a
 	@# cold start -- the warmup request absorbs that either way.
+	@# MODE=multiturn only: SALT=<s> leads every prefix of the session
+	@# (default: a fresh per-run nonce, printed in the report), so repeated
+	@# sessions share no prefix; MIN_TOKENS=<n> puts min_tokens at the top
+	@# level of every turn; METRICS_URL=<engine /metrics> records the
+	@# engine's prefix-cache and speculative-decoding counters before and
+	@# after each turn (e.g. http://devai-vllm-devai:11434/metrics).
+	@# SESSIONS=<n> runs n sessions salted <salt>-<ENGINE>-<i> and reports
+	@# each one's turn-2+ median TTFT (Phase 15, I16; 5 turns unless TURNS=).
+	@# The command is not echoed, so `> session.json` captures the report alone
+	@# (progress goes to stderr).
 	@if [ -z "$(MODEL)" ]; then \
-	  echo "usage: make bench-concurrency MODEL=<served-name> [PORT=11436] [MODE=sweep|multiturn] [LEVELS=1,2,4,8,16,32] [TURNS=8]"; \
-	  echo "  e.g. make bench-concurrency MODEL=gpt-oss-20b@131072 PORT=11436"; exit 2; fi
-	$(CONTAINER_RUNTIME) run --rm \
+	  echo "usage: make bench-concurrency MODEL=<served-name> [PORT=11435] [MODE=sweep|multiturn] [LEVELS=1,2,4,8,16,32] [TURNS=8] [SALT=..] [MIN_TOKENS=..] [METRICS_URL=..] [SESSIONS=..] [ENGINE=..]"; \
+	  echo "  e.g. make bench-concurrency MODEL=gpt-oss-20b@131072 PORT=11435"; exit 2; fi
+	@$(CONTAINER_RUNTIME) run --rm \
 		--network $(DEVAI_NETWORK) \
 		-v $(CURDIR)/scripts:/scripts:ro \
 		--entrypoint python3 \
-		$(IMAGE_NAME_GPU) \
+		$(IMAGE_NAME) \
 		/scripts/bench/bench_concurrency.py \
 			--model '$(MODEL)' \
-			--router-url http://devai-router:$(or $(PORT),11436) \
+			--router-url http://devai-router:$(or $(PORT),11435) \
 			--mode $(or $(MODE),sweep) \
 			$(if $(LEVELS),--levels $(LEVELS),) \
 			$(if $(TURNS),--turns $(TURNS),) \
 			$(if $(PREFIX_TOKENS),--prefix-tokens $(PREFIX_TOKENS),) \
 			$(if $(GROWTH_TOKENS),--growth-tokens $(GROWTH_TOKENS),) \
-			$(if $(MAX_TOKENS),--max-tokens $(MAX_TOKENS),)
+			$(if $(MAX_TOKENS),--max-tokens $(MAX_TOKENS),) \
+			$(if $(SALT),--salt '$(SALT)',) \
+			$(if $(MIN_TOKENS),--min-tokens $(MIN_TOKENS),) \
+			$(if $(METRICS_URL),--metrics-url '$(METRICS_URL)',) \
+			$(if $(SESSIONS),--sessions $(SESSIONS),) \
+			$(if $(ENGINE),--engine '$(ENGINE)',)
 
 bench-report: ## Print a Markdown leaderboard from .bench-cache.json
 	@$(CONTAINER_RUNTIME) run --rm \
@@ -2156,7 +2162,7 @@ test-bench-smoke: ## 1-model tiny-subset smoke test (CI / sanity)
 		-e GPU_MEMORY_GB=$(GPU_MEMORY_GB) \
 		-e HF_TOKEN -e HUGGING_FACE_HUB_TOKEN \
 		--entrypoint python3 \
-		$(IMAGE_NAME_GPU) \
+		$(IMAGE_NAME) \
 		/scripts/bench/bench_runner.py --backend vllm \
 			--repo "Qwen3-8B-NVFP4" \
 			--n-gsm8k 5 --n-humaneval 5 --n-tools 4 --n-leak-prompts 10 \

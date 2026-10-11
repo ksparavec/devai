@@ -4,7 +4,7 @@
 # DeepSeek Harness has no terminal UI; its interactive surface is a browser
 # UI. The picker has already written the router providers and the default
 # model (model-picker.py, _write_dsh_config); this serves the UI on the
-# container's port 3080, which `make lab-cpu|lab-gpu` publishes as DSH_PORT,
+# container's port 3080, which `make lab` publishes as DSH_PORT,
 # and prints the URL to open. Ctrl-C stops it.
 #
 # Why it needs its own port and not JupyterLab's /proxy/: dsh hardcodes
@@ -12,10 +12,10 @@
 # so it only works at the root of its own origin.
 #
 # Env contract:
-#   DSH_PORT   host-side port published by lab-cpu/lab-gpu (required; the
+#   DSH_PORT   host-side port published by `make lab` (required; the
 #              shell containers publish none, and the picker hides this
 #              agent there)
-#   HOST_IP    host address the browser uses (set by lab-cpu/lab-gpu)
+#   HOST_IP    host address the browser uses (set by `make lab`)
 #   DEVAI_ROUTER_API_KEY  exported here; the router providers name it as
 #              their apiKeyEnv (local backends ignore the value, dsh needs one)
 #   DEVAI_DSH_OVERLAY     overlay path (default /etc/devai/dsh-overlay.yml)
@@ -24,7 +24,7 @@ set -euo pipefail
 
 if [ -z "${DSH_PORT:-}" ]; then
     echo "error: DeepSeek Harness serves a browser UI on a published port, and only" >&2
-    echo "       'make lab-cpu' / 'make lab-gpu' publish one (DSH_PORT)." >&2
+    echo "       'make lab' publishes one (DSH_PORT)." >&2
     exit 1
 fi
 

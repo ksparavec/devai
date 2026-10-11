@@ -59,6 +59,7 @@ from _contexts import (  # noqa: E402  — local import after sys.path fix
     vram_label,
 )
 import _card_hints  # noqa: E402
+import _vllm_recipes  # noqa: E402
 from _capability import Capability, is_terminal  # noqa: E402
 from _probe_core import (  # noqa: E402
     has_inline_think_markers,
@@ -77,6 +78,7 @@ from _probe_core import (  # noqa: E402
 )
 from _vllm_plugins import PluginEntry, PluginRegistry, get_registry  # noqa: E402
 from _model_status import (  # noqa: E402
+    LEDGER_PATH as _LEDGER_PATH,
     clear as _ledger_clear,
     exclusion_reason as _ledger_reason,
     implied_vram_exclusion as _ledger_implied_vram_exclusion,
@@ -137,41 +139,234 @@ MUTEX_CONTAINERS = ("devai-router", "devai-vllm", "devai-vllm-devai", "devai-sgl
 
 
 # ── Recovery flags registry ──────────────────────────────────────────────────
-# Per-model launch flags + env overrides shared with the router. Same file
-# the router reads via gpu-arbiter/recovery_flags.go. Loaded once at module
-# import; lookup is a single dict access per probe.
+# Per-model launch flags + env overrides shared with the router. The same two
+# files gpu-arbiter/recovery_flags.go reads:
+#
+#   deploy/recovery-flags.json            hand-curated, one entry per model
+#                                         (contract C2, _entry_applies_to_backend)
+#   deploy/recovery-flags.generated.json  machine-made (plan I25): per model a
+#                                         list of groups {backends (required),
+#                                         engine_flags, engine_env, source,
+#                                         reason, added}; written only by
+#                                         scripts/recipe-apply.py today, whole
+#                                         file to a temporary name and renamed
+#
+# For a launch on backend B: the curated entry's flags/env when it applies to
+# B, then every generated group whose `backends` names B or B's engine, in
+# file order (recovery_overrides). Both files are re-read before each launch
+# when either one's device, inode, mtime or size changed (_refresh_recovery).
+# A file that fails to parse keeps what was loaded before and warns; so does
+# a curated file that disappears after a good load (git checkout replaces a
+# file by unlink and create). A missing generated file reads as empty.
+#
+# The decoding rules are those of recovery_flags.go's header (exact keys; a
+# top level that is not an object fails the file; an entry or group with a
+# malformed field is skipped whole; a curated non-list `backends` is C2's
+# "treat as absent"), and the two readers' verdicts are pinned by the shared
+# fixture in tests/fixtures/recovery-flags/, which both test suites load.
 RECOVERY_FLAGS_PATH = Path(
     os.environ.get("RECOVERY_FLAGS_REGISTRY", str(REPO_ROOT / "deploy" / "recovery-flags.json"))
 )
+RECOVERY_GENERATED_PATH = Path(
+    os.environ.get("RECOVERY_FLAGS_GENERATED",
+                   str(RECOVERY_FLAGS_PATH.parent / "recovery-flags.generated.json"))
+)
+RECOVERY_GENERATED_VERSION = 1
 
 
-def _load_recovery_registry(path: Path) -> dict[str, dict]:
-    """Read deploy/recovery-flags.json and return {model_name: entry}.
+def _strict_json(text: str) -> object:
+    """json.loads, but refusing NaN / Infinity, which Go's decoder rejects."""
+    def _refuse(token: str) -> object:
+        raise ValueError(f"non-standard JSON constant {token}")
+    return json.loads(text, parse_constant=_refuse)
 
-    Missing file is normal (no registry configured) -> empty dict.
-    A JSON parse error is data corruption -> warn and return empty so
-    probers can still make progress. Any other OSError (permission
-    denied, IO error, file is a directory, ...) means the operator's
-    environment is broken in a way that would otherwise cause every
-    model to silently launch without its recovery flags -- which on
-    24G cards typically OOMs during model load. Re-raise so the prober
-    aborts loudly instead of writing fits=false for models that would
-    have fit with the recovery flag.
+
+def _is_str_list(value: object) -> bool:
+    return isinstance(value, list) and all(isinstance(v, str) for v in value)
+
+
+def _is_str_map(value: object) -> bool:
+    return isinstance(value, dict) and all(isinstance(v, str) for v in value.values())
+
+
+def _curated_entry_problem(entry: object) -> str | None:
+    """Why a curated entry is skipped whole, or None when it is usable.
+
+    `engine_flags` absent, null or a list of strings; `engine_env` absent,
+    null or an object of strings; `image` absent, null or a string; a
+    `backends` LIST must hold strings only (a non-list `backends` is C2's
+    "treat as absent", decided in _entry_applies_to_backend)."""
+    if not isinstance(entry, dict):
+        return "not an object"
+    flags = entry.get("engine_flags")
+    if flags is not None and not _is_str_list(flags):
+        return "`engine_flags` must be a list of strings"
+    env = entry.get("engine_env")
+    if env is not None and not _is_str_map(env):
+        return "`engine_env` must be an object of strings"
+    image = entry.get("image")
+    if image is not None and not isinstance(image, str):
+        return "`image` must be a string"
+    backends = entry.get("backends")
+    if isinstance(backends, list) and not _is_str_list(backends):
+        return "`backends` must list strings"
+    return None
+
+
+def _generated_group_problem(group: object) -> str | None:
+    """Why a generated group is skipped whole, or None when it is usable:
+    `backends` a list of strings (required, no "every backend" group, I25);
+    `engine_flags` and `engine_env` as in a curated entry. `source`,
+    `reason` and `added` are informational and not checked."""
+    if not isinstance(group, dict):
+        return "not an object"
+    if not _is_str_list(group.get("backends")):
+        return "`backends` must be a list of strings"
+    flags = group.get("engine_flags")
+    if flags is not None and not _is_str_list(flags):
+        return "`engine_flags` must be a list of strings"
+    env = group.get("engine_env")
+    if env is not None and not _is_str_map(env):
+        return "`engine_env` must be an object of strings"
+    return None
+
+
+def _read_top_level(path: Path, label: str) -> tuple[dict, dict]:
+    """(top-level object, its `models` map) of a recovery file. A JSON
+    error, a top level that is not an object (`null` included) or a
+    `models` that is neither absent/null nor an object raises ValueError.
+    FileNotFoundError propagates; so does any other OSError, which means
+    the operator's environment is broken in a way that would otherwise make
+    every model launch without its recovery flags -- the prober aborts
+    loudly instead of writing fits=false for models that would have fit."""
+    try:
+        data = _strict_json(path.read_text())
+    except ValueError as exc:  # json.JSONDecodeError is a ValueError
+        raise ValueError(f"{label} {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"{label} {path}: not a JSON object")
+    models = data.get("models")
+    if models is None:
+        models = {}
+    if not isinstance(models, dict):
+        raise ValueError(f"{label} {path}: `models` is not an object")
+    return data, models
+
+
+def _read_curated_recovery(path: Path) -> dict[str, dict]:
+    """Read deploy/recovery-flags.json -> {model_name: entry}. A malformed
+    entry is skipped on its own with a warning; FileNotFoundError and
+    ValueError (see _read_top_level) propagate."""
+    _, models = _read_top_level(path, "recovery registry")
+    out: dict[str, dict] = {}
+    for name, entry in models.items():
+        problem = _curated_entry_problem(entry)
+        if problem:
+            print(f"[warn] recovery registry: entry {name!r} skipped ({problem})",
+                  file=sys.stderr)
+            continue
+        out[name] = entry
+    return out
+
+
+def _read_generated_recovery(path: Path) -> dict[str, list[dict]]:
+    """Read deploy/recovery-flags.generated.json -> {model_name: [group, ...]}.
+
+    Missing file -> {}. Besides _read_top_level's failures, a `version`
+    other than the integer 1 raises ValueError (the caller keeps what it
+    had). A model whose value is not a list, or a malformed group, is
+    skipped on its own with a warning. Group order is kept: it is the order
+    the flags are appended in.
     """
     try:
-        data = json.loads(path.read_text())
+        data, models = _read_top_level(path, "generated recovery flags")
     except FileNotFoundError:
         return {}
-    except json.JSONDecodeError as exc:
-        print(f"[warn] recovery registry {path}: {exc}", file=sys.stderr)
-        return {}
-    models = data.get("models")
-    if not isinstance(models, dict):
-        return {}
-    return {name: entry for name, entry in models.items() if isinstance(entry, dict)}
+    version = data.get("version")
+    if type(version) is not int or version != RECOVERY_GENERATED_VERSION:
+        raise ValueError(f"generated recovery flags {path}: `version` must be "
+                         f"the integer {RECOVERY_GENERATED_VERSION}")
+    out: dict[str, list[dict]] = {}
+    for name, groups in models.items():
+        if not isinstance(groups, list):
+            print(f"[warn] generated recovery flags: {name}: not a list of "
+                  f"groups; skipped", file=sys.stderr)
+            continue
+        kept = []
+        for i, group in enumerate(groups):
+            problem = _generated_group_problem(group)
+            if problem:
+                print(f"[warn] generated recovery flags: {name} group {i}: "
+                      f"{problem}; group skipped", file=sys.stderr)
+                continue
+            if "image" in group:
+                print(f"[warn] generated recovery flags: {name} group {i}: a "
+                      f"generated group may not carry an `image`; ignored",
+                      file=sys.stderr)
+            kept.append(group)
+        if kept:
+            out[name] = kept
+    return out
 
 
-_RECOVERY_REGISTRY: dict[str, dict] = _load_recovery_registry(RECOVERY_FLAGS_PATH)
+def _file_sig(path: Path) -> tuple[int, int, int, int] | None:
+    """(device, inode, mtime_ns, size), or None for a missing file. A new
+    inode (a writer's rename, git checkout's unlink and create) or an
+    in-place write changes it."""
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return None
+    return (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size)
+
+
+_UNSEEN = object()
+_RECOVERY_REGISTRY: dict[str, dict] = {}
+_RECOVERY_GENERATED: dict[str, list[dict]] = {}
+# Signature of each file as last loaded successfully: [curated, generated].
+_RECOVERY_SIGS: list = [_UNSEEN, _UNSEEN]
+
+
+def _refresh_recovery() -> None:
+    """Reload whichever recovery file changed since its last good load.
+
+    Called before every launch. A file that fails to parse keeps the
+    previously loaded content and warns; its signature is not advanced, so
+    the next launch tries again. A curated file that is missing at the
+    first load reads as empty (with a warning); one that disappears after a
+    good load keeps the previous entries. A missing generated file reverts
+    what it added (I25).
+    """
+    global _RECOVERY_REGISTRY, _RECOVERY_GENERATED
+    sig = _file_sig(RECOVERY_FLAGS_PATH)
+    if sig != _RECOVERY_SIGS[0]:
+        first = _RECOVERY_SIGS[0] is _UNSEEN
+        try:
+            _RECOVERY_REGISTRY = _read_curated_recovery(RECOVERY_FLAGS_PATH)
+            _RECOVERY_SIGS[0] = sig
+        except FileNotFoundError:
+            if first:
+                print(f"[warn] recovery registry {RECOVERY_FLAGS_PATH} not present "
+                      f"-- no per-model overrides", file=sys.stderr)
+                _RECOVERY_REGISTRY, _RECOVERY_SIGS[0] = {}, None
+            else:
+                print(f"[warn] recovery registry {RECOVERY_FLAGS_PATH} disappeared; "
+                      f"keeping the previously loaded curated entries "
+                      f"({len(_RECOVERY_REGISTRY)})", file=sys.stderr)
+        except ValueError as exc:
+            print(f"[warn] {exc}; keeping the previously loaded curated "
+                  f"entries ({len(_RECOVERY_REGISTRY)})", file=sys.stderr)
+    sig = _file_sig(RECOVERY_GENERATED_PATH)
+    if sig != _RECOVERY_SIGS[1]:
+        try:
+            _RECOVERY_GENERATED = _read_generated_recovery(RECOVERY_GENERATED_PATH)
+            _RECOVERY_SIGS[1] = sig
+        except ValueError as exc:
+            print(f"[warn] {exc}; keeping the previously loaded generated "
+                  f"groups ({len(_RECOVERY_GENERATED)} models)", file=sys.stderr)
+
+
+_refresh_recovery()
 
 
 _WARNED_BAD_BACKENDS: set[str] = set()
@@ -199,9 +394,9 @@ def _entry_applies_to_backend(
 
     Keep this in sync with the Go side.
     """
-    if "backends" not in entry:
-        return True
     backends = entry.get("backends")
+    if backends is None:  # absent, or an explicit null: no restriction
+        return True
     if not isinstance(backends, list):
         label = model_name or "<unknown model>"
         if label not in _WARNED_BAD_BACKENDS:
@@ -217,12 +412,19 @@ def _entry_applies_to_backend(
 
 
 def _recovery_entry(model_name: str, backend: str) -> dict | None:
-    """Registry entry for (model_name, backend), or None when absent or
-    gated out by the entry's `backends` list."""
+    """Curated registry entry for (model_name, backend), or None when absent
+    or gated out by the entry's `backends` list."""
     entry = _RECOVERY_REGISTRY.get(model_name)
     if not entry or not _entry_applies_to_backend(entry, backend, model_name):
         return None
     return entry
+
+
+def _flags_env(item: dict) -> tuple[list[str], dict[str, str]]:
+    flags = item.get("engine_flags") or []
+    env = item.get("engine_env") or {}
+    return (list(flags) if isinstance(flags, list) else [],
+            dict(env) if isinstance(env, dict) else {})
 
 
 def recovery_overrides(
@@ -230,19 +432,50 @@ def recovery_overrides(
 ) -> tuple[list[str], dict[str, str]]:
     """Return (extra_flags, extra_env) for model_name on `backend`.
 
-    Empty when there is no entry, or when the entry declares a `backends`
-    list that does not include `backend` (contract C2).
+    The curated entry's flags/env when it applies to `backend` (contract
+    C2), then every generated group whose `backends` names `backend` or its
+    engine, in file order (I25); later env keys win, and the engine takes
+    the last of a repeated flag. Both files are re-read first when changed.
+    Empty when nothing applies.
     """
+    _refresh_recovery()
+    flags: list[str] = []
+    env: dict[str, str] = {}
     entry = _recovery_entry(model_name, backend)
-    if not entry:
-        return [], {}
-    flags = entry.get("engine_flags") or []
-    env = entry.get("engine_env") or {}
-    if not isinstance(flags, list):
-        flags = []
-    if not isinstance(env, dict):
-        env = {}
-    return list(flags), dict(env)
+    if entry:
+        f, e = _flags_env(entry)
+        flags += f
+        env.update(e)
+    for group in _RECOVERY_GENERATED.get(model_name, []):
+        if _entry_applies_to_backend(group, backend, model_name):
+            f, e = _flags_env(group)
+            flags += f
+            env.update(e)
+    return flags, env
+
+
+def recovery_entries_for_backend(backend: str) -> list[tuple[str, str, list[str], str | None]]:
+    """Every recovery entry that applies to `backend`, for flag checks.
+
+    (model, origin, engine_flags, image) per curated entry gated in by its
+    `backends` (contract C2) and per generated group naming `backend` or
+    its engine (I25), in file order; origin is "curated" or "generated",
+    image the curated entry's override or None. Both files are re-read
+    first when changed, as for a launch.
+    """
+    _refresh_recovery()
+    out: list[tuple[str, str, list[str], str | None]] = []
+    for name in sorted(_RECOVERY_REGISTRY):
+        entry = _recovery_entry(name, backend)
+        if entry:
+            image = entry.get("image")
+            out.append((name, "curated", _flags_env(entry)[0],
+                        image if isinstance(image, str) and image else None))
+    for name in sorted(_RECOVERY_GENERATED):
+        for group in _RECOVERY_GENERATED[name]:
+            if _entry_applies_to_backend(group, backend, name):
+                out.append((name, "generated", _flags_env(group)[0], None))
+    return out
 
 
 def recovery_image(model_name: str, backend: str) -> str | None:
@@ -260,7 +493,9 @@ def recovery_image(model_name: str, backend: str) -> str | None:
 
     Backend-gated the same way as recovery_overrides (contract C2): an
     entry pinning a vLLM-only image must not redirect an SGLang launch.
+    Curated file only: a generated group carries no image (I25).
     """
+    _refresh_recovery()
     entry = _recovery_entry(model_name, backend)
     if not entry:
         return None
@@ -302,6 +537,178 @@ def derive_parser_for(name: str, models_dir: Path, backend: str,
                       kind: str) -> str | None:
     """Card-derived parser hint; the hint tables are keyed by engine too."""
     return _card_hints.derive_parser(name, models_dir, engine_of(backend), kind)
+
+
+# Name -> parser guesses, the fourth step of the parser order (plan Phase
+# 17a): used only when the row has no curated block for the engine, the
+# checkpoint's own template derives nothing and no recipe seeds a value.
+# Labelled "guessed, not probe-verified": the probe is the authority, and a
+# guessed TOOL parser is recorded only when the auto-choice call verifies it
+# (probe_one_cell, `tool_parser_auto_only`). Ordered, first match wins,
+# matched against the lower-cased catalog name.
+#
+# Each value is one this host's probe caches recorded for that family on
+# 2026-10-07 (deploy/.vllm-, .vllm-devai- and .sglang-reasoning-cache.json):
+# a tool parser verified in AUTO mode (`tool_mode: auto`), a reasoning
+# parser with capability `structured`. Left out on that evidence: the
+# Llama-3.x tool parsers (`llama3_json`, SGLang `llama3`) and SGLang's
+# `qwen` for the Qwen3.5+ markup, which passed only the forced call; SGLang
+# `qwen3_coder`, never verified there; and every plugin-backed parser
+# (deploy/vllm-plugins.json).
+NAME_PARSER_HEURISTICS: tuple[tuple[str, dict[str, dict[str, str]]], ...] = (
+    # First: a distill names its base too (DeepSeek-R1-0528-Qwen3-8B).
+    (r"deepseek-r1", {"vllm": {"reasoning": "deepseek_r1"},
+                      "sglang": {"reasoning": "deepseek-r1"}}),
+    (r"gpt-oss", {"vllm": {"tool": "openai", "reasoning": "openai_gptoss"},
+                  "sglang": {"tool": "gpt-oss", "reasoning": "gpt-oss"}}),
+    (r"qwen3-?coder", {"vllm": {"tool": "qwen3_coder"}}),
+    # Qwen3.5 and later (the qwen3_5 architecture: Qwen3.5/3.6/3.8).
+    (r"qwen3\.[5-9]", {"vllm": {"tool": "qwen3_xml", "reasoning": "qwen3"},
+                       "sglang": {"reasoning": "qwen3"}}),
+    (r"qwen3(?![.\d])", {"vllm": {"tool": "hermes", "reasoning": "qwen3"},
+                         "sglang": {"tool": "qwen", "reasoning": "qwen3"}}),
+    (r"gemma-?4", {"vllm": {"tool": "gemma4"}}),
+)
+
+# The label printed beside a heuristic value; `heuristic` is what the cache
+# records as its source.
+HEURISTIC_LABEL = "guessed, not probe-verified"
+# Sources whose value is a guess: dropped when the row's first launch fails
+# and the same context fits without it; a guessed tool parser is recorded
+# only on the auto call.
+GUESSED_PARSER_SOURCES = frozenset({"recipe", "heuristic"})
+# The entry fields that record where a row's parsers came from; restored
+# with the band when an exact-context probe misses.
+PARSER_PROVENANCE_KEYS = ("tool_parser_source", "reasoning_parser_source",
+                          "parser_disagreement", "parser_fallback")
+_ABSENT = object()
+
+
+def heuristic_parser(name: str, backend: str, kind: str) -> str | None:
+    """The name heuristic's parser for `kind` ("tool" / "reasoning") on the
+    backend's engine, or None. The first rule whose pattern matches the name
+    decides; a matching rule with no value for this kind gives None."""
+    lowered = (name or "").lower()
+    for pattern, by_engine in NAME_PARSER_HEURISTICS:
+        if re.search(pattern, lowered):
+            return (by_engine.get(engine_of(backend)) or {}).get(kind)
+    return None
+
+
+def recipe_seed_parsers(name: str, backend: str, image: str | None,
+                        seeds: dict | None = None) -> dict[str, str]:
+    """The recipe seed's parsers for this row (deploy/recipe-seeds.yaml), or
+    {}: vLLM engines only, and only when the recipe's min_vllm_version admits
+    the vLLM this backend runs (a recipe never injects a parser the pinned
+    vLLM lacks). When that version is unknown (an image tagged `latest`),
+    nothing is seeded."""
+    if seeds is None:
+        seeds = _vllm_recipes.load_seeds()
+    seed = seeds.get(name)
+    if not seed:
+        return {}
+    # The image the launch will really use: a curated `image` pin wins, and
+    # is judged by its own tag only.
+    pin = recovery_image(name, backend)
+    version = _vllm_recipes.engine_vllm_version(backend, pin or image, pinned=bool(pin))
+    return _vllm_recipes.seed_parsers(seed, engine_of(backend), version)
+
+
+def has_curated_block(row: dict, backend: str) -> bool:
+    """True when the catalog row curates parsers for this backend (its own
+    name or its engine), even if the block names only one kind."""
+    parsers = row.get("parsers") or {}
+    return bool(parsers.get(backend) or parsers.get(engine_of(backend)))
+
+
+def resolve_parsers(
+    name: str, models_dir: Path, backend: str,
+    curated_reasoning: str | None, curated_tool: str | None,
+    *, recipe_parsers: dict[str, str] | None = None,
+    ignore_curated: bool = False, curated_block: bool = False,
+    rejected: dict[str, str] | None = None,
+) -> tuple[str | None, str | None, dict[str, str | None], dict[str, dict]]:
+    """Pick each parser in the order of plan Phase 17a, step 1.
+
+    1. the curated `parsers:` block (`curated`);
+    2. the value derived from the checkpoint's own chat template
+       (`card`, scripts/_card_hints.py, which refuses rather than guesses);
+    3. the recipe seed (`recipe`, deploy/recipe-seeds.yaml);
+    4. the name heuristic (`heuristic`, "guessed, not probe-verified");
+    5. none (no parser flag; the router strips tools).
+
+    Steps 3 and 4 are guesses for a model nobody has curated: with
+    `curated_block` (the row has a `parsers:` block for this engine) a kind
+    the block leaves out stays a curated omission and they are skipped.
+    That keeps decisions like gemma4's measured "no reasoning parser"
+    (scripts/model-families.yaml) from being overridden by a recipe.
+
+    `ignore_curated` (PROBE_IGNORE_CURATED_PARSERS=1, plan I24) skips 1, 3
+    and 4, so the card-derived parsers alone drive the launch. The probe
+    remains the authority: a value it cannot verify is not recorded.
+
+    `rejected` ({kind: parser}, from the row's recorded `parser_fallback`)
+    names guesses an earlier run dropped: a recipe or heuristic value equal
+    to it is skipped, and the order goes on to the next step.
+
+    Returns (reasoning, tool, sources, disagreements); `sources` maps each
+    kind to its step's label or None, `disagreements` records a card
+    derivation that names a different parser than the curated block.
+    """
+    chosen: dict[str, str | None] = {}
+    sources: dict[str, str | None] = {}
+    disagreements: dict[str, dict] = {}
+    seeded = recipe_parsers or {}
+    for kind, curated in (("tool", curated_tool),
+                          ("reasoning", curated_reasoning)):
+        if ignore_curated:
+            curated = None
+        derived = None
+        try:
+            derived = derive_parser_for(name, models_dir, backend, kind)
+        except Exception as e:  # noqa: BLE001
+            # Never let a hint break a probe: no hint is today's
+            # behaviour, a crash is not.
+            print(f"  {name}: card-hint derivation failed ({kind}): {e}",
+                  file=sys.stderr)
+        if curated is not None:
+            chosen[kind], sources[kind] = curated, "curated"
+            if derived and derived != curated:
+                # Behaviour is unchanged -- curated still wins -- but a
+                # silent disagreement is how curation drifts out of step
+                # with the checkpoints it describes.
+                print(f"  {name}: WARNING {kind} parser disagreement -- "
+                      f"curated={curated!r} but the chat template "
+                      f"derives {derived!r}. Serving the curated value.",
+                      file=sys.stderr)
+                disagreements[kind] = {"curated": curated, "derived": derived}
+            continue
+        if derived:
+            chosen[kind], sources[kind] = derived, "card"
+            continue
+        if not ignore_curated and not curated_block:
+            dropped = (rejected or {}).get(kind)
+            if seeded.get(kind) and seeded[kind] != dropped:
+                chosen[kind], sources[kind] = seeded[kind], "recipe"
+                continue
+            guessed = heuristic_parser(name, backend, kind)
+            if guessed and guessed == dropped:
+                print(f"  {name}: {kind} parser {guessed!r} skipped: an earlier "
+                      f"run dropped it (parser_fallback)", file=sys.stderr)
+                guessed = None
+            if guessed:
+                print(f"  {name}: {kind} parser {guessed!r} from the name "
+                      f"heuristic ({HEURISTIC_LABEL})", file=sys.stderr)
+                chosen[kind], sources[kind] = guessed, "heuristic"
+                continue
+        chosen[kind], sources[kind] = None, None
+    return chosen.get("reasoning"), chosen.get("tool"), sources, disagreements
+
+
+def ignore_curated_parsers_from_env() -> bool:
+    """PROBE_IGNORE_CURATED_PARSERS=1 (the Makefile forwards it; plan I24)."""
+    return os.environ.get("PROBE_IGNORE_CURATED_PARSERS", "").strip().lower() in (
+        "1", "true", "yes", "on")
 
 
 @dataclass(frozen=True)
@@ -689,6 +1096,26 @@ def container_state(runtime: str, name: str) -> str:
 ENGINE_CACHE_VOLUME_PREFIX = "devai-engine-cache-"
 
 
+# Run-time FlashInfer cubin downloads are disabled for these backends (plan
+# Phase 4, step 4v, "Run-time cubins off for every 4v launch"). Without the
+# variable, vLLM GETs NVIDIA's artifactory at startup (0.28.0
+# vllm/utils/flashinfer.py:367-414) and, if it answers, may select the
+# TRTLLM XQA decode kernels on SM12x; with it, every kernel comes from the
+# image or its nvcc JIT compile, as 4d's launcher will serve. Scoped to the
+# home-built vLLM only: the stock image is not part of 4v's measurement.
+# Pinned to the router's buildContainerSpec by the tests on both sides.
+NO_RUNTIME_CUBINS_ENV = {"FLASHINFER_CUBINS_REPOSITORY": "file:///nonexistent/"}
+NO_RUNTIME_CUBINS_BACKENDS = frozenset({"vllm-devai"})
+
+
+def engine_env_defaults(backend: str | None) -> dict[str, str]:
+    """Engine environment every launch on `backend` carries, whatever the
+    model: today only NO_RUNTIME_CUBINS_ENV on the backends it is scoped to."""
+    if backend in NO_RUNTIME_CUBINS_BACKENDS:
+        return dict(NO_RUNTIME_CUBINS_ENV)
+    return {}
+
+
 def engine_cache_volumes(backend: str) -> list[tuple[str, str]]:
     """(volume name, container path) pairs for an HF backend; [] otherwise."""
     engine = engine_of(backend)
@@ -716,7 +1143,9 @@ def container_run_args(
 
     `backend` adds that backend's persistent engine-cache volumes (see
     engine_cache_volumes); a named volume takes the same `--volume
-    name:dest:mode` form as a bind and is created on demand.
+    name:dest:mode` form as a bind and is created on demand. It also adds
+    the backend's fixed engine environment (engine_env_defaults), applied
+    last so no per-model entry can turn run-time cubin downloads back on.
     """
     args = [
         runtime, "run", "--detach",
@@ -731,7 +1160,8 @@ def container_run_args(
         args.extend(["--volume", f"{host}:{dst}:{mode}"])
     for vol, dst in engine_cache_volumes(backend) if backend else []:
         args.extend(["--volume", f"{vol}:{dst}:rw"])
-    for k, v in env_vars.items():
+    env = {**env_vars, **engine_env_defaults(backend)}
+    for k, v in env.items():
         args.extend(["--env", f"{k}={v}"])
     args.append(image)
     args.extend(command)
@@ -1144,6 +1574,12 @@ _LAUNCH_ARGS_ERROR_PATTERNS = (
     "unrecognized arguments",
     "error: argument",
     "invalid choice:",
+    # vLLM rejects an unknown parser name at startup with a KeyError, not
+    # through argparse (`validate_api_server_args`, as read in the vLLM
+    # 0.28.0 source by the 2026-10-07 review). Our command line, not the
+    # model: without these the failure filed as `infra`.
+    "invalid tool call parser",
+    "invalid reasoning parser",
 )
 _OOM_PATTERNS = (
     "CUDA out of memory",
@@ -1365,6 +1801,110 @@ def _resolve_plugins(
     return volume, tool_path, reasoning_path
 
 
+def run_tool_probe(
+    base_url: str, model_name: str, tool_parser: str | None, capability: str,
+    *, auto_only: bool = False,
+) -> tuple[str | None, dict | None]:
+    """Probe B of probe_one_cell: (verified tool parser or None, evidence).
+
+    B1 sends tool_choice="auto"; when no call comes back, B2 forces a named
+    call. For a curated or card-derived parser either verifies it. With
+    `auto_only` (a guessed recipe / heuristic parser) only B1 does: a named
+    tool_choice is satisfied by constrained decoding without the parser,
+    so B2 cannot tell a working parser from a wrong one. The B2 result is
+    then kept in the evidence with the reason, and nothing is recorded.
+    """
+    if not tool_parser:
+        return None, None
+    # Reasoning models burn 500-2000 tokens on chain-of-thought before
+    # any tool-call markers. The old 128-token budget guaranteed they
+    # never reached the call. 2048 covers typical R1-Distill traces.
+    is_reasoning = capability in (Capability.STRUCTURED, Capability.INLINE)
+    tool_max_tokens = 2048 if is_reasoning else 128
+    auto_body = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": TOOL_PROBE_PROMPT}],
+        "tools": TOOL_PROBE_SPEC,
+        "tool_choice": "auto",
+        "temperature": 0,
+        "max_tokens": tool_max_tokens,
+        "stream": False,
+    }
+    auto_resp = _post_chat(base_url, auto_body)
+    if response_has_valid_tool_call(auto_resp, "get_time"):
+        return tool_parser, {"verified": True, "mode": "auto"}
+    # Force a call so the parser is exercised even when the model
+    # wouldn't pick a tool on its own. Keep the same prompt and
+    # tools spec; just change tool_choice. Boost the budget once
+    # more so reasoning + the forced call both fit.
+    forced_body = dict(auto_body)
+    forced_body["tool_choice"] = {
+        "type": "function",
+        "function": {"name": "get_time"},
+    }
+    forced_body["max_tokens"] = max(tool_max_tokens, 4096)
+    forced_resp = _post_chat(base_url, forced_body)
+    forced_ok = response_has_valid_tool_call(forced_resp, "get_time")
+    if forced_ok and auto_only:
+        return None, {
+            "verified": False,
+            "mode": "forced",
+            "auto_only": True,
+            "reason": "a guessed (recipe / heuristic) tool parser is recorded "
+                      "only when the auto call verifies it; the forced call is "
+                      "satisfied by constrained decoding without the parser",
+            "auto_response_preview": _short(auto_resp),
+            "forced_response_preview": _short(forced_resp),
+        }
+    if forced_ok:
+        return tool_parser, {
+            "verified": True,
+            "mode": "forced",
+            "auto_response_preview": _short(auto_resp),
+        }
+    return None, {
+        "verified": False,
+        "auto_response_preview": _short(auto_resp),
+        "forced_response_preview": _short(forced_resp),
+    }
+
+
+def speculative_config_json(
+    mtp_method: str | None,
+    mtp_drafter: str | None = None,
+    mtp_num_tokens: int | None = None,
+) -> str | None:
+    """The `--speculative-config` JSON for a catalog `mtp:` block, or None.
+
+    Built JSON-side so the same blob ends up in both probe-time and
+    serve-time (router) launches; the fit pass's MTP launch and the load
+    pass's `--mtp` relaunch both build it here. SGLang discards it (its MTP
+    path is unvalidated on this fleet); vLLM appends `--speculative-config
+    <json>` when present.
+    """
+    if not mtp_method:
+        return None
+    payload: dict[str, object] = {
+        "method": mtp_method,
+        "num_speculative_tokens": int(mtp_num_tokens or 1),
+    }
+    if mtp_drafter:
+        # The drafter directory must already be on disk inside the bound
+        # /models tree. Mirror the router's path convention so the same JSON
+        # works at probe and serve time.
+        payload["model"] = f"/models/{mtp_drafter.split('/')[-1]}"
+    return json.dumps(payload, separators=(",", ":"))
+
+
+def row_speculative_config(row: dict) -> str | None:
+    """speculative_config_json for a catalog row's `mtp:` block, or None."""
+    mtp = row.get("mtp") if isinstance(row.get("mtp"), dict) else None
+    if not mtp:
+        return None
+    return speculative_config_json(
+        mtp.get("method"), mtp.get("drafter"), mtp.get("num_speculative_tokens"))
+
+
 def probe_one_cell(
     spec: BackendSpec,
     *,
@@ -1384,6 +1924,7 @@ def probe_one_cell(
     mtp_method: str | None = None,
     mtp_drafter: str | None = None,
     mtp_num_tokens: int | None = None,
+    tool_parser_auto_only: bool = False,
 ) -> dict:
     """Launch the backend once, run up to three HTTP probes against the
     same container, return a single record.
@@ -1395,7 +1936,9 @@ def probe_one_cell(
       B. Tool-call. Only when `tool_parser` is set and the launch
          succeeded. Send TOOL_PROBE_PROMPT with TOOL_PROBE_SPEC; if the
          response carries a parseable tool_call to `get_time`, record
-         `tool_parser=<curated-name>`; else null.
+         `tool_parser=<curated-name>`; else null. See run_tool_probe;
+         with `tool_parser_auto_only` (a guessed parser) only the auto
+         call can verify it.
       C. Disable verification. Only when Probe A produced `structured`.
          Send the same prompt with the backend-specific suppression
          flag. If `reasoning_content` is then absent, record
@@ -1410,23 +1953,9 @@ def probe_one_cell(
     plugin_volume, tool_plugin_path, reasoning_plugin_path = _resolve_plugins(
         spec, reasoning_parser, tool_parser,
     )
-    # Multi-token-prediction launch flag. Built JSON-side so the same
-    # blob ends up in both probe-time and serve-time (router) launches.
-    # SGLang discards this (its MTP path is unvalidated on this fleet -- NVFP4
-    # loading itself is fixed via --disable-piecewise-cuda-graph); vLLM
-    # appends `--speculative-config <json>` when present.
-    speculative_config_json: str | None = None
-    if mtp_method:
-        spec_payload: dict[str, object] = {
-            "method": mtp_method,
-            "num_speculative_tokens": int(mtp_num_tokens or 1),
-        }
-        if mtp_drafter:
-            # The drafter directory must already be on disk inside the
-            # bound /models tree. Mirror the router's path convention so
-            # the same JSON works at probe and serve time.
-            spec_payload["model"] = f"/models/{mtp_drafter.split('/')[-1]}"
-        speculative_config_json = json.dumps(spec_payload, separators=(",", ":"))
+    # Multi-token-prediction launch flag (see speculative_config_json).
+    speculative_config = speculative_config_json(
+        mtp_method, mtp_drafter, mtp_num_tokens)
     # Fail before touching the GPU: the two engines accept DIFFERENT KV
     # dtype spellings and PROBE_KV_CACHE_TYPE is one knob shared by both.
     validate_kv_dtype(spec, spec.kv_cache_dtype)
@@ -1435,7 +1964,7 @@ def probe_one_cell(
         reasoning_parser=reasoning_parser, tool_parser=tool_parser,
         reasoning_parser_plugin=reasoning_plugin_path,
         tool_parser_plugin=tool_plugin_path,
-        speculative_config=speculative_config_json,
+        speculative_config=speculative_config,
         kv_cache_dtype=spec.kv_cache_dtype,
     )
 
@@ -1616,52 +2145,19 @@ def probe_one_cell(
         # router's strip-tools logic only cares whether the parser CAN
         # extract; agents that send explicit tool_choice still need the
         # plugin loaded even if the model wouldn't auto-pick.
-        tool_parser_verified: str | None = None
-        tool_evidence: dict | None = None
-        if tool_parser:
-            # Reasoning models burn 500-2000 tokens on chain-of-thought before
-            # any tool-call markers. The old 128-token budget guaranteed they
-            # never reached the call. 2048 covers typical R1-Distill traces.
-            is_reasoning = capability in (Capability.STRUCTURED, Capability.INLINE)
-            tool_max_tokens = 2048 if is_reasoning else 128
-            auto_body = {
-                "model": model_name,
-                "messages": [{"role": "user", "content": TOOL_PROBE_PROMPT}],
-                "tools": TOOL_PROBE_SPEC,
-                "tool_choice": "auto",
-                "temperature": 0,
-                "max_tokens": tool_max_tokens,
-                "stream": False,
-            }
-            auto_resp = _post_chat(base_url, auto_body)
-            if response_has_valid_tool_call(auto_resp, "get_time"):
-                tool_parser_verified = tool_parser
-                tool_evidence = {"verified": True, "mode": "auto"}
-            else:
-                # Force a call so the parser is exercised even when the model
-                # wouldn't pick a tool on its own. Keep the same prompt and
-                # tools spec; just change tool_choice. Boost the budget once
-                # more so reasoning + the forced call both fit.
-                forced_body = dict(auto_body)
-                forced_body["tool_choice"] = {
-                    "type": "function",
-                    "function": {"name": "get_time"},
-                }
-                forced_body["max_tokens"] = max(tool_max_tokens, 4096)
-                forced_resp = _post_chat(base_url, forced_body)
-                if response_has_valid_tool_call(forced_resp, "get_time"):
-                    tool_parser_verified = tool_parser
-                    tool_evidence = {
-                        "verified": True,
-                        "mode": "forced",
-                        "auto_response_preview": _short(auto_resp),
-                    }
-                else:
-                    tool_evidence = {
-                        "verified": False,
-                        "auto_response_preview": _short(auto_resp),
-                        "forced_response_preview": _short(forced_resp),
-                    }
+        #
+        # EXCEPT for a guessed parser (`tool_parser_auto_only`: a recipe
+        # seed or the name heuristic). B2 is satisfied by constrained
+        # decoding: vLLM 0.28 builds a named-choice call from the
+        # constrained JSON without the tool parser, and SGLang skips its
+        # detector for a named or required choice in the common case. So
+        # B2 cannot tell a working parser from a wrong one, and a row
+        # recorded `tool_mode=forced` answers every multi-tool request 400
+        # at the router -- worse than stripping tools. A guess is recorded
+        # only when B1 verified it.
+        tool_parser_verified, tool_evidence = run_tool_probe(
+            base_url, model_name, tool_parser, capability,
+            auto_only=tool_parser_auto_only)
 
         # ── Probe C: disable verification ────────────────────────────────
         disable_verified = False
@@ -2233,6 +2729,12 @@ def build_argparser(spec: BackendSpec, doc: str) -> argparse.ArgumentParser:
                     help="re-probe top-level arch/capability fields")
     ap.add_argument("--no-cache-write", action="store_true",
                     help="dry run — do not modify the cache")
+    ap.add_argument("--ignore-curated-parsers", action="store_true",
+                    default=ignore_curated_parsers_from_env(),
+                    help="skip the curated parsers: block, the recipe seed and "
+                         "the name heuristic, so card-derived parsers alone "
+                         "drive the launch (plan I24; default from "
+                         "PROBE_IGNORE_CURATED_PARSERS=1)")
     ap.add_argument("--no-mtp", action="store_true",
                     help="skip the per-cell MTP overhead probe for "
                          "catalog rows declaring an `mtp:` block. Halves "
@@ -2248,13 +2750,73 @@ def build_argparser(spec: BackendSpec, doc: str) -> argparse.ArgumentParser:
                     help="fractional depth (0.0=top, 1.0=bottom) at which "
                          "the load probe inserts its recall needle "
                          "(default 0.5)")
+    ap.add_argument("--mtp", action="store_true",
+                    help="--load only: relaunch a row whose fit cell records "
+                         "mtp_fits: true with its catalog MTP drafter (the "
+                         "speculative config the fit pass builds), as the "
+                         "picker serves it, and stamp serving_mtp: true on "
+                         "the cell; other rows are load-probed without one "
+                         "(Make PROBE_MTP=1)")
+    ap.add_argument("--ledger", type=Path, default=None,
+                    help="exclusion ledger to read and write instead of "
+                         "deploy/.model-status.json, so a scratch run leaves "
+                         "the real one alone; a missing file reads as empty "
+                         "(Make PROBE_LEDGER=<file>)")
     return ap
+
+
+def ledger_file_args(args: argparse.Namespace) -> tuple[Path, ...]:
+    """The ledger path argument for _load_ledger / _save_ledger: () for the
+    real ledger (deploy/.model-status.json, _model_status's default), or
+    (--ledger,). Read like `no_mtp`: hand-built Namespaces in the tests
+    predate the flag."""
+    path = getattr(args, "ledger", None)
+    return (Path(path),) if path else ()
 
 
 # ── Main loop ────────────────────────────────────────────────────────────────
 
+def check_ignore_curated(spec: BackendSpec, args: argparse.Namespace) -> bool:
+    """I24's switch, refused where it would rewrite production data.
+
+    PROBE_IGNORE_CURATED_PARSERS=1 probes with the card-derived parsers
+    alone, so neither its cells nor its verdicts may replace the curated
+    run's: it is accepted only scoped to rows (`--repo`), with a scratch
+    cache (`--cache` other than the backend's own) and a scratch exclusion
+    ledger (`--ledger` other than deploy/.model-status.json), which the run
+    reads and writes. `--no-cache-write` is refused: it makes a row that
+    already fits look fully cached, so the run would probe nothing. The
+    --load pass refuses the switch (run_load_probe_pass). Read like
+    `no_mtp`: hand-built Namespaces in the tests predate the flag.
+    """
+    if not getattr(args, "ignore_curated_parsers", False):
+        return False
+    scratch = Path(args.cache).resolve() != Path(spec.cache_path).resolve()
+    ledger = getattr(args, "ledger", None)
+    scratch_ledger = bool(ledger) and (
+        Path(ledger).resolve() != Path(_LEDGER_PATH).resolve())
+    if (not args.repo or not scratch or not scratch_ledger
+            or getattr(args, "no_cache_write", False)):
+        sys.exit("error: PROBE_IGNORE_CURATED_PARSERS=1 / --ignore-curated-parsers "
+                 "needs --repo <regex> (PROBE_REPO), a scratch --cache <file> "
+                 "other than the backend's own and a scratch --ledger <file> "
+                 "(PROBE_LEDGER) other than deploy/.model-status.json, and "
+                 "refuses --no-cache-write: its cells and verdicts come from "
+                 "card-derived parsers only and must not replace the curated "
+                 "ones (plan I24)")
+    print("PROBE_IGNORE_CURATED_PARSERS: curated parsers, recipe seeds and "
+          "the name heuristic are ignored; only card-derived parsers drive "
+          f"the launch; exclusion verdicts go to the scratch ledger {ledger}",
+          file=sys.stderr)
+    return True
+
+
 def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
     """Run one probe pass with the given backend spec and argparse args."""
+    ignore_curated = check_ignore_curated(spec, args)
+    if getattr(args, "mtp", False):
+        sys.exit("error: --mtp (PROBE_MTP) applies to the --load pass; the fit "
+                 "pass probes a row's MTP drafter on its own unless --no-mtp")
     assert_no_active_backends(args.runtime)
     install_probe_cleanup()
 
@@ -2268,6 +2830,8 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
     models_dir = Path(args.models_dir)
     if not models_dir.is_dir():
         sys.exit(f"error: models dir not found: {models_dir}")
+
+    seeds = {} if ignore_curated else _vllm_recipes.load_seeds()
 
     # Default to ONLY the host VRAM. Probing 16G when the host has 24G
     # produces data nobody on this host can use; the operator can still
@@ -2318,10 +2882,13 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
         cache, digest=run_image_digest, image_ref=args.image)
     if not args.no_cache_write:
         save_cache(args.cache, cache)
-    ledger = _load_ledger()
+    ledger_args = ledger_file_args(args)
+    ledger = _load_ledger(*ledger_args)
 
     print(f"  prober:         probe-{spec.name}-reasoning", file=sys.stderr)
     print(f"  cache:          {args.cache} ({len(cache)} entries)", file=sys.stderr)
+    if ledger_args:
+        print(f"  ledger:         {ledger_args[0]} (scratch)", file=sys.stderr)
     print(f"  catalog rows:   {len(catalog_rows)} (after --repo filter)",
           file=sys.stderr)
     print(f"  vram bands:     {','.join(vram_label(v) for v in vrams)}",
@@ -2408,45 +2975,30 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
         # produces the expected response shape.
         curated_reasoning, curated_tool = curated_parsers(row, spec.name)
 
-        # Card-derived fallback. A curated value ALWAYS wins -- derivation
-        # only fills gaps, so onboarding an uncurated model no longer
-        # requires hand-writing a `parsers:` block first. The derivation
-        # refuses to guess wherever validation showed the markup does not
-        # determine the parser (qwen3_xml vs qwen3_coder, bare <think>,
-        # Gemma-4's prompt-side <|think|>), so a gap it cannot fill stays
-        # exactly as it is today: no parser flag emitted.
-        parser_sources: dict[str, str | None] = {}
-        disagreements: dict[str, dict] = {}
-        row_reasoning_parser = curated_reasoning
-        row_tool_parser = curated_tool
-        for kind, curated in (("tool", curated_tool),
-                              ("reasoning", curated_reasoning)):
-            derived = None
-            try:
-                derived = derive_parser_for(name, models_dir, spec.name, kind)
-            except Exception as e:  # noqa: BLE001
-                # Never let a hint break a probe: no hint is today's
-                # behaviour, a crash is not.
-                print(f"  {name}: card-hint derivation failed ({kind}): {e}",
-                      file=sys.stderr)
-            if curated is None:
-                if kind == "tool":
-                    row_tool_parser = derived
-                else:
-                    row_reasoning_parser = derived
-                parser_sources[kind] = "card" if derived else None
-            else:
-                parser_sources[kind] = "curated"
-                if derived and derived != curated:
-                    # Behaviour is unchanged -- curated still wins -- but a
-                    # silent disagreement is how curation drifts out of
-                    # step with the checkpoints it describes.
-                    print(f"  {name}: WARNING {kind} parser disagreement -- "
-                          f"curated={curated!r} but the chat template "
-                          f"derives {derived!r}. Serving the curated value.",
-                          file=sys.stderr)
-                    disagreements[kind] = {"curated": curated,
-                                           "derived": derived}
+        # The parser order (plan Phase 17a): curated, then card-derived
+        # (which refuses to guess wherever validation showed the markup
+        # does not determine the parser -- qwen3_xml vs qwen3_coder, bare
+        # <think>, Gemma-4's prompt-side <|think|>), then the recipe seed,
+        # then the labelled name heuristic, then none. A curated value
+        # ALWAYS wins unless PROBE_IGNORE_CURATED_PARSERS=1 (I24), which
+        # leaves the card derivation alone.
+        curated_block = has_curated_block(row, spec.name)
+        recipe_parsers = ({} if ignore_curated or curated_block else
+                          recipe_seed_parsers(name, spec.name, args.image, seeds))
+        # Guesses an earlier run dropped (see _fit_works): skipped again.
+        prior_fallback = entry.get("parser_fallback")
+        rejected = ({k: v["parser"] for k, v in prior_fallback.items()
+                     if isinstance(v, dict) and isinstance(v.get("parser"), str)}
+                    if isinstance(prior_fallback, dict) else {})
+        (row_reasoning_parser, row_tool_parser, parser_sources,
+         disagreements) = resolve_parsers(
+            name, models_dir, spec.name, curated_reasoning, curated_tool,
+            recipe_parsers=recipe_parsers, ignore_curated=ignore_curated,
+            curated_block=curated_block, rejected=rejected,
+        )
+        # Guessed values a failed first launch may be blamed on; see _fit_works.
+        guessed_kinds = [k for k, src in parser_sources.items()
+                         if src in GUESSED_PARSER_SOURCES]
 
         # Provenance. Additive fields only, matching how the LOAD probe
         # augments cells -- no schema bump. Lets a reader tell "a human
@@ -2465,12 +3017,29 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
         else:
             entry.pop("card_sampling", None)
 
-        entry["tool_parser_source"] = parser_sources.get("tool")
-        entry["reasoning_parser_source"] = parser_sources.get("reasoning")
-        if disagreements:
-            entry["parser_disagreement"] = disagreements
-        else:
-            entry.pop("parser_disagreement", None)
+        def _stamp_parser_provenance() -> None:
+            # Written only when this run probes the row, so the fields
+            # describe the parsers its cells were measured with; a cached
+            # row keeps the provenance of the run that measured it.
+            entry["tool_parser_source"] = parser_sources.get("tool")
+            entry["reasoning_parser_source"] = parser_sources.get("reasoning")
+            if disagreements:
+                entry["parser_disagreement"] = disagreements
+            else:
+                entry.pop("parser_disagreement", None)
+            if parser_fallback:
+                entry["parser_fallback"] = dict(parser_fallback)
+            else:
+                entry.pop("parser_fallback", None)
+
+        # A recorded fallback stays while it still keeps the same guess out.
+        parser_fallback: dict[str, dict] = {
+            k: prior_fallback[k] for k, v in rejected.items()
+            if not ignore_curated and not curated_block
+            and parser_sources.get(k) not in ("curated", "card")
+            and v in (recipe_parsers.get(k), heuristic_parser(name, spec.name, k))
+        }
+        first_launch_pending = True
 
         # A row measured under a DIFFERENT engine image is not evidence
         # about this one. Unlike launch-fingerprint drift (see the long
@@ -2575,10 +3144,25 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
                 continue
             # Exact mode keeps the previous band on a miss (see below).
             prior_band = dict(band) if ctx_exact is not None else None
+            # ... and the provenance that describes it, restored with it.
+            prior_provenance = ({k: entry.get(k, _ABSENT) for k in PARSER_PROVENANCE_KEYS}
+                                if ctx_exact is not None else None)
+
+            def _restore_prior() -> None:
+                band.update(prior_band or {})
+                for k, v in (prior_provenance or {}).items():
+                    if v is _ABSENT:
+                        entry.pop(k, None)
+                    else:
+                        entry[k] = v
+
             band.clear()
+            _stamp_parser_provenance()
 
             def _src(kind: str) -> str:
                 src = parser_sources.get(kind)
+                if src == "heuristic":
+                    return f"(heuristic: {HEURISTIC_LABEL})"
                 return f"({src})" if src else ""
 
             parser_label = (
@@ -2605,8 +3189,8 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
             # model's position_limit are instant-failed with no launch.
             probed_cells: dict[int, dict] = {}
 
-            def _fit_works(ctx: int) -> bool:
-                rec = probe_one_cell(
+            def _probe_at(ctx: int) -> dict:
+                return probe_one_cell(
                     spec,
                     runtime=args.runtime,
                     image=args.image,
@@ -2621,7 +3205,60 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
                     prompt=args.prompt,
                     reasoning_parser=row_reasoning_parser,
                     tool_parser=row_tool_parser,
+                    tool_parser_auto_only=(
+                        parser_sources.get("tool") in GUESSED_PARSER_SOURCES),
                 )
+
+            def _fit_works(ctx: int) -> bool:
+                nonlocal row_reasoning_parser, row_tool_parser, first_launch_pending
+                rec = _probe_at(ctx)
+                if first_launch_pending:
+                    first_launch_pending = False
+                    if guessed_kinds and not rec.get("fits"):
+                        # The row's FIRST launch failed -- at startup, in
+                        # Probe A, anywhere -- while it carried a GUESSED
+                        # parser (recipe seed or name heuristic). Retry the
+                        # same context once without the guesses. Only if
+                        # that run fits is the guess blamed: it is dropped
+                        # for the rest of the run, recorded in
+                        # `parser_fallback`, and skipped by later runs. If
+                        # the run without it fails too, the failure is not
+                        # the guess's (an OOM, a recovery flag the engine
+                        # rejects, ...): the guesses stay and nothing is
+                        # recorded. At most one extra launch per row.
+                        failed_kind = (rec.get("evidence") or {}).get("kind", "?")
+                        saved = (row_reasoning_parser, row_tool_parser)
+                        dropped = {k: (row_tool_parser if k == "tool"
+                                       else row_reasoning_parser)
+                                   for k in guessed_kinds}
+                        if "tool" in dropped:
+                            row_tool_parser = None
+                        if "reasoning" in dropped:
+                            row_reasoning_parser = None
+                        print(f"    {context_label(ctx):>4s} the first launch with "
+                              f"guessed parser(s) {dropped} failed "
+                              f"(kind={failed_kind}); retrying without them",
+                              file=sys.stderr)
+                        retry = _probe_at(ctx)
+                        if retry.get("fits"):
+                            for kind, value in dropped.items():
+                                parser_fallback[kind] = {
+                                    "parser": value,
+                                    "source": parser_sources.get(kind),
+                                    "failure": failed_kind,
+                                    "note": "the first launch with it failed and "
+                                            "the same context fit without it; "
+                                            "later runs skip it",
+                                }
+                                parser_sources[kind] = None
+                            guessed_kinds.clear()
+                            _stamp_parser_provenance()
+                            rec = retry
+                        else:
+                            row_reasoning_parser, row_tool_parser = saved
+                            print(f"    {context_label(ctx):>4s} failed without them "
+                                  f"too (kind={(retry.get('evidence') or {}).get('kind', '?')}); "
+                                  f"keeping the guesses", file=sys.stderr)
                 probed_cells[ctx] = rec
                 if rec.get("fits"):
                     rp = rec.get("reasoning_parser") or "—"
@@ -2643,7 +3280,7 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
                 try:
                     exact_ctx_grid(ctx_exact, pos_cap)
                 except ValueError as e:
-                    band.update(prior_band or {})
+                    _restore_prior()
                     sys.exit(f"error: {name}: {e}")
                 prior_max = max((int(c) for c, cell in (prior_band or {}).items()
                                  if isinstance(cell, dict) and cell.get("fits")),
@@ -2701,6 +3338,8 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
                         prompt=args.prompt,
                         reasoning_parser=row_reasoning_parser,
                         tool_parser=row_tool_parser,
+                        tool_parser_auto_only=(
+                            parser_sources.get("tool") in GUESSED_PARSER_SOURCES),
                         mtp_method=mtp_method,
                         mtp_drafter=mtp_drafter,
                         mtp_num_tokens=mtp_k,
@@ -2724,7 +3363,7 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
                     # cell served it (measured 2026-09-22: 120K fit, MTP did
                     # not, and the 115K MTP cell was lost). Keep the previous
                     # cell and report the MTP pass's own estimate.
-                    band.update(prior_band or {})
+                    _restore_prior()
                     est = engine_max_len_estimate(winner.get("mtp_evidence"))
                     hint = (f"; with MTP the engine estimates {est} tokens "
                             f"({context_label(est)}) would fit -- retry with "
@@ -2749,7 +3388,7 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
                 # fit, and let the run end non-zero so nobody mistakes it
                 # for a recorded result.
                 miss = probed_cells[ctx_exact]
-                band.update(prior_band or {})
+                _restore_prior()
                 est = engine_max_len_estimate(miss.get("evidence"))
                 kind = (miss.get("evidence") or {}).get("kind", "?")
                 hint = (f"; the engine estimates {est} tokens "
@@ -2834,8 +3473,10 @@ def run_probe_pass(spec: BackendSpec, args: argparse.Namespace) -> None:
     pruned = prune_orphaned_shas(cache, catalog_rows)
     if pruned and not args.no_cache_write:
         save_cache(args.cache, cache)
+    # Under the I24 switch ledger_args is the scratch ledger
+    # (check_ignore_curated refuses the run without one).
     if not args.no_cache_write:
-        _save_ledger(ledger, host_vram_gb=args.host_vram_gb)
+        _save_ledger(ledger, *ledger_args, host_vram_gb=args.host_vram_gb)
 
     print(file=sys.stderr)
     by_cap: dict[str, int] = {}

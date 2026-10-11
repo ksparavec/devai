@@ -13,6 +13,9 @@ to thaw it without re-deriving the design.
 | Subtree | What it is | Frozen on | Why |
 | --- | --- | --- | --- |
 | [cluster-mode/](./cluster-mode/) | Multi-host cluster mode (`--mode=worker\|head`) and the SkyPilot cloud-burst fleet provisioner | 2026-07-25 | Built for a fleet this project does not have. Never functioned end to end. See below. |
+| [amd-rocm/](./amd-rocm/) | The AMD/ROCm GPU-vendor overlay: `make gpu-vendor`, `devai-gpu-vendor`, the ROCm branches of the lab image and the launcher | 2026-10-07 | Platform-rebuild Phase 1, operator decision M11: never ran on ROCm hardware, and the rocm6.4 index has no torch for Python 3.14. devai is NVIDIA-only until it is restored. See [amd-rocm/RESTORE.md](./amd-rocm/RESTORE.md). |
+| [sops-age/](./sops-age/) | The sops + age secret-store scaffold: `.sops.yaml`, the key and render scripts, the tmpfs mount, the `secrets-*` targets | 2026-10-07 | Platform-rebuild Phase 1, operator decision M12: its last consumer, the MCP gateway, was deleted the same day (M10). The Slurm work may restore it for its JWT key and MariaDB password. See [sops-age/RESTORE.md](./sops-age/RESTORE.md). |
+| [sglang/](./sglang/) | The SGLang backend's live wiring: its router entry on port 11436, its compose service, picker rows and agent providers, its prober, its make targets and its SGLang-only tests | 2026-10-10 | Platform-rebuild Phase 15, decision M16: on the same checkpoint its turn-2+ TTFT was 0.81x vLLM 0.30.0's, short of the 0.75 the operator's I16 required. Its engine code stays in place, unreachable. See [sglang/RESTORE.md](./sglang/RESTORE.md). |
 
 ## Why cluster-mode was frozen
 
@@ -58,6 +61,9 @@ doing nothing.
 
 ## How to thaw
 
+Each subtree has its own RESTORE.md; read it first. The rest of this
+section is cluster-mode's.
+
 The Go sources under `cluster-mode/gpu-arbiter/` each carry a
 `//go:build devai_frozen_cluster` tag, and `attic/` sits outside every
 Go module in the repo, so they are invisible to `go build ./...` twice
@@ -81,6 +87,9 @@ fixed, so a naive thaw restores broken code.
 
 ## The design plans
 
-The plans themselves stay in `docs/plans/` with a `Frozen` status
-rather than moving here -- they are still the design record, and
-`docs/plans/README.md` is the canonical status table.
+The plans (gpu-arbiter-cluster-mode, skypilot-fleet-provisioner,
+skypilot-agent-skill) were removed from `docs/plans/` on 2026-10-05: the
+platform rebuild replaces the launch layer they extend, and multi-host, if it
+comes, is built on Slurm. They remain the design record in git history:
+`git log --diff-filter=D -- docs/plans/gpu-arbiter-cluster-mode.md` finds the
+commit that removed them.

@@ -4,11 +4,15 @@ The laya trainer fine-tunes laya "System 1" decision models for aiagent by
 distillation from the 27B teacher. It is a router backend, but a **job runner**,
 not an inference engine: a request to its port starts a training job that holds
 the GPU for minutes to hours after the request has returned. The design and its
-owner decisions are in [docs/plans/laya-trainer.md](plans/laya-trainer.md); this
-page is the reference for what is built.
+owner decisions were in the laya-trainer plan (removed 2026-10-05, in git
+history). Its Phase 4 was closed by the owner on 2026-10-05, with the quality
+caveats under "Quality of the installed student" kept as known limits
+([the platform-rebuild plan](plans/platform-rebuild.md), I23); this page is the
+reference for what is built.
 
 - Image: `localhost/devai-laya-trainer:latest` (`make build-laya-trainer`), on the
-  lab's GPU base image (`devai-base-gpu`, Python 3.14.7), hash-locked Python
+  lab's base image (`devai-base`, Debian trixie-slim, Python 3.14.7; it was the
+  CUDA-based `devai-base-gpu` until platform-rebuild Phase 3), hash-locked Python
   packages (`laya-trainer/requirements.lock`, `torch==2.14.0` = the lab's cu130
   build).
 - Container: `devai-laya-trainer`. Compose starts it as a `sleep infinity`
@@ -413,7 +417,7 @@ Logs: `make logs SERVICE=devai-laya-trainer`.
 
 ```bash
 make model-pull NAME=laya-multilingual   # base checkpoint (default student); laya-english likewise
-make build-laya-trainer                  # the image (needs devai-base-gpu; builds it via build-base-gpu)
+make build-laya-trainer                  # the image (needs devai-base; builds it via build-base)
 make test-laya-trainer [VERBOSE=1]       # unit tests in the image, CPU, no network
 make laya-trainer-lock                   # regenerate the hash lock from laya-trainer/requirements.in
 make laya-check [TEACHER=...] [KEEP_RUN=1]  # GPU, evicts the teacher ~3 min: the reference check below

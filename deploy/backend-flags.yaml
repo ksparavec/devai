@@ -21,6 +21,11 @@
 #                  (vLLM 0.19.1+, CUDA 13, Ubuntu 24.04)
 #   SGLANG_IMAGE = docker.io/lmsysorg/sglang:v0.5.16-cu130
 #                  (SGLang 0.5.16, CUDA 13)
+#   VLLM_DEVAI_IMAGE = docker.io/devai/vllm-devai:latest
+#                  (home-built, scripts/build-vllm.sh; checked against the
+#                  `vllm` names below PLUS the flag names of every recovery
+#                  entry scoped to the vllm-devai backend, curated and
+#                  generated, read with --help=all; plan Phase 4 step 4v)
 #
 # Verified 2026-04-29 against the images above; SGLang re-verified
 # 2026-07-28 (--tp corrected to --tp-size; served_model_name and
@@ -60,6 +65,14 @@ vllm:
   # method, optional drafter path, and num_speculative_tokens.
   speculative_config:   "--speculative-config"
 
+# Flags only the home-built vLLM (vllm-devai, VLLM_DEVAI_IMAGE) emits, on
+# top of the vllm: names above; stock vLLM 0.22.1 does not have them.
+# verify-backend-flags.py checks this section against VLLM_DEVAI_IMAGE only.
+vllm-devai:
+  # gpu-arbiter engineArgDefaults / probe-vllm-devai-reasoning.py
+  # PREFIX_CACHE_RETENTION_ARGS (plan 4v, adopted 2026-10-07).
+  prefix_cache_retention_interval: "--prefix-cache-retention-interval"
+
 sglang:
   model_path:           "--model-path"
   host:                 "--host"
@@ -86,6 +99,13 @@ sglang:
   # fails the gate instead of silently dropping quantized-KV support.
   kv_cache_dtype:       "--kv-cache-dtype"
   trust_remote_code:    "--trust-remote-code"
+  # /metrics (sglang:cached_tokens_total, sglang:prompt_tokens_total) is
+  # served only with it; the router and the prober emit it on every launch
+  # (platform-rebuild Phase 15).
+  enable_metrics:       "--enable-metrics"
+  # Phase 15's radix-off arm only (sglang_command_args disable_radix_cache);
+  # the router never emits it.
+  disable_radix_cache:  "--disable-radix-cache"
   tool_call_parser:     "--tool-call-parser"
   reasoning_parser:     "--reasoning-parser"
   # disable_piecewise_cuda_graph was pinned here while the router and

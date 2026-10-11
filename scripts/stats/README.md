@@ -41,7 +41,7 @@ compression method is not supported` on them, so run the log readers
 (`bench_extract_logs.py`, `bench_stats.py`, `kvquant_*`, ...) inside the
 lab image (Python 3.14.7) once logs from the re-bench are in the
 directory, e.g. `podman run --rm --network=none --entrypoint python3
--v $PWD:/repo:ro -v $L:$L:ro -v $O:$O localhost/devai-lab-gpu:latest
+-v $PWD:/repo:ro -v $L:$L:ro -v $O:$O localhost/devai-lab:latest
 /repo/scripts/stats/bench_extract_logs.py $L $O/logs_extracted.json`.
 
 ```bash
@@ -67,7 +67,7 @@ python3 scripts/stats/bench_timeouts.py $L $O/timeouts.tsv
   port-11435 vs 11437 AutoRound pair (docs/router.md). It EXECUTES model
   code and imports inspect_ai, so run it inside the lab image:
   `podman run --rm --network=none --entrypoint python3 -v $PWD:/repo:ro
-  -v $L:/logs:ro -v $O:/o localhost/devai-lab-gpu:latest
+  -v $L:/logs:ro -v $O:/o localhost/devai-lab:latest
   /repo/scripts/stats/bench_rescore_humaneval.py /o/logs_extracted.json
   /logs /o/humaneval_rescore.json`.
 - `bench_engine_facts.py`: the sampler defaults and KV dtype each engine
@@ -75,12 +75,31 @@ python3 scripts/stats/bench_timeouts.py $L $O/timeouts.tsv
 - `bench_timeouts.py`: every log with a sample that hit the per-sample time
   limit.
 
+## vLLM 0.30.0 prefix-cache retention (platform-rebuild Phase 4, step 4v)
+
+```bash
+B=/var/cache/devai/bench/4v; O=~/.cache/devai/stats/4v; mkdir -p $O
+python3 scripts/stats/vllm_upgrade_accept.py retention \
+    --default $B/retention/default/*.json --none $B/retention/none/*.json --out $O/retention.json
+```
+
+- `vllm_upgrade_accept.py retention`: the prefix-cache retention rule (a)-(b)
+  over the per-session `bench_concurrency.py --mode multiturn` reports of the
+  two arms (one JSON file per session, paired by salt; save them with
+  `make -s` so make's own echo stays out of the file). Rule (c), the
+  exact-context probes with the flag, is not evaluated here.
+- Its `accept` subcommand (0.28.0 against 0.30.0: quality non-inferiority,
+  speed ratios, MTP acceptance length) was removed on 2026-10-07 with the
+  0.28.0 arm (plan E7: 0.30.0 is accepted on its own context and load
+  probes). Git history keeps it.
+- Tested by `tests/python/test_stats_vllm_upgrade_accept.py`.
+
 ## Use-case scores (owner's four use cases)
 
 ```bash
 L=/var/cache/devai/bench/inspect-logs; O=~/.cache/devai/stats/usecase; mkdir -p $O
 podman run --rm --network=none --entrypoint python3 -v $PWD:/repo:ro -v $L:$L:ro -v $O:$O \
-    localhost/devai-lab-gpu:latest /repo/scripts/stats/bench_extract_logs.py $L $O/logs_extracted.json
+    localhost/devai-lab:latest /repo/scripts/stats/bench_extract_logs.py $L $O/logs_extracted.json
 python3 scripts/stats/usecase_scores.py $O/logs_extracted.json deploy/.bench-cache.json $O
 ```
 
@@ -143,7 +162,7 @@ python3 perf_client_logs.py ~/.cache/devai /var/cache/devai/logs/devai-vllm.log 
 - `perf_phases.py` (`python3 perf_phases.py /var/cache/devai/logs/devai-router.log /var/cache/devai/logs/devai-vllm.log /var/cache/devai/logs/devai-vllm-devai.log $O/ /var/cache/devai/bench/bench-vllm-run-20260505T140328Z.log`): vLLM start-up phases and memory lines (weights, model load, compile, KV pool, graph pool, peak activation, effective GPU-memory utilisation) joined to the router launches, never-ready and restart-abandoned launches, the MTP memory cost (weights, KV bytes per token, KV pool), CUDA-graph capture sizes, and the 2026-05-05 bench-run summary lines.
 - `perf_enginelog.py` holds the log parsers.
 
-## laya trainer (docs/laya-trainer.md, docs/plans/laya-trainer.md)
+## laya trainer (docs/laya-trainer.md)
 
 ```bash
 python3 scripts/stats/laya_stats.py      # defaults point at /var/cache/devai/laya, ~/devai-home, ~/laya-pilot, ~/git/aiagent

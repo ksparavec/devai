@@ -3,7 +3,7 @@
 # Codex 0.124+ removed `wire_api = "chat"` and only supports its built-in OSS
 # code path (`--oss --local-provider <name>`) for non-OpenAI endpoints. The
 # built-in `ollama` provider name is reserved and hard-codes localhost, so we
-# define custom providers (`router-ollama`, `router-vllm`, `router-sglang`,
+# define custom providers (`router-ollama`, `router-vllm`,
 # `router-vllm-devai`) pointing at the DevAI router on the appropriate port.
 # The picker invokes codex with `--oss --local-provider router-<backend>`.
 #
@@ -24,10 +24,6 @@ base_url = "http://devai-router:11434/v1"
 [model_providers.router-vllm]
 name = "vLLM via DevAI router"
 base_url = "http://devai-router:11435/v1"
-
-[model_providers.router-sglang]
-name = "SGLang via DevAI router"
-base_url = "http://devai-router:11436/v1"
 
 [model_providers.router-vllm-devai]
 name = "vLLM devai via DevAI router"

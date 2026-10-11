@@ -10,19 +10,22 @@ import (
 )
 
 // Snapshot writes a gzipped tar archive containing every existing manifest
-// entry into destDir, named "<timestamp>.tar.gz". Each source file is read
+// entry into destDir, named "<timestamp>.tar.gz". The archive holds C7's
+// 0600 secrets (devai-config/slurm), so the directory is created 0700 and
+// the file is created 0600 with O_EXCL: the umask cannot widen it, and an
+// existing file of that name is never reused. Each source file is read
 // fully into memory before its tar header+body is written, rather than
 // streamed against a pre-Stat'd size -- all backed-up files are small
 // (hundreds of KB max), and buffering removes the race where a concurrent
 // writer changes a file's size between Stat and copy, which would corrupt
 // the tar stream itself (not just the JSON content).
 func Snapshot(destDir string, manifest []Entry, timestamp string) (string, error) {
-	if err := os.MkdirAll(destDir, 0o755); err != nil {
+	if err := os.MkdirAll(destDir, 0o700); err != nil {
 		return "", fmt.Errorf("create dest dir: %w", err)
 	}
 	archivePath := filepath.Join(destDir, timestamp+".tar.gz")
 
-	f, err := os.Create(archivePath)
+	f, err := os.OpenFile(archivePath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return "", err
 	}
@@ -62,14 +65,6 @@ func addEntry(tw *tar.Writer, e Entry) error {
 	info, err := os.Lstat(e.SourcePath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			if e.IsAgeKey {
-				fmt.Fprintf(os.Stderr,
-					"WARNING: age key not found at %s -- skipping. "+
-						"sops+age has no backdoor: losing this key means losing "+
-						"every secret encrypted with its public key. Run "+
-						"`make age-keygen-host` if this host should have one.\n",
-					e.SourcePath)
-			}
 			return nil
 		}
 		return fmt.Errorf("stat %s: %w", e.SourcePath, err)

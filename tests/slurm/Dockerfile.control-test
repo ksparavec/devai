@@ -1,0 +1,41 @@
+# devai-control-test -- the image of Phase 5's two devai-control test
+# containers (platform-rebuild Phase 5; tests/slurm/test-slurm.sh):
+#
+#   devai-control-test-engines   default user namespace, root, the GPU;
+#                                container `engines`, service `fake`:
+#                                scripts/vram-ballast.py as the engine
+#   devai-control-test-operator  --userns=keep-id, user devai, no GPU;
+#                                container `operator`, service `actions`,
+#                                with the test registry below
+#
+# trixie-slim + supervisor + python3 (the ballast) + devai-control and
+# devai-bus (static, built on the host by `make slurm-tools` and
+# bind-mounted for the build, as for devai-slurm). Each container gets its
+# own control.yaml from test-slurm.sh, mounted at /etc/devai/control.yaml.
+#
+# Build (test-slurm.sh does it): context = the repository root.
+ARG BASE_IMAGE=docker.io/library/debian:trixie-slim@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd
+FROM ${BASE_IMAGE}
+
+ARG APT_PROXY
+RUN set -eu; \
+    if [ -n "${APT_PROXY:-}" ]; then echo "Acquire::http::Proxy \"$APT_PROXY\";" > /etc/apt/apt.conf.d/00cache; fi; \
+    apt-get update; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends supervisor python3 procps ca-certificates; \
+    rm -rf /var/lib/apt/lists/* /etc/apt/apt.conf.d/00cache; \
+    groupadd --gid 1000 devai; \
+    useradd --uid 1000 --gid 1000 --create-home --shell /bin/bash devai
+
+ARG DIST_ID=unset
+RUN set -eu; \
+    echo "devai-tools build $DIST_ID"; \
+    for b in devai-control devai-bus; do \
+        test -x /var/cache/devai-tools-dist/$b \
+            || { echo "error: no $b in the mounted build -- run 'make slurm-tools' first" >&2; exit 1; }; \
+        install -m 0755 /var/cache/devai-tools-dist/$b /usr/local/bin/$b; \
+    done
+
+COPY scripts/vram-ballast.py /usr/local/lib/devai/vram-ballast.py
+COPY tests/slurm/control-test/supervisord-engines.conf tests/slurm/control-test/supervisord-operator.conf /etc/devai/test/
+COPY tests/slurm/control-test/repo/ /opt/devai-test/
+RUN chmod 0755 /usr/local/lib/devai/vram-ballast.py /opt/devai-test/bin/*.sh

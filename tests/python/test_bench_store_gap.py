@@ -249,7 +249,8 @@ class CacheServicesInSyncTest(unittest.TestCase):
         # laya-trainer (the job runner) is recreated the same way.
         backends = self._makefile_var("CACHE_BACKEND_SERVICES")
         self.assertTrue(backends <= self._makefile_var("CACHE_SERVICES"))
-        self.assertEqual(backends, {"ollama", "vllm", "vllm-devai", "laya-trainer", "sglang"})
+        # SGLang left with its backend (platform-rebuild Phase 15, M16).
+        self.assertEqual(backends, {"ollama", "vllm", "vllm-devai", "laya-trainer"})
 
 
 if __name__ == "__main__":

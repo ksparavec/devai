@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/json"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -142,6 +144,112 @@ func TestMutationGuard_ExactPathsOnly(t *testing.T) {
 		if got := matchedPattern(t, mux, http.MethodPost, path); got != "/" {
 			t.Errorf("%s routed to pattern %q, want the catch-all %q", path, got, "/")
 		}
+	}
+}
+
+// /api/blobs/ is the one subtree pattern: a blob route carries the digest
+// in its path, and both the upload (POST) and the existence check (HEAD)
+// that precede `ollama create` must stop at the router.
+func TestMutationGuard_BlobRoutesRefused(t *testing.T) {
+	for _, method := range []string{http.MethodPost, http.MethodHead} {
+		t.Run(method, func(t *testing.T) {
+			var upstreamHits int64
+			mux := guardedMux(t, "ollama", &upstreamHits)
+
+			req := httptest.NewRequest(method, "/api/blobs/sha256:"+strings.Repeat("ab", 32), strings.NewReader("GGUF"))
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, req)
+
+			if w.Code != http.StatusForbidden {
+				t.Errorf("%s status = %d, want 403", method, w.Code)
+			}
+			if got := atomic.LoadInt64(&upstreamHits); got != 0 {
+				t.Errorf("%s reached upstream %d times, want 0", method, got)
+			}
+		})
+	}
+	var upstreamHits int64
+	mux := guardedMux(t, "ollama", &upstreamHits)
+	if got := matchedPattern(t, mux, http.MethodPost, "/api/blobsx"); got != "/" {
+		t.Errorf("/api/blobsx routed to pattern %q, want the catch-all", got)
+	}
+}
+
+// ServeMux matches on the escaped path, so an encoded slash turns a guarded
+// route into one segment that misses its pattern and lands on the
+// catch-all. Ollama decodes the path and runs the handler (verified
+// against devai-ollama 0.34.2 in review: `DELETE /api%2Fdelete` reached
+// the delete handler, `POST /api/blobs%2Fsha256:...` wrote a blob). The
+// catch-all must refuse these on the decoded path.
+func TestMutationGuard_EncodedSlashesRefused(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("ab", 32)
+	cases := []struct{ method, target string }{
+		{http.MethodDelete, "/api%2Fdelete"},
+		{http.MethodPost, "/api%2fpull"},
+		{http.MethodPost, "/api%2Fcreate"},
+		{http.MethodPost, "/api%2Fcopy"},
+		{http.MethodPost, "/api%2Fpush"},
+		{http.MethodPost, "/api/blobs%2F" + digest},
+		{http.MethodHead, "/api%2Fblobs%2F" + digest},
+		{http.MethodPost, "/api%2F%2Fdelete"},
+		{http.MethodPost, "/api%2Fdelete%2F"},
+		{http.MethodPost, "/api%2Fx%2F..%2Fpull"},
+	}
+	for _, backend := range []string{"ollama", "vllm"} {
+		for _, c := range cases {
+			t.Run(backend+" "+c.method+" "+c.target, func(t *testing.T) {
+				var upstreamHits int64
+				mux := guardedMux(t, backend, &upstreamHits)
+				req := httptest.NewRequest(c.method, c.target, strings.NewReader(`{"model":"m","name":"m"}`))
+				w := httptest.NewRecorder()
+				mux.ServeHTTP(w, req)
+				if w.Code != http.StatusForbidden {
+					t.Errorf("status = %d, want 403", w.Code)
+				}
+				if got := atomic.LoadInt64(&upstreamHits); got != 0 {
+					t.Errorf("upstream saw %d requests, want 0", got)
+				}
+			})
+		}
+	}
+}
+
+func TestIsMutationPath(t *testing.T) {
+	for p, want := range map[string]bool{
+		"/api/delete": true, "/api/delete/": true, "/api//pull": true, "/api/blobs": true,
+		"/api/blobs/sha256:ab": true, "/api/blobs/x/y": true,
+		"/api/chat": false, "/api/pullxyz": false, "/api/blobsx": false, "/api/show": false,
+		"/v1/chat/completions": false, "/api/tags": false,
+	} {
+		if got := isMutationPath(p); got != want {
+			t.Errorf("isMutationPath(%q) = %v, want %v", p, got, want)
+		}
+	}
+}
+
+// The refusal echoes the client's path; it must stay valid JSON and one
+// log line whatever the path holds (an encoded newline included).
+func TestMutationGuard_ClientPathCannotBreakBodyOrLog(t *testing.T) {
+	var upstreamHits int64
+	mux := guardedMux(t, "ollama", &upstreamHits)
+
+	var buf strings.Builder
+	prev := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(prev) })
+
+	req := httptest.NewRequest(http.MethodPost, `/api/blobs/x%0A2026/01/01%2000:00:00%20[vllm]%20fingerprint:%20{%22forged%22:1}%22`, nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", w.Code)
+	}
+	if !json.Valid(w.Body.Bytes()) {
+		t.Errorf("403 body is not valid JSON: %q", w.Body.String())
+	}
+	if n := strings.Count(strings.TrimRight(buf.String(), "\n"), "\n"); n != 0 {
+		t.Errorf("the refusal logged %d extra line(s): %q", n, buf.String())
 	}
 }
 

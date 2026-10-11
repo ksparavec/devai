@@ -6,16 +6,14 @@ CLI plus its broad cloud-extras set
 credentials in place, you can ask any of the bundled CLI agents
 (Claude Code, Gemini CLI, Codex CLI) to provision GPU jobs on your
 own cloud accounts via natural-language instructions -- the
-[SkyPilot Agent Skill](https://blog.skypilot.co/agent-skill/) plugin
-teaches each agent how to drive the `sky` CLI.
+agents drive the `sky` CLI as an ordinary command-line tool. No
+[SkyPilot Agent Skill](https://blog.skypilot.co/agent-skill/) plugin is
+installed (see "Driving SkyPilot from an AI agent" below).
 
-This is the user-facing reference. The architecture rationale and
-phase split live in
-[docs/plans/skypilot-agent-skill.md](plans/skypilot-agent-skill.md).
-The system-side fleet provisioner (gpu-arbiter cloud-burst) is the
-**sibling** plan
-[docs/plans/skypilot-fleet-provisioner.md](plans/skypilot-fleet-provisioner.md);
-this guide is independent of it.
+This is the user-facing reference. Its plan (skypilot-agent-skill) and the
+sibling system-side fleet provisioner plan were removed on 2026-10-05; both
+are in git history. The fleet provisioner's code is frozen in
+`attic/cluster-mode/`; this guide is independent of it.
 
 ## What you get
 
@@ -23,7 +21,7 @@ this guide is independent of it.
 | ------------------- | ------------------------------------------------------ |
 | `sky` CLI           | All standard commands (launch/exec/status/down/etc.)   |
 | Cloud extras        | aws, gcp, azure, kubernetes, slurm, runpod, lambda     |
-| Agent Skill         | Pre-installed for the agents that support it           |
+| Agent Skill         | Not installed; agents drive the `sky` CLI directly     |
 | Credentials         | Read from $HOME/{.aws,.config/gcloud,.config/sky,...}  |
 | Cost path           | Your cloud account; devai never sees a bill            |
 
@@ -122,10 +120,10 @@ A 24-hour fine-tune on a single A100 is ~$30. A 24-hour H100 run
 that you forget to shut down is ~$120. **Use `sky cost-report`
 weekly** and set up budget alerts on each cloud account.
 
-## Plugin install per agent (if needed)
+## Plugin install per agent (optional)
 
-The plugin should be pre-installed by the lab image; if it's missing
-for your agent, install manually:
+The lab image does not install the SkyPilot Agent Skill plugin. To add
+it for your agent, install it yourself:
 
 - **Claude Code**:
   ```bash
@@ -167,15 +165,12 @@ into its own venv, `/opt/skypilot`, with only `sky` linked onto PATH.
 It is kept out of the lab's own Python because SkyPilot's version caps
 (click, websocket-client, protobuf, ...) would otherwise downgrade lab
 packages. To upgrade: edit the version in `requirements-skypilot.in`, run
-`make lab-lock`, then `make build-gpu` (or `make build-cpu`). Do not
+`make lab-lock`, then `make build-lab`. Do not
 `uv pip install --system skypilot` inside the lab: that puts the caps
 back into the lab's environment.
 
 ## References
 
-- Plan: [docs/plans/skypilot-agent-skill.md](plans/skypilot-agent-skill.md)
-- Sibling system-side plan:
-  [docs/plans/skypilot-fleet-provisioner.md](plans/skypilot-fleet-provisioner.md)
 - SkyPilot docs: docs.skypilot.co
 - SkyPilot GitHub: github.com/skypilot-org/skypilot
 - Agent Skill: blog.skypilot.co/agent-skill/

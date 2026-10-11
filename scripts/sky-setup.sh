@@ -19,7 +19,7 @@ if ! command -v sky >/dev/null 2>&1; then
     echo "       The lab image installs it into /opt/skypilot during build" >&2
     echo "       (requirements-skypilot.lock) and links /usr/local/bin/sky." >&2
     echo "       An image without it predates that step: rebuild with" >&2
-    echo "       'make build-gpu' (or build-cpu). Do not uv pip install it" >&2
+    echo "       'make build-lab'. Do not uv pip install it" >&2
     echo "       into the system Python; its version caps downgrade lab packages." >&2
     exit 1
 fi

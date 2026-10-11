@@ -1,0 +1,429 @@
+{
+ "_comment": "Hand-written expectations (by rule, not by running either reader). lookups: backend/model -> merged flags, env and image. keeps_previous: replacing the named file with one of these leaves every lookup as it was.",
+ "keeps_previous": {
+  "curated": [
+   "curated-array.json",
+   "curated-models-list.json",
+   "curated-models-string.json",
+   "curated-nan.json",
+   "curated-null.json",
+   "curated-string.json",
+   "curated-truncated.json"
+  ],
+  "generated": [
+   "generated-array.json",
+   "generated-models-list.json",
+   "generated-null.json",
+   "generated-truncated.json",
+   "generated-version-2.json",
+   "generated-version-bool.json",
+   "generated-version-exponent.json",
+   "generated-version-float.json",
+   "generated-version-key-case.json",
+   "generated-version-missing.json",
+   "generated-version-null.json",
+   "generated-version-string.json"
+  ]
+ },
+ "lookups": {
+  "sglang/BackendsEmpty": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "sglang/BackendsNull": {
+   "env": {},
+   "flags": [
+    "--backends-null"
+   ],
+   "image": ""
+  },
+  "sglang/BackendsNullElement": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "sglang/BackendsNumberElement": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "sglang/BackendsString": {
+   "env": {},
+   "flags": [
+    "--backends-string"
+   ],
+   "image": ""
+  },
+  "sglang/CaseKeys": {
+   "env": {},
+   "flags": [
+    "--lower"
+   ],
+   "image": ""
+  },
+  "sglang/EnvList": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "sglang/EnvNullValue": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "sglang/EnvNumberValue": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "sglang/Everywhere": {
+   "env": {},
+   "flags": [
+    "--trust-remote-code"
+   ],
+   "image": ""
+  },
+  "sglang/FlagsNullElement": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "sglang/FlagsNumberElement": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "sglang/FlagsObject": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "sglang/FlagsString": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "sglang/G": {
+   "env": {},
+   "flags": [
+    "--sglang-only"
+   ],
+   "image": ""
+  },
+  "sglang/ImageNull": {
+   "env": {},
+   "flags": [
+    "--image-null"
+   ],
+   "image": ""
+  },
+  "sglang/ImageNumber": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "sglang/M": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "sglang/NotAnObject": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "sglang/NullModel": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "sglang/NullsEverywhere": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "sglang/Other": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "sglang/WithImage": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "vllm-devai/BackendsEmpty": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "vllm-devai/BackendsNull": {
+   "env": {},
+   "flags": [
+    "--backends-null"
+   ],
+   "image": ""
+  },
+  "vllm-devai/BackendsNullElement": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "vllm-devai/BackendsNumberElement": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "vllm-devai/BackendsString": {
+   "env": {},
+   "flags": [
+    "--backends-string"
+   ],
+   "image": ""
+  },
+  "vllm-devai/CaseKeys": {
+   "env": {},
+   "flags": [
+    "--lower"
+   ],
+   "image": ""
+  },
+  "vllm-devai/EnvList": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "vllm-devai/EnvNullValue": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "vllm-devai/EnvNumberValue": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "vllm-devai/Everywhere": {
+   "env": {},
+   "flags": [
+    "--trust-remote-code"
+   ],
+   "image": ""
+  },
+  "vllm-devai/FlagsNullElement": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "vllm-devai/FlagsNumberElement": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "vllm-devai/FlagsObject": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "vllm-devai/FlagsString": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "vllm-devai/G": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "vllm-devai/ImageNull": {
+   "env": {},
+   "flags": [
+    "--image-null"
+   ],
+   "image": ""
+  },
+  "vllm-devai/ImageNumber": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "vllm-devai/M": {
+   "env": {
+    "A": "generated",
+    "B": "2"
+   },
+   "flags": [
+    "--language-model-only",
+    "--enforce-eager",
+    "--odd-source",
+    "--image-ignored",
+    "--case-flags",
+    "--devai-only"
+   ],
+   "image": ""
+  },
+  "vllm-devai/NotAnObject": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "vllm-devai/NullModel": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "vllm-devai/NullsEverywhere": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "vllm-devai/Other": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "vllm-devai/WithImage": {
+   "env": {},
+   "flags": [
+    "--with-image"
+   ],
+   "image": "img/custom:1"
+  },
+  "vllm/BackendsEmpty": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "vllm/BackendsNull": {
+   "env": {},
+   "flags": [
+    "--backends-null"
+   ],
+   "image": ""
+  },
+  "vllm/BackendsNullElement": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "vllm/BackendsNumberElement": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "vllm/BackendsString": {
+   "env": {},
+   "flags": [
+    "--backends-string"
+   ],
+   "image": ""
+  },
+  "vllm/CaseKeys": {
+   "env": {},
+   "flags": [
+    "--lower"
+   ],
+   "image": ""
+  },
+  "vllm/EnvList": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "vllm/EnvNullValue": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "vllm/EnvNumberValue": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "vllm/Everywhere": {
+   "env": {},
+   "flags": [
+    "--trust-remote-code"
+   ],
+   "image": ""
+  },
+  "vllm/FlagsNullElement": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "vllm/FlagsNumberElement": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "vllm/FlagsObject": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "vllm/FlagsString": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "vllm/G": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "vllm/ImageNull": {
+   "env": {},
+   "flags": [
+    "--image-null"
+   ],
+   "image": ""
+  },
+  "vllm/ImageNumber": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "vllm/M": {
+   "env": {
+    "A": "curated"
+   },
+   "flags": [
+    "--language-model-only",
+    "--enforce-eager",
+    "--odd-source",
+    "--image-ignored",
+    "--case-flags"
+   ],
+   "image": ""
+  },
+  "vllm/NotAnObject": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "vllm/NullModel": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "vllm/NullsEverywhere": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "vllm/Other": {
+   "env": {},
+   "flags": [],
+   "image": ""
+  },
+  "vllm/WithImage": {
+   "env": {},
+   "flags": [
+    "--with-image"
+   ],
+   "image": "img/custom:1"
+  }
+ }
+}

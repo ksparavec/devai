@@ -64,14 +64,29 @@ import re
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
-from vllm.entrypoints.openai.engine.protocol import (
-    DeltaFunctionCall,
-    DeltaMessage,
-    DeltaToolCall,
-    ExtractedToolCallInformation,
-    FunctionCall,
-    ToolCall,
-)
+# devai: vLLM 0.29 moved these classes to vllm.entrypoints.generate.base.
+# protocol and removed vllm.entrypoints.openai.engine.protocol (vllm#54492);
+# a plugin whose import fails is skipped, its parser never registers, and the
+# server refuses --tool-call-parser at startup. The new module first, the old
+# one as the fallback, so one file serves stock 0.22.1, 0.28.0 and 0.30.0.
+try:
+    from vllm.entrypoints.generate.base.protocol import (
+        DeltaFunctionCall,
+        DeltaMessage,
+        DeltaToolCall,
+        ExtractedToolCallInformation,
+        FunctionCall,
+        ToolCall,
+    )
+except ImportError:
+    from vllm.entrypoints.openai.engine.protocol import (
+        DeltaFunctionCall,
+        DeltaMessage,
+        DeltaToolCall,
+        ExtractedToolCallInformation,
+        FunctionCall,
+        ToolCall,
+    )
 from vllm.logger import init_logger
 from vllm.tool_parsers.abstract_tool_parser import (
     ToolParser,

@@ -234,7 +234,7 @@ Why each:
   `make cache-up` calls `podman compose` (subcommand), which
   `podman-compose` from Homebrew satisfies.
 - `mkcert` -- optional, only needed if the operator wants trusted local
-  TLS certs for Open WebUI.
+  TLS certs for JupyterLab.
 
 ### 3.3 Verification
 
@@ -488,7 +488,6 @@ Recommended `.env` values for macOS:
 
 ```ini
 LAB_PORT=8888
-WEBUI_PORT=8443
 CONTAINER_RUNTIME=podman
 HOST_HOME_DIR=$(HOME)
 HOME_VOLUME=$(HOME)/devai-home
@@ -536,10 +535,6 @@ services:
       # rejects requests on those ports cleanly.
       - VLLM_URL=http://127.0.0.1:1
       - SGLANG_URL=http://127.0.0.1:1
-
-  open-webui:
-    environment:
-      - OLLAMA_BASE_URL=http://router:11434
 EOF
 ```
 
@@ -557,7 +552,7 @@ which the macOS procedure never does.
 
 ---
 
-## 9. Phase 8 -- Build CPU lab + router images
+## 9. Phase 8 -- Build the lab + router images
 
 ### 9.1 Apple Silicon `arm64` build caveat
 
@@ -594,18 +589,26 @@ The agent must apply exactly one workaround. Default to A.
 $ cd ${REPO_DIR}
 $ make pull-images       # populates podman machine VM image store
 $ make fetch-cli         # downloads CLI tarballs to /var/cache/devai/pip/bin (VM-side)
-$ make build-cpu build-router
+$ make build-lab build-router
 ```
 
-**Do NOT run `make build-gpu` or `make build`.** Both target
-`devai-lab-gpu` and `devai-base-gpu`, which pull
-`docker.io/nvidia/cuda:*` -- that image has no arm64 manifest and is
-useless without an NVIDIA GPU anyway.
+There is one lab image since platform-rebuild Phase 3 (M14): `devai-lab`
+on `devai-base`, both on the pinned `debian:trixie-slim`, built natively
+for arm64 in the podman machine VM. It carries the CUDA torch and runs on
+the CPU here: the VM has no NVIDIA GPU, so the host check
+(`scripts/host-gpu.sh`) prints nothing and no device is attached.
+
+**Not yet verified on a Mac.** The arm64 build of the one image has not
+been run (2026-10-10). Known obstacles besides section 9.1's uv fetch: the
+aiagent and dstui installers that `make fetch-cli` pre-fetches are
+x86_64-only, and the Python hash locks (`make lab-lock`,
+`make laya-trainer-lock`) are resolved for `x86_64-manylinux_2_28`; regenerate
+them for aarch64 if the build reports missing hashes.
 
 ### 9.3 Verification
 
 ```bash
-[verify] $ podman images --format '{{.Repository}}:{{.Tag}}' | grep -E '^(devai-(base-cpu|lab-cpu)|localhost/devai-router):latest$'
+[verify] $ podman images --format '{{.Repository}}:{{.Tag}}' | grep -E '^localhost/devai-(base|lab|router):latest$'
 ```
 
 Expected: three entries.
@@ -626,10 +629,9 @@ $ podman compose \
 
 This brings up:
 
-- `devai-apt-cache`, `devai-registry-cache` -- build accelerators (kept).
+- `devai-apt-cache` -- build accelerator (kept).
 - `devai-router` -- protocol bridge + reasoning policy + tool stripping.
   Pointed at host Ollama.
-- `devai-open-webui`, `devai-webui-proxy` -- chat UI.
 - `devai-logger` -- per-container stdout sink.
 
 NOT brought up: `devai-ollama`, `devai-vllm`, `devai-sglang`. That is
@@ -641,10 +643,9 @@ correct -- host-native Ollama is doing the inference.
 [verify] $ podman ps --format '{{.Names}}\t{{.Status}}' | grep -E '^devai-' | sort
 [verify] $ podman ps --format '{{.Names}}' | grep -E '^devai-(ollama|vllm|sglang)$' && echo SHOULD_BE_EMPTY || true
 [verify] $ curl -fsS http://localhost:11434/v1/models       # router -> host ollama
-[verify] $ curl -k -fsS https://localhost:8443/             # webui-proxy
 ```
 
-The first command should list six services. The second must print
+The first command should list four services. The second must print
 nothing. The third proves the router talks to host Ollama through
 `host.containers.internal`.
 
@@ -654,7 +655,6 @@ nothing. The third proves the router talks to host Ollama through
 |---|---|
 | `curl http://localhost:11434/v1/models` returns connection refused | Router is not reaching host Ollama. From inside the VM: `podman machine ssh ${VM_NAME} 'curl -v http://host.containers.internal:11434/api/tags'`. If that fails, re-check section 6.1 (`OLLAMA_HOST=0.0.0.0:11434`). |
 | Router container restarts repeatedly | `podman logs devai-router`. Most common: `OLLAMA_URL` resolved at compose time picked up the wrong value -- confirm by inspecting `podman inspect devai-router | jq '.[].Config.Env'`. |
-| Open WebUI shows "no models" | Open WebUI caches the model list; click the refresh button in the model dropdown after Phase 10 pulls a model. |
 
 ---
 
@@ -722,7 +722,7 @@ before invoking `devai-agent`.
 ```
 
 `--show` prints the resolved `podman run` invocation without launching
-anything. It must reference `devai-lab-cpu` (NOT `-gpu`).
+anything. It must reference `devai-lab` and carry no `--device`.
 
 ---
 
@@ -732,7 +732,6 @@ anything. It must reference `devai-lab-cpu` (NOT `-gpu`).
 [verify] $ curl -fsS http://localhost:11434/api/chat \
               -H 'content-type: application/json' \
               -d '{"model":"qwen3.5:9b-q8_0","messages":[{"role":"user","content":"reply with the single word PONG"}],"stream":false}'
-[verify] $ curl -k -fsS https://localhost:8443/ -o /dev/null && echo webui_up
 $ devai-agent
 ```
 
@@ -861,16 +860,14 @@ podman machine VM (${VM_NAME})
 |   +-- apt/, npm/, pip/, registry/, logs/
 |   +-- (NO ollama/ -- host-side instead)
 +-- containers:
-    devai-apt-cache, devai-registry-cache,
+    devai-apt-cache,
     devai-router (-> host Ollama),
-    devai-open-webui, devai-webui-proxy,
     devai-logger
 ```
 
 Network flow:
 
 ```
-Browser (8443)  ->  devai-webui-proxy  ->  devai-open-webui  ->  devai-router
 Agent (lab)     ->  devai-router (in VM)  ->  host.containers.internal:11434
                                             ->  macOS host: ollama serve (Metal, UMA)
 ```

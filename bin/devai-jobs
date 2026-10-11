@@ -1,0 +1,19 @@
+#!/bin/bash
+# devai-jobs on the host (docs/slurm.md Sec. 9; platform-rebuild I13).
+#
+# devai-jobs runs inside devai-slurm and devai-operator, never on the host:
+# neither slurmrestd nor NATS is published to the host, and the JWT key is
+# never read here. This wrapper runs it in devai-slurm. From Phase 10 on,
+# `submit`, `suspend`, `interrupt` and `service` run in devai-operator
+# instead (podman exec devai-operator devai-jobs ...), the only container
+# that mounts the action registry and holds the operator's bus credentials;
+# every other command stays in devai-slurm.
+#
+# Installed by `make install` (a symlink into ~/.local/bin).
+set -euo pipefail
+runtime=${CONTAINER_RUNTIME:-podman}
+if ! "$runtime" container inspect devai-slurm >/dev/null 2>&1; then
+    echo "devai-jobs: devai-slurm is not running -- make slurm-up" >&2
+    exit 1
+fi
+exec "$runtime" exec devai-slurm devai-jobs "$@"

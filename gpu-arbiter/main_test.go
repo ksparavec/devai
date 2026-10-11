@@ -1665,9 +1665,10 @@ func TestBuildContainerSpecImageOverride(t *testing.T) {
 	}
 }
 
-// TestBuildContainerSpecGPUDevice locks the GPU-vendor overlay contract
-// (docs/gpu-vendors.md): DEVAI_GPU_DEVICE overrides the CDI device string,
-// defaulting to NVIDIA's when unset so an nvidia-only host needs no config.
+// TestBuildContainerSpecGPUDevice locks the CDI device contract:
+// DEVAI_GPU_DEVICE overrides the CDI device string, defaulting to NVIDIA's
+// when unset so a host needs no config. (Its AMD case went with the ROCm
+// overlay to attic/amd-rocm/ on 2026-10-07, platform-rebuild Phase 1.)
 func TestBuildContainerSpecGPUDevice(t *testing.T) {
 	cfg := backendConfig{
 		Name:          "vllm",
@@ -1690,11 +1691,11 @@ func TestBuildContainerSpecGPUDevice(t *testing.T) {
 	})
 
 	t.Run("DEVAI_GPU_DEVICE overrides", func(t *testing.T) {
-		t.Setenv("DEVAI_GPU_DEVICE", "amd.com/gpu=all")
+		t.Setenv("DEVAI_GPU_DEVICE", "nvidia.com/gpu=0")
 		spec := buildContainerSpec(cfg, "m", launchConfig{}, nil, nil)
 		devices := spec["devices"].([]map[string]any)
-		if got := devices[0]["path"]; got != "amd.com/gpu=all" {
-			t.Errorf("devices[0][path] = %v, want amd.com/gpu=all", got)
+		if got := devices[0]["path"]; got != "nvidia.com/gpu=0" {
+			t.Errorf("devices[0][path] = %v, want nvidia.com/gpu=0", got)
 		}
 	})
 }
@@ -1751,5 +1752,42 @@ func TestBuildContainerSpec_HFEnginesPersistTheirCaches(t *testing.T) {
 	}
 	if v := buildContainerSpec(ollama, "m", launchConfig{}, nil, nil)["volumes"]; v != nil && len(v.([]map[string]any)) != 0 {
 		t.Errorf("ollama must get no engine-cache volumes, got %v", v)
+	}
+}
+
+func TestBuildContainerSpec_VLLMDevaiLaunchesWithoutRuntimeCubins(t *testing.T) {
+	// Plan 4v: every vllm-devai launch runs with FlashInfer's run-time
+	// cubin downloads disabled, as the probers launch it and as Phase 4d's
+	// launcher will serve. A model's recovery env cannot turn it back on;
+	// the stock vllm and sglang backends do not get it.
+	spec := func(backend string, recoveryEnv map[string]string) map[string]any {
+		cfg := backendConfig{
+			Name: backend, ContainerName: "devai-" + backend, Image: "img",
+			ModelsDir:  "/var/cache/devai/vllm",
+			EnvVars:    map[string]string{"VLLM_NO_USAGE_STATS": "1"},
+			Entrypoint: func(string, launchConfig) []string { return []string{"x"} },
+		}
+		return buildContainerSpec(cfg, "m", launchConfig{MaxContext: 32768}, nil, recoveryEnv)
+	}
+	for _, recovery := range []map[string]string{
+		nil,
+		{"FLASHINFER_CUBINS_REPOSITORY": "https://edge.urm.nvidia.com/artifactory/", "X": "1"},
+	} {
+		env, _ := spec("vllm-devai", recovery)["env"].(map[string]string)
+		if got := env["FLASHINFER_CUBINS_REPOSITORY"]; got != "file:///nonexistent/" {
+			t.Errorf("vllm-devai (recovery %v): FLASHINFER_CUBINS_REPOSITORY=%q, want file:///nonexistent/", recovery, got)
+		}
+		if env["VLLM_NO_USAGE_STATS"] != "1" {
+			t.Errorf("vllm-devai: the backend env was lost: %v", env)
+		}
+		if recovery != nil && env["X"] != "1" {
+			t.Errorf("vllm-devai: the rest of the recovery env was lost: %v", env)
+		}
+	}
+	for _, backend := range []string{"vllm", "sglang", "ollama"} {
+		env, _ := spec(backend, nil)["env"].(map[string]string)
+		if v, ok := env["FLASHINFER_CUBINS_REPOSITORY"]; ok {
+			t.Errorf("%s: FLASHINFER_CUBINS_REPOSITORY=%q is scoped to vllm-devai only", backend, v)
+		}
 	}
 }

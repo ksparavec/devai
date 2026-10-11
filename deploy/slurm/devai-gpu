@@ -1,0 +1,902 @@
+#!/usr/bin/env python3
+"""devai-gpu -- the GPU guard's eyes and hands in devai-slurm.
+
+Reads the card through NVML with ctypes (I3: `nvidia-smi` on this driver
+does not expose the energy counter; python3-minimal lacks ctypes, so the
+image installs Debian's python3). Follows the pattern of
+scripts/vram-ballast.py: the driver's own library, nothing else.
+
+Commands
+  present                    exit 0 when a GPU is readable through NVML, 1 when not
+  processes [--json]         compute processes: "<pid> <used MiB>" per line
+  used                       used memory in MiB
+  energy                     the energy counter in J (NVML reports mJ)
+  sample --interval S --out F --pidfile P
+                             one JSON line [t, used_mib, util_pct] per sample,
+                             flushed per line; exits 0 on SIGTERM
+  guard  --job J             the prolog's guard (docs/slurm.md Sec. 6, steps 1-5)
+  epilog --job J             the epilog's work for a job (Sec. 6)
+  health                     the health check: resume a node the guard or a
+                             failed epilog drained, once the card is idle (I7)
+
+Environment
+  DEVAI_GPU_FAKE     a JSON file standing in for NVML (tests):
+                     {"present": true, "used_mib": N, "util_pct": N,
+                      "energy_mj": N, "processes": [{"pid": P, "used_mib": M}]};
+                     re-read at every call, so a test can change it
+  DEVAI_GPU_PROC     the /proc to read (tests); default /proc
+  DEVAI_JOBS_DIR     default /var/cache/devai/jobs
+  DEVAI_SAMPLER_DIR  default /run/devai/sampler
+  DEVAI_TEST_EPILOG_CONF  default /run/devai/test/epilog.conf (Phase 5's
+                     epilog test switch; only tests/slurm/test-slurm.sh writes it)
+  DEVAI_BUS_BIN      default devai-bus
+  DEVAI_GUARD_ENGINE_SERVICES  the engine services whose state the guard
+                     reads (default "ollama vllm sglang vllm-s1 fake")
+"""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+IDLE_MAX_MIB = 512            # the prolog's idle rule (Sec. 6, step 1)
+IDLE_WAIT_S = 10              # step 1
+UNLOAD_WAIT_S = 60            # step 2
+TERM_GRACE_S = 5              # step 3
+STOP_GRACE_S = 5              # a stale prober: stop with TERM, 5 s grace
+OVERFLOW_UID = 65534          # a uid this user namespace cannot map
+EPILOG_UNLOAD_TIMEOUT_S = 60  # C3: the epilog waits up to 60 s
+SLEEPER_SLACK_MIB = 256
+
+GPU_KINDS = ("engine", "trainer", "probe")
+ACTIVE_STATUSES = ("loading", "serving", "waking", "unloading")
+DEFAULT_ENGINE_SERVICES = "ollama vllm sglang vllm-s1 fake"
+
+# ---------------------------------------------------------------------------
+# NVML
+
+
+class NVMLError(Exception):
+    pass
+
+
+class _Memory(ctypes.Structure):
+    _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong),
+                ("used", ctypes.c_ulonglong)]
+
+
+class _Util(ctypes.Structure):
+    _fields_ = [("gpu", ctypes.c_uint), ("memory", ctypes.c_uint)]
+
+
+class _ProcInfo(ctypes.Structure):
+    # nvmlProcessInfo_v2_t, which nvmlDeviceGetComputeRunningProcesses_v3 fills
+    _fields_ = [("pid", ctypes.c_uint), ("usedGpuMemory", ctypes.c_ulonglong),
+                ("gpuInstanceId", ctypes.c_uint), ("computeInstanceId", ctypes.c_uint)]
+
+
+_NVML_NOT_AVAILABLE = 0xFFFFFFFFFFFFFFFF
+_NVML_ERROR_INSUFFICIENT_SIZE = 7
+_MIB = 1024 * 1024
+
+
+class NVML:
+    """Device 0 through libnvidia-ml.so.1 (single-GPU host, as vram-ballast)."""
+
+    def __init__(self, device_index: int = 0):
+        try:
+            self.lib = ctypes.CDLL("libnvidia-ml.so.1")
+        except OSError as e:
+            raise NVMLError(f"no NVML: {e}") from e
+        self._ck(self.lib.nvmlInit_v2(), "nvmlInit_v2")
+        self.dev = ctypes.c_void_p()
+        self._ck(self.lib.nvmlDeviceGetHandleByIndex_v2(device_index, ctypes.byref(self.dev)),
+                 f"nvmlDeviceGetHandleByIndex_v2({device_index})")
+        self.device = str(device_index)
+
+    @staticmethod
+    def _ck(rc: int, what: str) -> None:
+        if rc != 0:
+            raise NVMLError(f"{what} failed with NVML error {rc}")
+
+    def present(self) -> bool:
+        return True
+
+    def used_mib(self) -> int:
+        m = _Memory()
+        self._ck(self.lib.nvmlDeviceGetMemoryInfo(self.dev, ctypes.byref(m)), "nvmlDeviceGetMemoryInfo")
+        return int(m.used // _MIB)
+
+    def util_pct(self) -> int:
+        u = _Util()
+        self._ck(self.lib.nvmlDeviceGetUtilizationRates(self.dev, ctypes.byref(u)),
+                 "nvmlDeviceGetUtilizationRates")
+        return int(u.gpu)
+
+    def energy_mj(self) -> int:
+        e = ctypes.c_ulonglong()
+        self._ck(self.lib.nvmlDeviceGetTotalEnergyConsumption(self.dev, ctypes.byref(e)),
+                 "nvmlDeviceGetTotalEnergyConsumption")
+        return int(e.value)
+
+    def processes(self) -> list[dict]:
+        fn = self.lib.nvmlDeviceGetComputeRunningProcesses_v3
+        count = ctypes.c_uint(0)
+        rc = fn(self.dev, ctypes.byref(count), None)
+        if rc == 0 and count.value == 0:
+            return []
+        if rc not in (0, _NVML_ERROR_INSUFFICIENT_SIZE):
+            self._ck(rc, "nvmlDeviceGetComputeRunningProcesses_v3")
+        n = count.value + 8
+        arr = (_ProcInfo * n)()
+        count = ctypes.c_uint(n)
+        self._ck(fn(self.dev, ctypes.byref(count), arr), "nvmlDeviceGetComputeRunningProcesses_v3")
+        out = []
+        for i in range(count.value):
+            used = arr[i].usedGpuMemory
+            out.append({"pid": int(arr[i].pid),
+                        "used_mib": None if used == _NVML_NOT_AVAILABLE else int(used // _MIB)})
+        return out
+
+
+class FakeNVML:
+    """DEVAI_GPU_FAKE: a JSON file, re-read at every call."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self.device = "fake"
+
+    def _d(self) -> dict:
+        try:
+            return json.loads(Path(self.path).read_text())
+        except (OSError, ValueError) as e:
+            raise NVMLError(f"fake NVML {self.path}: {e}") from e
+
+    def present(self) -> bool:
+        return bool(self._d().get("present", True))
+
+    def used_mib(self) -> int:
+        return int(self._d().get("used_mib", 0))
+
+    def util_pct(self) -> int:
+        return int(self._d().get("util_pct", 0))
+
+    def energy_mj(self) -> int:
+        return int(self._d().get("energy_mj", 0))
+
+    def processes(self) -> list[dict]:
+        return [{"pid": int(p["pid"]), "used_mib": p.get("used_mib")}
+                for p in self._d().get("processes", [])]
+
+
+def open_nvml():
+    """The card, or None on a host without one (the guard is skipped then)."""
+    fake = os.environ.get("DEVAI_GPU_FAKE")
+    try:
+        g = FakeNVML(fake) if fake else NVML()
+        return g if g.present() else None
+    except NVMLError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# /proc
+
+
+class Proc:
+    def __init__(self, root: str | None = None):
+        self.root = Path(root or os.environ.get("DEVAI_GPU_PROC", "/proc"))
+
+    def _read(self, pid: int, name: str) -> bytes | None:
+        try:
+            return (self.root / str(pid) / name).read_bytes()
+        except OSError:
+            return None
+
+    def exists(self, pid: int) -> bool:
+        return (self.root / str(pid)).exists()
+
+    def cmdline(self, pid: int) -> list[str]:
+        b = self._read(pid, "cmdline")
+        if not b:
+            return []
+        return [a.decode(errors="replace") for a in b.rstrip(b"\0").split(b"\0")]
+
+    def environ(self, pid: int) -> dict[str, str]:
+        b = self._read(pid, "environ")
+        env = {}
+        for kv in (b or b"").split(b"\0"):
+            if b"=" in kv:
+                k, v = kv.split(b"=", 1)
+                env[k.decode(errors="replace")] = v.decode(errors="replace")
+        return env
+
+    def uid(self, pid: int) -> int | None:
+        b = self._read(pid, "status")
+        for line in (b or b"").decode(errors="replace").splitlines():
+            if line.startswith("Uid:"):
+                return int(line.split()[1])
+        return None
+
+    def cgroup_key(self, pid: int) -> str | None:
+        """The container a process runs in: its libpod-<id>.scope segment
+        (I26), or the whole cgroup line when it has none."""
+        b = self._read(pid, "cgroup")
+        if b is None:
+            return None
+        text = b.decode(errors="replace").strip()
+        m = re.search(r"libpod-([0-9a-f]{12,64})\.scope", text)
+        return "libpod-" + m.group(1) if m else text
+
+    def pids(self) -> list[int]:
+        try:
+            return sorted(int(p.name) for p in self.root.iterdir() if p.name.isdigit())
+        except OSError:
+            return []
+
+    def controls(self) -> dict[str, list[str]]:
+        """cgroup key -> the containers whose devai-control runs in it. A
+        devai-control is found by its command line, which names its
+        container (`devai-control --container <name> ...`, C7)."""
+        found: dict[str, list[str]] = {}
+        for pid in self.pids():
+            argv = self.cmdline(pid)
+            if not argv or os.path.basename(argv[0]) != "devai-control":
+                continue
+            name = None
+            for i, a in enumerate(argv):
+                if a == "--container" and i + 1 < len(argv):
+                    name = argv[i + 1]
+                elif a.startswith("--container="):
+                    name = a.split("=", 1)[1]
+            key = self.cgroup_key(pid)
+            if name and key:
+                found.setdefault(key, []).append(name)
+        return found
+
+
+# ---------------------------------------------------------------------------
+# The bus, through devai-bus (one Go client; C8's rule)
+
+
+class BusError(Exception):
+    pass
+
+
+class Bus:
+    def __init__(self, job: int):
+        self.job = job
+        self.bin = os.environ.get("DEVAI_BUS_BIN", "devai-bus")
+
+    def request(self, subject: str, body: dict, timeout_s: int) -> dict | None:
+        """The reply, or None when nothing answered (no service, no bus)."""
+        try:
+            p = subprocess.run([self.bin, "request", subject, json.dumps(body), "--job", str(self.job),
+                                "--timeout", f"{timeout_s}s"],
+                               capture_output=True, text=True, timeout=timeout_s + 15)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            log(f"bus request {subject}: {e}")
+            return None
+        try:
+            return json.loads(p.stdout) if p.stdout.strip() else None
+        except ValueError:
+            log(f"bus request {subject}: unreadable reply {p.stdout[:200]!r}")
+            return None
+
+    def publish(self, subject: str, body: dict) -> None:
+        try:
+            subprocess.run([self.bin, "publish", subject, json.dumps(body)],
+                           capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            log(f"bus publish {subject}: {e}")
+
+
+def log(msg: str) -> None:
+    print(f"devai-gpu: {msg}", file=sys.stderr, flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Jobs
+
+
+@dataclass
+class JobInfo:
+    job: int
+    kind: str = ""
+    backend: str = ""
+    gpu: bool = False
+    licenses: str = ""
+    comment: dict = field(default_factory=dict)
+
+    @property
+    def gpu_job(self) -> bool:
+        """engine, trainer, probe and GPU-action jobs: those that hold the
+        engine license (C3, C8)."""
+        lic = {x.split(":")[0].strip() for x in self.licenses.split(",") if x.strip()}
+        if "engine" in lic:
+            return True
+        return self.kind in GPU_KINDS or (self.kind == "action" and self.gpu)
+
+    @property
+    def wants_empty_card(self) -> bool:
+        """probe and GPU-action jobs, and vllm-s1 engine jobs, unload a
+        sleeper instead of tolerating it (Sec. 6, step 1)."""
+        return self.kind == "probe" or (self.kind == "action" and self.gpu) or \
+            (self.kind == "engine" and self.backend == "vllm-s1")
+
+
+def parse_comment(text: str) -> dict:
+    try:
+        d = json.loads(text) if text else {}
+        return d if isinstance(d, dict) else {}
+    except ValueError:
+        return {}
+
+
+def job_info(job: int) -> JobInfo:
+    """The job's kind, backend and licenses: from slurmd's environment when
+    it carries them, otherwise from `scontrol show job --json`."""
+    comment = os.environ.get("SLURM_JOB_COMMENT")
+    licenses = os.environ.get("SLURM_JOB_LICENSES")
+    if comment is None or licenses is None:
+        try:
+            p = subprocess.run(["scontrol", "show", "job", str(job), "--json"],
+                               capture_output=True, text=True, timeout=30)
+            jobs = json.loads(p.stdout).get("jobs", []) if p.returncode == 0 else []
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            jobs = []
+        if jobs:
+            comment = comment if comment is not None else jobs[0].get("comment", "")
+            licenses = licenses if licenses is not None else jobs[0].get("licenses", "")
+    c = parse_comment(comment or "")
+    return JobInfo(job=job, kind=str(c.get("kind", "")), backend=str(c.get("backend", "")),
+                   gpu=bool(c.get("gpu", False)), licenses=licenses or "", comment=c)
+
+
+# ---------------------------------------------------------------------------
+# The guard
+
+
+def engine_services() -> list[str]:
+    return os.environ.get("DEVAI_GUARD_ENGINE_SERVICES", DEFAULT_ENGINE_SERVICES).split()
+
+
+class Guard:
+    def __init__(self, nvml, proc: Proc, bus: Bus, job: JobInfo,
+                 kill=os.kill, sleep=time.sleep, clock=time.monotonic):
+        self.nvml = nvml
+        self.proc = proc
+        self.bus = bus
+        self.job = job
+        self.kill = kill
+        self.sleep = sleep
+        self.clock = clock
+        self.holders: list[dict] = []
+
+    # -- engine states and sleepers
+
+    def engine_states(self) -> dict[str, dict]:
+        states = {}
+        for svc in engine_services():
+            r = self.bus.request(f"devai.engines.{svc}.state", {}, 5)
+            if r and r.get("ok") and isinstance(r.get("state"), dict):
+                states[svc] = r["state"]
+        return states
+
+    @staticmethod
+    def sleeper_mib(states: dict[str, dict]) -> int:
+        return sum(int((s.get("sleeper") or {}).get("used_mib") or 0) for s in states.values())
+
+    def own_sleeper(self, states: dict[str, dict]) -> bool:
+        """A vllm-s1 engine job whose own launch sleeps: its load wakes it."""
+        if self.job.backend != "vllm-s1":
+            return False
+        sl = (states.get("vllm-s1") or {}).get("sleeper") or {}
+        return bool(sl) and json.dumps(sl.get("launch"), sort_keys=True) == \
+            json.dumps((self.job.comment or {}).get("launch"), sort_keys=True)
+
+    def is_idle(self, allowed_mib: int, engines_key: str | None) -> bool:
+        procs = self.nvml.processes()
+        if engines_key is not None:
+            procs = [p for p in procs if self.proc.cgroup_key(p["pid"]) != engines_key]
+        return not procs and self.nvml.used_mib() <= IDLE_MAX_MIB + allowed_mib
+
+    def wait_idle(self, seconds: float, allowed_mib: int, engines_key: str | None) -> bool:
+        end = self.clock() + seconds
+        while True:
+            if self.is_idle(allowed_mib, engines_key):
+                return True
+            if self.clock() >= end:
+                return False
+            self.sleep(1)
+
+    # -- step 2 and 3
+
+    def classify(self, pid: int, controls: dict[str, list[str]]) -> dict:
+        h = {"pid": pid, "uid": self.proc.uid(pid), "container": None, "devai_job_id": None,
+             "cmd": " ".join(self.proc.cmdline(pid))[:200]}
+        key = self.proc.cgroup_key(pid)
+        names = controls.get(key or "", [])
+        if len(names) > 1:
+            h["error"] = f"two devai-control processes in one cgroup: {', '.join(sorted(names))}"
+        elif names:
+            h["container"] = names[0]
+        jid = self.proc.environ(pid).get("DEVAI_JOB_ID", "")
+        if jid.isdigit():
+            h["devai_job_id"] = int(jid)
+        return h
+
+    def signalable(self, pid: int) -> bool:
+        """kill(pid, 0): a process of another host user (its uid unmapped
+        here, shown as 65534) refuses it; a mapped `nobody` does not."""
+        try:
+            self.kill(pid, 0)
+        except PermissionError:
+            return False
+        except ProcessLookupError:
+            return True
+        return True
+
+    def gone(self, pid: int) -> bool:
+        return not self.proc.exists(pid) or pid not in {p["pid"] for p in self.nvml.processes()}
+
+    def terminate(self, pid: int) -> str:
+        """SIGTERM, then SIGKILL after 5 s (step 3)."""
+        try:
+            self.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return "gone"
+        except PermissionError:
+            return "not_permitted"
+        end = self.clock() + TERM_GRACE_S
+        while self.clock() < end:
+            if self.gone(pid):
+                return "terminated"
+            self.sleep(0.5)
+        try:
+            self.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return "terminated"
+        except PermissionError:
+            return "not_permitted"
+        return "killed"
+
+    def run(self) -> tuple[int, dict]:
+        """Steps 1-4. Returns (exit code, verdict)."""
+        states = self.engine_states()
+        controls = self.proc.controls()
+        verdict = {"v": 1, "job": self.job.job, "kind": self.job.kind, "gpu": True,
+                   "used_mib_before": self.nvml.used_mib(), "holders": self.holders}
+        for names in controls.values():
+            if len(names) > 1:
+                verdict.update(verdict="busy", reason="configuration error: two devai-control "
+                               f"processes in one cgroup ({', '.join(sorted(names))})")
+                return 1, verdict
+        engines_keys = [k for k, v in controls.items() if v == ["engines"]]
+        engines_key = engines_keys[0] if engines_keys else None
+
+        # A sleeping model is tolerated (its used_mib, C1), except by a job
+        # that needs an empty card, which unloads it first (step 1).
+        if self.sleeper_mib(states) and self.job.wants_empty_card and not self.own_sleeper(states):
+            for svc, st in states.items():
+                if st.get("sleeper"):
+                    self.bus.request(f"devai.engines.{svc}.unload",
+                                     {"target": "sleeper", "force": True}, UNLOAD_WAIT_S + 10)
+            states = self.engine_states()
+        active = {svc: st for svc, st in states.items() if st.get("status") in ACTIVE_STATUSES}
+        allowed = self.sleeper_mib(states)
+        tolerate = engines_key if allowed else None
+
+        # Step 1: wait up to 10 s for an idle card. While an engine model is
+        # active, the engines' processes are holders, not a sleeper.
+        if not active and self.wait_idle(IDLE_WAIT_S, allowed, tolerate):
+            verdict.update(verdict="idle", used_mib_after=self.nvml.used_mib())
+            return 0, verdict
+
+        # Step 2: ask devai's services; step 3: terminate everything else.
+        for svc in active:
+            self.bus.request(f"devai.engines.{svc}.unload", {"force": True}, UNLOAD_WAIT_S + 10)
+        acted = set()
+        foreign_user = False
+        for p in self.nvml.processes():
+            h = self.classify(p["pid"], controls)
+            h["used_mib"] = p.get("used_mib")
+            if h["container"] == "engines" and not active and tolerate is not None:
+                continue  # the sleeper's own process
+            self.holders.append(h)
+            if h["uid"] == OVERFLOW_UID and not self.signalable(p["pid"]):
+                h["action"] = "foreign_user"
+                foreign_user = True
+            elif h["container"] == "engines":
+                h["action"] = "unload"
+            elif h["container"] == "laya-trainer":
+                if "laya-trainer" not in acted:
+                    self.bus.request("devai.laya-trainer.trainer.cancel",
+                                     {"force": True, "reason": "guard", "timeout_s": UNLOAD_WAIT_S},
+                                     UNLOAD_WAIT_S + 10)
+                    acted.add("laya-trainer")
+                h["action"] = "cancel"
+            elif h["devai_job_id"] is not None:
+                rj = h["devai_job_id"]
+                if ("run", rj) not in acted:
+                    self.bus.request("devai.operator.actions.stop",
+                                     {"force": True, "run_job": rj, "signal": "TERM",
+                                      "grace_s": STOP_GRACE_S}, 10)
+                    acted.add(("run", rj))
+                end = self.clock() + STOP_GRACE_S + 2
+                while self.clock() < end and not self.gone(p["pid"]):
+                    self.sleep(0.5)
+                h["action"] = "stop" if self.gone(p["pid"]) else "stop+" + self.terminate(p["pid"])
+            else:
+                h["action"] = self.terminate(p["pid"])
+
+        # Step 4: a holder of another host user, or a card still busy, fails
+        # the prolog: Slurm drains the node and holds the job.
+        if foreign_user:
+            verdict.update(verdict="busy", reason="a GPU holder belongs to another host user",
+                           used_mib_after=self.nvml.used_mib())
+            return 1, verdict
+        states = self.engine_states() if active else states
+        allowed = self.sleeper_mib(states)
+        tolerate = engines_key if allowed else None
+        if self.wait_idle(UNLOAD_WAIT_S, allowed, tolerate):
+            kinds = {h.get("action", "") for h in self.holders}
+            v = "unloaded" if kinds <= {"unload", "cancel", "stop"} else "killed"
+            verdict.update(verdict=v, used_mib_after=self.nvml.used_mib())
+            return 0, verdict
+        verdict.update(verdict="busy", reason="the card is still in use",
+                       used_mib_after=self.nvml.used_mib())
+        return 1, verdict
+
+
+# ---------------------------------------------------------------------------
+# Files
+
+
+def jobs_dir() -> Path:
+    return Path(os.environ.get("DEVAI_JOBS_DIR", "/var/cache/devai/jobs"))
+
+
+def sampler_dir() -> Path:
+    return Path(os.environ.get("DEVAI_SAMPLER_DIR", "/run/devai/sampler"))
+
+
+def results_dir(job: int) -> Path:
+    return jobs_dir() / "results" / str(job)
+
+
+def write_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=1) + "\n")
+    os.replace(tmp, path)
+
+
+def now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def epilog_switched_off() -> bool:
+    """Phase 5's epilog test switch: DEVAI_TEST_EPILOG=off in a test-only
+    file under /run/devai/test, which only test-slurm.sh writes."""
+    path = Path(os.environ.get("DEVAI_TEST_EPILOG_CONF", "/run/devai/test/epilog.conf"))
+    try:
+        for line in path.read_text().splitlines():
+            if line.strip() == "DEVAI_TEST_EPILOG=off":
+                return True
+    except OSError:
+        pass
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Commands
+
+
+def cmd_sample(a) -> int:
+    nvml = open_nvml()
+    if nvml is None:
+        log("sample: no GPU")
+        return 1
+    Path(a.pidfile).parent.mkdir(parents=True, exist_ok=True)
+    Path(a.pidfile).write_text(f"{os.getpid()}\n")
+    stop = {"now": False}
+
+    def on_term(*_):
+        stop["now"] = True
+    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGINT, on_term)
+    with open(a.out, "a", buffering=1) as f:
+        while not stop["now"]:
+            try:
+                row = [round(time.time(), 3), nvml.used_mib(), nvml.util_pct()]
+                f.write(json.dumps(row) + "\n")
+                f.flush()
+            except NVMLError as e:
+                log(f"sample: {e}")
+            end = time.monotonic() + a.interval
+            while not stop["now"] and time.monotonic() < end:
+                time.sleep(min(0.2, a.interval))
+    return 0
+
+
+def start_sampler(job: int) -> None:
+    """Step 5: detached from the prolog -- its own session, no descriptor of
+    the prolog's -- so the prolog returns at once and the sampler outlives
+    it. The prolog waits (at most 5 s) for its pid file, so the epilog
+    always finds one unless the sampler died."""
+    d = sampler_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    pidfile = d / f"{job}.pid"
+    exe = os.environ.get("DEVAI_GPU_BIN", "devai-gpu")
+    subprocess.Popen(["setsid", "-f", exe, "sample", "--interval", os.environ.get("DEVAI_GPU_SAMPLE_INTERVAL", "5"),
+                      "--out", str(d / f"{job}.jsonl"), "--pidfile", str(pidfile)],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     close_fds=True).wait()
+    end = time.monotonic() + 5
+    while time.monotonic() < end and not pidfile.exists():
+        time.sleep(0.05)
+    if not pidfile.exists():
+        log(f"guard: job {job}: the sampler did not start")
+
+
+def cmd_guard(a) -> int:
+    job = job_info(a.job)
+    if not job.gpu_job:
+        return 0
+    bus = Bus(a.job)
+    nvml = open_nvml()
+    if nvml is None:
+        verdict = {"v": 1, "job": a.job, "kind": job.kind, "gpu": False, "verdict": "idle",
+                   "holders": [], "at": now_iso()}
+        write_json(results_dir(a.job) / "guard.json", verdict)
+        bus.publish("devai.events.slurm.guard", verdict)
+        return 0
+    rc, verdict = Guard(nvml, Proc(), bus, job).run()
+    verdict["at"] = now_iso()
+    write_json(results_dir(a.job) / "guard.json", verdict)
+    bus.publish("devai.events.slurm.guard", verdict)
+    if rc != 0:
+        log(f"guard: job {a.job}: {verdict.get('reason', 'busy')}")
+        return rc
+    try:
+        (sampler_dir()).mkdir(parents=True, exist_ok=True)
+        (sampler_dir() / f"{a.job}.energy").write_text(f"{nvml.energy_mj()}\n")
+    except (OSError, NVMLError) as e:
+        log(f"guard: energy: {e}")
+    start_sampler(a.job)
+    return 0
+
+
+def stop_sampler(job: int, proc: Proc) -> bool:
+    """SIGTERM to the sampler of this job; False when it was lost."""
+    pidfile = sampler_dir() / f"{job}.pid"
+    try:
+        pid = int(pidfile.read_text().strip())
+    except (OSError, ValueError):
+        return False
+    argv = proc.cmdline(pid)
+    mine = any(os.path.basename(x) == "devai-gpu" for x in argv) and "sample" in argv and \
+        any(x.endswith(f"/{job}.jsonl") for x in argv)
+    if not mine:
+        return False
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return False
+    end = time.monotonic() + 5
+    while time.monotonic() < end and proc.exists(pid):
+        st = (proc.root / str(pid) / "stat")
+        try:
+            if st.read_text().split(") ", 1)[1].startswith("Z"):
+                break
+        except (OSError, IndexError):
+            break
+        time.sleep(0.1)
+    return True
+
+
+def gpu_summary(job: int, lost: bool) -> dict:
+    d = sampler_dir()
+    samples = []
+    try:
+        for line in (d / f"{job}.jsonl").read_text().splitlines():
+            try:
+                row = json.loads(line)
+                if isinstance(row, list) and len(row) == 3:
+                    samples.append(row)
+            except ValueError:
+                pass
+    except OSError:
+        pass
+    out = {"v": 1, "job": job, "device": os.environ.get("DEVAI_GPU_DEVICE_NAME", "0"), "interval_s": 5,
+           "started_at": samples[0][0] if samples else None,
+           "ended_at": samples[-1][0] if samples else None,
+           "samples": samples,
+           "peak_mib": max((s[1] for s in samples), default=None),
+           "mean_mib": round(sum(s[1] for s in samples) / len(samples), 1) if samples else None,
+           "mean_util_pct": round(sum(s[2] for s in samples) / len(samples), 1) if samples else None,
+           "energy_j": None}
+    if lost:
+        out["sampler_lost"] = True
+    return out
+
+
+def epilog_end_service(job: JobInfo, bus: Bus) -> None:
+    """End the job's service as its script would (Sec. 6): `unload` for an
+    engine or probe job's engine unless the job ended with `sleep`, `cancel`
+    for a trainer job's run (a no-op once it has ended)."""
+    if job.kind in ("engine", "probe") and job.backend:
+        svc = f"devai.engines.{job.backend}"
+        st = bus.request(f"{svc}.state", {}, 10)
+        state = (st or {}).get("state") or {}
+        if state.get("status") == "sleeping" and state.get("job") == job.job:
+            return
+        if job.kind == "engine" and ((state.get("sleeper") or {}).get("job")) == job.job:
+            return
+        bus.request(f"{svc}.unload", {"timeout_s": EPILOG_UNLOAD_TIMEOUT_S}, EPILOG_UNLOAD_TIMEOUT_S + 10)
+    elif job.kind == "trainer":
+        bus.request("devai.laya-trainer.trainer.cancel", {"reason": "epilog", "timeout_s": EPILOG_UNLOAD_TIMEOUT_S},
+                    EPILOG_UNLOAD_TIMEOUT_S + 10)
+
+
+def stop_run_and_wait(job: JobInfo, bus: Bus) -> None:
+    st = bus.request("devai.operator.actions.state", {}, 10)
+    run = ((st or {}).get("state") or {}).get("run") or {}
+    if run.get("status") != "running":
+        return
+    bus.request("devai.operator.actions.stop", {"signal": "TERM", "grace_s": 30}, 10)
+    end = time.monotonic() + 45
+    while time.monotonic() < end:
+        time.sleep(1)
+        st = bus.request("devai.operator.actions.state", {}, 10)
+        run = ((st or {}).get("state") or {}).get("run") or {}
+        if run.get("status") != "running":
+            return
+
+
+def cmd_epilog(a) -> int:
+    job = job_info(a.job)
+    if not job.gpu_job:
+        return 0  # bench and other action jobs leave the card and the engines alone
+    bus = Bus(a.job)
+    nvml = open_nvml()
+    proc = Proc()
+    off = epilog_switched_off()
+    action_job = job.kind == "probe" or (job.kind == "action" and job.gpu)
+    if action_job and not off:
+        stop_run_and_wait(job, bus)  # a probe or GPU-action job's action first
+    if nvml is not None:
+        found = stop_sampler(a.job, proc)
+        s = gpu_summary(a.job, lost=not found)
+        try:
+            e0 = int((sampler_dir() / f"{a.job}.energy").read_text().strip())
+            s["energy_j"] = round((nvml.energy_mj() - e0) / 1000.0, 1)
+        except (OSError, ValueError, NVMLError):
+            pass
+        write_json(results_dir(a.job) / "gpu.json", s)
+        for suffix in ("jsonl", "pid", "energy"):
+            try:
+                (sampler_dir() / f"{a.job}.{suffix}").unlink()
+            except OSError:
+                pass
+        # gpu.json is the record. C4 also had the epilog put the summary into
+        # the job's AdminComment; Slurm 24.11.5 refuses that from the epilog
+        # of a completing job ("Job has already finished for job <id>",
+        # measured 2026-10-07), so Phase 13 reads gpu.json (Phase 5 risks).
+        if off:
+            return 0  # the test switch: gpu.json only, no unload, cancel or stop
+    elif off:
+        return 0
+    epilog_end_service(job, bus)
+    if nvml is None:
+        return 0  # without a GPU the epilog only sends the unload or cancel
+    g = Guard(nvml, proc, bus, job)
+    states = g.engine_states()
+    keys = [k for k, v in proc.controls().items() if v == ["engines"]]
+    tolerate = keys[0] if keys and g.sleeper_mib(states) else None
+    if g.wait_idle(IDLE_WAIT_S, g.sleeper_mib(states), tolerate):
+        return 0
+    log(f"epilog: job {a.job}: the card is not idle after the job; the node drains")
+    return 1
+
+
+def node_state() -> tuple[list[str], str]:
+    try:
+        p = subprocess.run(["scontrol", "show", "node", "devai", "--json"],
+                           capture_output=True, text=True, timeout=30)
+        nodes = json.loads(p.stdout).get("nodes", []) if p.returncode == 0 else []
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        nodes = []
+    if not nodes:
+        return [], ""
+    return [str(s).upper() for s in nodes[0].get("state", [])], str(nodes[0].get("reason", ""))
+
+
+GUARD_REASONS = re.compile(r"(?i)prolog|epilog|devai-guard")
+
+
+def cmd_health(_a) -> int:
+    states, reason = node_state()
+    if "DRAIN" not in states:
+        return 0
+    if not GUARD_REASONS.search(reason):
+        return 0  # drained by someone else: not the health check's to undo
+    nvml = open_nvml()
+    if nvml is not None:
+        bus = Bus(0)
+        g = Guard(nvml, Proc(), bus, JobInfo(job=0))
+        st = g.engine_states()
+        keys = [k for k, v in Proc().controls().items() if v == ["engines"]]
+        tolerate = keys[0] if keys and g.sleeper_mib(st) else None
+        if not g.is_idle(g.sleeper_mib(st), tolerate):
+            return 0
+    p = subprocess.run(["scontrol", "update", "NodeName=devai", "State=RESUME"],
+                       capture_output=True, text=True, timeout=30)
+    if p.returncode != 0:
+        log(f"health: resume failed: {p.stderr.strip()}")
+        return 1
+    log(f"health: resumed node devai (was drained: {reason})")
+    return 0
+
+
+def cmd_simple(a) -> int:
+    nvml = open_nvml()
+    if a.cmd == "present":
+        return 0 if nvml is not None else 1
+    if nvml is None:
+        log("no GPU")
+        return 1
+    if a.cmd == "used":
+        print(nvml.used_mib())
+    elif a.cmd == "energy":
+        print(round(nvml.energy_mj() / 1000.0, 3))
+    elif a.cmd == "processes":
+        procs = nvml.processes()
+        if a.json:
+            print(json.dumps(procs))
+        else:
+            for p in procs:
+                print(p["pid"], "-" if p["used_mib"] is None else p["used_mib"])
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="devai-gpu")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("present")
+    sub.add_parser("used")
+    sub.add_parser("energy")
+    pp = sub.add_parser("processes")
+    pp.add_argument("--json", action="store_true")
+    sp = sub.add_parser("sample")
+    sp.add_argument("--interval", type=float, default=5.0)
+    sp.add_argument("--out", required=True)
+    sp.add_argument("--pidfile", required=True)
+    for name in ("guard", "epilog"):
+        g = sub.add_parser(name)
+        g.add_argument("--job", type=int, required=True)
+    sub.add_parser("health")
+    a = ap.parse_args(argv)
+    if a.cmd == "sample":
+        return cmd_sample(a)
+    if a.cmd == "guard":
+        return cmd_guard(a)
+    if a.cmd == "epilog":
+        return cmd_epilog(a)
+    if a.cmd == "health":
+        return cmd_health(a)
+    return cmd_simple(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

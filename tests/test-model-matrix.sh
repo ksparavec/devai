@@ -22,8 +22,8 @@
 #   /v1/messages             Claude Code
 #
 # Run from the host:  make test-models
-# All curl traffic goes through devai-open-webui (already on devai-net,
-# already has curl) — no extra container, no host port mapping needed.
+# All curl traffic goes through one throwaway client container on devai-net
+# (tests/lib/devai-net-client.sh) — no host port mapping needed.
 #
 # Errors propagate; the script is fail-safe. Final exit is 0 only when
 # every non-skip cell passes.
@@ -34,6 +34,9 @@ set -o pipefail
 # inside `local`. The PASS/FAIL tracking is robust against missing args.
 
 RUNTIME="${CONTAINER_RUNTIME:-podman}"
+# Compose mounts ${DEVAI_REPO}/deploy and refuses to start without it (plan I25);
+# this script runs compose itself, outside make, so it defaults it here.
+: "${DEVAI_REPO:=$(cd "$(dirname "$0")/.." && pwd)}"; export DEVAI_REPO
 ROUTER="${ROUTER:-devai-router:11434}"
 OLLAMA="${OLLAMA:-devai-ollama:11434}"
 PROBE_CACHE="${PROBE_CACHE:-deploy/.ollama-reasoning-cache.json}"
@@ -66,19 +69,24 @@ cell_skip() {
 }
 hdr() { printf '\n%s%s%s\n' "$B" "$1" "$N"; }
 
+# Curl client on devai-net (the router publishes no host ports): sets EXEC_HOST.
+# shellcheck source=tests/lib/devai-net-client.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/devai-net-client.sh"
+devai_net_client_start || exit 1
+
 curl_via() {
-    # POST to $ROUTER (default) or another host:port via devai-open-webui.
+    # POST to $ROUTER (default) or another host:port via the devai-net client.
     # $1=path  $2=body  $3=timeout(s)  $4=optional extra header (-H)
     local path="$1" body="$2" timeout="${3:-60}" hdr="${4:-}"
     local target="${5:-$ROUTER}"
     if [ -n "$hdr" ]; then
-        $RUNTIME exec devai-open-webui curl -sS --max-time "$timeout" \
+        $RUNTIME exec "$EXEC_HOST" curl -sS --max-time "$timeout" \
             -w '\n__HTTP__%{http_code}' \
             -H "Content-Type: application/json" \
             -H "$hdr" \
             "http://$target$path" -d "$body" 2>&1
     else
-        $RUNTIME exec devai-open-webui curl -sS --max-time "$timeout" \
+        $RUNTIME exec "$EXEC_HOST" curl -sS --max-time "$timeout" \
             -w '\n__HTTP__%{http_code}' \
             -H "Content-Type: application/json" \
             "http://$target$path" -d "$body" 2>&1
@@ -89,7 +97,7 @@ curl_get() {
     # GET helper for endpoints like /api/ps and /api/tags that don't accept
     # a body. Same target/timeout convention as curl_via.
     local path="$1" timeout="${2:-10}" target="${3:-$ROUTER}"
-    $RUNTIME exec devai-open-webui curl -sS --max-time "$timeout" \
+    $RUNTIME exec "$EXEC_HOST" curl -sS --max-time "$timeout" \
         -w '\n__HTTP__%{http_code}' \
         "http://$target$path" 2>&1
 }

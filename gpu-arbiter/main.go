@@ -19,11 +19,8 @@
 //	VLLM_CONTAINER    vLLM container name (default devai-vllm)
 //	VLLM_IMAGE        vLLM container image
 //	VLLM_MODELS_DIR   host path to vLLM models
-//	SGLANG_URL        SGLang backend URL (default http://devai-sglang:11434)
-//	SGLANG_PORT       SGLang listen port (default 11436)
-//	SGLANG_CONTAINER  SGLang container name (default devai-sglang)
-//	SGLANG_IMAGE      SGLang container image
-//	SGLANG_MODELS_DIR host path to SGLang models
+//	(SGLang, port 11436, was frozen by platform-rebuild Phase 15 (M16): its
+//	code below stays, unreachable, and its SGLANG_* variables are not read.)
 //	IDLE_TIMEOUT      seconds before an idle backend is auto-unloaded; 0 = never (default 0, keep-warm)
 //	DRAIN_TIMEOUT     seconds to wait for in-flight requests before stopping (default 30)
 //	HEALTH_TIMEOUT_SECONDS  seconds to wait for a backend to become healthy after launch (default 600)
@@ -270,14 +267,17 @@ type launchConfig struct {
 	ToolParserPlugin      string
 	ReasoningParserPlugin string
 	// RecoveryFlags carries per-model CLI args pre-resolved by
-	// containerRecreate from the arbiter's recovery registry. Passing
-	// them through launchConfig instead of having the entrypoints reach
-	// up to a package global keeps the entrypoint functions pure (no
-	// hidden global dependency) and lets a future signal-driven reload
-	// of recovery-flags.json swap the registry atomically without
-	// racing in-flight requests. Empty slice = no flags, which is the
-	// path test fixtures already exercise.
+	// containerRecreate from the arbiter's recovery files (curated, then
+	// generated, I25). Passing them through launchConfig instead of having
+	// the entrypoints reach up to a package global keeps the entrypoint
+	// functions pure (no hidden global dependency); the files are
+	// re-read at each launch when they changed, outside the builders.
+	// Empty slice = no flags, which is the path test fixtures already
+	// exercise.
 	RecoveryFlags []string
+	// EngineArgs carries the backend-wide engine argv (engineArgDefaults),
+	// emitted after the speculative flags and before RecoveryFlags.
+	EngineArgs []string
 	// Speculative carries the resolved multi-token-prediction launch
 	// parameters for this request. nil = MTP off (entrypoints emit no
 	// speculative-decoding flags); non-nil = the request body's model
@@ -910,6 +910,14 @@ type arbiter struct {
 	// See sse_keepalive.go.
 	keepaliveInterval time.Duration
 	keepaliveGrace    time.Duration
+	// fingerprint logs one content-free shape line per POST
+	// (DEVAI_REQUEST_FINGERPRINT / _RAW, fingerprint.go). Off by default.
+	// Raw mode writes bodies to fingerprintDir ("" = fingerprintRawDir)
+	// until fingerprintRawBytes passes fingerprintRawCapBytes.
+	fingerprint         fingerprintMode
+	fingerprintDir      string
+	fingerprintRawBytes atomic.Int64
+	fingerprintCapHit   atomic.Bool
 	// Size and declared-context are keyed by (backend, model name) for the
 	// same reason every other lookup below is: a model probed on BOTH vLLM
 	// and SGLang has an independent row per backend, and a name-only map
@@ -987,12 +995,12 @@ type arbiter struct {
 	// deploy/vllm-plugins.json). Always non-nil; entries map is empty
 	// when the registry file is missing or has no plugins.
 	pluginRegistry *vllmPluginRegistry
-	// recoveryRegistry holds per-model recovery flags (CLI args and env
-	// vars) from deploy/recovery-flags.json. Always non-nil; lookups
-	// for unknown models return (zero, false). Held on the struct (vs.
-	// a package-level var) so a future SIGHUP-style reload can swap
-	// the pointer atomically without racing in-flight requests.
-	recoveryRegistry *recoveryRegistry
+	// recoveryFiles holds per-model recovery flags (CLI args and env
+	// vars) from deploy/recovery-flags.json (curated) and
+	// deploy/recovery-flags.generated.json (machine-made, plan I25), and
+	// re-reads either file at each launch when it changed. Lookups for
+	// unknown models, and on a nil pointer, return (zero, false).
+	recoveryFiles *recoveryFiles
 	// healthClient is the short-timeout client used by backendIsServing
 	// to probe /health on each request that finds bs.running=true. A
 	// per-call &http.Client allocates a fresh transport (with its own
@@ -1434,9 +1442,13 @@ func vllmEntrypoint(modelName string, lc launchConfig) []string {
 			args = append(args, "--speculative-config", cfg)
 		}
 	}
+	// Backend-wide engine args (engineArgDefaults), before the recovery
+	// flags so a per-model entry can still override them.
+	args = append(args, lc.EngineArgs...)
 	// Per-model recovery flags (e.g. --enforce-eager for checkpoints that
 	// OOM at vLLM model-load time on 24G). Pre-resolved by containerRecreate
-	// from a.recoveryRegistry. See deploy/recovery-flags.json.
+	// from a.recoveryFiles. See deploy/recovery-flags.json and
+	// deploy/recovery-flags.generated.json.
 	args = append(args, lc.RecoveryFlags...)
 	return args
 }
@@ -1551,6 +1563,12 @@ func sglangEntrypoint(modelName string, lc launchConfig) []string {
 		// image, so re-adding it is a one-line change if a future bump
 		// regresses -- but carrying a workaround for a fixed bug costs
 		// every launch the graph capture it disables.
+		//
+		// --enable-metrics: SGLang serves /metrics only with it, and
+		// platform-rebuild Phase 15 reads its cache counters
+		// (sglang:cached_tokens_total, sglang:prompt_tokens_total) there.
+		// Must match sglang_command_args in scripts/probe-sglang-reasoning.py.
+		"--enable-metrics",
 	}
 	// Per-model KV dtype from the probe cache. SGLang's legacy cells ran
 	// the engine default (no flag), decoded as "" — emit nothing so those
@@ -1652,7 +1670,6 @@ func buildArbiter() *arbiter {
 	ollamaURL, _ := url.Parse(env("OLLAMA_URL", "http://devai-ollama:11434"))
 	vllmURL, _ := url.Parse(env("VLLM_URL", "http://devai-vllm:11434"))
 	vllmDevaiURL, _ := url.Parse(env("VLLM_DEVAI_URL", "http://devai-vllm-devai:11434"))
-	sglangURL, _ := url.Parse(env("SGLANG_URL", "http://devai-sglang:11434"))
 	socketPath := env("PODMAN_SOCKET", "/run/podman/podman.sock")
 	network := env("NETWORK", "devai-net")
 
@@ -1716,9 +1733,6 @@ func buildArbiter() *arbiter {
 	vllmCachePath := env("VLLM_PROBE_CACHE", "/etc/devai/.vllm-reasoning-cache.json")
 	cfg.Models = append(cfg.Models,
 		loadHFCache(vllmCachePath, "vllm", hostVRAMGB, operatorMaxCtx, catalogMTP)...)
-	sglangCachePath := env("SGLANG_PROBE_CACHE", "/etc/devai/.sglang-reasoning-cache.json")
-	cfg.Models = append(cfg.Models,
-		loadHFCache(sglangCachePath, "sglang", hostVRAMGB, operatorMaxCtx, catalogMTP)...)
 	// The custom vLLM build has its own cache: cells are stamped with the
 	// image they were measured on, and this backend's image is not vllm's.
 	vllmDevaiCachePath := env("VLLM_DEVAI_PROBE_CACHE", "/etc/devai/.vllm-devai-reasoning-cache.json")
@@ -1782,17 +1796,11 @@ func buildArbiter() *arbiter {
 			Entrypoint:    vllmEntrypoint,
 			EnvVars:       map[string]string{"VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1"},
 		},
-		{
-			Name:          "sglang",
-			ListenPort:    envInt("SGLANG_PORT", 11436),
-			BackendURL:    sglangURL,
-			ContainerName: env("SGLANG_CONTAINER", "devai-sglang"),
-			Image:         env("SGLANG_IMAGE", "docker.io/lmsysorg/sglang:v0.5.16-cu130"),
-			ModelsDir:     env("SGLANG_MODELS_DIR", "/var/cache/devai/sglang"),
-			Network:       network,
-			HealthPath:    "/health",
-			Entrypoint:    sglangEntrypoint,
-		},
+		// SGLang (port 11436) was here until platform-rebuild Phase 15
+		// froze it (M16, 2026-10-10: its turn-2+ TTFT on Qwen3.5-9B-NVFP4
+		// was 0.81x vLLM's, short of I16's 0.75). sglangEntrypoint and its
+		// policies stay, unreachable; attic/sglang/RESTORE.md says how to
+		// bring the entry back.
 		// The laya trainer: a job runner, not an inference engine. See
 		// job_runner.go and docs/plans/laya-trainer.md.
 		layaTrainerBackend(network),
@@ -1932,8 +1940,14 @@ func buildArbiter() *arbiter {
 		env("VLLM_PLUGINS_REGISTRY", "/etc/devai/vllm-plugins.json"),
 		env("VLLM_PLUGINS_HOST_DIR", ""),
 	)
-	recoveryRegistry := loadRecoveryRegistry(
-		env("RECOVERY_FLAGS_REGISTRY", "/etc/devai/recovery-flags.json"),
+	// Both recovery files, re-read at each launch when either changed
+	// (recovery_flags.go). Compose points both into the read-only mount of
+	// the repository's deploy/ directory; the generated file defaults to
+	// the curated file's directory.
+	recoveryCurated := env("RECOVERY_FLAGS_REGISTRY", "/etc/devai/deploy/recovery-flags.json")
+	recoveryFiles := newRecoveryFiles(
+		recoveryCurated,
+		env("RECOVERY_FLAGS_GENERATED", generatedRecoveryPath(recoveryCurated)),
 	)
 
 	// Advertisement vetting inputs. Both are OPTIONAL, and a missing file
@@ -1966,6 +1980,7 @@ func buildArbiter() *arbiter {
 		maxConcurrent:        int64(envIntAllowZero("MAX_CONCURRENT_REQUESTS", 32)),
 		keepaliveInterval:    time.Duration(envIntAllowZero("DEVAI_SSE_KEEPALIVE_SECONDS", sseKeepaliveIntervalDefault)) * time.Second,
 		keepaliveGrace:       time.Duration(envIntAllowZero("DEVAI_SSE_KEEPALIVE_GRACE_SECONDS", sseKeepaliveGraceDefault)) * time.Second,
+		fingerprint:          fingerprintModeFromEnv(),
 		modelSizes:           modelSizes,
 		modelContexts:        modelContexts,
 		benchedModels:        benchedModels,
@@ -1984,9 +1999,26 @@ func buildArbiter() *arbiter {
 		totalVRAMGB:          totalVRAMGB,
 		maxContextLen:        maxCtx,
 		pluginRegistry:       pluginRegistry,
-		recoveryRegistry:     recoveryRegistry,
+		recoveryFiles:        recoveryFiles,
 		healthClient:         &http.Client{Timeout: 2 * time.Second},
 		holdCacheTTL:         jobHoldRetryAfter * time.Second,
+	}
+	for _, w := range fingerprintEnvWarnings() {
+		log.Printf("WARNING: %s", w)
+	}
+	switch a.fingerprint {
+	case fingerprintOn:
+		log.Printf("request fingerprints ON (DEVAI_REQUEST_FINGERPRINT=on): one content-free line per POST")
+	case fingerprintRaw:
+		log.Printf("WARNING: request fingerprints RAW (DEVAI_REQUEST_FINGERPRINT_RAW=on): every POST body is written in full to %s (in this container), up to %d MiB",
+			fingerprintRawDir, fingerprintRawCapBytes>>20)
+	}
+	if a.fingerprint != fingerprintRaw {
+		// Bodies captured by an earlier raw-mode run of this container
+		// (a `podman restart` keeps its filesystem) do not outlive it.
+		if err := os.RemoveAll(fingerprintRawDir); err != nil {
+			log.Printf("WARNING: could not remove %s: %v", fingerprintRawDir, err)
+		}
 	}
 
 	// Image-drift detection (Phase C): compare each HF backend's running
@@ -1994,7 +2026,7 @@ func buildArbiter() *arbiter {
 	// moved tag silently invalidates fit/serving/parser data; we serve
 	// anyway but warn (loud log here + X-DevAI-Warning per response + a
 	// /health flag). Ollama (empty Image, no _meta stamp) never goes stale.
-	backendCachePath := probeCachePathByBackend(vllmCachePath, sglangCachePath, vllmDevaiCachePath)
+	backendCachePath := probeCachePathByBackend(vllmCachePath, vllmDevaiCachePath)
 	for _, bc := range backends {
 		probed := readProbedImageDigest(backendCachePath[bc.Name])
 		running := a.imageDigestFromLibpod(bc.Image)
@@ -2069,6 +2101,10 @@ var ollamaMutationPaths = []string{
 	"/api/push",
 	"/api/copy",
 	"/api/delete",
+	// A subtree pattern: Ollama's blob routes carry the digest in the path
+	// (POST/HEAD /api/blobs/sha256:<hex>). Uploading a blob is the first
+	// step of an `ollama create` from a local file.
+	"/api/blobs/",
 }
 
 // makeMutationGuard refuses a model-store mutation with 403 and names the
@@ -2078,14 +2114,48 @@ var ollamaMutationPaths = []string{
 // from an upstream that never implemented the endpoint.
 func (a *arbiter) makeMutationGuard(backendName string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("[%s] REFUSED %s %s from %s -- model-store mutation via router",
+		// %q and json.Marshal: the path is the client's, and since the
+		// /api/blobs/ subtree it is not one of a fixed set.
+		log.Printf("[%s] REFUSED %s %q from %s -- model-store mutation via router",
 			backendName, r.Method, r.URL.Path, r.RemoteAddr)
+		body, _ := json.Marshal(map[string]string{"error": r.URL.Path +
+			" is disabled at the router: models must be probed before they can be served. " +
+			"Use 'make model-pull' on the host, then 'make probe' (or probe-vllm/probe-sglang)."})
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusForbidden)
-		_, _ = fmt.Fprintf(w,
-			`{"error":"%s is disabled at the router: models must be probed before they can be served. `+
-				`Use 'make model-pull' on the host, then 'make probe' (or probe-vllm/probe-sglang)."}`+"\n",
-			r.URL.Path)
+		_, _ = w.Write(append(body, '\n'))
+	}
+}
+
+// isMutationPath reports whether a DECODED, cleaned request path is one of
+// ollamaMutationPaths. ServeMux matches on the escaped path, so
+// `/api%2Fdelete` is one segment that misses the `/api/delete` pattern and
+// lands on the catch-all, which would proxy it raw -- and Ollama decodes it
+// and runs the delete. The catch-all therefore checks the decoded path too.
+func isMutationPath(p string) bool {
+	c := path.Clean(p)
+	for _, m := range ollamaMutationPaths {
+		if base, subtree := strings.CutSuffix(m, "/"); subtree {
+			if c == base || strings.HasPrefix(c, m) {
+				return true
+			}
+		} else if c == m {
+			return true
+		}
+	}
+	return false
+}
+
+// refuseMutation puts the mutation guard in front of the catch-all for
+// paths ServeMux could not match because a slash in them was encoded.
+func (a *arbiter) refuseMutation(backendName string, next http.HandlerFunc) http.HandlerFunc {
+	guard := a.makeMutationGuard(backendName)
+	return func(w http.ResponseWriter, r *http.Request) {
+		if isMutationPath(r.URL.Path) {
+			guard(w, r)
+			return
+		}
+		next(w, r)
 	}
 }
 
@@ -2103,7 +2173,7 @@ func (a *arbiter) newBackendMux(name string) *http.ServeMux {
 	for _, p := range ollamaMutationPaths {
 		mux.HandleFunc(p, a.makeMutationGuard(name))
 	}
-	mux.HandleFunc("/", a.makeRequestHandler(name))
+	mux.HandleFunc("/", a.refuseMutation(name, a.makeRequestHandler(name)))
 	return mux
 }
 
@@ -2347,11 +2417,11 @@ func normalizeImageDigest(digest string, repoDigests []string) string {
 // HF backend's probe cache through. Every backend that has a probe cache
 // must be here: a name that is missing reads back "" and can never be
 // reported stale -- which is how vllm-devai spent its first day with the
-// drift safety net silently off (2026-09-22).
-func probeCachePathByBackend(vllm, sglang, vllmDevai string) map[string]string {
+// drift safety net silently off (2026-09-22). SGLang left it with its
+// backend entry (platform-rebuild Phase 15, M16).
+func probeCachePathByBackend(vllm, vllmDevai string) map[string]string {
 	return map[string]string{
 		"vllm":       vllm,
-		"sglang":     sglang,
 		"vllm-devai": vllmDevai,
 	}
 }
@@ -2856,6 +2926,11 @@ func buildContainerSpec(
 			envMap[k] = v
 		}
 	}
+	// The backend's fixed engine environment (engine_cache.go) goes last:
+	// it must hold whatever a model's recovery env says.
+	for k, v := range engineEnvDefaults(cfg.Name) {
+		envMap[k] = v
+	}
 	if len(envMap) > 0 {
 		spec["env"] = envMap
 	}
@@ -2952,6 +3027,7 @@ func (a *arbiter) containerRecreate(bs *backendState, modelName string, desiredC
 	// actually serve. Emitted before RecoveryFlags, so a per-model
 	// --max-num-seqs (VRAM rescue) still wins last.
 	lc.MaxNumSeqs = int(a.maxConcurrent)
+	lc.EngineArgs = engineArgDefaults(cfg.Name)
 	if parser := a.modelToolParser[cfg.Name][modelName]; parser != "" {
 		lc.ToolParser = parser
 	}
@@ -2963,10 +3039,11 @@ func (a *arbiter) containerRecreate(bs *backendState, modelName string, desiredC
 	// via launchConfig and the spec envMap below. Single lookup keeps
 	// the two halves synced if the registry ever swaps mid-call.
 	var recoveryEnv map[string]string
-	if rec, ok := a.recoveryRegistry.Lookup(cfg.Name, modelName); ok {
+	if rec, ok := a.recoveryFiles.Lookup(cfg.Name, modelName); ok {
 		lc.RecoveryFlags = rec.Flags
 		recoveryEnv = rec.Env
 		lc.RecoveryImage = rec.Image
+		log.Printf("  %s recovery flags for %s: %s", cfg.Name, modelName, rec.describe())
 	}
 	// Speculative-decoding config (MTP). Set by the request handler when
 	// the model name carried `::mtp` AND the catalog declared an `mtp:`
@@ -3760,6 +3837,7 @@ func (a *arbiter) makeRequestHandler(backendName string) http.HandlerFunc {
 				http.Error(w, `{"error":"failed to read body or body too large"}`, http.StatusRequestEntityTooLarge)
 				return
 			}
+			a.logFingerprint(backendName, req.URL.Path, body)
 
 			var parsed struct {
 				Model string `json:"model"`

@@ -1,0 +1,64 @@
+# nats-server configuration for devai's bus (platform-rebuild C1;
+# docs/slurm.md Sec. 3.1 and 12). Rendered at every start of devai-slurm by
+# entrypoint.sh into /run/devai/nats-server.conf (0600): each @PASS:<user>@ is
+# replaced with the content of /etc/devai/slurm/nats/<user>.pass.
+#
+# No TLS (devai-net only, nothing published), no JetStream: nothing is stored
+# in the bus; a service's state is asked for or published. Messages are JSON,
+# at most 64 KiB.
+#
+# The users block is written as JSON (nats-server's format accepts it) so
+# tests/python/test_slurm_config.py can compare it with the plan's C1 table,
+# and the Go tests start an embedded nats-server from this very file.
+#
+# allow_responses on the control users: `expires` is stated explicitly.
+# Given without values, nats-server 2.10.27 allows ONE reply for 2 minutes
+# (DEFAULT_ALLOW_RESPONSE_EXPIRATION, server/const.go:218, applied in
+# server/auth.go:254-257), shorter than a cold `load` (timeout_s up to 840).
+
+listen: "0.0.0.0:4222"
+max_payload: 65536
+logtime: true
+
+authorization {
+  users = [
+    {"user": "router", "password": "@PASS:router@",
+     "permissions": {
+       "publish": {"allow": ["devai.*.*.state", "devai.engines.*.unload"]},
+       "subscribe": {"allow": ["devai.events.>", "_INBOX.router.>"]}}},
+    {"user": "jobs", "password": "@PASS:jobs@",
+     "permissions": {
+       "publish": {"allow": [
+         "devai.engines.*.load", "devai.engines.*.unload", "devai.engines.*.sleep",
+         "devai.engines.*.lease", "devai.engines.*.state",
+         "devai.laya-trainer.trainer.train", "devai.laya-trainer.trainer.cancel",
+         "devai.laya-trainer.trainer.lease", "devai.laya-trainer.trainer.state",
+         "devai.operator.actions.run", "devai.operator.actions.stop",
+         "devai.operator.actions.lease", "devai.operator.actions.state",
+         "devai.events.slurm.guard"]},
+       "subscribe": {"allow": ["devai.events.>", "_INBOX.jobs.>"]}}},
+    {"user": "operator", "password": "@PASS:operator@",
+     "permissions": {
+       "publish": {"allow": ["devai.>"]},
+       "subscribe": {"allow": ["devai.events.>", "_INBOX.operator.>"]}}},
+    {"user": "control-engines", "password": "@PASS:control-engines@",
+     "permissions": {
+       "publish": {"allow": ["devai.events.engines.>"]},
+       "subscribe": {"allow": ["devai.engines.>"]},
+       "allow_responses": {"max": 1, "expires": "15m"}}},
+    {"user": "control-laya", "password": "@PASS:control-laya@",
+     "permissions": {
+       "publish": {"allow": ["devai.events.laya-trainer.>"]},
+       "subscribe": {"allow": ["devai.laya-trainer.>"]},
+       "allow_responses": {"max": 1, "expires": "15m"}}},
+    {"user": "control-operator", "password": "@PASS:control-operator@",
+     "permissions": {
+       "publish": {"allow": ["devai.events.operator.>"]},
+       "subscribe": {"allow": ["devai.operator.>"]},
+       "allow_responses": {"max": 1, "expires": "15m"}}},
+    {"user": "buslog", "password": "@PASS:buslog@",
+     "permissions": {
+       "publish": {"deny": [">"]},
+       "subscribe": {"allow": ["devai.events.>"]}}}
+  ]
+}

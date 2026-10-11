@@ -5,9 +5,7 @@ interactive lab container network **fail-closed**: the lab has NO route to the
 internet except through pipelock, which decrypts and inspects outbound TLS,
 DLP-blocks accidental secret egress, and logs every decision.
 
-This is the source of truth for the pipelock integration. See also
-`docs/secrets.md` (the sops/age scaffold the CA key uses) and `docs/mcp.md`
-(the peer opt-in service whose conventions pipelock mirrors).
+This is the source of truth for the pipelock integration.
 
 ## Why
 
@@ -24,24 +22,33 @@ keeping the adversarial-evasion scanners in warn-only to avoid false positives.
 ## Architecture
 
 ```
-lab container (devai-lab-gpu/cpu)              devai-net (has internet)
+lab container (devai-lab)                      devai-net (has internet)
   joined ONLY to devai-lab-egress                ^
   - no internet route, no host-gateway           | internet leg
   - HTTPS_PROXY=http://devai-pipelock:8888        |
-  - NO_PROXY=devai-router,apt-cache,...    -->  devai-pipelock (dual-homed)
+  - NO_PROXY=devai-router,ollama,...       -->  devai-pipelock (dual-homed)
   - pipelock CA in the system trust store         - MITM + DLP block + audit
         |                                          - cap_drop:ALL, no-new-privs
         | devai-lab-egress (internal: true, NO NAT)
         v
-  devai-router / apt-cache / registry-cache   (dual-homed: devai-net + egress;
-                                               they do NOT IP-forward -> no leak)
+  devai-router                               (dual-homed: devai-net + egress;
+                                               does NOT IP-forward or proxy -> no leak)
 ```
 
 The lab joins only the internal `devai-lab-egress` network. pipelock is the only
 member of that network that is also on `devai-net` (the internet leg), so it is
-the lab's sole path out. The router and caches are dual-homed so inference and
-package installs still work; containers do not forward between their interfaces,
-so they cannot be used as a back-door route.
+the lab's sole path out. The router is dual-homed so inference works; it does
+not forward between its interfaces, and it proxies only to the inference
+backends, so it cannot be used as a back-door route.
+
+apt-cache was dual-homed too until platform-rebuild Phase 2 (2026-10-10), and
+it was a back door: no IP forwarding is needed when the container is itself a
+proxy. apt-cacher-ng answers CONNECT to any host (`PassThroughPattern: .*`, the
+old sameersbn image's setting) and forwards plain http to any host, so
+`curl --proxy http://apt-cache:3142 https://example.com` returned 200 from the
+locked lab, around pipelock's DLP. It is now on `devai-net` only; the lab never
+used it (the lab configures no apt proxy). Going through pipelock to it fails
+too: pipelock's `internal` list blocks 10.0.0.0/8, which covers devai-net.
 
 ## Why fail-closed holds
 
@@ -49,8 +56,9 @@ so they cannot be used as a back-door route.
    installs **no masquerade / forward rules** for it -- a container whose only
    interface is on that bridge has no route off-host. (The gateway IP existing
    is not a leak; the absence of NAT is what matters.)
-2. Dual-homed infra (`router`, `apt-cache`, `registry-cache`) does not enable
-   `ip_forward` and has no `NET_ADMIN`, so the lab cannot route through them.
+2. The dual-homed router does not enable `ip_forward` and has no `NET_ADMIN`,
+   so the lab cannot route through it, and it is no general-purpose proxy.
+   Nothing else on the lab network may be one (see apt-cache above).
 3. The lab is launched with no `--add-host=host.containers.internal:host-gateway`
    (that would be an off-host route) and `cap_drop`-style restraint, so nothing
    inside can reconfigure its way out. The only egress interface lives in
@@ -67,11 +75,11 @@ lives on the host and is never committed. Bootstrap is three commands:
 ```
 make pipelock-ca-init   # CA cert -> deploy/pipelock-ca.crt (local build input, gitignored)
                         # CA key  -> ~/.config/devai/pipelock-ca-key.pem (0600, host-only)
-make build-gpu          # or build-cpu -- bakes the CA cert into the lab trust store
+make build-lab          # bakes the CA cert into the lab trust store
 make cache-up           # mounts the host key into devai-pipelock automatically
 ```
 
-No sops, no tmpfs, no `.env` edit. `cache-up` looks for the key at
+No secrets tooling, no tmpfs, no `.env` edit. `cache-up` looks for the key at
 `$(PIPELOCK_CA_KEY)` (default `~/.config/devai/pipelock-ca-key.pem`, override
 via the Make variable) and mounts it; if it is missing, cache-up prints a note
 and pipelock stays unhealthy until you run `make pipelock-ca-init`. Nothing
@@ -94,7 +102,7 @@ make cache-up         # starts devai-pipelock (+ creates devai-lab-egress --inte
 make pipelock-logs    # tail decisions (also at /var/cache/devai/logs/devai-pipelock.log)
 ```
 
-`bin/devai-agent` and `make lab-gpu/shell-gpu` launch the lab on
+`bin/devai-agent` and `make lab` / `make shell` launch the lab on
 `devai-lab-egress` with the proxy + CA env forced. To bypass the lock for
 debugging (UNSAFE -- no egress control), set `DEVAI_NO_EGRESS_LOCK=1` (launcher
 only); this restores the open `devai-net` path.
@@ -114,8 +122,10 @@ only); this restores the open `devai-net` path.
   leg. Tools must honor the proxy; `NO_PROXY` lists every internal alias.
 - **Dev installs go through pipelock.** pip/uv/npm/git-over-HTTPS work because
   they honor the proxy and trust the baked CA; their destinations are in the
-  allowlist (`pypi.org`, `registry.npmjs.org`, `github.com`, ...). apt uses the
-  internal `apt-cache` and never touches pipelock.
+  allowlist (`pypi.org`, `registry.npmjs.org`, `github.com`, ...). So does
+  apt: the lab configures no apt proxy, `http_proxy` sends it to pipelock, and
+  `deb.debian.org` is in the allowlist (measured 2026-10-10: `apt-get update`
+  works, about 200 kB/s through the DLP).
 - **Trusted harnesses are not locked.** `make test-agents`, `bench-*`, and
   `probe*` stay on `devai-net` -- they run trusted code and need direct access.
   Only the interactive agent lab is egress-locked.
@@ -163,16 +173,15 @@ Exa tool, enabled in the lab image with `ENV OPENCODE_ENABLE_EXA=1`
 (`deploy/Dockerfile.lab`). Its queries egress through pipelock like everything
 else (and may trip the DLP false-positive above on query content). The other
 agents' built-in search is cloud-provider-coupled and does not function against
-the local router; giving them search uniformly is a backlog item (the MCP
-gateway -- see TODO.md).
+the local router. Nothing gives them search uniformly: the MCP gateway that was
+meant to was removed on 2026-10-07 (platform-rebuild Phase 1, M10).
 
 ## Backlog
 
 Pipelock-related open items live in TODO.md under "Open Items -> pipelock egress
-lockdown": MCP search for all agents, making the MCP gateway reachable from the
-locked lab, fixing web fetch for the Node-runtime agents (Gemini CLI / Claude
-Code), the DLP signed-URL false-positive, and the systemd boot network-create
-gap.
+lockdown": web search for every agent, fixing web fetch for the Node-runtime
+agents (Gemini CLI / Claude Code), the DLP signed-URL false-positive, and the
+systemd boot network-create gap.
 
 ## Logging
 

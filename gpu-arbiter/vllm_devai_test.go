@@ -142,11 +142,15 @@ func TestVLLMDevai_LegacyCellsDecodeToFP8LikeVLLM(t *testing.T) {
 // safety net built for exactly this kind of backend was silently off
 // (found in review, 2026-09-22).
 func TestVLLMDevai_DriftCheckReadsItsOwnProbeCache(t *testing.T) {
-	m := probeCachePathByBackend("/v.json", "/s.json", "/d.json")
-	want := map[string]string{"vllm": "/v.json", "sglang": "/s.json", "vllm-devai": "/d.json"}
+	m := probeCachePathByBackend("/v.json", "/d.json")
+	want := map[string]string{"vllm": "/v.json", "vllm-devai": "/d.json"}
 	for name, path := range want {
 		if m[name] != path {
 			t.Errorf("probeCachePathByBackend[%q] = %q, want %q", name, m[name], path)
 		}
+	}
+	// SGLang left with its backend entry (platform-rebuild Phase 15, M16).
+	if len(m) != len(want) {
+		t.Errorf("probeCachePathByBackend has %d entries, want %d: %v", len(m), len(want), m)
 	}
 }

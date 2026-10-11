@@ -1,18 +1,30 @@
 # devai-laya-trainer: the laya trainer backend (docs/plans/laya-trainer.md).
 #
-# Built on the lab's GPU base image (Python 3.14.7 via uv) -- a separate image,
-# NOT an extension of devai-lab-gpu (owner decision D4). Build with
-# `make build-laya-trainer`, which bind-mounts the uv cache like the lab build.
+# Built on the lab's base image, devai-base (Debian, Python 3.14.7 via uv) --
+# a separate image, NOT an extension of devai-lab (owner decision D4). Build
+# with `make build-laya-trainer`, which bind-mounts the uv cache like the lab
+# build. torch brings its CUDA runtime as pip packages (the lock pins
+# nvidia-cuda-runtime), so the base needs no system CUDA.
 #
 # Every Python package comes from laya-trainer/requirements.lock with
 # --require-hashes: a package, version or file the lock does not name is
 # refused. Regenerate the lock with `make laya-trainer-lock`.
 #
 # The router starts this image as devai-laya-trainer with the laya store
-# mounted at /laya; compose starts it as a `sleep infinity` placeholder.
+# mounted at /laya and its own entrypoint (the controller); compose starts it
+# as a `sleep infinity` placeholder. Run as it is, the image idles under tini
+# (platform-rebuild Phase 3), so it can stay up as a permanent container;
+# Phase 8 makes supervisord and devai-control its default command.
 
-ARG BASE_IMAGE=localhost/devai-base-gpu:latest
+ARG BASE_IMAGE=localhost/devai-base:latest
 FROM ${BASE_IMAGE}
+
+ARG APT_PROXY=
+RUN set -eu; \
+    if [ -n "$APT_PROXY" ]; then echo "Acquire::http::Proxy \"$APT_PROXY\";" > /etc/apt/apt.conf.d/00cache; fi; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends tini; \
+    rm -rf /var/lib/apt/lists/* /etc/apt/apt.conf.d/00cache
 
 ENV HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1 \
@@ -44,4 +56,5 @@ ARG SOURCE_ID=unknown
 ENV LAYA_TRAINER_BUILD=${SOURCE_ID}
 
 EXPOSE 11434
-CMD ["python", "-m", "laya_trainer.controller", "--store", "/laya", "--catalog", "/etc/devai/laya-models.yaml", "--port", "11434"]
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["sleep", "infinity"]

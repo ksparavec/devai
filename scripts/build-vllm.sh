@@ -5,29 +5,51 @@
 # vLLM image is used anywhere, not even as a build input (operator decision,
 # same as devai-ollama -- see scripts/build-ollama.sh).
 #
+# What is built is a BUILD RECORD, deploy/vllm-builds/<version>.sh, chosen by
+# VLLM_VERSION (default 0.30.0, platform-rebuild E1) and sourced below. It
+# holds what used to be constants here:
+#
+#   VLLM_SDIST_SHA256  the PyPI sdist's sha256
+#   VLLM_TORCH_PIN     torch for the build venv; the runtime set must pin the same
+#   HYPERQWEN_COMMIT   a full commit of github.com/syv-ai/HyperQwen, or empty
+#   HYPERQWEN_SKIP     patches of HyperQwen's series the record skips, as
+#                      upstream does at that commit (an array, may be empty)
+#   DEVAI_PATCHES      devai's own series directory, repository-relative, or empty
+#   EXTERNALS          the kernel repositories, at the revisions that version's
+#                      CMake files name
+#
+# A record without HyperQwen or without devai's series skips that series and
+# the wheel check that looks for it (deploy/Dockerfile.vllm reads BUILD_INFO
+# for its own HyperQwen check). Beside each record lie its runtime set,
+# <version>.in, which this script writes (`--write-in`, run by
+# `make vllm-lock`), and <version>.lock, its hash lock. The wheels are fetched
+# from the lock with --require-hashes and the dist carries the lock as
+# requirements.txt, so the image installs exactly the reviewed set.
+#
 # What is built, and why it is shaped this way:
 #
 #   * vLLM $VLLM_VERSION from the PyPI sdist, sha256-verified. HyperQwen
-#     (github.com/syv-ai/HyperQwen) pins exactly this release and applies its
-#     patches with `--fuzz 0`, so the version is not a free choice.
+#     (github.com/syv-ai/HyperQwen) pins exactly one release per commit and
+#     applies its patches with `--fuzz 0`, so the version is not a free choice.
 #   * The HyperQwen series is applied to the SOURCE TREE before compiling, in
 #     the order patches/series gives (a few patches carry context an earlier
-#     one adds, so glob order is wrong). `dflash2-backport` is skipped, as
-#     HyperQwen's own Dockerfile does: it is native in 0.28.0. Their KVarN
+#     one adds, so glob order is wrong), minus the record's skips. Their KVarN
 #     KV-cache plugin is NOT installed -- 4/2-bit KV was ruled out here on
 #     quality grounds (see docs/backends.md).
 #   * devai's own patches (deploy/vllm-patches/series) are applied after
 #     HyperQwen's, same rules. The first one stops the MTP drafter allocating
 #     two vocabulary-sized layers vLLM deletes anyway -- the 0.5 GiB shortfall
 #     that kept MTP from loading on 24 GiB.
-#     All 38 patches touch Python only. Compiling therefore produces the same
-#     kernels the stock wheel ships, minus every GPU generation but ours.
+#     Every patch of both series touches Python only (38 at c0c81bb, 46 at
+#     7af097b, plus devai's). Compiling therefore produces the same kernels
+#     the stock wheel ships, minus every GPU generation but ours.
 #   * TORCH_CUDA_ARCH_LIST=12.0 (Blackwell): native code for this card, no
 #     other architecture compiled.
-#   * vLLM's CMake clones nine external kernel repositories DURING CONFIGURE,
+#   * vLLM's CMake clones its external kernel repositories DURING CONFIGURE,
 #     outside any retry. They are fetched here instead, each pinned to the
-#     revision the source tree names (a drifted pin is refused), and handed to
-#     CMake through the *_SRC_DIR variables vLLM already honours.
+#     revision the source tree names, from the repository it names (a drifted
+#     pin or repository is refused), and handed to CMake through the *_SRC_DIR
+#     variables vLLM already honours.
 #   * The Rust front end's crates are fetched up front for the same reason.
 #
 # Every network step is tried 3 times and then FAILS the script (operator
@@ -36,6 +58,9 @@
 #
 # Host prerequisites -- Debian packages, installed once by the operator:
 #   cmake ninja-build gcc g++ git patch python3 python3-dev        (Debian main)
+#   libdw-dev    (Debian main; elfutils/libdwfl.h, which 0.30.0's DeepGEMM
+#                 fork includes; at run time it only dlopens libdw.so.1,
+#                 optionally, for stack-trace symbols)
 #   cuda-nvcc-13-1 cuda-cudart-dev-13-1 cuda-cccl-13-1 libcublas-dev-13-1
 #   libcusparse-dev-13-1 libcusolver-dev-13-1 libcufft-dev-13-1
 #   libcurand-dev-13-1 cuda-nvrtc-dev-13-1 libnvjitlink-dev-13-1
@@ -43,41 +68,64 @@
 # plus uv (creates the build venv; python3-venv is not needed) and a rustup
 # toolchain matching the source tree's rust-toolchain.toml.
 #
-# Builds under ~/.cache/devai/vllm-build, NOT /var/cache/devai (a new
-# top-level directory there is not volume-backed).
+# Builds under ~/.cache/devai/vllm-build/<version>, one root per version, NOT
+# /var/cache/devai (a new top-level directory there is not volume-backed).
+# Each build deletes only its own dist/, so another version's wheelhouse --
+# the rollback -- is never touched.
+#
+# The compile (about 20 minutes) is skipped when its inputs are unchanged:
+# the newest wheel is kept under $BUILD_ROOT/compiled/<compile id>
+# (compile_id hashes the build record, devai's patches, the arch list, the
+# compilers, Python and the compile steps' own source -- not the runtime
+# lock), re-verified, and reused, so
+# a lock-only change rebuilds the wheelhouse in minutes. VLLM_REBUILD=1
+# compiles anyway.
+#
+# Usage: build-vllm.sh             compile and publish $BUILD_ROOT/dist
+#        build-vllm.sh --write-in  write deploy/vllm-builds/$VLLM_VERSION.in only
 set -euo pipefail
 
-VLLM_VERSION="${VLLM_VERSION:-0.28.0}"
-VLLM_SDIST_SHA256="${VLLM_SDIST_SHA256:-ac96dd0ec5be9c13f2aa4bfb50498c4727110406f6e4980b58a4097e4d18634a}"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VLLM_VERSION="${VLLM_VERSION:-0.30.0}"
+VLLM_RECORD_DIR="${VLLM_RECORD_DIR:-$REPO_ROOT/deploy/vllm-builds}"
 HYPERQWEN_REPO="https://github.com/syv-ai/HyperQwen.git"
-HYPERQWEN_COMMIT="${HYPERQWEN_COMMIT:-c0c81bbbbf91f11b54af7b95f49bd6d1570c2ba0}"
 CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-13.1}"
 CUDA_ARCH_LIST="${CUDA_ARCH_LIST:-12.0}"
-BUILD_ROOT="${VLLM_BUILD_ROOT:-$HOME/.cache/devai/vllm-build}"
+BUILD_ROOT="${VLLM_BUILD_ROOT:-$HOME/.cache/devai/vllm-build/$VLLM_VERSION}"
 # nvcc peaks at several GiB per translation unit on the attention kernels;
 # 16 keeps a 64 GiB host out of swap where $(nproc) does not.
 JOBS="${JOBS:-16}"
 FETCH_RETRY_DELAY="${FETCH_RETRY_DELAY:-5}"
 PYTHON="${PYTHON:-/usr/bin/python3}"
-DEVAI_PATCH_DIR="${DEVAI_PATCH_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/deploy/vllm-patches}"
-
-# name | env var vLLM's CMake reads | repository | pinned ref | file naming the pin
-# | optional subdirectory the variable must point at (triton: vLLM wants the
-#   triton_kernels package directory itself, not the repository root)
-EXTERNALS=(
-  "cutlass|VLLM_CUTLASS_SRC_DIR|https://github.com/nvidia/cutlass.git|v4.4.2|CMakeLists.txt"
-  "flash-attention|VLLM_FLASH_ATTN_SRC_DIR|https://github.com/vllm-project/flash-attention.git|f3e1a4f74c99145c0717709860bf765de1703779|cmake/external_projects/vllm_flash_attn.cmake"
-  "FlashMLA|FLASH_MLA_SRC_DIR|https://github.com/vllm-project/FlashMLA|a8f794d1251cbfd88a5011445dd5582289c727e4|cmake/external_projects/flashmla.cmake"
-  "MSA|FMHA_SM100_SRC_DIR|https://github.com/vllm-project/MSA.git|087c161814d4d9c735b46c21212a09e5f8eb92fa|cmake/external_projects/fmha_sm100.cmake"
-  "tml-fa4|TML_FA4_SRC_DIR|https://github.com/vllm-project/tml-fa4.git|b206834606ed5b5f21f8eed6b0683f528ea9cf7d|cmake/external_projects/tml_fa4.cmake"
-  "FlashKDA|FLASH_KDA_SRC_DIR|https://github.com/vllm-project/FlashKDA.git|053de1b716ef3255873e02d2d28f4adf09951978|cmake/external_projects/flashkda.cmake"
-  "qutlass|QUTLASS_SRC_DIR|https://github.com/IST-DASLab/qutlass.git|e74319e3405ce6d71965732880f5dc1f52371f64|cmake/external_projects/qutlass.cmake"
-  "DeepGEMM|DEEPGEMM_SRC_DIR|https://github.com/deepseek-ai/DeepGEMM.git|8b1392b978f5a03c828dd1711090d7fb50958b8a|cmake/external_projects/deepgemm.cmake"
-  "triton|TRITON_KERNELS_SRC_DIR|https://github.com/triton-lang/triton.git|v3.5.1|cmake/external_projects/triton_kernels.cmake|python/triton_kernels/triton_kernels"
-)
+# Where host development headers outside the CUDA toolkit live (tests point
+# it elsewhere).
+VLLM_HOST_INCLUDE="${VLLM_HOST_INCLUDE:-/usr/include}"
 
 die() { echo "error: $*" >&2; exit 1; }
 say() { echo "==> $*"; }
+
+# Source the record for $VLLM_VERSION. The record is authoritative: the
+# environment cannot override what it pins. DEVAI_PATCH_DIR (an absolute
+# directory) may still be set from outside, for the tests.
+load_record() {
+    local record="$VLLM_RECORD_DIR/$VLLM_VERSION.sh"
+    [ -f "$record" ] || die "no build record for vLLM $VLLM_VERSION ($record)"
+    VLLM_SDIST_SHA256="" VLLM_TORCH_PIN="" HYPERQWEN_COMMIT="" DEVAI_PATCHES=""
+    HYPERQWEN_SKIP=() EXTERNALS=()
+    # shellcheck source=/dev/null
+    . "$record"
+    [[ "$VLLM_SDIST_SHA256" =~ ^[0-9a-f]{64}$ ]] \
+        || die "$record: VLLM_SDIST_SHA256 is not a sha256"
+    [[ "$VLLM_TORCH_PIN" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+        || die "$record: VLLM_TORCH_PIN is not a version"
+    [ -z "$HYPERQWEN_COMMIT" ] || [[ "$HYPERQWEN_COMMIT" =~ ^[0-9a-f]{40}$ ]] \
+        || die "$record: HYPERQWEN_COMMIT must be a full 40-hex commit or empty"
+    [ -n "$HYPERQWEN_COMMIT" ] || [ "${#HYPERQWEN_SKIP[@]}" -eq 0 ] \
+        || die "$record: HYPERQWEN_SKIP without HYPERQWEN_COMMIT"
+    [ "${#EXTERNALS[@]}" -gt 0 ] || die "$record: no EXTERNALS"
+    DEVAI_PATCH_DIR="${DEVAI_PATCH_DIR:-${DEVAI_PATCHES:+$REPO_ROOT/$DEVAI_PATCHES}}"
+}
+load_record
 
 retry3() {
     local label="$1"; shift
@@ -125,14 +173,24 @@ fetch_source() {
     [ "$have" = "$ref" ] || die "$dest is at '$have', expected $label $ref"
 }
 
+# One attempt at downloading `url` to `dest`, through "$dest.part", so an
+# interrupted download never looks like a finished one.
+fetch_file() {
+    local url="$1" dest="$2"
+    curl -fsSL -o "$dest.part" "$url" && mv "$dest.part" "$dest"
+}
+
 fetch_sdist() {
     local tarball="$BUILD_ROOT/src/vllm-$VLLM_VERSION.tar.gz"
     mkdir -p "$BUILD_ROOT/src"
     if [ ! -f "$tarball" ]; then
         say "fetching vLLM $VLLM_VERSION sdist"
-        retry3 "fetching the vLLM sdist" "$PYTHON" -m pip download "vllm==$VLLM_VERSION" \
-            --no-binary=:all: --no-deps --no-build-isolation --no-cache-dir -q \
-            -d "$BUILD_ROOT/src"
+        # The file, not `pip download`: pip prepares the sdist's metadata,
+        # which runs its setup.py, and 0.30.0's needs setuptools_rust in
+        # the host Python. The sha256 below is the check either way.
+        retry3 "fetching the vLLM sdist" fetch_file \
+            "https://files.pythonhosted.org/packages/source/v/vllm/vllm-$VLLM_VERSION.tar.gz" \
+            "$tarball" || { rm -f "$tarball.part"; return 1; }
     fi
     local have
     have="$(sha256sum "$tarball" | cut -d' ' -f1)"
@@ -140,13 +198,157 @@ fetch_sdist() {
         || die "$tarball sha256 is $have, expected $VLLM_SDIST_SHA256"
 }
 
+# The record's sources: the sdist and, for a HyperQwen record, HyperQwen.
+fetch_record_sources() {
+    fetch_sdist
+    if [ -n "$HYPERQWEN_COMMIT" ]; then
+        fetch_source "HyperQwen" "$HYPERQWEN_REPO" "$HYPERQWEN_COMMIT" "$BUILD_ROOT/HyperQwen"
+    fi
+}
+
+# Unpack a pristine source tree and print its path.
+unpack_sdist() {
+    local src="$BUILD_ROOT/src/vllm-$VLLM_VERSION"
+    rm -rf "$src"
+    tar -xzf "$BUILD_ROOT/src/vllm-$VLLM_VERSION.tar.gz" -C "$BUILD_ROOT/src"
+    [ -d "$src/requirements" ] || die "$src has no requirements/ directory"
+    echo "$src"
+}
+
+# The runtime set, deploy/vllm-builds/<version>.in, printed to stdout: the
+# release's own (requirements/cuda.txt with the requirements files it
+# includes) followed, for a HyperQwen record, by HyperQwen's
+# docker/requirements.txt -- without vllm (built here), flashinfer-cubin
+# (published only on flashinfer.ai's index since 0.6.14; FlashInfer
+# JIT-compiles instead), the CUDA compiler packages (nvidia-cuda-nvcc,
+# -crt, -cccl, nvidia-nvvm: HyperQwen pins pip's 13.0 set because its image
+# has no toolkit; ours carries the host's CUDA 13.1, which FlashInfer
+# compiles with -- M2, plan E8) and index lines (PyPI alone, M3). The release's torch
+# pin must be the record's. Where both name a package, uv applies both
+# specifiers, so a HyperQwen pin the release's specifier refuses fails
+# `make vllm-lock`. Inline comments are dropped; markers are kept.
+runtime_in() {
+    local src="$1" hq_req=""
+    [ -z "$HYPERQWEN_COMMIT" ] || hq_req="$BUILD_ROOT/HyperQwen/docker/requirements.txt"
+    "$PYTHON" -I - "$src/requirements/cuda.txt" "$hq_req" "$VLLM_VERSION" \
+        "$HYPERQWEN_COMMIT" "$VLLM_TORCH_PIN" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+cuda_txt, hq_req, version, hq_commit, torch_pin = sys.argv[1:6]
+DROP = {"vllm", "flashinfer-cubin",
+        "nvidia-cuda-nvcc", "nvidia-cuda-crt", "nvidia-cuda-cccl", "nvidia-nvvm"}
+# Extras that exist only to bring pip's CUDA compiler (nvcc, cccl) for a
+# host without a toolkit: humming-kernels' cu12/cu13 add nvcc and cccl
+# beside the runtime and nvrtc torch requires anyway. Humming picks the
+# system toolkit over pip's when both are present (checked in the 0.30.0
+# image: /usr/local/cuda, 13.1), so the image's CUDA_HOME serves it.
+DROP_EXTRAS = {"humming-kernels": {"cu12", "cu13"}}
+INDEX_OPTIONS = {"-i", "--index-url", "--extra-index-url", "-f", "--find-links"}
+INCLUDE_OPTIONS = {"-r", "--requirement"}
+
+
+def norm(name):
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def requirements(path, seen):
+    if path in seen:
+        sys.exit(f"error: {path} includes itself")
+    seen = seen | {path}
+    out = []
+    for raw in path.read_text().splitlines():
+        line = re.sub(r"(^|\s)#.*$", "", raw).strip()
+        if not line:
+            continue
+        if line.startswith("-"):
+            option = re.split(r"[\s=]", line, maxsplit=1)[0]
+            arg = line[len(option):].lstrip(" \t=").strip()
+            if option in INCLUDE_OPTIONS and arg:
+                out += requirements((path.parent / arg).resolve(), seen)
+            elif option in INDEX_OPTIONS:
+                continue
+            else:
+                sys.exit(f"error: {path}: unexpected option line {raw!r}")
+            continue
+        m = re.match(r"[A-Za-z0-9][A-Za-z0-9._-]*", line)
+        if not m:
+            sys.exit(f"error: {path}: cannot read {raw!r}")
+        if norm(m.group(0)) in DROP:
+            continue
+        drop = DROP_EXTRAS.get(norm(m.group(0)))
+        if drop:
+            rest = line[m.end():]
+            e = re.match(r"\s*\[([^\]]*)\]", rest)
+            if e:
+                keep = [x.strip() for x in e.group(1).split(",") if x.strip() and x.strip() not in drop]
+                line = m.group(0) + (f"[{','.join(keep)}]" if keep else "") + rest[e.end():]
+        out.append(line)
+    return out
+
+
+release = requirements(Path(cuda_txt).resolve(), frozenset())
+torch = [ln for ln in release if norm(re.match(r"[A-Za-z0-9._-]+", ln).group(0)) == "torch"]
+want = f"torch=={torch_pin}"
+if not torch:
+    release.append(want)
+elif [re.sub(r"\s+", "", ln) for ln in torch] != [want]:
+    sys.exit(f"error: vLLM {version} pins {torch}, the build record pins {want}")
+
+print(f"# vLLM {version} runtime set, written by scripts/build-vllm.sh --write-in")
+print(f"# (make vllm-lock VLLM_VERSION={version}) and hash-locked as {version}.lock.")
+print("# Do not edit it: change the build record and run make vllm-lock.")
+print("#")
+print(f"# vllm-{version} sdist: requirements/cuda.txt and the files it includes,")
+print("# without vllm, flashinfer-cubin, the CUDA compiler packages and index lines")
+print("# (PyPI alone).")
+print("\n".join(release))
+if hq_req:
+    hq = requirements(Path(hq_req).resolve(), frozenset())
+    print("#")
+    print(f"# HyperQwen {hq_commit}: docker/requirements.txt,")
+    print("# without vllm, flashinfer-cubin, the CUDA compiler packages (the image carries")
+    print("# the host's CUDA 13.1 toolkit, M2) and index lines.")
+    print("\n".join(hq))
+PY
+}
+
+# `--write-in`: (re)write the record's runtime set from its sources.
+write_in() {
+    local t
+    for t in git tar sha256sum "$PYTHON"; do
+        command -v "$t" >/dev/null || die "'$t' not found on PATH"
+    done
+    mkdir -p "$BUILD_ROOT"
+    fetch_record_sources
+    local src out="$VLLM_RECORD_DIR/$VLLM_VERSION.in"
+    src="$(unpack_sdist)"
+    runtime_in "$src" > "$out.tmp" || { rm -f "$out.tmp"; die "could not write $out"; }
+    mv "$out.tmp" "$out"
+    say "wrote $out"
+}
+
+# A build must use the runtime set the record's sources give: a stale .in
+# (and so a stale lock) is refused, not built.
+check_runtime_in() {
+    local src="$1" in="$VLLM_RECORD_DIR/$VLLM_VERSION.in"
+    [ -f "$in" ] || die "no runtime set $in -- run 'make vllm-lock VLLM_VERSION=$VLLM_VERSION'"
+    [ -f "$VLLM_RECORD_DIR/$VLLM_VERSION.lock" ] \
+        || die "no lock $VLLM_RECORD_DIR/$VLLM_VERSION.lock -- run 'make vllm-lock VLLM_VERSION=$VLLM_VERSION'"
+    runtime_in "$src" | cmp -s - "$in" \
+        || die "$in is not what the record's sources give -- run 'make vllm-lock VLLM_VERSION=$VLLM_VERSION' and review the lock's diff"
+}
+
 fetch_wheels() {
-    # Runtime set: exactly what HyperQwen pins. Build set: what pyproject's
-    # build-system asks for and the runtime set does not already carry.
+    # Runtime set: the record's hash lock, every file checked against it.
+    # Build set: what pyproject's build-system asks for and the runtime set
+    # does not already carry.
+    local lock="$VLLM_RECORD_DIR/$VLLM_VERSION.lock"
     mkdir -p "$BUILD_ROOT/wheels" "$BUILD_ROOT/wheels-build"
-    say "fetching runtime wheels (HyperQwen docker/requirements.txt)"
+    say "fetching runtime wheels ($VLLM_VERSION.lock, --require-hashes)"
     retry3 "fetching runtime wheels" "$PYTHON" -m pip download \
-        -r "$BUILD_ROOT/HyperQwen/docker/requirements.txt" -d "$BUILD_ROOT/wheels" \
+        -r "$lock" --require-hashes -d "$BUILD_ROOT/wheels" \
         --only-binary=:all: --no-cache-dir --progress-bar off -q
     say "fetching build-only wheels"
     retry3 "fetching build wheels" "$PYTHON" -m pip download \
@@ -166,28 +368,38 @@ preflight() {
         [ -f "$CUDA_HOME/include/$f" ] \
             || die "no $f under $CUDA_HOME/include (see the package list at the top of this script)"
     done
+    [ -f "$VLLM_HOST_INCLUDE/elfutils/libdwfl.h" ] \
+        || die "no elfutils/libdwfl.h under $VLLM_HOST_INCLUDE: install libdw-dev (sudo apt install libdw-dev)"
 }
 
-# Refuse to build against a pin the source tree no longer names: the table
-# above is only correct for the vLLM release it was written for.
+# Refuse to build against a pin or a repository the source tree no longer
+# names: the record's table is only correct for the vLLM release it was
+# written for (DeepGEMM, for one, moved to a vllm-project fork in 0.30.0).
 check_pins() {
-    local src="$1" row name ref file
+    local src="$1" row name repo ref file
     for row in "${EXTERNALS[@]}"; do
-        IFS='|' read -r name _ _ ref file _ <<< "$row"
-        grep -q -- "$ref" "$src/$file" \
-            || die "$name pin $ref is not named in $file -- update EXTERNALS for vLLM $VLLM_VERSION"
+        IFS='|' read -r name _ repo ref file _ <<< "$row"
+        grep -qF -- "$ref" "$src/$file" \
+            || die "$name pin $ref is not named in $file -- update the build record for vLLM $VLLM_VERSION"
+        grep -qF -- "$repo" "$src/$file" \
+            || die "$name repository $repo is not named in $file -- update the build record for vLLM $VLLM_VERSION"
     done
 }
 
-# Apply one patch series to the vLLM package directory. `--fuzz 0`: a patch
-# that needs fuzz to apply is a patch written for different code.
+series_names() {
+    sed -e 's/#.*//' -e 's/^[[:space:]]*//;s/[[:space:]]*$//' -e '/^$/d' "$1"
+}
+
+# Apply one patch series to the vLLM package directory, minus the names given
+# after the label. `--fuzz 0`: a patch that needs fuzz to apply is a patch
+# written for different code.
 apply_series() {
-    local src="$1" dir="$2" label="$3" skip="${4:-}" name
+    local src="$1" dir="$2" label="$3"; shift 3
+    local skips=" $* " name
     [ -f "$dir/series" ] || die "no series file in $dir"
-    sed -e 's/#.*//' -e 's/^[[:space:]]*//;s/[[:space:]]*$//' -e '/^$/d' "$dir/series" \
-    | while IFS= read -r name; do
-        if [ -n "$skip" ] && [ "$name" = "$skip" ]; then
-            echo "    skip $name (native in vLLM $VLLM_VERSION)"
+    series_names "$dir/series" | while IFS= read -r name; do
+        if [[ "$skips" == *" $name "* ]]; then
+            echo "    skip $name (the build record for vLLM $VLLM_VERSION skips it)"
             continue
         fi
         echo "    $name"
@@ -198,27 +410,121 @@ apply_series() {
 }
 
 apply_patches() {
-    local src="$1"
+    local src="$1" skip
     : > "$src/PATCHES.applied"
-    apply_series "$src" "$BUILD_ROOT/HyperQwen/patches" hyperqwen dflash2-backport.patch
-    grep -q '^hyperqwen/' "$src/PATCHES.applied" \
-        || die "no patch was applied -- empty patches/series?"
-    apply_series "$src" "$DEVAI_PATCH_DIR" devai
+    if [ -n "$HYPERQWEN_COMMIT" ]; then
+        for skip in "${HYPERQWEN_SKIP[@]}"; do
+            series_names "$BUILD_ROOT/HyperQwen/patches/series" | grep -qxF -- "$skip" \
+                || die "the build record skips $skip, which HyperQwen's series does not list"
+        done
+        apply_series "$src" "$BUILD_ROOT/HyperQwen/patches" hyperqwen "${HYPERQWEN_SKIP[@]}"
+        grep -q '^hyperqwen/' "$src/PATCHES.applied" \
+            || die "no patch was applied -- empty patches/series?"
+    fi
+    if [ -n "$DEVAI_PATCH_DIR" ]; then
+        apply_series "$src" "$DEVAI_PATCH_DIR" devai
+    fi
 }
 
-main() {
-    preflight
-    mkdir -p "$BUILD_ROOT/ext"
-    fetch_sdist
-    fetch_source "HyperQwen" "$HYPERQWEN_REPO" "$HYPERQWEN_COMMIT" "$BUILD_ROOT/HyperQwen"
-    fetch_wheels
+# The patches the wheel must carry, one marker per series the record names.
+verify_wheel() {
+    local wheel="$1"
+    "$PYTHON" -I - "$wheel" "${HYPERQWEN_COMMIT:+hyperqwen}" "${DEVAI_PATCH_DIR:+devai}" <<'PY'
+import sys, zipfile
+z = zipfile.ZipFile(sys.argv[1]); names = z.namelist()
+series = {a for a in sys.argv[2:] if a}
+assert any(n.startswith("vllm/_C") and n.endswith(".so") for n in names), "no compiled vllm/_C*.so"
+mtp = z.read("vllm/model_executor/models/qwen3_5_mtp.py").decode()
+if "hyperqwen" in series:
+    assert "draft_vocab_ids" in mtp, "HyperQwen qwen3_5-mtp-draft-vocab patch is not in the wheel"
+if "devai" in series:
+    assert "shares_target_vocab" in mtp, "devai qwen3_5-mtp-share-vocab-at-init patch is not in the wheel"
+PY
+}
 
-    local src="$BUILD_ROOT/src/vllm-$VLLM_VERSION"
-    say "unpacking a pristine source tree"
-    rm -rf "$src"
-    tar -xzf "$BUILD_ROOT/src/vllm-$VLLM_VERSION.tar.gz" -C "$BUILD_ROOT/src"
-    check_pins "$src"
+# Bump when the compile changes in a way compile_id's inputs do not show
+# (the compile functions' own source is hashed; what they call is not).
+COMPILE_SCHEMA=1
 
+# A content hash of every input the compiled wheel depends on: the build
+# record (sdist sha256, torch pin, HyperQwen commit and skips, EXTERNALS),
+# devai's patch files, the arch list, the compilers, Python, the source of
+# the functions that patch and compile, and COMPILE_SCHEMA. NOT the runtime
+# lock: only the wheelhouse and the image read it, so a lock-only change
+# (plan E8) reuses the wheel instead of compiling for twenty minutes.
+# Contents only, never paths, so a moved checkout gets the same id.
+compile_id() {
+    # A command substitution clears errexit; an input that fails must fail
+    # the id, not hash its absence.
+    set -e
+    {
+        echo "compile-schema=$COMPILE_SCHEMA"
+        echo "vllm=$VLLM_VERSION arch=$CUDA_ARCH_LIST"
+        "$CUDA_HOME/bin/nvcc" --version | tail -1
+        gcc --version | head -1
+        "$PYTHON" --version
+        sha256sum < "$VLLM_RECORD_DIR/$VLLM_VERSION.sh"
+        declare -f compile_wheel apply_patches apply_series series_names
+        if [ -n "$DEVAI_PATCH_DIR" ]; then
+            local f
+            for f in $(cd "$DEVAI_PATCH_DIR" && ls | LC_ALL=C sort); do
+                printf '%s ' "$f"
+                sha256sum < "$DEVAI_PATCH_DIR/$f"
+            done
+        fi
+    } | sha256sum | cut -c1-16
+}
+
+# The wheel kept for compile id $1, or nothing.
+compiled_wheel() {
+    local f
+    for f in "$BUILD_ROOT/compiled/$1"/vllm-*.whl; do
+        [ -f "$f" ] && { echo "$f"; return 0; }
+    done
+    return 0
+}
+
+# Keep the wheel just compiled ($2, from source tree $3) under its compile
+# id $1, with the patch list it carries. Only the newest is kept (about 380
+# MiB): the new copy is moved into place before the older ones go, so an
+# interrupted run never leaves a half-written id.
+keep_compiled() {
+    local id="$1" wheel="$2" src="$3" dir="$BUILD_ROOT/compiled" old
+    mkdir -p "$dir"
+    rm -rf "$dir/.partial"
+    mkdir "$dir/.partial"
+    cp "$wheel" "$src/PATCHES.applied" "$dir/.partial/"
+    rm -rf "${dir:?}/$id"
+    mv "$dir/.partial" "$dir/$id"
+    for old in "$dir"/*; do
+        [ "$old" = "$dir/$id" ] || rm -rf "$old"
+    done
+}
+
+# Put the wheel for this build in WHEEL: the one kept for the same compile
+# inputs when it is complete and passes verify_wheel, else a fresh compile
+# of source tree $1, which is then kept. VLLM_REBUILD=1 always compiles.
+build_wheel() {
+    local src="$1" id kept
+    id="$(compile_id)"
+    kept="$(compiled_wheel "$id")"
+    if [ -n "$kept" ] && [ "${VLLM_REBUILD:-0}" != 1 ]; then
+        if [ -f "$(dirname "$kept")/PATCHES.applied" ] && verify_wheel "$kept"; then
+            say "reusing the wheel compiled from the same inputs ($id; VLLM_REBUILD=1 compiles anew)"
+            cp "$(dirname "$kept")/PATCHES.applied" "$src/PATCHES.applied"
+            WHEEL="$kept"
+            return 0
+        fi
+        say "the wheel kept for $id is incomplete or failed verification; compiling anew"
+    fi
+    compile_wheel "$src"
+    keep_compiled "$id" "$WHEEL" "$src"
+}
+
+# Fetch the kernel repositories and Rust crates, apply the record's patch
+# series and compile the wheel; sets WHEEL to its path.
+compile_wheel() {
+    local src="$1"
     local row name var repo ref sub
     for row in "${EXTERNALS[@]}"; do
         IFS='|' read -r name var repo ref _ sub <<< "$row"
@@ -230,7 +536,7 @@ main() {
     say "fetching Rust crates"
     ( cd "$src/rust" && retry3 "cargo fetch" cargo fetch --locked --quiet )
 
-    say "applying the HyperQwen series, then devai's own (--fuzz 0)"
+    say "applying the record's patch series (--fuzz 0)"
     apply_patches "$src"
 
     say "creating the build venv"
@@ -240,7 +546,7 @@ main() {
     . "$BUILD_ROOT/venv/bin/activate"
     uv pip install --quiet --offline --no-index \
         --find-links "$BUILD_ROOT/wheels" --find-links "$BUILD_ROOT/wheels-build" \
-        "torch==2.13.0" numpy ninja packaging "setuptools>=77.0.3,<81.0.0" \
+        "torch==$VLLM_TORCH_PIN" numpy ninja packaging "setuptools>=77.0.3,<81.0.0" \
         "setuptools-scm>=8" "setuptools-rust>=1.9.0" wheel jinja2 regex build protobuf
 
     say "compiling vLLM $VLLM_VERSION for sm$CUDA_ARCH_LIST (-j$JOBS); this takes a while"
@@ -255,30 +561,47 @@ main() {
     ( cd "$src" && python -m build --wheel --no-isolation --skip-dependency-check \
           --outdir dist . )
 
+    WHEEL="$(ls "$src"/dist/vllm-*.whl 2>/dev/null | head -1)"
+    [ -n "$WHEEL" ] || die "the build produced no wheel"
+    verify_wheel "$WHEEL" || die "the wheel failed verification"
+}
+
+main() {
+    case "${1:-}" in
+        --write-in) write_in; return;;
+        "") ;;
+        *) die "usage: build-vllm.sh [--write-in]";;
+    esac
+    preflight
+    mkdir -p "$BUILD_ROOT/ext"
+    fetch_record_sources
+
+    local src
+    say "unpacking a pristine source tree"
+    src="$(unpack_sdist)"
+    check_pins "$src"
+    check_runtime_in "$src"
+    fetch_wheels
+
     local wheel
-    wheel="$(ls "$src"/dist/vllm-*.whl 2>/dev/null | head -1)"
-    [ -n "$wheel" ] || die "the build produced no wheel"
-    "$PYTHON" - "$wheel" <<'PY' || die "the wheel failed verification"
-import sys, zipfile
-z = zipfile.ZipFile(sys.argv[1]); names = z.namelist()
-assert any(n.startswith("vllm/_C") and n.endswith(".so") for n in names), "no compiled vllm/_C*.so"
-mtp = z.read("vllm/model_executor/models/qwen3_5_mtp.py").decode()
-assert "draft_vocab_ids" in mtp, "HyperQwen qwen3_5-mtp-draft-vocab patch is not in the wheel"
-assert "shares_target_vocab" in mtp, "devai qwen3_5-mtp-share-vocab-at-init patch is not in the wheel"
-PY
+    build_wheel "$src"
+    wheel="$WHEEL"
 
     say "publishing the wheelhouse"
-    local dist="$BUILD_ROOT/dist"
+    local dist="$BUILD_ROOT/dist" devai_applied
     rm -rf "$dist"
     mkdir -p "$dist/wheels"
     cp "$BUILD_ROOT"/wheels/*.whl "$dist/wheels/"
-    rm -f "$dist"/wheels/vllm-*.whl          # the PyPI build; ours replaces it
+    rm -f "$dist"/wheels/vllm-*.whl          # a PyPI build, if any; ours replaces it
     cp "$wheel" "$dist/wheels/"
-    cp "$BUILD_ROOT/HyperQwen/docker/requirements.txt" "$dist/requirements.txt"
+    cp "$VLLM_RECORD_DIR/$VLLM_VERSION.lock" "$dist/requirements.txt"
     cp "$src/PATCHES.applied" "$dist/PATCHES.applied"
+    devai_applied="$(sed -n 's|^devai/||p' "$src/PATCHES.applied" | paste -sd, -)"
     {
         echo "vllm=$VLLM_VERSION"
-        echo "hyperqwen=$HYPERQWEN_COMMIT"
+        echo "hyperqwen=${HYPERQWEN_COMMIT:-none}"
+        echo "devai_patches=${devai_applied:-none}"
+        echo "torch=$VLLM_TORCH_PIN"
         echo "cuda_arch=$CUDA_ARCH_LIST"
         echo "cuda_home=$CUDA_HOME"
     } > "$dist/BUILD_INFO"

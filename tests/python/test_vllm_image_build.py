@@ -11,6 +11,9 @@ being wrong:
   * an online `pip install` would quietly pull PyPI's vLLM over ours,
   * a wheelhouse still carrying PyPI's vLLM wheel would do the same offline,
   * an install without the patches starts fine and behaves like stock vLLM,
+  * a runtime set other than the build record's hash lock (platform-rebuild
+    4v: the lock with --require-hashes, then our wheel with --no-deps, then
+    `pip check`),
   * a `python3` that is not the venv's breaks the router's launch command,
     which is `python3 -m vllm.entrypoints.openai.api_server ...`.
 
@@ -27,6 +30,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 DOCKERFILE = (REPO_ROOT / "deploy" / "Dockerfile.vllm").read_text()
 MAKEFILE = (REPO_ROOT / "Makefile").read_text()
 SCRIPT = (REPO_ROOT / "scripts" / "build-vllm.sh").read_text()
+RECORDS = sorted((REPO_ROOT / "deploy" / "vllm-builds").glob("*.sh"))
 ROUTER = (REPO_ROOT / "gpu-arbiter" / "main.go").read_text()
 WORKFLOW = (REPO_ROOT / ".github" / "workflows" / "security-blocking.yml").read_text()
 
@@ -58,6 +62,24 @@ class DockerfileTest(unittest.TestCase):
         self.assertIn("grep -q draft_vocab_ids", body)
         self.assertIn("lacks the HyperQwen patches", body)
         self.assertIn("no compiled _C extension", body)
+
+    def test_the_hyperqwen_check_runs_only_when_build_info_names_a_commit(self) -> None:
+        # A record without HyperQwen (Phase 23's stock 0.31.0, I29) writes
+        # `hyperqwen=none`; its image must build without the check.
+        body = _executed(DOCKERFILE)
+        guard = body.index("""if grep -Eq '^hyperqwen=[0-9a-f]{40}$' "$D/BUILD_INFO"; then""")
+        self.assertLess(guard, body.index("grep -q draft_vocab_ids"))
+        self.assertIn('echo "hyperqwen=${HYPERQWEN_COMMIT:-none}"', SCRIPT)
+
+    def test_runtime_set_is_the_lock_then_our_wheel_then_pip_check(self) -> None:
+        body = _executed(DOCKERFILE)
+        lock = body.index('--require-hashes -r "$D/requirements.txt"')
+        wheel = body.index('--no-deps "$D"/wheels/vllm-*.whl')
+        check = body.index("/opt/vllm/bin/pip check")
+        self.assertLess(lock, wheel)
+        self.assertLess(wheel, check)
+        # ... and the dist's requirements.txt IS the record's lock.
+        self.assertIn('cp "$VLLM_RECORD_DIR/$VLLM_VERSION.lock" "$dist/requirements.txt"', SCRIPT)
 
     def test_python3_on_path_is_the_venv_the_router_launches_through(self) -> None:
         # The venv must come FIRST: Debian's own python3 is installed too.
@@ -92,6 +114,8 @@ class DockerfileTest(unittest.TestCase):
         recipe = MAKEFILE.split("\nbuild-vllm-image:", 1)[1].split("\n\n", 1)[0]
         self.assertRegex(recipe, r"--build-arg DIST_ID=\$\$\(cat \$\(VLLM_DIST\)/wheels/vllm-\*\.whl")
         self.assertIn("sha256sum", recipe)
+        # A new lock changes the install as much as a new wheel does.
+        self.assertIn("$(VLLM_DIST)/requirements.txt | sha256sum", recipe)
 
     def test_the_ollama_image_has_the_same_protection(self) -> None:
         dockerfile = (REPO_ROOT / "deploy" / "Dockerfile.ollama").read_text()
@@ -117,9 +141,17 @@ class MakefileTest(unittest.TestCase):
         self.assertIn("-f deploy/Dockerfile.vllm", recipe)
         self.assertIn("run 'make build-vllm-dist' first", recipe)
 
-    def test_dist_lives_outside_the_volume_backed_cache_tree(self) -> None:
-        self.assertRegex(MAKEFILE, r"(?m)^VLLM_DIST \?= \$\(HOME\)/\.cache/devai/vllm-build/dist$")
-        self.assertIn('BUILD_ROOT="${VLLM_BUILD_ROOT:-$HOME/.cache/devai/vllm-build}"', SCRIPT)
+    def test_dist_lives_outside_the_volume_backed_cache_tree_one_root_per_version(self) -> None:
+        # One build root per version (4v): a 0.30.0 build deletes only its
+        # own dist/, never 0.28.0's wheelhouse, which is the rollback.
+        self.assertRegex(MAKEFILE, r"(?m)^VLLM_BUILD_ROOT \?= \$\(HOME\)/\.cache/devai/vllm-build/\$\(VLLM_VERSION\)$")
+        self.assertRegex(MAKEFILE, r"(?m)^VLLM_DIST \?= \$\(VLLM_BUILD_ROOT\)/dist$")
+        self.assertIn('BUILD_ROOT="${VLLM_BUILD_ROOT:-$HOME/.cache/devai/vllm-build/$VLLM_VERSION}"', SCRIPT)
+
+    def test_dist_target_builds_the_version_it_is_given(self) -> None:
+        recipe = self._recipe("build-vllm-dist")
+        self.assertIn("VLLM_VERSION=$(VLLM_VERSION) VLLM_BUILD_ROOT=$(VLLM_BUILD_ROOT)", recipe)
+        self.assertRegex(MAKEFILE, r"(?m)^VLLM_VERSION \?= 0\.30\.0$")
 
     def test_build_vllm_does_both_steps_in_order(self) -> None:
         self.assertRegex(MAKEFILE, r"(?m)^build-vllm: build-vllm-dist build-vllm-image\b")
@@ -131,23 +163,33 @@ class BuildScriptShapeTest(unittest.TestCase):
         self.assertIn('TORCH_CUDA_ARCH_LIST="$CUDA_ARCH_LIST"', SCRIPT)
 
     def test_sdist_is_hash_pinned(self) -> None:
-        self.assertRegex(SCRIPT, r'VLLM_SDIST_SHA256="\$\{VLLM_SDIST_SHA256:-[0-9a-f]{64}\}"')
+        for record in RECORDS:
+            self.assertRegex(record.read_text(), r"(?m)^VLLM_SDIST_SHA256=[0-9a-f]{64}$", record.name)
         self.assertIn("sha256sum", SCRIPT)
+        self.assertIn('[ "$have" = "$VLLM_SDIST_SHA256" ]', SCRIPT)
 
-    def test_hyperqwen_is_pinned_to_a_full_commit(self) -> None:
-        self.assertRegex(SCRIPT, r'HYPERQWEN_COMMIT="\$\{HYPERQWEN_COMMIT:-[0-9a-f]{40}\}"')
+    def test_hyperqwen_is_pinned_to_a_full_commit_or_absent(self) -> None:
+        for record in RECORDS:
+            self.assertRegex(record.read_text(), r"(?m)^HYPERQWEN_COMMIT=([0-9a-f]{40})?$", record.name)
+        self.assertIn("HYPERQWEN_COMMIT must be a full 40-hex commit or empty", SCRIPT)
 
     def test_patches_are_applied_without_fuzz(self) -> None:
         self.assertIn("patch -p1 --fuzz 0", _executed(SCRIPT))
 
     def test_every_external_has_a_source_dir_override_and_a_pin_file(self) -> None:
-        rows = re.findall(r'(?m)^  "([^"]+)"$', SCRIPT)
-        self.assertEqual(len(rows), 9)
-        for row in rows:
-            name, var, repo, ref, pinfile = row.split("|")[:5]
-            self.assertTrue(var.endswith("_SRC_DIR"), row)
-            self.assertTrue(repo.startswith("https://"), row)
-            self.assertTrue(ref and pinfile, row)
+        counts = {}
+        for record in RECORDS:
+            rows = re.findall(r'(?m)^  "([^"]+)"$', record.read_text())
+            counts[record.stem] = len(rows)
+            for row in rows:
+                name, var, repo, ref, pinfile = row.split("|")[:5]
+                self.assertTrue(var.endswith("_SRC_DIR"), row)
+                self.assertTrue(repo.startswith("https://"), row)
+                self.assertTrue(ref and pinfile, row)
+        # 0.30.0 adds DeepSelect (CMakeLists.txt:1575), through DEEPSELECT_SRC_DIR.
+        self.assertEqual(counts["0.28.0"], 9)
+        self.assertEqual(counts["0.30.0"], 10)
+        self.assertNotRegex(SCRIPT, r'(?m)^  "[^"]+\|[A-Z_]+_SRC_DIR\|', "the table lives in the records")
 
     def test_the_published_wheelhouse_drops_the_pypi_vllm_wheel(self) -> None:
         body = _executed(SCRIPT)

@@ -1,0 +1,43 @@
+# devai-apt-cache: Debian's own apt-cacher-ng on debian:trixie-slim
+# (platform-rebuild Phase 2). Replaces sameersbn/apt-cacher-ng:latest, an
+# Ubuntu 22.04 image with no release since 2023.
+#
+# Build: make build-apt-cache (passes BASE_IMAGE = the Makefile's DEBIAN_IMAGE,
+# pinned by digest).
+#
+# Same contract as the image it replaces, so compose changes only the image
+# name: port 3142, cache at /var/cache/apt-cacher-ng, the daemon running as
+# apt-cacher-ng with uid and gid 101. The uid is the old image's: the existing
+# cache volume (/var/cache/devai/apt) holds files owned by 101, and trixie-slim
+# has neither uid nor gid 101 in use, so the user is created with that id
+# BEFORE the package (whose postinst then keeps it) and the volume needs no
+# chown. The old image's configuration differed from the package default by
+# PassThroughPattern: .* (CONNECT to any host, so https sources tunnel through)
+# and running in the foreground; both are in zz-devai.conf below
+# (apt-cacher-ng reads every *.conf in its configuration directory).
+
+ARG BASE_IMAGE=docker.io/library/debian:trixie-slim@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd
+FROM ${BASE_IMAGE}
+
+# Defaulted: the RUN below is `set -u`.
+ARG APT_PROXY=
+RUN set -eu; \
+    groupadd --system --gid 101 apt-cacher-ng; \
+    useradd --system --uid 101 --gid 101 --home-dir /var/cache/apt-cacher-ng \
+        --no-create-home --shell /usr/sbin/nologin apt-cacher-ng; \
+    if [ -n "$APT_PROXY" ]; then echo "Acquire::http::Proxy \"$APT_PROXY\";" > /etc/apt/apt.conf.d/00cache; fi; \
+    apt-get update; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends apt-cacher-ng; \
+    rm -rf /var/lib/apt/lists/* /etc/apt/apt.conf.d/00cache; \
+    [ "$(id -u apt-cacher-ng):$(id -g apt-cacher-ng)" = "101:101" ] \
+        || { echo "error: apt-cacher-ng is $(id apt-cacher-ng), expected 101:101" >&2; exit 1; }; \
+    printf 'PassThroughPattern: .*\nForeGround: 1\n' > /etc/apt-cacher-ng/zz-devai.conf; \
+    install -d -o apt-cacher-ng -g apt-cacher-ng -m 0755 \
+        /run/apt-cacher-ng /var/log/apt-cacher-ng /var/cache/apt-cacher-ng; \
+    dpkg-query -W apt-cacher-ng
+
+COPY deploy/apt-cache-healthcheck.sh /usr/local/bin/apt-cache-healthcheck
+
+USER apt-cacher-ng
+EXPOSE 3142
+ENTRYPOINT ["/usr/sbin/apt-cacher-ng", "-c", "/etc/apt-cacher-ng"]

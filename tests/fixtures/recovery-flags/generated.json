@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "models": {
+    "M": [
+      {"backends": ["vllm"], "engine_flags": ["--enforce-eager"], "source": "recipe", "reason": "r", "added": "a"},
+      {"engine_flags": ["--no-backends"]},
+      {"backends": null, "engine_flags": ["--null-backends"]},
+      {"backends": "vllm", "engine_flags": ["--string-backends"]},
+      {"backends": ["vllm", 5], "engine_flags": ["--non-string-backend"]},
+      {"backends": ["vllm", null], "engine_flags": ["--null-backend-element"]},
+      {"backends": ["vllm"], "engine_flags": "--flags-not-a-list"},
+      {"backends": ["vllm"], "engine_flags": ["--non-string-flag", 4]},
+      {"backends": ["vllm"], "engine_flags": ["--null-flag-element", null]},
+      {"backends": ["vllm"], "engine_flags": ["--non-string-env"], "engine_env": {"N": 4}},
+      {"backends": ["vllm"], "engine_flags": ["--null-env"], "engine_env": {"N": null}},
+      {"backends": ["vllm"], "engine_flags": ["--env-not-a-map"], "engine_env": ["A"]},
+      {"backends": ["vllm"], "engine_flags": ["--odd-source"], "source": 5},
+      {"backends": ["vllm"], "engine_flags": ["--image-ignored"], "image": "x/y:z"},
+      {"Backends": ["vllm"], "engine_flags": ["--case-backends"]},
+      {"backends": ["vllm"], "ENGINE_FLAGS": ["--upper"], "engine_flags": ["--case-flags"]},
+      {"backends": ["vllm-devai"], "engine_flags": ["--devai-only"], "engine_env": {"B": "2", "A": "generated"}},
+      {"backends": ["vllm"], "engine_flags": null, "engine_env": null},
+      {"backends": [], "engine_flags": ["--no-backend-named"]},
+      "not an object",
+      null
+    ],
+    "Other": "not a list",
+    "NullModel": null,
+    "G": [{"backends": ["sglang"], "engine_flags": ["--sglang-only"]}]
+  }
+}

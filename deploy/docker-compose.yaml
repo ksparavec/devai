@@ -1,36 +1,35 @@
 services:
   # Loopback-only publish: apt-cacher-ng is an unauthenticated open HTTP
-  # proxy. Its only consumers reach it over loopback or over devai-net --
-  # image builds run `podman build --network=host` with
-  # APT_PROXY=http://localhost:3142 (host netns -> host loopback), and the
-  # egress-locked lab reaches it by service name on devai-lab-egress, which
-  # is unaffected by port publishing. Nothing documented reaches it from
-  # another host.
+  # proxy. Its only consumers are image builds, which run `podman build
+  # --network=host` with APT_PROXY=http://localhost:3142 (host netns -> host
+  # loopback). Nothing documented reaches it from another host.
+  #
+  # NOT on devai-lab-egress (platform-rebuild Phase 2): it proxies any host,
+  # over CONNECT and over plain http, so from the egress-locked lab it was a
+  # way out around pipelock (tested 2026-10-10: example.com 200 both ways).
+  # The lab's apt never used it -- the lab configures no apt proxy -- and
+  # goes through pipelock like everything else.
+  #
+  # Built here (`make build-apt-cache`, deploy/Dockerfile.apt-cache): Debian's
+  # apt-cacher-ng as uid 101, the owner of the files already in the cache.
   apt-cache:
-    image: sameersbn/apt-cacher-ng:latest
+    image: localhost/devai-apt-cache:latest
     container_name: devai-apt-cache
     hostname: apt-cache
     ports:
       - "127.0.0.1:3142:3142"
     volumes:
       - /var/cache/devai/apt:/var/cache/apt-cacher-ng
-    networks: [default, devai-lab-egress]   # also reachable by the egress-locked lab
-    restart: unless-stopped
-
-  # Loopback-only publish, same reasoning as apt-cache above: the mirror
-  # is an unauthenticated pull-through registry, and its only consumer is
-  # the host's own podman via deploy/registries.conf, which hardcodes
-  # `location = "localhost:5000"`.
-  registry-cache:
-    image: registry:2
-    container_name: devai-registry-cache
-    hostname: registry-cache
-    ports:
-      - "127.0.0.1:5000:5000"
-    volumes:
-      - /var/cache/devai/registry:/var/lib/registry
-      - ./registry-config.yaml:/etc/docker/registry/config.yml:ro
-    networks: [default, devai-lab-egress]   # also reachable by the egress-locked lab
+    networks: [default]
+    # deploy/apt-cache-healthcheck.sh, baked into the image: one GET of the
+    # report page. No argument here may contain a space: podman-compose
+    # splits them, and `bash -c "<script>"` became `bash -c exec`, which
+    # passed whatever the daemon did.
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/apt-cache-healthcheck"]
+      interval: 10s
+      timeout: 2s
+      retries: 3
     restart: unless-stopped
 
   ollama:
@@ -68,9 +67,11 @@ services:
       - label=disable
     restart: unless-stopped
 
-  # vLLM and SGLang are router-managed: the gpu-arbiter replaces these
-  # containers on demand via libpod when a request arrives on the
-  # backend's port (11435/11436). The compose `entrypoint: sleep` is a
+  # vLLM is router-managed: the gpu-arbiter replaces these containers on
+  # demand via libpod when a request arrives on the backend's port
+  # (11435/11437). SGLang (11436) was frozen by platform-rebuild Phase 15
+  # (M16); its service is kept in attic/sglang/frozen-branches.txt.
+  # The compose `entrypoint: sleep` is a
   # placeholder so `make cache-up` produces a clean idle container the
   # router can stop+recreate atomically — without it, a real entrypoint
   # would either fail at boot (wrong model path) or claim the GPU
@@ -128,27 +129,56 @@ services:
       - label=disable
     restart: "no"
 
-  sglang:
-    image: ${SGLANG_IMAGE:-docker.io/lmsysorg/sglang:v0.5.16-cu130}
-    container_name: devai-sglang
-    hostname: sglang
+  # devai-slurm (docs/slurm.md Sec. 3.1; platform-rebuild Phase 5): Slurm
+  # (slurmctld, slurmdbd, slurmrestd, slurmd), MariaDB, nats-server and the
+  # bus log in ONE container, built here (`make build-slurm`), never pulled.
+  # Behind the `slurm` profile until Phase 9 makes the router its client:
+  # `make slurm-up` / `make slurm-down`; `make cache-up` leaves it alone.
+  #
+  # - pid: host -- the GPU guard and the sampler see and signal GPU holders,
+  #   whose PIDs NVML reports in the host namespace; tini -s (the image's
+  #   entrypoint) reaps, since it is not PID 1 here.
+  # - podman's default user namespace (no userns_mode; I26): its root is the
+  #   host user, so the guard can kill holders in rootless containers; jobs
+  #   run as devai, a subordinate uid, and cannot read the keys.
+  # - devai-net only, nothing published (C6, I13): slurmrestd :6820 and NATS
+  #   :4222 are reached by name on devai-net; no podman socket.
+  # - /run/devai is a tmpfs: the rendered nats-server.conf, the jobs bus
+  #   password copy, the sampler files.
+  # - The GPU for NVML only; no CUDA work runs here. Phase 11 makes it
+  #   optional (compose.gpu.yaml).
+  slurm:
+    image: ${SLURM_IMAGE:-localhost/devai-slurm:latest}
+    pull_policy: never
+    profiles: [slurm]
+    container_name: devai-slurm
+    hostname: devai-slurm
+    networks: [default]
+    pid: host
+    tmpfs:
+      - /run/devai
+    environment:
+      # For devai-jobs under `podman exec devai-slurm` (bin/devai-jobs; C7).
+      - SLURM_REST_URL=http://127.0.0.1:6820
+      - SLURM_JWT_KEY_FILE=/etc/slurm/jwt_hs256.key
+      - SLURM_USER=devai
     volumes:
-      - /var/cache/devai/sglang:/models:ro
-    entrypoint: ["sleep", "infinity"]
+      - /var/cache/devai/jobs:/var/cache/devai/jobs
+      # C7's files (make slurm-init), read-only: slurm.key, jwt_hs256.key,
+      # mariadb.pass and every bus user's nats/<user>.pass, which the
+      # entrypoint renders into nats-server.conf.
+      - ${DEVAI_SLURM_CONFIG_DIR:-${HOME}/.config/devai/slurm}:/etc/devai/slurm:ro
     devices:
       - ${DEVAI_GPU_DEVICE:-nvidia.com/gpu=all}
     security_opt:
       - label=disable
-    restart: "no"
+    restart: unless-stopped
 
   router:
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile.router
     # Fully-qualified to bypass unqualified-search-registries (docker.io)
-    # in registries.conf — otherwise the local mirror at localhost:5000
-    # can shadow the locally-built image with a stale `docker.io/library/...`
-    # copy. `make build-router` tags as `localhost/devai-router:latest`.
+    # in registries.conf. Built by `make build-router` (the host's Go, then
+    # deploy/Dockerfile.router), which tags `localhost/devai-router:latest`;
+    # compose has no build stanza because the binary is compiled outside it.
     image: localhost/devai-router:latest
     container_name: devai-router
     hostname: router
@@ -169,11 +199,6 @@ services:
       - VLLM_DEVAI_PORT=11437
       - VLLM_DEVAI_CONTAINER=devai-vllm-devai
       - VLLM_DEVAI_IMAGE=${VLLM_DEVAI_IMAGE:-docker.io/devai/vllm-devai:latest}
-      - SGLANG_URL=http://sglang:11434
-      - SGLANG_PORT=11436
-      - SGLANG_CONTAINER=devai-sglang
-      - SGLANG_IMAGE=${SGLANG_IMAGE:-docker.io/lmsysorg/sglang:v0.5.16-cu130}
-      - SGLANG_MODELS_DIR=/var/cache/devai/sglang
       # The laya trainer, a job runner (gpu-arbiter/job_runner.go). While a
       # job runs, requests that need the GPU for another backend get 503 +
       # Retry-After instead of evicting it, for at most LAYA_MAX_HOLD_S
@@ -200,14 +225,18 @@ services:
       # Launch circuit breaker: consecutive failed launches of the same
       # (model, ctx) before the router refuses to keep retrying. 0 disables.
       - DEVAI_MAX_FAILED_LAUNCHES=${DEVAI_MAX_FAILED_LAUNCHES:-3}
+      # Request fingerprints (docs/router.md "Request fingerprints"): one
+      # content-free line per POST when on; _RAW logs every body in full.
+      - DEVAI_REQUEST_FINGERPRINT=${DEVAI_REQUEST_FINGERPRINT:-off}
+      - DEVAI_REQUEST_FINGERPRINT_RAW=${DEVAI_REQUEST_FINGERPRINT_RAW:-off}
       - GPU_MEMORY_GB=${GPU_MEMORY_GB:-24}
       # The CDI device string the router stamps onto the vLLM/SGLang
       # containers it recreates (main.go, containerRecreate). The compose
       # services above interpolate ${DEVAI_GPU_DEVICE} into their OWN
       # device lists, but the router does not inherit the shell that ran
       # compose -- so without this line it fell back to the hardcoded
-      # nvidia.com/gpu=all default and every router-recreated backend was
-      # NVIDIA regardless of `make gpu-vendor VENDOR=amd`.
+      # nvidia.com/gpu=all default and every router-recreated backend got
+      # that default regardless of a DEVAI_GPU_DEVICE override.
       - DEVAI_GPU_DEVICE=${DEVAI_GPU_DEVICE:-nvidia.com/gpu=all}
       - MAX_CONTEXT_LEN=${MAX_CONTEXT_LEN:-262144}
       - DEVAI_REASONING=${DEVAI_REASONING:-auto}
@@ -222,11 +251,16 @@ services:
       # an actionable error rather than silently launching wrong.
       - VLLM_PLUGINS_REGISTRY=/etc/devai/vllm-plugins.json
       - VLLM_PLUGINS_HOST_DIR=${VLLM_PLUGINS_HOST_DIR:-}
-      # Per-model recovery flags + env (deploy/recovery-flags.json).
-      # Same JSON read by the vLLM/SGLang probers so probe and serve-time
-      # launches stay in sync. Missing file → no per-model overrides;
-      # behaviour identical to pre-registry builds.
-      - RECOVERY_FLAGS_REGISTRY=/etc/devai/recovery-flags.json
+      # Per-model recovery flags + env: the hand-curated
+      # deploy/recovery-flags.json, then the machine-made
+      # deploy/recovery-flags.generated.json (plan I25; scripts/recipe-apply.py
+      # writes it). Same two files the vLLM/SGLang probers read, so probe and
+      # serve-time launches stay in sync. Both are read from the deploy/
+      # DIRECTORY mount below and re-read at each launch when either changed
+      # (gpu-arbiter/recovery_flags.go). Missing file -> no per-model
+      # overrides from it.
+      - RECOVERY_FLAGS_REGISTRY=/etc/devai/deploy/recovery-flags.json
+      - RECOVERY_FLAGS_GENERATED=/etc/devai/deploy/recovery-flags.generated.json
       # Advertisement vetting (gpu-arbiter/advertise.go). The router lists
       # on /v1/models and /api/tags ONLY models that are probed AND
       # benched AND have weights in that backend's own store AND carry no
@@ -243,10 +277,9 @@ services:
       # vLLM/SGLang repo+sha-keyed). Each is independent — missing
       # files are not fatal, the corresponding backend just exposes no
       # models. The router reads them via PROBE_CACHE / VLLM_PROBE_CACHE
-      # / SGLANG_PROBE_CACHE env vars (defaults match these mount paths).
+      # / VLLM_DEVAI_PROBE_CACHE env vars (defaults match these mount paths).
       - ./.ollama-reasoning-cache.json:/etc/devai/.ollama-reasoning-cache.json:ro
       - ./.vllm-reasoning-cache.json:/etc/devai/.vllm-reasoning-cache.json:ro
-      - ./.sglang-reasoning-cache.json:/etc/devai/.sglang-reasoning-cache.json:ro
       - ./.vllm-devai-reasoning-cache.json:/etc/devai/.vllm-devai-reasoning-cache.json:ro
       # Catalog metadata side-table -- the router reads `mtp:` blocks
       # from deploy/models.yaml at startup to thread MTP launch params
@@ -261,9 +294,16 @@ services:
       # the router only needs the host path string (passed via env) to
       # forward to libpod when recreating the vLLM container.
       - ./vllm-plugins.json:/etc/devai/vllm-plugins.json:ro
-      # Per-model recovery flags + env. See header comment in the JSON
-      # file for schema; loaded by gpu-arbiter/recovery_flags.go.
-      - ./recovery-flags.json:/etc/devai/recovery-flags.json:ro
+      # The repository's deploy/ directory, read-only, for the two recovery
+      # files (RECOVERY_FLAGS_REGISTRY / RECOVERY_FLAGS_GENERATED above).
+      # A DIRECTORY, not single files: a file replaced with a new inode (the
+      # writers' rename, git checkout's unlink and create) is invisible
+      # through a single-file bind mount, which pins the old inode and goes
+      # on serving the old content (plan I25). Absolute and
+      # required: an unset DEVAI_REPO stops compose instead of mounting
+      # /deploy. The Makefile exports DEVAI_REPO=$(CURDIR); scripts that run
+      # compose themselves default it to the repository root.
+      - ${DEVAI_REPO:?DEVAI_REPO must be set to the repository root (the Makefile exports it)}/deploy:/etc/devai/deploy:ro
       # Bench cache + exclusion ledger, read once at startup for
       # advertisement vetting (see BENCH_CACHE / MODEL_STATUS_LEDGER
       # above). Read-only: the router is a consumer of both, never a
@@ -272,118 +312,16 @@ services:
       - ./.model-status.json:/etc/devai/.model-status.json:ro
       # The HF weight stores, read-only, at the SAME paths the router
       # hands to libpod as the backend containers' bind source -- so
-      # VLLM_MODELS_DIR / SGLANG_MODELS_DIR need no translation between
+      # VLLM_MODELS_DIR needs no translation between
       # "path I mount into the engine" and "path I can stat myself".
       # Used ONLY by checkModelWeights, which fails a launch fast when
       # the probe cache advertises a model whose weights were never
-      # downloaded (the live SGLANG_MODELS_DIR gap). Read-only: the
+      # downloaded (as the SGLang store once did). Read-only: the
       # router must never write into a model store.
       - ${VLLM_MODELS_DIR:-/var/cache/devai/vllm}:${VLLM_MODELS_DIR:-/var/cache/devai/vllm}:ro
-      - ${SGLANG_MODELS_DIR:-/var/cache/devai/sglang}:${SGLANG_MODELS_DIR:-/var/cache/devai/sglang}:ro
     depends_on:
       - ollama
     restart: unless-stopped
-
-  open-webui:
-    image: ghcr.io/open-webui/open-webui:main
-    container_name: devai-open-webui
-    hostname: open-webui
-    environment:
-      - OLLAMA_BASE_URL=http://router:11434
-    volumes:
-      - /var/cache/devai/open-webui:/app/backend/data
-    depends_on:
-      - router
-    restart: unless-stopped
-
-  webui-proxy:
-    image: docker.io/library/nginx:alpine
-    container_name: devai-webui-proxy
-    hostname: webui-proxy
-    ports:
-      - "${WEBUI_PORT:-8443}:443"
-    environment:
-      - HOST_IP=${HOST_IP:-localhost}
-    volumes:
-      - ./webui-proxy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
-      - ./webui-proxy/entrypoint.sh:/entrypoint.sh:ro
-      - ${HOME}/devai-home/.jupyter/ssl:/ssl:ro
-    entrypoint: ["/bin/sh", "/entrypoint.sh"]
-    depends_on:
-      - open-webui
-    restart: unless-stopped
-
-  # MCP Gateway (per docs/plans/mcp-gateway.md). Phase 1 ships the 10
-  # Tier 1 servers (no secrets). Phase 2 adds the four Tier 2 servers
-  # with sops-rendered secrets at /run/devai/mcp-secrets.env (mounted
-  # only when present; absent on Phase 1 installs).
-  #
-  # Started by default per decision 5 in the plan. Operator can opt
-  # out by setting MCP_PROFILE=mcp-disabled in .env (compose ignores
-  # the service when its profile doesn't match).
-  mcp-gateway:
-    image: docker.io/docker/mcp-gateway:v0.43.3
-    container_name: devai-mcp-gateway
-    hostname: mcp-gateway
-    restart: unless-stopped
-    # Dual-homed, exactly like router/apt-cache/registry-cache/pipelock.
-    # The lab containers sit on devai-lab-egress; a service published only
-    # on devai-net is simply unresolvable from them, which is what made
-    # this gateway unreachable from every agent regardless of its config.
-    networks: [default, devai-lab-egress]
-    # Loopback-only publish. This service holds a READ-WRITE podman socket
-    # (below) and must keep it rw -- creating per-call MCP server containers
-    # is its whole job -- so container-create here is equivalent to host
-    # root. Binding the published port to 127.0.0.1 is the mitigation: it
-    # keeps unauthenticated MCP tool calls off the LAN. Remote clients need
-    # an SSH tunnel or an authenticating reverse proxy in front.
-    ports:
-      - "127.0.0.1:${MCP_PORT:-8088}:8088"
-    volumes:
-      - ${XDG_RUNTIME_DIR:-/run/user/1000}/podman/podman.sock:/var/run/docker.sock:Z
-      # First-party catalog only. Mounted under the gateway's catalogs
-      # directory because v0.43.3 rejects a catalog path outside it --
-      # the old /app/catalog.yaml mount breaks on this version.
-      - ./mcp-catalog-devai.yaml:/root/.docker/mcp/catalogs/devai.yaml:ro
-      # Phase 2 secrets mount. /run/devai/mcp-secrets.env is rendered
-      # by `make mcp-secrets-render` from deploy/mcp-secrets.sops.env;
-      # absent on Phase 1 installs. Compose tolerates the missing
-      # source via the conditional bind path -- Podman will refuse to
-      # start the container if the source doesn't exist, so consumers
-      # who want Tier 2 must run mcp-secrets-render first; consumers
-      # who only want Tier 1 should leave the MCP_SECRETS_FILE env
-      # unset so this volume entry is dropped.
-      - ${MCP_SECRETS_FILE:-/dev/null}:/secrets/.env:ro
-      - mcp-state:/data
-    command:
-      # NOT --catalog: that REPLACES the built-in catalog. --additional-
-      # catalog merges ours on top of Docker's official one, so all the
-      # third-party servers below resolve from upstream (digest-pinned
-      # and maintained there) and only devai-model-status comes from us.
-      - "--additional-catalog=/root/.docker/mcp/catalogs/devai.yaml"
-      # Without --servers the gateway enables NOTHING and serves only its
-      # own mcp-find/mcp-add builtins -- a correct catalog alone yields
-      # "0 tools listed". Names are upstream catalog keys and are
-      # case-sensitive: `SQLite`, not `sqlite`.
-      #
-      # Tier 2 (github-official, firecrawl, hugging-face, context7) are
-      # listed here but only github-official and firecrawl need secrets;
-      # hugging-face and context7 are `type: remote` upstream and connect
-      # anonymously, so they work on a Phase 1 install too.
-      - "--servers=filesystem,git,SQLite,fetch,memory,time,sequentialthinking,duckduckgo,arxiv-mcp-server,wikipedia-mcp,github-official,firecrawl,hugging-face,context7,devai-model-status"
-      - "--port=8088"
-      - "--transport=streaming"
-      - "--block-secrets"
-      # Container-side path of the secrets mount above -- NOT an env-var
-      # indirection. It has to name the same path the volume entry binds
-      # to, otherwise a Phase 2 operator who renders /run/devai/mcp-secrets.env
-      # and sets MCP_SECRETS_FILE still hands the gateway an empty file.
-      # On Phase 1 installs the mount source is /dev/null, so this reads
-      # as an empty secrets file and Tier 2 servers simply stay unusable.
-      - "--secrets=/secrets/.env"
-    security_opt:
-      - "no-new-privileges:true"
-    profiles: [mcp]
 
   # Aggregates stdout from every devai-* service into per-container
   # log files on the host (/var/cache/devai/logs/<name>.log). Survives
@@ -419,8 +357,12 @@ services:
   # on it. Requires an operator-bootstrapped CA (`make pipelock-ca-init`);
   # without the host key it fails its healthcheck and the launcher refuses to
   # start the lab (fail-closed, not fail-open).
+  #
+  # Built here (`make build-pipelock`): scripts/build-pipelock.sh compiles
+  # the version that ran from ghcr.io until platform-rebuild Phase 2, and
+  # deploy/Dockerfile.pipelock keeps that image's paths.
   pipelock:
-    image: ghcr.io/luckypipewrench/pipelock:latest
+    image: localhost/devai-pipelock:latest
     container_name: devai-pipelock
     hostname: pipelock
     command: ["run", "--listen", "0.0.0.0:8888", "--config", "/config/pipelock.yaml"]
@@ -455,10 +397,3 @@ networks:
   devai-lab-egress:
     name: devai-lab-egress
     external: true
-
-volumes:
-  # MCP gateway state (server logs, transient working data). Lives in
-  # podman's named-volume storage; survives container restarts. Wipe
-  # via `podman volume rm devai_mcp-state` if it ever gets corrupted.
-  mcp-state:
-

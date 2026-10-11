@@ -71,8 +71,7 @@ class _PiHome:
 VETTED = {
     "ollama": ["qwen3.6:27b-q4_K_M"],
     "vllm": ["Qwen3-8B-NVFP4@32768", "gpt-oss-20b@131072"],
-    "sglang": ["gpt-oss-20b@131072"],
-}
+}  # its "sglang" entry left with SGLang (platform-rebuild Phase 15, M16)
 
 
 def _ids(cfg: dict, provider: str) -> list[str]:
@@ -90,10 +89,9 @@ class TestWritePiModels(unittest.TestCase):
             cfg = json.loads(path.read_text())
         self.assertEqual(
             sorted(p for p in cfg["providers"] if p.startswith("router-")),
-            ["router-ollama", "router-sglang", "router-vllm", "router-vllm-devai"])
+            ["router-ollama", "router-vllm", "router-vllm-devai"])
         self.assertEqual(sorted(_ids(cfg, "router-vllm")),
                          ["Qwen3-8B-NVFP4@32768", "gpt-oss-20b@131072"])
-        self.assertEqual(_ids(cfg, "router-sglang"), ["gpt-oss-20b@131072"])
         for prov in cfg["providers"].values():
             self.assertEqual(prov["api"], "openai-completions")
             self.assertEqual(prov["apiKey"], "local")
@@ -203,6 +201,22 @@ class TestSeed(unittest.TestCase):
             prov = cfg["providers"][f"router-{bname}"]
             self.assertEqual(prov["baseUrl"], f"http://devai-router:{port}/v1")
             self.assertEqual(prov["api"], "openai-completions")
+
+
+class TestFetchPinned(unittest.TestCase):
+    """fetch-cli downloads the PI_VERSION release, never releases/latest."""
+
+    def test_pi_is_pinned(self) -> None:
+        mk = (REPO_ROOT / "Makefile").read_text()
+        self.assertRegex(mk, r"(?m)^PI_VERSION \?= \d+\.\d+\.\d+$")
+        self.assertIn(
+            "https://github.com/earendil-works/pi/releases/download/"
+            "v$(PI_VERSION)/pi-linux-$${PI_ARCH}.tar.gz", mk)
+        self.assertNotIn("earendil-works/pi/releases/latest", mk)
+
+    def test_fetch_refuses_a_binary_of_another_version(self) -> None:
+        mk = (REPO_ROOT / "Makefile").read_text()
+        self.assertIn('[ "$$VERSION" = "$(PI_VERSION)" ]', mk)
 
 
 if __name__ == "__main__":

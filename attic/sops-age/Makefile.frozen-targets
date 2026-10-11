@@ -1,0 +1,110 @@
+# Frozen Makefile pieces -- sops/age secret-store scaffold
+#
+# Removed from the top-level Makefile on 2026-10-07 (platform-rebuild
+# Phase 1, operator decision M12). Verbatim copy of each block, cut from
+# the Makefile at commit 4614adc; the comment line above each block says
+# where it sat. Read ../RESTORE.md first.
+
+# ---- (1) fetch-cli: the sops and age download blocks (between the Gemini
+# CLI block and the aiagent block). They fetched the LATEST release of each,
+# unpinned, into $(CACHE_DIR)/pip/bin/; nothing installed them into an image
+# (deploy/Dockerfile.lab never referenced sops or age), so the scaffold used
+# the host's own binaries. Note: each ETag file is part of BIN_HASH.
+	@# sops + age (sops-age-secrets plan): static Go binaries from GitHub
+	@# releases. ETag-stamped per the existing CLI pattern. Both projects
+	@# publish single-arch binaries with a -linux-${arch}.tar.gz naming
+	@# convention; we curl the asset, verify it's non-empty, and unpack
+	@# into /var/cache/devai/pip/bin/.
+	@ARCH=$$(dpkg --print-architecture) \
+		&& case "$$ARCH" in amd64) SOPS_ARCH=amd64;; arm64) SOPS_ARCH=arm64;; esac \
+		&& SOPS_VERSION=$$(curl -fsSL https://api.github.com/repos/getsops/sops/releases/latest | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])") \
+		&& HTTP_CODE=$$(curl -fsSL -w '%{http_code}' -o $(CACHE_DIR)/pip/bin/sops.tmp \
+			--etag-compare $(ETAG_DIR)/sops.etag --etag-save $(ETAG_DIR)/sops.etag \
+			"https://github.com/getsops/sops/releases/latest/download/sops-$${SOPS_VERSION}.linux.$${SOPS_ARCH}") \
+		&& if [ "$$HTTP_CODE" = "304" ] || [ ! -s $(CACHE_DIR)/pip/bin/sops.tmp ]; then \
+			rm -f $(CACHE_DIR)/pip/bin/sops.tmp; STATE="up to date"; \
+		else \
+			mv $(CACHE_DIR)/pip/bin/sops.tmp $(CACHE_DIR)/pip/bin/sops \
+			&& chmod +x $(CACHE_DIR)/pip/bin/sops && STATE="updated"; fi \
+		&& VERSION=$$($(CACHE_DIR)/pip/bin/sops --version 2>&1 | awk '{print $$2; exit}' || echo "?") \
+		&& echo "sops: $$STATE ($$VERSION)"
+	@# age + age-keygen ship in one tarball.
+	@ARCH=$$(dpkg --print-architecture) \
+		&& case "$$ARCH" in amd64) AGE_ARCH=amd64;; arm64) AGE_ARCH=arm64;; esac \
+		&& AGE_VERSION=$$(curl -fsSL https://api.github.com/repos/FiloSottile/age/releases/latest | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])") \
+		&& HTTP_CODE=$$(curl -fsSL -w '%{http_code}' -o $(CACHE_DIR)/pip/bin/age.tar.gz \
+			--etag-compare $(ETAG_DIR)/age.etag --etag-save $(ETAG_DIR)/age.etag \
+			"https://github.com/FiloSottile/age/releases/latest/download/age-$${AGE_VERSION}-linux-$${AGE_ARCH}.tar.gz") \
+		&& if [ "$$HTTP_CODE" = "304" ] || [ ! -s $(CACHE_DIR)/pip/bin/age.tar.gz ]; then \
+			rm -f $(CACHE_DIR)/pip/bin/age.tar.gz; STATE="up to date"; \
+		else \
+			tar -xzf $(CACHE_DIR)/pip/bin/age.tar.gz -C $(CACHE_DIR)/pip/bin --strip-components=1 age/age age/age-keygen \
+			&& chmod +x $(CACHE_DIR)/pip/bin/age $(CACHE_DIR)/pip/bin/age-keygen \
+			&& rm -f $(CACHE_DIR)/pip/bin/age.tar.gz && STATE="updated"; fi \
+		&& VERSION=$$($(CACHE_DIR)/pip/bin/age --version 2>&1 | head -n1 || echo "?") \
+		&& echo "age: $$STATE ($$VERSION)"
+
+# ---- (2) .PHONY line (test-python, also on it, stays live).
+.PHONY: secrets-tmpfs secrets-edit secrets-render secrets-rotate age-keygen-host test-python
+
+# ---- (3) the scaffold's own targets (after `prune`).
+# sops/age secret-store scaffold (per docs/plans/sops-age-secrets.md).
+# A consumer wraps secrets-render with its own (input, output) pair and
+# gates cache-up on the result. mcp-gateway Tier 2 is the only live
+# consumer; the cluster-mode and SkyPilot-fleet consumers were frozen on
+# 2026-07-25 (see attic/README.md).
+SOPS_FILE ?=
+
+secrets-tmpfs: ## Mount /run/devai as a 4 MiB tmpfs (one-time per boot)
+	@# Idempotent. Sudo because tmpfs requires CAP_SYS_ADMIN.
+	sudo bash deploy/setup-secrets-tmpfs.sh
+
+secrets-edit: ## Edit a sops-encrypted file in place. Pass SOPS_FILE=deploy/<name>.sops.env
+	@if [ -z "$(SOPS_FILE)" ]; then \
+		echo "ERROR: pass SOPS_FILE=deploy/<name>.sops.env" >&2; exit 2; \
+	fi
+	sops "$(SOPS_FILE)"
+
+secrets-render: ## Generic single-file render: pass SOPS_FILE and DEST. Consumer plans wrap this with concrete pairs.
+	@if [ -z "$(SOPS_FILE)" ] || [ -z "$(DEST)" ]; then \
+		echo "ERROR: pass SOPS_FILE=deploy/<name>.sops.env DEST=/run/devai/<name>.env" >&2; \
+		echo "       Or use a consumer-plan target (e.g. 'make mcp-secrets-render')." >&2; \
+		exit 2; \
+	fi
+	bash scripts/render-secret.sh "$(SOPS_FILE)" "$(DEST)"
+
+secrets-rotate: ## Re-key every deploy/*.sops.env file against the current .sops.yaml recipient list
+	@for f in deploy/*.sops.env; do \
+		if [ -f "$$f" ]; then \
+			echo ">>> updating keys for $$f"; \
+			sops updatekeys -y "$$f"; \
+		fi; \
+	done
+
+age-keygen-host: ## Generate a per-host age keypair under ~/.config/sops/age/ and print the public key
+	bash scripts/age-keygen-host.sh
+
+# ---- (4) mcp-secrets-render: the scaffold's last consumer. The MCP
+# gateway it rendered for was deleted on 2026-10-07 (M10), so this target
+# has nothing to serve; kept here only as the worked example of a consumer
+# wrapping secrets-render. Its .PHONY name sat on the MCP line:
+.PHONY: mcp-up mcp-down mcp-logs mcp-test mcp-health mcp-secrets-render test-mcp-modelstatus
+mcp-secrets-render: secrets-tmpfs ## Render deploy/mcp-secrets.sops.env to /run/devai/mcp-secrets.env
+	@# Phase 2 wrapper around the shared scripts/render-secret.sh.
+	@# Operator must have:
+	@#   1. ran `make age-keygen-host` once (ships under sops-age plan)
+	@#   2. added the printed public key to .sops.yaml
+	@#   3. encrypted real values into deploy/mcp-secrets.sops.env via
+	@#      `cp .../mcp-secrets.sops.env.example /tmp/mcp.env`,
+	@#      `sops --encrypt /tmp/mcp.env > deploy/mcp-secrets.sops.env`,
+	@#      `shred -u /tmp/mcp.env`
+	@if [ ! -f deploy/mcp-secrets.sops.env ]; then \
+		echo "ERROR: deploy/mcp-secrets.sops.env not present." >&2; \
+		echo "       See deploy/mcp-secrets.sops.env.example for the" >&2; \
+		echo "       expected variable names. Encrypt your file with" >&2; \
+		echo "       sops, then re-run this target." >&2; \
+		exit 1; \
+	fi
+	bash scripts/render-secret.sh \
+	     deploy/mcp-secrets.sops.env \
+	     /run/devai/mcp-secrets.env

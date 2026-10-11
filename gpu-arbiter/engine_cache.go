@@ -72,3 +72,55 @@ func engineCacheVolumes(backend string) []map[string]any {
 		"Name": engineCacheVolumeName(backend, engine), "Dest": "/root/.cache/" + engine,
 	})
 }
+
+// Run-time FlashInfer cubin downloads are disabled for these backends
+// (platform-rebuild Phase 4 step 4v, "Run-time cubins off for every 4v
+// launch"). Without the variable, vLLM GETs NVIDIA's artifactory at
+// startup (0.28.0 vllm/utils/flashinfer.py:367-414) and, if it answers,
+// may select the TRTLLM XQA decode kernels on SM12x; with it, every kernel
+// comes from the image or its nvcc JIT compile, as Phase 4d's launcher
+// will serve. Scoped to the home-built vLLM only: the stock image is not
+// part of 4v's measurement. The probers set the same value for the same
+// backends (scripts/_probe_hf_common.py, NO_RUNTIME_CUBINS_ENV); the tests
+// on both sides pin it. Phase 8 moves the constant into pkg/engineargs.
+const (
+	flashinferCubinsRepositoryEnv = "FLASHINFER_CUBINS_REPOSITORY"
+	noRuntimeCubinsRepository     = "file:///nonexistent/"
+)
+
+var noRuntimeCubinsBackends = map[string]bool{"vllm-devai": true}
+
+// engineEnvDefaults is the engine environment every launch on `backend`
+// carries, whatever the model. buildContainerSpec applies it last, so
+// neither the backend's EnvVars nor a model's recovery env can re-enable
+// run-time downloads (the probers use the same precedence).
+func engineEnvDefaults(backend string) map[string]string {
+	if !noRuntimeCubinsBackends[backend] {
+		return nil
+	}
+	return map[string]string{flashinferCubinsRepositoryEnv: noRuntimeCubinsRepository}
+}
+
+// prefixCacheRetentionArgs keeps vLLM's prefix-cache checkpoints dense.
+// vLLM 0.30.0 defaults --prefix-cache-retention-interval to 0, which under
+// MTP keeps less of each previous turn: on the teacher
+// (Qwen3.8-27B-MTP-devai-NVFP4::mtp@118784, 5-turn sessions with
+// 1,024-token replies, 8 sessions per setting) None cached 29,120 prompt
+// tokens per session against 24,128 and cut turn-2+ TTFT to 0.72x. Adopted
+// by plan 4v's retention rule on 2026-10-07, with both prepared rows
+// passing their exact-context and load probes with it (docs/backends.md
+// "vLLM 0.30.0"). Only the home-built vLLM has the flag: stock 0.22.1
+// refuses it. The probers emit the same constant
+// (scripts/probe-vllm-devai-reasoning.py); Phase 8 moves it into
+// pkg/engineargs.
+var prefixCacheRetentionArgs = []string{"--prefix-cache-retention-interval", "None"}
+
+// engineArgDefaults is the engine argv every launch on `backend` carries,
+// whatever the model. vllmEntrypoint emits it before the recovery flags,
+// so a model's recovery entry can still override a value (last flag wins).
+func engineArgDefaults(backend string) []string {
+	if backend != "vllm-devai" {
+		return nil
+	}
+	return append([]string(nil), prefixCacheRetentionArgs...)
+}

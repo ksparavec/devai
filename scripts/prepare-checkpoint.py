@@ -66,8 +66,11 @@ IMAGE = "docker.io/devai/vllm-devai:latest"   # local image store only, never pu
 VENDOR_DIR = REPO_ROOT / "third_party" / "hyperqwen"
 VENDOR_URL = "https://github.com/syv-ai/HyperQwen"
 VENDOR_LICENSE = "Apache-2.0"
-# Must equal HYPERQWEN_COMMIT in scripts/build-vllm.sh: the vLLM patches and
-# these scripts are one series and are validated together upstream.
+# The commit the prepared checkpoints were made with, and the HyperQwen commit
+# of the 0.28.0 build record (deploy/vllm-builds/0.28.0.sh): upstream validates
+# its vLLM patches and these scripts together. Platform-rebuild 4v builds vLLM
+# 0.30.0 with a newer series (its own record) and does not prepare the
+# checkpoints again, so the vendored scripts stay here.
 VENDOR_COMMIT = "c0c81bbbbf91f11b54af7b95f49bd6d1570c2ba0"
 MANIFEST = "PREPARED.json"
 DRAFT_IDS = "prepare/draft_vocab_ids.json"

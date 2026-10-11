@@ -1,0 +1,69 @@
+# SGLang Makefile targets, removed from the live Makefile by platform-rebuild
+# Phase 15 (M16, 2026-10-10). Verbatim; restore by pasting them back, adding
+# them to the .PHONY lines, and bench-sglang to `bench:` and test-sglang to
+# `test:` (see RESTORE.md).
+
+test-probe-sglang: ## Smoke test: probe one HF model via SGLang, assert cache schema
+	@# Wall time ~60-120s. Same precondition as test-probe-vllm.
+	@# Notes that the schema is correct even when the model can't load
+	@# (e.g. SGLang+FP4 on this image — the cache records `fits: false`
+	@# with `evidence.kind: "infra"`).
+	./tests/test-probe-sglang.sh
+
+test-sglang: cache-up ## Live integration tests for the SGLang backend (mirror of test-vllm)
+	@# Skips entirely when the SGLang cache has no fitting entries
+	@# (e.g. when SGLang+FP4 fails on this image — see docs/backends.md).
+	./tests/test-router-sglang.sh
+
+probe-sglang: ## Probe every downloaded SGLang/HF model per (VRAM, CONTEXT) cell.
+	@# Pre-condition: same as probe-vllm — all GPU-owning backends down.
+	@# Knobs:
+	@#   PROBE_VRAMS_SGLANG=16G,24G  target VRAM bands
+	@#   PROBE_CONTEXTS=32K,...      ctx tiers
+	@#   PROBE_REPO=<regex>          filter catalog rows by repo
+	@#   PROBE_FORCE=1               re-probe every cell
+	@#   PROBE_FORCE_ARCH=1          re-probe top-level capability/arch
+	@#   PROBE_KV_CACHE_TYPE=fp8_e5m2  enforce a KV dtype for this pass
+	@#                               (default: none = engine default);
+	@#                               cells are stamped so serve time
+	@#                               reproduces the measured dtype
+	@#   PROBE_IGNORE_CURATED_PARSERS=1  card-derived parsers only: skip the
+	@#                               curated block and name heuristic (plan I24);
+	@#                               refused without PROBE_REPO, a scratch --cache
+	@#                               and a scratch --ledger
+	PROBE_KV_CACHE_TYPE="$(PROBE_KV_CACHE_TYPE)" \
+	PROBE_IGNORE_CURATED_PARSERS="$(PROBE_IGNORE_CURATED_PARSERS)" \
+	python3 scripts/probe-sglang-reasoning.py \
+	    --host-vram-gb $(GPU_MEMORY_GB) \
+	    --models-dir $(SGLANG_MODELS_DIR) \
+	    $(if $(PROBE_VRAMS_SGLANG),--vram $(PROBE_VRAMS_SGLANG),) \
+	    $(if $(PROBE_CONTEXTS),--ctx $(PROBE_CONTEXTS),) \
+	    $(if $(PROBE_REPO),--repo '$(PROBE_REPO)',) \
+	    $(if $(PROBE_FORCE),--force,) \
+	    $(if $(PROBE_FORCE_ARCH),--force-arch,) \
+	    $(if $(PROBE_CTX_EXACT),--ctx-exact $(PROBE_CTX_EXACT),)
+
+probe-load-sglang: ## Serving-time LOAD probe for SGLang: same as probe-load-vllm against the SGLang cache.
+	@# Layers onto deploy/.sglang-reasoning-cache.json -- run `make probe-sglang`
+	@# first. Same precondition + knobs as probe-load-vllm.
+	PROBE_KV_CACHE_TYPE="$(PROBE_KV_CACHE_TYPE)" \
+	python3 scripts/probe-sglang-reasoning.py --load \
+	    --host-vram-gb $(GPU_MEMORY_GB) \
+	    --models-dir $(SGLANG_MODELS_DIR) \
+	    $(if $(PROBE_CONTEXTS),--ctx $(PROBE_CONTEXTS),) \
+	    $(if $(PROBE_REPO),--repo '$(PROBE_REPO)',) \
+	    $(if $(PROBE_FORCE),--force,) \
+	    $(if $(PROBE_NEEDLE_DEPTH),--needle-depth $(PROBE_NEEDLE_DEPTH),)
+
+bench-sglang: ## Bench every loaded SGLang model via devai-router:11436
+	@mkdir -p $(CACHE_DIR)/bench/inspect-logs
+	$(CONTAINER_RUNTIME) run --rm \
+		--network $(DEVAI_NETWORK) \
+		$(BENCH_CACHE_MOUNTS) \
+		$(GPU_FLAGS) \
+		-e GPU_MEMORY_GB=$(GPU_MEMORY_GB) \
+		-e HF_TOKEN -e HUGGING_FACE_HUB_TOKEN \
+		--entrypoint python3 \
+		$(IMAGE_NAME_GPU) \
+		/scripts/bench/bench_runner.py --backend sglang \
+			$(BENCH_RUN_FLAGS)

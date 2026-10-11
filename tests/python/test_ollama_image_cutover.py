@@ -8,10 +8,9 @@ request silently puts it back on the stock ollama/ollama image -- an older
 Ollama, reverted with no error anywhere.
 
 The router only ever sees what compose hands it, so the image has to be
-forwarded explicitly (the same gap DEVAI_GPU_DEVICE had until 2026-07-27:
-see docs/gpu-vendors.md). The existing "every knob the router reads is
-forwarded" test polices DEVAI_* names only, which is how OLLAMA_IMAGE went
-unchecked.
+forwarded explicitly (the same gap DEVAI_GPU_DEVICE had until 2026-07-27).
+The existing "every knob the router reads is forwarded" test polices
+DEVAI_* names only, which is how OLLAMA_IMAGE went unchecked.
 
 Stdlib unittest only; reads files, starts nothing.
 """

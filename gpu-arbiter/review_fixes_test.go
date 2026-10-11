@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -21,11 +22,26 @@ import (
 // recreates the lifecycle code decided to perform.
 func podmanStub(t *testing.T) (*http.Client, *int64) {
 	t.Helper()
+	client, creates, _ := podmanStubRecording(t)
+	return client, creates
+}
+
+// podmanStubRecording is podmanStub that also keeps every
+// /containers/create body, in order, for tests that inspect the spec a
+// launch sent (recovery_flags_test.go).
+func podmanStubRecording(t *testing.T) (*http.Client, *int64, func() [][]byte) {
+	t.Helper()
 	var creates int64
+	var mu sync.Mutex
+	var bodies [][]byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/containers/create"):
 			atomic.AddInt64(&creates, 1)
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			bodies = append(bodies, body)
+			mu.Unlock()
 			w.WriteHeader(http.StatusCreated)
 			_, _ = w.Write([]byte(`{"Id":"stub"}`))
 		case strings.HasSuffix(r.URL.Path, "/json"):
@@ -44,7 +60,12 @@ func podmanStub(t *testing.T) (*http.Client, *int64) {
 		},
 		Timeout: 5 * time.Second,
 	}
-	return client, &creates
+	recorded := func() [][]byte {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([][]byte(nil), bodies...)
+	}
+	return client, &creates, recorded
 }
 
 // --- F1: a model-less request must not release the GPU ---

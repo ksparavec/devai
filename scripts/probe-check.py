@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Report backend image drift against the probe caches (Phase C).
 
-For each HF backend (vLLM, SGLang) compare the digest of the locally
+For each HF backend (vLLM, vllm-devai) compare the digest of the locally
 available container image against the digest its probe cache was captured
 with (`_meta.current_image_digest`, stamped by scripts/_probe_core.
 stamp_image_digest). A mismatch means the cache's fit / serving_ok / parser
 data was measured on a different image and should be refreshed:
 
-    make cache-down && make probe-vllm && make probe-load-vllm   # or sglang
+    make cache-down && make probe-vllm && make probe-load-vllm   # or vllm-devai
 
 This is the operator-facing companion to the router's startup drift check
 (gpu-arbiter reads the same `_meta` and flags stale backends with a loud log
@@ -40,12 +40,6 @@ BACKENDS = (
         "deploy/.vllm-reasoning-cache.json",
         "VLLM_IMAGE",
         "docker.io/vllm/vllm-openai:v0.22.1-x86_64-cu129-ubuntu2404",
-    ),
-    (
-        "sglang",
-        "deploy/.sglang-reasoning-cache.json",
-        "SGLANG_IMAGE",
-        "docker.io/lmsysorg/sglang:v0.5.16-cu130",
     ),
     (
         "vllm-devai",
@@ -222,7 +216,7 @@ def main() -> int:
     if stale_any:
         print("At least one backend has drifted. Refresh with:")
         print("  make cache-down && make probe-vllm && make probe-load-vllm")
-        print("  make cache-down && make probe-sglang && make probe-load-sglang")
+        print("  make cache-down && make probe-vllm-devai && make probe-load-vllm-devai")
         return 1
     print("No drift detected.")
     return 0

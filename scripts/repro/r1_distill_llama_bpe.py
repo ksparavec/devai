@@ -23,7 +23,7 @@ Usage (against this project's local stack)::
 
     podman run --rm --network devai-net --entrypoint python3 \\
         -v $PWD/scripts/repro:/repro:ro \\
-        devai-lab-cpu /repro/r1_distill_llama_bpe.py \\
+        devai-lab /repro/r1_distill_llama_bpe.py \\
         --base-url http://devai-router:11435/v1 \\
         --model DeepSeek-R1-Distill-Llama-8B@32768
 

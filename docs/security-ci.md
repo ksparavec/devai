@@ -64,7 +64,7 @@ required status checks:
 3. Search for and add each blocking check. Based on the job/matrix
    names in `security-blocking.yml`, expect to see:
    - `gitleaks (secret scan)`
-   - `hadolint (deploy/Dockerfile.base)`, `hadolint (deploy/Dockerfile.lab)`, `hadolint (deploy/Dockerfile.router)`, `hadolint (deploy/Dockerfile.mcp-modelstatus)`
+   - `hadolint (deploy/Dockerfile.base)`, `hadolint (deploy/Dockerfile.lab)`, `hadolint (deploy/Dockerfile.router)`
    - `golangci-lint (gpu-arbiter)`, `golangci-lint (devai-tools)`
    - `dependency-review`
 4. Do **not** add the advisory workflow's jobs here -- they are
@@ -85,7 +85,6 @@ podman run --rm -v "$(pwd):/repo:z" -w /repo zricethezav/gitleaks:latest \
 podman run --rm -i hadolint/hadolint < deploy/Dockerfile.base
 podman run --rm -i hadolint/hadolint < deploy/Dockerfile.lab
 podman run --rm -i hadolint/hadolint < deploy/Dockerfile.router
-podman run --rm -i hadolint/hadolint < deploy/Dockerfile.mcp-modelstatus
 
 # Go lint, one per module
 podman run --rm -v "$(pwd)/gpu-arbiter:/src:z" -w /src golangci/golangci-lint:latest golangci-lint run ./...

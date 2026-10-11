@@ -1,5 +1,5 @@
 [Unit]
-Description=DevAI Infrastructure (caches + Ollama + Open WebUI)
+Description=DevAI Infrastructure (caches + Ollama + router)
 Requires=podman.socket
 After=podman.socket
 
@@ -7,6 +7,11 @@ After=podman.socket
 Type=oneshot
 RemainAfterExit=true
 WorkingDirectory=%h/.config/devai
+# The router mounts ${DEVAI_REPO}/deploy (plan I25) and compose refuses to
+# start without it. `make install-systemd` replaces the placeholder with the
+# repository's absolute path when it installs this unit, escaped for a
+# quoted value (\ and " backslashed, % doubled).
+Environment="DEVAI_REPO=@DEVAI_REPO@"
 ExecStart=/usr/bin/podman compose up -d
 ExecStop=/usr/bin/podman compose down
 TimeoutStartSec=600

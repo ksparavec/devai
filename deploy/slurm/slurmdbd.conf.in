@@ -1,0 +1,22 @@
+# slurmdbd.conf for devai-slurm (docs/slurm.md Sec. 3.1 and 9; platform-rebuild
+# Phase 5). Rendered at every start by entrypoint.sh into
+# /etc/slurm/slurmdbd.conf (0600, slurmdbd refuses anything wider):
+# @MARIADB_PASS@ is the content of /etc/devai/slurm/mariadb.pass (C7).
+#
+# MariaDB runs in the same container and listens on its socket only
+# (skip-networking); "localhost" makes the client library use the socket.
+
+AuthType=auth/slurm
+AuthAltTypes=auth/jwt
+AuthAltParameters=jwt_key=/etc/slurm/jwt_hs256.key
+DbdHost=localhost
+DbdPort=6819
+SlurmUser=root
+PidFile=/run/slurm/slurmdbd.pid
+DebugLevel=info
+
+StorageType=accounting_storage/mysql
+StorageHost=localhost
+StorageLoc=slurm_acct_db
+StorageUser=slurm
+StoragePass=@MARIADB_PASS@

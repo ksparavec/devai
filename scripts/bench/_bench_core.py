@@ -195,6 +195,58 @@ def p95(values: list[float]) -> float:
     return percentile(values, 95)
 
 
+# ── Prometheus counters ─────────────────────────────────────────────────────
+
+# The engine counters 4v and Phase 15 read off /metrics, by the names the
+# exposition format carries (prometheus_client appends `_total` to a
+# Counter's name). vLLM 0.30.0 declares them in vllm/v1/metrics/loggers.py
+# (prefix cache, :590 and :601) and vllm/v1/spec_decode/metrics.py
+# (speculative decoding, :229-231); SGLang's are Phase 15's (plan I16).
+ENGINE_COUNTERS: tuple[str, ...] = (
+    "vllm:prefix_cache_queries_total",
+    "vllm:prefix_cache_hits_total",
+    "vllm:spec_decode_num_drafts_total",
+    "vllm:spec_decode_num_draft_tokens_total",
+    "vllm:spec_decode_num_accepted_tokens_total",
+    "sglang:cached_tokens_total",
+    "sglang:prompt_tokens_total",
+)
+
+_PROM_SAMPLE = re.compile(
+    r"^(?P<name>[A-Za-z_:][A-Za-z0-9_:]*)(?:\{(?P<labels>.*)\})?\s+(?P<value>\S+)")
+
+
+def parse_prometheus_counters(text: str,
+                              names: tuple[str, ...] | None = None) -> dict[str, float]:
+    """Sum each metric's samples over all its label sets.
+
+    One process can expose a counter once per label set (vLLM labels by
+    model name and engine index, SGLang's cached tokens by cache source);
+    a read-out wants the total. ``names`` limits the result to those
+    metrics -- a name the text does not carry is absent from the result,
+    never 0, so a reader can tell "no such counter" from "counted nothing".
+    Comment lines and unparsable values are skipped.
+    """
+    wanted = set(names) if names is not None else None
+    out: dict[str, float] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = _PROM_SAMPLE.match(line)
+        if not m:
+            continue
+        name = m.group("name")
+        if wanted is not None and name not in wanted:
+            continue
+        try:
+            value = float(m.group("value"))
+        except ValueError:
+            continue
+        out[name] = out.get(name, 0.0) + value
+    return out
+
+
 # ── Leak regex compiler ─────────────────────────────────────────────────────
 
 def load_leak_patterns(

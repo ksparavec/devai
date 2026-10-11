@@ -1,0 +1,25 @@
+{
+  "_comment": "Shared by gpu-arbiter/recovery_flags_test.go and tests/python/test_recovery_flags_generated.py: both readers must turn this file and generated.json into expected.json's lookups, and must keep the previous registry when either file is replaced by one of broken/*.",
+  "models": {
+    "M": {"backends": ["vllm"], "engine_flags": ["--language-model-only"], "engine_env": {"A": "curated"}},
+    "Everywhere": {"engine_flags": ["--trust-remote-code"]},
+    "BackendsNull": {"backends": null, "engine_flags": ["--backends-null"]},
+    "BackendsString": {"backends": "vllm", "engine_flags": ["--backends-string"]},
+    "BackendsEmpty": {"backends": [], "engine_flags": ["--backends-empty"]},
+    "BackendsNullElement": {"backends": ["vllm", null], "engine_flags": ["--x"]},
+    "BackendsNumberElement": {"backends": ["vllm", 5], "engine_flags": ["--x"]},
+    "FlagsString": {"engine_flags": "--x"},
+    "FlagsNullElement": {"engine_flags": ["--x", null]},
+    "FlagsNumberElement": {"engine_flags": ["--x", 4]},
+    "FlagsObject": {"engine_flags": {"--x": true}},
+    "EnvNumberValue": {"engine_flags": ["--x"], "engine_env": {"A": 1}},
+    "EnvNullValue": {"engine_flags": ["--x"], "engine_env": {"A": null}},
+    "EnvList": {"engine_flags": ["--x"], "engine_env": ["A"]},
+    "ImageNumber": {"engine_flags": ["--x"], "image": 5},
+    "ImageNull": {"engine_flags": ["--image-null"], "image": null},
+    "CaseKeys": {"Backends": ["sglang"], "ENGINE_FLAGS": ["--upper"], "engine_flags": ["--lower"], "Engine_Env": {"U": "1"}},
+    "NullsEverywhere": {"engine_flags": null, "engine_env": null, "backends": null, "image": null},
+    "NotAnObject": ["--x"],
+    "WithImage": {"backends": ["vllm"], "engine_flags": ["--with-image"], "image": "img/custom:1"}
+  }
+}

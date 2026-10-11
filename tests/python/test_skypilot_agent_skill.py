@@ -117,9 +117,12 @@ class TestDocsSkypilotUserGuide(unittest.TestCase):
                 header, text, msg=f"docs/skypilot-user-guide.md missing: {header}"
             )
 
-    def test_links_to_sibling_plan(self) -> None:
+    def test_points_to_the_frozen_fleet_provisioner(self) -> None:
+        # The sibling plan was removed on 2026-10-05; the guide names where
+        # its frozen code lives instead of linking a file that no longer exists.
         text = self.path.read_text()
-        self.assertIn("skypilot-fleet-provisioner.md", text)
+        self.assertIn("attic/cluster-mode/", text)
+        self.assertNotIn("plans/skypilot-fleet-provisioner.md", text)
 
 
 if __name__ == "__main__":

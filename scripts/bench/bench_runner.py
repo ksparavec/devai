@@ -463,6 +463,69 @@ def discover_models(
     return out
 
 
+# --- MTP (--mtp) ---
+
+# The router's MTP override. It peels `::mtp` wherever it sits among the
+# control suffixes; the runner puts it before `@<ctx>`, the picker's
+# canonical order (`<name>::<reasoning>::<mtp>@<ctx>`).
+MTP_SUFFIX = "::mtp"
+
+
+def probe_cell(entry: dict, host_vram_gb: int, ctx: int) -> dict:
+    """The probe cell a target was chosen from (``{}`` if absent)."""
+    band = (entry.get("probes") or {}).get(str(host_vram_gb)) or {}
+    cell = band.get(str(ctx)) if isinstance(band, dict) else None
+    return cell if isinstance(cell, dict) else {}
+
+
+def with_mtp(targets: list[dict], host_vram_gb: int) -> list[dict]:
+    """Mark every target to be served with its MTP drafter (``--mtp``).
+
+    Only a row whose probe cell records ``mtp_fits: true`` can be: its
+    drafter loaded at that context. Any other row makes the WHOLE run
+    refuse (ValueError naming the rows), before anything is benched --
+    benching it without MTP would label MTP-off numbers as MTP-on, and
+    asking the router for `::mtp` on a row whose drafter does not fit
+    measures a launch failure. The cache key does not change: a row is
+    (model, backend, ctx); the task entries record ``mtp: true``.
+    """
+    refused = [f"{t['alias']}@{t['ctx']}" for t in targets
+               if probe_cell(t["entry"], host_vram_gb, t["ctx"]).get("mtp_fits") is not True]
+    if refused:
+        raise ValueError(
+            "no probe cell records mtp_fits: true for "
+            + ", ".join(refused)
+            + " -- narrow --repo/--ctx to rows whose drafter fits, or drop --mtp")
+    return [{**t, "mtp": True} for t in targets]
+
+
+def served_name(target: dict) -> str:
+    """The `model` the router is sent for ``target``: ``<alias>[::mtp]@<ctx>``."""
+    alias = target["alias"] + (MTP_SUFFIX if target.get("mtp") else "")
+    return serving_alias_with_ctx(alias, target["ctx"])
+
+
+def latency_records_path(log_dir: Path, served: str) -> Path:
+    """``<log-dir>/latency-<served>.jsonl``; a ``/`` in the name becomes ``_``."""
+    return log_dir / f"latency-{served.replace('/', '_')}.jsonl"
+
+
+def write_latency_records(log_dir: Path, served: str, records: list[dict]) -> Path:
+    """Write the latency task's per-prompt records, one JSON object per line.
+
+    Replaces the file of an earlier run of the same served name (written
+    to a temporary name and renamed, so a reader never sees half a file).
+    They go here and not into the cache row: 40 records per run would
+    bloat every row, and the cache keeps aggregates.
+    """
+    log_dir.mkdir(parents=True, exist_ok=True)
+    path = latency_records_path(log_dir, served)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text("".join(json.dumps(r, sort_keys=True) + "\n" for r in records))
+    os.replace(tmp, path)
+    return path
+
+
 # --- CLI ctx parsing helpers ---
 
 _CTX_TIER_ALIASES: dict[str, int] = {
@@ -661,8 +724,12 @@ def _invoke_inspect_task(
     log_dir: Path,
     timeout_s: float,
     fail_on_error: bool | None = None,
+    max_connections: int | None = None,
 ):
     """Run an inspect_ai Task against the router. Returns the EvalLog.
+
+    ``max_connections`` overrides ``max_connections_for(backend)``
+    (``--max-connections``); None keeps the backend's default.
 
     ``fail_on_error=False`` lets a single failing sample (e.g. a router
     400 against a forced-mode model on a multi-tool request) be recorded
@@ -714,7 +781,8 @@ def _invoke_inspect_task(
     )
     if fail_on_error is not None:
         eval_kwargs["fail_on_error"] = fail_on_error
-    eval_kwargs["max_connections"] = max_connections_for(backend)
+    eval_kwargs["max_connections"] = (max_connections if max_connections is not None
+                                      else max_connections_for(backend))
     logs = inspect_eval(task_obj, **eval_kwargs)
     if isinstance(logs, list) and not logs:
         # What inspect returns when the eval was interrupted (SIGINT at a
@@ -902,6 +970,7 @@ def run_for_target(
     backend_image_digest: str | None = None,
     drop_threshold: float = 0.70,
     early_drop: bool = True,
+    max_connections: int | None = None,
 ) -> None:
     """Run all requested tasks against one model and persist results.
 
@@ -913,15 +982,23 @@ def run_for_target(
     wipes the row upfront: unrelated tasks (e.g. the sharper benches) survive
     a forced re-run of the default tasks.
     """
-    served = serving_alias_with_ctx(target["alias"], target["ctx"])
+    served = served_name(target)
     key = target["key"]
     existing = cache.get(key) or {}
     existing_tasks = (existing.get("tasks") or {})
+    mtp = bool(target.get("mtp"))
+    # The value every scored task of this run is evaluated with. Recorded,
+    # because a sample queued INSIDE the engine is charged to its
+    # working_limit: a cap above what the engine serves at once can turn
+    # waiting into time-outs (see BACKEND_MAX_CONNECTIONS).
+    used_connections = (max_connections if max_connections is not None
+                        else max_connections_for(backend))
 
     print(f"\n=== {target['alias']} (backend={backend}, ctx={target['ctx']}) ===",
           file=sys.stderr)
     print(f"  served as: {served}", file=sys.stderr)
     print(f"  router:    {router_url}", file=sys.stderr)
+    print(f"  max_connections: {used_connections}", file=sys.stderr)
 
     sampler = VramSampler(interval=1.0)
     sampler.start()
@@ -949,6 +1026,20 @@ def run_for_target(
 
     persisted = 0
 
+    def _stamped(results: dict[str, dict]) -> dict[str, dict]:
+        """Task entries as written: ``mtp: true`` on every entry of an MTP
+        run, and the connection cap on each scored (inspect) task."""
+        out: dict[str, dict] = {}
+        for name, tres in results.items():
+            if not isinstance(tres, dict):
+                out[name] = tres
+                continue
+            extra: dict = {"mtp": True} if mtp else {}
+            if "inspect_log_dir" in tres:
+                extra["max_connections"] = used_connections
+            out[name] = {**tres, **extra}
+        return out
+
     def _persist() -> None:
         """Write the tasks finished so far, so a stopped run keeps them.
 
@@ -968,7 +1059,7 @@ def run_for_target(
         update_row(
             cache, key,
             model=target["alias"], backend=backend, router_endpoint=router_url,
-            context=int(target["ctx"]), task_results=task_results,
+            context=int(target["ctx"]), task_results=_stamped(task_results),
             host_env_id=host_env_id,
             backend_image_digest=backend_image_digest,
         )
@@ -983,6 +1074,10 @@ def run_for_target(
                     router_url=router_url,
                     n=n_leak_prompts,
                 )
+                records = latency.pop("records", None)
+                if records is not None:
+                    path = write_latency_records(log_dir, served, records)
+                    print(f"    per-prompt records: {path}", file=sys.stderr)
                 task_results["leak_probe"] = {
                     "leak_rate": latency["leak_rate"],
                     "leaked_markers": latency["leaked_markers"],
@@ -1012,6 +1107,7 @@ def run_for_target(
                     backend=backend,
                     router_url=router_url,
                     log_dir=log_dir,
+                    max_connections=used_connections,
                     timeout_s=600.0,
                 )
                 score, n = _aggregate_score(eval_log)
@@ -1042,6 +1138,7 @@ def run_for_target(
                     backend=backend,
                     router_url=router_url,
                     log_dir=log_dir,
+                    max_connections=used_connections,
                     timeout_s=900.0,
                 )
                 score, n = _aggregate_score(eval_log)
@@ -1069,6 +1166,7 @@ def run_for_target(
                     backend=backend,
                     router_url=router_url,
                     log_dir=log_dir,
+                    max_connections=used_connections,
                     timeout_s=900.0,
                 )
                 score, n = _aggregate_score(eval_log)
@@ -1095,6 +1193,7 @@ def run_for_target(
                     backend=backend,
                     router_url=router_url,
                     log_dir=log_dir,
+                    max_connections=used_connections,
                     timeout_s=900.0,
                 )
                 score, n = _aggregate_score(eval_log)
@@ -1121,6 +1220,7 @@ def run_for_target(
                     backend=backend,
                     router_url=router_url,
                     log_dir=log_dir,
+                    max_connections=used_connections,
                     timeout_s=900.0,
                 )
                 score, n = _aggregate_score(eval_log)
@@ -1181,6 +1281,7 @@ def run_for_target(
                     backend=backend,
                     router_url=router_url,
                     log_dir=log_dir,
+                    max_connections=used_connections,
                     timeout_s=600.0,
                     # Forced-mode models historically tripped the router's
                     # tool_choice_pinning_required check on individual
@@ -1286,6 +1387,10 @@ def run_for_target(
     # both greedy and override rows stays auditable.
     metrics = dict(metrics or {})
     metrics["sampling"] = sampling_record(target["alias"])
+    # Run-level, like the sampling record: the last run's settings. The
+    # task entries carry their own (see _stamped).
+    metrics["mtp"] = mtp
+    metrics["max_connections"] = used_connections
     update_row(
         cache,
         key,
@@ -1293,7 +1398,7 @@ def run_for_target(
         backend=backend,
         router_endpoint=router_url,
         context=int(target["ctx"]),
-        task_results=task_results,
+        task_results=_stamped(task_results),
         metrics=metrics,
         host_env_id=host_env_id,
         backend_image_digest=backend_image_digest,
@@ -1430,7 +1535,9 @@ def _check_router(router_url: str) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--backend", required=True, choices=["ollama", "vllm", "sglang", "vllm-devai"])
+    # SGLang was frozen by platform-rebuild Phase 15 (M16); its tables below
+    # stay, unreachable, for attic/sglang/RESTORE.md.
+    ap.add_argument("--backend", required=True, choices=["ollama", "vllm", "vllm-devai"])
     ap.add_argument(
         "--tasks",
         default=DEFAULT_TASKS,
@@ -1486,7 +1593,24 @@ def main() -> None:
         action="store_true",
         help="iterate every fits=true ctx per model (overrides --ctx).",
     )
+    ap.add_argument(
+        "--mtp",
+        action="store_true",
+        help="serve every row with its MTP drafter (`<name>::mtp@<ctx>`), as "
+             "the picker does; refused unless every selected row's probe "
+             "cell records mtp_fits: true.",
+    )
+    ap.add_argument(
+        "--max-connections", type=int, default=None,
+        help="concurrent requests for the scored tasks, overriding the "
+             "backend's default (ollama 1, others %d); recorded on the row. "
+             "Keep it at or below the engine's --max-num-seqs: a sample "
+             "queued inside the engine is charged to its working limit."
+             % DEFAULT_MAX_CONNECTIONS,
+    )
     args = ap.parse_args()
+    if args.max_connections is not None and args.max_connections < 1:
+        ap.error("--max-connections must be >= 1")
 
     tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
     invalid = [t for t in tasks if t not in {
@@ -1518,10 +1642,17 @@ def main() -> None:
             f"{PROBE_CACHE_BY_BACKEND[args.backend]} (host_vram_gb="
             f"{args.host_vram_gb}, repo={repo_filter!r})"
         )
+    if args.mtp:
+        try:
+            targets = with_mtp(targets, args.host_vram_gb)
+        except ValueError as e:
+            sys.exit(f"--mtp refused: {e}")
 
     print(
         f"bench: backend={args.backend}, host_vram={args.host_vram_gb}G, "
-        f"router={router_url}, tasks={tasks}, n_targets={len(targets)}",
+        f"router={router_url}, tasks={tasks}, n_targets={len(targets)}, "
+        f"mtp={args.mtp}, max_connections="
+        f"{args.max_connections if args.max_connections is not None else max_connections_for(args.backend)}",
         file=sys.stderr,
     )
 
@@ -1577,6 +1708,7 @@ def main() -> None:
             force=args.force,
             host_env_id=env_id,
             backend_image_digest=image_digest,
+            max_connections=args.max_connections,
         )
 
     print(f"\nbench: wrote {args.cache}", file=sys.stderr)

@@ -130,9 +130,9 @@ func TestMemFractionFormatMatchesProbers(t *testing.T) {
 
 	// And assert the Python side still agrees, so this cannot drift from
 	// the other end either.
+	// probe-sglang-reasoning.py went to attic/sglang/ (Phase 15, M16).
 	for _, p := range []string{
 		filepath.Join("..", "scripts", "probe-vllm-reasoning.py"),
-		filepath.Join("..", "scripts", "probe-sglang-reasoning.py"),
 	} {
 		b, err := os.ReadFile(p)
 		if err != nil {
