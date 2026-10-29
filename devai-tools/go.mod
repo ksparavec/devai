@@ -9,7 +9,7 @@ module github.com/sparavec/devai-tools
 go 1.27
 
 require (
-	github.com/nats-io/nats.go v1.54.0
+	github.com/nats-io/nats.go v1.55.0
 	github.com/sparavec/gpu-arbiter v0.0.0
 	gopkg.in/yaml.v3 v3.0.1
 )
